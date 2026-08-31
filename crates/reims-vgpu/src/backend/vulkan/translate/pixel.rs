@@ -670,6 +670,56 @@ pub fn color_attachment(
     Ok((ColorAttachmentFormat { vk: f.vk, numeric }, None))
 }
 
+/// The host texel a guest format's own bytes already are, and how wide it is —
+/// or `None` for a format whose bytes no host texel reproduces verbatim.
+///
+/// This is the question a **byte copy** asks. A copy converts nothing, so the
+/// only thing that licenses one is that the bytes the guest declared and the
+/// bytes the image holds are the same texel; a rail that can answer this can
+/// hand the guest its pages directly, and one that cannot must read back and
+/// convert.
+///
+/// # Why this is not [`crate::contract::pixel_format::store_texel_order`]
+///
+/// Both guest-page writeback licences used to ask that function, and it is the
+/// **render Store's** table: its own doc states the membership rule as "a guest
+/// *render target* can declare it", and
+/// `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is` holds
+/// it to that by requiring every admitted format to have a `render_target_bpp`
+/// and a `sampled_class`. That is correct for a Store and wrong for a compute
+/// storage image, which the guest never renders into and the sampler never
+/// reads — so asking it was a render-target question about a destination that is
+/// not one, and the answer was `FormatNeedsConversion` for every 32-bit-per-
+/// channel plane. On a driven macos-13 boot that was all five remaining compute
+/// readbacks: four linear at `MTLPixelFormatRGBA32Float` and one type-11 at
+/// `MTLPixelFormatRGBA32Uint` whose source image held `R32G32B32A32_UINT`, the
+/// very texel the guest had declared.
+///
+/// Widening the Store's table instead would have obliged this device to declare
+/// those formats renderable and samplable, which the guest never asked for and
+/// the contract does not say.
+///
+/// # Why this is a union and not a third table
+///
+/// Neither half is written here. A render target's answer is
+/// `store_texel_order` composed with [`vk_texel_layout`]; a storage image's is
+/// `storage_selector` composed with [`storage_image_from_selector`] and
+/// `StorageImageFormat::vk_format`. Both already existed, both are already the
+/// authority for their own rail, and a format either admits is a format that
+/// rail creates images at — so nothing new is claimed about any format, and a
+/// new arm in either table reaches this without being added twice.
+///
+/// The order does not matter, and `the_two_verbatim_texel_tables_never_disagree`
+/// is why: where both answer they must name the same format and the same width,
+/// which is the only way this can be a union rather than a precedence rule.
+pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
+    if let Some(layout) = pixel_format::store_texel_order(mtl) {
+        return Some((vk_texel_layout(layout), layout.bytes_per_texel()));
+    }
+    let storage = storage_image_from_selector(pixel_format::storage_selector(mtl)?);
+    Some((storage.vk_format(), storage.bytes_per_texel() as u32))
+}
+
 /// The engine's storage-image format for a contract [`StorageImageSelector`].
 ///
 /// The selector is the compute rail's own narrowing of `MTLPixelFormat`, so
@@ -795,6 +845,11 @@ pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
     // `unknown_pixel_format` rather than as a missing layout, exactly as
     // `storage_image` does for the same reason.
     let sampled_only = match mtl {
+        // `(0, 0, 0, a)` in one byte. It has no storage selector and no Vulkan
+        // 1.2 format of its own, so it rides `R8_UNORM` with the mapping
+        // `storage_image_components` supplies — the same one the draw rail
+        // already binds it through.
+        pf::MTL_FORMAT_A8_UNORM => StorageImageFormat::A8Unorm,
         pf::MTL_FORMAT_R16_UNORM => StorageImageFormat::R16Unorm,
         pf::MTL_FORMAT_RG16_UNORM => StorageImageFormat::Rg16Unorm,
         pf::MTL_FORMAT_RG16_UINT => StorageImageFormat::Rg16Uint,
@@ -923,6 +978,9 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::Rg16Float => vk::Format::R16G16_SFLOAT,
         StorageImageFormat::Rg16Uint => vk::Format::R16G16_UINT,
         StorageImageFormat::R8Unorm => vk::Format::R8_UNORM,
+        // Shares `R8_UNORM` with `R8Unorm`; what separates them is the view
+        // component mapping, which `storage_image_components` answers.
+        StorageImageFormat::A8Unorm => vk::Format::R8_UNORM,
         StorageImageFormat::Rg8Unorm => vk::Format::R8G8_UNORM,
         StorageImageFormat::Rgba32Uint => vk::Format::R32G32B32A32_UINT,
         StorageImageFormat::R32Uint => vk::Format::R32_UINT,
@@ -935,6 +993,28 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
         StorageImageFormat::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
         StorageImageFormat::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
+    }
+}
+
+/// The view component mapping a sampled image of this engine format needs.
+///
+/// One member has a non-identity answer: [`StorageImageFormat::A8Unorm`], whose
+/// byte rides in `R8_UNORM` and has to be put back in alpha. Everything else is
+/// identity, because [`translate`] gives a non-identity plan to that Metal
+/// format alone.
+///
+/// This is the *reduced* end of the same fact [`translate`] states, so a test
+/// holds the two equal rather than letting this become a second opinion about
+/// where `A8Unorm`'s byte lives.
+///
+/// A **storage** image view must not take this: Vulkan requires an identity
+/// mapping on a storage-image view, and no format reaching that role has a
+/// non-identity plan — `storage_selector` has no entry for `A8Unorm`. The
+/// caller that builds views asserts that pairing rather than trusting it.
+pub fn storage_image_components(format: StorageImageFormat) -> SwizzlePlan {
+    match format {
+        StorageImageFormat::A8Unorm => ALPHA_IN_RED,
+        _ => pixel_format::swizzle_identity(),
     }
 }
 
@@ -1011,6 +1091,71 @@ pub fn has_identity_components(mtl: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every Metal format a dispatch samples binds the component mapping
+    /// `translate` states for it — not one the reduction to
+    /// [`StorageImageFormat`] lost on the way.
+    ///
+    /// The reduction is where the plan goes missing. `A8Unorm` and `R8Unorm`
+    /// are one `VkFormat`, and only the first needs its byte moved back into
+    /// alpha, so an enum that named the format alone could not tell a rail which
+    /// mapping to bind — and the compute rail refused `A8Unorm` outright for
+    /// exactly that reason, taking ten conformance cases with it. This sweeps
+    /// the whole 16-bit space rather than naming that one format, because the
+    /// next format with a non-identity plan must not be able to slip through the
+    /// same hole quietly.
+    #[test]
+    fn every_sampled_dispatch_format_binds_the_plan_its_metal_format_states() {
+        for mtl in 0..=u16::MAX {
+            let Ok(engine) = sampled_image(mtl) else {
+                continue;
+            };
+            let stated = translate(mtl)
+                .expect("a format sampled_image admitted must translate")
+                .components;
+            assert_eq!(
+                storage_image_components(engine),
+                stated,
+                "{mtl:#x} samples as {engine:?} but would bind the wrong channels"
+            );
+        }
+    }
+
+    /// `A8Unorm` reaches a dispatch, and it reaches it as alpha.
+    ///
+    /// The named case of the sweep above, spelled out because the failure it
+    /// guards is silent: sampling the byte as **red** returns a plausible
+    /// non-zero value in the wrong channel, which reads like a working texture.
+    #[test]
+    fn a8unorm_samples_in_a_dispatch_with_its_byte_in_alpha() {
+        use crate::contract::pixel_format as p;
+        let engine =
+            sampled_image(p::MTL_FORMAT_A8_UNORM).expect("A8Unorm is sampleable in a dispatch");
+        assert_ne!(
+            engine,
+            StorageImageFormat::R8Unorm,
+            "A8Unorm must not reduce to R8Unorm: they share a VkFormat and \
+             differ only in the mapping, so collapsing them loses the mapping"
+        );
+        assert_eq!(vk_storage_image(engine), vk::Format::R8_UNORM);
+        assert_eq!(engine.bytes_per_texel(), 1);
+        let mapping = vk_component_mapping(&storage_image_components(engine));
+        assert_eq!(
+            (mapping.r, mapping.g, mapping.b, mapping.a),
+            (
+                vk::ComponentSwizzle::ZERO,
+                vk::ComponentSwizzle::ZERO,
+                vk::ComponentSwizzle::ZERO,
+                vk::ComponentSwizzle::R,
+            ),
+            "Metal A8Unorm presents (0, 0, 0, a)"
+        );
+        assert_eq!(
+            storage_image_components(StorageImageFormat::R8Unorm),
+            p::swizzle_identity(),
+            "its VkFormat twin keeps the identity mapping"
+        );
+    }
     use super::*;
     use crate::observe::Decline;
     use pixel_format as p;
@@ -1034,6 +1179,76 @@ mod tests {
             assert_eq!(storage_format(f), f, "{layout:?}");
             assert_eq!(has_bgra_order(f), f == SCANOUT_FORMAT, "{layout:?}");
         }
+    }
+
+    /// [`verbatim_texel`] is a union of two tables, and a union is only well
+    /// defined where the overlap agrees. Every `MTLPixelFormat` both the render
+    /// Store's table and the compute rail's selector answer for must name the
+    /// same `vk::Format` and the same texel width — otherwise the function would
+    /// be a precedence rule dressed as a union, and which answer a guest plane
+    /// got would depend on the order of two `if let`s rather than on the format
+    /// it declared.
+    ///
+    /// The sweep is the whole `u16` space because neither table publishes its
+    /// membership as a list, and both are cheap total functions.
+    #[test]
+    fn the_two_verbatim_texel_tables_never_disagree() {
+        let mut overlap = 0usize;
+        for mtl in 0..=u16::MAX {
+            let (Some(layout), Some(selector)) =
+                (p::store_texel_order(mtl), p::storage_selector(mtl))
+            else {
+                continue;
+            };
+            overlap += 1;
+            let storage = storage_image_from_selector(selector);
+            assert_eq!(
+                vk_texel_layout(layout),
+                storage.vk_format(),
+                "format {mtl:#x} is two different host texels"
+            );
+            assert_eq!(
+                layout.bytes_per_texel(),
+                storage.bytes_per_texel() as u32,
+                "format {mtl:#x} is two different widths"
+            );
+            // And whichever half answered, the union answers the same thing.
+            assert_eq!(
+                verbatim_texel(mtl),
+                Some((storage.vk_format(), storage.bytes_per_texel() as u32)),
+                "format {mtl:#x}"
+            );
+        }
+        // A zero here would make the assertions above vacuous, and the tables do
+        // overlap: an 8-bit-per-channel plane is a legal render target and a
+        // legal storage image both.
+        assert!(overlap > 0, "the two tables share no format at all");
+    }
+
+    /// The two formats that were the entire remaining compute readback traffic
+    /// on a driven macos-13 boot are byte-copy destinations, and they are so for
+    /// the reason the contract gives rather than because they were listed here:
+    /// the compute rail creates storage images at exactly these texels, so an
+    /// image→buffer copy of one lands the bytes the guest declared.
+    ///
+    /// Neither is in the render Store's table, and neither should be — the guest
+    /// does not render into them and does not sample them.
+    #[test]
+    fn a_thirty_two_bit_per_channel_storage_plane_is_a_byte_copy_destination() {
+        assert_eq!(
+            verbatim_texel(p::MTL_FORMAT_RGBA32_UINT),
+            Some((vk::Format::R32G32B32A32_UINT, 16))
+        );
+        assert_eq!(
+            verbatim_texel(p::MTL_FORMAT_RGBA32_FLOAT),
+            Some((vk::Format::R32G32B32A32_SFLOAT, 16))
+        );
+        // And the union did not quietly widen the render rail's own table to get
+        // there: the Store still refuses both, which is what keeps
+        // `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is`
+        // an honest statement about render targets.
+        assert!(p::store_texel_order(p::MTL_FORMAT_RGBA32_UINT).is_none());
+        assert!(p::store_texel_order(p::MTL_FORMAT_RGBA32_FLOAT).is_none());
     }
 
     /// A sampled bind can only ever spell a stored-byte format, so every
@@ -1148,12 +1363,14 @@ mod tests {
     /// The exceptions are listed rather than tolerated, because each is a real
     /// decision this rail cannot yet express:
     ///
-    /// - `A8Unorm` needs its channel plan. [`sampled_pixels`] hands back a
-    ///   [`SwizzlePlan`] that puts the single byte in alpha; a
-    ///   [`StorageImageFormat`] carries no component mapping, so admitting it
-    ///   here would sample the byte as **red**. A wrong sample is worse than a
-    ///   named refusal, so it stays refused until the compute request can carry
-    ///   a plan.
+    /// `A8Unorm` used to head this list — it needs its channel plan, and a
+    /// [`StorageImageFormat`] carried no component mapping, so admitting it
+    /// would have sampled the single byte as **red**. It is admitted now
+    /// because the enum carries the distinction: [`StorageImageFormat::A8Unorm`]
+    /// is its own member sharing `R8_UNORM` with
+    /// [`StorageImageFormat::R8Unorm`], and [`storage_image_components`] is the
+    /// plan the sampled view binds.
+    ///
     /// - The two `*_SRGB` orders would have to bind their linear sibling, which
     ///   is the [`TranslateReason::SrgbDowngraded`] loss [`srgb_decline`]
     ///   documents. This rail's `Result` has nowhere to record it, and
@@ -1183,7 +1400,6 @@ mod tests {
     #[test]
     fn a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one() {
         const EXCEPTIONS: &[(u16, &str)] = &[
-            (p::MTL_FORMAT_A8_UNORM, "needs a component mapping"),
             (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
             (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
             (

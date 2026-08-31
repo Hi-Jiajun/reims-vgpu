@@ -298,8 +298,9 @@ with no product behavior change, preserve the raw failing result, establish the 
 why the prior classification was unsupported. The correction must move the case atomically between
 the translation and driver/device inventories; it must never leave the case in both or neither.
 
-The current conformance runner is scoped to the x86 macOS / Linux Vulkan pathway and the macos-15
-rail. It is mandatory for guest-visible changes that can affect that pathway, including shared
+The current conformance runner is scoped to the x86 macOS / Linux Vulkan pathway. `RAIL` selects
+the guest rail; each rail carries its own debt inventory, and a result on one rail is a measurement
+of that rail's driver only. It is mandatory for guest-visible changes that can affect that pathway, including shared
 decode, contract, runtime, memory, synchronization, rendering, or Vulkan execution. It does not
 prove another pathway or rail; validate those separately when they are affected.
 
@@ -348,8 +349,8 @@ State exactly what was verified. One workload, host, pathway, and rail proves on
   execution, presentation, and Metal/Vulkan policy.
 - `crates/reims-vgpu/src/observe/`: typed failure and census emission.
 - `crates/reims-vgpu-wire`: derived wire views; its own `AGENTS.md` also applies.
-- `conformance/`: native-oracle Metal cases, macos-15 guest runner, and separate translation and
-  driver debt inventories. It preserves established compatibility; it does not define API truth.
+- `conformance/`: native-oracle Metal cases, a rail-selected guest runner, and separate per-rail
+  translation and driver debt inventories. It preserves established compatibility; it does not define API truth.
 - `vm/`: snapshot-revert boot scripts and rail selection.
 - `bugs/`: gitignored handoff packages for translator defects.
 
@@ -490,7 +491,7 @@ native oracle first. The tracked native baseline must contain every case exactly
 applicable case must pass before guest output can establish a device defect.
 
 For every guest-visible behavior change capable of affecting x86 macOS / Linux Vulkan, run the
-complete macos-15 battery on both the identified control and candidate. Preserve both output
+complete battery on the named rail for both the identified control and candidate. Preserve both output
 directories and manifests. Score both against the same native baseline and compare their raw
 per-case transitions using the ratchet in step 9. Focused modes are for establishing and repeating
 one repair; they do not replace the complete battery.

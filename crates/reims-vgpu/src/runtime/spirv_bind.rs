@@ -194,9 +194,7 @@ const _: () = assert!(
     SAMPLER_BINDING_BASE + reims_vgpu_wire::ops::bind_limit::SAMPLER <= COLOR_INPUT_BINDING_BASE
 );
 // The relocated fragment buffer band starts past every translator-owned band.
-const _: () = assert!(
-    FRAG_BUFFER_BINDING_OFFSET >= M2V_DEFAULT_DESCRIPTOR_LAYOUT.synthetic.end
-);
+const _: () = assert!(FRAG_BUFFER_BINDING_OFFSET >= M2V_DEFAULT_DESCRIPTOR_LAYOUT.synthetic.end);
 // ...and ends before the relocated fragment sampled bands begin.
 const _: () = assert!(
     SAMPLED_RESOURCE_BINDING_BASE - 1 + FRAG_BUFFER_BINDING_OFFSET
@@ -2196,6 +2194,11 @@ pub fn reflected_storage_image_format(
         TextureFormat::R16f => ImageFormat::R16Float,
         TextureFormat::R16ui => ImageFormat::Unsupported(16),
         TextureFormat::Rg16f => ImageFormat::Rg16Float,
+        // SPIR-V `Rg32f`. The device has no two-channel 32-bit float storage
+        // surface — neither `StorageImageSelector` nor `TexelLayout` names one
+        // — so the honest answer is the format's own SPIR-V ordinal carried as
+        // unsupported, which round-trips through `raw`/`from_raw` unchanged.
+        TextureFormat::Rg32f => ImageFormat::Unsupported(6),
         TextureFormat::R32f => ImageFormat::R32Float,
         TextureFormat::R32i => ImageFormat::Unsupported(17),
         TextureFormat::R32ui => ImageFormat::R32ui,
@@ -2975,6 +2978,17 @@ pub enum ReflectedComputeTexture {
     /// stage: a binding comes from one type-11 plane window or one linear GVA
     /// level, both flat `width × height` rectangles.
     Plain2d(ImageAccess),
+    /// A single-layer multisampled 2D texture the kernel reads
+    /// (`texture2d_ms<T, access::read>`).
+    ///
+    /// Not a staged shape and not an unstageable one: it is a shape with a
+    /// **different source**. `engine::types::SampledResource::multisampled`
+    /// states the rule — "Such an image can only come from a retained
+    /// multisample target; linear bytes cannot be uploaded into one with a
+    /// buffer-to-image copy" — so the staging question the other variants
+    /// answer does not arise here. The caller binds the target resident that
+    /// holds those samples, or refuses by naming that resident's absence.
+    Multisample2d,
     /// The shader declares a shape with a slice, depth, or sample axis the
     /// compute rail has no staged source for. `axis` names it for the fail log.
     UnstageableShape { axis: &'static str },
@@ -2988,8 +3002,9 @@ pub enum ReflectedComputeTexture {
 /// `Unknown`. The shape axis comes from the same decoded `OpTypeImage`, and
 /// the rail refuses anything it would otherwise stage as 2D behind the
 /// shader's back: binding a `TYPE_2D` view to a SPIR-V image declared
-/// `2DArray`/`3D`/`1D`/`Cube`/`Buffer`/multisampled is a descriptor-type
-/// mismatch, not a degraded render.
+/// `2DArray`/`3D`/`1D`/`Cube`/`Buffer` is a descriptor-type mismatch, not a
+/// degraded render. A multisampled read binding is the one shape that is
+/// neither staged nor refused: see [`ReflectedComputeTexture::Multisample2d`].
 pub fn reflected_compute_texture(
     reflection: &ShaderReflection,
     binding: u32,
@@ -3002,18 +3017,30 @@ pub fn reflected_compute_texture(
         TextureDimension::D3 => Some("dim_3d"),
         TextureDimension::Cube => Some("dim_cube"),
         TextureDimension::Buffer => Some("dim_buffer"),
+        // Ahead of the sample axis on purpose: the resident that serves a
+        // multisample bind is one layer, so an arrayed multisample texture is
+        // refused by its slice axis and never reaches the resident arm.
         TextureDimension::D2 if shape.arrayed => Some("arrayed"),
-        TextureDimension::D2 if shape.multisampled => Some("multisampled"),
+        // A writable multisampled image is a separate host capability
+        // (`shaderStorageImageMultisample`) and no Metal texture type decodes
+        // into one, so it keeps a refusal — under its own axis name, so that
+        // admitting the read class below cannot quietly admit this one too.
+        TextureDimension::D2 if shape.multisampled && shape.writable => {
+            Some("multisampled_storage")
+        }
         TextureDimension::D2 => None,
     };
-    match axis {
-        Some(axis) => ReflectedComputeTexture::UnstageableShape { axis },
-        None => ReflectedComputeTexture::Plain2d(if shape.writable {
-            ImageAccess::Storage
-        } else {
-            ImageAccess::Sampled
-        }),
+    if let Some(axis) = axis {
+        return ReflectedComputeTexture::UnstageableShape { axis };
     }
+    if shape.multisampled {
+        return ReflectedComputeTexture::Multisample2d;
+    }
+    ReflectedComputeTexture::Plain2d(if shape.writable {
+        ImageAccess::Storage
+    } else {
+        ImageAccess::Sampled
+    })
 }
 
 /// Validate that the translator's reflection is internally well-formed, once per
@@ -4541,7 +4568,11 @@ mod more_tests {
             (TextureDimension::Cube, true, false, "dim_cube"),
             (TextureDimension::Buffer, false, false, "dim_buffer"),
             (TextureDimension::D2, true, false, "arrayed"),
-            (TextureDimension::D2, false, true, "multisampled"),
+            // Multisampled *and* arrayed: `texture2d_ms_array`. The slice axis
+            // is what refuses it, and it refuses ahead of the sample axis
+            // because the resident that serves a multisample bind below is one
+            // layer.
+            (TextureDimension::D2, true, true, "arrayed"),
         ];
         for (dimension, arrayed, multisampled, axis) in unstageable {
             for writable in [false, true] {
@@ -4569,6 +4600,63 @@ mod more_tests {
                 ReflectedComputeTexture::Plain2d(want)
             );
         }
+    }
+
+    /// A multisampled 2D sampled texture is servable, and it is servable from
+    /// exactly one place.
+    ///
+    /// # The contract
+    ///
+    /// `MTLStoreActionStore` on a multisample colour attachment preserves every
+    /// sample in that texture, and a Metal kernel reads them back by declaring
+    /// `texture2d_ms<T, access::read>` and calling `read(coord, sample)`. The
+    /// translator already emits the multisampled `OpTypeImage` for it — this
+    /// module's own [`sampled_image_kind_from_shape`] has mapped that shape to
+    /// [`SampledImageKind::D2Multisample`] for the render rail all along.
+    ///
+    /// What that image can be built from is not a choice.
+    /// `engine::types::SampledResource::multisampled` states it: "Such an image
+    /// can only come from a retained multisample target; linear bytes cannot be
+    /// uploaded into one with a buffer-to-image copy." So the compute rail's
+    /// staging premise — one flat guest window per binding — does not apply to
+    /// this shape at all, and refusing on it refuses for a reason that is not
+    /// about this texture.
+    ///
+    /// # Why the write class stays refused
+    ///
+    /// A multisampled *storage* image is a different capability
+    /// (`shaderStorageImageMultisample`), and Metal has no writable
+    /// `texture2d_ms` to decode into one. It keeps a named refusal, and a
+    /// distinct axis name, so that admitting the sampled class cannot silently
+    /// admit the write class beside it.
+    #[test]
+    fn a_multisampled_sampled_texture_is_served_from_a_resident_not_refused() {
+        let bind = TEXTURE_BINDING_BASE + 5;
+        let mut r = empty_reflection(ShaderStage::Kernel);
+        let mut s = shape(TextureDimension::D2, false, false);
+        s.multisampled = true;
+        r.bindings.push(texture_binding(bind, s));
+        assert_eq!(
+            reflected_compute_texture(&r, bind),
+            ReflectedComputeTexture::Multisample2d,
+            "a texture2d_ms read binding has a source — the retained multisample \
+             target — and refusing it as unstageable refuses on a premise about \
+             guest bytes it never needed"
+        );
+
+        let mut r = empty_reflection(ShaderStage::Kernel);
+        let mut s = shape(TextureDimension::D2, false, true);
+        s.multisampled = true;
+        r.bindings.push(texture_binding(bind, s));
+        assert_eq!(
+            reflected_compute_texture(&r, bind),
+            ReflectedComputeTexture::UnstageableShape {
+                axis: "multisampled_storage"
+            },
+            "a writable multisampled image is a separate host capability and no \
+             Metal texture type decodes into one; admitting the read class must \
+             not admit it"
+        );
     }
 
     #[test]
@@ -4990,12 +5078,10 @@ mod more_tests {
         assert_eq!(classes[31], Some(BindingClass::StorageTexture));
         assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 1);
         let bindings = declared_binding_numbers(&words);
-        assert!(bindings.contains(&(
-            TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-        )));
-        assert!(bindings.contains(&(
-            M2V_DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start + 3
-        )));
+        assert!(
+            bindings.contains(&(TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET))
+        );
+        assert!(bindings.contains(&(M2V_DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start + 3)));
     }
 
     /// The type rule replaces the band rule, so on the layout the band rule was

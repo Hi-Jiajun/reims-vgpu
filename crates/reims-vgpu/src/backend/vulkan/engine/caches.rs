@@ -165,9 +165,84 @@ pub(crate) struct DepthAttachKey {
     pub stencil: bool,
 }
 
+/// How slot 0 obtains its contents at the start of a pass.
+///
+/// # Why this is not a bool
+///
+/// The guest's load action has three values and this key used to carry one bit,
+/// spelled `load_seed: bool` and resolved as "LOAD when true, CLEAR when
+/// false". Two different requests collapse onto `false`: a pass that asked to
+/// **clear** to the guest's own colour, and a pass that promised to **keep**
+/// its prior contents and arrived with none of them. They are not the same
+/// request and they do not have the same lawful answer.
+///
+/// [`crate::contract::pass_action::LoadAction::preserves_prior_contents`]
+/// states the term: `MTLLoadActionDontCare` declares the prior contents
+/// *undefined*, and undefined permits any contents — including the ones already
+/// there. Clearing is the one reading that destroys them, and the colour it
+/// destroys them with is not a colour the guest ever supplied: `target_clear`
+/// is assigned only on the `Clear` arm, so an unseeded preserving pass cleared
+/// to `[0.0; 4]`, a transparent black this device invented.
+///
+/// Measured cost of the collapse on rail macos-15, boot `s5`: 461 partial draws
+/// and 2 107 399 texels overwritten with that invented colour in one boot, over
+/// live guest content, on a rail where the guest declares DontCare and then
+/// redraws only its damage rectangle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum Color0Load {
+    /// Prior contents are available and the pass begins with them.
+    Preserve,
+    /// The guest asked for a clear, to the value it supplied.
+    Clear,
+    /// The guest's action permits undefined contents and this device found no
+    /// prior contents to offer. Writing none of the attachment is lawful and is
+    /// strictly cheaper than the full-surface clear it replaces; inventing a
+    /// colour is neither.
+    Undefined,
+}
+
+impl Color0Load {
+    /// The Vulkan load op and the layout the attachment must already be in.
+    ///
+    /// `Undefined` declares `UNDEFINED` as its initial layout, the same as a
+    /// clear, and **must**: images are created with
+    /// `initial_layout(vk::ImageLayout::UNDEFINED)`, and this arm is reachable
+    /// on the *first* pass into a fresh attachment — that is exactly what a
+    /// DontCare into a newly allocated plane is. Naming `color0_final` there
+    /// would tell Vulkan the image is in a layout it has never been
+    /// transitioned into. The `Preserve` arm may name it because prior contents
+    /// are what it is preserving, so a previous pass has already left it there.
+    ///
+    /// What that costs: `UNDEFINED` licenses an implementation to discard the
+    /// memory, so this arm removes the invented colour without *promising* the
+    /// prior contents. That promise needs the resident to be loaded from —
+    /// `Preserve` — and electing it when the resident is ready is the repair
+    /// still outstanding; its witness is
+    /// `a_preserving_gva_attachment_reaches_the_encoder_able_to_preserve`.
+    /// Not writing the attachment is strictly better than clearing it either
+    /// way, and it is the cheaper of the two.
+    pub(crate) fn ops(
+        self,
+        color0_final: ash::vk::ImageLayout,
+    ) -> (ash::vk::AttachmentLoadOp, ash::vk::ImageLayout) {
+        match self {
+            Self::Preserve => (ash::vk::AttachmentLoadOp::LOAD, color0_final),
+            Self::Clear => (
+                ash::vk::AttachmentLoadOp::CLEAR,
+                ash::vk::ImageLayout::UNDEFINED,
+            ),
+            Self::Undefined => (
+                ash::vk::AttachmentLoadOp::DONT_CARE,
+                ash::vk::ImageLayout::UNDEFINED,
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PassKey {
-    pub load_seed: bool, // LOAD vs CLEAR (slot 0)
+    /// How slot 0 obtains its contents. See [`Color0Load`].
+    pub color0_load: Color0Load,
     /// Slot 0 aliases memory the host may modify between submissions.
     ///
     /// A linear image is host-accessible only in `PREINITIALIZED` or `GENERAL`.
@@ -218,9 +293,9 @@ pub(crate) struct PassKey {
 
 impl PassKey {
     /// Single-color-attachment pass (the pre-MRT constructor).
-    pub(crate) fn single(load_seed: bool, color0_format: ash::vk::Format) -> Self {
+    pub(crate) fn single(color0_load: Color0Load, color0_format: ash::vk::Format) -> Self {
         Self {
-            load_seed,
+            color0_load,
             host_accessible_color0: false,
             color0_format,
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
@@ -263,7 +338,12 @@ impl PassKey {
     /// image is not in.
     pub(crate) fn compatibility(self) -> PassCompatibilityKey {
         let mut key = self;
-        key.load_seed = false;
+        // Erased to one arbitrary-but-fixed value, exactly as the old bool was
+        // erased to `false`: which load op a pass begins with is not part of
+        // Vulkan's compatibility, so all three must collapse here or two
+        // compatible passes would read as incompatible. This is the one place
+        // the collapse is correct.
+        key.color0_load = Color0Load::Clear;
         for secondary in &mut key.secondary {
             secondary.load = false;
         }
@@ -414,7 +494,7 @@ impl PassCompatibilityKey {
         let PassKey {
             // Load actions are erased by `PassKey::compatibility`, so they are
             // equal here by construction and cannot be a difference.
-            load_seed: _,
+            color0_load: _,
             host_accessible_color0,
             color0_format,
             secondary,
@@ -580,13 +660,19 @@ pub(crate) struct StencilKey {
     pub back: super::types::StencilFaceOps,
 }
 
-/// Lc: compute pipeline cache key — SPIR-V content digest + entry name + layout.
-/// Never funcId / pipeline ref.
+/// Lc: compute pipeline cache key — SPIR-V content digest + entry name + layout
+/// + the workgroup size the module is specialized to. Never funcId / pipeline ref.
+///
+/// The local size belongs in the key because an exact-thread module leaves it
+/// specializable: one translated kernel yields up to eight pipelines whose only
+/// difference is the boundary workgroup size, and they share every other term.
+/// `None` is a module that baked its local size as a constant.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct ComputePipelineKey {
     pub spirv: Digest128,
     pub entry: String,
     pub layout: LayoutKey,
+    pub local_size: Option<[u32; 3]>,
 }
 
 /// A shader module and the words the driver compiles from it.
@@ -1746,11 +1832,7 @@ impl ObjectCaches {
         // second spelling here would make that skip a missing transition the
         // first time somebody changed one of them.
         let color0_final = key.color_final_layout(0);
-        let (load_op, initial) = if key.load_seed {
-            (vk::AttachmentLoadOp::LOAD, color0_final)
-        } else {
-            (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
-        };
+        let (load_op, initial) = key.color0_load.ops(color0_final);
         // Slot 0 (primary) and the secondary attachments (slot 1..) now exit the
         // same way, at [`color0_pass_exit_layout`], and for the same reason: a
         // consumer's barrier is what establishes the dependency, so leaving the
@@ -2572,10 +2654,39 @@ impl ObjectCaches {
                 super::compute_validation::ComputeValidationDecline::EntryInteriorNul,
             )
         })?;
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+        // The translator decorates its three local-size specialization
+        // constants with `KERNEL_LOCAL_SIZE_SPEC_IDS`, so the map entries are
+        // its ids and the data is the three `u32` in that order.
+        let spec_data: Vec<u8> = key
+            .local_size
+            .iter()
+            .flat_map(|size| size.iter().flat_map(|value| value.to_ne_bytes()))
+            .collect();
+        let spec_entries: Vec<vk::SpecializationMapEntry> = key
+            .local_size
+            .iter()
+            .flat_map(|_| {
+                metal2vulkan::reflect::KERNEL_LOCAL_SIZE_SPEC_IDS
+                    .into_iter()
+                    .enumerate()
+                    .map(|(dimension, id)| {
+                        vk::SpecializationMapEntry::default()
+                            .constant_id(id)
+                            .offset((dimension * std::mem::size_of::<u32>()) as u32)
+                            .size(std::mem::size_of::<u32>())
+                    })
+            })
+            .collect();
+        let spec_info = vk::SpecializationInfo::default()
+            .map_entries(&spec_entries)
+            .data(&spec_data);
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader.module)
             .name(&entry_c);
+        if key.local_size.is_some() {
+            stage = stage.specialization_info(&spec_info);
+        }
         let cpci = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(pipeline_layout);
@@ -2610,6 +2721,121 @@ impl ObjectCaches {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
         }
         Ok(pipe)
+    }
+}
+
+#[cfg(test)]
+mod color0_load_tests {
+    use super::*;
+    use crate::contract::pass_action::LoadAction;
+
+    /// A pass that promises its prior contents and arrives with none of them
+    /// must not write the attachment.
+    ///
+    /// This is the external invariant the black rectangle behind a closing dock
+    /// menu violates. The guest declares `MTLLoadActionDontCare`, redraws only
+    /// its damage rectangle, and expects everything it did not cover to still
+    /// be there — which `LoadAction::preserves_prior_contents` says is a lawful
+    /// reading, because undefined permits the prior contents. Resolving that to
+    /// `CLEAR` writes the whole attachment with a colour the guest never
+    /// supplied, so the test is about the *load op*, not about the colour: a
+    /// clear is disqualified whatever value it would have used.
+    #[test]
+    fn a_preserving_pass_with_no_prior_contents_does_not_write_the_attachment() {
+        let resting = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        let (op, initial) = Color0Load::Undefined.ops(resting);
+        assert_ne!(
+            op,
+            vk::AttachmentLoadOp::CLEAR,
+            "an unseeded preserving pass may not invent a colour for the texels \
+             the guest did not draw"
+        );
+        assert_eq!(op, vk::AttachmentLoadOp::DONT_CARE);
+        // `UNDEFINED`, and not the resting layout: this arm runs on the first
+        // pass into a freshly created attachment, which really is in
+        // `UNDEFINED`, so claiming the resting layout would describe a
+        // transition that never happened.
+        assert_eq!(
+            initial,
+            vk::ImageLayout::UNDEFINED,
+            "an attachment that may never have been transitioned may not be \
+             declared to be in the resting layout"
+        );
+    }
+
+    /// The two answers that DO write, and the one that does not, stay apart.
+    #[test]
+    fn each_slot0_load_keeps_its_own_answer() {
+        let resting = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        assert_eq!(
+            Color0Load::Preserve.ops(resting),
+            (vk::AttachmentLoadOp::LOAD, resting)
+        );
+        assert_eq!(
+            Color0Load::Clear.ops(resting),
+            (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
+        );
+        // "writes the whole attachment" is exactly "the load op is CLEAR";
+        // there is no second spelling of it to drift from.
+        for (load, writes) in [
+            (Color0Load::Preserve, false),
+            (Color0Load::Clear, true),
+            (Color0Load::Undefined, false),
+        ] {
+            assert_eq!(
+                load.ops(resting).0 == vk::AttachmentLoadOp::CLEAR,
+                writes,
+                "{load:?} must{} write the whole attachment",
+                if writes { "" } else { " not" }
+            );
+        }
+    }
+
+    /// A pass key partitions on the load, so the three answers cannot share a
+    /// cached render pass.
+    ///
+    /// Without this a clear and an undefined begin would collide in
+    /// `ObjectCaches` and the second one served would begin with the first
+    /// one's load op — which is the same defect this change removes, moved one
+    /// layer down.
+    #[test]
+    fn the_three_slot0_loads_are_three_pass_keys() {
+        let keys = [
+            PassKey::single(Color0Load::Preserve, vk::Format::B8G8R8A8_UNORM),
+            PassKey::single(Color0Load::Clear, vk::Format::B8G8R8A8_UNORM),
+            PassKey::single(Color0Load::Undefined, vk::Format::B8G8R8A8_UNORM),
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for (j, b) in keys.iter().enumerate() {
+                assert_eq!(i == j, a == b, "slot-0 load must partition the pass cache");
+            }
+        }
+    }
+
+    /// Every declared action this device can receive lands on an answer that
+    /// does not invent a colour, unless the guest asked for one.
+    ///
+    /// Swept over the ordinal space rather than the three names, for the reason
+    /// `every_preserving_load_action_with_no_prior_contents_shares_one_bucket`
+    /// gives: a fourth ordinal arriving from the wire must not be able to
+    /// acquire the clearing reading by falling through a catch-all.
+    #[test]
+    fn only_a_declared_clear_may_invent_a_colour() {
+        for raw in (0u16..=8).chain([u16::MAX]) {
+            let declared = LoadAction::from_declared(raw);
+            let unseeded = if declared.preserves_prior_contents() {
+                Color0Load::Undefined
+            } else {
+                Color0Load::Clear
+            };
+            assert_eq!(
+                unseeded.ops(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL).0
+                    == vk::AttachmentLoadOp::CLEAR,
+                !declared.preserves_prior_contents(),
+                "ordinal {raw} declared {declared:?}: only a clear may write the \
+                 whole attachment when no prior contents were found"
+            );
+        }
     }
 }
 
@@ -2693,7 +2919,7 @@ mod object_cache_tests {
     /// attachment formats and subpass shape.
     #[test]
     fn pass_compatibility_ignores_only_load_actions() {
-        let mut clear = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let mut clear = PassKey::single(Color0Load::Clear, vk::Format::B8G8R8A8_UNORM);
         clear.secondary_count = 1;
         clear.secondary[0] = SecondaryAttachKey {
             format: vk::Format::R16G16_SFLOAT,
@@ -2705,7 +2931,7 @@ mod object_cache_tests {
         });
 
         let mut load = clear;
-        load.load_seed = true;
+        load.color0_load = Color0Load::Preserve;
         load.secondary[0].load = true;
         load.depth.as_mut().unwrap().load = true;
         assert_eq!(clear.compatibility(), load.compatibility());
@@ -2735,7 +2961,7 @@ mod object_cache_tests {
     /// per field, and it is made in both directions.
     #[test]
     fn every_compatibility_difference_is_named_and_equal_keys_name_none() {
-        let mut base = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let mut base = PassKey::single(Color0Load::Clear, vk::Format::B8G8R8A8_UNORM);
         base.secondary_count = 1;
         base.secondary[0] = SecondaryAttachKey {
             format: vk::Format::R16G16_SFLOAT,
@@ -2761,7 +2987,7 @@ mod object_cache_tests {
             (
                 "load actions",
                 |k| {
-                    k.load_seed = true;
+                    k.color0_load = Color0Load::Preserve;
                     k.secondary[0].load = true;
                     k.depth.as_mut().unwrap().load = true;
                 },
@@ -2839,9 +3065,9 @@ mod object_cache_tests {
     /// must not.
     #[test]
     fn framebuffer_compatibility_ignores_transport_and_dependency_state() {
-        let plain = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let plain = PassKey::single(Color0Load::Clear, vk::Format::B8G8R8A8_UNORM);
         let mut transported = plain;
-        transported.load_seed = true;
+        transported.color0_load = Color0Load::Preserve;
         transported.host_accessible_color0 = true;
         transported.feedback_colors = 1;
 
@@ -3488,7 +3714,7 @@ mod object_cache_tests {
 
     #[test]
     fn a_host_accessible_primary_stays_general_between_every_pass_shape() {
-        let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let mut key = PassKey::single(Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
         key.host_accessible_color0 = true;
         for color_input in [false, true] {
             for feedback in [false, true] {
@@ -3523,7 +3749,7 @@ mod object_cache_tests {
     /// which is undefined behaviour reported nowhere.
     #[test]
     fn feedback_attachment_layout_is_derived_consistently_from_the_mask() {
-        let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let mut key = PassKey::single(Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
         key.color_input = true;
         key.feedback_colors = (1 << 0) | (1 << 3);
 
@@ -3578,7 +3804,7 @@ mod object_cache_tests {
     /// `VUID-VkRenderPassBeginInfo-renderPass-00904` on a driven Maps boot.
     #[test]
     fn the_dependency_count_does_not_move_with_anything_the_framebuffer_key_erases() {
-        let base = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let base = PassKey::single(Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
         for feedback in [0u8, 1, (1 << 0) | (1 << 3)] {
             for host_accessible in [false, true] {
                 let mut key = base;
@@ -3628,7 +3854,7 @@ mod object_cache_tests {
     /// sampled read of an attachment it is writing with no feedback loop enabled.
     #[test]
     fn feedback_leaves_pass_compatibility_without_leaving_the_pipeline() {
-        let plain = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let plain = PassKey::single(Color0Load::Preserve, vk::Format::R8G8B8A8_UNORM);
         let mut feeds = plain;
         feeds.feedback_colors = 1;
 
@@ -3685,7 +3911,7 @@ mod object_cache_tests {
     /// `COLOR_ATTACHMENT_OPTIMAL` beside a feedback arm that derived.
     #[test]
     fn an_ordinary_colour_slot_enters_and_leaves_a_pass_at_one_layout() {
-        let key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
+        let key = PassKey::single(Color0Load::Preserve, vk::Format::B8G8R8A8_UNORM);
         for index in 0..=MAX_SECONDARY_ATTACH {
             assert_eq!(
                 key.color_layout(index),

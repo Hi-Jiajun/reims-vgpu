@@ -1660,6 +1660,67 @@ fn object_type_is_resource(object_type: u8) -> bool {
         .is_some_and(|bit| RESOURCE_CONSTRUCTOR_TYPE_MASK & (1u16 << bit) != 0)
 }
 
+/// Whether a cached resolution still describes the entry the guest's own object
+/// list holds for that reference.
+///
+/// The cache is keyed by `(task, ref)` and dropped on a new page-table root, a
+/// new object list, a deleted object, a deleted task, and a replaced physical
+/// page. The guest writes the list itself, in its own memory: none of those
+/// events accompanies a slot being *overwritten in place*, and a compositor
+/// recycles slots. A stale hit binds the bytes of whatever object used to live
+/// at that reference, which is a wrong texture rather than a missing one -- and
+/// on this rail one reference resolves to a small texture early in a boot and to
+/// a 3840x2160 video plane later.
+///
+/// Read-only, and it decides nothing: it reads the list entry the guest holds
+/// now and reports a disagreement. First sight per `(task, ref, kind of
+/// disagreement)`, so a steady bind is silent and a recycled slot names itself
+/// once.
+fn note_stale_task_resource<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+    cached: &TaskResource,
+) {
+    let Some(entry) = lookup_list_entry(state, host, task_id, obj_ref) else {
+        return;
+    };
+    // The entry is half the snapshot. The other half is the descriptor bytes it
+    // points at, and a serializer that rewrites a descriptor in place leaves the
+    // entry byte-identical -- same type, same length, same address -- while the
+    // object it describes becomes a different surface, plane or extent. A
+    // witness that compared only the entry would call that agreement.
+    let live_descriptor = read_descriptor(state, host, task_id, &entry);
+    let descriptor_moved = live_descriptor
+        .as_ref()
+        .is_some_and(|bytes| bytes.as_slice() != &*cached.descriptor);
+    if entry == cached.entry && !descriptor_moved {
+        return;
+    }
+    let disc = crate::backend::hash::hash_u64(
+        u64::from(task_id) << 32 | u64::from(obj_ref),
+        entry.descriptor_gva
+            ^ (u64::from(entry.object_type) << 56)
+            ^ (u64::from(descriptor_moved) << 63),
+    );
+    if !crate::observe::first_sight("task_resource_stale", disc) {
+        return;
+    }
+    crate::observe::fail(format!(
+        "task_resource_stale task={task_id} ref={obj_ref} \
+         cached=[type={} len={} gva={:#x}] list=[type={} len={} gva={:#x}] \
+         desc_moved={descriptor_moved} \
+         (the guest overwrote the slot and the cached resolution outlived it)",
+        cached.entry.object_type,
+        cached.entry.descriptor_length,
+        cached.entry.descriptor_gva,
+        entry.object_type,
+        entry.descriptor_length,
+        entry.descriptor_gva,
+    ));
+}
+
 /// Retrieve or construct the resource named by `task_id` / `obj_ref`.
 ///
 /// A successful construction snapshots the object-list entry and descriptor
@@ -1674,6 +1735,7 @@ pub fn resolve_resource<M: HostMemory>(
     obj_ref: u32,
 ) -> Result<Arc<TaskResource>, LadderRung> {
     if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
+        note_stale_task_resource(state, host, task_id, obj_ref, &resource);
         return Ok(resource);
     }
 

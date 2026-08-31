@@ -181,10 +181,136 @@ pub fn tight_image_layout(width: u32, height: u32, bytes_per_pixel: u32) -> Opti
     Some((width.checked_mul(bytes_per_pixel)?, total))
 }
 
+/// One level of a tightly-packed mip pyramid: where it starts, how long it is,
+/// and the extent it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MipLevelSpan {
+    pub level: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Byte offset of this level from the start of the packed pyramid.
+    pub offset: usize,
+    /// [`tight_image_bytes`] of this level's extent.
+    pub len: usize,
+}
+
+/// Every level of a tightly-packed mip pyramid, base first.
+///
+/// A pyramid staged for a host image is *two* facts that must agree: the byte
+/// range each level occupies in one upload allocation, and the extent the copy
+/// into that level names. Deriving them at the two ends of that journey is how
+/// they come apart — the producer packs level 3 at one offset and the consumer
+/// copies from another, and the result is a level holding a neighbour's texels,
+/// which reads exactly like a texture whose upper levels were never written.
+/// So both ends call this and neither computes an offset of its own.
+///
+/// Extents are [`mip_extent`], which is Metal's own rule, so a chain built here
+/// matches the one a guest descriptor declares level for level. `None` for a
+/// zero extent, a zero pixel size, no levels, or any overflow — the same
+/// contract [`tight_image_bytes`] states, and for its reason.
+pub fn tight_pyramid_spans(
+    width: u32,
+    height: u32,
+    levels: u32,
+    bytes_per_pixel: usize,
+) -> Option<Vec<MipLevelSpan>> {
+    if levels == 0 {
+        return None;
+    }
+    let mut spans = Vec::with_capacity(levels as usize);
+    let mut offset: usize = 0;
+    for level in 0..levels {
+        let w = mip_extent(width, level);
+        let h = mip_extent(height, level);
+        let len = tight_image_bytes(w, h, bytes_per_pixel)?;
+        spans.push(MipLevelSpan {
+            level,
+            width: w,
+            height: h,
+            offset,
+            len,
+        });
+        offset = offset.checked_add(len)?;
+    }
+    Some(spans)
+}
+
+/// Total bytes of [`tight_pyramid_spans`], without building the level list.
+pub fn tight_pyramid_bytes(
+    width: u32,
+    height: u32,
+    levels: u32,
+    bytes_per_pixel: usize,
+) -> Option<usize> {
+    let spans = tight_pyramid_spans(width, height, levels, bytes_per_pixel)?;
+    let last = spans.last()?;
+    last.offset.checked_add(last.len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::contract::pixel_format::{R8_BPP, RG8_BPP, RGBA8_BPP};
+
+    /// The pyramid's byte layout and its level extents come from one call, so a
+    /// producer and a consumer of the same staged upload cannot disagree about
+    /// where level `n` begins.
+    #[test]
+    fn a_packed_pyramid_places_each_level_after_the_one_above_it() {
+        let spans = tight_pyramid_spans(64, 64, 7, RGBA8_BPP as usize).expect("7 levels of 64x64");
+        let dims: Vec<(u32, u32)> = spans.iter().map(|s| (s.width, s.height)).collect();
+        assert_eq!(
+            dims,
+            vec![(64, 64), (32, 32), (16, 16), (8, 8), (4, 4), (2, 2), (1, 1)]
+        );
+        let mut want_offset = 0usize;
+        for span in &spans {
+            assert_eq!(span.offset, want_offset, "level {} offset", span.level);
+            assert_eq!(
+                span.len,
+                span.width as usize * span.height as usize * RGBA8_BPP as usize
+            );
+            want_offset += span.len;
+        }
+        assert_eq!(
+            tight_pyramid_bytes(64, 64, 7, RGBA8_BPP as usize),
+            Some(want_offset)
+        );
+    }
+
+    /// A one-level pyramid is exactly the single image it describes, so the
+    /// packed form is not a second layout for the overwhelmingly common case.
+    #[test]
+    fn a_single_level_pyramid_is_one_tight_image() {
+        assert_eq!(
+            tight_pyramid_bytes(37, 11, 1, RG8_BPP as usize),
+            tight_image_bytes(37, 11, RG8_BPP as usize)
+        );
+    }
+
+    /// A non-power-of-two chain floors and stops at 1 on each axis
+    /// independently — the rule `mip_extent` states, carried into the layout.
+    #[test]
+    fn a_non_square_chain_bottoms_out_on_each_axis_separately() {
+        let spans = tight_pyramid_spans(5, 1, 4, R8_BPP as usize).expect("4 levels");
+        assert_eq!(
+            spans
+                .iter()
+                .map(|s| (s.width, s.height))
+                .collect::<Vec<_>>(),
+            vec![(5, 1), (2, 1), (1, 1), (1, 1)]
+        );
+    }
+
+    /// Zero levels is not an empty pyramid; it is a geometry no caller can act
+    /// on, and a zero length would pass every "does the guest's buffer hold
+    /// this" check there is.
+    #[test]
+    fn a_pyramid_of_no_levels_has_no_layout() {
+        assert_eq!(tight_pyramid_spans(8, 8, 0, RGBA8_BPP as usize), None);
+        assert_eq!(tight_pyramid_bytes(8, 8, 0, RGBA8_BPP as usize), None);
+        assert_eq!(tight_pyramid_spans(0, 8, 3, RGBA8_BPP as usize), None);
+    }
 
     /// The length a texel copy is allowed to read is exactly `stride * height`,
     /// and both come from one call, so no caller can pair one format's stride

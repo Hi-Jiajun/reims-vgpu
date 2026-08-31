@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 use super::caches::{
-    canonicalize_layout_bindings, AttrKey, BindingSig, LayoutKey, ObjectCaches, PassKey,
-    PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
+    canonicalize_layout_bindings, AttrKey, BindingSig, Color0Load, LayoutKey, ObjectCaches,
+    PassKey, PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
 };
 use super::context::ContextOwner;
 use super::counters::{CreateSite, EngineCounters};
@@ -631,9 +631,9 @@ pub(crate) fn descriptor_range(len: u64) -> u64 {
     }
 }
 
-/// The first binding either of a draw's modules statically uses that the
-/// descriptor set layout this draw would build does not describe, and which
-/// module named it.
+/// The first binding either of a draw's retained shader variants statically
+/// uses that the descriptor set layout this draw would build does not describe,
+/// and which module named it.
 ///
 /// The draw-path twin of `exec_compute::used_binding_absent_from_layout`, and it
 /// exists for the reason that one does: a used binding the layout omits is not
@@ -647,29 +647,25 @@ pub(crate) fn descriptor_range(len: u64) -> u64 {
 /// set for the pipeline with `VERTEX | FRAGMENT` stage flags — so a binding is
 /// absent for both stages or for neither, and only the attribution differs.
 ///
-/// Conservative by construction, and deliberately so:
-/// [`crate::runtime::spirv_bind::descriptor_static_use`] answers `NotDeclared`
-/// for anything that is not a `UniformConstant`, so a storage buffer is never
-/// refused on a guess about a root this walk cannot resolve. That is the same
-/// narrowing the compute twin documents, and it is what keeps this a backstop
-/// rather than a second opinion about every draw.
+/// The retained sets were derived from the executable SPIR-V variants, not from
+/// reflection. They include only unambiguous, statically used
+/// `UniformConstant` roots, so a storage buffer is never refused on a guess
+/// about a root the walk cannot resolve. That is the same narrowing the compute
+/// twin documents, and it keeps this a backstop rather than a second opinion
+/// about every draw.
 fn used_binding_absent_from_layout(
-    vert_spirv: &[u32],
-    frag_spirv: &[u32],
+    vert_used: &[u32],
+    frag_used: &[u32],
     layout: &[BindingSig],
 ) -> Option<(u32, bool)> {
-    let absent = |spirv: &[u32]| -> Option<u32> {
-        crate::runtime::spirv_bind::declared_binding_numbers(spirv)
-            .into_iter()
-            .find(|binding| {
-                !layout.iter().any(|b| b.binding == *binding)
-                    && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding)
-                        .is_violation()
-            })
+    let absent = |used: &[u32]| -> Option<u32> {
+        used.iter()
+            .copied()
+            .find(|binding| !layout.iter().any(|b| b.binding == *binding))
     };
-    absent(frag_spirv)
+    absent(frag_used)
         .map(|binding| (binding, true))
-        .or_else(|| absent(vert_spirv).map(|binding| (binding, false)))
+        .or_else(|| absent(vert_used).map(|binding| (binding, false)))
 }
 
 #[derive(Clone, Copy)]
@@ -2949,9 +2945,11 @@ pub(crate) unsafe fn execute_draw_inner(
     // did not. Both of a draw's modules are checked, because either can name a
     // binding the layout above omits and the divide-by-zero is in the driver's
     // shared layout scoring rather than in anything stage-specific.
-    if let Some((binding, fragment)) =
-        used_binding_absent_from_layout(&req.vert_spirv, &req.frag_spirv, &layout_bindings)
-    {
+    if let Some((binding, fragment)) = used_binding_absent_from_layout(
+        &req.vert_used_descriptor_bindings,
+        &req.frag_used_descriptor_bindings,
+        &layout_bindings,
+    ) {
         return Err(DrawError::Unsupported(
             super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
         ));
@@ -2979,13 +2977,26 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         req.target_rgba8.as_ref().map(|v| v.as_slice())
     };
-    let mut pass_key = PassKey::single(
-        load_uses_gpu_content
-            || seed_bytes.is_some()
-            || req.target_guest_seed.is_some()
-            || req.seed_from_target.is_some(),
-        color0_format,
-    );
+    // Three questions, not one: can this device offer prior contents, and if
+    // not, did the guest ask for a clear or merely permit undefined contents?
+    // The second question used to have no representation here, so both answers
+    // resolved to `CLEAR` and an unseeded preserving pass was cleared to a
+    // colour the guest never supplied. See [`Color0Load`].
+    let color0_load = if load_uses_gpu_content
+        || seed_bytes.is_some()
+        || req.target_guest_seed.is_some()
+        || req.seed_from_target.is_some()
+    {
+        Color0Load::Preserve
+    } else if req
+        .color0_declared
+        .is_some_and(|declared| declared.preserves_prior_contents())
+    {
+        Color0Load::Undefined
+    } else {
+        Color0Load::Clear
+    };
+    let mut pass_key = PassKey::single(color0_load, color0_format);
     pass_key.host_accessible_color0 = req.guest_target_memory.is_some();
     for (i, sec) in req.secondary_targets.iter().enumerate() {
         if i >= MAX_SECONDARY_ATTACH {
@@ -3485,7 +3496,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
-        let mut color_only = PassKey::single(pass_key.load_seed, pass_key.color0_format);
+        let mut color_only = PassKey::single(pass_key.color0_load, pass_key.color0_format);
         color_only.host_accessible_color0 = pass_key.host_accessible_color0;
         (
             caches.get_or_create_pass(ctx, color_only, counters, pools)?,
@@ -5055,10 +5066,17 @@ pub(crate) unsafe fn execute_draw_inner(
         // outside-pass command closes whatever the predecessor left open.
         unsafe { pools.close_open_pass(&ctx.device, cb) };
         crate::runtime::drain::note_store_route(pass_begin_area_band(req.width, req.height));
-        crate::runtime::drain::note_store_route(if pass_key.load_seed {
-            "passbegin_load"
-        } else {
-            "passbegin_clear"
+        // Three buckets, because the key now has three answers. Folding
+        // `Undefined` into either existing counter would move counts between
+        // two populations that were already being read, and the whole point of
+        // the repair is that those passes used to be counted as clears and
+        // written as clears. `passbegin_undefined` rising while
+        // `passbegin_clear` falls by the same amount is the repair's own
+        // witness in the always-on log.
+        crate::runtime::drain::note_store_route(match pass_key.color0_load {
+            Color0Load::Preserve => "passbegin_load",
+            Color0Load::Clear => "passbegin_clear",
+            Color0Load::Undefined => "passbegin_undefined",
         });
         // Whether this pass's colour0 names guest backing at all, which is the
         // denominator every reading of `REIMS_VGPU_SHARED_TARGET` needs:
@@ -5820,7 +5838,7 @@ pub(crate) unsafe fn execute_draw_inner(
         VkOp::ExecMapReadback,
         VkOp::ExecInvalidateReadback,
     )?;
-    counters.note_readback(rb_size);
+    counters.note_readback(rb_size, super::counters::ReadbackSource::DrawTail);
 
     // Read at the attachment's width above, narrowed here to the RGBA8 a
     // `DrawOutput` consumer speaks. Shared with `read_target`'s rail so the two
@@ -6282,49 +6300,30 @@ mod tests {
     /// two arms consume the same wire form.
     #[test]
     fn a_used_binding_the_layout_omits_is_refused_before_the_pipeline_is_built() {
-        use crate::runtime::spirv_bind::test_support::module_with_descriptor;
-        let empty: Vec<u32> = Vec::new();
+        let empty: [u32; 0] = [];
 
-        let frag_uses_33 = module_with_descriptor(33, true);
         assert_eq!(
-            used_binding_absent_from_layout(&empty, &frag_uses_33, &[sig(32)]),
+            used_binding_absent_from_layout(&empty, &[33], &[sig(32)]),
             Some((33, true)),
             "binding 33 is used by the fragment module and the layout names only 32, \
              which is exactly the hole Mesa divides by"
         );
 
-        let vert_uses_33 = module_with_descriptor(33, true);
         assert_eq!(
-            used_binding_absent_from_layout(&vert_uses_33, &empty, &[sig(32)]),
+            used_binding_absent_from_layout(&[33], &empty, &[sig(32)]),
             Some((33, false)),
             "the vertex module can name the hole just as well, and the layout is shared"
         );
     }
 
-    /// The two populations that must NOT be refused, because refusing either
-    /// costs the guest a draw it was entitled to.
-    ///
-    /// A declared-but-never-referenced variable is legal to omit from the
-    /// layout, and a binding the layout provides is not a hole however the
-    /// module uses it. Getting the first wrong would refuse a large share of
-    /// every real draw — the census that separated `Used` from `DeclaredUnused`
-    /// exists precisely because the two look identical to a declaration scan.
+    /// A binding the layout provides is not a hole however the module uses it.
+    /// Declared-but-unused variables are excluded while constructing the
+    /// retained set and are covered at that ownership boundary.
     #[test]
-    fn a_declared_but_unused_binding_and_a_provided_one_are_both_left_alone() {
-        let empty: Vec<u32> = Vec::new();
-        use crate::runtime::spirv_bind::test_support::module_with_descriptor;
-
-        let declared_unused = module_with_descriptor(33, false);
+    fn a_provided_binding_and_empty_used_sets_are_both_left_alone() {
+        let empty: [u32; 0] = [];
         assert_eq!(
-            used_binding_absent_from_layout(&empty, &declared_unused, &[sig(32)]),
-            None,
-            "SPIR-V 1.4 puts every global in OpEntryPoint's interface list, so a \
-             declaration is not a use and omitting it from the layout is legal"
-        );
-
-        let used = module_with_descriptor(33, true);
-        assert_eq!(
-            used_binding_absent_from_layout(&empty, &used, &[sig(32), sig(33)]),
+            used_binding_absent_from_layout(&empty, &[33], &[sig(32), sig(33)]),
             None,
             "the layout names 33, so there is no hole"
         );
@@ -7368,7 +7367,7 @@ mod tests {
     /// The primary's entry was a hard-coded transparent black, so the only way
     /// to honour a colour was to allocate a whole-attachment RGBA8 image of it,
     /// exchange its channels and stage it to the GPU — per draw, for a constant.
-    /// That also set `target_rgba8`, which is what `load_seed` means, so the
+    /// That also set `target_rgba8`, which is what a preserving `color0_load` means, so the
     /// pass resolved to LOAD and a draw asking to discard its attachment loaded
     /// it instead.
     ///

@@ -4,8 +4,10 @@
 #   run-guest.sh <outdir>
 #
 # The same source the oracle runs, on the paravirtual device. `run-native.sh`
-# builds the x86_64 artifact that this runner sends to the fixed rail. The same
-# source and build identity therefore feed both oracle and guest results.
+# builds the x86_64 artifact that this runner sends to the rail. The same source
+# and build identity therefore feed both oracle and guest results.
+#
+# `RAIL` selects the guest rail and defaults to macos-13.
 #
 # Environment passes through, so an arm is `REIMS_VGPU_X=y run-guest.sh ...`.
 set -uo pipefail
@@ -13,11 +15,19 @@ export LC_ALL=C
 OUT="${1:?usage: run-guest.sh <outdir>}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-if [ "${RAIL:-macos-15}" != "macos-15" ]; then
-  echo "conformance: this suite is pinned to rail macos-15" >&2
+# A guest rail is a guest driver, so the failures a rail owns are that rail's
+# alone. Each rail therefore carries its own debt inventory, and a rail with no
+# inventory is refused rather than silently scored against another rail's debt.
+RAIL="${RAIL:-macos-13}"
+EXPECT="$HERE/expectations/$RAIL"
+if [ ! -d "$REPO/vm/disks/rails/$RAIL" ]; then
+  echo "conformance: no such rail: $RAIL (see vm/boot-x86.sh --list-rails)" >&2
   exit 2
 fi
-RAIL="macos-15"
+if [ ! -r "$EXPECT/driver-errors.txt" ] || [ ! -r "$EXPECT/translation-errors.txt" ]; then
+  echo "conformance: rail $RAIL has no expectation inventory at $EXPECT" >&2
+  exit 2
+fi
 RUN_KIND="${RUN_KIND:-candidate}"
 case "$RUN_KIND" in baseline|candidate) ;; *)
   echo "conformance: RUN_KIND must be baseline or candidate" >&2; exit 2 ;;
@@ -78,8 +88,8 @@ MANIFEST="$OUT/manifest.txt"
   echo "harness_status_end"
   echo "suite_inputs_begin"
   find "$HERE/suite" -type f -print0 | sort -z | xargs -0 sha256sum
-  sha256sum "$HERE/verdict.py" "$HERE/expectations/translation-errors.txt" \
-    "$HERE/expectations/driver-errors.txt"
+  sha256sum "$HERE/verdict.py" "$EXPECT/translation-errors.txt" \
+    "$EXPECT/driver-errors.txt"
   [ ! -x "$BIN" ] || sha256sum "$BIN"
   echo "suite_inputs_end"
   echo "qemu_source_repo=$QEMU_SOURCE_REPO"
@@ -149,9 +159,9 @@ for _ in $(seq 1 60); do
   sleep 5
 done
 
-# Run the exact x86_64 artifact produced beside the oracle result. The fixed
-# macOS-15 rail has no developer tools, and probing its `swiftc` shim opens the
-# installer rather than proving a compiler exists.
+# Run the exact x86_64 artifact produced beside the oracle result. A rail guest
+# has no developer tools, and probing its `swiftc` shim opens the installer
+# rather than proving a compiler exists.
 timeout 60 scp -o BatchMode=yes -q "$BIN" macos-vm:/tmp/conformance || {
   echo "could not copy the battery into the guest"; exit 1; }
 ssh -o BatchMode=yes macos-vm 'shasum -a 256 /tmp/conformance' \
@@ -195,8 +205,8 @@ env | grep -q '^REIMS_VGPU_' && ADVISORY=(--claims-advisory)
 
 echo "--- verdict ---"
 python3 "$HERE/verdict.py" --native "$NATIVE" --guest "$OUT/conformance.txt" \
-  --translation-errors "$HERE/expectations/translation-errors.txt" \
-  --driver-errors "$HERE/expectations/driver-errors.txt" --device "$OUT/device.log" \
+  --translation-errors "$EXPECT/translation-errors.txt" \
+  --driver-errors "$EXPECT/driver-errors.txt" --device "$OUT/device.log" \
   "${ADVISORY[@]}" --quiet | tee "$OUT/verdict.txt"
 vrc="${PIPESTATUS[0]}"
 pkill -f 'qemu-system-x86_6[4].*reims-vgpu' 2>/dev/null

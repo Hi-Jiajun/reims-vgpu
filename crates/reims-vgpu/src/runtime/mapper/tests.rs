@@ -1250,7 +1250,10 @@ fn vulkan_alias_unmaps_only_after_terminal_destruction_is_published() {
     assert_eq!(super::drain_deferred_unmaps(&mut host), 1);
     assert_eq!(host.unmap_pages_calls, 1);
     assert_eq!(super::drain_deferred_unmaps(&mut host), 0);
-    assert_eq!(host.unmap_pages_calls, 1, "an alias is returned exactly once");
+    assert_eq!(
+        host.unmap_pages_calls, 1,
+        "an alias is returned exactly once"
+    );
 }
 
 #[test]

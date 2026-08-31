@@ -633,6 +633,11 @@ pub(crate) struct ResourcePools {
     /// Cannot strand a pin: every entry that can submit passes through
     /// `seal_entry`, and every sealed cleanup belongs to one retiring slot.
     guest_write_pins_live: Vec<TargetIdentity>,
+    /// The compute-storage half of `guest_write_pins_live`, keyed in the other
+    /// registry. Separate because the release has to reach the registry that
+    /// holds the image; identical in discipline, and it travels to the same ring
+    /// slot in the same `seal_entry`.
+    compute_write_pins_live: Vec<crate::model::ComputeStorageResidencyKey>,
     initialized: bool,
 }
 
@@ -1195,6 +1200,8 @@ pub(crate) struct PendingGpuCleanup {
     /// Resident pins held by guest-page copies in this submission. The slot's
     /// fence is their lifetime boundary.
     unpin_residents: Vec<TargetIdentity>,
+    /// The same, in the compute-storage registry.
+    unpin_compute_residents: Vec<crate::model::ComputeStorageResidencyKey>,
 }
 
 /// What one sealed entry hands back: the cleanup its ring slot owes once the
@@ -1481,6 +1488,14 @@ pub(crate) struct StorageImageKey {
     pub format: StorageImageFormat,
     /// Read-only sampled descriptor instead of writable storage descriptor.
     pub sampled_only: bool,
+    /// Levels the image holds, `1` for everything but a sampled guest mip
+    /// chain.
+    ///
+    /// Part of the key, not a property set after the fact: a pooled image is
+    /// recycled by key, so a one-level free slot handed to a seven-level
+    /// request would answer `read(coord, 3)` with nothing at all — which is
+    /// indistinguishable from a texture whose upper levels were never written.
+    pub mip_levels: u32,
 }
 
 #[derive(Clone, Copy)]

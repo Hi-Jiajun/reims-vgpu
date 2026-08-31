@@ -111,10 +111,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         return (EncodeStatus::BadArgs("draw_vk_no_color_target"), None);
     };
 
-    // The engine draw's own refusal slug, kept so the skipped-draw tail can name
-    // why its draws were skipped instead of guessing. `None` means the engine
-    // draw was never attempted — this record carried no pipeline or no vertices.
-    let mut engine_refusal: Option<&'static str> = None;
+    // What the engine draw did, kept so the skipped-draw tail can name why its
+    // draws were skipped instead of guessing.
+    let mut engine_outcome = EngineDrawOutcome::NotAttempted;
     // This device used to write the whole clear frame into the guest's own pages
     // here, ahead of any GPU work, and hand the clear on as the next record's
     // seed. Nothing in the contract asks for the write: the guest states its
@@ -179,8 +178,18 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // `surface_store_armed`, and it returns through the same door.
     let mut gva_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
+        crate::runtime::draw::record_plane_draw(req);
         req.chain_resident_established = false;
-        match try_metal2vulkan_draw(state, host, req, writeback_guest) {
+        let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
+        // Set from the result itself rather than inside the arms, because the
+        // arms are where this went wrong: the refusal slug was assigned only in
+        // `Err`, every `Ok` arm left it `None`, and the tail spelled `None`
+        // "engine_draw_not_attempted". A draw that the engine *made* and whose
+        // Store then lost therefore reported an engine refusal that never
+        // happened. Deriving the outcome from the one value that knows makes
+        // that class of drift unrepresentable.
+        engine_outcome = EngineDrawOutcome::of(&engine);
+        match engine {
             Ok(M2vDrawSpan::Pixels { bytes, bgra }) => {
                 draw_rgba = Some(bytes);
                 draw_bgra = bgra;
@@ -311,7 +320,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // makes the skipped-draw line unreadable on its own: this fires
                 // once per (reason, pipeline) and the tail fires once per
                 // packet, so a hundred skipped draws sit behind one decline.
-                engine_refusal = Some(crate::observe::Decline::slug(&e));
                 linux_m2v_draw_failure(&e, req).fail_once(req.pipeline_ref as u64);
             }
         }
@@ -381,9 +389,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // takes ownership of that buffer, and a closure capturing it by
             // reference would pin it in place — which is the whole cost this
             // rail is removing.
-            fn rgb_stats(rgba: &[u8]) -> (usize, u8) {
-                let (nz, max, _) = crate::observe::rgba_rgb_stats(rgba);
-                (nz, max)
+            fn rgb_stats(rgba: &[u8]) -> (usize, u8, u8) {
+                let s = crate::observe::rgba_rgb_stats(rgba);
+                (s.rgb_nz, s.max_rgb, s.mean_rgb)
             }
             let ok = if c0.mapping_id != 0 {
                 // Unconditional. This used to be `if
@@ -464,27 +472,29 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         if crate::observe::draw_log_enabled() {
                             // Order-independent: both fields reduce over the three
                             // colour channels, so an R/B exchange cannot move them.
-                            let (rgb_nz, max_rgb) = rgb_stats(&bgra);
+                            let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&bgra);
                             crate::observe::line(format!(
-                                "linux_m2v_store mid={} {}x{} pipe={} import=0 reason=cpu_portability pages=1 rgb_nz={} max={}",
+                                "linux_m2v_store mid={} {}x{} pipe={} import=0 reason=cpu_portability pages=1 rgb_nz={} max={} mean_rgb={}",
                                 c0.mapping_id,
                                 c0.width,
                                 c0.height,
                                 req.pipeline_ref,
                                 rgb_nz,
-                                max_rgb
+                                max_rgb,
+                                mean_rgb
                             ));
                         }
                     } else {
-                        let (rgb_nz, max_rgb) = rgb_stats(&bgra);
+                        let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&bgra);
                         crate::observe::fail(format!(
-                            "linux_m2v_store mid={} {}x{} pipe={} reason=cpu_portability_write_fail rgb_nz={} max={} fmt={:#x}",
+                            "linux_m2v_store mid={} {}x{} pipe={} reason=cpu_portability_write_fail rgb_nz={} max={} mean_rgb={} fmt={:#x}",
                             c0.mapping_id,
                             c0.width,
                             c0.height,
                             req.pipeline_ref,
                             rgb_nz,
                             max_rgb,
+                            mean_rgb,
                             c0.format
                         ));
                     }
@@ -582,14 +592,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         true,
                     );
                 }
-                let (rgb_nz, max_rgb) = rgb_stats(&rgba);
+                let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&rgba);
                 // A Store that lands is expected control flow and belongs on
                 // the census channel, not the failure one — "non-OFF lines are
                 // the failures" is the rule the whole always-on log is triaged
                 // by. Only the loss gets a failure line, and it carries the
                 // census fields so nothing has to be correlated across two.
                 crate::observe::off(format!(
-                    "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} bpr={}",
+                    "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} mean_rgb={} bpr={}",
                     c0.target_gva,
                     c0.width,
                     c0.height,
@@ -599,11 +609,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     gva_ok as u8,
                     rgb_nz,
                     max_rgb,
+                    mean_rgb,
                     c0.row_stride
                 ));
                 if !gva_ok {
                     crate::observe::fail(format!(
-                        "linux_m2v_store lost gva={:#x} {}x{} pipe={} tex_ref={} rgb_nz={} max={} bpr={}",
+                        "linux_m2v_store lost gva={:#x} {}x{} pipe={} tex_ref={} rgb_nz={} max={} mean_rgb={} bpr={}",
                         c0.target_gva,
                         c0.width,
                         c0.height,
@@ -611,6 +622,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         c0.texture_ref,
                         rgb_nz,
                         max_rgb,
+                        mean_rgb,
                         c0.row_stride
                     ));
                 }
@@ -618,10 +630,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             } else {
                 // No target to write: the frame is lost, so this one is a
                 // failure line and there is no census twin to correlate with.
-                let (rgb_nz, max_rgb) = rgb_stats(&rgba);
+                let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&rgba);
                 crate::observe::fail(format!(
-                    "linux_m2v_store no_target pipe={} tex_ref={} rgb_nz={} max={}",
-                    req.pipeline_ref, c0.texture_ref, rgb_nz, max_rgb
+                    "linux_m2v_store no_target pipe={} tex_ref={} rgb_nz={} max={} mean_rgb={}",
+                    req.pipeline_ref, c0.texture_ref, rgb_nz, max_rgb, mean_rgb
                 ));
                 false
             };
@@ -658,12 +670,40 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         // ranks fail-channel lines on that key, and the underlying slug is
         // already counted once at its own emitter. Naming it twice would
         // make one refusal read as two.
+        // The target and its clear, because the cost of this refusal is not the
+        // draw count: `runtime::exec::finish_stream` still applies the pass's
+        // clear once the packet ends, so a record that reaches here publishes a
+        // flat clear colour over whatever the skipped draws would have drawn.
+        // Without the target named, a refusal on a scratch offscreen and one on
+        // the compositor's own full-screen plane read identically — and only the
+        // second is a desktop the guest never composited.
+        let (target, clear) = req
+            .colors
+            .first()
+            .map(|c| {
+                (
+                    format!(
+                        "mid={} gva={:#x} {}x{} load={:#x} store={:#x}",
+                        c.mapping_id,
+                        c.target_gva,
+                        c.width,
+                        c.height,
+                        c.load_action,
+                        c.store_action
+                    ),
+                    format!(
+                        "[{:.3},{:.3},{:.3},{:.3}]",
+                        c.clear_color[0], c.clear_color[1], c.clear_color[2], c.clear_color[3]
+                    ),
+                )
+            })
+            .unwrap_or_else(|| ("no_color_target".to_string(), "none".to_string()));
         crate::observe::fail(format!(
             "linux_clear_store draws_skipped reason=draws_skipped_after_engine_refusal \
-             pipe={} vtx={} refused_by={}",
+             pipe={} vtx={} refused_by={} {target} clear={clear}",
             req.pipeline_ref,
             req.vertex_count,
-            engine_refusal.unwrap_or("engine_draw_not_attempted")
+            engine_outcome.slug()
         ));
         // The line above dedupes on `(pipeline, slug)` and the count does
         // not, so the two answer different questions and only this one can
@@ -1006,6 +1046,53 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 /// has no question to answer. `t11sample_ready_guest_allocation` and
 /// `t11sample_ready_device_allocation` keep that population measurable. The
 /// copied resident retains every rung and witness below.
+/// A `(task, texture ref)` a bind resolved through.
+type SampledRefKey = (u32, u32);
+
+/// What one resolved to: mapping, and the view extent bound for it.
+type SampledRefBacking = (u32, u32, u32);
+
+/// The last resolution reported for each `(task, texture ref)`, so a change of
+/// backing is reportable and a steady bind is silent.
+static SAMPLED_REF_BACKING_LAST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<SampledRefKey, SampledRefBacking>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Report what a texture ref resolves to, on every change of backing or extent.
+fn note_sampled_ref_backing(
+    state: &crate::model::DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+    mapping_id: u32,
+    route: &str,
+) {
+    let now = (mapping_id, width, height);
+    let prior = {
+        let mut last = SAMPLED_REF_BACKING_LAST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        last.insert((task_id, texture_ref), now)
+    };
+    if prior == Some(now) {
+        return;
+    }
+    let (mw, mh, mfmt) = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| (m.width, m.height, m.format))
+        .unwrap_or((0, 0, 0));
+    let was = match prior {
+        Some((pmid, pw, ph)) => format!(" was=mid{pmid}:{pw}x{ph}"),
+        None => String::new(),
+    };
+    crate::observe::off(format!(
+        "sampled_ref_backing task={task_id} ref={texture_ref} view={width}x{height} \
+         mid={mapping_id} map={mw}x{mh} map_fmt={mfmt:#x} route={route}{was}"
+    ));
+}
+
 pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1120,6 +1207,39 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 })
                 .unwrap_or(true);
             if needs_materialization {
+                // What this bind reads, before either arm decides how to carry
+                // it. The window is the *view's* -- a plane of a multiplanar
+                // surface has its own format, extent and offset, and the
+                // mapping-derived window cannot describe it, which is why the
+                // video planes were absent from this record.
+                if let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(view.pixel_format)
+                {
+                    if let Some((base_off, bpr, _)) = state.mappings.get(&mid).and_then(|m| {
+                        crate::runtime::mapping_write::type5_sample_window(
+                            m,
+                            view.plane_index,
+                            view.width,
+                            view.height,
+                            view.pixel_format,
+                        )
+                    }) {
+                        crate::runtime::scanout::note_sampled_surface_field_window(
+                            state,
+                            &*host,
+                            mid,
+                            texture_ref,
+                            "type5_view",
+                            crate::runtime::scanout::SampledFieldWindow {
+                                width: view.width,
+                                height: view.height,
+                                format: u32::from(view.pixel_format),
+                                base_off,
+                                bpr,
+                                bpp,
+                            },
+                        );
+                    }
+                }
                 // Zero-copy the decoded plane straight from guest pages when
                 // it samples byte-identically (video NV12 R8/RG8, BGRA8/
                 // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
@@ -2432,7 +2552,8 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         if !crate::observe::draw_log_enabled() {
             return;
         }
-        let (nz, max, _) = crate::observe::rgba_rgb_stats(rgba);
+        let s = crate::observe::rgba_rgb_stats(rgba);
+        let (nz, max) = (s.rgb_nz, s.max_rgb);
         crate::observe::line(format!(
             "type5_draw_view ok task={task_id} ref={texture_ref} sid={mapping_id} map_gen={map_gen} view={}x{} fmt={:#x} bpp={bpp} base={base_w}x{base_h} base_fmt={base_fmt:#x} off={base_off} bpr={surface_bpr} span_end={span_end} src={generation_source} rgb_nz={nz} max_rgb={max}",
             view.width,
@@ -2552,6 +2673,61 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
 /// crossover is consulted. This floor applies only after direct construction
 /// is unavailable and the remaining GPU path would copy into another image.
 pub(super) const SAMPLED_GATHER_MIN_BYTES: u64 = 64 * 1024;
+
+/// Which sampled rail is asking [`sampled_gather_floor_admits`], so a decline
+/// names the rail that took it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SampledFloorRail {
+    /// A linear texture addressed through task-local GVA space.
+    Linear,
+    /// A type-11 surface plane addressed through a mapping.
+    Type11,
+    /// A serialized type-5 surface view addressed through a mapping.
+    Type5,
+}
+
+/// The only application of [`SAMPLED_GATHER_MIN_BYTES`], for all three sampled
+/// rails, returning whether the copied gather fallback may proceed.
+///
+/// The rule has two terms and they are not separable. The span term is the
+/// performance crossover [`SAMPLED_GATHER_MIN_BYTES`] documents. The layout term
+/// is [`TexelLayout::a_cost_floor_may_decline`], which exists because a floor is
+/// a performance decision *only* where the CPU arm it declines to produces the
+/// same pixels — where that arm is lossy or absent, the same comparison is a
+/// correctness gate wearing a threshold's clothes, and an extended-range LUT
+/// reaches the shader quantized.
+///
+/// Written once here because it was written three times by hand and the three
+/// did not agree: the type-11 arm carried the span term alone, so every
+/// half-float sampled surface under 64 KiB on that rail was declined onto the
+/// very loader `a_cost_floor_may_decline` was added to keep it away from. The
+/// two mapping rails also declined silently — no record at all — while the
+/// counter whose name reads like that refusal was attached to the *success*
+/// return above it, so the log said the opposite of what the code did.
+///
+/// A decline is recorded here rather than at the call site, banded by span, so
+/// a rail cannot be added that declines without saying so.
+pub(super) fn sampled_gather_floor_admits(
+    rail: SampledFloorRail,
+    native: TexelLayout,
+    span: u64,
+) -> bool {
+    if !native.a_cost_floor_may_decline() || span >= SAMPLED_GATHER_MIN_BYTES {
+        return true;
+    }
+    crate::runtime::drain::note_store_route(match (rail, span) {
+        (SampledFloorRail::Linear, s) if s < 4 * 1024 => "zc_lin_below_floor_lt4k",
+        (SampledFloorRail::Linear, s) if s < 16 * 1024 => "zc_lin_below_floor_lt16k",
+        (SampledFloorRail::Linear, _) => "zc_lin_below_floor_lt64k",
+        (SampledFloorRail::Type11, s) if s < 4 * 1024 => "zc_t11_below_floor_lt4k",
+        (SampledFloorRail::Type11, s) if s < 16 * 1024 => "zc_t11_below_floor_lt16k",
+        (SampledFloorRail::Type11, _) => "zc_t11_below_floor_lt64k",
+        (SampledFloorRail::Type5, s) if s < 4 * 1024 => "zc_t5_below_floor_lt4k",
+        (SampledFloorRail::Type5, s) if s < 16 * 1024 => "zc_t5_below_floor_lt16k",
+        (SampledFloorRail::Type5, _) => "zc_t5_below_floor_lt64k",
+    });
+    false
+}
 
 /// Zero-copy floor for draw-time vertex/storage buffer binds. Performance
 /// threshold only — never a correctness gate; below it the bind takes the CPU
@@ -3819,7 +3995,7 @@ fn load_index_content_reason<M: HostMemory + HostOps>(
 /// order the registry keys a resident on — and because two callers assembling
 /// the same five by hand is how they come to disagree about one of them.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct GvaSpan {
+pub(crate) struct GvaSpan {
     pub texture_ref: u32,
     pub gva: u64,
     pub row_stride: u32,
@@ -3837,7 +4013,7 @@ pub(super) struct GvaSpan {
 /// since the Store, and one is a target the engine no longer holds. Each caller
 /// names them on its own census routes — the rule is shared, the vocabulary is
 /// not, so a reading says which rung refused as well as why.
-pub(super) enum GvaResidentRefusal {
+pub(crate) enum GvaResidentRefusal {
     /// The resource has no complete initial transfer backing, so it has no
     /// usable resident identity yet.
     NoGeneration,
@@ -3892,25 +4068,33 @@ fn gva_resident_ready(
     ready
 }
 
-/// The one currency test behind every GVA resident shortcut: does the engine
-/// still hold, under this span's own identity, what the render Store published
-/// into these guest pages?
+/// Name the engine resident a render Store into this GVA span would have
+/// published into, without asking whether the guest's own bytes still agree
+/// with it.
 ///
-/// Two rails ask it — the sampled bind below and the colour LOAD seed — and it
-/// is written once because a copied version of this rule is the next
-/// divergence. The callers differ only in what they do with the answer.
+/// This is the identity half of [`gva_resident_if_current`], which is written
+/// here rather than inlined there because two rails need different halves of
+/// that function and a copied derivation of a registry key is the next
+/// divergence. `None` is the same condition that function reports as
+/// `GvaResidentRefusal::NoGeneration`: a degenerate span, or a resource with no
+/// complete allocation backing to name.
 ///
-/// A named resource uses its stable host-texture generation and retained
-/// transfer backing. The page-set fallback remains only for an attachment with
-/// no resource reference and therefore no protocol lifetime to carry.
-pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
+/// Which of the two doors a caller takes is a property of the shape it is
+/// binding, not a preference. A single-sample GVA target has a second copy of
+/// its pixels — the guest pages themselves — so substituting the resident for
+/// them requires the currency test. A multisample target has no such second
+/// copy: no rail of this device writes a multisample target's guest pages, and
+/// this device is the only reader of them. For that shape the witness has
+/// nothing to compare and can only decline for want of an answer, so the rail
+/// that binds it names the resident here and lets the engine's own
+/// `MultisampleSample*` declines carry the absent-or-unready hazard at bind
+/// time.
+pub(crate) fn gva_span_identity<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     span: GvaSpan,
-) -> Result<crate::backend::vulkan::engine::TargetIdentity, GvaResidentRefusal> {
-    use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
-
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
     let GvaSpan {
         texture_ref,
         gva,
@@ -3920,7 +4104,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
         format,
     } = span;
     if gva == 0 || w == 0 || h == 0 {
-        return Err(GvaResidentRefusal::NoGeneration);
+        return None;
     }
     let span_bytes = u64::from(row_stride).saturating_mul(u64::from(h));
     let generation = if texture_ref != 0 {
@@ -3938,16 +4122,39 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
         gva_span_alloc_generation(state, host, task_id, gva, row_stride, h)
     };
     if generation == 0 {
-        return Err(GvaResidentRefusal::NoGeneration);
+        return None;
     }
-    let resident_format = gva_resident_format(format);
-    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+    Some(crate::backend::vulkan::engine::TargetIdentity::Gva {
         gva,
         width: w,
         height: h,
         generation,
-        format: resident_format,
-    };
+        format: gva_resident_format(format),
+    })
+}
+
+/// The one currency test behind every GVA resident shortcut: does the engine
+/// still hold, under this span's own identity, what the render Store published
+/// into these guest pages?
+///
+/// Two rails ask it — the sampled bind below and the colour LOAD seed — and it
+/// is written once because a copied version of this rule is the next
+/// divergence. The callers differ only in what they do with the answer.
+///
+/// A named resource uses its stable host-texture generation and retained
+/// transfer backing. The page-set fallback remains only for an attachment with
+/// no resource reference and therefore no protocol lifetime to carry.
+pub(crate) fn gva_resident_if_current<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    span: GvaSpan,
+) -> Result<crate::backend::vulkan::engine::TargetIdentity, GvaResidentRefusal> {
+    use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
+
+    let texture_ref = span.texture_ref;
+    let identity =
+        gva_span_identity(state, host, task_id, span).ok_or(GvaResidentRefusal::NoGeneration)?;
     // An unpaid Store says the guest pages are deliberately stale and this
     // image is authoritative. The older witness below answers the opposite
     // state: a Store was copied out and both locations still agree. Keeping
@@ -3958,22 +4165,16 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
             .then_some(identity)
             .ok_or(GvaResidentRefusal::NoResident);
     }
-    let verdict = reach(
-        state,
-        host,
-        GvaTargetKey {
-            gva,
-            generation,
-            width: w,
-            height: h,
-            // From the identity built just above, not from `resident_format`
-            // again. `GvaTargetKey::of` builds this same key from the same
-            // identity on the other side of the witness, and the two must
-            // agree — a channel order written by hand at two sites is how they
-            // stop agreeing.
-            bgra: identity.is_bgra(),
-        },
-    );
+    // From the identity built just above, through the key's own constructor.
+    // `GvaTargetKey::of` is what builds this key on the other side of the
+    // witness, and the two must agree — a key written out by hand at one of the
+    // two sites is how they stop agreeing. It cannot decline here: it declines
+    // only for a zero gva or generation, which `gva_span_identity` has already
+    // refused to produce an identity for.
+    let Some(key) = GvaTargetKey::of(&identity) else {
+        return Err(GvaResidentRefusal::NoGeneration);
+    };
+    let verdict = reach(state, host, key);
     if !verdict.is_quiet() {
         return Err(GvaResidentRefusal::Wrote(verdict));
     }
@@ -4358,8 +4559,12 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 native_components,
                 owner.clone(),
             ) {
+                // Served zero-copy from the retained allocation, so the floor
+                // was never consulted — recorded because this is the band that
+                // would have been declined had the bind needed the copied
+                // fallback, which is what says how much the floor is worth.
                 if span < SAMPLED_GATHER_MIN_BYTES {
-                    crate::runtime::drain::note_store_route("zc_lin_direct_below_gather_floor");
+                    crate::runtime::drain::note_store_route("zc_lin_direct_under_floor_span");
                 }
                 return Some((w, h, request));
             }
@@ -4381,7 +4586,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     };
 
     if let Some(packed) = packed {
-        if !native.a_cost_floor_may_decline() || span >= SAMPLED_GATHER_MIN_BYTES {
+        if sampled_gather_floor_admits(SampledFloorRail::Linear, native, span) {
             let page = state.page_size();
             let packed_offset = packed.head.checked_add(layout.offset)?;
             let first_page = usize::try_from(packed_offset / page).ok()?;
@@ -4437,14 +4642,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // describes, so its size never selects a different ownership model.
     // Single-channel float LUTs have no equivalent CPU loader arm and therefore
     // cannot be declined on cost grounds even on this fallback.
-    if native.a_cost_floor_may_decline() && span < SAMPLED_GATHER_MIN_BYTES {
-        crate::runtime::drain::note_store_route(if span < 4 * 1024 {
-            "zc_lin_below_floor_lt4k"
-        } else if span < 16 * 1024 {
-            "zc_lin_below_floor_lt16k"
-        } else {
-            "zc_lin_below_floor_lt64k"
-        });
+    if !sampled_gather_floor_admits(SampledFloorRail::Linear, native, span) {
         return None;
     }
 
@@ -4578,8 +4776,10 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             owner,
         },
     ) {
+        // See the linear arm: served zero-copy, so this records the band the
+        // floor would have judged rather than a decline it took.
         if span < SAMPLED_GATHER_MIN_BYTES {
-            crate::runtime::drain::note_store_route("zc_t11_direct_below_gather_floor");
+            crate::runtime::drain::note_store_route("zc_t11_direct_under_floor_span");
         }
         return Some(SampledSourceRequest::GuestRuns(
             source,
@@ -4591,7 +4791,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             pixel_format::swizzle_identity(),
         ));
     }
-    if span < SAMPLED_GATHER_MIN_BYTES {
+    if !sampled_gather_floor_admits(SampledFloorRail::Type11, native, span) {
         return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
@@ -4703,8 +4903,10 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             owner,
         },
     ) {
+        // See the linear arm: served zero-copy, so this records the band the
+        // floor would have judged rather than a decline it took.
         if span < SAMPLED_GATHER_MIN_BYTES {
-            crate::runtime::drain::note_store_route("zc_t5_direct_below_gather_floor");
+            crate::runtime::drain::note_store_route("zc_t5_direct_under_floor_span");
         }
         return Some(SampledSourceRequest::GuestRuns(
             source,
@@ -4716,7 +4918,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             pixel_format::swizzle_identity(),
         ));
     }
-    if native.a_cost_floor_may_decline() && span < SAMPLED_GATHER_MIN_BYTES {
+    if !sampled_gather_floor_admits(SampledFloorRail::Type5, native, span) {
         return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
@@ -5494,6 +5696,112 @@ fn note_type11_elision_extent(w: u32, h: u32) {
 /// trace in a census this large will not be found by adding another counter to
 /// these rails; the next instrument has to observe surface *content* across the
 /// transition, not the routes taken to produce it.
+/// What the engine draw did, for the skipped-draw tail to name.
+///
+/// The tail — `linux_clear_store draws_skipped` — is reached whenever a record
+/// with vertices ends without storing anything, and its `refused_by=` field is
+/// the only thing that says why. It used to read one `Option<&'static str>`
+/// that was assigned in the engine draw's `Err` arm and nowhere else, and to
+/// spell the `None` case `engine_draw_not_attempted`. That made three different
+/// histories print the same sentence, and two of them were false: a record whose
+/// engine draw *succeeded* and whose Store then dropped the result reported an
+/// engine refusal that never happened, and a record the engine answered with no
+/// colour-0 geometry reported the same.
+///
+/// The distinction is not cosmetic. "The engine would not draw this" and "the
+/// engine drew this and the Store lost it" have different owners, different
+/// repairs, and different costs to the guest, and the first reading sends the
+/// reader into the translator for a defect that is in the Store rail.
+///
+/// One value carries the whole history, built from the engine's own result, so
+/// the assignment cannot go missing from an arm again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EngineDrawOutcome {
+    /// The gate never ran the draw: this record carried no pipeline, or no
+    /// vertices and no index buffer.
+    NotAttempted,
+    /// The engine declined, and this is the typed slug of the decline. The
+    /// draws this record would have made are lost to that refusal.
+    Refused(&'static str),
+    /// The engine drew. Reaching the tail after this means the **Store** lost
+    /// the result, not the draw — `runtime::exec::finish_stream` will then
+    /// apply the pass's clear over pixels that were successfully rendered.
+    Drew,
+    /// The engine answered with no span because the record declared no colour-0
+    /// geometry. Neither a refusal nor a completed draw.
+    NoColorGeometry,
+}
+
+impl EngineDrawOutcome {
+    /// Read the outcome off the engine's own result, so no arm of the match
+    /// below can forget to record itself.
+    fn of(result: &Result<M2vDrawSpan, DrawError>) -> Self {
+        match result {
+            Ok(M2vDrawSpan::None) => Self::NoColorGeometry,
+            Ok(_) => Self::Drew,
+            Err(e) => Self::Refused(crate::observe::Decline::slug(e)),
+        }
+    }
+
+    /// The `refused_by=` value. A refusal reports its own slug — deliberately
+    /// not spelled `reason=`, because the census ranks fail-channel lines on
+    /// that key and the underlying slug is already counted once at its own
+    /// emitter, so naming it twice would make one refusal read as two.
+    fn slug(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "engine_draw_not_attempted",
+            Self::Refused(slug) => slug,
+            Self::Drew => "engine_drew_store_lost_it",
+            Self::NoColorGeometry => "engine_draw_no_color0_geom",
+        }
+    }
+}
+
+/// Where a partial draw belongs once the declared load action is read as a
+/// contract term instead of an ordinal, or `None` when the action does not
+/// promise the prior contents at all.
+///
+/// A `Clear` returns `None`: destroying the texels outside the scissor is
+/// exactly what the guest asked for, so it has no place in a population whose
+/// whole subject is unasked-for destruction.
+///
+/// Everything else — `Load`, `DontCare`, and any ordinal outside the declared
+/// set, which [`LoadAction::from_declared`] folds to `DontCare` — promises the
+/// prior contents, and splits by whether this pass actually had them:
+///
+/// - `from_target`: the engine resident carries them and the pass keys
+///   `LoadOp::LoadFromTarget`. Preserved.
+/// - `seeded`: a CPU seed resolved and will be uploaded. Preserved.
+/// - neither: the pass key reads "no seed", `caches.rs` resolves that to
+///   `AttachmentLoadOp::CLEAR`, and every texel outside the scissor is
+///   destroyed. **This is the defect arm**, and it is the number to read.
+///
+/// Total over the load action so a new ordinal cannot fall out of the census:
+/// `from_declared` has no failure case, and the only escape is the deliberate
+/// `Clear` one above.
+fn preserving_partial_route(
+    load_action: Option<u16>,
+    seeded: bool,
+    from_target: bool,
+) -> Option<&'static str> {
+    use crate::contract::pass_action::LoadAction;
+    // An absent action is the same unknown the ordinal match spells
+    // `draw_partial_load_unknown`, and the contract's own answer for an unknown
+    // is DontCare — which preserves. Folding it in rather than dropping it is
+    // what keeps this population total.
+    let declared = LoadAction::from_declared(load_action.unwrap_or(MTL_LOAD_ACTION_DONT_CARE));
+    if !declared.preserves_prior_contents() {
+        return None;
+    }
+    Some(if from_target {
+        "draw_partial_preserving_from_target"
+    } else if seeded {
+        "draw_partial_preserving_seeded"
+    } else {
+        "draw_partial_preserving_unseeded"
+    })
+}
+
 fn note_draw_coverage(
     scissor: ScissorRect,
     target_w: u32,
@@ -5501,6 +5809,7 @@ fn note_draw_coverage(
     load_action: Option<u16>,
     seeded: bool,
     from_target: bool,
+    guest_backed: bool,
 ) {
     let covers = scissor.covers(target_w, target_h);
     crate::runtime::drain::note_store_route(if covers {
@@ -5542,6 +5851,84 @@ fn note_draw_coverage(
         Some(MTL_LOAD_ACTION_DONT_CARE) => "draw_partial_dontcare",
         _ => "draw_partial_load_unknown",
     });
+    // The same population again, split by the *contract* rather than by the
+    // ordinal, because the ordinal split above contradicts
+    // [`LoadAction::preserves_prior_contents`] and hides the arm it was built
+    // to catch.
+    //
+    // The buckets above call `draw_partial_load_unseeded` "the one arm that is
+    // a defect" and route every DontCare to `draw_partial_dontcare` with the
+    // sentence "undefined outside the scissor by declaration". That sentence is
+    // the reading this device has already rejected everywhere else: DontCare
+    // declares the prior contents undefined, undefined *permits* the prior
+    // contents, `backend::metal::render` hands the same wire word to Metal
+    // which preserves, and the seed block above therefore walks DontCare
+    // through the same doors as a Load. A DontCare that finds no door still
+    // keys "no seed" and `caches.rs` still resolves that to
+    // `AttachmentLoadOp::CLEAR` — so a *partial* draw on it destroys every
+    // texel it did not cover, which is the identical defect
+    // `draw_partial_load_unseeded` names, wearing the other ordinal's name and
+    // counted as benign.
+    //
+    // Derived from `LoadAction::from_declared` so the two cannot drift apart a
+    // second time, and so the out-of-contract ordinals — which fold to DontCare
+    // and must therefore preserve, but which the ordinal match sends to
+    // `draw_partial_load_unknown` — are inside the population rather than
+    // beside it.
+    //
+    // Additive: every counter above keeps its name, its meaning and its
+    // history. This is a second route on the same draw, so the two sets are
+    // read together and neither replaces the other.
+    if let Some(route) = preserving_partial_route(load_action, seeded, from_target) {
+        crate::runtime::drain::note_store_route(route);
+        // And what it costs, in the only unit the cost is proportional to.
+        //
+        // A record count cannot rank this population: a boot's small scratch
+        // targets outnumber its full-screen compositor layers by orders of
+        // magnitude, so a count is dominated by the passes whose answer does
+        // not matter. The number that says whether a guest can see this is the
+        // area the pass overwrote *without being asked to* — the attachment
+        // minus the rectangle the draw actually covered — because that is
+        // exactly the set of texels that held guest content before the pass and
+        // hold `[0.0; 4]` after it.
+        //
+        // Only for the unseeded arm. The other two preserved their contents, so
+        // their uncovered area is not destroyed and adding it here would price
+        // the rail working as if it were the defect — the same mistake
+        // `from_target` was added above to undo.
+        if route == "draw_partial_preserving_unseeded" {
+            let target = (target_w as u64).saturating_mul(target_h as u64);
+            let covered = (scissor.width.min(target_w) as u64)
+                .saturating_mul(scissor.height.min(target_h) as u64);
+            crate::runtime::drain::note_store_route_n(
+                "draw_partial_preserving_unseeded_lost_texels",
+                target.saturating_sub(covered),
+            );
+            // And split by whether the target has guest-visible backing,
+            // because that is exactly the line between a repair that is safe
+            // and one that is not.
+            //
+            // The prior contents this pass needed are on the engine resident.
+            // Loading them back is only unambiguous when nothing outside this
+            // device can have changed the surface since the resident was
+            // published — and the one writer this device cannot see is the
+            // guest's own CPU writing the surface's pages. A target with a
+            // type-11 mapping or a task GVA has such pages, and reusing its
+            // resident without the currency query is the documented fixpoint
+            // where "renders correctly for a few frames then stays corrupted"
+            // comes from.
+            //
+            // A target with neither has no guest pages at all, so it has no
+            // guest-side writer, and its resident is the *only* place its prior
+            // contents exist. For that subset the resident is authoritative by
+            // construction and there is nothing to reconcile.
+            crate::runtime::drain::note_store_route(if guest_backed {
+                "draw_partial_preserving_unseeded_guest_backed"
+            } else {
+                "draw_partial_preserving_unseeded_resident_only"
+            });
+        }
+    }
     // How much of the surface this draw's scissor actually covers.
     //
     // The deferred render flush copies the whole attachment on every landing,
@@ -7000,8 +7387,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route(use_.slug());
             }
             if let Some((gap, _)) = uses.iter().find(|(gap, use_)| {
-                gap.class == crate::runtime::draw::FragUnboundClass::Buffer
-                    && use_.is_violation()
+                gap.class == crate::runtime::draw::FragUnboundClass::Buffer && use_.is_violation()
             }) {
                 return Err(DrawError::DrawPreparation(
                     DrawPreparationDecline::UnboundStorageBuffer {
@@ -7267,7 +7653,73 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 },
                             ));
                         };
-                        let (rw, rh, _mid, src) = loaded;
+                        let (rw, rh, mid, src) = loaded;
+                        // What a texture ref resolved to, reported whenever it
+                        // changes. The plane draw ring records the refs a pass
+                        // sampled, and a ref is only a number: a layer turns
+                        // uniform on the first draw to bind refs it has never
+                        // bound before, and on this rail those same refs resolve
+                        // to a 242x5 texture minutes earlier and to a 3840x2160
+                        // video plane later. Which of the two a pass sampled is
+                        // the whole question, and a first-sight latch cannot
+                        // answer it -- only a record of every change can.
+                        if frag_stage {
+                            let route = match &src {
+                                SampledSourceRequest::Bytes(..) => "bytes",
+                                SampledSourceRequest::Target(..) => "target",
+                                SampledSourceRequest::GuestRuns(..) => "guest_runs",
+                            };
+                            note_sampled_ref_backing(
+                                state,
+                                req.task_id,
+                                texture_ref,
+                                rw,
+                                rh,
+                                mid,
+                                route,
+                            );
+                            // Which draw consumed a full-screen source, so a
+                            // record of what a source held can be joined to the
+                            // pass that read it. The plane ring names the refs a
+                            // pass sampled and the field witnesses name what a
+                            // source held; neither says which pass read which
+                            // source, and the wallpaper's two video planes are
+                            // read by one pass out of a frame's worth.
+                            if u64::from(rw) * u64::from(rh) >= 1 << 20 {
+                                let target = req
+                                    .colors
+                                    .first()
+                                    .map(|c| (c.mapping_id, c.width, c.height))
+                                    .unwrap_or((0, 0, 0));
+                                let disc = crate::backend::hash::hash_u64(
+                                    u64::from(req.pipeline_ref) << 32 | u64::from(texture_ref),
+                                    u64::from(target.0) << 32 | u64::from(mid),
+                                );
+                                if crate::observe::first_sight("sampled_full_screen_consumer", disc)
+                                {
+                                    crate::observe::off(format!(
+                                        "sampled_full_screen_consumer pipe={} ref={texture_ref} \
+                                         src_mid={mid} src={rw}x{rh} target_mid={} \
+                                         target={}x{} vtx={} route={route}",
+                                        req.pipeline_ref,
+                                        target.0,
+                                        target.1,
+                                        target.2,
+                                        req.vertex_count,
+                                    ));
+                                }
+                            }
+                            // And what it held: a whole-surface bind reads the
+                            // mapping's own geometry, which is the shape every
+                            // full-screen compositor layer on this rail takes.
+                            crate::runtime::scanout::note_sampled_surface_field(
+                                state,
+                                &*host,
+                                mid,
+                                texture_ref,
+                                route,
+                            );
+                        }
                         (rw, rh, src)
                     }
                 };
@@ -8021,6 +8473,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // independently driven x86/Vulkan boots: 1 558, 395 and 295
                     // colour LOAD seed resolutions, and 0 serves plus 0 misses
                     // at that door in every one.
+                    // What this pass declares for a full-screen compositor
+                    // plane, recorded where the load action has been resolved
+                    // rather than where it was decoded — the request builder
+                    // this rail takes does not pass through the MRT path.
+                    crate::runtime::draw::note_compositor_plane_pass(
+                        c0,
+                        w,
+                        h,
+                        req.pipeline_ref,
+                        target_rgba8.is_some() || target_guest_seed.is_some(),
+                        seed_door,
+                    );
                     if matches!(declared, LoadAction::DontCare) {
                         // The widened arm's own instrument, and it is a counter
                         // rather than the latched line below it. DontCare now
@@ -8199,6 +8663,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 req.colors.first().map(|c| c.load_action),
                 target_rgba8.is_some() || target_guest_seed.is_some(),
                 chain_load_from_target,
+                // Guest-visible backing is a type-11 mapping or a task GVA, and
+                // the two are exclusive — `ColorRtRequest::target_gva` documents
+                // that. Either one means the surface has pages the guest's own
+                // CPU can write without this device seeing it.
+                req.colors
+                    .first()
+                    .is_some_and(|c| c.mapping_id != 0 || c.target_gva != 0),
             );
         }
         // The mode is the guest's raw `MTLVisibilityResultMode`; the engine
@@ -8386,6 +8857,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // its four counters, nor its `else` arm, appears anywhere in the
         // always-on log across every boot it holds. Every type-11 Store either
         // skips its readback or is not a writeback Store.
+        // What the guest asked for, carried alongside what this device managed
+        // to offer. The engine decides between clearing and beginning the pass
+        // undefined from this; without it a pass that promised to keep its
+        // contents and arrived with none was indistinguishable from a real
+        // clear, and both were cleared to `[0.0; 4]` -- a colour no guest field
+        // supplies. See `backend::vulkan::engine::caches::Color0Load`.
+        resources.color0_declared = req
+            .colors
+            .first()
+            .map(|c| crate::contract::pass_action::LoadAction::from_declared(c.load_action));
         if chain_load_from_target {
             // The GVA Load elision validated its own identity and is the only
             // rail here whose target is not also claimed by a Store rail: a pass
@@ -8507,6 +8988,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // out-of-contract compare) are dropped fail-visibly, deduped per
         // (pipe,slug) so 3D content cannot flood the log.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleDepth);
+        // The test half only. The attachment is assembled from this and the
+        // pass's own declaration together, below — see `depth_state_for` for why
+        // deciding it here was the defect.
+        let mut depth_test: Option<DepthTest> = None;
         if req.depth_stencil_ref != 0 {
             let ds = match load_depth_stencil_descriptor(
                 state,
@@ -8537,35 +9022,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if !depth_stencil_descriptor_is_trivial(&ds) {
                     match translate::raster::compare_function(ds.depth_compare_function).ok() {
                         Some(compare) => {
-                            let (clear_value, load_action) = req
-                                .depth_attach
-                                .as_ref()
-                                .map(|d| (d.clear_depth as f32, d.load_action))
-                                .unwrap_or((1.0, MTL_LOAD_ACTION_CLEAR));
-                            // A record that continues a serialized render pass
-                            // shares the pass's depth attachment with the
-                            // records before it, so it LOADs whatever they
-                            // tested and wrote — the exact rule the record loop
-                            // already forces on every colour attachment at
-                            // `di > 0`, and depth was the attachment it missed.
-                            // Without it each record re-CLEARed (or re-created)
-                            // the depth buffer and inter-record occlusion was
-                            // lost. `honours_load` still gates on the resident
-                            // actually holding content, so a chain whose first
-                            // record failed degrades to CLEAR by name instead
-                            // of loading an undefined image.
-                            let load_action = if req.continues_render_pass {
-                                MTL_LOAD_ACTION_LOAD
-                            } else {
-                                load_action
-                            };
-                            // `MTLLoadActionLoad` is carried through as the
-                            // guest wrote it. Whether it can be *honoured* is
-                            // not decidable here — it needs the depth resident's
-                            // own content state, which only the engine holds —
-                            // so the engine makes that call and names the
-                            // degradation when it cannot. See
-                            // `pools::registry_mark_depth_ready`.
                             // Stencil test: engaged when either face is enabled.
                             // A face that is *not* enabled maps to Metal's
                             // documented `MTLStencilDescriptor` default (compare
@@ -8576,26 +9032,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // fail-visibly (unknown wire stays unknown); depth is
                             // still honored.
                             let stencil = if ds.front_stencil_enabled || ds.back_stencil_enabled {
-                                use crate::backend::vulkan::engine::{
-                                    SamplerCompareFunction, StencilFaceOps, StencilOp, StencilState,
-                                };
-                                const PASS_THROUGH: StencilFaceOps = StencilFaceOps {
-                                    compare: SamplerCompareFunction::Always,
-                                    fail_op: StencilOp::Keep,
-                                    depth_fail_op: StencilOp::Keep,
-                                    pass_op: StencilOp::Keep,
-                                    read_mask: 0xFFFF_FFFF,
-                                    write_mask: 0xFFFF_FFFF,
-                                };
+                                use crate::backend::vulkan::engine::StencilState;
                                 let front = if ds.front_stencil_enabled {
                                     engine_stencil_face(&ds.front_face)
                                 } else {
-                                    Ok(PASS_THROUGH)
+                                    Ok(STENCIL_PASS_THROUGH)
                                 };
                                 let back = if ds.back_stencil_enabled {
                                     engine_stencil_face(&ds.back_face)
                                 } else {
-                                    Ok(PASS_THROUGH)
+                                    Ok(STENCIL_PASS_THROUGH)
                                 };
                                 // Name the field that failed, not just "a
                                 // stencil op somewhere did". `TranslateReason`
@@ -8660,31 +9106,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             } else {
                                 None
                             };
-                            resources.depth = Some(crate::backend::vulkan::engine::DepthState {
-                                identity: depth_chain_identity(req, stencil.is_some()),
-                                test_enable: true,
+                            depth_test = Some(DepthTest {
                                 write_enable: ds.depth_write_enabled,
                                 compare,
-                                clear_value,
-                                // The depth slot opens with the same 28-byte
-                                // attachment prefix as the colour slots, so its
-                                // action means the same thing: DontCare permits
-                                // the prior contents, and asking for them is
-                                // what stops a pass that tests against earlier
-                                // depth from starting at the clear value. See
-                                // `LoadAction::preserves_prior_contents`.
-                                //
-                                // Widening the *ask* is safe here precisely
-                                // because honouring it is not decided here:
-                                // `honours_load` below gates on the depth
-                                // resident actually holding content and
-                                // degrades to CLEAR by name, so a DontCare with
-                                // nothing behind it cannot load an undefined
-                                // image.
-                                load: crate::contract::pass_action::LoadAction::from_declared(
-                                    load_action,
-                                )
-                                .preserves_prior_contents(),
                                 stencil,
                             });
                         }
@@ -8706,6 +9130,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }
                 }
             }
+        }
+        // Either half is enough to need an attachment: a bound test needs
+        // somewhere to test against, and a pass that declared a depth
+        // attachment owns its clear and its store whether or not any draw in it
+        // binds a state.
+        if needs_depth_attachment(req, &depth_test) {
+            resources.depth = Some(depth_state_for(req, depth_test));
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         // The `fixed_gap` anomaly — decoded fixed-function state the Vulkan
@@ -8935,6 +9366,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.vert_spirv = v_words;
         resources.frag_spirv = f_words;
+        resources.vert_used_descriptor_bindings = v_variant.used_descriptor_bindings.clone();
+        resources.frag_used_descriptor_bindings = f_variant.used_descriptor_bindings.clone();
         resources.width = w;
         resources.height = h;
         resources.vertex_count = vertex_count;
@@ -9168,6 +9601,141 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 ///
 /// Geometry and aspect changes still recreate the image, through
 /// `ResidentTargetSlot::reusable_for` and the `stencil` field of the key.
+/// The per-draw half of a depth attachment: what a bound `MTLDepthStencilState`
+/// says about the test.
+///
+/// `None` is Metal's **default** depth-stencil state — compare Always, writes
+/// off — which is what a draw that binds no state gets. That default is a test
+/// which changes nothing; it is not the absence of an attachment.
+pub(super) struct DepthTest {
+    pub write_enable: bool,
+    pub compare: crate::backend::vulkan::engine::SamplerCompareFunction,
+    pub stencil: Option<crate::backend::vulkan::engine::StencilState>,
+}
+
+/// Metal's documented `MTLStencilDescriptor` default: compare Always, every op
+/// Keep, full masks. A face that does nothing.
+///
+/// Used for two different absences, and they are the same absence. A bound state
+/// with one face disabled leaves that face at this default rather than at its
+/// raw decoded bytes, which for a disabled face need not be initialized. A pass
+/// that declares a stencil attachment while nothing binds a stencil test gets
+/// this for both faces — see [`depth_state_for`], which is where the attachment
+/// and the test stopped being the same question.
+const STENCIL_PASS_THROUGH: crate::backend::vulkan::engine::StencilFaceOps =
+    crate::backend::vulkan::engine::StencilFaceOps {
+        compare: crate::backend::vulkan::engine::SamplerCompareFunction::Always,
+        fail_op: crate::backend::vulkan::engine::StencilOp::Keep,
+        depth_fail_op: crate::backend::vulkan::engine::StencilOp::Keep,
+        pass_op: crate::backend::vulkan::engine::StencilOp::Keep,
+        read_mask: 0xFFFF_FFFF,
+        write_mask: 0xFFFF_FFFF,
+    };
+
+/// Whether a record needs a depth attachment at all.
+///
+/// **This is the rule that was wrong.** It used to be `test.is_some()` alone —
+/// spelled as the shape of the code rather than as a predicate, so there was
+/// nothing to assert against — and a pass that declared a depth attachment while
+/// binding no depth-stencil state answered `false`. Its clear and its store were
+/// then never encoded, and the pass that loaded that depth afterwards tested
+/// against values the guest never wrote. See [`depth_state_for`] for why the two
+/// terms are independent.
+fn needs_depth_attachment(req: &DrawEncodeRequest, test: &Option<DepthTest>) -> bool {
+    test.is_some() || req.depth_attach.is_some() || req.stencil_attach.is_some()
+}
+
+/// The depth attachment a record carries.
+///
+/// **Two independent Metal states decide this, and only one of them used to.**
+/// The render pass descriptor owns the *attachment*: which texture, which load
+/// action, which clear value, which store action. `MTLDepthStencilState` owns
+/// the *test*: the compare function and the write enable. Neither implies the
+/// other.
+///
+/// This device built a depth attachment only when a non-trivial depth-stencil
+/// state was bound, so a pass that declared `loadAction = .clear` and bound no
+/// state — which is lawful, and is what a pass that only wants to *establish*
+/// depth for a later pass does — got no attachment at all. Its clear and its
+/// store never happened, and the next pass loaded whatever was there and tested
+/// against the wrong values. `depth_stencil_descriptor_is_trivial` reasons
+/// entirely about occlusion, which is why the omission reads as correct at the
+/// call site: dropping a test that always passes is sound, and dropping the
+/// pass's own clear alongside it is not.
+///
+/// So the two halves are assembled here, once. `test` absent means Metal's
+/// default state, which disables the test and the writes and leaves everything
+/// the pass declared untouched.
+fn depth_state_for(
+    req: &DrawEncodeRequest,
+    test: Option<DepthTest>,
+) -> crate::backend::vulkan::engine::DepthState {
+    use crate::backend::vulkan::engine::SamplerCompareFunction;
+
+    let (clear_value, load_action) = req
+        .depth_attach
+        .as_ref()
+        .map(|d| (d.clear_depth as f32, d.load_action))
+        .unwrap_or((1.0, MTL_LOAD_ACTION_CLEAR));
+    // A record that continues a serialized render pass shares the pass's depth
+    // attachment with the records before it, so it LOADs whatever they tested
+    // and wrote — the exact rule the record loop already forces on every colour
+    // attachment at `di > 0`, and depth was the attachment it missed. Without
+    // it each record re-CLEARed (or re-created) the depth buffer and
+    // inter-record occlusion was lost. `honours_load` still gates on the
+    // resident actually holding content, so a chain whose first record failed
+    // degrades to CLEAR by name instead of loading an undefined image.
+    let load_action = if req.continues_render_pass {
+        MTL_LOAD_ACTION_LOAD
+    } else {
+        load_action
+    };
+    // **The aspect is the pass's, the test is the state's.** `DepthState::stencil`
+    // answers both — whether the image carries a STENCIL aspect at all, and what
+    // the stencil test does — so deriving it from the bound state alone gave a
+    // pass that declared a stencil attachment a depth-only image. Its clear
+    // could not land, and the next pass, which did bind a stencil test, asked
+    // for the combined image: a different resident, holding nothing. That is the
+    // `depth_load reason=depth_load_without_content 8x8 stencil=1` a macos-13
+    // battery logs.
+    //
+    // So a declared stencil attachment with no bound test gets a test that does
+    // nothing, over an attachment that is still cleared and still stored.
+    let stencil = test.as_ref().and_then(|t| t.stencil).or_else(|| {
+        req.stencil_attach
+            .as_ref()
+            .map(|s| crate::backend::vulkan::engine::StencilState {
+                front: STENCIL_PASS_THROUGH,
+                back: STENCIL_PASS_THROUGH,
+                reference_front: 0,
+                reference_back: 0,
+                clear_value: s.clear_stencil,
+            })
+    });
+    crate::backend::vulkan::engine::DepthState {
+        identity: depth_chain_identity(req, stencil.is_some()),
+        test_enable: test.is_some(),
+        write_enable: test.as_ref().is_some_and(|t| t.write_enable),
+        compare: test
+            .as_ref()
+            .map_or(SamplerCompareFunction::Always, |t| t.compare),
+        clear_value,
+        // The depth slot opens with the same 28-byte attachment prefix as the
+        // colour slots, so its action means the same thing: DontCare permits the
+        // prior contents, and asking for them is what stops a pass that tests
+        // against earlier depth from starting at the clear value. See
+        // `LoadAction::preserves_prior_contents`.
+        //
+        // Widening the *ask* is safe here precisely because honouring it is not
+        // decided here: `honours_load` gates on the depth resident actually
+        // holding content and degrades to CLEAR by name, so a DontCare with
+        // nothing behind it cannot load an undefined image.
+        load: crate::contract::pass_action::LoadAction::from_declared(load_action)
+            .preserves_prior_contents(),
+        stencil,
+    }
+}
+
 pub(super) fn depth_chain_identity(
     req: &DrawEncodeRequest,
     with_stencil: bool,
@@ -10376,6 +10944,250 @@ mod vulkan_split_tests {
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
 
+    /// A DontCare partial draw prices its loss as the area it overwrote
+    /// without being asked to, and a preserved one prices nothing.
+    ///
+    /// The area is the reading, not the record count: a boot's small scratch
+    /// targets outnumber its full-screen compositor layers by orders of
+    /// magnitude, so a count is dominated by the passes whose answer does not
+    /// matter. Asserted as a delta because the census map is process-global and
+    /// the rest of the suite shares it.
+    ///
+    /// The second half is the one that would have caught the original defect's
+    /// mirror image. Pricing a draw whose prior contents *were* preserved would
+    /// report the rail working as if it were the loss — which is exactly what
+    /// scoring `target_rgba8.is_some()` alone did to the LOAD population, and
+    /// it produced a 519 715-strong "defect" that was not one.
+    #[test]
+    fn a_dontcare_partial_draw_is_priced_by_the_area_it_destroyed() {
+        use crate::runtime::drain::store_route_count;
+        const LOST: &str = "draw_partial_preserving_unseeded_lost_texels";
+        // A 100x100 target with a 10x10 draw in it: 10 000 - 100 = 9 900 texels
+        // held guest content before the pass and hold `[0.0; 4]` after it.
+        let scissor = ScissorRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let before = store_route_count(LOST);
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_DONT_CARE),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            store_route_count(LOST),
+            before + 9_900,
+            "the loss is the attachment minus the rectangle the draw covered"
+        );
+
+        // The identical draw, with its prior contents on the engine resident.
+        // Nothing was destroyed, so nothing is priced.
+        let held = store_route_count(LOST);
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_DONT_CARE),
+            false,
+            true,
+            false,
+        );
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_LOAD),
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            store_route_count(LOST),
+            held,
+            "a pass that kept its prior contents lost none of them"
+        );
+
+        // And a Clear, which asked for those texels to be destroyed.
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_CLEAR),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            store_route_count(LOST),
+            held,
+            "a Clear got the destruction it asked for and is not a loss"
+        );
+
+        // The loss is also split by whether the target has guest-visible
+        // backing, and that split is the line between a repair that is safe and
+        // one that is not: a target with no guest pages has no guest-side
+        // writer, so its resident is the only place its prior contents exist
+        // and is authoritative by construction. One with pages needs the
+        // currency query, and reusing its resident without one is the
+        // documented "corrupts and stays corrupted" fixpoint.
+        const BACKED: &str = "draw_partial_preserving_unseeded_guest_backed";
+        const RESIDENT: &str = "draw_partial_preserving_unseeded_resident_only";
+        let (b0, r0) = (store_route_count(BACKED), store_route_count(RESIDENT));
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_DONT_CARE),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(store_route_count(BACKED), b0 + 1);
+        assert_eq!(store_route_count(RESIDENT), r0);
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_DONT_CARE),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(store_route_count(BACKED), b0 + 1);
+        assert_eq!(
+            store_route_count(RESIDENT),
+            r0 + 1,
+            "the two halves of the loss are counted apart, so the safe subset \
+             can be sized before it is repaired"
+        );
+    }
+
+    /// A draw the engine made and a draw the engine refused do not report the
+    /// same sentence, and neither reports "not attempted".
+    ///
+    /// This is the relation the skipped-draw tail got wrong. Its `refused_by=`
+    /// came from an `Option<&'static str>` assigned in the engine draw's `Err`
+    /// arm and nowhere else, and `None` printed `engine_draw_not_attempted` —
+    /// so a record whose engine draw *succeeded* and whose Store then dropped
+    /// the result claimed an engine refusal that never happened, and sent
+    /// whoever read it into the translator for a defect in the Store rail.
+    ///
+    /// Asserted over the engine's own `Result`, because that is where the
+    /// outcome is now read from: an arm of the match cannot forget to record
+    /// itself, since no arm records anything. The four histories are held
+    /// pairwise distinct rather than spot-checked, because the defect was
+    /// exactly two of them collapsing onto a third's name.
+    #[test]
+    fn the_skipped_draw_tail_tells_a_refused_draw_from_one_the_store_lost() {
+        use super::EngineDrawOutcome;
+        let drew = EngineDrawOutcome::of(&Ok(M2vDrawSpan::Pixels {
+            bytes: vec![0; 4],
+            bgra: false,
+        }));
+        let no_geom = EngineDrawOutcome::of(&Ok(M2vDrawSpan::None));
+        let refused = EngineDrawOutcome::of(&Err(DrawError::TargetRead(
+            crate::backend::vulkan::engine::reason::TargetReadDecline::NoReadyContent,
+        )));
+
+        assert_eq!(drew, EngineDrawOutcome::Drew);
+        assert_eq!(no_geom, EngineDrawOutcome::NoColorGeometry);
+        assert!(matches!(refused, EngineDrawOutcome::Refused(_)));
+
+        // A refusal reports the decline's own slug, so the tail names the check
+        // that declined rather than the fact that something did.
+        assert_eq!(
+            refused.slug(),
+            crate::observe::Decline::slug(&DrawError::TargetRead(
+                crate::backend::vulkan::engine::reason::TargetReadDecline::NoReadyContent,
+            )),
+        );
+
+        let slugs = [
+            EngineDrawOutcome::NotAttempted.slug(),
+            refused.slug(),
+            drew.slug(),
+            no_geom.slug(),
+        ];
+        for (i, a) in slugs.iter().enumerate() {
+            for b in &slugs[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "two histories with different owners and different repairs \
+                     must not print one sentence: {slugs:?}"
+                );
+            }
+        }
+    }
+
+    /// Every load action that promises the prior contents and arrives with
+    /// none of them lands in one bucket, whichever ordinal it was spelled with.
+    ///
+    /// This is the relation the ordinal census got wrong. `MTLLoadActionLoad`
+    /// with no seed was named a defect and `MTLLoadActionDontCare` with no seed
+    /// was named benign, but the two resolve to the identical Vulkan load op
+    /// and reach the attachment with the identical nothing — the pass key
+    /// cannot tell them apart by the time `caches.rs` reads it, and until
+    /// `Color0Load` replaced the old `load_seed: bool` that op was `CLEAR` and
+    /// they destroyed the identical texels. The bucket outlives that repair:
+    /// it counts passes that promised prior contents and had none, which is
+    /// still the population, whatever the engine then does with it. The
+    /// authority for that is `LoadAction::preserves_prior_contents`, so the
+    /// bucket is derived from it and this test sweeps the ordinal space rather
+    /// than listing the three names: an ordinal added to the declared set, or a
+    /// fourth one arriving from the wire, must not be able to leave the
+    /// population silently.
+    #[test]
+    fn every_preserving_load_action_with_no_prior_contents_shares_one_bucket() {
+        use crate::contract::pass_action::LoadAction;
+        // The declared set plus a sweep past its top, which is where an
+        // out-of-contract ordinal comes from; `from_declared` folds those to
+        // DontCare, and DontCare preserves.
+        let ordinals: Vec<Option<u16>> =
+            (0u16..=8).map(Some).chain([Some(u16::MAX), None]).collect();
+        for action in ordinals {
+            let declared =
+                LoadAction::from_declared(action.unwrap_or(super::MTL_LOAD_ACTION_DONT_CARE));
+            let route = super::preserving_partial_route(action, false, false);
+            if declared.preserves_prior_contents() {
+                assert_eq!(
+                    route,
+                    Some("draw_partial_preserving_unseeded"),
+                    "{action:?} promises the prior contents and has none, so it \
+                     destroys what it did not draw and belongs in the defect bucket"
+                );
+            } else {
+                assert_eq!(
+                    route, None,
+                    "{action:?} asked for its texels to be destroyed, so it is \
+                     not unasked-for destruction"
+                );
+            }
+        }
+        // And the two ways a preserving pass can actually hold its prior
+        // contents are kept apart from that bucket and from each other, so a
+        // rail going dark shows up as its own count falling rather than as the
+        // defect count staying flat.
+        for action in [
+            Some(super::MTL_LOAD_ACTION_LOAD),
+            Some(super::MTL_LOAD_ACTION_DONT_CARE),
+        ] {
+            assert_eq!(
+                super::preserving_partial_route(action, false, true),
+                Some("draw_partial_preserving_from_target")
+            );
+            assert_eq!(
+                super::preserving_partial_route(action, true, false),
+                Some("draw_partial_preserving_seeded")
+            );
+        }
+    }
+
     #[test]
     fn a_sampled_guest_allocation_does_not_enter_copy_currency_checks() {
         use crate::backend::vulkan::engine::ResidentContentBacking;
@@ -10533,6 +11345,7 @@ mod vulkan_split_tests {
             None,
             false,
             false,
+            false,
         );
         note_draw_coverage(
             ScissorRect {
@@ -10544,6 +11357,7 @@ mod vulkan_split_tests {
             1000,
             1000,
             None,
+            false,
             false,
             false,
         );
@@ -10566,6 +11380,7 @@ mod vulkan_split_tests {
             1000,
             1000,
             None,
+            false,
             false,
             false,
         );
@@ -10591,6 +11406,7 @@ mod vulkan_split_tests {
             None,
             false,
             false,
+            false,
         );
         note_draw_coverage(
             ScissorRect {
@@ -10602,6 +11418,7 @@ mod vulkan_split_tests {
             1000,
             1000,
             None,
+            false,
             false,
             false,
         );
@@ -10653,6 +11470,7 @@ mod vulkan_split_tests {
                 None,
                 false,
                 false,
+                false,
             );
             assert_eq!(
                 store_route_count(slug),
@@ -10676,6 +11494,7 @@ mod vulkan_split_tests {
             None,
             false,
             false,
+            false,
         );
         assert_eq!(
             store_route_count("draw_scissor_area_gt50"),
@@ -10694,6 +11513,7 @@ mod vulkan_split_tests {
             0,
             0,
             None,
+            false,
             false,
             false,
         );
@@ -12086,6 +12906,234 @@ mod vulkan_split_tests {
         assert_eq!(
             depth_chain_identity(&DrawEncodeRequest::default(), false),
             None
+        );
+    }
+
+    /// A pass owns its depth clear and its store whether or not a draw in it
+    /// binds a depth-stencil state.
+    ///
+    /// The two are independent Metal states. This device assembled the
+    /// attachment only from the bound state, so a pass that declared
+    /// `loadAction = .clear`, `clearDepth = 0`, `storeAction = .store` and bound
+    /// no state produced no attachment at all: its clear never ran, its store
+    /// never ran, and the next pass tested against whatever was left. That is
+    /// exactly `depth_attachment_clear_without_test_state`, which fails on the
+    /// guest and passes natively.
+    ///
+    /// The default state Metal supplies when none is bound is a test that always
+    /// passes with writes off — which is what is asserted here alongside the
+    /// clear value the pass declared.
+    #[test]
+    fn a_declared_depth_clear_survives_a_draw_that_binds_no_depth_stencil_state() {
+        use crate::backend::vulkan::engine::{SamplerCompareFunction, TargetIdentity};
+
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.depth_attach = Some(crate::runtime::decode::render::DepthAttachment {
+            texture_ref: 7,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            clear_depth: 0.0,
+            ..Default::default()
+        });
+
+        // The red witness. On the control the rule was `test.is_some()` alone,
+        // so this exact request — a declared depth attachment with no bound
+        // state — answered `false` and no attachment was encoded.
+        assert!(
+            needs_depth_attachment(&req, &None),
+            "a pass that declares a depth attachment needs one, bound state or not"
+        );
+
+        let depth = depth_state_for(&req, None);
+        assert_eq!(
+            depth.clear_value, 0.0,
+            "the pass declared the clear value; nothing else may choose it"
+        );
+        assert!(
+            !depth.load,
+            "a declared CLEAR must not be turned into a LOAD of prior contents"
+        );
+        assert!(
+            matches!(
+                depth.identity,
+                Some(TargetIdentity::Texture { ref_: 7, .. })
+            ),
+            "the pass named a depth texture, so the attachment is that guest resource"
+        );
+        assert!(
+            !depth.test_enable && !depth.write_enable,
+            "Metal's default state tests nothing and writes nothing"
+        );
+        assert_eq!(depth.compare, SamplerCompareFunction::Always);
+        assert!(depth.stencil.is_none());
+    }
+
+    /// A pass that declares a stencil attachment gets one, even though nothing
+    /// binds a stencil test.
+    ///
+    /// `DepthState::stencil` answers two questions — does the image carry a
+    /// STENCIL aspect, and what does the stencil test do — and deriving it from
+    /// the bound state alone answered the first with the second. The pass that
+    /// declared the attachment got a depth-only image, so its stencil clear had
+    /// nowhere to land; the pass that later bound a stencil test asked for the
+    /// combined image and found a different resident holding nothing. A macos-13
+    /// battery logs that as
+    /// `depth_load reason=depth_load_without_content 8x8 stencil=1`.
+    #[test]
+    fn a_declared_stencil_attachment_carries_its_aspect_without_a_bound_test() {
+        use crate::backend::vulkan::engine::SamplerCompareFunction;
+
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.stencil_attach = Some(crate::runtime::decode::render::StencilAttachment {
+            texture_ref: 11,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            clear_stencil: 3,
+            ..Default::default()
+        });
+
+        assert!(
+            needs_depth_attachment(&req, &None),
+            "a declared stencil attachment needs an attachment of its own"
+        );
+        let depth = depth_state_for(&req, None);
+        let stencil = depth
+            .stencil
+            .expect("the pass declared a stencil attachment, so the image carries the aspect");
+        assert_eq!(
+            stencil.clear_value, 3,
+            "the pass declared the stencil clear value"
+        );
+        assert_eq!(
+            (stencil.front.compare, stencil.back.compare),
+            (
+                SamplerCompareFunction::Always,
+                SamplerCompareFunction::Always
+            ),
+            "no bound test means a test that does nothing, not a test that rejects"
+        );
+        assert_eq!(stencil.front, STENCIL_PASS_THROUGH);
+        assert_eq!(stencil.back, STENCIL_PASS_THROUGH);
+    }
+
+    /// A bound stencil test wins over the pass's no-op default — the pass
+    /// supplies the aspect, the state supplies the test, and the state is only
+    /// consulted for the second.
+    #[test]
+    fn a_bound_stencil_test_is_not_replaced_by_the_passs_default() {
+        use crate::backend::vulkan::engine::{
+            SamplerCompareFunction, StencilFaceOps, StencilOp, StencilState,
+        };
+
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.stencil_attach = Some(crate::runtime::decode::render::StencilAttachment {
+            texture_ref: 11,
+            clear_stencil: 3,
+            ..Default::default()
+        });
+        let bound = StencilState {
+            front: StencilFaceOps {
+                compare: SamplerCompareFunction::Equal,
+                fail_op: StencilOp::Keep,
+                depth_fail_op: StencilOp::Keep,
+                pass_op: StencilOp::Replace,
+                read_mask: 0xFF,
+                write_mask: 0xFF,
+            },
+            back: STENCIL_PASS_THROUGH,
+            reference_front: 5,
+            reference_back: 6,
+            clear_value: 3,
+        };
+        let depth = depth_state_for(
+            &req,
+            Some(DepthTest {
+                write_enable: false,
+                compare: SamplerCompareFunction::Always,
+                stencil: Some(bound),
+            }),
+        );
+        assert_eq!(depth.stencil, Some(bound));
+    }
+
+    /// A bound test still carries its own compare and write enable, and still
+    /// takes the pass's clear value rather than a default.
+    #[test]
+    fn a_bound_depth_test_keeps_its_compare_and_the_passs_clear() {
+        use crate::backend::vulkan::engine::SamplerCompareFunction;
+
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.depth_attach = Some(crate::runtime::decode::render::DepthAttachment {
+            texture_ref: 3,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            clear_depth: 0.25,
+            ..Default::default()
+        });
+
+        let depth = depth_state_for(
+            &req,
+            Some(DepthTest {
+                write_enable: true,
+                compare: SamplerCompareFunction::Less,
+                stencil: None,
+            }),
+        );
+        assert!(depth.test_enable && depth.write_enable);
+        assert_eq!(depth.compare, SamplerCompareFunction::Less);
+        assert_eq!(depth.clear_value, 0.25);
+    }
+
+    /// A record continuing a serialized pass loads what the records before it
+    /// wrote, on both halves — the rule is the pass's, not the bound state's.
+    #[test]
+    fn a_continued_record_loads_prior_depth_with_or_without_a_bound_test() {
+        use crate::backend::vulkan::engine::SamplerCompareFunction;
+
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.depth_attach = Some(crate::runtime::decode::render::DepthAttachment {
+            texture_ref: 9,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        });
+        req.continues_render_pass = true;
+
+        assert!(
+            depth_state_for(&req, None).load,
+            "a continued record must not re-clear the depth the pass already has"
+        );
+        assert!(
+            depth_state_for(
+                &req,
+                Some(DepthTest {
+                    write_enable: false,
+                    compare: SamplerCompareFunction::Less,
+                    stencil: None,
+                }),
+            )
+            .load
         );
     }
 

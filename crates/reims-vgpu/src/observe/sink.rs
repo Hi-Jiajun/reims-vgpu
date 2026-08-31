@@ -243,15 +243,55 @@ impl FloodWindow {
     }
 }
 
+/// How often the writer thread reports on itself. One second, the same census
+/// interval every other levels line in this device shares, so a `log_writer`
+/// row reads against the `store_routes` and `drain_duty` rows beside it.
+const WRITER_BEAT_MS: u64 = 1_000;
+
+/// Whether the writer should emit its heartbeat now.
+///
+/// A pure function of `(last, now)` for the same reason
+/// `released_pages::claim_census_interval` is: a rate gate written inline
+/// against the clock can only be checked by a boot. Unlike that one this has a
+/// single caller on a single thread, so it needs no atomic — but it does need
+/// to be checkable, because the whole value of the beat is its cadence.
+fn writer_beat_due(last_ms: u128, now_ms: u128) -> bool {
+    now_ms.saturating_sub(last_ms) >= u128::from(WRITER_BEAT_MS)
+}
+
 /// Background log writer (product builds). A single thread owns both sink files
 /// behind buffered writers; producers only push a formatted line onto an mpsc
 /// channel. The thread batch-drains (block on one, then greedily take the rest)
 /// and flushes after each batch, so failure visibility trails real time by at
 /// most one drain cycle while the hot path stays syscall-free.
+///
+/// # Why it reports on itself
+///
+/// Every line is stamped at **enqueue**, so a log that ends at `t=29 682` while
+/// the process lived to 38 s has two readings and the file cannot tell them
+/// apart: the device stopped emitting, or this thread fell behind and its
+/// backlog died with the process. That is not a hypothetical distinction —
+/// those eight seconds are the eight seconds before a guest kernel panic on the
+/// host-pointer-import rail, so which reading is right decides whether any
+/// instrument can see that defect at all.
+///
+/// So the writer emits a `log_writer` row of its own, stamped with its own
+/// clock at write time and carrying the exact queue depth. It is written
+/// directly rather than enqueued — a heartbeat that queued behind the backlog it
+/// is measuring would report the backlog's clock, not its own. Read it as:
+///
+/// - beat present, `queued` small, then the file ends → the device stopped
+///   emitting, and the last producer line is where it stopped;
+/// - beat present, `queued` climbing → this thread is behind, and everything
+///   after the last written line was lost with the process.
+///
+/// The wait is a timeout rather than a block, so an idle device still beats. A
+/// silent writer and a silent device must not look alike.
 #[cfg(not(test))]
 mod writer {
     use super::{draw_log_path, fail_log_path, Sink};
     use std::io::{BufWriter, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, Sender};
     use std::sync::OnceLock;
 
@@ -287,16 +327,47 @@ mod writer {
             .map(BufWriter::new)
     }
 
+    /// Messages enqueued and not yet written. `mpsc` has no depth of its own, so
+    /// the two ends keep it between them: one relaxed add beside a channel send
+    /// the hot path was already paying for, and one relaxed subtract on the
+    /// writer. Exact, and it is the discriminator the heartbeat exists to carry.
+    static QUEUED: AtomicU64 = AtomicU64::new(0);
+
     fn writer_loop(rx: Receiver<Msg>, fail_path: String, draw_path: String) {
         let mut fail = open(&fail_path);
         let mut draw = open(&draw_path);
         let mut flood = super::FloodWindow::new(super::elapsed_ms());
-        // Block for the next line, then greedily drain everything already
-        // queued before a single flush — one syscall amortizes a whole burst.
-        while let Ok(first) = rx.recv() {
-            write_watched(&mut fail, &mut draw, &mut flood, first);
-            while let Ok(m) = rx.try_recv() {
-                write_watched(&mut fail, &mut draw, &mut flood, m);
+        let mut last_beat_ms = super::elapsed_ms();
+        let mut wrote_since_beat = 0u64;
+        // Wait for the next line with a timeout, then greedily drain everything
+        // already queued before a single flush — one syscall amortizes a whole
+        // burst. The timeout is what lets an idle device still beat.
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(super::WRITER_BEAT_MS)) {
+                Ok(first) => {
+                    write_watched(&mut fail, &mut draw, &mut flood, first);
+                    wrote_since_beat += 1;
+                    while let Ok(m) = rx.try_recv() {
+                        write_watched(&mut fail, &mut draw, &mut flood, m);
+                        wrote_since_beat += 1;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                // Every producer is gone, which for this process means shutdown.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            let now = super::elapsed_ms();
+            if super::writer_beat_due(last_beat_ms, now) {
+                if let Some(w) = fail.as_mut() {
+                    let _ = writeln!(
+                        w,
+                        "OFF log_writer wrote={wrote_since_beat} queued={} beat_ms={} t={now}",
+                        QUEUED.load(Ordering::Relaxed),
+                        now.saturating_sub(last_beat_ms),
+                    );
+                }
+                last_beat_ms = now;
+                wrote_since_beat = 0;
             }
             if let Some(w) = fail.as_mut() {
                 let _ = w.flush();
@@ -347,6 +418,7 @@ mod writer {
             let _ = w.write_all(line.as_bytes());
             let _ = w.write_all(b"\n");
         }
+        QUEUED.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Push one already-timestamped line to the background writer. Lock-free and
@@ -356,7 +428,11 @@ mod writer {
             Sink::Fail => Msg::Fail(line),
             Sink::Draw => Msg::Draw(line),
         };
-        let _ = sender().send(msg);
+        QUEUED.fetch_add(1, Ordering::Relaxed);
+        if sender().send(msg).is_err() {
+            // No writer to reach it, so it is not queued either.
+            QUEUED.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -666,10 +742,33 @@ unsafe fn bgra_present_stats_sse2(bgra: &[u8]) -> (usize, u8, usize, u8, [u8; 4]
     }
 }
 
-/// Same for tight RGBA8 (m2v encode output).
-pub fn rgba_rgb_stats(rgba: &[u8]) -> (usize, u8, [u8; 4]) {
+/// Same for tight RGBA8 (m2v encode output), plus the mean.
+///
+/// # Why a count of non-zero pixels was not enough
+///
+/// `rgb_nz` counts pixels with `max(R,G,B) > 0`, and that separates a surface
+/// with content from one that is black. It cannot separate a surface with
+/// content from one that is uniformly **white**, because both saturate it: a
+/// 1920x1080 store of live desktop and a 1920x1080 store of flat `0xff` both
+/// report about 2 073 600. The defect this rail is read for is a plane that
+/// comes up uniform white, so the one distinction the record could not make was
+/// the one being looked for -- ten labelled boots were scored on `rgb_nz` and
+/// the white and painted populations overlapped completely.
+///
+/// The mean makes it. Flat white is 255, and this rail's painted desktop
+/// measures near 100 in the same units, so the two are far apart and the
+/// comparison needs no threshold chosen in advance. It is the mean of the same
+/// per-pixel `max(R,G,B)` the other two fields are computed from, in the same
+/// pass, so the three cannot describe different pixels.
+///
+/// Accumulated in `u64`: a 4K surface has more pixels than `u32` can sum at 255
+/// each, and a saturating `u32` would report the brightest surfaces as darker
+/// than they are -- silently, and only for the largest ones.
+pub fn rgba_rgb_stats(rgba: &[u8]) -> RgbaRgbStats {
     let mut rgb_nz = 0usize;
     let mut max_rgb = 0u8;
+    let mut sum = 0u64;
+    let mut count = 0u64;
     let px0 = if rgba.len() >= 4 {
         [rgba[0], rgba[1], rgba[2], rgba[3]]
     } else {
@@ -683,8 +782,45 @@ pub fn rgba_rgb_stats(rgba: &[u8]) -> (usize, u8, [u8; 4]) {
         if m > max_rgb {
             max_rgb = m;
         }
+        sum += u64::from(m);
+        count += 1;
     }
-    (rgb_nz, max_rgb, px0)
+    RgbaRgbStats {
+        rgb_nz,
+        max_rgb,
+        px0,
+        // Zero pixels means no evidence about brightness, and 0 is the only
+        // answer that does not invent one. `rgb_nz` is 0 beside it, so a reader
+        // can tell an empty buffer from a black one.
+        //
+        // The quotient cannot exceed 255 -- every term summed is a `u8` and
+        // there are `count` of them -- so the narrowing is exact rather than
+        // saturating, and stating it as a `u8::try_from` keeps that an
+        // assertion instead of a silent truncation if the accumulation ever
+        // changes shape.
+        mean_rgb: sum
+            .checked_div(count)
+            .and_then(|m| u8::try_from(m).ok())
+            .unwrap_or(0),
+    }
+}
+
+/// What one tight RGBA8 buffer looks like, as the four numbers that travel
+/// together.
+///
+/// A tuple grew to four members and the third and fourth were both plausible
+/// as either position at a call site. Named fields make the emit sites read as
+/// what they print.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RgbaRgbStats {
+    /// Pixels with `max(R,G,B) > 0`.
+    pub rgb_nz: usize,
+    /// Largest `max(R,G,B)` over the buffer.
+    pub max_rgb: u8,
+    /// First pixel, RGBA.
+    pub px0: [u8; 4],
+    /// Mean `max(R,G,B)`; 255 is flat white and this rail's desktop is near 100.
+    pub mean_rgb: u8,
 }
 
 #[cfg(test)]
@@ -841,6 +977,46 @@ mod tests {
         assert_eq!(px0, [0, 0, 0, 255]);
     }
 
+    /// The writer's heartbeat is a census line, not a per-batch one.
+    ///
+    /// It is emitted from the writer's drain loop, which on a driven boot wakes
+    /// hundreds of times a second, so without this gate the beat would be a
+    /// flood in the file it exists to make readable — the same failure
+    /// `released_pages::note_levels` was built to avoid. A second's worth of
+    /// wake-ups yields one line.
+    #[test]
+    fn a_seconds_worth_of_writer_wakeups_beats_once() {
+        let base = 5_000u128;
+        assert!(
+            !writer_beat_due(base, base),
+            "no time has passed, so nothing is due"
+        );
+        let due = (1..1000)
+            .filter(|i| writer_beat_due(base, base + i))
+            .count();
+        assert_eq!(due, 0, "a wake-up inside the interval must not beat");
+        assert!(
+            writer_beat_due(base, base + u128::from(WRITER_BEAT_MS)),
+            "the wake-up that reaches the next interval beats"
+        );
+    }
+
+    /// An idle writer still beats, and it beats once per interval rather than
+    /// once per interval it slept through.
+    ///
+    /// This is the reading the whole line exists for: a device that has stopped
+    /// emitting must look different from a writer that has stopped writing, and
+    /// it only can if the beat survives silence.
+    #[test]
+    fn a_long_silence_is_still_due_exactly_once_per_interval() {
+        let base = 0u128;
+        assert!(writer_beat_due(base, base + 10_000), "silence is still due");
+        // The caller advances `last` to `now`, so the interval after a long
+        // silence is measured from the beat, not from the silence's start.
+        assert!(!writer_beat_due(10_000, 10_500));
+        assert!(writer_beat_due(10_000, 11_000));
+    }
+
     #[test]
     fn bgra_rgb_stats_gray_counts_pixels() {
         let mut bgra = vec![0u8; 8];
@@ -852,5 +1028,51 @@ mod tests {
         let (rgb_nz, max_rgb, _) = bgra_rgb_stats(&bgra);
         assert_eq!(rgb_nz, 1);
         assert_eq!(max_rgb, 100);
+    }
+
+    /// A flat white surface and a painted one are the two this record has to
+    /// tell apart, and the non-zero count cannot.
+    ///
+    /// This is the measurement written down: ten labelled boots of the
+    /// blank-field defect were scored on `rgb_nz` and the white and painted
+    /// populations overlapped completely, because both saturate a count of
+    /// pixels with any colour in them. The mean separates them by more than a
+    /// hundred, so no threshold has to be chosen in advance.
+    #[test]
+    fn a_flat_white_surface_is_distinguishable_from_a_painted_one_only_by_the_mean() {
+        let white = vec![0xff_u8; 4 * 64];
+        let mut painted = vec![0u8; 4 * 64];
+        for (i, px) in painted.chunks_exact_mut(4).enumerate() {
+            // Values in this rail's painted range, varied so the buffer is not
+            // itself flat -- a flat grey would make the test pass for the wrong
+            // reason.
+            px[0] = 90 + (i as u8 % 21);
+            px[1] = px[0];
+            px[2] = px[0];
+            px[3] = 0xff;
+        }
+
+        let w = rgba_rgb_stats(&white);
+        let p = rgba_rgb_stats(&painted);
+
+        assert_eq!(
+            w.rgb_nz, p.rgb_nz,
+            "the non-zero count cannot separate these, which is why the mean exists"
+        );
+        assert_eq!(w.mean_rgb, 255, "flat white is the top of the range");
+        assert!(
+            p.mean_rgb < 130,
+            "a painted desktop must land far below white: {}",
+            p.mean_rgb
+        );
+    }
+
+    /// An empty buffer reports no brightness rather than inventing one.
+    #[test]
+    fn an_empty_buffer_reports_a_zero_mean_beside_a_zero_count() {
+        let stats = rgba_rgb_stats(&[]);
+        assert_eq!(stats.mean_rgb, 0);
+        assert_eq!(stats.rgb_nz, 0);
+        assert_eq!(stats.px0, [0, 0, 0, 0]);
     }
 }

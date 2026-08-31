@@ -87,7 +87,7 @@ impl ResourcePools {
                         height: key.height.max(1),
                         depth: 1,
                     })
-                    .mip_levels(1)
+                    .mip_levels(key.mip_levels.max(1))
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
@@ -154,6 +154,25 @@ impl ResourcePools {
                 ctx.device.destroy_image(image, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStorageImage, e))
             })?;
+        // A guest format whose channels do not sit identically on its Vulkan
+        // format samples through a component mapping instead of being rewritten
+        // on the CPU. Only a *sampled* view may carry one: Vulkan requires the
+        // identity mapping on a storage-image view, and no format admitted to
+        // that role has a non-identity plan, so a storage key that somehow named
+        // one is a contradiction and is refused rather than built.
+        let plan = translate::pixel::storage_image_components(key.format);
+        let components = if key.sampled_only {
+            translate::pixel::vk_component_mapping(&plan)
+        } else {
+            if !crate::contract::pixel_format::swizzle_is_identity(&plan) {
+                ctx.device.free_memory(memory, None);
+                ctx.device.destroy_image(image, None);
+                return Err(DrawError::Unsupported(
+                    reason::DrawReason::StorageImageNeedsComponentMapping { format: key.format },
+                ));
+            }
+            translate::pixel::vk_component_mapping(&plan)
+        };
         let view = ctx
             .device
             .create_image_view(
@@ -161,7 +180,10 @@ impl ResourcePools {
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(color_subresource_range()),
+                    .components(components)
+                    .subresource_range(super::super::color_subresource_range_levels(
+                        key.mip_levels,
+                    )),
                 None,
             )
             .map_err(|e| {
@@ -565,16 +587,35 @@ impl ResourcePools {
         self.set_compute_sole_copy(identity, false)
     }
 
-    /// Pin/unpin a resident against LRU eviction (deferred-writeback content
-    /// whose only copy is the GPU image). No-op for an absent identity.
+    /// Pin/unpin a resident against removal while its content exists nowhere but
+    /// the GPU image. Answers whether a slot was there to pin.
+    ///
+    /// The bool exists for the same reason [`Self::pin_resident_target`]'s does:
+    /// the guest-write ledger records the pins it actually took, so a release can
+    /// never be handed out for a pin that was never taken. An absent identity is
+    /// not an error — there is then no image for anything to remove.
+    ///
+    /// # What this holds that `gpu_only_content` does not
+    ///
+    /// Both reclaim paths already skip a sole-copy resident, so a dispatch's own
+    /// output is safe from *allocation-pressure recovery* without any pin. The
+    /// window this closes is the other removal: a re-key.
+    /// [`Self::acquire_resident_storage_image`] destroys the held image when the
+    /// same identity arrives at a different shape, and
+    /// [`Self::compute_rekey_refusal`] is what stops it — and that refusal reads
+    /// `pinned`, nothing else. A compute writeback copying straight into guest
+    /// pages is submitted and not waited, so between the submit and the fence a
+    /// re-shaped dispatch would hand the queue a destroyed image.
     pub(crate) fn pin_resident_storage(
         &mut self,
         identity: &ComputeStorageResidencyKey,
         pinned: bool,
-    ) {
+    ) -> bool {
         if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
             resident.pinned = pinned;
+            return true;
         }
+        false
     }
 
     /// Generation of a resident compute storage image, if one is registered.
@@ -2716,9 +2757,27 @@ pub(super) mod pin_count_tests {
         }
 
         let levels = pools.registry_levels();
-        assert_eq!(levels.current, NonPinnedTotals { count: 3, bytes: 3072 });
-        assert_eq!(levels.recoverable, NonPinnedTotals { count: 1, bytes: 1024 });
-        assert_eq!(levels.pinned, NonPinnedTotals { count: 1, bytes: 1024 });
+        assert_eq!(
+            levels.current,
+            NonPinnedTotals {
+                count: 3,
+                bytes: 3072
+            }
+        );
+        assert_eq!(
+            levels.recoverable,
+            NonPinnedTotals {
+                count: 1,
+                bytes: 1024
+            }
+        );
+        assert_eq!(
+            levels.pinned,
+            NonPinnedTotals {
+                count: 1,
+                bytes: 1024
+            }
+        );
     }
 
     /// The window presenter blits a resident with no format conversion and no
@@ -3016,7 +3075,7 @@ pub(super) mod pin_count_tests {
     fn new_resident(framebuffer: vk::Framebuffer, render_pass: vk::RenderPass) -> NewResident {
         let framebuffer_compatibility = (framebuffer != vk::Framebuffer::null()).then(|| {
             crate::backend::vulkan::engine::caches::PassKey::single(
-                false,
+                crate::backend::vulkan::engine::caches::Color0Load::Clear,
                 translate::pixel::SCANOUT_FORMAT,
             )
             .framebuffer_compatibility()

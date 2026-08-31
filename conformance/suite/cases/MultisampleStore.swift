@@ -5,8 +5,18 @@ import Foundation
 /// encoder ends. Four unequal samples make preservation distinguishable from
 /// an implicit resolve, and the later command buffer forces the observation
 /// across the encoder/submission lifetime boundary.
+/// Both multisample-store cases run the same render and differ only in where the
+/// readback kernel's sample count comes from. See `read_ms_texels_host_count`
+/// for why that difference is worth two cases: one result line cannot say
+/// whether a device served the `texture2d_ms` bind, because a bind that was
+/// refused and a bind whose sample count came back as 1 both leave samples 1
+/// and up unwritten.
 func multisampleStoreCase() {
-    let label = "msaa4_color_store_no_resolve"
+    multisampleStoreCase(label: "msaa4_color_store_no_resolve", countFromTexture: true)
+    multisampleStoreCase(label: "msaa4_color_store_host_sample_count", countFromTexture: false)
+}
+
+func multisampleStoreCase(label: String, countFromTexture: Bool) {
     let w = 8, h = 8, samples = 4
     guard dev.supportsTextureSampleCount(samples) else {
         skip(label, "device does not report 4x texture sampling")
@@ -51,7 +61,8 @@ func multisampleStoreCase() {
     producer.commit()
     producer.waitUntilCompleted()
 
-    guard let got = readBackMultisample(texture, w, h, samples: samples) else {
+    guard let got = readBackMultisample(texture, w, h, samples: samples,
+                                        countFromTexture: countFromTexture) else {
         refused(label)
         return
     }

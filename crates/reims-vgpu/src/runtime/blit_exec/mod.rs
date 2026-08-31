@@ -52,6 +52,7 @@ use crate::runtime::fence_exec::{self, FenceStatus};
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
+use crate::runtime::mapper::RectStride;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
@@ -215,49 +216,6 @@ fn note_t5_decode_fail(sid: u32, bytes: &[u8]) {
         "blit t5_view_decode sid={sid} desc_len={} head_hex={hex}",
         bytes.len()
     ));
-}
-
-/// Dedup set for the `t2t_overlap` enrichment, keyed by `(task, src_ref, dst_ref)`.
-static T2T_OVERLAP_SEEN: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<(u32, u32, u32)>>,
-> = std::sync::OnceLock::new();
-
-/// Emit ONE always-on `blit t2t_overlap` line per distinct
-/// `(task, src_ref, dst_ref)` carrying the load-bearing overlap geometry so a
-/// genuine self-overlap (same allocation, live bytes collide — undefined in
-/// Metal, correctly rejected) can be told apart from a false positive.
-///
-/// The reject uses a COMPRESSED bounding span (`row_bytes*copy_h*copy_d`) that
-/// ignores `row_stride` gaps, so it can misjudge a strided sub-rect copy in
-/// either direction. Logging `row_bytes` vs `row_stride` and both offsets lets
-/// a future boot decide whether the check needs to become stride-precise.
-/// Deduped so a per-draw repeat cannot flood. Diagnostic only.
-#[allow(clippy::too_many_arguments)]
-fn note_t2t_overlap(
-    task_id: u32,
-    src_ref: u32,
-    dst_ref: u32,
-    src_off: u64,
-    dst_off: u64,
-    row_bytes: u64,
-    row_stride: u64,
-    copy_h: u64,
-    copy_d: u64,
-) -> bool {
-    let set = T2T_OVERLAP_SEEN.get_or_init(|| std::sync::Mutex::new(Default::default()));
-    if let Ok(mut g) = set.lock() {
-        if !g.insert((task_id, src_ref, dst_ref)) {
-            return false;
-        }
-    }
-    let span = row_bytes.saturating_mul(copy_h).saturating_mul(copy_d);
-    let strided = if row_bytes < row_stride { 1 } else { 0 };
-    crate::observe::fail(format!(
-        "blit t2t_overlap task={task_id} src_ref={src_ref} dst_ref={dst_ref} \
-         src_off={src_off} dst_off={dst_off} row_bytes={row_bytes} \
-         row_stride={row_stride} copy_h={copy_h} copy_d={copy_d} span={span} strided={strided}"
-    ));
-    true
 }
 
 /// `(task, side, format)` — what `repack_storage_assumed` reports once per.
@@ -1258,20 +1216,15 @@ fn read_texture_rect<M: HostMemory + HostOps>(
         return Err(br(BlitStatus::Capacity, "rd_rect_buf_cap"));
     }
     match tex {
-        TextureBacking::Linear(_) => {
-            for y in 0..row_count {
-                let at = (y * row_bytes) as usize;
-                read_texture_row(
-                    state,
-                    host,
-                    task_id,
-                    tex,
-                    origin,
-                    y,
-                    row_bytes,
-                    &mut buf[at..at + row_bytes as usize],
-                )?;
-            }
+        TextureBacking::Linear(t) => {
+            let (gva, rect) = linear_rect(t, origin, row_bytes, row_count, "rd_rect_linear_shape")?;
+            crate::runtime::gva_view::read_rect(state, host, task_id, gva, rect, buf)
+                .map_err(|_| br(BlitStatus::GuestIo, "rd_rect_linear_io"))?;
+            crate::runtime::drain::note_store_route("blit_rect_linear_read_walk");
+            crate::runtime::drain::note_store_route_n(
+                "blit_rect_linear_read_rows_hoisted",
+                row_count.saturating_sub(1),
+            );
             Ok(())
         }
         TextureBacking::Type11(t) => {
@@ -1296,6 +1249,59 @@ fn read_texture_rect<M: HostMemory + HostOps>(
             Ok(())
         }
     }
+}
+
+/// A linear level's rectangle as the GVA rail's own shape: where it starts and
+/// how its rows are laid out.
+///
+/// This is the linear endpoint's missing rect description. The type-11 endpoint
+/// has had one since it landed — [`mapping_write::write_rect_raw_at`] and
+/// friends — while the linear endpoint had only [`write_texture_row`] and
+/// [`read_texture_row`], so [`write_texture_rect`] and [`read_texture_rect`]
+/// each served a rectangle by re-entering the GVA rail `row_count` times. Every
+/// one of those re-entries walks the task page table afresh for a row of the
+/// same allocation, so all but the first re-derive an answer already in hand. A
+/// driven macos-13 boot charged that loop 906.7 ms of a 916.6 ms
+/// texture-to-texture rail across 118 464 rows — about 7.6 us for a 4 KiB row,
+/// which is the walk and not the bytes.
+///
+/// **The stride is the contract's, not an observation.**
+/// [`LinearTextureLevel::texel_offset`]'s `y` term is exactly `y * row_stride`,
+/// so consecutive rows of one rectangle are `row_stride` apart by construction.
+/// That makes the whole rectangle one [`RectStride`] over one span, which is
+/// what lets a single walk place every row.
+///
+/// Only the last row's offset is resolved alongside the first. That is not a
+/// two-endpoint sample of a range: `texel_offset` is affine and increasing in
+/// `y`, and its only `y` bound is `y < height`, so the largest `y` is the one
+/// that can fail and checking it checks them all.
+fn linear_rect(
+    t: &LinearTextureLevel,
+    origin: Point,
+    row_bytes: u64,
+    row_count: u64,
+    site: &'static str,
+) -> Result<(u64, RectStride), BlitStatus> {
+    let Point {
+        x: ox,
+        y: oy,
+        z: oz,
+    } = origin;
+    let last_y = oy
+        .checked_add(row_count.saturating_sub(1))
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    let first = t
+        .texel_offset(ox, oy, oz)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    t.texel_offset(ox, last_y, oz)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    let gva = t
+        .base_gva
+        .checked_add(first)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    let rect = RectStride::new(t.row_stride, row_bytes, row_count)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    Ok((gva, rect))
 }
 
 /// Write a whole `row_bytes`-wide, `row_count`-tall rectangle at `origin` from
@@ -1329,21 +1335,17 @@ fn write_texture_rect<M: HostMemory + HostOps>(
         return Err(br(BlitStatus::Capacity, "wr_rect_buf_cap"));
     }
     match tex {
-        TextureBacking::Linear(_) => {
-            for y in 0..row_count {
-                let at = (y * row_bytes) as usize;
-                write_texture_row(
-                    state,
-                    host,
-                    task_id,
-                    tex,
-                    origin,
-                    y,
-                    row_bytes,
-                    &buf[at..at + row_bytes as usize],
-                    allowed,
-                )?;
-            }
+        TextureBacking::Linear(t) => {
+            let (gva, rect) = linear_rect(t, origin, row_bytes, row_count, "wr_rect_linear_shape")?;
+            crate::runtime::gva_view::write_rect_within(
+                state, host, task_id, gva, rect, buf, allowed,
+            )
+            .map_err(|_| br(BlitStatus::GuestIo, "wr_rect_linear_io"))?;
+            crate::runtime::drain::note_store_route("blit_rect_linear_walk");
+            crate::runtime::drain::note_store_route_n(
+                "blit_rect_linear_rows_hoisted",
+                row_count.saturating_sub(1),
+            );
             Ok(())
         }
         TextureBacking::Type11(t) => {
@@ -3407,23 +3409,17 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         // onto themselves changes nothing, so succeed without work rather than
         // rejecting it as Overlap (which returned a spurious error to the guest
         // blit encoder and dropped a copy the guest treats as complete). A
-        // genuinely-shifted overlap (src_gva != dst_gva, undefined in Metal)
-        // still falls through to the reject below.
+        // genuinely-shifted overlap falls through to source-before-destination
+        // staging below.
         if src_gva == dst_gva && sl.row_stride == dl.row_stride && src_bpi == dst_bpi {
             return BlitStatus::Ok;
         }
         // Same allocation (self-copy or aliased view) but a different region:
-        // safe unless the source and destination TEXEL rectangles actually
-        // intersect. Two axis-aligned rectangles overlap iff they overlap on
-        // EVERY axis — the correct model when src/dst share the texel layout
-        // (same row stride + per-image stride, guaranteed for a same-texture
-        // self-copy). The prior byte-span test collapsed row_stride into one
-        // contiguous span and produced phantom overlaps for strided sub-rect
-        // column copies: a 1-wide column shifted N texels right (live: src_off=0
-        // dst_off=64, 4-byte rows 1024 apart) never collides row-to-row, yet the
-        // span test flagged it and dropped a legitimate copy. If the layouts
-        // differ (exotic aliased views with mismatched strides), texel grids are
-        // incomparable — keep the conservative byte-span reject there.
+        // direct row-by-row execution is safe only when the source and
+        // destination texel rectangles do not intersect. Two axis-aligned
+        // rectangles overlap iff they overlap on every axis. If the layouts
+        // differ, their texel grids are incomparable, so the byte spans give
+        // the conservative answer.
         if sl.base_gva == dl.base_gva {
             let same_layout = sl.row_stride == dl.row_stride && src_bpi == dst_bpi;
             let overlaps = if same_layout {
@@ -3444,18 +3440,88 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                 )
             };
             if overlaps {
-                note_t2t_overlap(
+                // The serialized copy record carries the complete source and
+                // destination regions and does not define an overlap refusal.
+                // Snapshot every source plane before writing any destination
+                // plane: a row-at-a-time loop can overwrite bytes a later row
+                // or depth plane still has to read.
+                let plane_bytes = match row_bytes.checked_mul(copy_h) {
+                    Some(v) => v,
+                    None => return br(BlitStatus::Capacity, "t2t_overlap_plane_overflow"),
+                };
+                let total_bytes = match plane_bytes.checked_mul(copy_d) {
+                    Some(v) => v,
+                    None => return br(BlitStatus::Capacity, "t2t_overlap_total_overflow"),
+                };
+                let Some(total_len) = host_alloc_len(total_bytes) else {
+                    return br(BlitStatus::Capacity, "t2t_overlap_alloc");
+                };
+                let allowed = match texture_region_window(
+                    state,
+                    host,
                     task_id,
-                    cmd.source,
-                    cmd.destination,
-                    src_off,
-                    dst_off,
-                    row_bytes,
-                    sl.row_stride,
+                    &dst,
+                    Point {
+                        x: dox,
+                        y: doy,
+                        z: doz,
+                    },
+                    copy_w as u32,
                     copy_h,
                     copy_d,
+                    copy_bpp,
+                ) {
+                    Ok(v) => v,
+                    Err(st) => return st,
+                };
+                let mut staged = vec![0u8; total_len];
+                for z in 0..copy_d {
+                    let start = (z * plane_bytes) as usize;
+                    let end = start + plane_bytes as usize;
+                    if let Err(st) = read_texture_rect(
+                        state,
+                        host,
+                        task_id,
+                        &src,
+                        Point {
+                            x: sox,
+                            y: soy,
+                            z: soz + z,
+                        },
+                        row_bytes,
+                        copy_h,
+                        &mut staged[start..end],
+                    ) {
+                        return st;
+                    }
+                }
+                for z in 0..copy_d {
+                    let start = (z * plane_bytes) as usize;
+                    let end = start + plane_bytes as usize;
+                    if let Err(st) = write_texture_rect(
+                        state,
+                        host,
+                        task_id,
+                        &dst,
+                        Point {
+                            x: dox,
+                            y: doy,
+                            z: doz + z,
+                        },
+                        row_bytes,
+                        copy_h,
+                        &staged[start..end],
+                        allowed.as_ref(),
+                    ) {
+                        return st;
+                    }
+                }
+                crate::runtime::drain::note_store_route("blit_t2t_overlap_staged");
+                crate::runtime::drain::note_store_route_n(
+                    "blit_t2t_overlap_staged_bytes",
+                    total_bytes,
                 );
-                return br(BlitStatus::Overlap, "t2t_overlap");
+                return BlitStatus::Ok;
             }
         }
         return match copy_row_region(
@@ -3503,6 +3569,36 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // slice/level form carried, and there a driven Maps leg charged the row loop
     // 30.15 s of a 30.28 s rail. See [`read_texture_rect`] for what a per-row
     // call into the mapping rail re-pays.
+    // Whether a GPU-side copy serves this pair, and if not, which term stops it.
+    // `engine::copy_target_to_guest_pages` takes no source rectangle: it copies
+    // level 0 of the resident whole, at origin zero, into a destination whose
+    // geometry is the resident's own. So a type-11 source going to a linear
+    // destination is reachable only when both ends are the whole plane at the
+    // origin, and the three counters partition the population so a reading says
+    // how much of it that is. See [`try_copy_t11_plane_to_linear_on_gpu`] for
+    // what the arm below is instead of, which is the settle the staging loop
+    // pays to make the source's guest bytes readable.
+    if src.is_type11() && !dst.is_type11() {
+        let whole_src =
+            sox == 0 && soy == 0 && copy_w == src.width() as u64 && copy_h == src.height() as u64;
+        let whole_dst =
+            dox == 0 && doy == 0 && copy_w == dst.width() as u64 && copy_h == dst.height() as u64;
+        crate::runtime::drain::note_store_route(match (whole_src, whole_dst) {
+            (true, true) => "blit_t2t_t11_whole_plane",
+            (true, false) => "blit_t2t_t11_dst_partial",
+            (false, _) => "blit_t2t_t11_src_partial",
+        });
+        #[cfg(feature = "backend-vulkan")]
+        if whole_src && whole_dst {
+            if let (TextureBacking::Type11(s), TextureBacking::Linear(d)) = (&src, &dst) {
+                if let Some(status) =
+                    try_copy_t11_plane_to_linear_on_gpu(state, host, task_id, cmd.destination, s, d)
+                {
+                    return status;
+                }
+            }
+        }
+    }
     let t2t_stage_started = std::time::Instant::now();
     let mut staged = vec![0u8; row_bytes.saturating_mul(copy_h) as usize];
     for z in 0..copy_d {
@@ -3908,6 +4004,219 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     _cmd: &Command,
 ) -> Option<BlitStatus> {
     None
+}
+
+/// Why one whole-plane type-11 to guest-linear copy is not the GPU arm's, for
+/// the terms that can be decided from the two endpoints alone.
+///
+/// Every variant is a **fall-through and not a loss**: the staging loop runs
+/// unchanged and lands the same pixels. They are counters for that reason, and
+/// with `t2t_gpu_src_not_resident`, `t2t_gpu_dst_unbounded`,
+/// `t2t_gpu_engine_declined` and `t2t_gpu_landed` they partition
+/// `blit_t2t_t11_whole_plane`, so a census that does not add up is the bug.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum T2tGvaRefusal {
+    /// The source names no mapping this device holds, or one that has not
+    /// declared its geometry, so there is no surface identity to ask about.
+    NoSurface,
+    /// The source is a plane of a larger surface, or disagrees with the mapping
+    /// about the surface's size. The resident is keyed by the mapping's own
+    /// geometry and this copy lands it whole, so anything but the whole surface
+    /// would land it into a window that is not the whole of it.
+    SrcNotWholeSurface,
+    /// The destination level's own base does not resolve.
+    DstOffsetOverflow,
+    /// The destination's pitch does not fit the guest's own 32-bit declaration
+    /// of one.
+    DstStrideWide,
+    /// The destination has no byte-copy geometry — the plane's own typed
+    /// reason, carried whole so a reading names the same check the copy would
+    /// have named.
+    DstPlane(crate::runtime::render_writeback::GvaWritebackDecline),
+    /// The plane runs past the allocation the level lives in.
+    DstExtentOob,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl T2tGvaRefusal {
+    fn route(&self) -> &'static str {
+        match self {
+            Self::NoSurface => "t2t_gpu_no_surface",
+            Self::SrcNotWholeSurface => "t2t_gpu_src_not_whole_surface",
+            Self::DstOffsetOverflow => "t2t_gpu_dst_offset_overflow",
+            Self::DstStrideWide => "t2t_gpu_dst_stride_wide",
+            Self::DstPlane(_) => "t2t_gpu_dst_plane",
+            Self::DstExtentOob => "t2t_gpu_dst_extent_oob",
+        }
+    }
+}
+
+/// The destination plane a whole-plane type-11 to guest-linear copy would write,
+/// and its span, or the typed reason there is none.
+///
+/// Everything [`try_copy_t11_plane_to_linear_on_gpu`] can decide before it asks
+/// the engine anything or walks the guest's page table, which is also everything
+/// about it that a test can reach without a GPU. `surface` is the mapping's own
+/// declared geometry and `None` when it has none.
+#[cfg(feature = "backend-vulkan")]
+fn gpu_t2t_gva_plane(
+    surface: Option<(u32, u32)>,
+    src: &Type11Texture,
+    dst: &LinearTextureLevel,
+    destination_ref: u32,
+) -> Result<
+    (
+        crate::runtime::render_writeback::GvaPlaneDestination,
+        crate::runtime::render_writeback::GvaPlaneGeometry,
+    ),
+    T2tGvaRefusal,
+> {
+    let Some((sw, sh)) = surface else {
+        return Err(T2tGvaRefusal::NoSurface);
+    };
+    if sw != src.width || sh != src.height || src.surface_offset != 0 || sw == 0 || sh == 0 {
+        return Err(T2tGvaRefusal::SrcNotWholeSurface);
+    }
+    // The destination plane, from the level the blit resolved. Origin zero on
+    // both ends is the caller's admission, so this is the level's own base.
+    let Some(level_base) = dst.texel_offset(0, 0, 0) else {
+        return Err(T2tGvaRefusal::DstOffsetOverflow);
+    };
+    let Some(target_gva) = dst.base_gva.checked_add(level_base) else {
+        return Err(T2tGvaRefusal::DstOffsetOverflow);
+    };
+    let Ok(row_stride) = u32::try_from(dst.row_stride) else {
+        return Err(T2tGvaRefusal::DstStrideWide);
+    };
+    let plane = crate::runtime::render_writeback::GvaPlaneDestination {
+        target_gva,
+        width: dst.width,
+        height: dst.height,
+        row_stride,
+        format: dst.pixel_format,
+        texture_ref: destination_ref,
+    };
+    // The span to walk, from the destination's own terms, so the licence covers
+    // exactly the bytes the copy writes and not one page more.
+    let geometry = plane.geometry().map_err(T2tGvaRefusal::DstPlane)?;
+    // Against the allocation and not against the span: a copy that runs off the
+    // level's own bytes is the class `texture_region_window` bounds the host
+    // path with, and this arm owes the same check before it walks anything.
+    if !range_fits(level_base, geometry.extent, dst.alloc_size) {
+        return Err(T2tGvaRefusal::DstExtentOob);
+    }
+    Ok((plane, geometry))
+}
+
+/// The whole-plane copy out of an IOSurface the GPU already holds, into a
+/// guest-linear destination, issued by the GPU.
+///
+/// # What this is instead of
+///
+/// The host path below reads the source through the mapping rail and writes the
+/// destination through the GVA rail. Reading the source's *guest bytes* is what
+/// makes it expensive, and the cost is not the copy: a mapping read must first
+/// settle, which pays the surface's writeback debt and then waits for this
+/// device's own submitted writes to land in those pages. On a driven macos-13
+/// x86 boot that settle was 91 % of the staging window and the memcpy behind it
+/// was 4.5 %.
+///
+/// None of it is owed here. The source's authoritative content is the engine's
+/// resident, the destination is a plane of guest pages, and
+/// `engine::copy_target_to_guest_pages` moves exactly that — so this arm never
+/// touches the source's guest bytes and has nothing to wait for. What the guest
+/// asked for is `copyFromTexture:toTexture:`, a blit-encoder command with no
+/// host visibility; making the source CPU-readable is `synchronizeResource:`,
+/// which is a different call the guest did not make.
+///
+/// # Why it is only the whole plane
+///
+/// `copy_target_to_guest_pages` takes no source rectangle: it copies level 0 of
+/// the resident whole, at origin zero. So a partial rect on either end is not
+/// this arm's, and the caller's census — which partitions the population — is
+/// what says how much of it that leaves. On the boot above it left all of it:
+/// 511 of 511.
+///
+/// Returns `None` for every fall-through, having named it on a counter. The
+/// caller then runs the host path unchanged, so nothing here can lose a frame —
+/// only spend one.
+#[cfg(feature = "backend-vulkan")]
+fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    destination_ref: u32,
+    src: &Type11Texture,
+    dst: &LinearTextureLevel,
+) -> Option<BlitStatus> {
+    use crate::runtime::drain::note_store_route;
+    let surface = state
+        .mappings
+        .get(&src.mapping_id)
+        .filter(|m| m.has_geom)
+        .map(|m| (m.width, m.height));
+    let (plane, geometry) = match gpu_t2t_gva_plane(surface, src, dst, destination_ref) {
+        Ok(v) => v,
+        Err(refusal) => {
+            note_store_route(refusal.route());
+            return None;
+        }
+    };
+    let identity = crate::runtime::present_identity::surface_identity(
+        state,
+        src.mapping_id,
+        src.width,
+        src.height,
+    );
+    if matches!(
+        crate::backend::vulkan::engine::resident_content_backing(&identity),
+        crate::backend::vulkan::engine::ResidentContentBacking::NotReady
+    ) {
+        // The source's bytes are its guest pages' bytes already, so the host
+        // path is reading what it should and is the cheap arm rather than the
+        // wasteful one.
+        note_store_route("t2t_gpu_src_not_resident");
+        return None;
+    }
+    // The destination's pages, captured once. The host path's `dest_window`
+    // takes the same walk for the same reason — the guest's vCPUs run
+    // throughout, so the licence must be the walk the command itself was
+    // authorised by rather than whatever the address names later.
+    let gpas = gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        plane.target_gva,
+        geometry.extent,
+        state.page_shift,
+    );
+    if gpas.is_empty() {
+        note_store_route("t2t_gpu_dst_unbounded");
+        return None;
+    }
+    let pages = crate::runtime::draw::StoreTargetPages::from_ordered(&gpas, geometry.extent);
+    match crate::runtime::render_writeback::copy_resident_into_gva_plane(
+        state,
+        host,
+        task_id,
+        &identity,
+        &plane,
+        Some(&pages),
+    ) {
+        Ok(_) => {
+            note_store_route("t2t_gpu_landed");
+            Some(BlitStatus::Ok)
+        }
+        Err(decline) => {
+            note_store_route("t2t_gpu_engine_declined");
+            crate::observe::off(format!(
+                "blit_gpu_gva mid={} {}x{} decline={decline:?}",
+                src.mapping_id, dst.width, dst.height
+            ));
+            None
+        }
+    }
 }
 
 /// Zero `slice_count` or `level_count` is a Metal no-op ([`BlitStatus::ZeroExtent`]).

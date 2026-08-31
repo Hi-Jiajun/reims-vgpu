@@ -248,6 +248,17 @@ pub enum DrawReason {
     NoDeviceLocalMemoryForStorageImage {
         memory_type_bits: u32,
     },
+    /// A storage-image view was asked for a format whose channels need a
+    /// component mapping.
+    ///
+    /// Vulkan requires the identity mapping on a storage-image view, and no
+    /// format the contract admits to that role has a non-identity plan — the one
+    /// that does, `A8Unorm`, has no storage selector at all. So this pairing is
+    /// a contradiction rather than a capability gap, and the view is refused
+    /// instead of built with the guest's channels in the wrong places.
+    StorageImageNeedsComponentMapping {
+        format: crate::backend::vulkan::engine::types::StorageImageFormat,
+    },
     /// No device-local memory type for a shared optimal-image slab.
     NoDeviceLocalMemoryForSlab {
         memory_type_bits: u32,
@@ -365,6 +376,9 @@ impl crate::observe::Decline for DrawReason {
             Self::NoHostVisibleMemoryForStats { .. } => "no_host_visible_memory_for_stats",
             Self::NoDeviceLocalMemoryForStorageImage { .. } => {
                 "no_device_local_memory_for_storage_image"
+            }
+            Self::StorageImageNeedsComponentMapping { .. } => {
+                "storage_image_needs_component_mapping"
             }
             Self::NoDeviceLocalMemoryForSlab { .. } => "no_device_local_memory_for_slab",
             Self::NoDeviceLocalMemoryForMrtSecondary { .. } => {

@@ -263,9 +263,10 @@ impl crate::observe::Decline for QemuHostDecline {
                     MapPagesFailure::ReservationFailed { host_errno } => {
                         ("reservation", None, *host_errno)
                     }
-                    MapPagesFailure::AliasFailed { page_index, host_errno } => {
-                        ("alias", Some(*page_index), *host_errno)
-                    }
+                    MapPagesFailure::AliasFailed {
+                        page_index,
+                        host_errno,
+                    } => ("alias", Some(*page_index), *host_errno),
                     MapPagesFailure::InvalidGuestPage { page_index } => {
                         ("invalid_guest_page", Some(*page_index), 0)
                     }

@@ -126,6 +126,22 @@ pub const PUSH_DESCRIPTORS: &str = "REIMS_VGPU_PUSH_DESCRIPTORS";
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 
+/// Write every AIR blob this device translates to `/tmp/reims-vgpu-air/`,
+/// named by the SPIR-V its translation produced.
+///
+/// Diagnostic capture for handing a translator defect over. `bugs/` wants the
+/// AIR that reproduces a defect, and the two places a defect shows up — a
+/// driver call that does not return, and a module the validator rejects — both
+/// know the emitted SPIR-V and neither knows the AIR that produced it. This is
+/// the join: the file name carries the emitted word count, which is what a
+/// quarantine line and a validator complaint both quote.
+///
+/// It observes and never decides. Translation, caching, and every guest-visible
+/// branch run exactly as they do with it unset; a write that fails costs its
+/// file and nothing else. Off by default because a driven boot translates a few
+/// hundred distinct shaders and some are megabytes.
+pub const AIR_CAPTURE: &str = "REIMS_VGPU_AIR_CAPTURE";
+
 /// Setting this off makes a completion stamp that follows a guest-page writeback
 /// block the drain worker on that writeback and then write the stamp word
 /// itself, instead of recording the word into the same GPU queue behind the
@@ -1191,7 +1207,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 26] = [
+pub const ALL: [&str; 27] = [
     COLOR_GENERAL,
     LAZY_WRITEBACK,
     SLAB_RETAIN,
@@ -1206,6 +1222,7 @@ pub const ALL: [&str; 26] = [
     GUEST_IMPORT,
     PUSH_DESCRIPTORS,
     DRAW_LOG,
+    AIR_CAPTURE,
     GPU_STAMP,
     PAGE_GUARDS,
     RANGE_COVERAGE,

@@ -23,6 +23,8 @@ let readPipe = pipeline("read_texels")
 
 let readMultisamplePipe = pipeline("read_ms_texels")
 
+let readMultisampleHostCountPipe = pipeline("read_ms_texels_host_count")
+
 let samplePipe = pipeline("sample_texels")
 
 let levelPipe = pipeline("read_level")
@@ -142,7 +144,8 @@ func readBack(_ pipe: MTLComputePipelineState,
 /// image cannot look like a valid four-sample store.
 func readBackMultisample(_ tex: MTLTexture,
                          _ w: Int, _ h: Int,
-                         samples: Int) -> [UInt32]? {
+                         samples: Int,
+                         countFromTexture: Bool = true) -> [UInt32]? {
     let count = w * h * samples
     let out = dev.makeBuffer(length: count * 4, options: .storageModeShared)!
     memset(out.contents(), 0xEE, count * 4)
@@ -150,7 +153,8 @@ func readBackMultisample(_ tex: MTLTexture,
     memset(ran.contents(), 0, 4)
     let cb = queue.makeCommandBuffer()!
     let enc = cb.makeComputeCommandEncoder()!
-    enc.setComputePipelineState(readMultisamplePipe)
+    enc.setComputePipelineState(
+        countFromTexture ? readMultisamplePipe : readMultisampleHostCountPipe)
     enc.setTexture(tex, index: 0)
     enc.setBuffer(out, offset: 0, index: 0)
     var width = UInt32(w)

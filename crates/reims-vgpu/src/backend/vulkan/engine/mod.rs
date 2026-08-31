@@ -54,7 +54,7 @@ pub mod vk_call;
 mod window_present;
 
 pub use context::MAX_DEVICE_RECREATES;
-pub(crate) use counters::{CounterSnapshot, EngineCounters};
+pub(crate) use counters::{CounterSnapshot, EngineCounters, TargetReadDelivery};
 pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
 pub(crate) use facade_decline::EngineFacadeDecline;
@@ -62,18 +62,19 @@ pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue,
-    ColorWriteMask, ComputeBufferResource, ComputeOutput, ComputeRequest,
-    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeStorageImageResource,
-    ComputeStorageResidency, CullMode, DepthClipMode, DepthState, DrawError, DrawOutput,
-    DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking, GuestTargetBacking,
-    GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
-    PrimitiveTopology, SampledByteOrigin, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
-    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
-    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
-    COLOR_INPUT_BINDING,
+    ColorWriteMask, ComputeBufferResource, ComputeDispatch, ComputeDispatchPayload,
+    ComputeDispatchRegion, ComputeImageDestination, ComputeImageResult, ComputeOutput,
+    ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+    ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
+    GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
+    PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
+    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
+    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, StorageImageFormat, TargetIdentity, TargetKeyDivergence,
+    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
+    VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
@@ -97,10 +98,21 @@ use types::ComputeError;
 /// writing it out again. Callers with a real array range or a depth aspect
 /// still spell theirs out; those are saying something.
 pub(crate) fn color_subresource_range() -> ash::vk::ImageSubresourceRange {
+    color_subresource_range_levels(1)
+}
+
+/// [`color_subresource_range`] over a whole mip pyramid rather than one level.
+///
+/// A transition that names fewer levels than the image has leaves the rest in
+/// `UNDEFINED`, and a later read of one of those levels is reading a layout
+/// nothing put content into. Every barrier on a multi-level image therefore
+/// takes this, and the single-level spelling above is this with `1` so the two
+/// cannot describe different things.
+pub(crate) fn color_subresource_range_levels(levels: u32) -> ash::vk::ImageSubresourceRange {
     ash::vk::ImageSubresourceRange {
         aspect_mask: ash::vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
-        level_count: 1,
+        level_count: levels.max(1),
         base_array_layer: 0,
         layer_count: 1,
     }
@@ -2408,9 +2420,7 @@ pub fn retire_guest_import(
     import_id: crate::runtime::guest_ram::ImportId,
 ) -> Option<(usize, usize)> {
     let mut guard = lock_engine();
-    let Some(device) = guard.owner.ctx.as_ref().map(|ctx| ctx.device.clone()) else {
-        return None;
-    };
+    let device = guard.owner.ctx.as_ref().map(|ctx| ctx.device.clone())?;
     let alias = guard.pools.host_ram_import_alias(import_id);
     unsafe { guard.pools.retire_guest_import(&device, import_id) };
     alias
@@ -3264,7 +3274,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
             ReadbackDelivery::Lease,
         )?;
         pools.registry_note_access(identity, read_access);
-        counters.note_target_read(rb_size);
+        counters.note_target_read(rb_size, TargetReadDelivery::Host);
         Ok(match delivered {
             ReadbackResult::Leased { token, ptr, len } => Some(LeasedFrame {
                 token,
@@ -3526,9 +3536,63 @@ pub fn copy_target_to_guest_pages(
     }
     if shared_backing_settles(snap.guest_backing, dst.shared_backing) {
         crate::runtime::drain::note_store_route("target_sync_shared_backing");
-        record_guest_write_debt(pools, identity, pages);
+        record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(identity), pages);
         return Ok(());
     }
+    unsafe {
+        let plan = plan_guest_copy(ctx, pools, counters, dst)?;
+        copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
+        pools.registry_note_access(
+            identity,
+            pools::ResidentAccess::transfer_read(snap.guest_backing.is_some()),
+        );
+        // The copy above is `vkCmdCopyImageToBuffer` into the guest's own
+        // imported pages, so these bytes are the host readback this rail elides
+        // rather than one it paid.
+        counters.note_target_read(
+            u64::from(dst.width) * u64::from(dst.height) * 4,
+            TargetReadDelivery::GuestPagesOnGpu,
+        );
+    }
+    // Past the last fallible step, so this runs exactly when the copy is on the
+    // queue. The ledger takes the resident's pin itself here — the caller holds
+    // none, and `finish` clears `gpu_only_content` as soon as this returns, so
+    // between that and the settle the pin is all that keeps the reclaim off an
+    // image the submitted copy still reads. Safe to leave until the end rather
+    // than guarding every early return above, because the whole body runs under
+    // the engine lock and a reclaim needs the same lock: nothing can take the
+    // image while this function is running, only after it returns.
+    record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(identity), pages);
+    Ok(())
+}
+
+/// Build the copy plan that lands one frame in a guest-page destination.
+///
+/// # Why this is the half both rails share
+///
+/// Nothing here names a source. The plan is a description of the *destination* —
+/// where the guest's bytes are, how its rows are pitched, and which of the two
+/// forms can write them — so it is derived from [`GuestPageTarget`] and the
+/// pools alone. What differs between a draw and a compute dispatch is only the
+/// image the plan is later recorded against, and which command buffer records
+/// it.
+///
+/// That split is why the compute rail can reuse this rather than growing a
+/// second spelling of the same routing: `copy_target_to_guest_pages` cannot be
+/// called from a dispatch — it resolves its source through the render-target
+/// registry, which a compute storage image is not in, and it opens a command
+/// buffer the dispatch already holds — but neither of those objections reaches
+/// this function.
+///
+/// The region and dispatch counters are bumped here because they count the
+/// plan, not the recording, and a caller that planned and then failed to record
+/// still consumed the pool slots they describe.
+unsafe fn plan_guest_copy(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &counters::EngineCounters,
+    dst: &GuestPageTarget,
+) -> Result<GuestCopyPlan, DrawError> {
     unsafe {
         // Dense rows are the common case and the cheap one; a padded pitch
         // falls to the rectangle path, which is the only form that can leave
@@ -3541,18 +3605,23 @@ pub fn copy_target_to_guest_pages(
             // held in `gather_live` and returned by the ring, so both of those
             // are properties of the pool rather than of a caller's promise.
             //
-            // Sized by `have` and not `need`. The detile writes `need` bytes
-            // from offset 0, but the scatter below reads one range per run and
-            // those sum to `have` — and the check above only establishes
-            // `need <= have`, so `need` is the smaller of the two. They are in
-            // fact equal wherever this branch is taken, because dense rows make
-            // `extent_end` the same tight frame `references_for_runs` tiled;
-            // that is a coincidence of two separately-derived numbers, not a
-            // stated relation, and sizing by the one the copies actually read
-            // costs nothing and does not depend on it holding.
+            // Sized by `window_bytes` and not `extent_end`. The detile writes
+            // `extent_end` bytes from offset 0, but the scatter below reads one
+            // range per run and those sum to `window_bytes` — and a caller only
+            // establishes `extent_end <= window_bytes`, so the extent is the
+            // smaller of the two. They are in fact equal wherever this branch is
+            // taken, because dense rows make `extent_end` the same tight frame
+            // `references_for_runs` tiled; that is a coincidence of two
+            // separately-derived numbers, not a stated relation, and sizing by
+            // the one the copies actually read costs nothing and does not depend
+            // on it holding.
+            //
+            // The relation itself is the caller's to check, because it is the
+            // caller that knows what the destination was built from and can name
+            // the refusal — see `GuestWriteDecline::WindowTooSmall`.
             let scratch = pools.acquire_guest_gather(
                 ctx,
-                have,
+                dst.window_bytes(),
                 ash::vk::BufferUsageFlags::empty(),
                 counters,
             )?;
@@ -3599,23 +3668,8 @@ pub fn copy_target_to_guest_pages(
         counters
             .guest_write_dispatches
             .fetch_add(plan.dispatches(), Ordering::Relaxed);
-        copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
-        pools.registry_note_access(
-            identity,
-            pools::ResidentAccess::transfer_read(snap.guest_backing.is_some()),
-        );
-        counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
+        Ok(plan)
     }
-    // Past the last fallible step, so this runs exactly when the copy is on the
-    // queue. The ledger takes the resident's pin itself here — the caller holds
-    // none, and `finish` clears `gpu_only_content` as soon as this returns, so
-    // between that and the settle the pin is all that keeps the reclaim off an
-    // image the submitted copy still reads. Safe to leave until the end rather
-    // than guarding every early return above, because the whole body runs under
-    // the engine lock and a reclaim needs the same lock: nothing can take the
-    // image while this function is running, only after it returns.
-    record_guest_write_debt(pools, identity, pages);
-    Ok(())
 }
 
 /// Synchronize a resident that is already backed by its guest allocation.
@@ -3656,12 +3710,53 @@ fn shared_backing_settles(
 /// Both a queued image-to-buffer copy and rendering into shared backing owe the
 /// same completion rule: guest code must not observe its completion stamp until
 /// the queue has finished writing these pages.
+/// What a recorded guest-page write must keep alive until it lands.
+///
+/// A copy that is submitted and not waited leaves its source image readable by
+/// the queue for as long as the fence is unsignalled, so something has to stop
+/// the reclaim paths taking it. There are exactly three answers in this device
+/// and they are not interchangeable, which is why this is an enum rather than an
+/// `Option<&TargetIdentity>`: an `Option` would let a caller mean "no pin
+/// needed" and "I forgot the identity" with the same `None`.
+///
+/// The two pinned arms name two different registries and the pin is taken in the
+/// registry that owns the image, not in whichever one the caller happened to
+/// have a key for. Both release through the same ring cleanup, because both are
+/// answering the same question — what holds this image to the fence.
+#[derive(Clone, Copy)]
+pub(super) enum GuestWriteSource<'a> {
+    /// A resident render target, or a resident compute storage image reached
+    /// through the target registry. The ledger takes the pin itself and releases
+    /// it when the submission's slot retires — between `finish` clearing
+    /// `gpu_only_content` and the settle, that pin is all that keeps a reclaim
+    /// off an image the submitted copy still reads.
+    ResidentTarget(&'a TargetIdentity),
+    /// A registered compute-storage resident, keyed in `compute_storage_registry`.
+    ///
+    /// The reclaim paths already skip it while `gpu_only_content` holds, so what
+    /// the pin closes here is the *re-key*: `acquire_resident_storage_image`
+    /// destroys the held image when the same identity arrives at a new shape, and
+    /// `compute_rekey_refusal` — the only thing that stops it — reads `pinned`.
+    /// See `ResourcePools::pin_resident_storage`.
+    ResidentStorage(&'a crate::model::ComputeStorageResidencyKey),
+    /// A transient image sealed into this submission's own ring entry.
+    ///
+    /// The ring is the lifetime: a slot with cleanup parked on it cannot be
+    /// reused until its fence has signalled and `drain_cleanup` has run, and
+    /// only then is the image returned to the free pool. That holds for the
+    /// whole window a submitted-not-landed copy needs, so there is nothing left
+    /// for a pin to do. It is *not* the right answer for anything reached
+    /// through a residency registry, which is popped out of the ring's live set
+    /// at acquire time and is therefore reclaimable while the fence still runs.
+    RingEntry,
+}
+
 pub(super) fn record_guest_write_debt(
     pools: &mut pools::ResourcePools,
-    identity: &TargetIdentity,
+    source: GuestWriteSource<'_>,
     pages: &[u64],
 ) {
-    pools.note_guest_write_recorded(identity);
+    pools.note_guest_write_recorded(source);
     // Before the flag and under the same lock: a reader that observes the flag
     // set must observe a footprint that already names this write, or it would be
     // told "disjoint" about pages this write is landing in.
@@ -3678,9 +3773,102 @@ pub(super) fn record_guest_write_footprint_debt(
     identity: &TargetIdentity,
     footprint: &crate::runtime::guest_ram::GuestPageFootprint,
 ) {
-    pools.note_guest_write_recorded(identity);
+    pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(identity));
+    note_store_destination(footprint);
     arm_guest_write_footprint(footprint);
     GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// The destination a resident store publishes into, reported when it changes.
+///
+/// The counterpart to `present_field_witness`'s page span, and the two exist to
+/// be read against each other. A boot in which the presented plane's field is
+/// uniform while stores keep publishing has two candidate readings -- the
+/// content stored is itself uniform, or the store and the present disagree about
+/// which guest pages the plane is -- and the second is settled by comparing the
+/// page set a store lands in with the page set the present reads. Both numbers
+/// were already inside this device and neither was emitted beside the other.
+///
+/// Reported on change rather than per store because it is the destination that
+/// is the question, and it moves rarely: this rail records hundreds of stores
+/// per second into a handful of surfaces, so a per-store line would be a flood
+/// that says the same thing. Recorded here, in the function that arms the
+/// ledger, so the destination named and the destination armed cannot drift.
+/// Whether this store publishes into a different allocation than the last one
+/// reported.
+///
+/// Allocation identity, not page values: a page list can be recycled, so equal
+/// addresses do not mean the same surface, and `same_allocation` is the identity
+/// the outstanding-write ledger already deduplicates on. Split out from the
+/// emitter so the suppression rule can be stated as a test rather than inferred
+/// from the shape of a log.
+fn store_destination_changed(
+    last: Option<&crate::runtime::guest_ram::GuestPageFootprint>,
+    now: &crate::runtime::guest_ram::GuestPageFootprint,
+) -> bool {
+    !matches!(last, Some(l) if l.same_allocation(now))
+}
+
+#[cfg(test)]
+mod store_destination_tests {
+    use super::*;
+    use crate::runtime::guest_ram::GuestPageFootprint;
+
+    fn fp(pages: &[u64]) -> GuestPageFootprint {
+        GuestPageFootprint::new(pages.into(), 0x1000).expect("valid footprint")
+    }
+
+    #[test]
+    fn a_recycled_page_list_is_a_new_destination_and_a_retained_one_is_not() {
+        let first = fp(&[0x1000, 0x2000]);
+        // The same retained allocation, cloned the way the resident hands it to
+        // the ledger. Reporting this again would be the flood the suppression
+        // exists to stop.
+        assert!(
+            !store_destination_changed(Some(&first), &first.clone()),
+            "a retained allocation is the same destination"
+        );
+        // The same page addresses, built again: a recycled list describing a
+        // later allocation. Suppressing this would hide a destination change
+        // behind equal numbers, which is the one thing this record must not do.
+        assert!(
+            store_destination_changed(Some(&first), &fp(&[0x1000, 0x2000])),
+            "equal page addresses are not allocation identity"
+        );
+        assert!(
+            store_destination_changed(Some(&first), &fp(&[0x9000])),
+            "a different page set is a different destination"
+        );
+        assert!(
+            store_destination_changed(None, &first),
+            "the first store of a process has nothing to be the same as"
+        );
+    }
+}
+
+fn note_store_destination(footprint: &crate::runtime::guest_ram::GuestPageFootprint) {
+    static LAST: std::sync::Mutex<Option<crate::runtime::guest_ram::GuestPageFootprint>> =
+        std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    if !store_destination_changed(last.as_ref(), footprint) {
+        return;
+    }
+    *last = Some(footprint.clone());
+    drop(last);
+    let pages = footprint.pages();
+    let Some(&first) = pages.first() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "store_destination pages={} first={:#x} last={:#x} runs={} page_size={:#x}",
+        pages.len(),
+        first,
+        pages.last().copied().unwrap_or(first),
+        footprint.runs().len(),
+        footprint.page_size(),
+    ));
 }
 
 /// Report the exact binding equation for one live packed guest surface.
@@ -4288,132 +4476,9 @@ unsafe fn copy_image_level0_to_buffer(
         &barrier,
     );
     unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
-    // One call per buffer, all of them into the same command buffer, so the
-    // whole frame is still one submission and one fence however many RAMBlocks
-    // it touched — and, on the linear plan, however many hops it takes.
-    match plan {
-        GuestCopyPlan::Rectangles(groups) => {
-            for (buffer, regions) in groups {
-                ctx.device.cmd_copy_image_to_buffer(
-                    cb,
-                    snap.image,
-                    read_access.layout(),
-                    *buffer,
-                    regions,
-                );
-            }
-        }
-        GuestCopyPlan::Linear {
-            scratch,
-            detile,
-            scatter,
-        } => {
-            let one = [*detile];
-            ctx.device.cmd_copy_image_to_buffer(
-                cb,
-                snap.image,
-                read_access.layout(),
-                *scratch,
-                &one,
-            );
-            // The scatter reads what the detile just wrote, and nothing in one
-            // command buffer orders the two by itself. A global memory barrier
-            // rather than a buffer one because there is exactly one buffer in
-            // flight between them and no other access to exclude.
-            match scatter {
-                ScatterForm::Regions(groups) => {
-                    let detiled = [ash::vk::MemoryBarrier::default()
-                        .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
-                        .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
-                    ctx.device.cmd_pipeline_barrier(
-                        cb,
-                        ash::vk::PipelineStageFlags::TRANSFER,
-                        ash::vk::PipelineStageFlags::TRANSFER,
-                        ash::vk::DependencyFlags::empty(),
-                        &detiled,
-                        &[],
-                        &[],
-                    );
-                    for (buffer, regions) in groups {
-                        ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
-                    }
-                }
-                ScatterForm::Dispatches(groups) => {
-                    // Two dependencies in one barrier because they have the same
-                    // destination: the detile's write to the scratch, and the
-                    // host's write of the run tables, which happened before this
-                    // submission and so needs `HOST` named on the source side.
-                    let ready = [ash::vk::MemoryBarrier::default()
-                        .src_access_mask(
-                            ash::vk::AccessFlags::TRANSFER_WRITE | ash::vk::AccessFlags::HOST_WRITE,
-                        )
-                        .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)];
-                    ctx.device.cmd_pipeline_barrier(
-                        cb,
-                        ash::vk::PipelineStageFlags::TRANSFER | ash::vk::PipelineStageFlags::HOST,
-                        ash::vk::PipelineStageFlags::COMPUTE_SHADER,
-                        ash::vk::DependencyFlags::empty(),
-                        &ready,
-                        &[],
-                        &[],
-                    );
-                    // Looked up rather than carried in the plan: the plan holds
-                    // only what a dispatch needs that is per-writeback, and the
-                    // pipeline is a fixture of the device. It is already built —
-                    // the plan could not have been made otherwise.
-                    if let Some(pipeline) = pools.scatter_pipeline(ctx) {
-                        // One bind for the whole run; the handle never changes.
-                        pipeline.bind(&ctx.device, cb);
-                        for group in groups {
-                            pipeline.dispatch(&ctx.device, cb, group.set, group.run_count);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    unsafe { record_guest_copy_plan(ctx, pools, cb, snap.image, read_access.layout(), plan) };
     unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
-    // The reader of these bytes is the guest's vCPU, which is a host reader as
-    // far as this device is concerned: the memory is guest RAM the driver
-    // imported, not device-local memory that owes a readback. So the write is
-    // released to `HOST` with `HOST_READ`, which is what makes it visible to a
-    // CPU access after the fence signals.
-    //
-    // Cache maintenance beyond that is the driver's. A host-pointer import
-    // names ordinary system pages this process already has mapped, and a PCIe
-    // write to system memory is snooped, so there is no invalidate for this
-    // side to issue.
-    //
-    // The source scope is the stage that actually wrote the guest's pages, which
-    // is the dispatch on the compute scatter and the copy on every other form.
-    // Naming `TRANSFER` alone against a dispatch would release the detile and
-    // leave the writes the guest is about to read unordered — the one place in
-    // this rail where the two forms are not interchangeable.
-    let (wrote_stage, wrote_access) = match plan {
-        GuestCopyPlan::Linear {
-            scatter: ScatterForm::Dispatches(_),
-            ..
-        } => (
-            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
-            ash::vk::AccessFlags::SHADER_WRITE,
-        ),
-        _ => (
-            ash::vk::PipelineStageFlags::TRANSFER,
-            ash::vk::AccessFlags::TRANSFER_WRITE,
-        ),
-    };
-    let host_visible = [ash::vk::MemoryBarrier::default()
-        .src_access_mask(wrote_access)
-        .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
-    ctx.device.cmd_pipeline_barrier(
-        cb,
-        wrote_stage,
-        ash::vk::PipelineStageFlags::HOST,
-        ash::vk::DependencyFlags::empty(),
-        &host_visible,
-        &[],
-        &[],
-    );
+    unsafe { release_guest_copy_to_host(ctx, cb, plan) };
     // The wait this rail no longer takes here.
     //
     // What the stamp needs is that every copy has landed before the guest is
@@ -4445,6 +4510,169 @@ unsafe fn copy_image_level0_to_buffer(
         submit_started.elapsed().as_micros() as u64,
     );
     Ok(())
+}
+
+/// Record one [`GuestCopyPlan`] against a source image into an open command
+/// buffer.
+///
+/// # Why this takes a command buffer instead of opening one
+///
+/// The plan says where the guest's bytes go; this says what writes them. Both
+/// rails that land a frame in guest pages need exactly these commands and
+/// differ only in which submission carries them — the render rail joins an open
+/// batch or begins its own entry, while a compute dispatch already holds a
+/// recording command buffer, the one its storage image was written in. Taking
+/// `cb` is what lets the second reuse this instead of restating the
+/// barrier-and-copy sequence, which is the part that is easy to restate subtly
+/// wrong: the scatter reads what the detile just wrote, and nothing in one
+/// command buffer orders those two by itself.
+///
+/// `src_layout` is the layout the image is already in, transitioned by the
+/// caller. This records no layout transition of its own, because the two rails
+/// arrive from different layouts for different reasons and neither can be
+/// guessed from the plan.
+unsafe fn record_guest_copy_plan(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    cb: ash::vk::CommandBuffer,
+    src_image: ash::vk::Image,
+    src_layout: ash::vk::ImageLayout,
+    plan: &GuestCopyPlan,
+) {
+    unsafe {
+        // One call per buffer, all of them into the same command buffer, so the
+        // whole frame is still one submission and one fence however many RAMBlocks
+        // it touched — and, on the linear plan, however many hops it takes.
+        match plan {
+            GuestCopyPlan::Rectangles(groups) => {
+                for (buffer, regions) in groups {
+                    ctx.device
+                        .cmd_copy_image_to_buffer(cb, src_image, src_layout, *buffer, regions);
+                }
+            }
+            GuestCopyPlan::Linear {
+                scratch,
+                detile,
+                scatter,
+            } => {
+                let one = [*detile];
+                ctx.device
+                    .cmd_copy_image_to_buffer(cb, src_image, src_layout, *scratch, &one);
+                // The scatter reads what the detile just wrote, and nothing in one
+                // command buffer orders the two by itself. A global memory barrier
+                // rather than a buffer one because there is exactly one buffer in
+                // flight between them and no other access to exclude.
+                match scatter {
+                    ScatterForm::Regions(groups) => {
+                        let detiled = [ash::vk::MemoryBarrier::default()
+                            .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
+                        ctx.device.cmd_pipeline_barrier(
+                            cb,
+                            ash::vk::PipelineStageFlags::TRANSFER,
+                            ash::vk::PipelineStageFlags::TRANSFER,
+                            ash::vk::DependencyFlags::empty(),
+                            &detiled,
+                            &[],
+                            &[],
+                        );
+                        for (buffer, regions) in groups {
+                            ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
+                        }
+                    }
+                    ScatterForm::Dispatches(groups) => {
+                        // Two dependencies in one barrier because they have the same
+                        // destination: the detile's write to the scratch, and the
+                        // host's write of the run tables, which happened before this
+                        // submission and so needs `HOST` named on the source side.
+                        let ready = [ash::vk::MemoryBarrier::default()
+                            .src_access_mask(
+                                ash::vk::AccessFlags::TRANSFER_WRITE
+                                    | ash::vk::AccessFlags::HOST_WRITE,
+                            )
+                            .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)];
+                        ctx.device.cmd_pipeline_barrier(
+                            cb,
+                            ash::vk::PipelineStageFlags::TRANSFER
+                                | ash::vk::PipelineStageFlags::HOST,
+                            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                            ash::vk::DependencyFlags::empty(),
+                            &ready,
+                            &[],
+                            &[],
+                        );
+                        // Looked up rather than carried in the plan: the plan holds
+                        // only what a dispatch needs that is per-writeback, and the
+                        // pipeline is a fixture of the device. It is already built —
+                        // the plan could not have been made otherwise.
+                        if let Some(pipeline) = pools.scatter_pipeline(ctx) {
+                            // One bind for the whole run; the handle never changes.
+                            pipeline.bind(&ctx.device, cb);
+                            for group in groups {
+                                pipeline.dispatch(&ctx.device, cb, group.set, group.run_count);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Release a landed guest-page copy to the host so the guest's vCPU sees it.
+///
+/// Split from [`record_guest_copy_plan`] only because the render rail stamps a
+/// timestamp between the two. Every caller of that function owes this one: the
+/// copy is otherwise on the queue but never released to `HOST`, and the guest
+/// reads whatever its pages held before.
+unsafe fn release_guest_copy_to_host(
+    ctx: &context::DeviceContext,
+    cb: ash::vk::CommandBuffer,
+    plan: &GuestCopyPlan,
+) {
+    unsafe {
+        // The reader of these bytes is the guest's vCPU, which is a host reader as
+        // far as this device is concerned: the memory is guest RAM the driver
+        // imported, not device-local memory that owes a readback. So the write is
+        // released to `HOST` with `HOST_READ`, which is what makes it visible to a
+        // CPU access after the fence signals.
+        //
+        // Cache maintenance beyond that is the driver's. A host-pointer import
+        // names ordinary system pages this process already has mapped, and a PCIe
+        // write to system memory is snooped, so there is no invalidate for this
+        // side to issue.
+        //
+        // The source scope is the stage that actually wrote the guest's pages, which
+        // is the dispatch on the compute scatter and the copy on every other form.
+        // Naming `TRANSFER` alone against a dispatch would release the detile and
+        // leave the writes the guest is about to read unordered — the one place in
+        // this rail where the two forms are not interchangeable.
+        let (wrote_stage, wrote_access) = match plan {
+            GuestCopyPlan::Linear {
+                scatter: ScatterForm::Dispatches(_),
+                ..
+            } => (
+                ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                ash::vk::AccessFlags::SHADER_WRITE,
+            ),
+            _ => (
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::AccessFlags::TRANSFER_WRITE,
+            ),
+        };
+        let host_visible = [ash::vk::MemoryBarrier::default()
+            .src_access_mask(wrote_access)
+            .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            wrote_stage,
+            ash::vk::PipelineStageFlags::HOST,
+            ash::vk::DependencyFlags::empty(),
+            &host_visible,
+            &[],
+            &[],
+        );
+    }
 }
 
 /// Import every RAMBlock in `imports` now, and report how many that took.
@@ -4958,7 +5186,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
             target_readback_ops(),
         )?;
         pools.registry_note_access(identity, read_access);
-        counters.note_target_read(rb_size);
+        counters.note_target_read(rb_size, TargetReadDelivery::Host);
         // A wide resident is quantized here rather than refused; see
         // `narrow_readback_to_rgba8` for why that direction is the safe one.
         let (pixels, texel) =

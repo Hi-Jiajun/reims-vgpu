@@ -57,6 +57,37 @@ kernel void read_ms_texels(texture2d_ms<float, access::read> tex [[texture(0)]],
     }
 }
 
+// The same readback with the sample count supplied by the host instead of
+// queried from the texture.
+//
+// `read_ms_texels` above is a witness for two independent obligations at once:
+// that a `texture2d_ms` bind is served at all, and that `get_num_samples()`
+// reports the texture's own count. A device that serves the bind correctly but
+// runs against a translator that folds the query to a constant produces the
+// same result line as a device that refused the bind outright, and the two are
+// opposite defects. This kernel drops the query so its result speaks only to
+// the first obligation; the caller already knows the count, because it created
+// the texture.
+kernel void read_ms_texels_host_count(texture2d_ms<float, access::read> tex [[texture(0)]],
+                                      device uint *out [[buffer(0)]],
+                                      constant uint &width [[buffer(1)]],
+                                      constant uint &samples [[buffer(2)]],
+                                      constant uint2 &extent [[buffer(3)]],
+                                      device uint *ran [[buffer(4)]],
+                                      uint2 gid [[thread_position_in_grid]]) {
+    ran[0] = 1u;
+    if (gid.x >= extent.x || gid.y >= extent.y) { return; }
+    for (uint sample = 0; sample < samples; ++sample) {
+        float4 v = tex.read(gid, sample);
+        uint r = uint(round(v.r * 255.0));
+        uint g = uint(round(v.g * 255.0));
+        uint b = uint(round(v.b * 255.0));
+        uint a = uint(round(v.a * 255.0));
+        out[(gid.y * width + gid.x) * samples + sample] =
+            (a << 24) | (b << 16) | (g << 8) | r;
+    }
+}
+
 // The sampler path, with nearest filtering and unnormalized coordinates, so the
 // result is still exactly one texel and any difference from `read_texels` is
 // the sampler/view rather than the memory.

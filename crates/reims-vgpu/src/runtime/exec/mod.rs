@@ -4250,6 +4250,48 @@ fn apply_clear<M: HostMemory + HostOps>(
         return false;
     };
     let c0 = req.colors.first().unwrap_or_else(|| unreachable!());
+    // A multisample attachment has no single-sample linear publication, and
+    // this is the first point at which that is knowable: `clear_publish_target`
+    // above decides from the store action alone, and the sample count arrives
+    // with the resolved target.
+    //
+    // The rule is the one the `StoredAndResolved` arm already states —
+    // "treating the source as a linear image would write only one sample" — and
+    // it applies just as much to a plain `MTLStoreActionStore` on a texture
+    // whose descriptor declares four samples. That arm could not reach this
+    // case because the store action does not name it.
+    //
+    // The guest sizes and strides these allocations for their samples. On rail
+    // macos-15 the 300x300 four-sample tiles carry `bpr = 4800`, exactly four
+    // times a 300-wide BGRA8 tight row, against `bpr = 1216` on the
+    // single-sample surfaces beside them. So writing a single-sample image here
+    // is not a partial answer: it fills 1200 bytes of every 4800-byte row with
+    // a solid colour and leaves the rest, in a sample layout this device has
+    // never established. Refusing leaves the guest the bytes it already had,
+    // which is what every other refusal on this rail promises.
+    //
+    // This narrows the clear rail; it does not close it. A resolve destination
+    // is single-sample by construction and still publishes, through
+    // `ClearPublish::Resolved` above.
+    if c0.sample_count > 1 {
+        note_clear_dropped(
+            "clear_multisample_source_not_linear",
+            att.texture_ref,
+            &format!(
+                "samples={} {}x{} bpr={} gva={:#x} mid={} store={} (the guest \
+                 strided this span for its samples; a one-sample image is the \
+                 wrong content for it, not a partial one)",
+                c0.sample_count,
+                c0.width,
+                c0.height,
+                c0.row_stride,
+                c0.target_gva,
+                c0.mapping_id,
+                att.store_action
+            ),
+        );
+        return false;
+    }
     // Format and clear representation are one contract decision. Continuous
     // colour keeps the semantic RGBA8 carrier the existing converters consume;
     // integer targets carry their own texels, where `1` remains the integer 1.

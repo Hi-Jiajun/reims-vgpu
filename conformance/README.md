@@ -24,8 +24,8 @@ verdict rather than diffing hundreds of lines by eye:
 ```sh
 conformance/verdict.py --native baselines/native-apple-m4-macos15.txt \
   --guest /tmp/conf-out/conformance.txt \
-  --translation-errors expectations/translation-errors.txt \
-  --driver-errors expectations/driver-errors.txt
+  --translation-errors expectations/macos-13/translation-errors.txt \
+  --driver-errors expectations/macos-13/driver-errors.txt
 ```
 
 It is stricter than the eye in two directions the eye is bad at. A case that
@@ -49,9 +49,18 @@ is green natively.
 
 ## Failure ownership is part of the verdict
 
-`expectations/translation-errors.txt` and `expectations/driver-errors.txt` are
-separate inventories. One case name goes on each line; `#` starts the required
-diagnosis. A name in both files is `DUPLICATE-CLASSIFICATION` and fails scoring.
+`expectations/<rail>/translation-errors.txt` and
+`expectations/<rail>/driver-errors.txt` are separate inventories. One case name
+goes on each line; `#` starts the required diagnosis. A name in both files is
+`DUPLICATE-CLASSIFICATION` and fails scoring.
+
+**They are per rail, and a rail is a driver.** `macos-13` and `macos-15` are two
+different guest drivers running the same battery, so a case one of them fails
+says nothing about the other, and neither does a case one of them passes. An
+entry established on one rail may not be copied to another to make a sweep
+green; it has to be re-established there, against that rail's own control. A
+rail with no inventory directory is refused by the runner rather than scored
+against a neighbour's debt.
 
 A translation entry names its gitignored `bugs/` handoff package, containing the
 AIR reproducer and translator evidence. A driver entry names the violated Metal
@@ -62,6 +71,52 @@ a listed case that starts passing is `FIXED-TRANSLATION` or `FIXED-DRIVER`.
 It is not a place to put a case that fails on the oracle too. That is
 `SUITE-BUG`, the expectation is wrong, and listing it hides a bug in the battery
 rather than one in the device.
+
+## The oracle says right; only the control says backwards
+
+`verdict.py` asks the native oracle whether a guest result is *correct*.
+`ratchet.py` asks an identified control run whether a candidate moved
+*backwards*. They are different questions and a change has to answer both.
+
+```sh
+conformance/ratchet.py \
+  --control  runs/control/conformance.txt  --control-device  runs/control/device.log \
+  --candidate runs/cand/conformance.txt    --candidate-device runs/cand/device.log
+```
+
+The distinction is load-bearing on a rail whose debt is not yet classified. Such
+a rail reads to the oracle scorer as scores of unexplained failures, and will
+until every one has an established owner. That is honest, and it also means the
+oracle scorer is red for *every* candidate on that rail and so cannot tell one
+that broke something from one that broke nothing. The control can: it already
+contains the debt, so a candidate reproducing it exactly has preserved the
+device's behavior whether or not anyone has yet written down whose fault it is.
+
+Classifying a failure and detecting a regression are therefore separate jobs,
+and only the second one gates a commit.
+
+**Give it more than one control.** The cases on this rail are reproducible and
+the device log is not: two back-to-back macos-13 controls of the same build
+agreed on all 290 case results exactly and still disagreed on their typed-reason
+counts, `stamp_wait_timeout` among them. `--control` may be repeated, and a
+repeated control measures the rail's variance instead of assuming it away -- a
+candidate inside the envelope has not moved. With one control the tool says so
+in its totals rather than leaving a reader to infer it. A case the controls
+themselves disagree about is `CONTROL-UNSTABLE` and is dropped from scoring,
+because charging a candidate for the rail's own noise is the same error in the
+other direction.
+
+It scores the workflow's transition table, and two things no case comparison
+can see. A name in only one of the two runs is a regression rather than a
+missing row -- coverage that moved is the failure this catches. And the device's
+own typed reasons are counted on both sides, so a candidate that keeps every
+pixel and doubles the fence timeouts is red on that alone.
+
+One reading it hands back rather than decides: a case that fails in both runs
+with a *different* detail is `CHANGED-DETAIL` and does not fail the run, because
+nothing in a `CASE` line separates the typed reason from its payload. The same
+defect described differently and a different defect wearing the same name look
+identical here, and only a reader who knows the case can say which it is.
 
 ## A case name must mean the same thing on both hosts
 
@@ -100,8 +155,9 @@ conformance/
     Support.swift     the library, pipelines, readback, helpers
     cases/*.swift     the case bodies, one file per rail or family
   baselines/          native runs, one per oracle host
-  expectations/       separate translation and driver inventories
+  expectations/<rail>/  separate translation and driver inventories, per rail
   verdict.py          scores a guest run against the native one
+  ratchet.py          scores a candidate guest run against a control guest run
   run-native.sh       build and run on the oracle
   run-guest.sh        boot a rail and run the same source in the guest
   build/              binaries; gitignored
@@ -137,10 +193,9 @@ fail log beside the results:
 conformance/run-guest.sh /tmp/conf-out
 ```
 
-The guest runner is pinned to the macos-15 rail. Environment passes through, so
-an ablation arm is
+`RAIL` selects the guest rail and defaults to `macos-13`. Environment passes
+through, so an ablation arm is
 `REIMS_VGPU_GUEST_IMPORT=off conformance/run-guest.sh /tmp/conf-off`.
-Any other `RAIL` value is rejected.
 
 For a fast, shaderless gate of the integer-clear contract, use
 `CONFORMANCE_MODE=integer-clear`. Use `CONFORMANCE_MODE=topology` for the
