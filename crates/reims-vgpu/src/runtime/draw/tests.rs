@@ -4,9 +4,15 @@ use super::*;
 // against whichever rail happened to win a flat re-export.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use super::metal::*;
+#[cfg(feature = "backend-vulkan")]
+use super::vulkan::*;
+#[cfg(feature = "backend-vulkan")]
+use crate::backend::vulkan::translate;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
+#[cfg(feature = "backend-vulkan")]
+use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -664,7 +670,7 @@ fn cpu_portability_store_publishes_composite() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn frag_unbound_scan_reports_only_missing_standard_kinds() {
-    use crate::runtime::draw::{FragUnbound, FragUnboundClass};
+    use crate::runtime::draw::vulkan::{FragUnbound, FragUnboundClass};
     use metal2vulkan::reflect::ResourceKind as K;
     let gap = |class, metal_index| FragUnbound { class, metal_index };
     let tex = |i| gap(FragUnboundClass::Texture, i);
@@ -1167,7 +1173,7 @@ fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
         let src: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
         for order in [false, true] {
             let mut same = src.clone();
-            crate::runtime::draw::reorder_rb_in_place(&mut same, order, order);
+            crate::runtime::draw::vulkan::reorder_rb_in_place(&mut same, order, order);
             assert_eq!(
                 same, src,
                 "len={len} order={order}: agreement must not copy"
@@ -1176,10 +1182,10 @@ fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
         // Disagreement in either direction is exactly the established swizzle,
         // tail included.
         let mut to_bgra = src.clone();
-        crate::runtime::draw::reorder_rb_in_place(&mut to_bgra, false, true);
+        crate::runtime::draw::vulkan::reorder_rb_in_place(&mut to_bgra, false, true);
         assert_eq!(to_bgra, swap_rb_channels(&src), "len={len} rgba->bgra");
         let mut to_rgba = src.clone();
-        crate::runtime::draw::reorder_rb_in_place(&mut to_rgba, true, false);
+        crate::runtime::draw::vulkan::reorder_rb_in_place(&mut to_rgba, true, false);
         assert_eq!(to_rgba, swap_rb_channels(&src), "len={len} bgra->rgba");
     }
 }
@@ -6899,7 +6905,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     let served = store_route_count("gvarung_resident");
 
     assert!(
-        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
+        super::vulkan::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
         "no Store has stamped this span, so nothing licenses serving a resident for it"
     );
     assert_eq!(
@@ -6928,7 +6934,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     };
     note_store(&mut state, &mut host, orphan, &gpas);
     assert!(
-        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
+        super::vulkan::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
         "a stale page set stamped at this address must not answer for the one that replaced it"
     );
     assert_eq!(
@@ -7164,7 +7170,7 @@ fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
 
     // Nothing is published, so the only way to an answer is the registry.
     assert!(
-        super::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
+        super::vulkan::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
         "with no retained state and no guest bytes there is no answer to give"
     );
 
@@ -7179,14 +7185,14 @@ fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
         .register(2, 7, std::sync::Arc::new(retained.clone()));
 
     assert_eq!(
-        super::load_depth_stencil_descriptor(&state, &host, 2, 7).ok(),
+        super::vulkan::load_depth_stencil_descriptor(&state, &host, 2, 7).ok(),
         Some(retained),
         "the retained state answers with no guest read available at all"
     );
 
     assert!(state.task_depth_stencil_states.delete(2, 7));
     assert!(
-        super::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
+        super::vulkan::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
         "and the delete is a real invalidation, not a counter"
     );
 }
@@ -7396,7 +7402,9 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
 fn an_attachment_sample_count_taken_from_the_pipeline_names_where_the_samples_go() {
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::drain::store_route_count;
-    use crate::runtime::draw::{note_attachment_sample_count_override, AttachmentSampleCounts};
+    use crate::runtime::draw::vulkan::{
+        note_attachment_sample_count_override, AttachmentSampleCounts,
+    };
 
     const NO_RESOLVE: &str = "attach_samples_multisample_no_resolve";
     const WITH_RESOLVE: &str = "attach_samples_from_pipeline_with_resolve";
@@ -7693,7 +7701,7 @@ fn a_span_can_be_named_without_asking_whether_its_guest_pages_are_current() {
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::draw::vulkan::{gva_resident_if_current, gva_span_identity};
-    use crate::runtime::draw::{GvaResidentRefusal, GvaSpan};
+    use crate::runtime::draw::vulkan::{GvaResidentRefusal, GvaSpan};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();

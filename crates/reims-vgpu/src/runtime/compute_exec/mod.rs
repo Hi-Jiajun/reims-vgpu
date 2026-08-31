@@ -2139,7 +2139,7 @@ fn stage_buffer_texture<M: HostMemory + HostOps>(
 /// # What it resolves, and why through the same span the render rail uses
 ///
 /// The samples live in the engine resident the render pass wrote, keyed by that
-/// target's `TargetIdentity`. It is named through `draw::gva_span_identity`,
+/// target's `TargetIdentity`. It is named through `draw::vulkan::gva_span_identity`,
 /// which is the identity half of the currency test itself, and not rebuilt
 /// here: a second derivation of the same registry key is how two rails come to
 /// name different residents for one texture.
@@ -2247,7 +2247,7 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
         c0.target_gva,
         c0.row_stride,
     );
-    let span = crate::runtime::draw::GvaSpan {
+    let span = crate::runtime::draw::vulkan::GvaSpan {
         texture_ref,
         gva: target_gva,
         row_stride,
@@ -2255,7 +2255,9 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
         height,
         format,
     };
-    let Some(identity) = crate::runtime::draw::gva_span_identity(state, host, task_id, span) else {
+    let Some(identity) =
+        crate::runtime::draw::vulkan::gva_span_identity(state, host, task_id, span)
+    else {
         return Err(refuse(
             "resident_unnamed",
             format!("samples={sample_count} {width}x{height} gva={target_gva:#x}"),
@@ -5048,7 +5050,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         {
             continue;
         }
-        let mut sampler = match crate::runtime::draw::load_vulkan_sampler(
+        let mut sampler = match crate::runtime::draw::vulkan::load_vulkan_sampler(
             state,
             host,
             task_id,
@@ -5075,7 +5077,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             .any(|sampler| sampler.binding == reflected.binding)
         {
             if let Some(state) = reflected.static_state {
-                let sampler = match crate::runtime::draw::reflected_static_sampler_resource(
+                let sampler = match crate::runtime::draw::vulkan::reflected_static_sampler_resource(
                     "kernel",
                     reflected.binding,
                     state,

@@ -880,7 +880,7 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         // The MTLB containers, not owned copies of the AIR inside them: the two
         // `ensure_cached_async` calls below borrow, digest and drop, so copying
         // first would allocate twice per pipeline ref for bytes nothing keeps.
-        let pair = draw::load_render_mtlb_pair(state, host, task_id, pipeline_ref);
+        let pair = draw::vulkan::load_render_mtlb_pair(state, host, task_id, pipeline_ref);
         note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
         let Ok((v_mtlb, f_mtlb)) = pair else {
             // Normal execution emits the precise pipeline/MTLB failure. A
@@ -4120,8 +4120,8 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     // — see `draw::M2vDrawSpan::ResidentSurfaceStore` for what that cost.
     #[cfg(feature = "backend-vulkan")]
     if end.resident && chain_rgba.is_none() {
-        if let Some(identity) = draw::render_chain_identity(state, req) {
-            *chain_rgba = draw::read_resident_chain(req, &identity);
+        if let Some(identity) = draw::vulkan::render_chain_identity(state, req) {
+            *chain_rgba = draw::vulkan::read_resident_chain(req, &identity);
         }
     }
     #[cfg(not(feature = "backend-vulkan"))]

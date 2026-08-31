@@ -1241,7 +1241,7 @@ pub(crate) fn gva_identity(
         width: debt.width,
         height: debt.height,
         generation: debt.generation,
-        format: crate::runtime::draw::gva_resident_format(debt.format),
+        format: crate::runtime::draw::vulkan::gva_resident_format(debt.format),
     }
 }
 

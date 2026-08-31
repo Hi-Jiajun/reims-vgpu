@@ -1576,8 +1576,8 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     // separates them. These layers are not the plane a present names, so the
     // present witness never drains their rings and nothing else does either.
     #[cfg(feature = "backend-vulkan")]
-    let ring = crate::runtime::draw::read_plane_draw_ring(
-        crate::runtime::draw::PlaneDrawReader::PresentedPlane,
+    let ring = crate::runtime::draw::vulkan::read_plane_draw_ring(
+        crate::runtime::draw::vulkan::PlaneDrawReader::PresentedPlane,
         mapping_id,
     )
     .to_string();
@@ -1770,8 +1770,8 @@ pub fn note_present_field_witness<M: HostMemory>(
     // publish it. Those have opposite repairs and no other record separates
     // them.
     #[cfg(feature = "backend-vulkan")]
-    let ring = crate::runtime::draw::read_plane_draw_ring(
-        crate::runtime::draw::PlaneDrawReader::SampledLayer,
+    let ring = crate::runtime::draw::vulkan::read_plane_draw_ring(
+        crate::runtime::draw::vulkan::PlaneDrawReader::SampledLayer,
         mapping_id,
     )
     .to_string();
