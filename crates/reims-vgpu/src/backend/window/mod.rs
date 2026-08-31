@@ -16,6 +16,17 @@
 //! and it is a run-time answer — a `--backend both` binary compiles this module
 //! for its Metal boot and its Vulkan boot alike.
 
+/// Where a guest frame lands inside a window, and where a window position lands
+/// inside a guest frame.
+///
+/// Here rather than beside the window, because both rails' presenters need it
+/// and `backend` may not reach up into [`crate::host_window`] — a lower layer
+/// importing from a higher one is how the two halves of "presentation and
+/// pointer move as one unit" once ended up compiled for different platforms.
+/// The window reaches down for the same functions, which is the direction that
+/// works.
+pub mod viewport;
+
 use crate::observe::Decline;
 
 /// The native surface a rail attaches its presenter to.

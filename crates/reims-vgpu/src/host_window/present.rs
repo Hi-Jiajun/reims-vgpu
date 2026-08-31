@@ -1,23 +1,25 @@
 //! Host-owned window presentation — a `winit` window that presents the guest
-//! frame on the engine's own `VkDevice`, replacing QEMU's UI ([[host-window]]).
+//! frame on the running rail's own device, replacing QEMU's UI
+//! ([[host-window]]).
 //!
-//! This file owns the window and the event loop. The surface, the swapchain and
-//! the acquire → clear/blit → present sequence live in
-//! [`crate::backend::vulkan::engine::window_present`], on the device that
-//! rendered the frame; this file drives them and decides *when* to present. It
-//! also translates window input via [`super::input_map`] and hands each
-//! [`HostAction`] to the [`InputSink`] (the device wires that to the prompt
-//! action queue).
+//! This file owns the window and the event loop, and nothing else. The native
+//! surface, the drawables and the fitted blit belong to whichever rail is
+//! running and are reached only through [`crate::backend::Backend`]'s
+//! `window_*` methods — a `VkSurfaceKHR` and a swapchain on the Vulkan rail, a
+//! `CAMetalLayer` on the Metal one. What is left here is *when* to present, and
+//! the input half: window events become [`HostAction`]s via
+//! [`super::input_map`] and reach the [`InputSink`] the device wires to its
+//! prompt action queue.
 //!
-//! The presenter prefers the engine-resident image, which is what keeps a
-//! presented layer from crossing host memory at all; the CPU-BGRA [`FrameSlot`]
-//! the device fills from its present capture is the source for the frames no
-//! resident carries — the firmware framebuffer, and any mapping the compositor
-//! has not rendered into.
+//! The rail prefers its own resident, which is what keeps a presented layer
+//! from crossing host memory at all; the CPU-BGRA [`FrameSlot`] the device
+//! fills from its present capture is the source for the frames no resident
+//! carries — the firmware framebuffer, any mapping the compositor has not
+//! rendered into, and every frame on a rail that holds no residents.
 //!
-//! There is exactly one presenter, on every platform. A host whose engine
-//! device cannot present to this surface gets a named refusal and a shutdown
-//! rather than a second `VkDevice`; `resumed` records why.
+//! There is exactly one presenter, on every platform and every rail. A rail
+//! that cannot present to this surface gets a named refusal and a shutdown
+//! rather than a second device of its own; `resumed` records why.
 //!
 //! Linux owns the event loop on a dedicated thread. macOS requires AppKit work
 //! on the process main thread, so QEMU creates it through
@@ -60,7 +62,7 @@ use crate::runtime::host::HostAction;
 ///
 /// # This replaced a 2 ms poll, and the poll was 98 % waste
 ///
-/// The loop used to ask for a redraw every 2 ms and let [`needs_engine_present`]
+/// The loop used to ask for a redraw every 2 ms and let [`needs_present`]
 /// throw away whatever the seq gate rejected. Driven x86/PCI boot, window-drag
 /// probe, whole run:
 ///
@@ -98,13 +100,13 @@ use crate::runtime::host::HostAction;
 /// produced 3074 of those draws: the other 508 were superseded in the slot
 /// before the loop looked, which is latest-wins working rather than a frame
 /// lost.
-const ENGINE_WINDOW_REDRAW_BACKSTOP: std::time::Duration =
+const WINDOW_REDRAW_BACKSTOP: std::time::Duration =
     std::time::Duration::from_millis(GUEST_RESIZE_WARN_AFTER.as_millis() as u64 / 10);
 /// How many rebuilds of the presenter may go unproven before the window stops
 /// trying — asked of the running rail, which is what gets lost.
 ///
 /// **A storm budget rather than a lifetime cap**, and [`App::draw`] is the half
-/// of that which lives here: it zeroes [`App::engine_reattempts`] on a present
+/// of that which lives here: it zeroes [`App::presenter_rebuilds`] on a present
 /// that reached the screen, on the reasoning that a rail which recovered and is
 /// lost again later is a new incident and not the fourth step of the old one.
 /// What the bound then stops is a surface that genuinely cannot be created
@@ -116,7 +118,7 @@ const ENGINE_WINDOW_REDRAW_BACKSTOP: std::time::Duration =
 /// logged `host_window_reattach status=ok attempt=3`, spent the budget, and sat
 /// out every later loss with the picture gone — which is most of the defect the
 /// re-attach exists to remove, reintroduced by its own bound.
-fn max_engine_reattaches() -> u32 {
+fn presenter_rebuild_budget() -> u32 {
     crate::backend::selected().window_reattach_budget()
 }
 /// How long a guest-driven native resize request may stay unmatched by a
@@ -146,7 +148,7 @@ pub enum WindowMode {
     /// The whole monitor the window opens on, undecorated — winit's
     /// `Fullscreen::Borderless`, which on Linux is a borderless full-screen
     /// window on both X11 and Wayland. The guest frame is letterboxed into it by
-    /// the same [`super::viewport`] arithmetic that already handles a window the
+    /// the same [`crate::backend::window::viewport`] arithmetic that already handles a window the
     /// guest's mode does not fit.
     Borderless,
 }
@@ -213,9 +215,9 @@ pub struct Frame {
     /// Monotonic publish sequence (assigned by the device when it writes a new
     /// frame). A static desktop publishes a new frame only when content changes.
     /// Linux re-blits its prepared staging source each vblank but prepares it only
-    /// when `seq` advances. macOS submits the engine resident only when
+    /// when `seq` advances. macOS submits the rail's resident only when
     /// `seq` advances or the window resizes, so an unchanged desktop does not
-    /// contend with guest render work for the engine queue.
+    /// contend with guest render work for the rail's queue.
     /// Wrap-around is harmless: a collision at most skips one prepare (the source
     /// still holds valid content).
     pub seq: u64,
@@ -247,7 +249,7 @@ pub struct FramePublished;
 ///
 /// The window used to find new frames by asking for a redraw every 2 ms and
 /// discarding 98 % of them at the seq gate — see
-/// [`ENGINE_WINDOW_REDRAW_BACKSTOP`] for that reading. This turns it round: the
+/// [`WINDOW_REDRAW_BACKSTOP`] for that reading. This turns it round: the
 /// publisher already knows, so it says so, and the loop sleeps until it does.
 ///
 /// # Why a proxy and not the window handle
@@ -293,7 +295,7 @@ impl WindowWaker {
     /// Silent in all three failure modes, because none of them is a lost frame:
     /// before the loop is armed and after it has closed there is nothing that
     /// could present, and a poisoned lock means the window thread panicked. In
-    /// every case [`ENGINE_WINDOW_REDRAW_BACKSTOP`] still runs, so a wake that
+    /// every case [`WINDOW_REDRAW_BACKSTOP`] still runs, so a wake that
     /// does not land costs latency bounded by that constant rather than a frame
     /// — which is the property that lets this be a wake and not a protocol.
     pub fn wake(&self) {
@@ -328,11 +330,7 @@ fn window_cpu_frame(frame: &Frame) -> crate::backend::window::WindowCpuFrame<'_>
 /// guest has not produced a different frame, so the only reasons to pay it are a
 /// new frame seq or a drawable that must be rebuilt (first frame, resize,
 /// suboptimal swapchain).
-fn needs_engine_present(
-    presented: Option<u64>,
-    redraw_required: bool,
-    incoming: Option<u64>,
-) -> bool {
+fn needs_present(presented: Option<u64>, redraw_required: bool, incoming: Option<u64>) -> bool {
     redraw_required || presented != incoming
 }
 
@@ -344,7 +342,7 @@ fn needs_engine_present(
 /// position is proportional to a guest position only *inside* the viewport — in
 /// a letterbox bar it is not over the guest surface at all. Reporting raw
 /// window coordinates therefore offsets and rescales every event by the bar
-/// size, which is the regression [`super::viewport`]'s module docs record as
+/// size, which is the regression [`crate::backend::window::viewport`]'s module docs record as
 /// rolled back. It survived on non-macOS hosts because this mapping was
 /// `cfg`-gated to macOS while the presenter's `aspect_fit` never was, so the
 /// two halves of "presentation and pointer move as one unit" were compiled for
@@ -359,7 +357,8 @@ fn pointer_report(
 ) -> (u32, u32, u32, u32) {
     match guest {
         Some(guest) => {
-            let (x, y) = super::viewport::pointer_to_guest(position, window, guest);
+            let (x, y) =
+                crate::backend::window::viewport::pointer_to_guest(position, window, guest);
             (x, y, guest.0, guest.1)
         }
         None => (
@@ -382,7 +381,7 @@ fn pointer_report(
 /// request holds presentation for [`GUEST_RESIZE_WARN_AFTER`] and then reports
 /// `native_resize_not_applied`, which is a fail-visible line about a window doing
 /// what the operator asked it to do. The guest's mode reaches the screen
-/// letterboxed by [`super::viewport`] instead, exactly as it does on a tiling
+/// letterboxed by [`crate::backend::window::viewport`] instead, exactly as it does on a tiling
 /// compositor that refuses the request on its own.
 fn guest_resize_request(
     mode: WindowMode,
@@ -471,11 +470,11 @@ pub type ExitedFlag = Arc<AtomicBool>;
 /// rides along as a whitespace-safe `detail=` field.
 ///
 /// Every variant is a *window lifecycle* refusal: creating the loop, owning the
-/// process window, creating the native window, or attaching the engine
-/// presenter to it. Nothing here describes a swapchain or a blit — those belong
-/// to the engine presenter, which types its own declines
-/// ([`crate::backend::vulkan::engine`]'s `DrawError`), and there is no second
-/// presenter in this file to type declines for.
+/// process window, creating the native window, or attaching the running rail's
+/// presenter to it. Nothing here describes a drawable or a blit — those belong
+/// to the rail, which types its own declines and classifies them through
+/// [`crate::backend::window::WindowDecline`], and there is no second presenter
+/// in this file to type declines for.
 ///
 /// `#[allow(dead_code)]` because four of the variants (`MainLoopRun`,
 /// `AlreadyOwned`, `NoRegisteredWindow`, `WrongOwner`) are
@@ -499,13 +498,13 @@ pub enum WindowError {
     /// `resumed`: winit could not create the native window (shared step, both
     /// platforms) — the bring-up cannot proceed past this.
     CreateNativeWindow(String),
-    /// Engine-attach: the window's display handle was unavailable.
+    /// Presenter attach: the window's display handle was unavailable.
     AttachDisplayHandle(String),
-    /// Engine-attach: the window's window handle was unavailable.
+    /// Presenter attach: the window's window handle was unavailable.
     AttachWindowHandle(String),
-    /// Engine-attach: `window_present_attach` (engine swapchain) failed. The
-    /// refusal that ends the window, on every platform.
-    AttachEngine(String),
+    /// Presenter attach: the running rail refused to build a presenter for this
+    /// surface. The refusal that ends the window, on every platform and rail.
+    AttachPresenter(String),
     /// [`crate::env::FULLSCREEN`] was set to something that is neither an on nor
     /// an off spelling. The window opens sized; the value is quoted so the
     /// operator can see what the parse rejected. The one variant here that does
@@ -525,7 +524,7 @@ impl WindowError {
             | Self::CreateNativeWindow(d)
             | Self::AttachDisplayHandle(d)
             | Self::AttachWindowHandle(d)
-            | Self::AttachEngine(d)
+            | Self::AttachPresenter(d)
             | Self::FullscreenValue(d) => Some(d),
             Self::AlreadyOwned { .. }
             | Self::NoRegisteredWindow { .. }
@@ -552,7 +551,7 @@ impl crate::observe::Decline for WindowError {
             Self::CreateNativeWindow(_) => "window_create_native_window",
             Self::AttachDisplayHandle(_) => "window_attach_display_handle",
             Self::AttachWindowHandle(_) => "window_attach_window_handle",
-            Self::AttachEngine(_) => "window_attach_engine",
+            Self::AttachPresenter(_) => "window_attach_presenter",
             Self::FullscreenValue(_) => "window_fullscreen_unrecognized",
         }
     }
@@ -751,36 +750,36 @@ struct App {
     /// `None` before `resumed`; a [`super::capture::NoCapture`] on a window
     /// system this build cannot ask, so the call sites never branch.
     capture: Option<Box<dyn Capture>>,
-    /// The engine presenter holds a swapchain on this window's surface. False
+    /// The running rail holds a presenter on this window's surface. False
     /// before the attach in `resumed` and again after `exiting` releases it;
     /// there is no other presenter, so false means nothing can be drawn.
-    engine_attached: bool,
-    first_engine_present_logged: bool,
-    first_engine_guest_logged: bool,
-    engine_error_logged: bool,
-    /// How many times [`App::reattach_engine`] has rebuilt, or tried to rebuild,
+    presenter_attached: bool,
+    first_present_logged: bool,
+    first_direct_present_logged: bool,
+    present_error_logged: bool,
+    /// How many times [`App::rebuild_presenter`] has rebuilt, or tried to rebuild,
     /// the presenter after a device loss. Bounded by
-    /// [`max_engine_reattaches`] so a surface that cannot be recreated is
+    /// [`presenter_rebuild_budget`] so a surface that cannot be recreated is
     /// retried a few times and then left alone, rather than once per redraw for
     /// the life of the boot.
-    engine_reattempts: u32,
+    presenter_rebuilds: u32,
     /// A [`FramePublished`] arrived (or a present asked to be repeated) and no
     /// redraw has been requested for it yet. Consumed by `about_to_wait`, which
     /// is the one place that talks to the platform about redraws.
     frame_pending: bool,
     /// The latest the loop may sleep to when nothing has asked it to draw. Pushed
     /// forward by every redraw request, so a steady publish stream never lets it
-    /// fire; see [`ENGINE_WINDOW_REDRAW_BACKSTOP`] for what it is a floor under.
+    /// fire; see [`WINDOW_REDRAW_BACKSTOP`] for what it is a floor under.
     next_backstop: std::time::Instant,
     /// Frame seq the drawable currently holds, or `None` before the first
     /// present.
-    last_engine_seq: Option<u64>,
+    last_presented_seq: Option<u64>,
     /// Force the next present regardless of seq: first frame, resize, or a
     /// swapchain that reported suboptimal.
-    engine_redraw_required: bool,
+    redraw_required: bool,
     /// Last guest DisplaySwap geometry the window observed. Drives the
     /// once-per-mode-change native resize request and the pointer-to-guest
-    /// viewport transform ([`super::viewport`]).
+    /// viewport transform ([`crate::backend::window::viewport`]).
     guest_extent: Option<(u32, u32)>,
     /// Outstanding guest-driven native resize, kept only for the fail-visible
     /// `native_resize_not_applied` alarm — never a presentation gate.
@@ -809,7 +808,7 @@ struct LoopCensus {
     /// `about_to_wait` entries: how often the loop woke at all.
     ticks: u64,
     /// Ticks that asked the platform for a redraw. Bounded by published frames
-    /// plus [`ENGINE_WINDOW_REDRAW_BACKSTOP`] ticks rather than by the tick
+    /// plus [`WINDOW_REDRAW_BACKSTOP`] ticks rather than by the tick
     /// rate, which is what [`redraw_due`] is for — a run where this tracks
     /// `ticks` instead is a loop that has fallen back to polling.
     redraws_asked: u64,
@@ -905,44 +904,44 @@ impl ApplicationHandler<FramePublished> for App {
                 return;
             }
         };
-        // Built before the engine attach so a window that fails to present
+        // Built before the presenter attach so a window that fails to present
         // still reports which capture it would have had, and torn down with the
         // window in `exiting`.
         self.capture = Some(Self::build_capture(&window));
-        match Self::attach_engine(&window) {
+        match Self::attach_presenter(&window) {
             Ok(()) => {
-                self.engine_attached = true;
+                self.presenter_attached = true;
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
                 window.request_redraw();
                 self.window = Some(window);
             }
             Err(error) => {
-                // One rule on every platform: a host whose engine device cannot
-                // present to this surface gets a named refusal, not a second
-                // presenter.
+                // One rule on every platform and every rail: a rail that
+                // cannot present to this surface gets a named refusal, not a
+                // second presenter.
                 //
                 // The alternative was a self-contained `VkInstance`/`VkDevice`
                 // and swapchain in this file, reached only here. It could not
-                // draw the same picture the engine rail draws — it stretched
-                // instead of letterboxing, so the pointer mapping had to be
-                // suppressed to stay in agreement with it, and it presented
-                // FIFO where the engine rail takes MAILBOX when the surface
-                // offers it. A user on the one host that reached it therefore
-                // got a measurably different display with no counter saying
-                // which rail had drawn it, which is the silent degradation this
-                // project does not ship. macOS already refused here for its own
-                // reason (a second `VkInstance` on the same `CAMetalLayer` does
-                // not fix a MoltenVK surface failure); the two pathways now
-                // agree on what an attach failure means.
+                // draw the same picture the rails draw — it stretched instead
+                // of letterboxing, so the pointer mapping had to be suppressed
+                // to stay in agreement with it, and it presented FIFO where the
+                // Vulkan rail takes MAILBOX when the surface offers it. A user
+                // on the one host that reached it therefore got a measurably
+                // different display with no counter saying which rail had drawn
+                // it, which is the silent degradation this project does not
+                // ship. macOS already refused here for its own reason (a second
+                // `VkInstance` on the same `CAMetalLayer` does not fix a
+                // MoltenVK surface failure); the two pathways now agree on what
+                // an attach failure means.
                 //
-                // `host_window_engine_attach` is the counter that says the
-                // refusal happened, and the presenter's own typed reason
+                // `host_window_attach` is the counter that says the refusal
+                // happened, and the rail's own typed reason
                 // (`SwapchainUnavailable`, `QueueCannotPresent`, a `vk_window_*`
-                // slug) rides along in it as the detail.
-                crate::observe::Emit::decline("host_window_engine_attach", &error).fail();
+                // or `metal_window_*` slug) rides along in it as the detail.
+                crate::observe::Emit::decline("host_window_attach", &error).fail();
                 eprintln!(
-                    "reims-vgpu-window: engine present unavailable ({error}); \
+                    "reims-vgpu-window: no rail can present into this window ({error}); \
                      the host window has no other presenter — shutting down"
                 );
                 self.request_shutdown();
@@ -963,7 +962,7 @@ impl ApplicationHandler<FramePublished> for App {
             }
             WindowEvent::Resized(size) => {
                 let applied = (size.width.max(1), size.height.max(1));
-                if self.engine_attached {
+                if self.presenter_attached {
                     crate::backend::selected().window_resize(applied.0, applied.1);
                     self.note_guest_resize_applied(applied);
                 }
@@ -1026,13 +1025,13 @@ impl ApplicationHandler<FramePublished> for App {
         // freed `wl_proxy` and crash. winit calls this before the loop ends, so
         // the ordering is explicit here rather than left to drop order.
         //
-        // `window_present_detach` publishes the attached flag itself; this file
-        // used to set it here as a second statement, and the third site that
-        // takes the presenter — the engine's own device-loss flush — did not
-        // know to.
-        if self.engine_attached {
+        // `Backend::window_detach` publishes the rail's own attached flag; this
+        // file used to set it here as a second statement, and the third site
+        // that takes a presenter — the Vulkan engine's device-loss flush — did
+        // not know to.
+        if self.presenter_attached {
             crate::backend::selected().window_detach();
-            self.engine_attached = false;
+            self.presenter_attached = false;
         }
         // Close the guest's held keys and hand the desktop its shortcuts back
         // while the native window is still alive. An X11 keyboard grab in
@@ -1047,7 +1046,7 @@ impl ApplicationHandler<FramePublished> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.loop_census.tick();
         // The device sets `stop` on VM teardown. The loop wakes at least once per
-        // [`ENGINE_WINDOW_REDRAW_BACKSTOP`], so the request is picked up within
+        // [`WINDOW_REDRAW_BACKSTOP`], so the request is picked up within
         // one of those — then the loop exits and `exiting` releases the
         // presenter's swapchain and surface on this thread before the device's
         // join returns. Nothing publishes at teardown, so this is one of the two
@@ -1087,7 +1086,7 @@ impl ApplicationHandler<FramePublished> for App {
             if redraw_due(pending, now, self.next_backstop) {
                 window.request_redraw();
                 self.loop_census.redraws_asked += 1;
-                self.next_backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
+                self.next_backstop = now + WINDOW_REDRAW_BACKSTOP;
             }
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 self.next_backstop,
@@ -1112,7 +1111,7 @@ impl ApplicationHandler<FramePublished> for App {
 /// The whole rule, and the reason the loop is allowed to sleep: a tick with no
 /// publish behind it and time left on the backstop asks for nothing. Under the
 /// 2 ms poll this was unconditionally true, which is how 98 % of the redraws
-/// this window asked for reached [`needs_engine_present`] only to be refused.
+/// this window asked for reached [`needs_present`] only to be refused.
 fn redraw_due(frame_pending: bool, now: std::time::Instant, backstop: std::time::Instant) -> bool {
     frame_pending || now >= backstop
 }
@@ -1136,18 +1135,18 @@ impl App {
             keyboard: Keyboard::new(),
             capture_engaged_logged: false,
             capture: None,
-            engine_attached: false,
-            first_engine_present_logged: false,
-            first_engine_guest_logged: false,
-            engine_error_logged: false,
-            engine_reattempts: 0,
-            // The first tick draws: `engine_redraw_required` is set and there is
+            presenter_attached: false,
+            first_present_logged: false,
+            first_direct_present_logged: false,
+            present_error_logged: false,
+            presenter_rebuilds: 0,
+            // The first tick draws: `redraw_required` is set and there is
             // no publish behind the first frame, which is a clear rather than a
             // guest frame.
             frame_pending: true,
             next_backstop: std::time::Instant::now(),
-            last_engine_seq: None,
-            engine_redraw_required: true,
+            last_presented_seq: None,
+            redraw_required: true,
             guest_extent: None,
             pending_guest_resize: None,
             loop_census: LoopCensus::new(),
@@ -1208,19 +1207,19 @@ impl App {
 
     /// Force the next present and make sure a redraw is asked for to carry it.
     ///
-    /// The two flags answer different questions — `engine_redraw_required`
-    /// opens [`needs_engine_present`]'s seq gate, `frame_pending` makes
+    /// The two flags answer different questions — `redraw_required`
+    /// opens [`needs_present`]'s seq gate, `frame_pending` makes
     /// `about_to_wait` talk to the platform — and every caller that wants one
     /// wants both. Setting only the first is the shape that leaves a resized
     /// window blank until the guest happens to publish, because under the
     /// backstop nothing asks for the redraw the flag was waiting for.
     ///
     /// Deliberately not folded into [`redraw_due`]: a standing
-    /// `engine_redraw_required` that a `Busy` presenter cannot clear would then
+    /// `redraw_required` that a `Busy` presenter cannot clear would then
     /// re-request on every wake, which is the spin this loop has already been
     /// bitten by twice. A one-shot flag cannot do that.
     fn force_redraw(&mut self) {
-        self.engine_redraw_required = true;
+        self.redraw_required = true;
         self.frame_pending = true;
     }
 
@@ -1232,8 +1231,8 @@ impl App {
     }
 
     fn surface_dims(&self) -> (u32, u32) {
-        // The engine presenter owns the swapchain, so the native window is the
-        // only thing here that knows the drawable size. Before it opens, the
+        // The rail owns its drawables, so the native window is the only thing
+        // here that knows their size. Before it opens, the
         // requested size is the best answer available.
         match self.window.as_ref() {
             Some(window) => {
@@ -1272,7 +1271,7 @@ impl App {
         let capture = match handles {
             Some((display, handle)) => super::capture::for_window(display, handle),
             None => {
-                // The same handles the engine attach needs; if they are gone the
+                // The same handles the presenter attach needs; if they are gone the
                 // attach is about to fail too, and this is not the refusal that
                 // should be read as the cause.
                 Box::new(super::capture::NoCapture::new("no_window_handle"))
@@ -1283,18 +1282,18 @@ impl App {
         capture
     }
 
-    /// Build the engine-owned surface and swapchain over this native window.
+    /// Ask the running rail to build a presenter over this native window.
     ///
-    /// Present from the engine's own device. Presenting the compositor resident
-    /// from the device that rendered it is what removes the three full-frame
-    /// host copies every presented layer otherwise pays: the drain's
-    /// `read_target`, the publish copy, and a staging upload.
+    /// It presents from the rail's own device, which is what lets a rail that
+    /// holds residents skip the three full-frame host copies every presented
+    /// layer otherwise pays: the drain's `read_target`, the publish copy, and a
+    /// staging upload.
     ///
-    /// Taken out of `resumed` so [`Self::reattach_engine`] can run it again on a
-    /// window that already exists. `window_present_attach` is idempotent — it
+    /// Taken out of `resumed` so [`Self::rebuild_presenter`] can run it again on
+    /// a window that already exists. `Backend::window_attach` is idempotent — it
     /// returns `Ok` if a presenter is already there — so calling it twice is
-    /// safe, and it is the engine that publishes the attached flag.
-    fn attach_engine(window: &Arc<Window>) -> Result<(), WindowError> {
+    /// safe, and it is the rail that publishes the attached flag.
+    fn attach_presenter(window: &Arc<Window>) -> Result<(), WindowError> {
         let display = window
             .display_handle()
             .map_err(|error| WindowError::AttachDisplayHandle(error.to_string()))?
@@ -1311,12 +1310,17 @@ impl App {
                 width: size.width.max(1),
                 height: size.height.max(1),
             })
-            .map_err(|error| WindowError::AttachEngine(error.to_string()))
+            .map_err(|error| WindowError::AttachPresenter(error.to_string()))
     }
 
-    /// Rebuild the presenter after the engine device was lost and recreated.
+    /// Rebuild the presenter after the rail said it lost one.
     ///
     /// # Why the window has to do this and nothing else can
+    ///
+    /// Measured on the Vulkan rail, and stated in its terms because that is
+    /// where it was found; the shape is the rail-independent one, which is why
+    /// `WindowDecline::PresenterLost` is the rail's answer rather than this
+    /// file's `matches!` on a Vulkan enum.
     ///
     /// A `VK_ERROR_DEVICE_LOST` poisons the engine device; the next guest draw
     /// destroys everything derived from it — caches, pools, and the presenter's
@@ -1334,32 +1338,32 @@ impl App {
     /// recreated must not be retried once per redraw forever. Past the bound the
     /// window keeps running on whatever the previous behaviour was — a named
     /// refusal per present — rather than spinning.
-    fn reattach_engine(&mut self) {
+    fn rebuild_presenter(&mut self) {
         let Some(window) = self.window.clone() else {
             return;
         };
-        if self.engine_reattempts >= max_engine_reattaches() {
+        if self.presenter_rebuilds >= presenter_rebuild_budget() {
             return;
         }
-        self.engine_reattempts += 1;
-        match Self::attach_engine(&window) {
+        self.presenter_rebuilds += 1;
+        match Self::attach_presenter(&window) {
             Ok(()) => {
                 // The presenter is new, so nothing on screen came from it and
                 // the sequence this loop last presented is not its history.
                 // Clearing it is what makes the next frame count as fresh
                 // instead of stale, which is the difference between recovering
                 // and looking recovered.
-                self.last_engine_seq = None;
-                self.engine_redraw_required = true;
-                self.engine_error_logged = false;
+                self.last_presented_seq = None;
+                self.redraw_required = true;
+                self.present_error_logged = false;
                 crate::observe::off(format!(
                     "host_window_reattach status=ok attempt={}",
-                    self.engine_reattempts
+                    self.presenter_rebuilds
                 ));
                 eprintln!(
-                    "reims-vgpu-window: engine presenter rebuilt after device loss \
+                    "reims-vgpu-window: presenter rebuilt after device loss \
                      (attempt {})",
-                    self.engine_reattempts
+                    self.presenter_rebuilds
                 );
                 self.force_redraw();
             }
@@ -1369,7 +1373,7 @@ impl App {
         }
     }
 
-    /// Present one frame through the engine presenter, or decide there is
+    /// Present one frame through the running rail, or decide there is
     /// nothing to present.
     ///
     /// The guard is teardown, not a rail choice: `exiting` releases the
@@ -1377,7 +1381,7 @@ impl App {
     /// window at all. Both already named themselves where they happened, so a
     /// redraw arriving after either is expected control flow and stays quiet.
     fn draw(&mut self) {
-        if !self.engine_attached {
+        if !self.presenter_attached {
             return;
         }
         let frame = self.frames.lock().ok().and_then(|guard| guard.clone());
@@ -1393,11 +1397,7 @@ impl App {
             return;
         }
         let incoming_seq = frame.as_ref().map(|frame| frame.seq);
-        if !needs_engine_present(
-            self.last_engine_seq,
-            self.engine_redraw_required,
-            incoming_seq,
-        ) {
+        if !needs_present(self.last_presented_seq, self.redraw_required, incoming_seq) {
             self.loop_census.draws_stale += 1;
             return;
         }
@@ -1415,32 +1415,32 @@ impl App {
                 buffers,
                 suboptimal,
             }) => {
-                self.engine_error_logged = false;
+                self.present_error_logged = false;
                 // A frame reached the screen, so whatever rebuilt the presenter
                 // is proven and its budget starts over — the same rule, for the
                 // same reason, as `ContextOwner::note_work_completed` applies to
                 // the device's own recreate count. Without this the bound is a
                 // lifetime cap and a rail that recovers eight times is left dark
-                // after the third. See [`max_engine_reattaches`].
-                self.engine_reattempts = 0;
-                self.last_engine_seq = incoming_seq;
+                // after the third. See [`presenter_rebuild_budget`].
+                self.presenter_rebuilds = 0;
+                self.last_presented_seq = incoming_seq;
                 // A suboptimal present armed a swapchain recreation; redraw
                 // promptly so the corrected drawable replaces this one even if
                 // no new guest frame arrives for seconds. The assignment clears
                 // the flag on a healthy present, so this cannot become a
                 // self-feeding loop: one suboptimal buys exactly one more draw.
-                self.engine_redraw_required = suboptimal;
+                self.redraw_required = suboptimal;
                 if suboptimal {
                     self.force_redraw();
                 }
-                if !self.first_engine_present_logged {
+                if !self.first_present_logged {
                     eprintln!(
                         "reims-vgpu-window: first frame presented \
                          ({width}x{height}, {buffers} drawables)"
                     );
-                    self.first_engine_present_logged = true;
+                    self.first_present_logged = true;
                 }
-                if direct && frame.is_some() && !self.first_engine_guest_logged {
+                if direct && frame.is_some() && !self.first_direct_present_logged {
                     eprintln!(
                         "reims-vgpu-window: first guest frame presented via rail resident \
                          (same-device zero-copy)"
@@ -1448,11 +1448,11 @@ impl App {
                     crate::observe::off(
                         "host_window_direct_present path=rail_resident status=live",
                     );
-                    self.first_engine_guest_logged = true;
+                    self.first_direct_present_logged = true;
                 }
             }
             Err(error) => {
-                if !self.engine_error_logged {
+                if !self.present_error_logged {
                     // The rail's own refusal names itself — a `VkCall`'s
                     // `vk_window_*` slug, a `DrawReason`, a Metal layer
                     // refusal. Emitting it typed keeps that slug the primary
@@ -1460,15 +1460,15 @@ impl App {
                     // `reason=rail_present error=...` double-reason.
                     crate::observe::Emit::decline("host_window_present", &error).fail();
                     eprintln!("reims-vgpu-window: rail present failed: {error}");
-                    self.engine_error_logged = true;
+                    self.present_error_logged = true;
                 }
                 // One disposition is recoverable and every other refusal is the
                 // rail's own to report: a presenter that is *gone* means the
                 // rail's device was lost and took it. Which refusals mean that
                 // is the rail's answer, made once where it is known — see
-                // [`Self::reattach_engine`].
+                // [`Self::rebuild_presenter`].
                 if error.presenter_lost() {
-                    self.reattach_engine();
+                    self.rebuild_presenter();
                 }
             }
         }
@@ -1516,7 +1516,7 @@ impl App {
             // Applied synchronously — winit emits no later `Resized` for it.
             let applied = (applied.width.max(1), applied.height.max(1));
             crate::backend::selected().window_resize(applied.0, applied.1);
-            self.engine_redraw_required = true;
+            self.redraw_required = true;
             self.note_guest_resize_applied(applied);
         }
     }
@@ -1621,7 +1621,7 @@ mod wake_tests {
     #[test]
     fn a_wake_with_no_publish_and_time_left_asks_for_no_redraw() {
         let now = std::time::Instant::now();
-        let backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
+        let backstop = now + WINDOW_REDRAW_BACKSTOP;
         assert!(
             !redraw_due(false, now, backstop),
             "an input event or a stray wake must not become a redraw"
@@ -1633,7 +1633,7 @@ mod wake_tests {
     #[test]
     fn a_publish_is_answered_before_the_backstop() {
         let now = std::time::Instant::now();
-        let backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
+        let backstop = now + WINDOW_REDRAW_BACKSTOP;
         assert!(redraw_due(true, now, backstop));
     }
 
@@ -1646,7 +1646,7 @@ mod wake_tests {
             redraw_due(false, now, now),
             "a deadline that has arrived is a reason on its own"
         );
-        assert!(redraw_due(false, now + ENGINE_WINDOW_REDRAW_BACKSTOP, now));
+        assert!(redraw_due(false, now + WINDOW_REDRAW_BACKSTOP, now));
     }
 
     /// Over a second of the workload that motivated this, the loop asks for a
@@ -1674,11 +1674,10 @@ mod wake_tests {
             let published = wake % publish_every == 0;
             if redraw_due(published, now, backstop) {
                 requested += 1;
-                backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
+                backstop = now + WINDOW_REDRAW_BACKSTOP;
             }
         }
-        let backstop_ticks =
-            (second.as_millis() / ENGINE_WINDOW_REDRAW_BACKSTOP.as_millis()) as u32;
+        let backstop_ticks = (second.as_millis() / WINDOW_REDRAW_BACKSTOP.as_millis()) as u32;
         assert!(
             requested <= publishes + backstop_ticks,
             "asked {requested} times for {publishes} frames — a pacing rule \
@@ -1721,7 +1720,7 @@ mod tests {
                 10..=289 => 2,
                 _ => 3,
             });
-            if needs_engine_present(presented, redraw_required, incoming) {
+            if needs_present(presented, redraw_required, incoming) {
                 presents += 1;
                 presented = incoming;
                 redraw_required = false;
@@ -1740,15 +1739,15 @@ mod tests {
     #[test]
     fn forced_redraw_presents_without_a_new_frame() {
         assert!(
-            needs_engine_present(None, true, None),
+            needs_present(None, true, None),
             "the first present has no frame and must still happen"
         );
         assert!(
-            !needs_engine_present(None, false, None),
+            !needs_present(None, false, None),
             "and must not repeat once the flag is cleared"
         );
         assert!(
-            needs_engine_present(Some(7), true, Some(7)),
+            needs_present(Some(7), true, Some(7)),
             "a resize must repaint the same frame into new swapchain images"
         );
     }
@@ -1772,7 +1771,7 @@ mod tests {
             WindowError::CreateNativeWindow("os error creating window".into()),
             WindowError::AttachDisplayHandle("no display handle".into()),
             WindowError::AttachWindowHandle("no window handle".into()),
-            WindowError::AttachEngine("swapchain unavailable".into()),
+            WindowError::AttachPresenter("swapchain unavailable".into()),
             WindowError::FullscreenValue("borderless please".into()),
         ]
     }
@@ -1790,7 +1789,7 @@ mod tests {
             WindowError::CreateNativeWindow(_) => "CreateNativeWindow",
             WindowError::AttachDisplayHandle(_) => "AttachDisplayHandle",
             WindowError::AttachWindowHandle(_) => "AttachWindowHandle",
-            WindowError::AttachEngine(_) => "AttachEngine",
+            WindowError::AttachPresenter(_) => "AttachPresenter",
             WindowError::FullscreenValue(_) => "FullscreenValue",
         }
     }
@@ -1830,18 +1829,18 @@ mod tests {
         // reader greps for is exactly this.
         assert_eq!(
             Emit::decline(
-                "host_window_engine_attach",
-                &WindowError::AttachEngine("swapchain unavailable".into()),
+                "host_window_attach",
+                &WindowError::AttachPresenter("swapchain unavailable".into()),
             )
             .render(),
-            "host_window_engine_attach reason=window_attach_engine detail=swapchain_unavailable"
+            "host_window_attach reason=window_attach_presenter detail=swapchain_unavailable"
         );
     }
 
     /// This file types the refusals of a window that has **one** presenter, and
     /// no others.
     ///
-    /// An engine-attach failure ends the window on every platform, so nothing
+    /// A presenter-attach failure ends the window on every platform, so nothing
     /// here owns a `VkInstance`, a physical-device choice, a swapchain, a queue
     /// submit or a staging image — and none of those can name a refusal from
     /// this module. While the window carried a second self-contained presenter
@@ -1853,8 +1852,9 @@ mod tests {
     ///
     /// The eleven: building the event loop, running it (one variant per entry
     /// point), the three ways the single process window can be claimed by the
-    /// wrong device, creating the native window, the three steps of the engine
-    /// attach, and the geometry the operator asked for being unreadable. That
+    /// wrong device, creating the native window, the three steps of the
+    /// presenter attach, and the geometry the operator asked for being
+    /// unreadable. That
     /// last one is the only variant that ends nothing, and it belongs here for
     /// the same reason as the rest: it is a statement about bringing the window
     /// up, made once, before there is a window.
@@ -1878,19 +1878,19 @@ mod tests {
         // The attach refusal itself must survive under its registered name: it
         // is the counter that tells a reader the window refused rather than
         // quietly drew something else.
-        assert!(names.contains("AttachEngine"));
+        assert!(names.contains("AttachPresenter"));
         assert_eq!(
-            WindowError::AttachEngine("swapchain unavailable".into()).slug(),
-            "window_attach_engine"
+            WindowError::AttachPresenter("swapchain unavailable".into()).slug(),
+            "window_attach_presenter"
         );
     }
 
     #[test]
-    fn engine_present_gate_submits_new_frames_and_forced_redraws_only() {
-        assert!(needs_engine_present(None, true, None));
-        assert!(!needs_engine_present(Some(7), false, Some(7)));
-        assert!(needs_engine_present(Some(7), false, Some(8)));
-        assert!(needs_engine_present(Some(7), true, Some(7)));
+    fn the_present_gate_submits_new_frames_and_forced_redraws_only() {
+        assert!(needs_present(None, true, None));
+        assert!(!needs_present(Some(7), false, Some(7)));
+        assert!(needs_present(Some(7), false, Some(8)));
+        assert!(needs_present(Some(7), true, Some(7)));
     }
 
     #[test]

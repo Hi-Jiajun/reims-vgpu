@@ -1284,7 +1284,7 @@ impl WindowPresenter {
                 // native resize normally makes this the full window within
                 // milliseconds). The window input path maps pointer positions
                 // through this same transform.
-                let vp = crate::host_window::viewport::aspect_fit(
+                let vp = crate::backend::window::viewport::aspect_fit(
                     (base_width, base_height),
                     (self.extent.width, self.extent.height),
                 );

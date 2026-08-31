@@ -57,7 +57,7 @@ pub(crate) struct WindowLink {
     ///
     /// The window used to find frames by polling the slot every 2 ms, which on a
     /// driven boot asked for 494 redraws a second to serve 8.7 — see
-    /// `host_window::present::ENGINE_WINDOW_REDRAW_BACKSTOP`. The publisher is
+    /// `host_window::present::WINDOW_REDRAW_BACKSTOP`. The publisher is
     /// the only thing that knows a frame exists, so it is the only thing that
     /// can end the polling.
     wake: crate::host_window::present::WindowWakeHandle,

@@ -26,7 +26,7 @@
 //! `vkCmdBlitImage`, which does scale; the Metal equivalent is a one-triangle
 //! render pass with the viewport set to the fitted rectangle and the clear
 //! colour showing through the letterbox bars. It also puts the fit in this
-//! file, where [`crate::host_window::viewport::aspect_fit`] is the same
+//! file, where [`crate::backend::window::viewport::aspect_fit`] is the same
 //! function the pointer path maps through — presentation and input move as one
 //! unit, or a click lands where the pixel is not.
 
@@ -45,8 +45,8 @@ use raw_window_handle::RawWindowHandle;
 
 use super::raw_metal;
 use super::runtime::{cached_default_sampler, system_device, thread_queue};
+use crate::backend::window::viewport::aspect_fit;
 use crate::backend::window::{WindowCpuFrame, WindowPresentOutcome, WindowSurface};
-use crate::host_window::viewport::aspect_fit;
 use crate::observe::Decline;
 
 /// The layer's and the staging texture's pixel format.

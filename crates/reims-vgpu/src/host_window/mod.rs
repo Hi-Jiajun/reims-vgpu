@@ -23,12 +23,12 @@
 //!   publish → fit → present loop. It also drives [`input_map`] and hands each
 //!   action to an `InputSink`; `lib.rs` wires that to the device's prompt action
 //!   queue through QEMU's thread-safe `notify_actions` callback.
-//! - [`viewport`] — letterbox/scale arithmetic mapping guest framebuffer extent
-//!   to window extent, shared by the blit and by input coordinate translation so
-//!   a click lands where the pixel was drawn.
+//!
+//! The letterbox/scale arithmetic both the blit and the pointer path move
+//! through is `backend::window::viewport`, one layer down, because both rails'
+//! presenters need it too and `backend` may not reach up into this module.
 
 pub mod capture;
 pub mod input_map;
 pub mod keyboard;
 pub mod present;
-pub mod viewport;

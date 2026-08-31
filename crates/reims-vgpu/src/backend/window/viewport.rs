@@ -1,11 +1,15 @@
-//! Aspect-fit viewport math shared by the macOS engine presenter (where the
-//! guest frame lands inside the drawable) and the window input path (where
-//! host pointer coordinates map back into guest coordinates).
+//! Aspect-fit viewport math, shared by every rail's presenter (where the guest
+//! frame lands inside the drawable) and by the window's input path (where host
+//! pointer coordinates map back into guest coordinates).
 //!
 //! Presentation and pointer translation MUST move through the same transform
 //! as one unit: the rolled-back aspect-fit experiment stayed visible but left
 //! clicks in full-window coordinates, so every pointer event was offset and
 //! scaled against the letterboxed guest viewport ([[host-window]]).
+//!
+//! Two rails and an input path are three callers, and the two rails are below
+//! the window — which is why this is under [`super`] and not beside the loop
+//! that drives it.
 
 /// Where a `src`-sized frame lands inside a `dst`-sized drawable: the largest
 /// centered rectangle with `src`'s aspect ratio that fits `dst`.
