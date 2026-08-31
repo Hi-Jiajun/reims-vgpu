@@ -1,13 +1,27 @@
-//! Backend selection seam.
+//! Backend selection seam — **the** seam. Everything the running rail decides
+//! comes through the `Backend` trait below, and nothing above this module
+//! names a rail.
 //!
-//! - [`metal`] / [`vulkan`] = concrete backends (feature-selected), each
+//! - [`metal`] / [`vulkan`] are the concrete rails, feature-selected and each
 //!   **self-contained** in this crate (Metal via `metal`; Vulkan via `ash` +
 //!   [`vulkan::engine`]).
-//! - Draws, compute and blits do **not** come through this module. The live
-//!   seams are `runtime/draw::try_metal2vulkan_draw` → [`vulkan::engine`]
-//!   on the Vulkan rail and `metal::render::render_core_mrt` /
-//!   `metal::compute::compute_core` on the Metal rail; the runtime drives them
-//!   directly.
+//! - [`SelectedBackend`] is the one that runs. `select` picks it once per
+//!   process — from what the build compiled and what `REIMS_VGPU_RAIL` narrows
+//!   that to — and every one of its methods forwards to the arm that is
+//!   actually executing.
+//! - Draws, compute, blits, mipmaps, presents, the completion stamp, the census
+//!   and the host window all go through the trait. The rail-specific halves
+//!   live in rail-named modules under `runtime/` (`draw::metal`,
+//!   `draw::vulkan`, `compute_exec::vulkan`, …); the trait is what chooses
+//!   between them.
+//! - [`window`] is the neutral vocabulary the host-owned window and the rails
+//!   share, and it is below both so that neither has to name the other.
+//!
+//! This is not a style preference. A `--backend both` binary compiles both
+//! rails, so `cfg` can only ever answer "what did this build compile" — a
+//! `cfg`-selected call site meaning "the Metal arm" silently disappears there,
+//! and one meaning "the Vulkan arm" executes against Metal. The trait is the
+//! only construct that can ask the other question.
 //!
 //! Metal indices/semantics are canonical (guest wire is serialized Metal).
 //! Vulkan-only binding rewrites live only in [`vulkan`].
