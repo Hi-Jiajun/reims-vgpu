@@ -9,7 +9,7 @@
 //! two producers and the arm a reader landed on was arbitrary.
 
 use crate::backend::metal::runtime::system_device;
-use crate::backend::Backend;
+use crate::backend::{Backend, CensusSite};
 use crate::model::{DeviceInfoLimits, DeviceState};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session::{self, ComputeSession};
@@ -149,6 +149,16 @@ impl Backend for MetalBackend {
     /// behind this rail is one of them.
     fn compute_threadgroup_limits(&self) -> (u32, u32) {
         (1024, 32)
+    }
+
+    fn emit_census(&self, site: CensusSite) {
+        // One line, at one site. The other three are engine counters, phase
+        // windows and a mutex census that this rail has no counterpart for —
+        // absent rather than zeroed, so a reader cannot mistake "no such engine"
+        // for "an idle one".
+        if site == CensusSite::Levels {
+            crate::runtime::drain::census::metal::emit_object_cache_levels();
+        }
     }
 
     // The rest of `Backend` takes the trait's defaults, and each default is the

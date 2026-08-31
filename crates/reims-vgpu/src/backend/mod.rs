@@ -428,6 +428,46 @@ pub(crate) trait Backend: Copy {
         crate::runtime::render_writeback::settle_guest_writes(site);
         StampOrdering::Settled
     }
+
+    /// Emit this rail's census lines for one point in the drain's census window.
+    ///
+    /// Census only, and the reason it is a trait method rather than a `cfg` is
+    /// that a `cfg` answers "which rail was compiled" and this asks "which rail
+    /// is *running*". A build carrying both would print one rail's engine
+    /// counters for a device executing on the other, and — worse, because it is
+    /// silent — would drop the Metal cache-levels line entirely, since its gate
+    /// spelled "the Metal arm" as `not(backend-vulkan)`.
+    ///
+    /// A rail with nothing to say at a site says nothing. That is not the same
+    /// as a zero: an absent `engine_delta` means no such engine, where
+    /// `engine_delta …=0` would mean an idle one.
+    fn emit_census(&self, _site: CensusSite) {}
+}
+
+/// A point in the drain's per-second census window at which a rail may
+/// contribute lines — the vocabulary of [`Backend::emit_census`].
+///
+/// The **order** of these points is the drain's and not a rail's, which is why
+/// they are named for the drain's reason rather than for any rail's tables:
+/// several of the neutral lines emitted between them are only interpretable
+/// read against a rail line that must come first. Ordering *within* a site is
+/// the rail's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CensusSite {
+    /// Beside `window_publish`, which it divides: `window_publish fresh` is
+    /// what the device offered the window and `host_window_cadence presents` is
+    /// what reached the screen, and when the two disagree the first candidate is
+    /// the rail's own serialization. Carries the window the drain measured.
+    Serialization { win_ms: u64 },
+    /// Beside the eviction routes: those say which cap fired and this says how
+    /// much the workload wanted, and neither is interpretable without the other.
+    WorkingSet,
+    /// Before the neutral `chain_phase`, which divides against it — reading them
+    /// in the other order invites treating a rail's phases as the whole draw.
+    Throughput,
+    /// After `chain_phase`. Levels, not per-interval deltas: entry counts of the
+    /// caches that hold one entry per distinct guest object.
+    Levels,
 }
 
 /// Who publishes a FIFO completion stamp word — the vocabulary of
@@ -789,6 +829,15 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.order_completion_stamp(state, host, index, value, site),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.order_completion_stamp(state, host, index, value, site),
+        }
+    }
+
+    fn emit_census(&self, site: CensusSite) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.emit_census(site),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.emit_census(site),
         }
     }
 }
