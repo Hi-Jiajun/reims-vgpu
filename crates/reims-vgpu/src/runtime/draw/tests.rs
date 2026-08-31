@@ -1,9 +1,9 @@
 use super::*;
-// This file tests both rails. Neither is re-exported into `super`, so each is
-// named where its arm compiles — which is also what keeps a test from asserting
-// against whichever rail happened to win a flat re-export.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use super::metal::*;
+// This file tests both rails, and neither is re-exported into `super`. The
+// Metal rail is named at each use (there are two), because the two rails
+// declare same-named entry points on purpose — `encode_draw_chain` is one — and
+// two globs make a build carrying both rails assert against whichever import
+// won rather than against the rail the test names.
 #[cfg(feature = "backend-vulkan")]
 use super::vulkan::*;
 #[cfg(feature = "backend-vulkan")]
@@ -2269,7 +2269,12 @@ fn missing_pipeline_is_soft() {
     // used to pass *different* `force_full_store` values for the same call.
     // These are the arguments `exec` passes for a single-record draw that owns
     // its writeback.
-    let st = encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
+    // Through the seam, not a rail: this test is about what any rail answers
+    // for a pipeline it cannot resolve, and naming one would make a build
+    // carrying both assert against whichever glob import won.
+    let st = crate::backend::selected()
+        .encode_draw_chain(&mut state, &mut host, &mut req, true, false)
+        .0;
     assert!(matches!(
         st,
         EncodeStatus::MissingPipeline(_) | EncodeStatus::MissingMtlb(_) | EncodeStatus::NoMetal(_)
@@ -2493,7 +2498,7 @@ fn the_metal_draw_arm_refuses_a_bind_past_its_table() {
         .into(),
         ..Default::default()
     };
-    let st = encode_draw_chain(&mut state, &mut host, &mut req, false, false).0;
+    let st = super::metal::encode_draw_chain(&mut state, &mut host, &mut req, false, false).0;
     assert!(
         matches!(st, EncodeStatus::BadArgs("draw_mtl_bind_slot_past_table")),
         "expected a past-table refusal, got {st:?}"
@@ -6268,7 +6273,7 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
     let vertices_before = store_route_count(VERTICES);
 
     let cap = crate::observe::FailCapture::start();
-    let st = encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
+    let st = super::vulkan::encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
     let lines = cap.lines();
     drop(cap);
 

@@ -959,12 +959,22 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
         height: 4,
         bytes: vec![0; 64],
         is_storage: true,
+        // The Vulkan-gated half of the struct, kept complete because a build
+        // carrying both rails compiles these lines and nothing else checks
+        // them: this literal named a `seed_skipped: bool` and a
+        // `sample_resident` that were folded into one `serve` field, and both
+        // spellings survived because each single-arm build `cfg`s out exactly
+        // the arm that would have caught it.
+        #[cfg(feature = "backend-vulkan")]
+        array_element: 0,
+        #[cfg(feature = "backend-vulkan")]
+        descriptor_count: 1,
         #[cfg(feature = "backend-vulkan")]
         residency: None,
         #[cfg(feature = "backend-vulkan")]
-        seed_skipped: false,
+        serve: None,
         #[cfg(feature = "backend-vulkan")]
-        sample_resident: None,
+        multisample_target: None,
         writeback: TextureWriteback::None,
     };
 
