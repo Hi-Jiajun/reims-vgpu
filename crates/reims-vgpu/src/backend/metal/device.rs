@@ -196,17 +196,91 @@ impl Backend for MetalBackend {
         }
     }
 
+    #[cfg(feature = "host-window")]
+    fn presents_host_window(&self) -> bool {
+        // The drawable half of that window is `super::window`, so this rail can
+        // fill one. Whether this *build* compiled a window at all is a
+        // different question with a different owner — `device::window_publish`,
+        // where the `host-window` feature is asked.
+        true
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_attach(
+        &self,
+        surface: &crate::backend::window::WindowSurface,
+    ) -> Result<(), crate::backend::window::WindowDecline> {
+        super::window::attach(surface).map_err(window_decline)
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_attached(&self) -> bool {
+        super::window::attached()
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_present(
+        &self,
+        resident: Option<&crate::backend::window::WindowResident>,
+        cpu: Option<crate::backend::window::WindowCpuFrame<'_>>,
+    ) -> Result<crate::backend::window::WindowPresentOutcome, crate::backend::window::WindowDecline>
+    {
+        if resident.is_some() {
+            // Unreachable through the publish path — this rail's
+            // `window_resident` refuses, so nothing ever parks one for it — and
+            // typed rather than ignored because reaching it means the publisher
+            // and the presenter disagree about which rail is running, which is
+            // exactly the class of defect a `--backend both` binary exists to
+            // make visible.
+            return Err(crate::backend::window::WindowDecline::Refused(
+                crate::backend::window::WindowDeclineReason::ResidentFromOtherRail,
+            ));
+        }
+        super::window::present(cpu).map_err(window_decline)
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_resize(&self, width: u32, height: u32) {
+        super::window::resize(width, height);
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_detach(&self) {
+        super::window::detach();
+    }
+
     // The rest of `Backend` takes the trait's defaults, and each default is the
     // accurate statement for this rail rather than a stub:
     //
-    // * The two blit fast paths, the resident census, and the two present
-    //   questions — no resident registry to copy out of, to count, or to ask.
+    // * The two blit fast paths, the resident census, and `window_resident` —
+    //   no resident registry to copy out of, to count, or to name a present
+    //   from, so the host window takes this rail's CPU frames.
     // * The guest-memory group — this rail's Store is a host copy that has
     //   already executed when it returns, so nothing is ever outstanding, it
     //   holds no alias of guest RAM past the call, and it pins no linear
     //   resident to release.
     // * The cadence pair — nothing is batched or deferred, so there is nothing
     //   for the heartbeat or the drain tail to flush.
+}
+
+/// Which disposition one of this rail's window refusals carries.
+///
+/// The window acts on exactly one distinction — a presenter that is *gone* gets
+/// rebuilt — and only this rail knows which of its refusals means that. Losing
+/// the presenter is losing the `CAMetalLayer`, and the layer is dropped in
+/// exactly one place: `window::detach`, from the window's own `exiting`. Every
+/// other refusal leaves a presenter standing and is named and dropped.
+#[cfg(feature = "host-window")]
+fn window_decline(
+    error: super::window::MetalWindowDecline,
+) -> crate::backend::window::WindowDecline {
+    let lost = matches!(error, super::window::MetalWindowDecline::NotAttached);
+    let reason = crate::backend::window::WindowDeclineReason::Metal(error);
+    if lost {
+        crate::backend::window::WindowDecline::PresenterLost(reason)
+    } else {
+        crate::backend::window::WindowDecline::Refused(reason)
+    }
 }
 
 #[cfg(test)]

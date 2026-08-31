@@ -473,10 +473,12 @@ else
   QEMU_ARGS+=(-nic none)   # suppress QEMU's implicit default user-mode NIC
 fi
 
-# The Vulkan product build owns its AppKit window in Rust and therefore disables
-# QEMU's Cocoa display. The Apple reference and Metal-direct builds retain Cocoa.
-# The build stamp is authoritative configure-time state, not an env-gated device
-# path; fail closed rather than accidentally run two competing display windows.
+# Both product rails own their AppKit window in Rust and therefore disable QEMU's
+# Cocoa display: the Vulkan rail fills it through a VkSurfaceKHR swapchain, the
+# Metal rail through a CAMetalLayer on the same view. Only the Apple reference
+# device (apple-gfx-mmio), which is QEMU's own and has no Rust window, retains
+# Cocoa. The build stamp is authoritative configure-time state, not an env-gated
+# device path; fail closed rather than accidentally run two competing windows.
 DISPLAY_KIND="cocoa"
 BACKEND_RAIL=""
 if [ "$GFX_DEVICE" = "reims-vgpu-mmio" ]; then
@@ -486,11 +488,9 @@ if [ "$GFX_DEVICE" = "reims-vgpu-mmio" ]; then
   # Which rails the binary carries is the stamp's to say. Which one *runs* is
   # the stamp's too for a single-rail build, and REIMS_VGPU_RAIL's for a `both`
   # build — the same split the device itself makes. This has to agree with
-  # `backend::resolve_rail`, because the display below is chosen from it: the
-  # Vulkan rail owns its own AppKit window in Rust and QEMU's Cocoa display must
-  # be off, and two competing windows is the failure this block exists to
-  # prevent. Metal is the device's default on an Apple host, so it is the
-  # default here.
+  # `backend::resolve_rail`, because the rail is also what the Vulkan loader
+  # environment below is set for. Metal is the device's default on an Apple
+  # host, so it is the default here.
   case "$(cat "$BACKEND_STAMP")" in
     vulkan) BACKEND_RAIL="vulkan" ;;
     metal) BACKEND_RAIL="metal" ;;
@@ -507,8 +507,11 @@ if [ "$GFX_DEVICE" = "reims-vgpu-mmio" ]; then
       ;;
     *) die "invalid backend stamp: $BACKEND_STAMP" ;;
   esac
+  # Every rail this device carries presents into the Rust-owned window, so the
+  # window follows the *device* and not the rail; only the loader environment
+  # below is the Vulkan rail's.
+  DISPLAY_KIND="reims-host-window"
   if [ "$BACKEND_RAIL" = vulkan ]; then
-    DISPLAY_KIND="reims-host-window"
     VULKAN_LOADER_DIR="/opt/homebrew/opt/vulkan-loader/lib"
     MOLTENVK_ICD="/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json"
     [ -d "$VULKAN_LOADER_DIR" ] || die \

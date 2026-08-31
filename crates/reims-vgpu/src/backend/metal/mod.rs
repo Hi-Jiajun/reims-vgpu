@@ -45,5 +45,13 @@ mod stage_input;
 #[cfg(target_os = "macos")]
 pub(crate) mod util;
 
+/// This rail's half of the host-owned presentation window: a `CAMetalLayer` on
+/// the window's own view, and the blit that fills its drawables.
+///
+/// Gated on the window's feature, which is the lawful question — whether this
+/// build compiled a window at all is a fact about the build.
+#[cfg(feature = "host-window")]
+pub mod window;
+
 #[cfg(target_os = "macos")]
 pub(crate) use device::MetalBackend;

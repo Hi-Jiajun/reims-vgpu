@@ -106,9 +106,13 @@ pub mod runtime;
 pub mod backend;
 pub mod qemu;
 
-/// Host-owned presentation window (winit + VkSurfaceKHR) — see
-/// [[host-window]]. The `host-window` feature implies `backend-vulkan`, and is
-/// enabled for every verification command the x86 pathway is checked with.
+/// Host-owned presentation window — a Rust-owned `winit` window that replaces
+/// QEMU's UI. See [[host-window]].
+///
+/// The feature names no backend. Which rail fills the window is a run-time
+/// answer (`backend::Backend::presents_host_window`) and every rail can:
+/// Vulkan drives a swapchain on a `VkSurfaceKHR`, Metal a `CAMetalLayer` on the
+/// same native view. It is enabled on every product arm.
 #[cfg(feature = "host-window")]
 pub mod host_window;
 

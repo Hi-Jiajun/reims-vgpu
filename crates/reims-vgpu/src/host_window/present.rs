@@ -101,17 +101,14 @@ use crate::runtime::host::HostAction;
 const ENGINE_WINDOW_REDRAW_BACKSTOP: std::time::Duration =
     std::time::Duration::from_millis(GUEST_RESIZE_WARN_AFTER.as_millis() as u64 / 10);
 /// How many rebuilds of the presenter may go unproven before the window stops
-/// trying.
+/// trying — asked of the running rail, which is what gets lost.
 ///
-/// Derived from the engine's own device-recreate budget — and, the part that
-/// matters, **a storm budget in the same sense rather than a lifetime cap**.
-/// `ContextOwner::note_work_completed` zeroes `recreate_count` the moment guest
-/// work runs on a rebuilt device, on the reasoning that a device which recovered
-/// and is lost again later is a new incident and not the fourth step of the old
-/// one. Exactly the same holds for the presenter, so [`App::draw`] zeroes
-/// [`App::engine_reattempts`] on a present that reached the screen. What the
-/// bound then stops is a surface that genuinely cannot be created being retried
-/// once per redraw forever.
+/// **A storm budget rather than a lifetime cap**, and [`App::draw`] is the half
+/// of that which lives here: it zeroes [`App::engine_reattempts`] on a present
+/// that reached the screen, on the reasoning that a rail which recovered and is
+/// lost again later is a new incident and not the fourth step of the old one.
+/// What the bound then stops is a surface that genuinely cannot be created
+/// being retried once per redraw forever.
 ///
 /// Reading it as a lifetime cap was measured wrong on real hardware, and the
 /// measurement is why this doc is here. A driven macos-11 boot lost the device
@@ -119,7 +116,9 @@ const ENGINE_WINDOW_REDRAW_BACKSTOP: std::time::Duration =
 /// logged `host_window_reattach status=ok attempt=3`, spent the budget, and sat
 /// out every later loss with the picture gone — which is most of the defect the
 /// re-attach exists to remove, reintroduced by its own bound.
-const MAX_ENGINE_REATTACHES: u32 = crate::backend::vulkan::engine::MAX_DEVICE_RECREATES;
+fn max_engine_reattaches() -> u32 {
+    crate::backend::selected().window_reattach_budget()
+}
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
 /// apply within single-digit milliseconds; one second means the window system
@@ -761,7 +760,7 @@ struct App {
     engine_error_logged: bool,
     /// How many times [`App::reattach_engine`] has rebuilt, or tried to rebuild,
     /// the presenter after a device loss. Bounded by
-    /// [`MAX_ENGINE_REATTACHES`] so a surface that cannot be recreated is
+    /// [`max_engine_reattaches`] so a surface that cannot be recreated is
     /// retried a few times and then left alone, rather than once per redraw for
     /// the life of the boot.
     engine_reattempts: u32,
@@ -1339,7 +1338,7 @@ impl App {
         let Some(window) = self.window.clone() else {
             return;
         };
-        if self.engine_reattempts >= MAX_ENGINE_REATTACHES {
+        if self.engine_reattempts >= max_engine_reattaches() {
             return;
         }
         self.engine_reattempts += 1;
@@ -1422,7 +1421,7 @@ impl App {
                 // same reason, as `ContextOwner::note_work_completed` applies to
                 // the device's own recreate count. Without this the bound is a
                 // lifetime cap and a rail that recovers eight times is left dark
-                // after the third. See [`MAX_ENGINE_REATTACHES`].
+                // after the third. See [`max_engine_reattaches`].
                 self.engine_reattempts = 0;
                 self.last_engine_seq = incoming_seq;
                 // A suboptimal present armed a swapchain recreation; redraw

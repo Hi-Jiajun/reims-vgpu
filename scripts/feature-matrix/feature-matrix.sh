@@ -39,7 +39,7 @@ its binaries do not run on this host.
 
 The supported arms:
 
-  Metal              --features backend-metal                     Apple only
+  Metal              --features backend-metal,host-window         Apple only
   Vulkan / MoltenVK  --no-default-features
                        --features backend-vulkan,host-window      Apple
   Vulkan / native    same feature set                             Linux
@@ -131,7 +131,7 @@ if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ] &&
 fi
 
 # Feature sets, verbatim from vendor/qemu/hw/display/meson.build.
-FEATURES_METAL="--features backend-metal"
+FEATURES_METAL="--features backend-metal,host-window"
 FEATURES_VULKAN="--no-default-features --features backend-vulkan,host-window"
 # Both rails in one binary, chosen at run time through REIMS_VGPU_RAIL. Apple
 # only, because backend-metal needs target_os = "macos".

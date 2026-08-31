@@ -323,8 +323,12 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // it stands, so the frame never crosses host memory. `display_from_resident`
     // is what tells the NEXT capture not to read it back, and it is only set
     // when a resident actually carried this one.
-    if backend.window_attached() {
-        if let Ok(resident) = resident {
+    // Say why a direct present was not taken, because the fallback below copies
+    // the whole framebuffer through host memory on every frame and the
+    // difference between the two is the window's frame rate. Silence here is
+    // what let `direct_frac` sit at 0.00 for a whole boot with no cause named.
+    match (backend.window_attached(), resident) {
+        (true, Ok(resident)) => {
             let published = window_write_frame(link, width, height, Vec::new(), Some(resident));
             crate::runtime::census::present_proxy::host_window_publish::note(published);
             if published {
@@ -333,15 +337,8 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
             }
             return;
         }
-    }
-    // Say why the direct present was not taken, because the fallback below
-    // copies the whole framebuffer through host memory on every frame and the
-    // difference between the two is the window's frame rate. Silence here is
-    // what let `direct_frac` sit at 0.00 for a whole boot with no cause named.
-    if !backend.window_attached() {
-        crate::runtime::drain::note_store_route("winpub_window_not_attached");
-    } else if let Err(route) = resident {
-        crate::runtime::drain::note_store_route(route);
+        (true, Err(route)) => crate::runtime::drain::note_store_route(route),
+        (false, _) => crate::runtime::drain::note_store_route("winpub_window_not_attached"),
     }
     // No resident carries this present (firmware framebuffer, a mapping the
     // compositor cleared but never rendered into, the frames after a device

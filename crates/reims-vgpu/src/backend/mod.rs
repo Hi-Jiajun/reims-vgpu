@@ -511,6 +511,25 @@ pub(crate) trait Backend: Copy {
     #[cfg(feature = "host-window")]
     fn window_resize(&self, _width: u32, _height: u32) {}
 
+    /// How many rebuilds of this rail's presenter may go unproven before the
+    /// window stops trying.
+    ///
+    /// A **storm budget, not a lifetime cap**: the window zeroes its count on
+    /// any present that reaches the screen, on the reasoning that a rail which
+    /// recovered and is lost again later is a new incident and not the fourth
+    /// step of the old one. What the bound stops is a surface that genuinely
+    /// cannot be created being retried once per redraw forever.
+    ///
+    /// The rail answers because the rail is what gets lost, and it already has
+    /// a number for how many times it will rebuild itself; a second constant in
+    /// the window would be that number copied, free to drift. The default is
+    /// one rebuild, which is the honest answer for a rail whose presenter has
+    /// no loss to recover from.
+    #[cfg(feature = "host-window")]
+    fn window_reattach_budget(&self) -> u32 {
+        1
+    }
+
     /// Release the presenter while the native window is still alive.
     ///
     /// Ordering, not politeness: the presenter's surface is serviced through
@@ -1098,6 +1117,16 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.window_detach(),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.window_detach(),
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_reattach_budget(&self) -> u32 {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.window_reattach_budget(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.window_reattach_budget(),
         }
     }
 
@@ -1803,25 +1832,29 @@ mod tests {
         );
     }
 
-    /// The host-owned window belongs to the rail that can fill it.
+    /// Every rail a build with a window carries can fill one, and the selected
+    /// handle forwards the question rather than taking the trait default.
     ///
-    /// Named rails rather than [`selected`], because the case this guards is a
-    /// binary that compiled the window and is *not* running the rail that owns
-    /// it: on a `--backend both` build `feature = "host-window"` is on for the
-    /// Metal boot too, and answering it from the feature opened a `winit` event
-    /// loop next to QEMU's Cocoa display, which aborts the boot. The selected
-    /// handle is then checked to forward rather than take the trait default.
+    /// Named rails rather than only [`selected`], because the case this guards
+    /// is a binary that compiled the window and is running either rail. It used
+    /// to be answered from `feature = "host-window"`, which is on for the Metal
+    /// boot of a `--backend both` build too — that opened a `winit` event loop
+    /// next to QEMU's Cocoa display and aborted the boot. The default stays
+    /// `false` for the rail that has no presenter, so the forwarding is what is
+    /// checked here: a missing arm would read the default and leave the screen
+    /// dark with no refusal anywhere.
     #[test]
     #[cfg(feature = "host-window")]
-    fn only_the_vulkan_rail_presents_into_the_host_window() {
+    fn every_compiled_rail_presents_into_the_host_window() {
         #[cfg(feature = "backend-metal")]
-        assert!(!metal::MetalBackend.presents_host_window());
+        assert!(metal::MetalBackend.presents_host_window());
         #[cfg(feature = "backend-vulkan")]
         assert!(vulkan::VulkanBackend::new().presents_host_window());
-        assert_eq!(
-            selected().presents_host_window(),
-            selected().rail() == Rail::Vulkan
-        );
+        assert!(selected().presents_host_window());
+        // The budget the window spends on rebuilding a presenter is the rail's,
+        // and a rail that forgot to answer would silently take the trait's
+        // one-rebuild default.
+        assert!(selected().window_reattach_budget() >= 1);
     }
 
     /// One spelling of a rail's name, reachable from every direction it is

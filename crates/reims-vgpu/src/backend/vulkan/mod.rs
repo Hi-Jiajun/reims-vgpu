@@ -200,6 +200,14 @@ impl Backend for VulkanBackend {
         engine::window_present_detach();
     }
 
+    #[cfg(feature = "host-window")]
+    fn window_reattach_budget(&self) -> u32 {
+        // The presenter dies with the device that owns its swapchain, so the
+        // number of rebuilds worth attempting is the number of device recreates
+        // this rail will attempt — one value, in the one place that decides it.
+        engine::MAX_DEVICE_RECREATES
+    }
+
     fn guest_writes_outstanding(&self) -> bool {
         engine::guest_writes_outstanding()
     }

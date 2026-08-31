@@ -153,6 +153,8 @@ pub enum WindowDeclineReason {
     ResidentFromOtherRail,
     #[cfg(feature = "backend-vulkan")]
     Vulkan(crate::backend::vulkan::engine::DrawError),
+    #[cfg(feature = "backend-metal")]
+    Metal(crate::backend::metal::window::MetalWindowDecline),
 }
 
 impl WindowDecline {
@@ -191,6 +193,8 @@ impl Decline for WindowDeclineReason {
             Self::ResidentFromOtherRail => "window_resident_other_rail",
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(error) => error.slug(),
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(error) => error.slug(),
         }
     }
 
@@ -199,6 +203,8 @@ impl Decline for WindowDeclineReason {
             Self::RailHasNoPresenter | Self::ResidentFromOtherRail => Vec::new(),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(error) => error.fields(),
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(error) => error.fields(),
         }
     }
 
@@ -207,6 +213,8 @@ impl Decline for WindowDeclineReason {
             Self::RailHasNoPresenter | Self::ResidentFromOtherRail => std::any::type_name::<Self>(),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(error) => error.owner(),
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(error) => error.owner(),
         }
     }
 }
