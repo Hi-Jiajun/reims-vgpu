@@ -18,6 +18,9 @@
 //! decision cannot be made twice with two different answers.
 
 pub mod caps;
+/// The census lines only this rail can answer. Reached through
+/// [`Backend::emit_census`], never through a `cfg`.
+mod census;
 pub mod engine;
 pub mod translate;
 
@@ -613,7 +616,6 @@ impl Backend for VulkanBackend {
     }
 
     fn emit_census(&self, site: CensusSite) {
-        use drain::census::vulkan as census;
         match site {
             CensusSite::Serialization { win_ms } => census::emit_engine_lock(win_ms),
             CensusSite::WorkingSet => census::emit_working_set(),

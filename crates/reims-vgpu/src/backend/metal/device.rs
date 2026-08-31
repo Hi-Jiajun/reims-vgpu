@@ -159,7 +159,7 @@ impl Backend for MetalBackend {
         // absent rather than zeroed, so a reader cannot mistake "no such engine"
         // for "an idle one".
         if site == CensusSite::Levels {
-            crate::runtime::drain::census::metal::emit_object_cache_levels();
+            super::census::emit_object_cache_levels();
         }
     }
 

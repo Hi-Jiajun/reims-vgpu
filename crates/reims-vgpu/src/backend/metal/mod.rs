@@ -15,11 +15,10 @@ pub mod error;
 
 #[cfg(target_os = "macos")]
 mod cache;
-/// Live entries in each compiled-object cache. See
-/// [`cache::cache_levels`] — re-exported because `cache` is private to this
-/// module and the census that publishes the reading is in `runtime::drain`.
+/// The census lines only this rail can answer. Reached through
+/// [`crate::backend::Backend::emit_census`], never through a `cfg`.
 #[cfg(target_os = "macos")]
-pub(crate) use cache::cache_levels;
+mod census;
 #[cfg(target_os = "macos")]
 pub(crate) mod compute;
 #[cfg(target_os = "macos")]

@@ -16,14 +16,10 @@
 //! `crate::runtime::drain::note_*` path still resolves; this module is where
 //! they are written, not a new place to reach them from.
 
-// The lines each rail alone can answer, named rather than re-exported flat:
-// this module owns the *order* of the census window and asks the rail through
-// `Backend::emit_census`, so nothing here mentions a rail.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-pub mod metal;
-#[cfg(feature = "backend-vulkan")]
-pub mod vulkan;
-
+// The lines each rail alone can answer live with the rail that answers them
+// (`backend::{metal,vulkan}::census`). This module owns the *order* of the
+// census window and asks the rail through `Backend::emit_census`, so nothing
+// here mentions a rail.
 use super::DISPLAY_VBL_MIN_INTERVAL_US;
 use crate::backend::{Backend as _, CensusSite};
 /// Delivered-VBL rate, reported from the branch that decides it.
