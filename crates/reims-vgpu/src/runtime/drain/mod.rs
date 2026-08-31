@@ -3,7 +3,7 @@
 //! Prefer structure correctness over full exec.c coverage: known root/child
 //! control-plane ops update device state; unknown opcodes are recorded visibly.
 
-use crate::backend::Backend as _;
+use crate::backend::{Backend as _, RetainedObject};
 use crate::contract::endian::{ld16, ld32, ld64, st16, st32};
 use crate::contract::iosurface_pages::{
     MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP, MAPPER_REQUEST_MAPPING_ID, MAPPER_REQUEST_TYPE,
@@ -313,29 +313,26 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
         });
         return;
     }
-    #[cfg(feature = "backend-vulkan")]
-    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_DEPTH_STENCIL_STATE {
-        // The invalidation for `task_depth_stencil_states`, and the whole reason
-        // that retention is sound: the guest names the end of the object's life
-        // rather than leaving this device to guess it from the bytes.
-        let retired = state.task_depth_stencil_states.delete(task_id, object_ref);
-        note_store_route(if retired {
-            "ds_state_deleted"
-        } else {
-            "ds_state_delete_absent"
-        });
-        return;
-    }
-    #[cfg(feature = "backend-vulkan")]
-    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_RENDER_PIPELINE_STATE {
-        let retired = state
-            .task_render_pipeline_states
-            .delete(task_id, object_ref);
-        note_store_route(if retired {
-            "pipeline_state_deleted"
-        } else {
-            "pipeline_state_delete_absent"
-        });
+    // The two kinds a rail may retain by `(task, ref)`. Whether one does is the
+    // running rail's answer and not the build's: these used to be
+    // `cfg(feature = "backend-vulkan")` arms, which on a `--backend both`
+    // binary retired from the Vulkan tables during a Metal run — reporting
+    // `..._delete_absent` about a table that rail never fills — and on a
+    // Metal-only build fell through to `note_unimplemented` instead. One rail,
+    // two builds, two different answers about the same guest command.
+    let retained = match op.opcode() {
+        reims_vgpu_wire::ops::destroy::OPCODE_DELETE_DEPTH_STENCIL_STATE => {
+            Some(RetainedObject::DepthStencilState)
+        }
+        reims_vgpu_wire::ops::destroy::OPCODE_DELETE_RENDER_PIPELINE_STATE => {
+            Some(RetainedObject::RenderPipelineState)
+        }
+        _ => None,
+    };
+    if let Some(object) = retained {
+        let outcome =
+            crate::backend::selected().retire_task_object(state, task_id, object, object_ref);
+        note_store_route(object.route(outcome));
         return;
     }
     note_unimplemented(

@@ -23,7 +23,10 @@ pub mod translate;
 
 #[cfg(feature = "host-window")]
 use crate::backend::window;
-use crate::backend::{Backend, CensusSite, GuestWriteReach, PlaneDrawReader, Rail, StampOrdering};
+use crate::backend::{
+    Backend, CensusSite, GuestWriteReach, ObjectRetirement, PlaneDrawReader, Rail, RetainedObject,
+    StampOrdering,
+};
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus, ResidentServe};
@@ -126,6 +129,32 @@ impl Backend for VulkanBackend {
         // `exec::note_compute_refusal` names the slug for every non-`Ok`
         // compute record.
         ComputeStatus::NoMetal("compute_nested_no_vulkan_path")
+    }
+
+    fn retire_task_object(
+        &self,
+        state: &mut DeviceState,
+        task_id: u32,
+        object: RetainedObject,
+        object_ref: u32,
+    ) -> ObjectRetirement {
+        // This rail retains both kinds by `(task, ref)` — the depth-stencil
+        // table for `draw::vulkan`, the pipeline table for
+        // `runtime::pipeline_resolve` — so the guest's declaration is the
+        // invalidation, and it is what makes the retention sound.
+        let retired = match object {
+            RetainedObject::DepthStencilState => {
+                state.task_depth_stencil_states.delete(task_id, object_ref)
+            }
+            RetainedObject::RenderPipelineState => state
+                .task_render_pipeline_states
+                .delete(task_id, object_ref),
+        };
+        if retired {
+            ObjectRetirement::Retired
+        } else {
+            ObjectRetirement::Absent
+        }
     }
 
     #[cfg(feature = "host-window")]

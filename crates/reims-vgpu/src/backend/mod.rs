@@ -150,6 +150,55 @@ use crate::runtime::host::{HostMemory, HostOps};
 /// backend is about to act on — which is every call site, because the runtime's
 /// unit of work is `(&mut DeviceState, &mut impl HostOps)`. A `&mut self`
 /// backend would have to be borrowed out of that same state and could not be.
+/// A guest object kind whose retention is a rail's own business.
+///
+/// Not every kind. The sampler-state registry is this device's, shared by both
+/// rails, and its delete is handled where it is decoded; the kinds no rail owns
+/// a registry for stay fail-visible as unimplemented, which is what says the
+/// contract gap is still open. These two are the ones exactly one rail keeps a
+/// table for — [`crate::runtime::pipeline_resolve`] and the Vulkan draw rail —
+/// while the other resolves them out of the guest's object list on every use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedObject {
+    DepthStencilState,
+    RenderPipelineState,
+}
+
+impl RetainedObject {
+    /// The census route for what retiring this kind found.
+    ///
+    /// Here rather than at the call site so the six strings are one table: the
+    /// pair a reader greps to tell "the rail dropped an object" from "the rail
+    /// never had one" is only readable if both spellings are written together.
+    pub fn route(self, outcome: ObjectRetirement) -> &'static str {
+        match (self, outcome) {
+            (Self::DepthStencilState, ObjectRetirement::Retired) => "ds_state_deleted",
+            (Self::DepthStencilState, ObjectRetirement::Absent) => "ds_state_delete_absent",
+            (Self::DepthStencilState, ObjectRetirement::NotRetained) => {
+                "ds_state_delete_not_retained"
+            }
+            (Self::RenderPipelineState, ObjectRetirement::Retired) => "pipeline_state_deleted",
+            (Self::RenderPipelineState, ObjectRetirement::Absent) => "pipeline_state_delete_absent",
+            (Self::RenderPipelineState, ObjectRetirement::NotRetained) => {
+                "pipeline_state_delete_not_retained"
+            }
+        }
+    }
+}
+
+/// What retiring a guest object found on the running rail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectRetirement {
+    /// The rail held one and dropped it.
+    Retired,
+    /// The rail keeps a table for this kind, and this ref was not in it.
+    Absent,
+    /// The rail keeps no table for this kind. The guest's declaration is
+    /// honoured by there being nothing to do, which is why this is a census
+    /// route and not a refusal.
+    NotRetained,
+}
+
 pub(crate) trait Backend: Copy {
     /// What this backend calls itself on the fail channel and in QEMU's trace.
     ///
@@ -420,6 +469,29 @@ pub(crate) trait Backend: Copy {
         _height: u32,
     ) -> bool {
         false
+    }
+
+    /// Retire whatever this rail retains for a guest object the guest has just
+    /// declared dead.
+    ///
+    /// The guest naming the end of an object's life — rather than leaving this
+    /// device to guess it from the bytes — is the whole reason retaining one is
+    /// sound, so a rail that keeps a table has to be told. A rail that keeps
+    /// none still *handles* the command: it resolves that object kind out of
+    /// the guest's own object list on every use, so there is nothing whose life
+    /// this ends. [`ObjectRetirement::NotRetained`] is that answer, and it is
+    /// not the same as unimplemented — nothing was dropped.
+    ///
+    /// The default is the second one, which is what a rail with no table for
+    /// [`RetainedObject`]'s kinds truthfully says.
+    fn retire_task_object(
+        &self,
+        _state: &mut DeviceState,
+        _task_id: u32,
+        _object: RetainedObject,
+        _object_ref: u32,
+    ) -> ObjectRetirement {
+        ObjectRetirement::NotRetained
     }
 
     /// Whether this rail presents into the host-owned window (kb host-window).
@@ -1051,6 +1123,21 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
+        }
+    }
+
+    fn retire_task_object(
+        &self,
+        state: &mut DeviceState,
+        task_id: u32,
+        object: RetainedObject,
+        object_ref: u32,
+    ) -> ObjectRetirement {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.retire_task_object(state, task_id, object, object_ref),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.retire_task_object(state, task_id, object, object_ref),
         }
     }
 
@@ -1869,6 +1956,79 @@ mod tests {
         // and a rail that forgot to answer would silently take the trait's
         // one-rebuild default.
         assert!(selected().window_reattach_budget() >= 1);
+    }
+
+    /// Retiring a guest object is the running rail's answer, and the six
+    /// census routes it can produce are six distinct strings.
+    ///
+    /// Named rails, because the case this guards is a binary that compiled the
+    /// Vulkan tables and is running Metal. Those two arms were
+    /// `cfg(feature = "backend-vulkan")` blocks in the drain: on a
+    /// `--backend both` binary they retired from tables the Metal run never
+    /// fills — reporting `..._delete_absent` about a table that rail does not
+    /// keep — and on a Metal-only build the same command fell past them into
+    /// `note_unimplemented`. One rail, two builds, two different answers.
+    ///
+    /// The route table is checked with them because it is the only thing that
+    /// makes the distinction readable: `..._delete_absent` and
+    /// `..._delete_not_retained` are different findings, and a shared string
+    /// would put "the rail lost track of an object" and "the rail keeps no
+    /// track" in one counter.
+    #[test]
+    fn retiring_a_guest_object_is_the_rails_answer_and_names_which() {
+        let mut routes = std::collections::BTreeSet::new();
+        for object in [
+            RetainedObject::DepthStencilState,
+            RetainedObject::RenderPipelineState,
+        ] {
+            for outcome in [
+                ObjectRetirement::Retired,
+                ObjectRetirement::Absent,
+                ObjectRetirement::NotRetained,
+            ] {
+                assert!(
+                    routes.insert(object.route(outcome)),
+                    "{:?}/{outcome:?} shares a census route with another finding",
+                    object
+                );
+            }
+        }
+        assert_eq!(routes.len(), 6);
+
+        let mut state = DeviceState::new(crate::model::DeviceId(1), 12);
+        // The Metal rail resolves both kinds out of the guest's object list on
+        // every use, so it retains nothing whose life this ends — which is a
+        // handled command, not an unimplemented one.
+        #[cfg(feature = "backend-metal")]
+        for object in [
+            RetainedObject::DepthStencilState,
+            RetainedObject::RenderPipelineState,
+        ] {
+            assert_eq!(
+                metal::MetalBackend.retire_task_object(&mut state, 2, object, 12),
+                ObjectRetirement::NotRetained
+            );
+        }
+        // The Vulkan rail keeps a table for both, so a ref it never registered
+        // is a different finding from one it did.
+        #[cfg(feature = "backend-vulkan")]
+        {
+            let vulkan = vulkan::VulkanBackend::new();
+            assert_eq!(
+                vulkan.retire_task_object(&mut state, 2, RetainedObject::DepthStencilState, 12),
+                ObjectRetirement::Absent
+            );
+            state.task_depth_stencil_states.register(
+                2,
+                12,
+                std::sync::Arc::new(Default::default()),
+            );
+            assert_eq!(
+                vulkan.retire_task_object(&mut state, 2, RetainedObject::DepthStencilState, 12),
+                ObjectRetirement::Retired
+            );
+        }
+        let _ = &mut state;
     }
 
     /// One spelling of a rail's name, reachable from every direction it is

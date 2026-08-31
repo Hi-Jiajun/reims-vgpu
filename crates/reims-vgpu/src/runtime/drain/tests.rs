@@ -5475,12 +5475,20 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
 /// the resource table alone. Conversely, resource deletion must not cross into
 /// the pipeline registry.
 ///
-/// The retained render-pipeline registry is a Vulkan-arm structure
+/// The two retained registries are Vulkan-arm structures
 /// ([`crate::model::state::DeviceState::task_render_pipeline_states`] and
-/// [`crate::runtime::pipeline_resolve`] are both gated on it), so the statements
-/// that populate and interrogate it are gated the same way. Everything else —
-/// including that the pipeline destroy opcode leaves the object table alone on
-/// an arm where it falls through to the unimplemented path — runs on both.
+/// [`crate::runtime::pipeline_resolve`] are both gated on them), so the
+/// statements that populate them are gated the same way — that part is a fact
+/// about the build.
+///
+/// Whether a delete *empties* one is a different question with a different
+/// owner: the running rail's. The Vulkan rail keeps the tables and the guest's
+/// delete is their invalidation; the Metal rail resolves both kinds out of the
+/// guest's own object list on every use and keeps none, so there is nothing for
+/// it to retire. A `--backend both` binary compiles the tables for its Metal
+/// boot too, which is why those assertions ask `selected().rail()` rather than
+/// the feature. Everything else here — above all that no destroy kind crosses
+/// into the resource-list ref space — runs on every arm and every rail.
 #[test]
 fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     use reims_vgpu_wire::ops::destroy::{
@@ -5574,10 +5582,12 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         &destroy_packet(2, OPCODE_DELETE_DEPTH_STENCIL_STATE, 12),
     );
     #[cfg(feature = "backend-vulkan")]
-    assert!(
+    assert_eq!(
         state.task_depth_stencil_states.get(2, 12).is_none(),
-        "the depth-stencil destroy opcode retires its own retained state, which \
-         is the whole invalidation behind retaining it at all"
+        crate::backend::selected().rail() == crate::backend::Rail::Vulkan,
+        "the depth-stencil destroy opcode retires the retained state of the rail \
+         that has one — which is the whole invalidation behind retaining it — \
+         and leaves the other rail's compiled-but-unused table alone"
     );
     assert!(
         state.objects.contains(&(2, 12)),
@@ -5591,9 +5601,11 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         &destroy_packet(2, OPCODE_DELETE_RENDER_PIPELINE_STATE, 13),
     );
     #[cfg(feature = "backend-vulkan")]
-    assert!(
+    assert_eq!(
         state.task_render_pipeline_states.get(2, 13).is_none(),
-        "the render-pipeline destroy opcode retires its own retained state"
+        crate::backend::selected().rail() == crate::backend::Rail::Vulkan,
+        "the render-pipeline destroy opcode retires the retained state of the \
+         rail that has one, and no other rail's"
     );
     assert!(
         state.objects.contains(&(2, 13)),
