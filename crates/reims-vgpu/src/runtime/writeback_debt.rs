@@ -1517,7 +1517,7 @@ fn pay<M: HostMemory + HostOps>(
         return;
     }
     crate::runtime::drain::note_store_route(route);
-    if !crate::runtime::render_writeback::store_render_frame(
+    if !crate::runtime::render_writeback::vulkan::store_render_frame(
         state,
         host,
         mapping_id,
@@ -1732,7 +1732,7 @@ fn pay_gva<M: HostMemory + HostOps>(
         ..Default::default()
     };
     crate::runtime::drain::note_store_route(site.route());
-    if let Err(reason) = crate::runtime::render_writeback::store_gva_frame(
+    if let Err(reason) = crate::runtime::render_writeback::vulkan::store_gva_frame(
         state,
         host,
         key.task_id,

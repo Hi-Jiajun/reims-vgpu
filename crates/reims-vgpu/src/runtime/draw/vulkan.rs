@@ -10782,7 +10782,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
         if lazy {
             crate::runtime::drain::note_store_route("target_store_shared_eager");
         }
-        match crate::runtime::render_writeback::store_guest_backed_frame(
+        match crate::runtime::render_writeback::vulkan::store_guest_backed_frame(
             state,
             mapping_id,
             identity,
@@ -10801,7 +10801,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
             }
         }
     }
-    if !crate::runtime::render_writeback::store_render_frame(
+    if !crate::runtime::render_writeback::vulkan::store_render_frame(
         state, host, mapping_id, identity, width, height,
     ) {
         return false;

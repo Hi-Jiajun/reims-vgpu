@@ -95,7 +95,7 @@ impl crate::observe::Decline for NeutralSampledImage {
 /// Two conditions, and each names a contract term rather than an observation:
 ///
 /// - the writeback must be a **guest-linear plane**. A type-11 destination is a
-///   tiled surface mapping, which [`crate::runtime::render_writeback::GvaPlaneDestination`]
+///   tiled surface mapping, which [`crate::runtime::render_writeback::vulkan::GvaPlaneDestination`]
 ///   cannot describe and the licence therefore cannot walk. It is the largest
 ///   class this arm does not reach, so [`note_type11_shape`] bands how much of
 ///   it a raw copy could ever serve — see that function for why the route
@@ -141,7 +141,7 @@ pub(super) fn direct_destination<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("compute_dst_host_stride_width");
         return ComputeImageDestination::Host;
     };
-    let plane = crate::runtime::render_writeback::GvaPlaneDestination {
+    let plane = crate::runtime::render_writeback::vulkan::GvaPlaneDestination {
         target_gva: *gva,
         width: *width,
         height: *height,
@@ -149,7 +149,7 @@ pub(super) fn direct_destination<M: HostMemory + HostOps>(
         format: *pixel_format,
         texture_ref: *texture_ref,
     };
-    match crate::runtime::render_writeback::licence_gva_plane(
+    match crate::runtime::render_writeback::vulkan::licence_gva_plane(
         state,
         host,
         held,

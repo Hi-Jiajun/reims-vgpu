@@ -1002,7 +1002,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
 /// A window of a type-11 surface mapping the GPU is asked to write.
 ///
 /// The type-11 counterpart of
-/// [`crate::runtime::render_writeback::GvaPlaneDestination`], and it exists for
+/// [`crate::runtime::render_writeback::vulkan::GvaPlaneDestination`], and it exists for
 /// the same reason: the licence must not resolve its own destination. Which
 /// window of which plane a copy lands in is the *caller's* knowledge, and the
 /// two callers here come by it differently — a render Store's destination is the
@@ -1041,7 +1041,7 @@ pub(crate) struct Type11SurfaceDestination {
 /// A licensed direct-to-guest-pages destination over a type-11 surface mapping.
 ///
 /// The type-11 counterpart of
-/// [`crate::runtime::render_writeback::GvaPlaneLicence`], and it exists for the
+/// [`crate::runtime::render_writeback::vulkan::GvaPlaneLicence`], and it exists for the
 /// same reason: the two rails that write a guest surface from the GPU — a render
 /// Store and a compute storage-image output — differ only in the image they copy
 /// *from* and in which command buffer records the copy. Everything about the
@@ -1178,7 +1178,7 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
             ));
         }
     }
-    // No settle here, and the twin rail is why. `render_writeback::store_gva_frame`
+    // No settle here, and the twin rail is why. `render_writeback::vulkan::store_gva_frame`
     // does exactly this for a GVA-addressed destination — vouch, resolve runs,
     // submit a buffer copy — and takes no settle at all, because nothing between
     // here and the submit reads the pixel bytes a pending writeback would land

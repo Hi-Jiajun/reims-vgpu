@@ -196,7 +196,7 @@ pub(super) enum T2tGvaRefusal {
     /// The destination has no byte-copy geometry — the plane's own typed
     /// reason, carried whole so a reading names the same check the copy would
     /// have named.
-    DstPlane(crate::runtime::render_writeback::GvaWritebackDecline),
+    DstPlane(crate::runtime::render_writeback::vulkan::GvaWritebackDecline),
     /// The plane runs past the allocation the level lives in.
     DstExtentOob,
 }
@@ -228,8 +228,8 @@ fn gpu_t2t_gva_plane(
     destination_ref: u32,
 ) -> Result<
     (
-        crate::runtime::render_writeback::GvaPlaneDestination,
-        crate::runtime::render_writeback::GvaPlaneGeometry,
+        crate::runtime::render_writeback::vulkan::GvaPlaneDestination,
+        crate::runtime::render_writeback::vulkan::GvaPlaneGeometry,
     ),
     T2tGvaRefusal,
 > {
@@ -250,7 +250,7 @@ fn gpu_t2t_gva_plane(
     let Ok(row_stride) = u32::try_from(dst.row_stride) else {
         return Err(T2tGvaRefusal::DstStrideWide);
     };
-    let plane = crate::runtime::render_writeback::GvaPlaneDestination {
+    let plane = crate::runtime::render_writeback::vulkan::GvaPlaneDestination {
         target_gva,
         width: dst.width,
         height: dst.height,
@@ -356,7 +356,7 @@ pub(crate) fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
         return None;
     }
     let pages = crate::runtime::draw::StoreTargetPages::from_ordered(&gpas, geometry.extent);
-    match crate::runtime::render_writeback::copy_resident_into_gva_plane(
+    match crate::runtime::render_writeback::vulkan::copy_resident_into_gva_plane(
         state,
         host,
         task_id,
@@ -550,7 +550,7 @@ mod tests {
                     9
                 ),
                 Err(DstPlane(
-                    crate::runtime::render_writeback::GvaWritebackDecline::PitchNotTexels { .. }
+                    crate::runtime::render_writeback::vulkan::GvaWritebackDecline::PitchNotTexels { .. }
                 ))
             ),
             "a pitch that is not a whole number of texels is the plane's own refusal"
