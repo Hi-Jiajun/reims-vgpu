@@ -219,7 +219,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 ));
             }
             Ok(M2vDrawSpan::ResidentGvaStore { identity }) => {
-                let _store_span = StoreCostSpan::new("gva_store_us");
+                let _store_span = crate::runtime::chain_phase::CostSpan::new("gva_store_us");
                 note_mapper_ref_texture_store_route("gva_flush");
                 // Metal Store preserves the attachment in host GPU memory. It
                 // does not synchronize that texture into guest backing; the
@@ -268,7 +268,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // into the residual `draw_phase` cannot attribute — which is
                 // exactly the 28 % hole `b872e43` had to instrument, and it would
                 // read as a win of the same size as the work it hid.
-                let _store_span = StoreCostSpan::new("t11_store_us");
+                let _store_span = crate::runtime::chain_phase::CostSpan::new("t11_store_us");
                 let c0_store = req
                     .colors
                     .first()
@@ -286,7 +286,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // `present_unbacked`, and a route that skipped it would
                         // make that gate structurally dead.
                         {
-                            let _span = StoreCostSpan::new("t11_publish_us");
+                            let _span =
+                                crate::runtime::chain_phase::CostSpan::new("t11_publish_us");
                             publish_surface_store(state, host, mid, cw, ch, fmt);
                         }
                         surface_store_armed = true;
@@ -426,7 +427,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // boundary, so this arm — the cache publish, the window arm,
                     // the guest scatter — is the bulk of the ~245 ms/s (28 % of
                     // `draw_us`) that no phase claimed.
-                    let _span = StoreCostSpan::new("t11_store_us");
+                    let _span = crate::runtime::chain_phase::CostSpan::new("t11_store_us");
                     // Every consumer below wants guest scanout order: the
                     // deferred window's `write_bgra8`, `surface_cache`, and the
                     // synchronous route. A `Surface` resident reads back in that
@@ -436,7 +437,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // resolve rendered into a pooled RGBA target.
                     let mut bgra = rgba;
                     {
-                        let _span = StoreCostSpan::new("t11_convert_us");
+                        let _span = crate::runtime::chain_phase::CostSpan::new("t11_convert_us");
                         reorder_rb_in_place(&mut bgra, draw_bgra, true);
                     }
                     note_mapper_ref_texture_store_route("cpu_portability");
@@ -474,7 +475,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // CPU-portability Store path: no mapping's
                         // `dense_frame_seq` would ever advance.
                         {
-                            let _span = StoreCostSpan::new("t11_publish_us");
+                            let _span =
+                                crate::runtime::chain_phase::CostSpan::new("t11_publish_us");
                             publish_surface_store(
                                 state,
                                 host,
@@ -6440,29 +6442,6 @@ struct GuestStoreStatus {
 /// `return`s out of its own middle on the deferred route — the measurement that
 /// matters most — and a hand-closed bracket there records nothing while looking
 /// exactly like one that does. Reporting on `Drop` makes every exit pay.
-struct StoreCostSpan {
-    name: &'static str,
-    started: std::time::Instant,
-}
-
-impl StoreCostSpan {
-    fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            started: std::time::Instant::now(),
-        }
-    }
-}
-
-impl Drop for StoreCostSpan {
-    fn drop(&mut self) {
-        crate::runtime::drain::note_store_route_us(
-            self.name,
-            self.started.elapsed().as_micros() as u64,
-        );
-    }
-}
-
 /// Name which of the six routes a mapper-ref-texture Store took: counted every time, and
 /// fail-logged once per route per process so a boot's route *set* is readable
 /// without the draw log.

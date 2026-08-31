@@ -689,7 +689,14 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         .saturating_mul(height as usize)
         .saturating_mul(RGBA8_BPP as usize);
     chain_phase::enter(chain_phase::Phase::Seed);
-    let mut color_outs: Vec<Vec<u8>> = (0..color_list.len()).map(|_| vec![0u8; need]).collect();
+    // The two halves of this rail's `seed_us`, which a driven macos-13 boot put
+    // at 4.79 ms a draw — the largest bar on the rail. They are counters beside
+    // the bar rather than a finer cut of it, so the bar keeps comparing across
+    // boots; see [`chain_phase::CostSpan`].
+    let mut color_outs: Vec<Vec<u8>> = {
+        let _outs = chain_phase::CostSpan::new("metal_seed_outs_us");
+        (0..color_list.len()).map(|_| vec![0u8; need]).collect()
+    };
 
     // For indexed draws, pass index_count as vertex_count for the early gate.
     let vertex_count = if is_indexed {
@@ -706,11 +713,16 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // seed-and-write-back path the alias already fell through to on every
     // contract refusal (unaligned offset or row stride, span out of range, no
     // device), so this is a rung the rail has always had.
-    for (i, c) in color_list.iter().enumerate() {
-        if c.mapping_id == 0 {
-            continue;
-        }
-        if c.load_action == MTL_LOAD_ACTION_LOAD && color_seeds[i].is_none() {
+    {
+        let _seed_span = chain_phase::CostSpan::new("metal_seed_load_us");
+        for (i, c) in color_list.iter().enumerate() {
+            if c.mapping_id == 0 {
+                continue;
+            }
+            if c.load_action != MTL_LOAD_ACTION_LOAD || color_seeds[i].is_some() {
+                continue;
+            }
+            crate::runtime::drain::note_store_route("metal_seed_load_asked");
             color_seeds[i] =
                 seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);
             if color_seeds[i].is_none() {

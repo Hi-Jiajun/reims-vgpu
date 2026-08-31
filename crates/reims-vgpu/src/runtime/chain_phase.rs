@@ -309,6 +309,41 @@ pub fn take_window() -> Option<ChainPhaseWindow> {
     (chains > 0).then_some(w)
 }
 
+/// One named microsecond span inside a phase, committed on `Drop`.
+///
+/// The eight phases above divide a chain exhaustively and cannot be subdivided
+/// without changing what a bar means across boots. This is the tool for the
+/// other question — "what inside this bar costs" — and it answers by adding a
+/// counter beside the bars rather than by re-cutting them: a span's total is a
+/// `store_routes` key like any other, so two spans that divide one phase can be
+/// read against it and the phase keeps meaning what it meant last boot.
+///
+/// Nestable and overlappable by construction, because it counts elapsed time
+/// under a name rather than owning a slot. Two overlapping spans double-count
+/// the overlap, which is the caller's to arrange.
+pub struct CostSpan {
+    name: &'static str,
+    started: Instant,
+}
+
+impl CostSpan {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for CostSpan {
+    fn drop(&mut self) {
+        crate::runtime::drain::note_store_route_us(
+            self.name,
+            self.started.elapsed().as_micros() as u64,
+        );
+    }
+}
+
 /// Close the open phase and open `next`. Inert when no [`ChainTimer`] is live.
 pub fn enter(next: Phase) {
     OPEN.with(|open| {
