@@ -8,12 +8,13 @@
 //! put one name on two functions in two modules — so a `grep` for it reported
 //! two producers and the arm a reader landed on was arbitrary.
 
+use crate::backend::compute_session::ComputeSession;
 use crate::backend::metal::runtime::system_device;
 use crate::backend::{Backend, CensusSite, MipmapGeneration, Rail};
 use crate::contract::mipmap::MetalMipmapError;
 use crate::model::{DeviceInfoLimits, DeviceState};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
-use crate::runtime::compute_session::{self, ComputeSession};
+use crate::runtime::compute_session;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
 use crate::runtime::host::{HostMemory, HostOps};

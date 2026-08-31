@@ -1119,7 +1119,7 @@ pub(crate) fn new_icb_compute_pso(
 /// When the ICB was created with `inheritPipelineState` / `inheritBuffers`, those
 /// resources are **not** recorded into the slot — the parent compute encoder
 /// supplies them at `executeCommandsInBuffer` (see
-/// [`crate::runtime::compute_session::ComputeSession::encode_icb`]).
+/// [`crate::backend::compute_session::ComputeSession::encode_icb`]).
 pub fn fill_compute_command<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,

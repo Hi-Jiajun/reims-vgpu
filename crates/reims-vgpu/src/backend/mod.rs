@@ -113,10 +113,14 @@ pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
+/// The encoder one rail holds open across a compute segment — the one type
+/// besides [`SelectedBackend`] whose shape is neutral and whose contents are a
+/// rail's.
+pub mod compute_session;
+
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus, ResidentServe};
-use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus, GvaSpan};
@@ -125,6 +129,7 @@ use crate::runtime::gva_store_witness::GvaTargetKey;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::resident_target::ResidentTarget;
 use crate::runtime::writeback_debt::GvaWritebackDebt;
+pub(crate) use compute_session::ComputeSession;
 use std::sync::Arc;
 
 /// How a rail's own completion thread announces a finished stamp back to the

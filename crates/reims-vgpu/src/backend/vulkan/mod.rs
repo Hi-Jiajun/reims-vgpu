@@ -28,6 +28,7 @@ pub mod pipeline_resolve;
 pub mod present_identity;
 pub mod translate;
 
+use crate::backend::compute_session::ComputeSession;
 #[cfg(feature = "host-window")]
 use crate::backend::window;
 use crate::backend::{
@@ -37,7 +38,6 @@ use crate::backend::{
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus, ResidentServe};
-use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::drain;
