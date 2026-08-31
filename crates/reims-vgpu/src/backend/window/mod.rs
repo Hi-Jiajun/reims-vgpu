@@ -312,4 +312,24 @@ mod tests {
         assert_eq!(lost.slug(), refused.slug());
         assert_eq!(lost.to_string(), "reason=window_resident_other_rail");
     }
+
+    /// The two neutral reasons are two checks, so they are two slugs.
+    ///
+    /// Neither is reachable while both compiled rails implement the window
+    /// methods and refuse a resident that is not theirs — which is why they are
+    /// asserted here rather than trusted: a slug shared with the arm beside it
+    /// is invisible until the day one of them fires, and the whole point of the
+    /// pair is telling "this rail has no presenter" from "the publisher and the
+    /// presenter disagree about which rail is running".
+    #[test]
+    fn the_neutral_window_reasons_do_not_share_a_slug() {
+        let no_presenter = WindowDeclineReason::RailHasNoPresenter;
+        let other_rail = WindowDeclineReason::ResidentFromOtherRail;
+        assert_ne!(no_presenter.slug(), other_rail.slug());
+        assert_eq!(no_presenter.owner(), other_rail.owner());
+        for reason in [no_presenter, other_rail] {
+            assert!(reason.fields().is_empty(), "{reason} names no value");
+            assert!(reason.slug().starts_with("window_"));
+        }
+    }
 }
