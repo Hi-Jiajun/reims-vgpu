@@ -426,17 +426,38 @@ mod tests {
             enter(Phase::Store);
         }
         let w = take_window().expect("one chain ran");
+        // Lower bounds and one sum, because `thread::sleep` promises *at least*
+        // its duration and says nothing about the excess. This test used to
+        // bound each field on both sides with a 1.5 ms window; an Apple Silicon
+        // host returns from all three of these sleeps about 25 % late, which is
+        // 1.5 ms on the 6 ms one alone, so the window failed on the host's timer
+        // rather than on the accounting it exists to check. Both claims below
+        // are invariant under any overshoot, because the overshoot lands inside
+        // the phase that was open when it happened.
+        //
+        // A crossed pair still cannot pass: the three spans are disjoint slices
+        // of one chain, so any assignment other than the intended one hands some
+        // field a shorter sleep than its bound.
         assert!(
-            (1_000..3_500).contains(&w.assemble_target_us),
-            "the 2 ms sleep charged the target rails and only them: {w:?}"
+            w.assemble_target_us >= 2_000,
+            "the 2 ms sleep charged the target rails: {w:?}"
         );
         assert!(
-            (3_000..5_500).contains(&w.assemble_depth_us),
-            "the 4 ms sleep charged the depth load and only it: {w:?}"
+            w.assemble_depth_us >= 4_000,
+            "the 4 ms sleep charged the depth load: {w:?}"
         );
         assert!(
-            (5_000..7_500).contains(&w.assemble_trail_us),
-            "the 6 ms sleep charged the trail and only it: {w:?}"
+            w.assemble_trail_us >= 6_000,
+            "the 6 ms sleep charged the trail: {w:?}"
+        );
+        // Carved out of `assemble_us`, not added beside it: the residue plus the
+        // three sub-phases are slices of the one chain `max_us` measured, so a
+        // sub-phase that also charged the residue — or charged twice — would put
+        // the sum over the whole.
+        assert!(
+            w.assemble_target_us + w.assemble_depth_us + w.assemble_trail_us + w.assemble_us
+                <= w.max_us,
+            "the three sub-phases and the residue are carved out of one chain: {w:?}"
         );
         assert!(
             w.assemble_us < 1_000,

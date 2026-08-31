@@ -889,27 +889,37 @@ fn a_skipping_write_supersedes_the_debt_instead_of_paying_it_over_the_skip() {
 
     // The whole-frame writer is unchanged and still pays: it has no ranges to
     // protect, and a debt left standing there would be read straight past.
-    assert!(state
-        .pending_writebacks
-        .arm(
-            7,
-            crate::runtime::writeback_debt::test_resident_identity(
+    //
+    // Paying is the Vulkan rail: `writeback_debt::pay` lands the owed frame out
+    // of a resident the engine holds, and the arm with no engine has no such
+    // frame — its `pay` is the unreachable stub, because nothing on that arm
+    // arms the ledger in the first place. The supersede half above is the
+    // arm-independent claim and stays ungated; this half asserts a payment only
+    // the engine can make, so it is checked where the payer exists.
+    #[cfg(feature = "backend-vulkan")]
+    {
+        assert!(state
+            .pending_writebacks
+            .arm(
                 7,
+                crate::runtime::writeback_debt::test_resident_identity(
+                    7,
+                    W,
+                    H,
+                    u64::from(map_generation),
+                ),
                 W,
                 H,
-                u64::from(map_generation),
-            ),
-            W,
-            H,
-            map_generation,
-        )
-        .is_none());
-    assert!(write_bgra8(&mut state, &mut host, 7, &frame, W * 4, W, H));
-    assert_eq!(
-        count("wbdebt_paid_named"),
-        paid0 + 1,
-        "a write with nothing to skip must still discharge the debt by paying it"
-    );
+                map_generation,
+            )
+            .is_none());
+        assert!(write_bgra8(&mut state, &mut host, 7, &frame, W * 4, W, H));
+        assert_eq!(
+            count("wbdebt_paid_named"),
+            paid0 + 1,
+            "a write with nothing to skip must still discharge the debt by paying it"
+        );
+    }
 }
 
 #[test]

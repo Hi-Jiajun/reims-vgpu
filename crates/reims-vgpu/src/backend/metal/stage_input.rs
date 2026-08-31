@@ -362,20 +362,38 @@ mod tests {
             .render()
     }
 
+    /// The two caps refuse for different reasons and name their own limit.
+    ///
+    /// Both expectations are built from the same constants the check reads, not
+    /// from the numbers those constants happen to hold today. The decoder owns
+    /// the cap (`abi::REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_*` derive from it), so
+    /// a literal here is a second spelling of a value with one owner — and when
+    /// the decoder's cap moved from 16 to 31 this test failed for that reason
+    /// alone, reporting a cap change as a refusal-vocabulary regression.
     #[test]
     fn stage_input_attribute_and_layout_caps_have_distinct_reasons() {
+        let attribute_limit = REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES;
         let mut attributes = empty_descriptor();
-        attributes.attribute_count = REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES as u32 + 1;
+        attributes.attribute_count = attribute_limit as u32 + 1;
         assert_eq!(
             refused_line(&attributes),
-            "metal_stage_input_test reason=metal_stage_input_attribute_count_exceeded class=args attributes=17 limit=16"
+            format!(
+                "metal_stage_input_test reason=metal_stage_input_attribute_count_exceeded \
+                 class=args attributes={} limit={attribute_limit}",
+                attribute_limit + 1
+            )
         );
 
+        let layout_limit = REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS;
         let mut layouts = empty_descriptor();
-        layouts.layout_count = REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS as u32 + 1;
+        layouts.layout_count = layout_limit as u32 + 1;
         assert_eq!(
             refused_line(&layouts),
-            "metal_stage_input_test reason=metal_stage_input_layout_count_exceeded class=args layouts=17 limit=16"
+            format!(
+                "metal_stage_input_test reason=metal_stage_input_layout_count_exceeded \
+                 class=args layouts={} limit={layout_limit}",
+                layout_limit + 1
+            )
         );
     }
 }

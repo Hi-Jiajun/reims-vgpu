@@ -1068,8 +1068,11 @@ fn explicit_metal_sampler_and_depth_binds_return_typed_missing_entry_declines() 
             .field("pipe", 19)
             .field("stage", "fragment")
             .render(),
-        "metal_draw_sampler_fallback reason=metal_sampler_entry_missing \
-             sampler_ref=77 index=3 task=4 pipe=19 stage=fragment"
+        format!(
+            "metal_draw_sampler_fallback reason={} \
+             sampler_ref=77 index=3 task=4 pipe=19 stage=fragment",
+            crate::observe::ladder_slug!("metal_sampler", no_list_entry)
+        )
     );
 
     let depth = load_depth_stencil_state(&state, &host, 4, 88)
@@ -1085,8 +1088,11 @@ fn explicit_metal_sampler_and_depth_binds_return_typed_missing_entry_declines() 
             .field("task", 4)
             .field("pipe", 19)
             .render(),
-        "metal_draw_depth_stencil_fallback reason=metal_depth_stencil_entry_missing \
-             depth_stencil_ref=88 task=4 pipe=19"
+        format!(
+            "metal_draw_depth_stencil_fallback reason={} \
+             depth_stencil_ref=88 task=4 pipe=19",
+            crate::observe::ladder_slug!("metal_depth_stencil", no_list_entry)
+        )
     );
 }
 
@@ -1204,8 +1210,48 @@ fn every_metal_icb_inheritance_check_is_unique_namespaced_and_log_safe() {
         },
     ];
 
+    // Coverage is checked by an exhaustive `match`, not by a count. A literal
+    // here is a second spelling of the variant list: when the enum lost five
+    // checks this assertion still said 26 and failed for that reason alone,
+    // reporting a shrunk vocabulary as a fixture gap. `variant_name` has no `_`
+    // arm, so a new check stops this test compiling until the fixture carries
+    // one — which is what "the fixture must cover every check" was asking for.
+    fn variant_name(decline: &MetalIcbInheritanceDecline) -> &'static str {
+        use MetalIcbInheritanceDecline as D;
+        match decline {
+            D::CullModeUnsupported { .. } => "CullModeUnsupported",
+            D::FrontFacingUnsupported { .. } => "FrontFacingUnsupported",
+            D::BindSlotPastTable { .. } => "BindSlotPastTable",
+            D::VertexBufferMissing { .. } => "VertexBufferMissing",
+            D::FragmentBufferMissing { .. } => "FragmentBufferMissing",
+            D::VertexTextureMissing { .. } => "VertexTextureMissing",
+            D::FragmentTextureMissing { .. } => "FragmentTextureMissing",
+            D::PipelineRefZero => "PipelineRefZero",
+            D::PipelineMissing { .. } => "PipelineMissing",
+            D::VertexMtlbMissing { .. } => "VertexMtlbMissing",
+            D::FragmentMtlbMissing { .. } => "FragmentMtlbMissing",
+            D::VertexLibraryLoad { .. } => "VertexLibraryLoad",
+            D::FragmentLibraryLoad { .. } => "FragmentLibraryLoad",
+            D::VertexFunctionCount { .. } => "VertexFunctionCount",
+            D::FragmentFunctionCount { .. } => "FragmentFunctionCount",
+            D::VertexFunctionGet { .. } => "VertexFunctionGet",
+            D::FragmentFunctionGet { .. } => "FragmentFunctionGet",
+            D::VertexDescriptorMissing { .. } => "VertexDescriptorMissing",
+            D::VertexAttributeUnencodable { .. } => "VertexAttributeUnencodable",
+            D::RenderPipelineCreate { .. } => "RenderPipelineCreate",
+            D::AllocationFailed { .. } => "AllocationFailed",
+        }
+    }
+    let mut covered = all.iter().map(variant_name).collect::<Vec<_>>();
+    covered.sort_unstable();
+    covered.dedup();
+    assert_eq!(
+        covered.len(),
+        all.len(),
+        "the fixture names one check twice: {covered:?}"
+    );
+
     let mut slugs = all.iter().map(Decline::slug).collect::<Vec<_>>();
-    assert_eq!(slugs.len(), 26, "the fixture must cover every check");
     for decline in &all {
         assert!(decline.slug().starts_with("metal_icb_inherit_"));
         for (key, value) in decline.fields() {
