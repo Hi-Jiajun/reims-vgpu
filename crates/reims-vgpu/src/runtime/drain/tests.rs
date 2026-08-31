@@ -1,14 +1,5 @@
 use super::*;
 
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_cpu_only_stamp_publishes_now_unless_its_fifo_has_an_older_completion() {
-    assert_eq!(StampOrder::from_debt(false, false), StampOrder::CpuReady);
-    assert_eq!(StampOrder::from_debt(true, false), StampOrder::Queued);
-    assert_eq!(StampOrder::from_debt(false, true), StampOrder::Queued);
-    assert!(!StampOrder::CpuReady.needs_blocking_fallback());
-    assert!(StampOrder::Declined.needs_blocking_fallback());
-}
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
 
 /// I2's carve-out, asserted rather than trusted: a partial packet is the

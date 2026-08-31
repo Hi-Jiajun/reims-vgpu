@@ -397,6 +397,55 @@ pub(crate) trait Backend: Copy {
     ) -> bool {
         false
     }
+
+    /// Publish a FIFO completion stamp, ordered behind the guest-memory work it
+    /// completes.
+    ///
+    /// The guest's fence moving is what frees everything the completed work
+    /// allocated, so **before this returns, everything this device owes guest
+    /// RAM for that work has to be in guest RAM.** The two answers differ only
+    /// in *who writes the word*, never in whether that debt was paid:
+    ///
+    /// * [`StampOrdering::Queued`] — the rail attached the word to a GPU
+    ///   submission and will publish it, and raise the interrupt, from its own
+    ///   completion thread. The caller must not write the word.
+    /// * [`StampOrdering::Settled`] — the debt has landed and the caller writes
+    ///   the word on the CPU.
+    ///
+    /// The default is `Settled` after a blocking settle at `site`, which is the
+    /// correct answer for any rail that cannot attach a word to a submission:
+    /// the wait is what the ordering costs when it cannot be expressed as one.
+    /// A rail that *can* attach one must still return `Settled` for the stamps
+    /// it declines, and must pay the same debt on that arm before it does.
+    fn order_completion_stamp<M: HostMemory + HostOps>(
+        &self,
+        _state: &DeviceState,
+        _host: &mut M,
+        _index: u32,
+        _value: u32,
+        site: crate::runtime::render_writeback::SettleSite,
+    ) -> StampOrdering {
+        crate::runtime::render_writeback::settle_guest_writes(site);
+        StampOrdering::Settled
+    }
+}
+
+/// Who publishes a FIFO completion stamp word — the vocabulary of
+/// [`Backend::order_completion_stamp`], and neutral because the *caller's*
+/// obligation is the same on any rail: write the word, or do not.
+///
+/// Two cases rather than the three a rail may distinguish internally. A rail
+/// that separates "nothing was owed" from "the async route declined" keeps that
+/// distinction where it is load-bearing — inside itself, where the settle
+/// either happens or provably need not — because both reach the drain as the
+/// same instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StampOrdering {
+    /// The rail took the word. It publishes it and raises the interrupt; the
+    /// caller advances its fence sequence and writes nothing.
+    Queued,
+    /// The caller writes the word. Everything owed guest RAM has landed.
+    Settled,
 }
 
 /// Whether a rail's outstanding guest-page writes can reach a set of pages.
@@ -724,6 +773,22 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.try_capture_from_resident(state, buf, mapping_id, width, height),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.try_capture_from_resident(state, buf, mapping_id, width, height),
+        }
+    }
+
+    fn order_completion_stamp<M: HostMemory + HostOps>(
+        &self,
+        state: &DeviceState,
+        host: &mut M,
+        index: u32,
+        value: u32,
+        site: crate::runtime::render_writeback::SettleSite,
+    ) -> StampOrdering {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.order_completion_stamp(state, host, index, value, site),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.order_completion_stamp(state, host, index, value, site),
         }
     }
 }

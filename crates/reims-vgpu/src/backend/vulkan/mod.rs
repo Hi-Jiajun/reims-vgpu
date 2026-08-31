@@ -21,16 +21,18 @@ pub mod caps;
 pub mod engine;
 pub mod translate;
 
-use crate::backend::{Backend, GuestWriteReach};
+use crate::backend::{Backend, GuestWriteReach, StampOrdering};
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
+use crate::runtime::drain;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
 use crate::runtime::guest_ram::ImportId;
 use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::render_writeback::SettleSite;
 use crate::runtime::scanout;
 
 /// The Vulkan rail's [`Backend`] handle.
@@ -238,6 +240,17 @@ impl Backend for VulkanBackend {
         height: u32,
     ) -> bool {
         scanout::vulkan::try_capture_from_resident(state, buf, mapping_id, width, height)
+    }
+
+    fn order_completion_stamp<M: HostMemory + HostOps>(
+        &self,
+        state: &DeviceState,
+        host: &mut M,
+        index: u32,
+        value: u32,
+        site: SettleSite,
+    ) -> StampOrdering {
+        drain::vulkan::order_completion_stamp(state, host, index, value, site)
     }
 }
 
