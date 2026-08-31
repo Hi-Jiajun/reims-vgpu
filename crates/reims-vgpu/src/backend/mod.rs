@@ -454,6 +454,32 @@ pub(crate) trait Backend: Copy {
     fn plane_draw_witness(&self, _reader: PlaneDrawReader, _mapping_id: u32) -> String {
         String::new()
     }
+
+    /// The raster sample count the bound pipeline declares, when this rail has
+    /// to make the attachment match it.
+    ///
+    /// Metal requires a pipeline's `rasterSampleCount` to equal the sample count
+    /// of every colour attachment it renders into. The *target* side of that
+    /// equation is not recoverable here — a linear texture resource's dimensions
+    /// do not retain its creation descriptor's sample count, so every resolved
+    /// render target carries a provisional `1` — which leaves the pipeline as the
+    /// only place the real count is written down.
+    ///
+    /// `None` is the default and means "this rail does not consult the
+    /// pipeline": its encoder derives the attachment's sample count from the
+    /// attachment it is handed. It is not a failure to resolve, and the caller
+    /// treats it as "keep the target's count" rather than as a refusal. It also
+    /// silences `note_attachment_sample_count_override`, which has nothing to
+    /// report when no count was taken from a pipeline.
+    fn pipeline_raster_sample_count<M: HostMemory + HostOps>(
+        &self,
+        _state: &DeviceState,
+        _host: &M,
+        _task_id: u32,
+        _pipeline_ref: u32,
+    ) -> Option<u32> {
+        None
+    }
 }
 
 /// Which witness is asking, because two of them ask about the same plane rings
@@ -882,6 +908,21 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.plane_draw_witness(reader, mapping_id),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.plane_draw_witness(reader, mapping_id),
+        }
+    }
+
+    fn pipeline_raster_sample_count<M: HostMemory + HostOps>(
+        &self,
+        state: &DeviceState,
+        host: &M,
+        task_id: u32,
+        pipeline_ref: u32,
+    ) -> Option<u32> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.pipeline_raster_sample_count(state, host, task_id, pipeline_ref),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.pipeline_raster_sample_count(state, host, task_id, pipeline_ref),
         }
     }
 }

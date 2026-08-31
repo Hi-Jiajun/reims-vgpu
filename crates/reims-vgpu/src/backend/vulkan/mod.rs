@@ -253,6 +253,21 @@ impl Backend for VulkanBackend {
         drain::vulkan::order_completion_stamp(state, host, index, value, site)
     }
 
+    fn pipeline_raster_sample_count<M: HostMemory + HostOps>(
+        &self,
+        state: &DeviceState,
+        host: &M,
+        task_id: u32,
+        pipeline_ref: u32,
+    ) -> Option<u32> {
+        crate::runtime::pipeline_resolve::attachment_sample_count(
+            state,
+            host,
+            task_id,
+            pipeline_ref,
+        )
+    }
+
     fn plane_draw_witness(&self, reader: PlaneDrawReader, mapping_id: u32) -> String {
         draw::vulkan::read_plane_draw_ring(reader, mapping_id).to_string()
     }

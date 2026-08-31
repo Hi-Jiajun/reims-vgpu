@@ -7397,14 +7397,15 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
 ///
 /// Delta form, because the census map is process-global and the rest of the
 /// suite shares it.
-#[cfg(feature = "backend-vulkan")]
+///
+/// Runs on every arm. The record is decoded guest state and `observe` and
+/// nothing else, so gating it on the rail that happens to supply a pipeline
+/// count put a test of pure arithmetic on one arm for no reason.
 #[test]
 fn an_attachment_sample_count_taken_from_the_pipeline_names_where_the_samples_go() {
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::drain::store_route_count;
-    use crate::runtime::draw::vulkan::{
-        note_attachment_sample_count_override, AttachmentSampleCounts,
-    };
+    use crate::runtime::draw::{note_attachment_sample_count_override, AttachmentSampleCounts};
 
     const NO_RESOLVE: &str = "attach_samples_multisample_no_resolve";
     const WITH_RESOLVE: &str = "attach_samples_from_pipeline_with_resolve";

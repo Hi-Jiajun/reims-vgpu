@@ -25,6 +25,7 @@
 //! taken before it. The module path and the log vocabulary are two different
 //! names, and only one of them was wrong.
 
+use crate::backend::Backend as _;
 use crate::contract::pixel_format::{
     self, solid_rgba8, SampledByteFormat, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
@@ -1844,6 +1845,125 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     wrote
 }
 
+// --- The record for a sample count taken from the pipeline -----------------
+//
+// Neutral, and here rather than in a rail, because every line of it is decoded
+// guest state and `crate::observe`: the three counts, the resolve reference,
+// the geometry. A rail that does not consult the pipeline hands `pipeline:
+// None` and the emitter returns without a word, which is the same silence the
+// `cfg` used to produce and one the compiler no longer has to be told about.
+
+/// The three sample counts in play when a colour attachment is resolved, named
+/// so the record below cannot transpose two of them.
+pub struct AttachmentSampleCounts {
+    /// `MTLRenderPipelineDescriptor.rasterSampleCount` of the bound pipeline,
+    /// or `None` when the pipeline could not be resolved.
+    pub pipeline: Option<u32>,
+    /// What [`super::render_target::ResolvedRenderTarget`] carried.
+    ///
+    /// **Not the texture's creation sample count**, and reading it as one is a
+    /// mistake this record has already caused once. That field is a hardcoded
+    /// `1` at every one of its construction sites, because a linear texture
+    /// resource's dimensions do not retain the creation descriptor's sample
+    /// count — the field's own documentation says so, and says the Vulkan
+    /// encode is expected to replace the provisional value with the pipeline's.
+    ///
+    /// So `pipeline != target` is *not* evidence that the guest's texture is
+    /// single-sample. It is only evidence that the pipeline declared more than
+    /// one sample, which is the case worth naming here for the reason below.
+    pub target: u32,
+    /// What this device gave the attachment. Today: the pipeline's, when it has
+    /// one.
+    pub resolved: u32,
+}
+
+/// Report a colour attachment whose sample count this device took from the
+/// **pipeline** while the destination texture declared a different one.
+///
+/// # Why this needs a record
+///
+/// Metal requires a pipeline's `rasterSampleCount` to equal the sample count of
+/// every colour attachment it renders into, and this device recovers that count
+/// from the pipeline because the resolved target cannot carry it (see
+/// [`AttachmentSampleCounts::target`]). So this record does not report a
+/// disagreement between the guest's two declarations — it cannot see the
+/// texture's declaration at all. What it reports is the passes that end up
+/// multisampled, and where their samples are meant to go.
+///
+/// That matters because it has a downstream cost the site cannot see. The
+/// engine creates the resident at the promoted count, the draw succeeds, and
+/// then `resident_read_snapshot` refuses to read a `sample_count != 1` resident
+/// back — so nothing is stored, `runtime::exec::finish_stream` applies the
+/// pass's clear, and a rendered tile reaches the guest as a flat colour. On
+/// the Vulkan rail that is measured at twice per boot on 300x300 targets, and until
+/// the skipped-draw tail was corrected it was reported as an engine refusal
+/// that never happened.
+///
+/// Measured on rail macos-15, boot s4: **two** records in a whole boot, both
+/// `pipeline_samples=4 resolve_ref=0 store=0x1` on 300x300 linear GVA targets,
+/// and they are the same two passes the corrected skipped-draw tail reports as
+/// `engine_drew_store_lost_it`. Two out of a boot's several hundred pipelines
+/// is also what says the pipeline's count is decoded correctly rather than
+/// misread: `raster_sample_count` comes from a TLV tag, and a misread tag would
+/// not be this rare.
+///
+/// So the guest really does run a 4x pass here, and the open question is no
+/// longer "who invented the multisample" — it is **what the guest expects to
+/// find in those guest pages afterwards**. Metal writes nothing to a linear
+/// buffer for a multisample `MTLStoreActionStore`; this device writes the
+/// pass's clear colour there. Neither this record nor any other establishes
+/// which the guest reads, and until one does, no repair here is supportable.
+///
+/// Latched per `(pipeline, texture)`: a guest that means this means it every
+/// frame, and the population's size belongs to a counter, not to this line.
+/// The counter is beside it and is not conditioned on first sight.
+pub fn note_attachment_sample_count_override(
+    pipeline_ref: u32,
+    att: ColorAttachment,
+    counts: AttachmentSampleCounts,
+    geom: (u32, u32),
+    dest: (u32, u64),
+) {
+    let Some(pipeline) = counts.pipeline else {
+        return;
+    };
+    if pipeline == counts.target {
+        return;
+    }
+    // Split at the emitter, because the two halves have different owners. A
+    // promotion with a resolve texture declared is a shape this device can
+    // still land; one without has nowhere for the samples to go.
+    crate::runtime::drain::note_store_route(if att.resolve_texture_ref != 0 {
+        "attach_samples_from_pipeline_with_resolve"
+    } else if pipeline > counts.target {
+        "attach_samples_multisample_no_resolve"
+    } else {
+        "attach_samples_below_provisional"
+    });
+    if crate::observe::first_sight(
+        "attachment_sample_count_override",
+        (u64::from(pipeline_ref) << 32) | u64::from(att.texture_ref),
+    ) {
+        crate::observe::off(format!(
+            "attachment_sample_count_override pipe={pipeline_ref} tex_ref={} \
+             resolve_ref={} pipeline_samples={pipeline} target_samples={} \
+             resolved_samples={} load={:#x} store={:#x} {}x{} mid={} gva={:#x} \
+             (Metal requires these to agree; a promotion with no resolve \
+              texture has nowhere to put the samples)",
+            att.texture_ref,
+            att.resolve_texture_ref,
+            counts.target,
+            counts.resolved,
+            att.load_action,
+            att.store_action,
+            geom.0,
+            geom.1,
+            dest.0,
+            dest.1,
+        ));
+    }
+}
+
 /// Resolve color texture ref → mapping geometry for a draw request.
 #[allow(
     clippy::too_many_arguments,
@@ -1863,16 +1983,9 @@ pub fn color_target_request<M: HostMemory + HostOps>(
 ) -> Option<DrawEncodeRequest> {
     let color_texture_ref = color.texture_ref;
     let rt = lookup_render_target(state, host, task_id, color)?;
-    #[cfg(feature = "backend-vulkan")]
-    let attachment_sample_count = crate::runtime::pipeline_resolve::attachment_sample_count(
-        state,
-        host,
-        task_id,
-        pipeline_ref,
-    )
-    .unwrap_or(rt.sample_count);
-    #[cfg(not(feature = "backend-vulkan"))]
-    let attachment_sample_count = rt.sample_count;
+    let attachment_sample_count = crate::backend::selected()
+        .pipeline_raster_sample_count(state, host, task_id, pipeline_ref)
+        .unwrap_or(rt.sample_count);
     let c0 = ColorRtRequest {
         slot: 0,
         texture_ref: color_texture_ref,
@@ -1924,13 +2037,8 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     // bound pipeline supplies the missing contract: every color attachment
     // must match its raster sample count. Resolve that before LOAD/CLEAR seed
     // policy and before this request is cloned by either encoder.
-    #[cfg(feature = "backend-vulkan")]
-    let pipeline_sample_count = crate::runtime::pipeline_resolve::attachment_sample_count(
-        state,
-        host,
-        task_id,
-        pipeline_ref,
-    );
+    let pipeline_sample_count =
+        crate::backend::selected().pipeline_raster_sample_count(state, host, task_id, pipeline_ref);
     let mut colors = Vec::new();
     let mut base_w = 0u32;
     let mut base_h = 0u32;
@@ -1967,7 +2075,6 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route("mrt_resolve_target_unresolved");
                 return None;
             };
-            #[cfg(feature = "backend-vulkan")]
             if crate::observe::first_sight(
                 "render_resolve_contract",
                 (u64::from(att.texture_ref) << 32) | u64::from(att.resolve_texture_ref),
@@ -1991,7 +2098,14 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                     resolve_target.format,
                     att.load_action,
                     att.store_action,
-                    pipeline_sample_count.unwrap_or(1),
+                    // What the attachment will be encoded at, which is the
+                    // pipeline's count where a rail consults it and the target's
+                    // otherwise. Every construction site of the resolved target
+                    // hardcodes `1` (see `AttachmentSampleCounts::target`), so
+                    // this is the same number the `unwrap_or(1)` here used to
+                    // spell — said in terms of where it comes from rather than
+                    // as a literal that happens to match.
+                    pipeline_sample_count.unwrap_or(source_target.sample_count),
                 ));
             }
             if source_target.width != resolve_target.width
@@ -2025,15 +2139,11 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             format: mfmt,
             sample_count: target_sample_count,
         } = target;
-        #[cfg(feature = "backend-vulkan")]
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
-        #[cfg(not(feature = "backend-vulkan"))]
-        let attachment_sample_count = target_sample_count;
-        #[cfg(feature = "backend-vulkan")]
-        vulkan::note_attachment_sample_count_override(
+        note_attachment_sample_count_override(
             pipeline_ref,
             att,
-            vulkan::AttachmentSampleCounts {
+            AttachmentSampleCounts {
                 pipeline: pipeline_sample_count,
                 target: target_sample_count,
                 resolved: attachment_sample_count,
