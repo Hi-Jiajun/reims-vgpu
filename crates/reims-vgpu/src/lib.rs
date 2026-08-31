@@ -71,7 +71,12 @@ compile_error!(
 pub mod contract;
 /// Every environment variable this device reads, and the rule that an override
 /// may only narrow what it does — see the module doc.
-pub mod env;
+/// Operator switches, in the crate that owns their names and their parse.
+///
+/// Re-exported under the path every caller already writes (`crate::env::…`) so
+/// moving the module out did not move a call site. See `reims_vgpu_env` for why
+/// a switch may only narrow what this device does.
+pub use reims_vgpu_env as env;
 pub mod model;
 /// Crate-wide observability: the always-on fail sink and the decline
 /// vocabulary. Above `runtime/` because every subsystem owes the reader a

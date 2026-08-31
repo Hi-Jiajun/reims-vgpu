@@ -2,9 +2,9 @@
 //!
 //! # The property no single impl can see
 //!
-//! [`crate::observe::decline`] states it and cannot enforce it: **no two checks share a
+//! [`crate::decline`] states it and cannot enforce it: **no two checks share a
 //! slug**. The failure is specific rather than aesthetic.
-//! [`crate::observe::emit::Emit::fail_once`] latches on `(slug, discriminant)` in one
+//! [`crate::emit::Emit::fail_once`] latches on `(slug, discriminant)` in one
 //! process-global set, so two declines spelling one slug share a latch —
 //! whichever fires first for a given discriminant silences the other for the
 //! rest of the boot, and the log looks healthy while it happens. That is not
@@ -20,7 +20,7 @@
 //! deleting a decline expensive, so both are gone and are not coming back.
 //!
 //! What is left is the observation itself. A slug reaches the log through
-//! [`crate::observe::emit::Emit`], and there the concrete decline type is known, so a line can
+//! [`crate::emit::Emit`], and there the concrete decline type is known, so a line can
 //! *claim* its slug on behalf of its type. A second type claiming a slug some
 //! other type already holds is a collision, reported by name on the always-on
 //! channel and — in a unit-test build, where one process runs the whole suite
@@ -90,7 +90,7 @@ pub(super) fn claim(slug: &'static str, owner: &'static str) {
 
 /// Name a collision once per claimant, on the always-on channel.
 ///
-/// Latched through [`crate::observe::emit::first_sight`] because the colliding pair emits as
+/// Latched through [`crate::emit::first_sight`] because the colliding pair emits as
 /// often as the guest provokes it, and the second report says nothing the first
 /// did not.
 fn report(slug: &'static str, held: &'static str, claimant: &'static str) {
@@ -101,10 +101,14 @@ fn report(slug: &'static str, held: &'static str, claimant: &'static str) {
             compact(claimant),
         ));
     }
-    // A unit-test build runs the whole suite in one process, so this is where a
-    // collision is cheapest to find and loudest to ignore. Production keeps the
-    // line and no panic: an observability defect must not take the device down.
-    #[cfg(test)]
+    // A test build runs a whole suite in one process, so this is where a
+    // collision is cheapest to find and loudest to ignore. `testing` as well as
+    // `test`: the declines that collide belong to the crates above this one,
+    // whose tests are a different compilation, and gating on `test` alone would
+    // point the check at the handful of declines defined here. Production keeps
+    // the line and no panic: an observability defect must not take the device
+    // down.
+    #[cfg(any(test, feature = "testing"))]
     panic!("two types spell the slug {slug:?}: {held} and {claimant}");
 }
 

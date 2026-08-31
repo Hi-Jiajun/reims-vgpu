@@ -347,7 +347,19 @@ State exactly what was verified. One workload, host, pathway, and rail proves on
   HostOps plumbing.
 - `crates/reims-vgpu`: Rust device model, protocol decode, mapping, scheduling, command planning and
   execution, presentation, and Metal/Vulkan policy.
-- `crates/reims-vgpu/src/observe/`: typed failure and census emission.
+- `crates/reims-vgpu/src/observe/`: the two emitters that name `runtime` types;
+  everything else moved to `crates/reims-vgpu-observe`, whose surface it
+  re-exports under the paths callers already write.
+- `crates/reims-vgpu-observe`: the always-on sink, the `Decline`/`Refusal`
+  vocabulary, the `Emit` builder, and the slug registry. A crate so the layers
+  below the device can name a refusal without depending on the device, and so
+  nothing in it can reach back up. It may describe a decision and never select
+  one. Its `testing` feature exposes `FailCapture` and the slug-collision panic
+  to the crates above, whose tests are a different compilation.
+- `crates/reims-vgpu-env`: every environment variable the device reads, their
+  one parse, and the rule that a switch may only narrow what the device does.
+  `ALL` is derived from the declarations, so a switch cannot exist without being
+  on the boot line.
 - `crates/reims-vgpu-wire`: derived wire views; its own `AGENTS.md` also applies.
 - `conformance/`: native-oracle Metal cases, a rail-selected guest runner, and separate per-rail
   translation and driver debt inventories. It preserves established compatibility; it does not define API truth.
@@ -524,6 +536,20 @@ Metal tests are cfg-disabled on non-Apple hosts. Cross-clippy compiles that code
 its tests; never report them as passed from Linux. Layout-truth tests under `reims-vgpu-wire` are
 ignored without the gitignored captured fixtures. Their absence means wire layout was not verified.
 
+`-p reims-vgpu` is not the whole suite. The supporting crates carry their own tests and a change
+that moves a module into one moves its tests with it, so run them too and quote both counts:
+
+```sh
+cargo test -p reims-vgpu-env -p reims-vgpu-observe -p reims-vgpu-paging -p reims-vgpu-wire \
+  -- --test-threads=1
+```
+
+`reims-vgpu-observe`'s test-only surface — `FailCapture`, `fail_log_path`, the slug-collision panic
+— is gated on `any(test, feature = "testing")`, because the tests that use it are compiled
+separately from the crate that defines it. `reims-vgpu` turns the feature on from
+`[dev-dependencies]`; a new consumer whose tests capture the sink must do the same, or the sink will
+run its background writer against the live log path.
+
 Run the feature matrix when cfgs, shared Rust, feature boundaries, or backend boundaries change:
 
 ```sh
@@ -539,6 +565,7 @@ The feature matrix runs `cargo check`; it does not replace clippy. Use this requ
 | Metal-only implementation with no shared signature or cfg change | the aarch64 Metal arm below |
 | feature, cfg, backend boundary, or uncertain scope | all three main arms below, plus the feature matrix |
 | `crates/reims-vgpu-efi` | both EFI arms below, from that workspace |
+| `crates/reims-vgpu-env`, `crates/reims-vgpu-observe`, `-paging`, `-wire` | that crate's own arm, plus every arm above that links it — which for the first two is all three |
 
 When in doubt, run all three main arms. All three can run on Linux: the Metal command
 cross-compiles for `aarch64-apple-darwin`, but it does not run Metal tests. Every clippy invocation

@@ -1145,6 +1145,8 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "raw-window-handle",
+ "reims-vgpu-env",
+ "reims-vgpu-observe",
  "reims-vgpu-paging",
  "reims-vgpu-wire",
  "serde_json",
@@ -1153,6 +1155,17 @@ dependencies = [
  "wayland-protocols",
  "winit",
  "x11-dl",
+]
+
+[[package]]
+name = "reims-vgpu-env"
+version = "0.1.0"
+
+[[package]]
+name = "reims-vgpu-observe"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-env",
 ]
 
 [[package]]
