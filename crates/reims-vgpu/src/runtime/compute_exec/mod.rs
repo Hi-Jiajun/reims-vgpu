@@ -4178,27 +4178,32 @@ pub(crate) fn flush_nested_jobs<M: HostMemory + HostOps>(
 /// doc for why that was the wrong half of the journey to protect.
 use crate::contract::extent::Extent3;
 
-impl Extent3 {
-    /// From a decoded wire `Size3`, refusing each component out of range.
-    fn from_wire(s: crate::runtime::decode::compute::Size3) -> Result<Self, ComputeStatus> {
-        Ok(Self {
-            x: u32_dim(s.x)?,
-            y: u32_dim(s.y)?,
-            z: u32_dim(s.z)?,
-        })
-    }
+// The two constructors are free functions here rather than an inherent `impl`
+// on `Extent3`, because both refuse with `ComputeStatus` and one reads a decoded
+// `Size3` — device vocabulary the contract crate cannot name, and Rust's orphan
+// rule says so. The extent type stays shared; only the narrowing that produces
+// it from *this* device's wire belongs to this decoder.
 
-    /// From three consecutive LE `u32`s of an indirect-arguments buffer at
-    /// `at`. One stride expression rather than six offset literals: the
-    /// literals were `0, 4, 8` and `12, 16, 20` written out, where a
-    /// transposition is invisible.
-    fn from_indirect(raw: &[u8], at: usize) -> Result<Self, ComputeStatus> {
-        Ok(Self {
-            x: u32_dim(u64::from(ld32(&raw[at..])))?,
-            y: u32_dim(u64::from(ld32(&raw[at + 4..])))?,
-            z: u32_dim(u64::from(ld32(&raw[at + 8..])))?,
-        })
-    }
+/// An [`Extent3`] from a decoded wire `Size3`, refusing each component out of
+/// range.
+fn extent_from_wire(s: crate::runtime::decode::compute::Size3) -> Result<Extent3, ComputeStatus> {
+    Ok(Extent3 {
+        x: u32_dim(s.x)?,
+        y: u32_dim(s.y)?,
+        z: u32_dim(s.z)?,
+    })
+}
+
+/// An [`Extent3`] from three consecutive LE `u32`s of an indirect-arguments
+/// buffer at `at`. One stride expression rather than six offset literals: the
+/// literals were `0, 4, 8` and `12, 16, 20` written out, where a transposition
+/// is invisible.
+fn extent_from_indirect(raw: &[u8], at: usize) -> Result<Extent3, ComputeStatus> {
+    Ok(Extent3 {
+        x: u32_dim(u64::from(ld32(&raw[at..])))?,
+        y: u32_dim(u64::from(ld32(&raw[at + 4..])))?,
+        z: u32_dim(u64::from(ld32(&raw[at + 8..])))?,
+    })
 }
 
 /// Grid and threadgroup extents for one dispatch.
@@ -4271,13 +4276,13 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
         // anything past `u32::MAX` with `BadGrid("compute_grid_dim_range")`, so
         // a malformed grid is a named refusal rather than a substitution.
         Kind::DispatchThreadgroups => Ok(DispatchDims {
-            grid: Extent3::from_wire(cmd.grid)?,
-            threadgroup: Extent3::from_wire(cmd.threads_per_threadgroup)?,
+            grid: extent_from_wire(cmd.grid)?,
+            threadgroup: extent_from_wire(cmd.threads_per_threadgroup)?,
             dispatch_threads: false,
         }),
         Kind::DispatchThreads => Ok(DispatchDims {
-            grid: Extent3::from_wire(cmd.grid)?,
-            threadgroup: Extent3::from_wire(cmd.threads_per_threadgroup)?,
+            grid: extent_from_wire(cmd.grid)?,
+            threadgroup: extent_from_wire(cmd.threads_per_threadgroup)?,
             dispatch_threads: true,
         }),
         Kind::DispatchThreadgroupsIndirect => {
@@ -4290,8 +4295,8 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
                 INDIRECT_THREADGROUPS_ARGS_LEN,
             )?;
             Ok(DispatchDims {
-                grid: Extent3::from_indirect(&raw, 0)?,
-                threadgroup: Extent3::from_wire(cmd.threads_per_threadgroup)?,
+                grid: extent_from_indirect(&raw, 0)?,
+                threadgroup: extent_from_wire(cmd.threads_per_threadgroup)?,
                 dispatch_threads: false,
             })
         }
@@ -4306,8 +4311,8 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
             )?;
             // MTLDispatchThreadsIndirectArguments: threadsPerGrid[3], threadsPerThreadgroup[3].
             Ok(DispatchDims {
-                grid: Extent3::from_indirect(&raw, 0)?,
-                threadgroup: Extent3::from_indirect(&raw, 12)?,
+                grid: extent_from_indirect(&raw, 0)?,
+                threadgroup: extent_from_indirect(&raw, 12)?,
                 dispatch_threads: true,
             })
         }

@@ -72,7 +72,7 @@ pub fn mip_extent(base: u32, level: u32) -> u32 {
 /// with no row alignment.
 ///
 /// "Tight" is the whole contract. Anything the guest has told us a pitch for
-/// must not come through here — [`crate::contract::iosurface_pages::packed_span_estimate`]
+/// must not come through here — [`crate::iosurface_pages::packed_span_estimate`]
 /// is the row-aligned estimate for sizing a page table, and the two differ by
 /// exactly the alignment slack. Mixing them up reads short.
 ///
@@ -140,7 +140,7 @@ pub fn tight_layered_block_bytes(
     width: u32,
     height: u32,
     layers: u32,
-    block: crate::contract::pixel_format::BlockGeometry,
+    block: crate::pixel_format::BlockGeometry,
 ) -> Option<usize> {
     if layers == 0 || width == 0 || height == 0 || block.bytes == 0 {
         return None;
@@ -166,8 +166,8 @@ pub fn tight_layered_block_bytes(
 /// They did. `runtime::draw::metal_icb` sized an ICB colour attachment's
 /// staging from the *guest* attachment's bytes-per-pixel while creating a
 /// BGRA8Unorm texture and passing `width * 4` as the stride, so for any format
-/// narrower than four bytes ([`crate::contract::pixel_format::R8_BPP`],
-/// [`crate::contract::pixel_format::RG8_BPP`]) Metal read past the end of the
+/// narrower than four bytes ([`crate::pixel_format::R8_BPP`],
+/// [`crate::pixel_format::RG8_BPP`]) Metal read past the end of the
 /// buffer and copied whatever followed it on the host heap into a render target
 /// the guest reads back. The writeback half of that same function computed the
 /// length correctly, ten lines away. One quantity, two derivations, and only
@@ -250,7 +250,7 @@ pub fn tight_pyramid_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::pixel_format::{R8_BPP, RG8_BPP, RGBA8_BPP};
+    use crate::pixel_format::{R8_BPP, RG8_BPP, RGBA8_BPP};
 
     /// The pyramid's byte layout and its level extents come from one call, so a
     /// producer and a consumer of the same staged upload cannot disagree about

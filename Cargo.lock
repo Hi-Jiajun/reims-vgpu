@@ -1145,6 +1145,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "raw-window-handle",
+ "reims-vgpu-contract",
  "reims-vgpu-env",
  "reims-vgpu-observe",
  "reims-vgpu-paging",
@@ -1155,6 +1156,15 @@ dependencies = [
  "wayland-protocols",
  "winit",
  "x11-dl",
+]
+
+[[package]]
+name = "reims-vgpu-contract"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-observe",
+ "reims-vgpu-paging",
+ "reims-vgpu-wire",
 ]
 
 [[package]]

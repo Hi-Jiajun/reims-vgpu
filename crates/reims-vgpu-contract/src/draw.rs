@@ -6,7 +6,7 @@
 ///
 /// The guest driver answers `-[MTLDevice supportsPrimitiveType:]` by testing
 /// bit `type` of the device-info value for
-/// [`crate::model::DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK`], for any `type <= 8`,
+/// `crate::model::DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK`, for any `type <= 8`,
 /// and falls back to `type < 5` when the key is absent. So the number this
 /// device publishes decides which primitive types the guest is permitted to
 /// build a draw out of — and a bit set for a type no backend can translate is a
@@ -18,7 +18,7 @@
 /// `UnknownPrimitiveType` and `backend::metal::mtl_enum::primitive_type` answers
 /// `None` — so every one of those bits was a promise this device cannot keep.
 /// Narrowing to what it can execute is the rule
-/// [`crate::model::device_info_caps`] already applies to the GPU-dependent keys:
+/// `crate::model::device_info_caps` already applies to the GPU-dependent keys:
 /// answering higher than the host can execute does not degrade gracefully.
 ///
 /// Widening it again needs the *meaning* of 5..=8 first. They are not in the
@@ -79,7 +79,7 @@ pub struct DrawArgs {
 /// ```
 ///
 /// `baseVertex` is the one signed field, for the same reason
-/// [`crate::runtime::draw::IndexedDrawInfo::base_vertex`] is: read as
+/// `crate::runtime::draw::IndexedDrawInfo::base_vertex` is: read as
 /// unsigned, a negative one becomes a huge index rather than an error.
 ///
 /// Nothing here is a `#[repr(C)]` view over guest bytes — the block is loaded
@@ -88,7 +88,7 @@ pub struct DrawArgs {
 /// out-of-range guest value would make invalid, and five little-endian loads
 /// cost nothing.
 pub mod indirect {
-    use crate::contract::endian::ld32;
+    use crate::endian::ld32;
 
     /// Bytes `MTLDrawPrimitivesIndirectArguments` occupies: four `uint32_t`.
     pub const UNINDEXED_LEN: usize = 16;

@@ -1,6 +1,6 @@
 //! Metal pixel-format helpers (port of `host/utils/reims-vgpu-pixel-format`).
 
-use crate::contract::endian::{ld16, st16};
+use crate::endian::{ld16, st16};
 
 pub const COMPONENT_COUNT: usize = 4;
 pub const COMPONENT_R: usize = 0;
@@ -34,7 +34,7 @@ pub const MTL_FORMAT_R8_UNORM: u16 = 0x0a;
 ///
 /// Declared for the same reason as [`MTL_FORMAT_RGBA16_UNORM`] below: its
 /// absence was a *decode* gap, not a rail gap. `bytes_per_pixel` answered `None`
-/// for it, and since [`crate::runtime::draw::effective_view_sample_format`] asks
+/// for it, and since `crate::runtime::draw::effective_view_sample_format` asks
 /// that question about both the base and the view before anything else looks at
 /// the bind, every path refused it as `format_incompatible` — a slug that reads
 /// as "the guest asked for an illegal reinterpretation" when what happened is
@@ -42,7 +42,7 @@ pub const MTL_FORMAT_R8_UNORM: u16 = 0x0a;
 /// into compute dispatches, which is what surfaced it.
 ///
 /// Being *declared* is not being *sampled*: an integer texel must not be run
-/// through the unorm converters, so it has no [`crate::backend::vulkan`] texel
+/// through the unorm converters, so it has no `crate::backend::vulkan` texel
 /// layout and no storage selector, and both of those decline it by name.
 pub const MTL_FORMAT_R8_UINT: u16 = 0x0d;
 /// `MTLPixelFormatR16Unorm`. The luma plane of a ten-bit biplanar video
@@ -96,7 +96,7 @@ pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
 /// and `BGR10A2Unorm` consecutively from 90; this table carried the fourth of
 /// the five and none of the others, so a guest naming any of the rest was
 /// refused at the *width* gate — `bytes_per_pixel` answered `None`, and
-/// [`crate::runtime::draw::effective_view_sample_format`] asks that before
+/// `crate::runtime::draw::effective_view_sample_format` asks that before
 /// anything else looks at the bind. The refusal reads as "the guest asked for an
 /// illegal reinterpretation" when what happened is that this crate had never
 /// heard of the format. That is the same gap [`MTL_FORMAT_R8_UINT`] records, one
@@ -1343,7 +1343,7 @@ const F32_TO_F16_ROUND_BIT: u32 = 0x1000;
 /// `X32_Stencil8` and `X24_Stencil8` are **stencil-aspect views of a combined
 /// depth-stencil texture**, not formats with storage of their own. This answers
 /// the size of the cell they view — 8 and 4 — because that is what every caller
-/// of this function needs: [`crate::backend::vulkan::translate::pixel`] binds
+/// of this function needs: `crate::backend::vulkan::translate::pixel` binds
 /// them to `D32_SFLOAT_S8_UINT` and `D24_UNORM_S8_UINT`, whose texels are
 /// exactly those widths, and a resource sized at anything else is a short
 /// allocation.
@@ -1499,7 +1499,7 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
 ///
 /// Three states, and exactly three: `MTLBlitOption`'s depth and stencil bits
 /// are mutually exclusive, and
-/// [`crate::runtime::decode::blit::parse_blit_options`] refuses the pair with
+/// `crate::runtime::decode::blit::parse_blit_options` refuses the pair with
 /// `ConflictingAspects` rather than producing one.
 ///
 /// Lives here, below the decoder, because every consumer of the choice is a
@@ -2220,7 +2220,7 @@ pub fn f64_to_unorm8(value: f64) -> u8 {
 /// The fill therefore walks the buffer instead of counting texels. A
 /// `chunks_exact_mut` cannot describe a different image from the one that was
 /// allocated, where a second expression always can — the rule
-/// [`crate::contract::extent::tight_image_layout`] states for a length and its
+/// [`crate::extent::tight_image_layout`] states for a length and its
 /// stride, one level down.
 ///
 /// Here rather than in either caller because it is arithmetic both rails need
@@ -3923,13 +3923,13 @@ mod tests {
     }
 
     /// The 128-byte-aligned IOSurface row lives in
-    /// [`crate::contract::iosurface_pages::packed_span_estimate`], which is the
+    /// [`crate::iosurface_pages::packed_span_estimate`], which is the
     /// one the mapper rail reads. A second `iosurface_row_bytes` here computed
     /// the same rule from its own copy of the alignment and served nothing but
     /// this test. At height 1 the estimate is exactly one aligned row.
     #[test]
     fn rows_and_image_size() {
-        use crate::contract::iosurface_pages::packed_span_estimate;
+        use crate::iosurface_pages::packed_span_estimate;
         let bpr = |w, fmt| packed_span_estimate(fmt, w, 1);
         assert_eq!(bpr(200, MTL_FORMAT_BGRA8_UNORM), Some(896));
         assert_eq!(bpr(64, MTL_FORMAT_BGRA8_UNORM), Some(256));

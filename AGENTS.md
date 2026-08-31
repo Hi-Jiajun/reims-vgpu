@@ -356,6 +356,11 @@ State exactly what was verified. One workload, host, pathway, and rail proves on
   nothing in it can reach back up. It may describe a decision and never select
   one. Its `testing` feature exposes `FailCapture` and the slug-collision panic
   to the crates above, whose tests are a different compilation.
+- `crates/reims-vgpu-contract`: the backend-neutral protocol vocabulary —
+  layouts, pixel formats, geometry, page arithmetic, and the refusals each check
+  names. A crate so that a Vulkan handle, a Metal object, a QEMU type or this
+  device's state cannot be named from it: none of them is in scope, which is a
+  compiler's claim where the module boundary only had a habit.
 - `crates/reims-vgpu-env`: every environment variable the device reads, their
   one parse, and the rule that a switch may only narrow what the device does.
   `ALL` is derived from the declarations, so a switch cannot exist without being
@@ -540,8 +545,8 @@ ignored without the gitignored captured fixtures. Their absence means wire layou
 that moves a module into one moves its tests with it, so run them too and quote both counts:
 
 ```sh
-cargo test -p reims-vgpu-env -p reims-vgpu-observe -p reims-vgpu-paging -p reims-vgpu-wire \
-  -- --test-threads=1
+cargo test -p reims-vgpu-contract -p reims-vgpu-env -p reims-vgpu-observe \
+  -p reims-vgpu-paging -p reims-vgpu-wire -- --test-threads=1
 ```
 
 `reims-vgpu-observe`'s test-only surface — `FailCapture`, `fail_log_path`, the slug-collision panic
@@ -565,7 +570,7 @@ The feature matrix runs `cargo check`; it does not replace clippy. Use this requ
 | Metal-only implementation with no shared signature or cfg change | the aarch64 Metal arm below |
 | feature, cfg, backend boundary, or uncertain scope | all three main arms below, plus the feature matrix |
 | `crates/reims-vgpu-efi` | both EFI arms below, from that workspace |
-| `crates/reims-vgpu-env`, `crates/reims-vgpu-observe`, `-paging`, `-wire` | that crate's own arm, plus every arm above that links it — which for the first two is all three |
+| `crates/reims-vgpu-contract`, `-env`, `-observe`, `-paging`, `-wire` | that crate's own arm, plus every arm above that links it — which for the first two is all three |
 
 When in doubt, run all three main arms. All three can run on Linux: the Metal command
 cross-compiles for `aarch64-apple-darwin`, but it does not run Metal tests. Every clippy invocation

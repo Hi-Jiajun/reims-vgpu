@@ -68,7 +68,12 @@ compile_error!(
      target_os = \"linux\", and target_os = \"windows\" (native ICDs)"
 );
 
-pub mod contract;
+/// The backend-neutral protocol vocabulary, in the crate that owns it.
+///
+/// Re-exported under the path every caller already writes
+/// (`crate::contract::…`). See `reims_vgpu_contract` for what the crate
+/// boundary makes true that the module boundary only asserted.
+pub use reims_vgpu_contract as contract;
 /// Every environment variable this device reads, and the rule that an override
 /// may only narrow what it does — see the module doc.
 /// Operator switches, in the crate that owns their names and their parse.

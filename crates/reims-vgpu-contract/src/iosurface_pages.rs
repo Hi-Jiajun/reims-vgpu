@@ -1,8 +1,8 @@
 //! IOSurface mapper/page-table planning (port of `host/utils/reims-vgpu-iosurface-pages`).
 
-use crate::contract::endian::{ld16, ld32, ld64};
-use crate::contract::pixel_format;
-use crate::contract::{align_up_u64, checked_add_u64, checked_mul_u64};
+use crate::endian::{ld16, ld32, ld64};
+use crate::pixel_format;
+use crate::{align_up_u64, checked_add_u64, checked_mul_u64};
 
 pub const U32_SIZE: usize = 4;
 
@@ -144,7 +144,7 @@ pub enum Status {
     ErrNoPageTable(&'static str),
 }
 
-impl crate::observe::Refusal for Status {
+impl reims_vgpu_observe::Refusal for Status {
     fn refusal(&self) -> Option<&'static str> {
         match self {
             Self::Ok => None,
@@ -863,9 +863,17 @@ pub fn build_table_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
-    use crate::observe::Refusal;
+    use crate::gva::PAGE_SHIFT_ARM64E;
+    use crate::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    /// The arm64e page size as the `u64` this module's plan arithmetic takes.
+    ///
+    /// Derived from the one shift rather than restated, exactly as the device's
+    /// own `model` copy is: `gva`'s `PAGE_SIZE_ARM64E` is the `u32` a
+    /// page-offset mask wants, and widening it here is cheaper than two
+    /// constants that can disagree.
+    const PAGE_SIZE_ARM64E: u64 = 1u64 << PAGE_SHIFT_ARM64E;
+    use reims_vgpu_observe::Refusal;
 
     use std::collections::HashMap;
 
@@ -908,7 +916,7 @@ mod tests {
     fn status_refusal_separates_control_flow_from_exact_failures() {
         assert_eq!(Status::Ok.refusal(), None);
         assert!(
-            crate::observe::Emit::refusal("mapper_resolve_fail", &Status::Ok).is_none(),
+            reims_vgpu_observe::Emit::refusal("mapper_resolve_fail", &Status::Ok).is_none(),
             "success must not be representable as a failure line"
         );
 
@@ -925,7 +933,7 @@ mod tests {
             "two distinct short-record checks must not collapse to one reason"
         );
         assert_eq!(
-            crate::observe::Emit::refusal("mapper_resolve_fail", &texture)
+            reims_vgpu_observe::Emit::refusal("mapper_resolve_fail", &texture)
                 .unwrap()
                 .field("mapping", 7)
                 .render(),
@@ -1205,8 +1213,8 @@ mod tests {
     /// independently of plane dims.
     #[test]
     fn mapping_span_bound_rejects_a_span_past_alloc_size() {
-        use crate::contract::endian::{st32, st64};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::endian::{st32, st64};
+        use crate::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
         // Device desc: 1024×1024 dims, alloc only 384*4096 = 0x180000.
         let mut desc = vec![0u8; DEVICE_DESC_LEN];
@@ -1243,8 +1251,8 @@ mod tests {
 
     #[test]
     fn the_geometry_scan_picks_a_plane_only_when_exactly_one_matches() {
-        use crate::contract::endian::{st16, st32, st64};
-        use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
+        use crate::endian::{st16, st32, st64};
+        use crate::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
 
         let mut desc = vec![0u8; DEVICE_DESC_LEN];
         st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x20000);
@@ -1289,8 +1297,8 @@ mod tests {
     /// record `+0x20`) separates them.
     #[test]
     fn sample_window_plane_index_selects_among_same_geometry_planes() {
-        use crate::contract::endian::{st16, st32, st64};
-        use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
+        use crate::endian::{st16, st32, st64};
+        use crate::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
 
         // Live shape (scaled): Y 946×350 @32 bpr 960; UV 473×175 @336032
         // bpr 960 bpe 2; alpha 946×350 @504992 bpr 960 bpe 1.

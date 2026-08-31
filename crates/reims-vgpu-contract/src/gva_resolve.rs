@@ -16,7 +16,7 @@
 //!
 //! The guest-memory seam is the wire crate's
 //! [`GuestMemory`](reims_vgpu_wire::mem::GuestMemory); the device implements
-//! it over [`crate::runtime::host::HostMemory`] at each caller.
+//! it over `crate::runtime::host::HostMemory` at each caller.
 
 use reims_vgpu_paging::resolve::ResolveStatus;
 
