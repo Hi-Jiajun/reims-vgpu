@@ -68,7 +68,7 @@ reims-vgpu-contract = { path = "../reims-vgpu-contract" }
 reims-vgpu-observe = { path = "../reims-vgpu-observe" }
 ash = { version = "0.38", optional = true }
 # Always available for Linux MTLB→AIR→SPIR-V (encode path + probes).
-metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "47009b2693757b8d51b907bff37ce4fa4793293f" }
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "42a7998514681fea7e955d789e084344b8fcbb51" }
 winit = { version = "0.30", optional = true }
 ash-window = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
