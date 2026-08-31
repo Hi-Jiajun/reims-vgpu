@@ -30,6 +30,9 @@ pub mod init_decline;
 mod linear_target_import;
 mod pools;
 mod queue_owner;
+/// This rail's half of a serialized resource's rail state: the resident-target
+/// leases the guest's own delete releases.
+pub mod resource_lease;
 mod scatter_shader;
 pub(crate) mod stamp_completion;
 /// The requested draw-time buffer-gather working set. Re-exported for the same

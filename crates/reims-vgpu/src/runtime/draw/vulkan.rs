@@ -10,7 +10,7 @@
 
 use super::*;
 
-use crate::backend::vulkan::engine::{DrawError, DrawPreparationDecline};
+use crate::backend::vulkan::engine::{resource_lease, DrawError, DrawPreparationDecline};
 use crate::backend::vulkan::translate;
 use crate::backend::PlaneDrawReader;
 use crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE;
@@ -1325,7 +1325,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     .filter(|resource| {
                         resource_type_owns_surface_resident(resource.entry.object_type)
                     })
-                    .map(|resource| resource.resident_target_backing(&resident_id))
+                    .map(|resource| {
+                        resource_lease::resident_target_backing(resource, &resident_id)
+                    })
                     // An unclassified ref has no resource object to own a
                     // lease. Keep its existing query path so compatibility
                     // traffic still reaches the copying rails.
@@ -4096,7 +4098,7 @@ fn gva_resident_ready(
         .then(|| state.task_resources.get(task_id, texture_ref))
         .flatten()
         .filter(|resource| resource_type_owns_gva_resident(resource.entry.object_type))
-        .map(|resource| resource.resident_target_backing(identity));
+        .map(|resource| resource_lease::resident_target_backing(&resource, identity));
     let retained = backing.is_some();
     let ready = retained_resident_is_ready(backing, || {
         crate::backend::vulkan::engine::resident_content_ready(identity)
@@ -8365,7 +8367,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         .filter(|resource| {
                             resource_type_owns_surface_resident(resource.entry.object_type)
                         })
-                        .map(|resource| resource.resident_target_backing(&identity))
+                        .map(|resource| {
+                            resource_lease::resident_target_backing(&resource, &identity)
+                        })
                 });
                 let (resident_current, guest_wrote) =
                     mapper_ref_texture_load_resident_is_current(backing, || {
