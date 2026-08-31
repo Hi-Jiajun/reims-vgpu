@@ -879,7 +879,13 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut any_write = false;
     if !writeback_guest {
         // Still log + early paint latch only when storing; chain returns RGBA.
-        return (EncodeStatus::Ok, color_outs.first().cloned());
+        // Moved out rather than cloned: `color_outs` is this call's own storage
+        // and dies with the frame, so a clone was a second full-frame
+        // allocation and copy for a buffer nothing else would read.
+        return (
+            EncodeStatus::Ok,
+            std::mem::take(&mut color_outs).into_iter().next(),
+        );
     }
     for (i, c) in color_list.iter().enumerate() {
         if c.store_action == MTL_STORE_ACTION_DONT_CARE {
@@ -1015,7 +1021,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     {
         seeded.store_back(state, host, (width, height));
     }
-    let color0_rgba = color_outs.first().cloned();
+    // Moved, not cloned; see the early return above.
+    let color0_rgba = std::mem::take(&mut color_outs).into_iter().next();
     (EncodeStatus::Ok, color0_rgba)
 }
 
