@@ -23,6 +23,8 @@ pub mod translate;
 
 use crate::backend::Backend;
 use crate::model::DeviceState;
+use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
+use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
 use crate::runtime::host::{HostMemory, HostOps};
 
@@ -81,6 +83,39 @@ impl Backend for VulkanBackend {
             range_location,
             range_length,
         )
+    }
+
+    fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        cmd: &BlitCommand,
+    ) -> Option<BlitStatus> {
+        blit_exec::vulkan::try_copy_whole_plane_on_gpu(state, host, task_id, cmd)
+    }
+
+    fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        destination_ref: u32,
+        src: &Type11Texture,
+        dst: &LinearTextureLevel,
+    ) -> Option<BlitStatus> {
+        blit_exec::vulkan::try_copy_t11_plane_to_linear_on_gpu(
+            state,
+            host,
+            task_id,
+            destination_ref,
+            src,
+            dst,
+        )
+    }
+
+    fn note_blit_t11_resident(&self, state: &DeviceState, mapping_id: u32) {
+        blit_exec::vulkan::note_blit_t11_resident(state, mapping_id);
     }
 }
 

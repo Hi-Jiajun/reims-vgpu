@@ -70,6 +70,9 @@ impl Backend for MetalBackend {
         draw::metal::encode_draw_chain(state, host, req, writeback_guest, force_full_store)
     }
 
+    // The two blit fast paths and the resident census take the trait's
+    // defaults: this rail keeps no resident registry to copy out of or to count,
+    // so it declines both optimisations and records no reading.
     fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         &self,
         state: &mut DeviceState,

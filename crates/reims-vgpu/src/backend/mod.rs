@@ -90,10 +90,18 @@ pub mod metal;
 pub mod vulkan;
 
 use crate::model::DeviceState;
+use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, Type11Texture};
+use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus};
 use crate::runtime::host::{HostMemory, HostOps};
 
 /// What the device executes guest work through.
+///
+/// `pub(crate)`: this is the device's internal seam, and its vocabulary is the
+/// device's own resolved state — a `DrawEncodeRequest`, a resolved blit
+/// endpoint. Nothing outside this crate implements a backend or calls one, so
+/// making the trait public would only mean publishing those types to keep a
+/// signature legal.
 ///
 /// The trait names the operations the runtime cannot perform itself, and
 /// nothing else. It once declared the whole Metal-semantic operation set —
@@ -114,7 +122,7 @@ use crate::runtime::host::{HostMemory, HostOps};
 /// backend is about to act on — which is every call site, because the runtime's
 /// unit of work is `(&mut DeviceState, &mut impl HostOps)`. A `&mut self`
 /// backend would have to be borrowed out of that same state and could not be.
-pub trait Backend: Copy {
+pub(crate) trait Backend: Copy {
     /// What this backend calls itself on the fail channel and in QEMU's trace.
     ///
     /// One of the arm names `scripts/feature-matrix` builds, so a log line and
@@ -168,6 +176,50 @@ pub trait Backend: Copy {
         range_location: u64,
         range_length: u64,
     ) -> EncodeStatus;
+
+    /// Copy a whole texture plane the rail already holds, without routing the
+    /// content through the source's guest pages.
+    ///
+    /// `None` is the normal answer and is never a loss: the caller runs its host
+    /// copy loop unchanged and lands the same pixels. So the method is an
+    /// *optimisation the rail may decline*, and it is shaped that way rather
+    /// than as a status a caller has to interpret — a rail with no resident
+    /// registry declines everything, which is exactly what "there is nothing on
+    /// the GPU to copy" means.
+    fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _task_id: u32,
+        _cmd: &BlitCommand,
+    ) -> Option<BlitStatus> {
+        None
+    }
+
+    /// [`Self::try_copy_whole_plane_on_gpu`] for a type-11 source landing in a
+    /// guest-linear destination, which resolves its endpoints differently.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "both endpoints are already resolved backings; re-resolving them                   inside the rail is the crossing this path exists to avoid"
+    )]
+    fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _task_id: u32,
+        _destination_ref: u32,
+        _src: &Type11Texture,
+        _dst: &LinearTextureLevel,
+    ) -> Option<BlitStatus> {
+        None
+    }
+
+    /// Count whether this rail already holds a type-11 surface's content.
+    ///
+    /// Census only: it changes no decision, and the caller copies the same bytes
+    /// either way. A rail with no resident registry records nothing rather than
+    /// a "not ready" reading it would have to be told to discount.
+    fn note_blit_t11_resident(&self, _state: &DeviceState, _mapping_id: u32) {}
 }
 
 /// The backend a device executes through, resolved once per process.
@@ -256,6 +308,61 @@ impl Backend for SelectedBackend {
                 range_location,
                 range_length,
             ),
+        }
+    }
+
+    fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        cmd: &BlitCommand,
+    ) -> Option<BlitStatus> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.try_copy_whole_plane_on_gpu(state, host, task_id, cmd),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.try_copy_whole_plane_on_gpu(state, host, task_id, cmd),
+        }
+    }
+
+    fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        destination_ref: u32,
+        src: &Type11Texture,
+        dst: &LinearTextureLevel,
+    ) -> Option<BlitStatus> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.try_copy_t11_plane_to_linear_on_gpu(
+                state,
+                host,
+                task_id,
+                destination_ref,
+                src,
+                dst,
+            ),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.try_copy_t11_plane_to_linear_on_gpu(
+                state,
+                host,
+                task_id,
+                destination_ref,
+                src,
+                dst,
+            ),
+        }
+    }
+
+    fn note_blit_t11_resident(&self, state: &DeviceState, mapping_id: u32) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.note_blit_t11_resident(state, mapping_id),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.note_blit_t11_resident(state, mapping_id),
         }
     }
 }
