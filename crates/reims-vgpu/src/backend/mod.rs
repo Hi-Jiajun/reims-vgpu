@@ -52,6 +52,16 @@ pub mod blob;
 /// can be served as one.
 pub mod render_pso_key;
 
+/// The rail-neutral vocabulary of the host-owned presentation window: the
+/// native surface a rail attaches to, the two frame sources it may present
+/// from, what a present did, and why one was refused.
+///
+/// Gated on the window's own feature, which is the lawful question — whether
+/// this build compiled a window at all is a fact about the build. Which rail
+/// fills it is [`Backend::presents_host_window`], answered at run time.
+#[cfg(feature = "host-window")]
+pub mod window;
+
 // There is no fourth. `AGENTS.md` asks for pure logic under `backend/metal/` to
 // be moved out here so its tests run on every arm rather than on none, and the
 // three above are what that yielded; a survey of the rest found the remaining
@@ -400,9 +410,10 @@ pub(crate) trait Backend: Copy {
 
     /// Whether this rail presents into the host-owned window (kb host-window).
     ///
-    /// That window is a `VkSurfaceKHR` and a swapchain the Vulkan engine drives,
-    /// so it is the only rail that can fill one; on any other rail QEMU's own
-    /// display owns the screen, and there is nothing here to fall back to.
+    /// The one question that decides whether a window opens at all, and it is
+    /// asked before any of [`Self::window_attach`] and its siblings: a rail
+    /// that answers `false` leaves the screen to QEMU's own display, and the
+    /// six window methods below it are never reached.
     ///
     /// A trait method rather than a `cfg` for [`Self::emit_census`]'s reason,
     /// and this is the case where the difference is fatal rather than
@@ -424,6 +435,90 @@ pub(crate) trait Backend: Copy {
     fn presents_host_window(&self) -> bool {
         false
     }
+
+    /// Build this rail's presenter for a native window surface.
+    ///
+    /// Idempotent: a rail that already holds a presenter for this window
+    /// returns `Ok` without building a second one, because the window calls
+    /// this both at creation and to rebuild after a device loss.
+    ///
+    /// The handles in `surface` are only valid while the window that vended
+    /// them lives, so this and [`Self::window_detach`] are driven from the
+    /// window's own lifecycle callbacks and never from the device.
+    #[cfg(feature = "host-window")]
+    fn window_attach(&self, _surface: &window::WindowSurface) -> Result<(), window::WindowDecline> {
+        Err(window::WindowDecline::Refused(
+            window::WindowDeclineReason::RailHasNoPresenter,
+        ))
+    }
+
+    /// Whether this rail currently holds a presenter for the host window.
+    ///
+    /// Read by the publish path on the drain worker, which has to decide
+    /// whether the next capture may skip its readback *before* it pays for it.
+    /// It is therefore a question about right now, not about the build: a
+    /// device loss takes the presenter with it, and a publisher still routing
+    /// to a rail that lost one is how a boot goes dark behind a single latched
+    /// log line.
+    #[cfg(feature = "host-window")]
+    fn window_attached(&self) -> bool {
+        false
+    }
+
+    /// The GPU-resident frame, if any, that can carry this present into the
+    /// window without its pixels crossing host memory.
+    ///
+    /// Called once per published present on the drain worker, whether or not a
+    /// window is attached, because a rail may fold resident maintenance into
+    /// the same transaction that answers this. `Err` is the census route that
+    /// says why the direct present was not taken — the difference between the
+    /// two paths is the window's frame rate, so a rail must never decline here
+    /// silently.
+    #[cfg(feature = "host-window")]
+    fn window_resident(
+        &self,
+        _state: &DeviceState,
+        _mapping_id: u32,
+        _width: u32,
+        _height: u32,
+    ) -> Result<window::WindowResident, &'static str> {
+        Err("winpub_rail_has_no_resident")
+    }
+
+    /// Put one frame on the screen.
+    ///
+    /// `resident` is preferred and `cpu` is the fallback for presents no
+    /// resident carries — the firmware framebuffer, a mapping the compositor
+    /// cleared but never rendered into, the frames after a device reset. A rail
+    /// given neither still owes the window a drawable, because a window that
+    /// presents nothing at boot is a window that never appears.
+    #[cfg(feature = "host-window")]
+    fn window_present(
+        &self,
+        _resident: Option<&window::WindowResident>,
+        _cpu: Option<window::WindowCpuFrame<'_>>,
+    ) -> Result<window::WindowPresentOutcome, window::WindowDecline> {
+        Err(window::WindowDecline::Refused(
+            window::WindowDeclineReason::RailHasNoPresenter,
+        ))
+    }
+
+    /// Match the presenter's drawables to a new native window size.
+    ///
+    /// Called from the window's `Resized` event, which is the only thing that
+    /// knows the size the window system actually granted — a request the
+    /// compositor clamped or refused arrives here as the size it chose.
+    #[cfg(feature = "host-window")]
+    fn window_resize(&self, _width: u32, _height: u32) {}
+
+    /// Release the presenter while the native window is still alive.
+    ///
+    /// Ordering, not politeness: the presenter's surface is serviced through
+    /// the window system objects the native window owns, and releasing the
+    /// window first makes the driver marshal to freed handles. The window calls
+    /// this from `exiting`, before it drops its own handle.
+    #[cfg(feature = "host-window")]
+    fn window_detach(&self) {}
 
     /// Publish a FIFO completion stamp, ordered behind the guest-memory work it
     /// completes.
@@ -933,6 +1028,76 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.presents_host_window(),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.presents_host_window(),
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_attach(&self, surface: &window::WindowSurface) -> Result<(), window::WindowDecline> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.window_attach(surface),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.window_attach(surface),
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_attached(&self) -> bool {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.window_attached(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.window_attached(),
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_resident(
+        &self,
+        state: &DeviceState,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<window::WindowResident, &'static str> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.window_resident(state, mapping_id, width, height),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.window_resident(state, mapping_id, width, height),
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_present(
+        &self,
+        resident: Option<&window::WindowResident>,
+        cpu: Option<window::WindowCpuFrame<'_>>,
+    ) -> Result<window::WindowPresentOutcome, window::WindowDecline> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.window_present(resident, cpu),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.window_present(resident, cpu),
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_resize(&self, width: u32, height: u32) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.window_resize(width, height),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.window_resize(width, height),
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_detach(&self) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.window_detach(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.window_detach(),
         }
     }
 

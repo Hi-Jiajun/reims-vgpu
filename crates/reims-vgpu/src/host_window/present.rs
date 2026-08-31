@@ -39,6 +39,8 @@ use winit::window::{Window, WindowId};
 use super::capture::{Capture, CaptureEngaged, CaptureMode};
 use super::input_map;
 use super::keyboard::{Grab, KeyEffect, Keyboard};
+use crate::backend::window::WindowPresentOutcome;
+use crate::backend::Backend as _;
 use crate::runtime::host::HostAction;
 
 /// How long the loop may sleep when nothing has asked it to draw.
@@ -221,8 +223,11 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
-    /// Engine-resident source for same-device MoltenVK presentation.
-    pub resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
+    /// The rail's own handle to a GPU-resident frame, when one carries this
+    /// present. Opaque here: it is produced by `Backend::window_resident` on
+    /// the drain worker and handed back to `Backend::window_present` on this
+    /// thread, and nothing in between looks inside it.
+    pub resident: Option<crate::backend::window::WindowResident>,
 }
 
 /// Shared slot the device writes and the window reads (latest-wins). The frame
@@ -301,15 +306,15 @@ impl WindowWaker {
     }
 }
 
-/// Offer a published frame's CPU bytes to the engine presenter.
+/// Offer a published frame's CPU bytes to the rail's presenter.
 ///
 /// The presenter prefers the resident and only reads these when none carries the
 /// display — the firmware framebuffer, and any mapping the compositor has not
 /// rendered into. `bgra` is empty on presents the device elided the readback
 /// for, and the presenter rejects a short buffer rather than blitting a torn
 /// frame.
-fn window_cpu_frame(frame: &Frame) -> crate::backend::vulkan::engine::WindowCpuFrame<'_> {
-    crate::backend::vulkan::engine::WindowCpuFrame {
+fn window_cpu_frame(frame: &Frame) -> crate::backend::window::WindowCpuFrame<'_> {
+    crate::backend::window::WindowCpuFrame {
         bgra: &frame.bgra,
         width: frame.width,
         height: frame.height,
@@ -960,7 +965,7 @@ impl ApplicationHandler<FramePublished> for App {
             WindowEvent::Resized(size) => {
                 let applied = (size.width.max(1), size.height.max(1));
                 if self.engine_attached {
-                    crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
+                    crate::backend::selected().window_resize(applied.0, applied.1);
                     self.note_guest_resize_applied(applied);
                 }
                 // Fresh swapchain images hold nothing; the seq gate would
@@ -1027,7 +1032,7 @@ impl ApplicationHandler<FramePublished> for App {
         // takes the presenter — the engine's own device-loss flush — did not
         // know to.
         if self.engine_attached {
-            crate::backend::vulkan::engine::window_present_detach();
+            crate::backend::selected().window_detach();
             self.engine_attached = false;
         }
         // Close the guest's held keys and hand the desktop its shortcuts back
@@ -1300,13 +1305,14 @@ impl App {
             .map_err(|error| WindowError::AttachWindowHandle(error.to_string()))?
             .as_raw();
         let size = window.inner_size();
-        crate::backend::vulkan::engine::window_present_attach(
-            display,
-            handle,
-            size.width.max(1),
-            size.height.max(1),
-        )
-        .map_err(|error| WindowError::AttachEngine(error.to_string()))
+        crate::backend::selected()
+            .window_attach(&crate::backend::window::WindowSurface {
+                display,
+                window: handle,
+                width: size.width.max(1),
+                height: size.height.max(1),
+            })
+            .map_err(|error| WindowError::AttachEngine(error.to_string()))
     }
 
     /// Rebuild the presenter after the engine device was lost and recreated.
@@ -1397,17 +1403,17 @@ impl App {
             return;
         }
         self.loop_census.draws_fresh += 1;
-        let result = crate::backend::vulkan::engine::window_present_frame(
+        let result = crate::backend::selected().window_present(
             frame.as_ref().and_then(|frame| frame.resident.as_ref()),
             frame.as_deref().map(window_cpu_frame),
         );
         match result {
-            Ok(crate::backend::vulkan::engine::WindowPresentOutcome::Busy) => {}
-            Ok(crate::backend::vulkan::engine::WindowPresentOutcome::Presented {
+            Ok(WindowPresentOutcome::Busy) => {}
+            Ok(WindowPresentOutcome::Presented {
                 direct,
                 width,
                 height,
-                swapchain_images,
+                buffers,
                 suboptimal,
             }) => {
                 self.engine_error_logged = false;
@@ -1431,43 +1437,38 @@ impl App {
                 if !self.first_engine_present_logged {
                     eprintln!(
                         "reims-vgpu-window: first frame presented \
-                         ({width}x{height}, {swapchain_images} swapchain images)"
+                         ({width}x{height}, {buffers} drawables)"
                     );
                     self.first_engine_present_logged = true;
                 }
                 if direct && frame.is_some() && !self.first_engine_guest_logged {
                     eprintln!(
-                        "reims-vgpu-window: first guest frame presented via engine resident \
+                        "reims-vgpu-window: first guest frame presented via rail resident \
                          (same-device zero-copy)"
                     );
                     crate::observe::off(
-                        "host_window_direct_present path=engine_resident status=live",
+                        "host_window_direct_present path=rail_resident status=live",
                     );
                     self.first_engine_guest_logged = true;
                 }
             }
             Err(error) => {
                 if !self.engine_error_logged {
-                    // The engine present rail's `DrawError` names its own reason
-                    // — a `VkCall`'s `vk_window_*` slug, a `DrawReason` refusal,
-                    // or `vk_engine_*_untyped` for the not-yet-typed variants.
-                    // Emitting it typed keeps that slug the primary `reason=`
-                    // rather than nesting it inside a coarse
-                    // `reason=engine_resident_present error=...` double-reason.
+                    // The rail's own refusal names itself — a `VkCall`'s
+                    // `vk_window_*` slug, a `DrawReason`, a Metal layer
+                    // refusal. Emitting it typed keeps that slug the primary
+                    // `reason=` rather than nesting it inside a coarse
+                    // `reason=rail_present error=...` double-reason.
                     crate::observe::Emit::decline("host_window_present", &error).fail();
-                    eprintln!("reims-vgpu-window: engine resident present failed: {error}");
+                    eprintln!("reims-vgpu-window: rail present failed: {error}");
                     self.engine_error_logged = true;
                 }
-                // This one error is recoverable and every other one is the
-                // presenter's own: it says the presenter is *gone*, which on a
-                // running window means a device loss destroyed it. See
+                // One disposition is recoverable and every other refusal is the
+                // rail's own to report: a presenter that is *gone* means the
+                // rail's device was lost and took it. Which refusals mean that
+                // is the rail's answer, made once where it is known — see
                 // [`Self::reattach_engine`].
-                if matches!(
-                    error,
-                    crate::backend::vulkan::engine::DrawError::Facade(
-                        crate::backend::vulkan::engine::EngineFacadeDecline::WindowPresenterNotAttached
-                    )
-                ) {
+                if error.presenter_lost() {
                     self.reattach_engine();
                 }
             }
@@ -1515,7 +1516,7 @@ impl App {
         if let Some(applied) = immediate {
             // Applied synchronously — winit emits no later `Resized` for it.
             let applied = (applied.width.max(1), applied.height.max(1));
-            crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
+            crate::backend::selected().window_resize(applied.0, applied.1);
             self.engine_redraw_required = true;
             self.note_guest_resize_applied(applied);
         }

@@ -314,41 +314,33 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     if need == 0 {
         return;
     }
-    let present_identity =
-        crate::runtime::present_identity::surface_identity(state, mapping, width, height);
-    // One engine operation keeps this resident alive across the idle sweep,
-    // reclaims aged peers, and returns the direct-present decision for this
-    // exact identity and geometry.
-    let resident_present = crate::backend::vulkan::engine::prepare_window_resident_present(
-        &present_identity,
-        width,
-        height,
-    );
-    // The window presenting from the engine's own device can take the resident
-    // as it stands, so the frame never crosses host memory. `display_from_resident`
+    // Asked whether or not the window takes it: a rail may fold resident
+    // maintenance into the same transaction that answers, so the question is
+    // also what keeps this resident alive across the idle sweep.
+    let backend = crate::backend::selected();
+    let resident = backend.window_resident(state, mapping, width, height);
+    // A window presenting from the rail's own device can take the resident as
+    // it stands, so the frame never crosses host memory. `display_from_resident`
     // is what tells the NEXT capture not to read it back, and it is only set
     // when a resident actually carried this one.
-    if crate::backend::vulkan::engine::window_present_attached() && resident_present.is_ok() {
-        let resident_source = crate::backend::vulkan::engine::WindowPresentSource {
-            width,
-            height,
-            identity: present_identity,
-        };
-        let published = window_write_frame(link, width, height, Vec::new(), Some(resident_source));
-        crate::runtime::census::present_proxy::host_window_publish::note(published);
-        if published {
-            link.last = key;
-            state.present.display_from_resident = true;
+    if backend.window_attached() {
+        if let Ok(resident) = resident {
+            let published = window_write_frame(link, width, height, Vec::new(), Some(resident));
+            crate::runtime::census::present_proxy::host_window_publish::note(published);
+            if published {
+                link.last = key;
+                state.present.display_from_resident = true;
+            }
+            return;
         }
-        return;
     }
     // Say why the direct present was not taken, because the fallback below
     // copies the whole framebuffer through host memory on every frame and the
     // difference between the two is the window's frame rate. Silence here is
     // what let `direct_frac` sit at 0.00 for a whole boot with no cause named.
-    if !crate::backend::vulkan::engine::window_present_attached() {
+    if !backend.window_attached() {
         crate::runtime::drain::note_store_route("winpub_window_not_attached");
-    } else if let Err(route) = resident_present {
+    } else if let Err(route) = resident {
         crate::runtime::drain::note_store_route(route);
     }
     // No resident carries this present (firmware framebuffer, a mapping the
@@ -409,7 +401,7 @@ fn window_write_frame(
     width: u32,
     height: u32,
     bgra: Vec<u8>,
-    resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
+    resident: Option<crate::backend::window::WindowResident>,
 ) -> bool {
     link.seq = link.seq.wrapping_add(1);
     let frame = std::sync::Arc::new(crate::host_window::present::Frame {

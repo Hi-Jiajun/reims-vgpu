@@ -21,6 +21,8 @@ pub mod caps;
 pub mod engine;
 pub mod translate;
 
+#[cfg(feature = "host-window")]
+use crate::backend::window;
 use crate::backend::{Backend, CensusSite, GuestWriteReach, PlaneDrawReader, Rail, StampOrdering};
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
@@ -133,6 +135,69 @@ impl Backend for VulkanBackend {
         // the window at all is a different question with a different owner —
         // `device::window_publish`, where the `host-window` feature is asked.
         true
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_attach(&self, surface: &window::WindowSurface) -> Result<(), window::WindowDecline> {
+        engine::window_present_attach(
+            surface.display,
+            surface.window,
+            surface.width,
+            surface.height,
+        )
+        .map_err(window_decline)
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_attached(&self) -> bool {
+        engine::window_present_attached()
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_resident(
+        &self,
+        state: &DeviceState,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<window::WindowResident, &'static str> {
+        let identity =
+            crate::runtime::present_identity::surface_identity(state, mapping_id, width, height);
+        // One engine operation keeps this resident alive across the idle sweep,
+        // reclaims aged peers, and returns the direct-present decision for this
+        // exact identity and geometry — so it runs whether or not the window
+        // ends up taking the resident.
+        engine::prepare_window_resident_present(&identity, width, height)?;
+        Ok(window::WindowResident::Vulkan(
+            engine::WindowPresentSource {
+                width,
+                height,
+                identity,
+            },
+        ))
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_present(
+        &self,
+        resident: Option<&window::WindowResident>,
+        cpu: Option<window::WindowCpuFrame<'_>>,
+    ) -> Result<window::WindowPresentOutcome, window::WindowDecline> {
+        // The rail's own resident, and the only shape this enum can hold on a
+        // build that compiled this rail — Metal contributes no variant, having
+        // no registry to name one from.
+        let source = resident.map(|window::WindowResident::Vulkan(source)| source);
+        engine::window_present_frame(source, cpu).map_err(window_decline)
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_resize(&self, width: u32, height: u32) {
+        engine::window_present_resize(width, height);
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_detach(&self) {
+        engine::window_present_detach();
     }
 
     fn guest_writes_outstanding(&self) -> bool {
@@ -331,6 +396,28 @@ impl Backend for VulkanBackend {
                 census::emit_guest_import_levels();
             }
         }
+    }
+}
+
+/// Which disposition one of this rail's draw refusals carries when it reaches
+/// the host window.
+///
+/// The window acts on exactly one distinction — a presenter that is *gone* gets
+/// rebuilt — and only this rail knows which of its refusals means that. A
+/// `VK_ERROR_DEVICE_LOST` destroys the presenter along with everything else
+/// derived from the device, and the next present finds no presenter at all;
+/// every other refusal leaves one standing and is named and dropped.
+#[cfg(feature = "host-window")]
+fn window_decline(error: engine::DrawError) -> window::WindowDecline {
+    let lost = matches!(
+        error,
+        engine::DrawError::Facade(engine::EngineFacadeDecline::WindowPresenterNotAttached)
+    );
+    let reason = window::WindowDeclineReason::Vulkan(error);
+    if lost {
+        window::WindowDecline::PresenterLost(reason)
+    } else {
+        window::WindowDecline::Refused(reason)
     }
 }
 
