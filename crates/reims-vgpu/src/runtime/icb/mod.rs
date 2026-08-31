@@ -2954,16 +2954,6 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
     Ok(())
 }
 
-#[cfg(feature = "backend-vulkan")]
-pub fn resolve_metal_icb<M: HostMemory + HostOps>(
-    _state: &DeviceState,
-    _host: &M,
-    _task_id: u32,
-    _icb_ref: u32,
-) -> Result<(IndirectCommandBufferDescriptor, ()), IcbStatus> {
-    Err(IcbStatus::NoMetal("icb_resolve_no_vulkan_path"))
-}
-
 /// Clone writeback slots for a cached ICB into a session nested job (after execute).
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 pub(crate) fn export_icb_writeback_job(
