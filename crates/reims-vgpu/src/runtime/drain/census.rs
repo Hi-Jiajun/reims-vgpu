@@ -2792,8 +2792,7 @@ pub fn note_drain_setup(ns: u64) {
 }
 
 /// Accumulate one completed drain tranche; emits at most once per second.
-///
-pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
+pub fn note_drain_tranche(host: &dyn crate::runtime::host::HostOps, drain_us: u64, publish_us: u64) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
         // Immediately after `drain_duty`, so the two read as one record: the
@@ -2881,6 +2880,7 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
             crate::observe::off(wanted);
         }
         emit_engine_delta();
+        emit_alias_pressure(host);
         // After `emit_engine_delta`, which emits `draw_phase`: the two divide
         // against each other and reading them in the other order invites
         // treating the engine's phases as the whole draw, which is the
@@ -2891,6 +2891,22 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         emit_object_cache_levels();
         emit_guest_import_levels();
     }
+}
+
+fn emit_alias_pressure(host: &dyn crate::runtime::host::HostOps) {
+    let Some(now) = host.page_alias_census() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "alias_pressure (levels, not per-interval) live={} live_mib={} pages={} \
+         created={} destroyed={} vma_estimate={}",
+        now.live,
+        now.live_bytes >> 20,
+        now.live_pages,
+        now.created,
+        now.destroyed,
+        now.live_pages,
+    ));
 }
 
 /// How many RAMBlocks this device has imported, and how many bytes they cover,
@@ -3079,9 +3095,16 @@ fn emit_engine_delta() {
 #[cfg(feature = "backend-vulkan")]
 fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot) {
     crate::observe::off(format!(
-        "registry_pressure (levels, not per-interval) peak={} peak_mib={} \
+        "registry_pressure (levels, not per-interval) current={}/{}mib \
+         recoverable={}/{}mib pinned={}/{}mib peak={} peak_mib={} \
          resident_samples={} resample_peak_ms={}/{} \
          slab_mib={}/{} sole_copy={}/{}mib cs_sole_copy={}/{}mib",
+        now.registry_current_count,
+        now.registry_current_bytes >> 20,
+        now.registry_recoverable_count,
+        now.registry_recoverable_bytes >> 20,
+        now.registry_pinned_count,
+        now.registry_pinned_bytes >> 20,
         now.registry_non_pinned_peak,
         now.registry_non_pinned_peak_bytes >> 20,
         now.sampled_gpu_binds,

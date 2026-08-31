@@ -1470,6 +1470,9 @@ pub struct ComputeRequest {
     pub entry: String,
     /// Workgroup counts in (x, y, z). Runtime converts threads→groups when needed.
     pub grid: [u32; 3],
+    /// Reflected push-constant offset and exact Metal thread grid, when the
+    /// translated kernel's dispatch contract requires a rounded-invocation guard.
+    pub threads_per_grid_push: Option<(u32, [u32; 3])>,
     /// Storage-buffer descriptors with reflected shader write access.
     pub storage_buffers: Vec<ComputeBufferResource>,
     /// Sampled images (binding, format, geometry, immutable input bytes).

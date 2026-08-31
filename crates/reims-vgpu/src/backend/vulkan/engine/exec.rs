@@ -2956,6 +2956,7 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     let layout_key = LayoutKey {
         bindings: layout_bindings,
+        push_constant: None,
     };
     // Resolve load action: resident > guest/host seed > Clear black.
     let mut load_uses_gpu_content = req.load_from_target;

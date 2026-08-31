@@ -442,6 +442,7 @@ pub(crate) unsafe fn execute_compute_inner(
 
     let layout_key = LayoutKey {
         bindings: layout_bindings,
+        push_constant: req.threads_per_grid_push.map(|(offset, _)| (offset, 12)),
     };
 
     let (spirv_digest, module) = caches.get_or_create_shader(ctx, &req.spirv, counters, pools)?;
@@ -1179,6 +1180,16 @@ pub(crate) unsafe fn execute_compute_inner(
         counters
             .descriptor_set_binds
             .fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some((offset, threads)) = req.threads_per_grid_push {
+        let bytes = std::slice::from_raw_parts(threads.as_ptr().cast::<u8>(), 12);
+        ctx.device.cmd_push_constants(
+            cb,
+            pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            offset,
+            bytes,
+        );
     }
     ctx.device
         .cmd_dispatch(cb, req.grid[0], req.grid[1], req.grid[2]);

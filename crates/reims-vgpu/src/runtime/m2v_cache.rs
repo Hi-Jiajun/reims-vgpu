@@ -1298,7 +1298,9 @@ mod tests {
     /// A minimal `CachedShader` wrapping raw bytes with an empty reflection —
     /// enough to prime the cache in unit tests that never call metal2vulkan.
     fn synth_shader(stage: Stage, spirv: Vec<u8>) -> Arc<CachedShader> {
-        use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
+        use metal2vulkan::reflect::{
+            DescriptorLayout, ShaderReflection, ShaderStage, REFLECTION_VERSION,
+        };
         let stage = match stage {
             Stage::Vertex => ShaderStage::Vertex,
             Stage::Fragment => ShaderStage::Fragment,
@@ -1325,6 +1327,10 @@ mod tests {
                 implicit_imageblock_attachments: vec![],
                 fragment_imageblock: None,
                 datalayout: None,
+                descriptor_layout: DescriptorLayout::default(),
+                kernel_dispatch: None,
+                runtime_sampler_specializations: vec![],
+                runtime_storage_image_specializations: vec![],
                 function_constants: vec![],
             }),
         ))
@@ -1336,8 +1342,8 @@ mod tests {
         metal_indices: &[u32],
     ) -> Arc<CachedShader> {
         use metal2vulkan::reflect::{
-            DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection, ShaderStage,
-            REFLECTION_VERSION, RESOURCE_DESCRIPTOR_SET, SAMPLER_BINDING_BASE,
+            DescriptorLayout, DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection,
+            ShaderStage, REFLECTION_VERSION, RESOURCE_DESCRIPTOR_SET, SAMPLER_BINDING_BASE,
         };
         let reflected_stage = match stage {
             Stage::Vertex => ShaderStage::Vertex,
@@ -1390,6 +1396,10 @@ mod tests {
                 implicit_imageblock_attachments: vec![],
                 fragment_imageblock: None,
                 datalayout: None,
+                descriptor_layout: DescriptorLayout::default(),
+                kernel_dispatch: None,
+                runtime_sampler_specializations: vec![],
+                runtime_storage_image_specializations: vec![],
                 function_constants: vec![],
             }),
         ))
@@ -1431,11 +1441,11 @@ mod tests {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shader = synth_shader(Stage::Fragment, bytes);
 
-        // The stored module is the widened one: the sampler moved out of the
-        // texture band's way, the buffer and texture did not move at all.
+        // The translator's v22 layout is already wide, so the compatibility
+        // pass leaves all three bindings unchanged.
         let mut widened = words.clone();
         let moved = crate::runtime::spirv_bind::widen_sampled_bands(&mut widened);
-        assert_eq!(moved, 1, "only the sampler band moves");
+        assert_eq!(moved, 0, "the translator and device layouts agree");
         assert_eq!(*shader.words, widened);
         assert_eq!(shader.words[8], 3);
         assert_eq!(shader.words[12], M2V_TEXTURE_BINDING_BASE + 8);

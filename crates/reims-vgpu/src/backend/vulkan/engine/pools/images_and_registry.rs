@@ -2179,6 +2179,24 @@ impl ResourcePools {
         self.registry_non_pinned.bytes
     }
 
+    /// Instantaneous registry populations for the once-per-second census.
+    pub(crate) fn registry_levels(&self) -> RegistryLevels {
+        let mut levels = RegistryLevels::default();
+        for slot in self.registry.values() {
+            let bytes = Self::slot_attachment_bytes(slot);
+            levels.current.count += 1;
+            levels.current.bytes += bytes;
+            if slot.pin_count != 0 {
+                levels.pinned.count += 1;
+                levels.pinned.bytes += bytes;
+            } else if !slot.gpu_only_content {
+                levels.recoverable.count += 1;
+                levels.recoverable.bytes += bytes;
+            }
+        }
+        levels
+    }
+
     /// One slot's contribution to [`Self::non_pinned_registry_bytes`].
     ///
     /// Attachment footprint, not allocation footprint: it does not know tiling
@@ -2715,6 +2733,33 @@ pub(super) mod pin_count_tests {
             generation: 0,
             format: translate::pixel::SCANOUT_FORMAT,
         }
+    }
+
+    #[test]
+    fn registry_levels_separate_recoverable_pinned_and_sole_copy_residents() {
+        let mut pools = ResourcePools::new();
+        for id in 1..=3 {
+            let identity = TargetIdentity::Surface {
+                id,
+                width: 16,
+                height: 16,
+                generation: 0,
+                format: translate::pixel::SCANOUT_FORMAT,
+            };
+            let mut slot = dummy_slot(true);
+            if id == 2 {
+                slot.pin_count = 1;
+            }
+            if id == 3 {
+                slot.gpu_only_content = true;
+            }
+            pools.registry.insert(identity, slot);
+        }
+
+        let levels = pools.registry_levels();
+        assert_eq!(levels.current, NonPinnedTotals { count: 3, bytes: 3072 });
+        assert_eq!(levels.recoverable, NonPinnedTotals { count: 1, bytes: 1024 });
+        assert_eq!(levels.pinned, NonPinnedTotals { count: 1, bytes: 1024 });
     }
 
     /// The window presenter blits a resident with no format conversion and no
