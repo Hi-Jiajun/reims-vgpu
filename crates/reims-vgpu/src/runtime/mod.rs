@@ -121,6 +121,9 @@ mod spirv_layout;
 pub mod spirv_vertex_input;
 /// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).
 pub mod surface_cache;
+/// Whether a host-side copy of a mapper-ref-texture surface's pixels is still
+/// that surface's content, per the hypervisor's witness.
+pub mod surface_currency;
 /// The wire task word a command payload carries → a live task slot.
 pub mod task_slot;
 /// Texture / mapper-ref-texture geometry registration.

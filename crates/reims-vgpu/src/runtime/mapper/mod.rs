@@ -1685,7 +1685,6 @@ pub enum GuestWriteVerdict {
 /// more than one rail can ask the same question and report it under its own names. A shared counter
 /// would pool two rails' refusals into one number, and the number would then be unreadable for
 /// either.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     state: &DeviceState,
     host: &M,
