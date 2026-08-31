@@ -33,8 +33,12 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
         // resolves below. `translations_ready` states why that is not a weaker
         // answer — chiefly that the translate cache never evicts, so a shader
         // this memo saw translated is still translated.
-        if crate::runtime::pipeline_resolve::translations_ready(state, host, task_id, pipeline_ref)
-        {
+        if crate::backend::vulkan::pipeline_resolve::translations_ready(
+            state,
+            host,
+            task_id,
+            pipeline_ref,
+        ) {
             continue;
         }
         let air_started = std::time::Instant::now();

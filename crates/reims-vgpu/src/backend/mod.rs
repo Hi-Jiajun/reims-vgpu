@@ -171,7 +171,7 @@ pub type StampAnnounce = Arc<dyn Fn(u32) + Send + Sync>;
 /// rails, and its delete is handled where it is decoded; the kinds no rail owns
 /// a registry for stay fail-visible as unimplemented, which is what says the
 /// contract gap is still open. These two are the ones exactly one rail keeps a
-/// table for — [`crate::runtime::pipeline_resolve`] and the Vulkan draw rail —
+/// table for — [`crate::backend::vulkan::pipeline_resolve`] and the Vulkan draw rail —
 /// while the other resolves them out of the guest's object list on every use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetainedObject {

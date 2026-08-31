@@ -1313,7 +1313,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // Compute the resident-surface identity once and reuse it for
                 // both the readiness check and the direct bind.
                 let resident_id =
-                    crate::runtime::present_identity::surface_identity(state, mid, w, h);
+                    crate::backend::vulkan::present_identity::surface_identity(state, mid, w, h);
                 // `content_ready` only. The obvious strengthening — also require
                 // the resident's `content_epoch` to match the mapping's, as the
                 // attachment LOAD elision does — was tried and reverted, because
@@ -6665,7 +6665,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 format,
             }
         } else if c.mapping_id != 0 {
-            crate::runtime::present_identity::surface_identity(
+            crate::backend::vulkan::present_identity::surface_identity(
                 state,
                 c.mapping_id,
                 c.width,
@@ -6938,15 +6938,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     req.gva_alloc_gen = gva_alloc_generation(state, host, req);
     // One call for the pipeline descriptor and both translated shaders. It is
     // memoized on the three objects' list entries — see
-    // `crate::runtime::pipeline_resolve` for what that identity is and what it
+    // `crate::backend::vulkan::pipeline_resolve` for what that identity is and what it
     // does not cover — so the object-list walks, descriptor reads, MTLB reads,
     // AIR carves and content hashes behind it happen once per pipeline object
     // rather than once per draw. The sub-phases below still bracket the parts,
     // so a boot's `chain_phase` line says how much of the span survived.
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PipelineDesc);
-    let resolved =
-        crate::runtime::pipeline_resolve::resolve(state, host, req.task_id, req.pipeline_ref)
-            .map_err(DrawError::DrawPreparation)?;
+    let resolved = crate::backend::vulkan::pipeline_resolve::resolve(
+        state,
+        host,
+        req.task_id,
+        req.pipeline_ref,
+    )
+    .map_err(DrawError::DrawPreparation)?;
     let pd = &resolved.desc;
     let v_shader = resolved.vertex.clone();
     let f_shader = resolved.fragment.clone();
@@ -7109,7 +7113,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Which indices those are, and which the attribute list names at all,
         // are both functions of the pipeline's attribute list and nothing else,
         // so they are resolved with the pipeline rather than rebuilt per draw —
-        // see [`crate::runtime::pipeline_resolve::VertexBindPlan`], which also
+        // see [`crate::backend::vulkan::pipeline_resolve::VertexBindPlan`], which also
         // carries why the second set is deliberately unfiltered. Not to be
         // confused with `stage_in_bufs` further down: that one is filled during
         // the attribute walk, holds only the indices that actually carried
@@ -9902,7 +9906,7 @@ pub(crate) fn render_chain_identity(
         return None;
     }
     if c0.mapping_id != 0 {
-        return Some(crate::runtime::present_identity::surface_identity(
+        return Some(crate::backend::vulkan::present_identity::surface_identity(
             state,
             c0.mapping_id,
             width,
@@ -12232,10 +12236,10 @@ mod vulkan_split_tests {
         ));
 
         // The key the draw would have handed `registry_ensure`.
-        let drawn = crate::runtime::present_identity::surface_identity(&state, mid, w, h);
+        let drawn = crate::backend::vulkan::present_identity::surface_identity(&state, mid, w, h);
         crate::model::DeviceState::bump_map_generation(state.mappings.get_mut(&mid).unwrap());
         assert_ne!(
-            crate::runtime::present_identity::surface_identity(&state, mid, w, h),
+            crate::backend::vulkan::present_identity::surface_identity(&state, mid, w, h),
             drawn,
             "the bump has to change what a second derivation answers or this \
              test cannot see the defect"

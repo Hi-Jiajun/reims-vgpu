@@ -5476,8 +5476,8 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
 /// the pipeline registry.
 ///
 /// The two retained registries are Vulkan-arm structures
-/// ([`crate::model::state::DeviceState::task_render_pipeline_states`] and
-/// [`crate::runtime::pipeline_resolve`] are both gated on them), so the
+/// ([`crate::backend::vulkan::pipeline_resolve::retained`] and
+/// [`crate::backend::vulkan::pipeline_resolve`] are both gated on them), so the
 /// statements that populate them are gated the same way — that part is a fact
 /// about the build.
 ///
@@ -5530,16 +5530,20 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         state
             .task_depth_stencil_states
             .register(2, 12, std::sync::Arc::new(Default::default()));
-        state.task_render_pipeline_states.register(
-            2,
-            13,
-            crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
-        );
-        state.task_render_pipeline_states.register(
-            2,
-            15,
-            crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
-        );
+        crate::backend::vulkan::pipeline_resolve::retained(&state)
+            .expect("this rail owns the device's rail-state slot")
+            .register(
+                2,
+                13,
+                crate::backend::vulkan::pipeline_resolve::retained_pipeline_for_test(),
+            );
+        crate::backend::vulkan::pipeline_resolve::retained(&state)
+            .expect("this rail owns the device's rail-state slot")
+            .register(
+                2,
+                15,
+                crate::backend::vulkan::pipeline_resolve::retained_pipeline_for_test(),
+            );
     }
 
     // Same task, same number, well-formed record: the collision that an arm
@@ -5602,7 +5606,10 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     #[cfg(feature = "backend-vulkan")]
     assert_eq!(
-        state.task_render_pipeline_states.get(2, 13).is_none(),
+        crate::backend::vulkan::pipeline_resolve::retained(&state)
+            .expect("this rail owns the device's rail-state slot")
+            .get(2, 13)
+            .is_none(),
         crate::backend::selected().rail() == crate::backend::Rail::Vulkan,
         "the render-pipeline destroy opcode retires the retained state of the \
          rail that has one, and no other rail's"
@@ -5618,7 +5625,9 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     #[cfg(feature = "backend-vulkan")]
     assert!(
-        state.task_render_pipeline_states.contains(2, 15),
+        crate::backend::vulkan::pipeline_resolve::retained(&state)
+            .expect("this rail owns the device's rail-state slot")
+            .contains(2, 15),
         "resource-list deletion must not cross into the pipeline ref space"
     );
 

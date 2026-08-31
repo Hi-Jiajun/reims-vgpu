@@ -9,8 +9,10 @@
 //! The identity is independent of that storage choice. It names the guest
 //! resource and its current incarnation, so changing host capability changes
 //! performance and ownership but never which surface the guest observes.
-
-#![cfg(feature = "backend-vulkan")]
+//!
+//! It lives under this rail and not in the neutral runtime because every word
+//! of it is this rail's: an engine `TargetIdentity`, a `vk::Format`, and this
+//! rail's own pixel translation. No neutral module calls it.
 
 use crate::backend::vulkan::engine::TargetIdentity;
 use crate::model::DeviceState;

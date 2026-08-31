@@ -695,7 +695,7 @@ fn mapping_write_geometry(m: &MappingEntry, width: u32, height: u32) -> (u32, u3
 /// Public because the *resident* has to agree with it. A render target's
 /// identity carries the format its image is created with, and for this namespace
 /// that answer is this one — so
-/// [`crate::runtime::present_identity::surface_identity`] reads it here rather
+/// [`crate::backend::vulkan::present_identity::surface_identity`] reads it here rather
 /// than deriving a second copy from the same fields. Two derivations agreeing
 /// only because they share an input is precisely how the primary attachment's
 /// format used to be decided, and it did not stay agreed.

@@ -22,6 +22,10 @@ pub mod caps;
 /// [`Backend::emit_census`], never through a `cfg`.
 mod census;
 pub mod engine;
+/// A draw's pipeline and both its shaders, resolved once per pipeline object.
+pub mod pipeline_resolve;
+/// The resident identity a mapper-ref-texture guest surface renders into.
+pub mod present_identity;
 pub mod translate;
 
 #[cfg(feature = "host-window")]
@@ -223,16 +227,15 @@ impl Backend for VulkanBackend {
         object_ref: u32,
     ) -> ObjectRetirement {
         // This rail retains both kinds by `(task, ref)` — the depth-stencil
-        // table for `draw::vulkan`, the pipeline table for
-        // `runtime::pipeline_resolve` — so the guest's declaration is the
+        // table on the neutral device model, the pipeline table in this rail's
+        // own device-lifetime state — so the guest's declaration is the
         // invalidation, and it is what makes the retention sound.
         let retired = match object {
             RetainedObject::DepthStencilState => {
                 state.task_depth_stencil_states.delete(task_id, object_ref)
             }
-            RetainedObject::RenderPipelineState => state
-                .task_render_pipeline_states
-                .delete(task_id, object_ref),
+            RetainedObject::RenderPipelineState => pipeline_resolve::retained(state)
+                .is_some_and(|states| states.delete(task_id, object_ref)),
         };
         if retired {
             ObjectRetirement::Retired
@@ -274,8 +277,9 @@ impl Backend for VulkanBackend {
         width: u32,
         height: u32,
     ) -> Result<window::WindowResident, &'static str> {
-        let identity =
-            crate::runtime::present_identity::surface_identity(state, mapping_id, width, height);
+        let identity = crate::backend::vulkan::present_identity::surface_identity(
+            state, mapping_id, width, height,
+        );
         // One engine operation keeps this resident alive across the idle sweep,
         // reclaims aged peers, and returns the direct-present decision for this
         // exact identity and geometry — so it runs whether or not the window
@@ -603,7 +607,7 @@ impl Backend for VulkanBackend {
         task_id: u32,
         pipeline_ref: u32,
     ) -> Option<u32> {
-        crate::runtime::pipeline_resolve::attachment_sample_count(
+        crate::backend::vulkan::pipeline_resolve::attachment_sample_count(
             state,
             host,
             task_id,

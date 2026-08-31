@@ -323,7 +323,7 @@ pub(crate) fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
             return None;
         }
     };
-    let identity = crate::runtime::present_identity::surface_identity(
+    let identity = crate::backend::vulkan::present_identity::surface_identity(
         state,
         src.mapping_id,
         src.width,
@@ -411,7 +411,7 @@ pub(crate) fn note_blit_t11_resident(state: &DeviceState, mapping_id: u32) {
         return;
     }
     let (w, h) = (m.width, m.height);
-    let id = crate::runtime::present_identity::surface_identity(state, mapping_id, w, h);
+    let id = crate::backend::vulkan::present_identity::surface_identity(state, mapping_id, w, h);
     crate::runtime::drain::note_store_route(
         match crate::backend::vulkan::engine::resident_content_backing(&id) {
             crate::backend::vulkan::engine::ResidentContentBacking::NotReady => {

@@ -3,7 +3,7 @@
 //! Two questions, one file, because they are the same lookup asked for two
 //! reasons: *would* a resident carry this present (a census/failure-channel
 //! split at the drain), and *does* one, hand me its bytes (the capture). Both
-//! resolve the surface through [`crate::runtime::present_identity`], and a
+//! resolve the surface through [`crate::backend::vulkan::present_identity`], and a
 //! second spelling of that identity in either place would report a frame as
 //! carried that the other then cannot find.
 //!
@@ -11,8 +11,8 @@
 //! never name this rail.
 
 use crate::backend::vulkan::engine;
+use crate::backend::vulkan::present_identity::surface_identity;
 use crate::model::DeviceState;
-use crate::runtime::present_identity::surface_identity;
 
 /// Would a resident carry the present this mapping names, at this geometry?
 ///

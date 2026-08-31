@@ -678,6 +678,34 @@ impl TaskResource {
 /// it can only call for a type it can name.
 pub trait RailResourceState: Any + Default + Send + Sync {}
 
+/// State the running rail keeps for exactly one device's lifetime, in the
+/// rail's own vocabulary.
+///
+/// # Why the model may not name it
+///
+/// [`RailResourceState`] states the rule for one resource; this is the same
+/// rule one scope up. The Vulkan rail retains, per `(task, pipeline_ref)`, a
+/// resolved pipeline holding two translated SPIR-V shaders and an engine
+/// pipeline-object identity. Metal retains nothing of the kind. Spelling that
+/// type in [`DeviceState`] made `model` depend on `backend::vulkan` — the same
+/// cycle — and left the struct with two shapes across a feature boundary.
+///
+/// # What the model still owns
+///
+/// The slot, the drop, and *when* a lifetime ends. Task teardown is a guest
+/// event the model decodes, so the model tells the rail about it through
+/// [`Self::delete_task`]; what a task's references mean, and what dropping them
+/// costs, is the rail's. The rail reports its own count under its own census
+/// name, because a name the model chose would describe a table it cannot see.
+pub trait RailDeviceState: Any + Send + Sync + std::fmt::Debug {
+    /// This state as `Any`, so the rail that installed it can read it back.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Drop everything held under one task's reference namespaces, reporting
+    /// what went under this rail's own census names.
+    fn delete_task(&self, task_id: u32);
+}
+
 static NEXT_TASK_RESOURCE_LIFETIME: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
@@ -856,13 +884,6 @@ impl<T> TaskReferenceStates<T> {
 
 /// Per-task sampler objects, keyed by the sampler API's reference space.
 pub type TaskSamplerStates = TaskReferenceStates<TaskSamplerState>;
-
-/// Per-task render pipeline states, keyed by the pipeline API's reference
-/// space. A state owns its decoded descriptor, translated functions and derived
-/// bind plan exactly as one native pipeline state owns its construction.
-#[cfg(feature = "backend-vulkan")]
-pub type TaskRenderPipelineStates =
-    TaskReferenceStates<crate::runtime::pipeline_resolve::ResolvedRenderPipeline>;
 
 /// Per-task depth-stencil states, keyed by that API's reference space.
 ///
@@ -2350,11 +2371,14 @@ pub struct DeviceState {
     pub task_sampler_states: TaskSamplerStates,
     /// Immutable depth-stencil objects in that API's separate ref space.
     pub task_depth_stencil_states: TaskDepthStencilStates,
-    /// Immutable render pipeline states in the pipeline API's separate ref
-    /// space. The guest binds these by reference after construction and ends
-    /// them with resource deletion or task teardown.
-    #[cfg(feature = "backend-vulkan")]
-    pub task_render_pipeline_states: TaskRenderPipelineStates,
+    /// What the running rail retains for exactly this device's lifetime, in
+    /// the rail's own vocabulary. See [`RailDeviceState`].
+    ///
+    /// The model owns the slot and the drop; it does not own — and cannot name
+    /// — the contents. `OnceLock` rather than a lock, because the slot is
+    /// claimed once by the one rail this process latched and never replaced, so
+    /// a read on the draw path is an acquire load and not a mutex.
+    rail: OnceLock<Box<dyn RailDeviceState>>,
     /// Mapper-ref-texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
@@ -2713,8 +2737,7 @@ impl DeviceState {
             task_resources: TaskResources::default(),
             task_sampler_states: TaskSamplerStates::default(),
             task_depth_stencil_states: TaskDepthStencilStates::default(),
-            #[cfg(feature = "backend-vulkan")]
-            task_render_pipeline_states: TaskRenderPipelineStates::default(),
+            rail: OnceLock::new(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -2960,6 +2983,21 @@ impl DeviceState {
         }
     }
 
+    /// The running rail's own device-lifetime state, created empty on first
+    /// ask.
+    ///
+    /// `None` means the slot is already held by a *different* rail's type.
+    /// [`crate::backend::select`] latches one rail per process, so no live
+    /// build can reach it; it is an answer rather than a panic because every
+    /// caller is on a path whose lawful reply to "nothing retained" is the
+    /// ablation it already implements — reconstruct, or report absent.
+    pub fn rail_state<T: RailDeviceState + Default>(&self) -> Option<&T> {
+        self.rail
+            .get_or_init(|| Box::<T>::default() as Box<dyn RailDeviceState>)
+            .as_any()
+            .downcast_ref::<T>()
+    }
+
     fn forget_compositor_mapping(&mut self, mapping_id: u32) {
         // The plane draw ring is keyed by mapping id and read by two witnesses,
         // so it is dropped with the mapping: bounded by the live compositor
@@ -3139,11 +3177,9 @@ impl DeviceState {
             "ds_state_task_deleted",
             self.task_depth_stencil_states.delete_task(task_id) as u64,
         );
-        #[cfg(feature = "backend-vulkan")]
-        crate::runtime::drain::note_store_route_n(
-            "pipeline_state_task_deleted",
-            self.task_render_pipeline_states.delete_task(task_id) as u64,
-        );
+        if let Some(rail) = self.rail.get() {
+            rail.delete_task(task_id);
+        }
         // A deleted task's whole address space goes with it, so its live
         // mappings are not leaks and a reused id must not inherit them.
         self.map_audit.remove(&task_id);
@@ -3196,11 +3232,9 @@ impl DeviceState {
             "ds_state_task_deleted",
             self.task_depth_stencil_states.delete_task(task_id) as u64,
         );
-        #[cfg(feature = "backend-vulkan")]
-        crate::runtime::drain::note_store_route_n(
-            "pipeline_state_task_deleted",
-            self.task_render_pipeline_states.delete_task(task_id) as u64,
-        );
+        if let Some(rail) = self.rail.get() {
+            rail.delete_task(task_id);
+        }
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         self.host_texture_surfaces.retain(|&(t, _), _| t != task_id);

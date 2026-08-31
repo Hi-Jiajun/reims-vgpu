@@ -2869,16 +2869,18 @@ fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encod
             .texture_to_mapping
             .insert((1, texture_ref), mapping_id);
     }
-    state.task_render_pipeline_states.register(
-        1,
-        7,
-        crate::runtime::pipeline_resolve::retained_pipeline_with_desc_for_test(
-            RenderPipelineDescriptor {
-                raster_sample_count: 4,
-                ..RenderPipelineDescriptor::default()
-            },
-        ),
-    );
+    crate::backend::vulkan::pipeline_resolve::retained(&state)
+        .expect("this rail owns the device's rail-state slot")
+        .register(
+            1,
+            7,
+            crate::backend::vulkan::pipeline_resolve::retained_pipeline_with_desc_for_test(
+                RenderPipelineDescriptor {
+                    raster_sample_count: 4,
+                    ..RenderPipelineDescriptor::default()
+                },
+            ),
+        );
     let mut att = clear_black_attachment(42);
     att.resolve_texture_ref = 43;
     att.store_action = MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;

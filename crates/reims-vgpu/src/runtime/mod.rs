@@ -97,13 +97,7 @@ pub mod mtlb;
 pub mod node_guard;
 /// Object-list lookup and mapper-ref-texture registration.
 pub mod objects;
-/// A draw's pipeline and both its shaders, resolved once per pipeline object.
-#[cfg(feature = "backend-vulkan")]
-pub mod pipeline_resolve;
 pub mod plan;
-/// The resident identity a mapper-ref-texture guest surface renders into.
-#[cfg(feature = "backend-vulkan")]
-pub mod present_identity;
 /// Whether a range's page-table entries are in the state the guest's own next
 /// edit of them requires — the direction that is ordered is the map.
 pub mod range_coverage;
