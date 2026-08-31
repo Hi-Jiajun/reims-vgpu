@@ -16,6 +16,7 @@
 use super::*;
 
 use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+use crate::runtime::chain_phase;
 
 // The Metal ICB execute half of this rail.
 pub mod icb;
@@ -76,6 +77,11 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     use crate::backend::metal::render::{render_core_mrt, ColorRt, VisibilityQuery};
     use crate::backend::metal::util::ErrOut;
 
+    // Opened before the first refusal check, so a chain that declines is charged
+    // to whichever phase was open rather than vanishing from the division. See
+    // `chain_phase`'s doc on early returns.
+    let _phase = chain_phase::ChainTimer::start();
+    chain_phase::enter(chain_phase::Phase::Prep);
     if req.colors.is_empty() {
         return (EncodeStatus::BadArgs("draw_mtl_no_color_target"), None);
     }
@@ -136,6 +142,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // writeback: `render_core_mrt` below submits and waits, and the guest keeps
     // running on its own vCPUs across that. Indexed by attachment because MRT
     // stores every color target, not just slot 0.
+    chain_phase::enter(chain_phase::Phase::PrepPages);
     let sync_store_pages: Vec<Option<StoreTargetPages>> = if writeback_guest {
         color_list
             .iter()
@@ -153,6 +160,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         return (EncodeStatus::BadArgs("draw_mtl_no_vertices"), None);
     }
 
+    chain_phase::enter(chain_phase::Phase::PipelineDesc);
     let Some(pipeline) = load_render_pipeline(state, host, req.task_id, req.pipeline_ref) else {
         crate::observe::fail(format!(
             "metal_draw MissingPipeline pipe={}",
@@ -163,6 +171,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             None,
         );
     };
+    chain_phase::enter(chain_phase::Phase::PipelineMtlb);
     let Some(vert) = load_mtlb(
         state,
         host,
@@ -196,6 +205,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // Materialize buffer backs (storage first, then ReimsVgpuBuffer views).
     // Archive apple-pv-gpu-exec: a non-zero bound buffer that does not resolve
     // sets all_binds_ok=false and gates the draw (never feeds garbage geometry).
+    chain_phase::enter(chain_phase::Phase::Binds);
     let mut vtx_storage: Vec<Vec<u8>> = Vec::new();
     let mut frag_storage: Vec<Vec<u8>> = Vec::new();
     let mut vtx_bind_idx: Vec<u32> = Vec::new();
@@ -341,6 +351,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     }
     // Archive apple-pv-gpu-exec: a bound texture that does not resolve gates the
     // draw (never samples black/garbage). Same for vertex-stage textures.
+    chain_phase::enter(chain_phase::Phase::Sampled);
     let mut vtx_tex_items: Vec<TexItem> = Vec::new();
     let mut frag_tex_items: Vec<TexItem> = Vec::new();
     for t in req.vertex_textures.iter() {
@@ -468,6 +479,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // was the field above; the count these carry is now the guest's own, and
     // the backend refuses a count past `REIMS_VGPU_BACKEND_MAX_VIEWPORTS`
     // rather than truncating it.
+    chain_phase::enter(chain_phase::Phase::Assemble);
     let viewports: Vec<ReimsVgpuViewport> = req
         .viewports
         .iter()
@@ -563,6 +575,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let depth_bias_opt = depth_bias_state.as_ref();
 
     // Serializer-object depth-stencil object + optional stencil reference.
+    chain_phase::enter(chain_phase::Phase::AssembleDepth);
     let depth_stencil_state = if req.depth_stencil_ref != 0 {
         match load_depth_stencil_state(state, host, req.task_id, req.depth_stencil_ref) {
             Ok(depth_stencil) => Some(depth_stencil),
@@ -584,6 +597,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let stencil_ref_opt = stencil_ref_state.as_ref();
 
     // Host-side depth/stencil attachment buffers (guest LOAD / clear seed, STORE writeback).
+    chain_phase::enter(chain_phase::Phase::Assemble);
     let mut depth_attach_api: Option<ReimsVgpuDepthAttachment> = None;
     let depth_storage = req.depth_attach.as_ref().and_then(|da| {
         let mut seeded = seed_host_depth_stencil(
@@ -674,6 +688,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let need = (width as usize)
         .saturating_mul(height as usize)
         .saturating_mul(RGBA8_BPP as usize);
+    chain_phase::enter(chain_phase::Phase::Seed);
     let mut color_outs: Vec<Vec<u8>> = (0..color_list.len()).map(|_| vec![0u8; need]).collect();
 
     // For indexed draws, pass index_count as vertex_count for the early gate.
@@ -715,6 +730,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     }
 
     // Build ColorRt views with raw pointers into seeds/outs (disjoint mut slices).
+    chain_phase::enter(chain_phase::Phase::Assemble);
     let mut color_rts: Vec<ColorRt<'_>> = Vec::with_capacity(color_list.len());
     for (i, c) in color_list.iter().enumerate() {
         // Every target encodes host RGBA8 for writeback conversion.
@@ -798,6 +814,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         mode: arming.mode,
         samples: None,
     });
+    chain_phase::enter(chain_phase::Phase::Engine);
     let st = render_core_mrt(
         &vert,
         &frag,
@@ -832,6 +849,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         visibility.as_mut(),
         err,
     );
+    chain_phase::enter(chain_phase::Phase::Store);
     // Read before the status is matched, the way `runtime::exec` reads the
     // field it lands in: the backend only fills `samples` on a pass that ran to
     // completion, so a refusal leaves the query unanswered and says so.
