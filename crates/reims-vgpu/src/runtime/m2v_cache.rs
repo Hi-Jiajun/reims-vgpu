@@ -1128,12 +1128,12 @@ pub fn translate_cached_reflected(
                 // (~1.1M lines / boot, drowning real failures) and paid a file write
                 // per draw on the render path. Verbose-gated only; the miss/`ok` line
                 // below stays always-on so cache lifecycle is still visible.
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
+                crate::observe::verbose(|| {
+                    format!(
                         "linux_m2v_translate_hit pipe={pipeline_ref} stage={stage:?} spv={} hits={hits} misses={misses}",
                         shader.spirv.len()
-                    ));
-                }
+                    )
+                });
                 return Ok(shader);
             }
             Some(Entry::Failed(e)) => {
@@ -1191,12 +1191,12 @@ pub fn translate_cached_kernel_reflected(
                 drop(c);
                 // Verbose-gated (see `translate_cached_reflected`): a compute-kernel cache hit
                 // is the hot path and only carries a cumulative counter.
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
+                crate::observe::verbose(|| {
+                    format!(
                         "linux_m2v_translate_hit pipe={pipeline_ref} stage=Kernel tg=[{},{},{}] spv={} hits={hits} misses={misses}",
                         local_size[0], local_size[1], local_size[2], shader.spirv.len()
-                    ));
-                }
+                    )
+                });
                 return Ok(shader);
             }
             Some(Entry::Failed(e)) => {

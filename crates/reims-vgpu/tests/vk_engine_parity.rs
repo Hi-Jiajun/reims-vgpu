@@ -2615,10 +2615,11 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
     req.skip_readback = true;
     req.target_guest_seed = Some(engine::GuestTargetSeed {
         source: engine::GuestRunSource {
-            runs: std::sync::Arc::new(vec![engine::GuestRun {
-                host_ptr: backing.as_ptr() as usize,
-                len: backing.len() as u64,
-            }]),
+            runs: std::sync::Arc::new(vec![engine::GuestRun::whole(
+                backing.as_ptr() as usize,
+                backing.len() as u64,
+            )
+            .expect("a fixture run covers its own span")]),
             source_offset: 0,
             total_len: backing.len() as u64,
             row_length_texels: 0,

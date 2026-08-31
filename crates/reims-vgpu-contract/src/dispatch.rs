@@ -5,7 +5,7 @@
 //! answered here once rather than at every backend's encode site. Each is a
 //! *closed* rule with a substitution behind it, which is why they are functions
 //! and not open-coded comparisons — see
-//! [`crate::contract::dispatch::workgroup_counts`] for what the split version of
+//! [`crate::dispatch::workgroup_counts`] for what the split version of
 //! the second one cost.
 //!
 //! The two dimension rules are deliberately neighbours, because they disagree
@@ -26,7 +26,7 @@
 //! # Why they live here rather than in the backend
 //!
 //! The value arrives on the wire, from the guest, and is decoded by
-//! [`crate::runtime::decode::compute`] — none of which is backend-specific. It
+//! `crate::runtime::decode::compute` — none of which is backend-specific. It
 //! was previously reachable only through `backend::metal::abi`, which is
 //! `backend-metal`-gated, so the shared code that accepts the field could not
 //! name the values it was accepting and the one place that narrowed it ran on a

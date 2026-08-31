@@ -673,10 +673,11 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
     opener.storage_buffers.push(StorageBufferResource {
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {
-            runs: std::sync::Arc::new(vec![GuestRun {
-                host_ptr: backing.as_ptr() as usize,
-                len: backing.len() as u64,
-            }]),
+            runs: std::sync::Arc::new(vec![GuestRun::whole(
+                backing.as_ptr() as usize,
+                backing.len() as u64,
+            )
+            .expect("a fixture run covers its own span")]),
             source_offset: 0,
             total_len: backing.len() as u64,
             row_length_texels: 0,
@@ -829,14 +830,9 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         source: SampledSource::GuestRuns(
             GuestRunSource {
                 runs: std::sync::Arc::new(vec![
-                    GuestRun {
-                        host_ptr: ptr as usize,
-                        len: 8,
-                    },
-                    GuestRun {
-                        host_ptr: ptr as usize + 8,
-                        len: 8,
-                    },
+                    GuestRun::whole(ptr as usize, 8).expect("a fixture run covers its own span"),
+                    GuestRun::whole(ptr as usize + 8, 8)
+                        .expect("a fixture run covers its own span"),
                 ]),
                 source_offset: 0,
                 total_len: 16,
@@ -987,10 +983,10 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
             )
             .expect("the slice came from this import"),
         });
-        runs.push(GuestRun {
-            host_ptr: (base + import_offset) as usize,
-            len: STRETCH,
-        });
+        runs.push(
+            GuestRun::whole((base + import_offset) as usize, STRETCH)
+                .expect("a fixture run covers its own span"),
+        );
     }
 
     let before = engine::counter_snapshot();
@@ -1217,10 +1213,10 @@ void main() {{
             )
             .expect("the slice came from this import"),
         });
-        runs.push(GuestRun {
-            host_ptr: (base + import_offset) as usize,
-            len: STRETCH,
-        });
+        runs.push(
+            GuestRun::whole((base + import_offset) as usize, STRETCH)
+                .expect("a fixture run covers its own span"),
+        );
     }
 
     let before = engine::counter_snapshot();
@@ -1398,10 +1394,10 @@ void main() {{
             )
             .expect("the slice came from this import"),
         });
-        runs.push(GuestRun {
-            host_ptr: (base + import_offset) as usize,
-            len: STRETCH,
-        });
+        runs.push(
+            GuestRun::whole((base + import_offset) as usize, STRETCH)
+                .expect("a fixture run covers its own span"),
+        );
     }
 
     let before = engine::counter_snapshot();
@@ -1563,10 +1559,8 @@ void main() {{
         )
         .expect("the slice came from this import"),
     }];
-    let runs = vec![GuestRun {
-        host_ptr: base as usize,
-        len: WINDOW,
-    }];
+    let runs =
+        vec![GuestRun::whole(base as usize, WINDOW).expect("a fixture run covers its own span")];
 
     let before = engine::counter_snapshot();
     let mut req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
@@ -1679,10 +1673,9 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
         .expect("the slice came from this import"),
     }];
     let source = GuestRunSource {
-        runs: std::sync::Arc::new(vec![GuestRun {
-            host_ptr: base as usize,
-            len: block_len,
-        }]),
+        runs: std::sync::Arc::new(vec![
+            GuestRun::whole(base as usize, block_len).expect("a fixture run covers its own span")
+        ]),
         source_offset: SOURCE_OFFSET,
         total_len: INDEX_BYTES,
         row_length_texels: 0,

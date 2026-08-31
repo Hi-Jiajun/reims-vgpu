@@ -1,8 +1,8 @@
 //! `MTLVertexStepFunction` ordinals, and the step rate that pairs with each.
 //!
 //! A type-7 pipeline descriptor's buffer layout carries a step function and a
-//! step rate, decoded by [`crate::runtime::decode::resource`] into
-//! [`VertexAttribute::step_function_ordinal`] and [`VertexAttribute::step_rate`].
+//! step rate, decoded by `crate::runtime::decode::resource` into
+//! `VertexAttribute::step_function_ordinal` and `VertexAttribute::step_rate`.
 //! The two are one rule and not two fields: `MTLVertexBufferLayoutDescriptor`
 //! requires `stepRate == 0` for `MTLVertexStepFunctionConstant` and rejects it
 //! for every other step function, because a constant-rate attribute is fetched
@@ -28,9 +28,6 @@
 //! ordinals below. (Named in prose, not linked: that module is
 //! `backend-metal`-gated, so a link from here is unresolved on every Vulkan-arm
 //! doc build.)
-//!
-//! [`VertexAttribute::step_function_ordinal`]: crate::runtime::decode::resource::VertexAttribute::step_function_ordinal
-//! [`VertexAttribute::step_rate`]: crate::runtime::decode::resource::VertexAttribute::step_rate
 
 /// `MTLVertexStepFunctionConstant` — one fetch for the whole draw.
 pub const MTL_VERTEX_STEP_FUNCTION_CONSTANT: u32 = 0;

@@ -1433,7 +1433,7 @@ fn validate_buffer_content(
         };
         return Err(DrawError::DrawValidation(decline));
     }
-    let sum: u64 = src.runs.iter().map(|r| r.len).sum();
+    let sum: u64 = src.runs.iter().map(|r| r.len()).sum();
     let covered = src.source_offset.checked_add(src.total_len);
     if src.total_len == 0 || covered.is_none_or(|end| end > sum) {
         let decline = match role {
@@ -1609,7 +1609,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        let covered = seed.source.runs.iter().map(|run| run.len).sum();
+        let covered = seed.source.runs.iter().map(|run| run.len()).sum();
         if covered != seed.source.total_len {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::TargetGuestSeedCoverage {
@@ -2004,7 +2004,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                         },
                     ));
                 }
-                let sum: u64 = src.runs.iter().map(|r| r.len).sum();
+                let sum: u64 = src.runs.iter().map(|r| r.len()).sum();
                 let covered = src.source_offset.checked_add(src.total_len);
                 if src.total_len == 0 || src.runs.is_empty() || covered.is_none_or(|end| end > sum)
                 {
@@ -6569,10 +6569,9 @@ mod tests {
     /// source alive. This is the engine half of buffer-plus-offset semantics.
     #[test]
     fn one_run_source_at_two_offsets_has_two_bind_keys() {
-        let runs = std::sync::Arc::new(vec![GuestRun {
-            host_ptr: 0x1000,
-            len: 0x4000,
-        }]);
+        let runs = std::sync::Arc::new(vec![
+            GuestRun::whole(0x1000, 0x4000).expect("a fixture run covers its own span")
+        ]);
         let content = |source_offset| {
             BufferContent::GuestRuns(GuestRunSource {
                 runs: std::sync::Arc::clone(&runs),
@@ -6660,7 +6659,9 @@ mod tests {
 
         let content = |host_ptr| {
             BufferContent::GuestRuns(GuestRunSource {
-                runs: std::sync::Arc::new(vec![GuestRun { host_ptr, len: 16 }]),
+                runs: std::sync::Arc::new(vec![
+                    GuestRun::whole(host_ptr, 16).expect("a fixture run covers its own span")
+                ]),
                 source_offset: 0,
                 total_len: 16,
                 row_length_texels: 0,
@@ -6980,10 +6981,8 @@ mod tests {
                 multisampled: false,
                 source: SampledSource::GuestRuns(
                     GuestRunSource {
-                        runs: std::sync::Arc::new(vec![GuestRun {
-                            host_ptr: 0x1000,
-                            len: total_len,
-                        }]),
+                        runs: std::sync::Arc::new(vec![GuestRun::whole(0x1000, total_len)
+                            .expect("a fixture run covers its own span")]),
                         source_offset: 0,
                         total_len,
                         row_length_texels,
@@ -7021,10 +7020,8 @@ mod tests {
             frag_spirv: std::sync::Arc::new(vec![0]),
             target_guest_seed: Some(super::super::types::GuestTargetSeed {
                 source: GuestRunSource {
-                    runs: std::sync::Arc::new(vec![GuestRun {
-                        host_ptr: 0x1000,
-                        len: covered,
-                    }]),
+                    runs: std::sync::Arc::new(vec![GuestRun::whole(0x1000, covered)
+                        .expect("a fixture run covers its own span")]),
                     source_offset: 0,
                     total_len: declared,
                     row_length_texels,
@@ -7540,10 +7537,11 @@ mod tests {
                 panic!("the fixture is guest-backed")
             };
             source.source_offset = 32;
-            source.runs = std::sync::Arc::new(vec![GuestRun {
-                host_ptr: 0x1000,
-                len: source.source_offset + source.total_len,
-            }]);
+            source.runs = std::sync::Arc::new(vec![GuestRun::whole(
+                0x1000,
+                source.source_offset + source.total_len,
+            )
+            .expect("a fixture run covers its own span")]);
         }
         assert!(validate_v1(&req).is_ok());
 
@@ -7551,10 +7549,11 @@ mod tests {
             let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
                 panic!("the fixture is guest-backed")
             };
-            source.runs = std::sync::Arc::new(vec![GuestRun {
-                host_ptr: 0x1000,
-                len: source.source_offset + source.total_len - 1,
-            }]);
+            source.runs = std::sync::Arc::new(vec![GuestRun::whole(
+                0x1000,
+                source.source_offset + source.total_len - 1,
+            )
+            .expect("a fixture run covers its own span")]);
         }
         assert_eq!(
             validation_slug(&req),
@@ -7699,9 +7698,8 @@ mod tests {
             runs: std::sync::Arc::new(
                 run_lens
                     .iter()
-                    .map(|&len| GuestRun {
-                        host_ptr: 0x1000,
-                        len,
+                    .map(|&len| {
+                        GuestRun::whole(0x1000, len).expect("a fixture run covers its own span")
                     })
                     .collect(),
             ),
@@ -7911,14 +7909,10 @@ mod tests {
     fn buffer_content_cpu_bytes_materializes_runs() {
         let backing: Vec<u8> = (0u8..=255).collect();
         let runs = vec![
-            GuestRun {
-                host_ptr: backing.as_ptr() as usize,
-                len: 100,
-            },
-            GuestRun {
-                host_ptr: backing.as_ptr() as usize + 200,
-                len: 56,
-            },
+            GuestRun::whole(backing.as_ptr() as usize, 100)
+                .expect("a fixture run covers its own span"),
+            GuestRun::whole(backing.as_ptr() as usize + 200, 56)
+                .expect("a fixture run covers its own span"),
         ];
         let content = BufferContent::GuestRuns(super::super::types::GuestRunSource {
             runs: std::sync::Arc::new(runs),

@@ -26,10 +26,71 @@
 //! Reading it is how a caller notices an operator asked for something the host
 //! cannot give and says so, rather than ignoring the request in silence.
 
+/// Declare a switch variable so that its name, its documentation, and its
+/// membership in [`ALL`] are one act rather than three.
+///
+/// [`ALL`] used to be written out a second time below the constants, and
+/// nothing connected the two: a constant declared and read by the device but
+/// left off the list reported as `unset` on every boot line while the device
+/// obeyed it. That is the divergence this module exists to prevent, reproduced
+/// inside the module itself, and it had already happened three times.
+/// `COMPUTE_GATHER` was missing until 2026-08-11, which made the boot line
+/// silent about the arm of the one switch whose two arms are byte-identical
+/// implementations, so an A/B could not be told from a pair of default boots by
+/// reading the log afterwards — the "compare arms, not pins" trap with the
+/// evidence removed. `SAMPLED_IDENTITY` and `GATHER_AUDIT_ALL` were missing
+/// until 2026-08-12, and the first of those has two arms differing in what the
+/// guest *sees*, so a boot that could not say which arm it ran was a boot whose
+/// content evidence was unattributable. `PASS_EXIT_NARROW` was missing until
+/// this registry was derived.
+///
+/// Deriving the registry from the declarations makes the omission unspellable
+/// rather than merely discouraged.
+macro_rules! switches {
+    ($( $(#[$doc:meta])* pub const $ident:ident: &str = $name:literal; )*) => {
+        $( $(#[$doc])* pub const $ident: &str = $name; )*
+
+        /// Every variable this device reads as a [`Switch`], in declaration
+        /// order.
+        ///
+        /// The one place the set is enumerable. A boot line built from this
+        /// reports what an operator actually set, which is the difference
+        /// between a bug report that says "it is slow" and one that says "it is
+        /// slow with a rail switched off" — and an operator who mistyped a
+        /// value learns it from the same line, because [`Switch::Unrecognized`]
+        /// has its own spelling there.
+        ///
+        /// Derived from the declarations above, so a switch this device reads
+        /// cannot fail to be reported.
+        pub const ALL: [&str; switches!(@count $($ident)*)] = [$($ident),*];
+    };
+    (@count $($ident:ident)*) => { [$( switches!(@unit $ident) ),*].len() };
+    (@unit $ident:ident) => { () };
+}
+
+/// [`switches`] for the variables read through [`count`] instead.
+///
+/// A separate registry because [`report_line`] has to print these differently:
+/// a count has no on/off state to name, and running one through the switch
+/// parse would report `REIMS_VGPU_BATCH_DRAWS=4` as `unrecognized(4)` — a line
+/// saying the device rejected the very value it adopted.
+macro_rules! counts {
+    ($( $(#[$doc:meta])* pub const $ident:ident: &str = $name:literal; )*) => {
+        $( $(#[$doc])* pub const $ident: &str = $name; )*
+
+        /// Every variable read as a [`count`] rather than as a [`Switch`], in
+        /// declaration order. Derived exactly as [`ALL`] is.
+        pub const ALL_COUNTS: [&str; counts!(@count $($ident)*)] = [$($ident),*];
+    };
+    (@count $($ident:ident)*) => { [$( counts!(@unit $ident) ),*].len() };
+    (@unit $ident:ident) => { () };
+}
+
+switches! {
 /// Guest RAM reaches the GPU as a host-pointer import over whole RAMBlocks.
 /// Setting this off makes the device take the copying rails on a host that
 /// could have imported — see
-/// [`crate::backend::vulkan::caps::host_pointer`].
+/// `crate::backend::vulkan::caps::host_pointer`.
 ///
 /// This is the switch that matters for verification. Where the import works
 /// every guest window takes it and the copying rails run zero times, so a green
@@ -157,7 +218,7 @@ pub const AIR_CAPTURE: &str = "REIMS_VGPU_AIR_CAPTURE";
 pub const GPU_STAMP: &str = "REIMS_VGPU_GPU_STAMP";
 
 /// Setting this off stops the two guest-page write guards —
-/// [`crate::runtime::node_guard`] and [`crate::runtime::released_pages`] — from
+/// `crate::runtime::node_guard` and `crate::runtime::released_pages` — from
 /// observing anything. They decide nothing, so this changes no guest-visible
 /// behavior; what it removes is the page-table descent and the page-list resolve
 /// that each map and unmap packet pays for them, on the drain thread, while it
@@ -173,7 +234,7 @@ pub const GPU_STAMP: &str = "REIMS_VGPU_GPU_STAMP";
 /// the drain thread is exactly the kind that could perturb its own subject.
 pub const PAGE_GUARDS: &str = "REIMS_VGPU_PAGE_GUARDS";
 
-/// Setting this **on** makes [`crate::runtime::range_coverage`] walk the guest's
+/// Setting this **on** makes `crate::runtime::range_coverage` walk the guest's
 /// page table across every page of every map and unmap range. Default off, and
 /// it is the only variable here whose default is the quiet one.
 ///
@@ -263,7 +324,7 @@ pub const BATCH_DEPTH: &str = "REIMS_VGPU_BATCH_DEPTH";
 ///
 /// The wider arm — the default — binds a neutral page for such a bind instead of
 /// gathering the guest's, because
-/// [`crate::runtime::spirv_bind::ReflectedBufferAccess::Unused`] means no shader
+/// `crate::runtime::spirv_bind::ReflectedBufferAccess::Unused` means no shader
 /// invocation reads through the descriptor. The descriptor is still written, so
 /// the pipeline layout is byte-for-byte what it was; only the contents change,
 /// and only for binds nothing reads.
@@ -361,7 +422,7 @@ pub const STAMP_COALESCE: &str = "REIMS_VGPU_STAMP_COALESCE";
 /// fence the GPU takes longer to signal.
 ///
 /// That answers the question for this host class and it is written up where the
-/// rail is, in [`crate::runtime::render_writeback`]. The probe stays because the
+/// rail is, in `crate::runtime::render_writeback`. The probe stays because the
 /// answer is a property of the **host**, not of this device: a discrete GPU
 /// crossing PCIe per region and a unified-memory host writing into the same
 /// physical pages have no reason to agree, and only one of the two has been
@@ -380,7 +441,7 @@ pub const SCATTER_SPLIT: &str = "REIMS_VGPU_SCATTER_SPLIT";
 /// and it stays the form for a run whose geometry the dispatch cannot express.
 ///
 /// It exists because it is the A/B. The region count is measured to be ~35 % of
-/// frame time (see [`crate::runtime::render_writeback`]), and the only way to
+/// frame time (see `crate::runtime::render_writeback`), and the only way to
 /// hold that number against this repair on a given host is to run the host both
 /// ways in one binary.
 pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
@@ -441,7 +502,7 @@ pub const SLAB_RETAIN: &str = "REIMS_VGPU_SLAB_RETAIN";
 /// It exists because the identity lookup is the only place in the sampled path
 /// where an image is bound with **nothing read and nothing compared** — the bind
 /// rests entirely on the guest-write witness in
-/// [`crate::runtime::gather_witness`] having seen every write to the window. A
+/// `crate::runtime::gather_witness` having seen every write to the window. A
 /// witness that missed one binds a stale texture, and the failure mode is
 /// content: no counter can report it, because an elision correctly taken and one
 /// wrongly taken are the same absence. The eighteen-switch narrowing sweep that
@@ -450,7 +511,7 @@ pub const SLAB_RETAIN: &str = "REIMS_VGPU_SLAB_RETAIN";
 pub const SAMPLED_IDENTITY: &str = "REIMS_VGPU_SAMPLED_IDENTITY";
 
 /// `on` audits **every** vouched gather bind instead of one in
-/// [`crate::runtime::gather_witness::AUDIT_STRIDE`].
+/// `crate::runtime::gather_witness::AUDIT_STRIDE`.
 ///
 /// It narrows in the sense this module requires, and it is the only switch here
 /// that narrows by doing *more* work: the fold is a read of the window, and a
@@ -482,7 +543,7 @@ pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
 ///
 /// It exists because the memo's correctness rests on a stated claim about what a
 /// guest does to a live pipeline object — see
-/// [`crate::runtime::pipeline_resolve`] — and a claim about a guest is worth a
+/// `crate::runtime::pipeline_resolve` — and a claim about a guest is worth a
 /// binary that can be run both ways against that guest.
 pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 
@@ -542,7 +603,7 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// but it is 1.4x on the count, not 18x.
 ///
 /// **The per-dispatch cost, and the next reading is an instrument and not a
-/// guess.** [`crate::backend::vulkan::engine::gather_phase`] splits the 0.86 us
+/// guess.** `crate::backend::vulkan::engine::gather_phase` splits the 0.86 us
 /// four ways — the run-table planning, the shared staging arena, the descriptor
 /// set, and the command-buffer calls — because guessing which of them is the
 /// next 0.8 us is how a session spends a day on `vkCmdBindPipeline` and finds it
@@ -591,7 +652,7 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 ///
 /// **The GPU cost is now measured directly rather than inferred from a wall-clock
 /// wait.** Every reading above reaches for `slot_us`, which is the drain worker
-/// blocked on a ring fence. [`crate::backend::vulkan::engine::gpu_span`] times the
+/// blocked on a ring fence. `crate::backend::vulkan::engine::gpu_span` times the
 /// submission on the GPU's own clock instead. Driven macos-13 sustained boots,
 /// same pin, matched compositing regime, with the *planned* region count carried
 /// as the control so "byte-identical output" is checkable rather than asserted:
@@ -676,7 +737,7 @@ pub const COMPUTE_GATHER: &str = "REIMS_VGPU_COMPUTE_GATHER";
 /// pipeline flush point on some hardware, so an A/B that needs the absolute floor
 /// — anything ranking submission shape or ring depth — should take it out on both
 /// arms and say that it did. See
-/// [`crate::backend::vulkan::engine::gpu_span`] for what the pair measures and
+/// `crate::backend::vulkan::engine::gpu_span` for what the pair measures and
 /// the two caveats that belong to the reading rather than to the code.
 pub const GPU_SPANS: &str = "REIMS_VGPU_GPU_SPANS";
 
@@ -758,7 +819,7 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// # What it prices, and why nothing else can
 ///
 /// Every batched draw opens and closes its own render pass. `passmerge_*` /
-/// `passheld_*` (see [`crate::backend::vulkan::engine`]'s `PassObstacles`) say
+/// `passheld_*` (see `crate::backend::vulkan::engine`'s `PassObstacles`) say
 /// how many of them *could* share one: 82 % of draws, once the guest gathers
 /// they record between the draws are hoisted out of the way. Hoisting them
 /// needs a second command buffer per batch, which is a large change to the ring,
@@ -892,7 +953,7 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 /// **Both halves of that were closed, by two changes aimed at other reports.**
 /// The `held_gen=N-1` half is the debt rebuilding its identity from the
 /// mapping's generation *now* instead of carrying the one the draw registered —
-/// see [`crate::runtime::writeback_debt::WritebackDebt::identity`]. The
+/// see `crate::runtime::writeback_debt::WritebackDebt::identity`. The
 /// `held_gen=none` half is a released resource whose resident held the only copy
 /// of a frame being collected before the debt was paid — see
 /// `ResidentTargetSlot::released_and_collectable`'s third term.
@@ -1069,6 +1130,9 @@ pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 /// outcome a tiling compositor already produces. `host_window::present`'s
 /// `WindowMode` owns both halves.
 pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+}
+
+counts! {
 
 /// **A count, not a switch.** How many draws one command buffer may carry,
 /// narrowing the active memory-topology batch policy. Read through [`count`],
@@ -1085,9 +1149,10 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// It is also the instrument that says *which* submission hung. At a cap of one
 /// the ring holds one draw per slot, so a fence that never signals names a
 /// single draw rather than up to thirty-two, and
-/// [`crate::runtime::gpu_hang_trail`]'s ring covers every submission still in
+/// `crate::runtime::gpu_hang_trail`'s ring covers every submission still in
 /// flight instead of the last half millisecond of a batch.
 pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
+}
 
 /// What one variable says, including the two ways it says nothing usable.
 ///
@@ -1168,7 +1233,7 @@ const OFF_SPELLINGS: [&str; 4] = ["0", "off", "false", "no"];
 /// to quote it.
 ///
 /// Pure: it reads the environment and parses, and emits nothing. Deliberately —
-/// [`crate::observe`] itself reads a variable through here, so an emit on this
+/// `crate::observe` itself reads a variable through here, so an emit on this
 /// path would recurse through the sink that is asking whether it is enabled.
 /// The caller emits, and it is better placed to: it knows which rail the answer
 /// gates and what the consequence of refusing is.
@@ -1195,65 +1260,6 @@ pub fn read(name: &str) -> (Switch, Option<String>) {
 pub fn switch(name: &str) -> Switch {
     read(name).0
 }
-
-/// Every variable this device reads.
-///
-/// The one place the set is enumerable. A boot line built from this reports what
-/// an operator actually set, which is the difference between a bug report that
-/// says "it is slow" and one that says "it is slow with a rail switched off" —
-/// and an operator who mistyped a value learns it from the same line, because
-/// [`Switch::Unrecognized`] has its own spelling here.
-///
-/// Nothing enforces that a new `pub const` above is added to this list; the rule
-/// is stated and honestly unenforced. What keeps it small is that the list is
-/// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 27] = [
-    COLOR_GENERAL,
-    LAZY_WRITEBACK,
-    SLAB_RETAIN,
-    // Both absent until 2026-08-12, for the same reason `COMPUTE_GATHER` was:
-    // added next to their constants and not here. `SAMPLED_IDENTITY`'s two arms
-    // differ in what the guest *sees* rather than in how fast it sees it, so a
-    // boot that cannot say which arm it ran is a boot whose content evidence is
-    // unattributable.
-    SAMPLED_IDENTITY,
-    GATHER_AUDIT_ALL,
-    PIPELINE_MEMO,
-    GUEST_IMPORT,
-    PUSH_DESCRIPTORS,
-    DRAW_LOG,
-    AIR_CAPTURE,
-    GPU_STAMP,
-    PAGE_GUARDS,
-    RANGE_COVERAGE,
-    BUFFER_EXTENT,
-    BATCH_MIXED_TARGETS,
-    BATCH_DEPTH,
-    UNUSED_BINDS,
-    PRESENT_DEPTH,
-    STAMP_COALESCE,
-    SCATTER_SPLIT,
-    COMPUTE_SCATTER,
-    // Absent from this list until 2026-08-11, which made the boot line silent
-    // about the arm of the one switch here whose two arms are byte-identical
-    // implementations — so a `COMPUTE_GATHER` A/B could not be told from a pair of
-    // default boots by reading the log afterwards. That is the "compare arms, not
-    // pins" trap with the evidence removed.
-    COMPUTE_GATHER,
-    GPU_SPANS,
-    LAYOUT_CHURN,
-    PASS_CHURN,
-    SHARED_TARGET,
-    FULLSCREEN,
-];
-
-/// Every variable read as a [`count`] rather than as a [`Switch`].
-///
-/// A second list because [`report_line`] has to print these differently: a count
-/// has no on/off state to name, and running one through the switch parse would
-/// report `REIMS_VGPU_BATCH_DRAWS=4` as `unrecognized(4)` — a line saying the
-/// device rejected the very value it adopted.
-pub const ALL_COUNTS: [&str; 1] = [BATCH_DRAWS];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.
 ///
@@ -1376,7 +1382,7 @@ mod tests {
     /// [`report_line`] is the only record of which arm a boot ran, and a count
     /// pushed through [`read`] reports `4` as `unrecognized(4)` — a line saying
     /// the device rejected the value it had in fact adopted, which is exactly
-    /// the "compare arms, not pins" trap the [`ALL`] doc records.
+    /// the "compare arms, not pins" trap the [`switches`] doc records.
     #[test]
     fn a_count_is_reported_as_its_value_and_not_as_an_unrecognized_switch() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1469,6 +1475,32 @@ mod tests {
             for b in &names[i + 1..] {
                 assert_ne!(a, b, "two variables share a name");
             }
+        }
+    }
+
+    /// Every switch this device reads reaches the boot line.
+    ///
+    /// The names below are the ones that did not. Each was declared, read by a
+    /// product path, and left off the hand-written registry, so every boot
+    /// reported it `unset` while the device obeyed it — a run whose arm cannot
+    /// be recovered from its own log. They are written out here rather than
+    /// derived: deriving them from the same declaration the line is built from
+    /// would assert nothing.
+    #[test]
+    fn every_switch_the_device_reads_reaches_the_boot_line() {
+        let line = report_line();
+        for name in [
+            PASS_EXIT_NARROW,
+            COMPUTE_GATHER,
+            SAMPLED_IDENTITY,
+            GATHER_AUDIT_ALL,
+        ] {
+            assert!(ALL.contains(&name), "{name} is not in the registry");
+            let short = name
+                .strip_prefix("REIMS_VGPU_")
+                .expect("prefix")
+                .to_ascii_lowercase();
+            assert!(line.contains(&format!(" {short}=")), "{name}: {line}");
         }
     }
 

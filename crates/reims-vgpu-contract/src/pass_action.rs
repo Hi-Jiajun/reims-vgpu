@@ -11,7 +11,7 @@
 //! They were declared twice. `runtime::decode::render` had them as `u16` under
 //! `PASS_*`, `backend::metal::abi` as `u32` under `REIMS_VGPU_MTL_*`, five
 //! ordinals each, and nothing in the toolchain compared the two — the only
-//! thing that touched both was an identity `match` in [`crate::runtime::draw`]
+//! thing that touched both was an identity `match` in `crate::runtime::draw`
 //! that read as a translation table. A value that arrives on the wire and is
 //! consumed by both backends belongs beside the other wire/SDK numbers, per this
 //! module tree's own doc; `backend::metal::abi` keeps its spelling because that
@@ -24,7 +24,7 @@
 //! The attachment prefix spells an action in 16 bits; the Metal C shim takes an
 //! `MTLLoadAction`/`MTLStoreAction` as `uint32_t`. So the declaration that
 //! crosses to C is `u32` and this one is `u16`, and everything between them is a
-//! widening — see [`crate::runtime::draw`]'s `map_load_action`, which returns
+//! widening — see `crate::runtime::draw`'s `map_load_action`, which returns
 //! DontCare for a value outside the set and widens every value inside it.
 
 /// `MTLLoadActionDontCare` — the attachment's prior contents may be discarded.
@@ -46,7 +46,7 @@ pub const MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE: u16 = 3;
 
 /// Whether `raw` is one of the three `MTLLoadAction` values.
 ///
-/// The set is *closed* in the same sense as [`crate::contract::dispatch`]'s:
+/// The set is *closed* in the same sense as [`crate::dispatch`]'s:
 /// `MTLLoadAction` has exactly these three, so a fourth ordinal is a corrupt
 /// record or a wrong wire offset rather than a guest feature this device has no
 /// contract for yet.

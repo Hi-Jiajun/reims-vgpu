@@ -347,7 +347,7 @@ pub fn capture_present_frame(
     // about the contract. It is gone rather than re-tuned: a peer below the
     // threshold was invisible, so the field could not answer the question it
     // looked like it was answering.
-    if crate::observe::draw_log_enabled() {
+    crate::observe::when_verbose(|| {
         let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
         crate::observe::line(format!(
             "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} host_cache={} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} byte_max={maxb} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={}",
@@ -360,7 +360,7 @@ pub fn capture_present_frame(
             state.present.frame_mapping,
             state.present.frame_flush_seen as u8,
         ));
-    }
+    });
     // Publish the new frame and recycle the old retain buffer as the next
     // capture scratch (warm 8 MiB alloc, no per-present malloc/free/zero).
     let old_frame = std::mem::replace(&mut state.present.frame_bgra, buf);
@@ -505,7 +505,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             // REIMS_VGPU_DRAW_LOG: a normal boot pays neither the scan nor the flood.
             // The always-on present rate/occupancy signal lives in the
             // `present_proxy` summary.
-            if crate::observe::draw_log_enabled() {
+            crate::observe::when_verbose(|| {
                 let (nz, maxb, rgb_nz, max_rgb, px0) =
                     crate::observe::bgra_present_stats(&state.present.frame_bgra);
                 crate::observe::line(format!(
@@ -516,7 +516,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
                     "present_paint Painted mid={shown_mid} (action mid={mapping_id} gen={expected_generation}) {width}x{height} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}] (this is what QMP shows)",
                     px0[0], px0[1], px0[2], px0[3]
                 ));
-            }
+            });
             state.present.valid = true;
             state.present.width = width;
             state.present.height = height;

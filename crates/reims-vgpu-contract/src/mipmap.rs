@@ -36,7 +36,7 @@
 //! backend either, because a number that comes from the wire and the SDK is a
 //! contract fact wherever it is checked.
 
-use crate::contract::pixel_format::{self, bytes_per_pixel};
+use crate::pixel_format::{self, bytes_per_pixel};
 
 /// Exact failed checks for the Metal mipmap path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +84,7 @@ pub enum MetalMipmapError {
     },
 }
 
-impl crate::observe::Decline for MetalMipmapError {
+impl reims_vgpu_observe::Decline for MetalMipmapError {
     fn slug(&self) -> &'static str {
         match self {
             Self::NoDevice => "metal_mipmap_device_unavailable",
@@ -234,8 +234,8 @@ pub fn plan_level0(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
-    use crate::observe::{Decline, Emit};
+    use crate::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+    use reims_vgpu_observe::{Decline, Emit};
 
     #[test]
     fn filterable_accepts_unorm_rejects_uint() {
@@ -402,7 +402,7 @@ mod tests {
     ///
     /// The four this module cannot reach — `NoDevice`, `CommandBufferFailed`,
     /// `LevelCountRejected` and `LevelSpanOverflow` — are Metal's own answers,
-    /// raised in [`crate::backend::metal::mipmap`] where nobody on a non-Apple
+    /// raised in `crate::backend::metal::mipmap` where nobody on a non-Apple
     /// host can execute them. Their slugs and fields are pure data, so they are
     /// checked here, which is the only arm that runs.
     #[test]

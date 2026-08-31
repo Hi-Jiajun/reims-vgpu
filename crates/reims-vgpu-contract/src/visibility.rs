@@ -2,7 +2,7 @@
 //!
 //! # Why the set lives here and not in either backend
 //!
-//! One Apple enum is spelled twice — [`crate::backend::vulkan::translate::raster`]
+//! One Apple enum is spelled twice — `crate::backend::vulkan::translate::raster`
 //! maps it to `VisibilityResultMode` and `backend::metal::mtl_enum` maps it to
 //! `MTLVisibilityResultMode` — and nothing in the toolchain compares the two.
 //! A mode one arm records and the other refuses is a guest that culls correctly

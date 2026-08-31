@@ -3906,7 +3906,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // `REIMS_VGPU_DRAW_LOG=1` so a normal boot pays neither; the functional
         // view-retire below stays always-on. Wire has no PPNs — the probe
         // asks whether the guest PT is already walkable under wire task_id.
-        if crate::observe::draw_log_enabled() {
+        crate::observe::when_verbose(|| {
             let walk = crate::runtime::gva_mem::diagnose_gva_walk(
                 host,
                 &state.tasks,
@@ -3927,7 +3927,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
                     state.map_family_events
                 ));
             }
-        }
+        });
         // RE (AppleParavirtMemoryMap): Unmap/Map only mutate the **task
         // page table** then notify — wire has no PPNs. Guest order is
         // deallocate/allocate **then** FIFO, so:
@@ -4006,11 +4006,11 @@ fn apply_map_family<H: HostMemory + HostOps>(
             "unmapped"
         };
         crate::runtime::mapper::flush_retired_views(state, host);
-        if crate::observe::draw_log_enabled() {
-            crate::observe::line(format!(
+        crate::observe::verbose(|| {
+            format!(
                 "map_family op=DeleteIOSurfaceBacking2 ch={channel_id} object={object_id} task={task_id} plen={plen} mode={mode}"
-            ));
-        }
+            )
+        });
     } else if family == MapFamily::InvalidateResources {
         // RE: {task_id, count} + count×{object_id, 4×u8 validity ops}.
         // Ops (PVG host layout): clr_host, set_host, clr_guest, set_guest.
@@ -4059,8 +4059,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 // `decode_fail` and `inv_multi` paths below stay
                 // fail-visible, and the guard also skips the format alloc
                 // on a healthy boot.
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
+                crate::observe::verbose(|| {
+                    format!(
                     "map_family op=InvalidateResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x} flags={flags:#x} clr_h={} set_h={} clr_g={} set_g={} pageon={pageon} bumped={bumped} miss={miss}",
                     packet.opcode,
                     cmd.task_id,
@@ -4069,8 +4069,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
                     ops.set_host_valid,
                     ops.clear_guest_valid,
                     ops.set_guest_valid
-                ));
-                }
+                )
+                });
                 if cmd.count > 1 {
                     let ids: Vec<String> = cmd
                         .records
@@ -4147,12 +4147,12 @@ fn apply_map_family<H: HostMemory + HostOps>(
                     }
                 }
                 let oid = cmd.object_ids.first().copied().unwrap_or(0);
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
+                crate::observe::verbose(|| {
+                    format!(
                         "map_family op={name} opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x}",
                         packet.opcode, cmd.task_id, cmd.count
-                    ));
-                }
+                    )
+                });
                 if cmd.count > 1 {
                     let ids: Vec<String> =
                         cmd.object_ids.iter().map(|id| format!("{id:#x}")).collect();
@@ -4510,8 +4510,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     || result.compute_icb_fail > 0;
                 if packet_failed {
                     crate::observe::fail(exec_summary(channel_id, &result, packet.payload.len()));
-                } else if crate::observe::draw_log_enabled() {
-                    crate::observe::line(exec_summary(channel_id, &result, packet.payload.len()));
+                } else {
+                    crate::observe::verbose(|| {
+                        exec_summary(channel_id, &result, packet.payload.len())
+                    });
                 }
                 if sync_exec_stalled(result.total_us) {
                     crate::observe::fail(format!(

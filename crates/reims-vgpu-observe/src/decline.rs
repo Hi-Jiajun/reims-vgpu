@@ -21,9 +21,11 @@
 //! expensive. Both went in `db80389`.
 //!
 //! One property is genuinely crate-wide and not visible from any single impl:
-//! **no two checks share a slug**. A source scan over the `Decline`/`Refusal`
-//! impls used to check it and is gone, so it is now the author's obligation —
-//! prefix a slug with the rail that owns it and a collision stops being likely.
+//! **no two checks share a slug**. The source scan that used to check it is
+//! gone and is not coming back; [`crate::slugs`] observes it instead, by having
+//! every rendered line claim its slug for the type that spelled it. That proves
+//! a collision when both sides emit and cannot prove their absence, so prefixing
+//! a slug with the rail that owns it stays the author's habit.
 //!
 //! # Adding a decline type
 //!
@@ -54,6 +56,19 @@ pub trait Decline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         Vec::new()
     }
+
+    /// The type that spells this slug, for the crate-wide "no two checks share
+    /// a slug" claim in [`crate::slugs`].
+    ///
+    /// The default is this type's own name, which is right for every impl that
+    /// returns its slugs from its own arms. A type that *delegates* — an outer
+    /// enum whose arm hands the question to an inner decline — must delegate
+    /// this too, or the outer and inner types read as two claimants for one
+    /// slug and the collision report fires on a wrapper that shares no check
+    /// with anything.
+    fn owner(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 /// Give a [`Decline`] the `Display` every always-on line renders it through:
@@ -68,11 +83,16 @@ pub trait Decline {
 ///
 /// The `use` is inside the function body so the macro works whether or not the
 /// trait is already in scope where it is invoked.
+///
+/// `#[macro_export]` because the callers are in the crates above this one, and
+/// `$crate` resolves to this crate wherever it lands. The consumer re-exports
+/// it beside the trait so call sites still read `observe::decline_display!`.
+#[macro_export]
 macro_rules! decline_display {
     ($ty:ty) => {
         impl std::fmt::Display for $ty {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                use $crate::observe::Decline as _;
+                use $crate::Decline as _;
                 write!(f, "reason={}", self.slug())?;
                 for (key, value) in self.fields() {
                     write!(f, " {key}={value}")?;
@@ -82,7 +102,6 @@ macro_rules! decline_display {
         }
     };
 }
-pub(crate) use decline_display;
 
 /// A status enum that mixes success with refusal.
 ///
@@ -108,4 +127,25 @@ pub trait Refusal {
     fn fields(&self) -> Vec<(&'static str, String)> {
         Vec::new()
     }
+
+    /// The type that spells this slug, for the crate-wide "no two checks share
+    /// a slug" claim in [`crate::slugs`].
+    ///
+    /// The default is this type's own name, which is right for every impl that
+    /// returns its slugs from its own arms. A type that *delegates* — an outer
+    /// enum whose arm hands the question to an inner decline — must delegate
+    /// this too, or the outer and inner types read as two claimants for one
+    /// slug and the collision report fires on a wrapper that shares no check
+    /// with anything.
+    fn owner(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
+
+/// The macro again, under the module that documents it.
+///
+/// `#[macro_export]` puts it at the crate root, which is where `$crate` finds
+/// it. Callers reach it as `observe::decline_display!` or
+/// `observe::decline::decline_display!`; both spellings exist in the tree and
+/// neither is worth a rename.
+pub use crate::decline_display;

@@ -51,6 +51,7 @@ impl Emit {
     /// Start a line for `event`, taking the reason and its load-bearing fields
     /// from `decline`.
     pub fn decline(event: &'static str, decline: &dyn Decline) -> Self {
+        super::slugs::claim(decline.slug(), decline.owner());
         Self {
             event,
             reason: decline.slug(),
@@ -73,9 +74,11 @@ impl Emit {
     /// which reads as "log it if it refused" and cannot be written the other way
     /// round.
     pub fn refusal(event: &'static str, status: &dyn Refusal) -> Option<Self> {
+        let reason = status.refusal()?;
+        super::slugs::claim(reason, status.owner());
         Some(Self {
             event,
-            reason: status.refusal()?,
+            reason,
             fields: status.fields(),
         })
     }
@@ -208,7 +211,7 @@ static LAST: OnceLock<Mutex<HashMap<(&'static str, u64), u64>>> = OnceLock::new(
 /// `runtime::draw` moved several hundred tests from after `runtime::mapper` to
 /// before it and turned one such pair red.
 ///
-/// [`crate::observe::sink::FailCapture::start`] calls this, so any test that
+/// [`crate::sink::FailCapture::start`] calls this, so any test that
 /// captures the sink starts from an empty latch and is order-independent by
 /// construction. That is the whole cure: it is not possible to write the bug
 /// above in a capturing test, and no fixture needs a value chosen to dodge
@@ -217,8 +220,8 @@ static LAST: OnceLock<Mutex<HashMap<(&'static str, u64), u64>>> = OnceLock::new(
 /// A test that wants a latch *claimed* — to prove an emitter stays quiet, or
 /// that two namespaces do not suppress each other — claims it after `start()`
 /// rather than before.
-#[cfg(test)]
-pub(crate) fn forget_all_latches() {
+#[cfg(any(test, feature = "testing"))]
+pub fn forget_all_latches() {
     if let Some(s) = SEEN.get() {
         s.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
@@ -317,7 +320,7 @@ mod tests {
         assert!(state_changed("capture_reset_flip", 1, 7));
         assert!(!state_changed("capture_reset_flip", 1, 7));
 
-        let _cap = crate::observe::sink::FailCapture::start();
+        let _cap = crate::sink::FailCapture::start();
 
         assert!(
             first_sight("capture_reset_reason", 0x99),

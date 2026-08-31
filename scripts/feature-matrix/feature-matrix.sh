@@ -276,6 +276,16 @@ esac
 # feature set; the host is what differs.
 run_cell "vulkan,host-window / $HOST_TRIPLE" "" "$FEATURES_VULKAN"
 count_cell "vulkan,host-window / $HOST_TRIPLE" "$FEATURES_VULKAN"
+
+# The supporting crates, counted separately because they are counted at all.
+# `reims-vgpu`'s own count is the number this file has always printed, and a
+# drop in it is supposed to mean a cfg change emptied an arm. When a module
+# moves out into a crate its tests move with it, and a reader with only the
+# first number would read that move as exactly the loss this cell exists to
+# catch. Every arm links these, so the feature set does not change them.
+count_cell "support crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
+  "-p reims-vgpu-contract -p reims-vgpu-env -p reims-vgpu-observe -p reims-vgpu-paging \
+   -p reims-vgpu-wire"
 if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then
   run_cell "vulkan,host-window / $CROSS_TARGET" "$CROSS_TARGET" "$FEATURES_VULKAN"
   if [ "$COUNT_TESTS" -eq 1 ]; then

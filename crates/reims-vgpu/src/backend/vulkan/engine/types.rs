@@ -139,6 +139,32 @@ impl crate::observe::Decline for DrawError {
         }
     }
 
+    /// Delegated arm for arm with `slug`.
+    ///
+    /// A delegating decline that kept the default owner would claim every
+    /// inner type's slug under its own name, and
+    /// [`crate::observe::slugs`] would report a collision on a wrapper that
+    /// shares no check with anything. The claim has to name the type that
+    /// spelled the slug, not the one that passed it on.
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::TargetRead(d) => d.owner(),
+            Self::GuestPageWrite(d) => d.owner(),
+            Self::Unsupported(r) => r.owner(),
+            Self::VkCall(c) => c.owner(),
+            Self::Slab(d) => d.owner(),
+            Self::FenceTimeout => std::any::type_name::<Self>(),
+            Self::Init(d) => d.owner(),
+            Self::Facade(d) => d.owner(),
+            Self::DrawPreparation(d) => d.owner(),
+            Self::DrawValidation(d) => d.owner(),
+            Self::DrawExecution(d) => d.owner(),
+            Self::ComputeValidation(d) => d.owner(),
+            Self::ComputeExecution(d) => d.owner(),
+            Self::DeviceLost(d) => d.owner(),
+        }
+    }
+
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::TargetRead(d) => d.fields(),
@@ -1102,20 +1128,22 @@ impl BufferContent {
                     if take == 0 {
                         break;
                     }
-                    if skip >= run.len {
-                        skip -= run.len;
+                    if skip >= run.len() {
+                        skip -= run.len();
                         continue;
                     }
                     let within = skip as usize;
                     skip = 0;
-                    let n = (run.len as usize).saturating_sub(within).min(take);
+                    let n = (run.len() as usize).saturating_sub(within).min(take);
                     // SAFETY: `host_ptr` is a stable RAMBlock alias from
                     // `HostOps::map_pages`, valid for the VM lifetime; the
                     // read races guest CPU writes exactly like the staging
                     // path's `read_task_gva_by_id` copy does.
                     unsafe {
-                        let slice =
-                            std::slice::from_raw_parts((run.host_ptr as *const u8).add(within), n);
+                        let slice = std::slice::from_raw_parts(
+                            (run.host_ptr() as *const u8).add(within),
+                            n,
+                        );
                         out.extend_from_slice(slice);
                     }
                 }
@@ -2394,13 +2422,12 @@ pub enum SampledSource {
 
 /// One packed-contiguous guest-RAM span (a direct RAMBlock alias from
 /// `HostOps::map_pages`; stable for the VM lifetime, unmap is a no-op).
-#[derive(Clone, Copy, Debug)]
-pub struct GuestRun {
-    /// Host VA of the span start (page-aligned base + in-page offset).
-    pub host_ptr: usize,
-    /// Byte length of the span.
-    pub len: u64,
-}
+///
+/// Owned by [`crate::runtime::guest_ram`] and re-exported here, because a host
+/// span over guest memory is the memory layer's vocabulary and not the
+/// engine's. It was a pair of public fields on this side of the boundary, and
+/// what that cost is written up on the type itself.
+pub use crate::runtime::guest_ram::GuestRun;
 
 /// Guest-RAM texel source: the requested window is
 /// `source_offset..source_offset + total_len` inside `runs`. With

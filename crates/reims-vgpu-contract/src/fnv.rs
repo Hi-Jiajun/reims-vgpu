@@ -10,7 +10,7 @@
 //! backend's own hash module, behind `feature = "backend-metal"` — so the sites
 //! outside it *could not* name them even if their authors had looked, and wrote
 //! the basis and the prime out as literals instead. (That module is
-//! [`crate::backend::hash`] now, and ungated, for a different reason its own doc
+//! `crate::backend::hash` now, and ungated, for a different reason its own doc
 //! gives.)
 //!
 //! They wrote them out in different shapes. Before this module existed the

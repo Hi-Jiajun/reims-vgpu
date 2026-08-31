@@ -34,7 +34,7 @@
 //! alone to claim the screen is not black.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -43,9 +43,9 @@ use std::{
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static INIT: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 static FAIL_FILE: Mutex<Option<File>> = Mutex::new(None);
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 static DRAW_FILE: Mutex<Option<File>> = Mutex::new(None);
 
 /// Which always-on sink a line targets.
@@ -55,25 +55,17 @@ enum Sink {
     Draw,
 }
 
-pub(crate) fn enabled() -> bool {
+pub fn enabled() -> bool {
     if !INIT.swap(true, Ordering::Relaxed) {
         // Through the shared parse, and read once. Nothing is emitted for an
         // unrecognized value: this is the emit path itself, so a report from
         // here would recurse into the sink that is being asked whether it is
         // enabled. Such a value reads as off, which is what every
         // non-affirmative value already did.
-        let on = crate::env::switch(crate::env::DRAW_LOG) == crate::env::Switch::On;
+        let on = reims_vgpu_env::switch(reims_vgpu_env::DRAW_LOG) == reims_vgpu_env::Switch::On;
         ENABLED.store(on, Ordering::Relaxed);
     }
     ENABLED.load(Ordering::Relaxed)
-}
-
-/// Whether verbose draw logging (`REIMS_VGPU_DRAW_LOG=1`) is active. Lets always-on
-/// paths skip building expensive *diagnostic-only* detail (e.g. per-peer
-/// full-frame rescans for a log field) on a normal boot without losing the
-/// always-on line itself.
-pub(crate) fn draw_log_enabled() -> bool {
-    enabled()
 }
 
 /// Milliseconds since the first log line of this process. Appended as a
@@ -84,7 +76,7 @@ pub(crate) fn draw_log_enabled() -> bool {
 /// `pub(crate)` so always-on rate proxies (e.g. display-signal cadence) can
 /// window their counters on the same process-monotonic clock that stamps every
 /// line — no second time base to reconcile against `t=`.
-pub(crate) fn elapsed_ms() -> u128 {
+pub fn elapsed_ms() -> u128 {
     T0.get_or_init(std::time::Instant::now)
         .elapsed()
         .as_millis()
@@ -96,7 +88,7 @@ pub(crate) fn elapsed_ms() -> u128 {
 /// 120 Hz frame is 8333 µs, and rounding it to 8 ms delivers 125 Hz. Paths that
 /// pace something the guest measures need this one; `t=` stamps stay in
 /// milliseconds so line-class censuses keep working.
-pub(crate) fn elapsed_us() -> u64 {
+pub fn elapsed_us() -> u64 {
     T0.get_or_init(std::time::Instant::now)
         .elapsed()
         .as_micros() as u64
@@ -119,17 +111,17 @@ fn test_path(kind: &str) -> String {
     format!("/tmp/reims-vgpu-{kind}-test-{}.log", std::process::id())
 }
 
-pub(crate) fn fail_log_path() -> &'static str {
-    #[cfg(test)]
+pub fn fail_log_path() -> &'static str {
+    #[cfg(any(test, feature = "testing"))]
     return FAIL_PATH.get_or_init(|| test_path("fail"));
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "testing")))]
     FAIL_PATH.get_or_init(|| "/tmp/reims-vgpu-fail.log".to_string())
 }
 
-pub(crate) fn draw_log_path() -> &'static str {
-    #[cfg(test)]
+pub fn draw_log_path() -> &'static str {
+    #[cfg(any(test, feature = "testing"))]
     return DRAW_PATH.get_or_init(|| test_path("draw"));
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "testing")))]
     DRAW_PATH.get_or_init(|| "/tmp/reims-vgpu-draw.log".to_string())
 }
 
@@ -145,7 +137,7 @@ pub fn redirect_logs_for_tests() {
 /// Synchronous single-line append (unit-test builds only). Worker + MMIO proxy
 /// lines may arrive concurrently; keep each record on one physical line so
 /// failure evidence never merges into another event.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 fn append_sync(file: &Mutex<Option<File>>, path: &str, msg: &str, t: u128) {
     let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
     if file.is_none() {
@@ -172,7 +164,7 @@ fn append_sync(file: &Mutex<Option<File>>, path: &str, msg: &str, t: u128) {
 /// `read_to_string` the sink and assert on it.
 fn emit(sink: Sink, msg: &str) {
     let t = elapsed_ms();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     {
         if matches!(sink, Sink::Fail) {
             if let Some(buf) = CAPTURED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
@@ -185,7 +177,7 @@ fn emit(sink: Sink, msg: &str) {
         };
         append_sync(file, path, msg, t);
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "testing")))]
     writer::enqueue(sink, format!("{msg} t={t}"));
 }
 
@@ -198,24 +190,36 @@ fn emit(sink: Sink, msg: &str) {
 /// reintroduces a flood is named on the very boot it lands instead of silently
 /// drowning real failures. Legitimate always-on lines are self-clocked windowed
 /// summaries (`drain_duty`, `store_routes`) well under the threshold.
+///
+/// Everything in this block down to `writer_beat_due` belongs to the background
+/// writer, so it is compiled when that writer is — and for this crate's own
+/// tests of it. A *consumer's* test build turns on `testing`, which replaces
+/// the writer with a synchronous append, and in that one configuration this is
+/// genuinely dead. Saying so in a `cfg` is cheaper and more honest than an
+/// `allow(dead_code)` that would also hide a real one.
+#[cfg(any(test, not(feature = "testing")))]
 const FLOOD_WINDOW_MS: u128 = 1000;
+#[cfg(any(test, not(feature = "testing")))]
 const FLOOD_THRESHOLD_PER_WINDOW: u64 = 1000;
 
 /// The flood-accounting key for an always-on line: its slug — the first
 /// whitespace token, skipping a leading `OFF ` marker. Groups a runaway line by
 /// kind (`type5_view_zc`, `map_family`, …) so the warning names the culprit.
+#[cfg(any(test, not(feature = "testing")))]
 fn flood_key(line: &str) -> &str {
     let slug = line.strip_prefix("OFF ").unwrap_or(line);
     slug.split(' ').next().unwrap_or(slug)
 }
 
-/// Windowed per-prefix counter for the always-on stream. Pure + always compiled
-/// so the threshold/keying is unit-tested without a background thread.
+/// Windowed per-prefix counter for the always-on stream. Pure, so the
+/// threshold and the keying are unit-tested without a background thread.
+#[cfg(any(test, not(feature = "testing")))]
 struct FloodWindow {
     counts: std::collections::HashMap<String, u64>,
     window_start_ms: u128,
 }
 
+#[cfg(any(test, not(feature = "testing")))]
 impl FloodWindow {
     fn new(now: u128) -> Self {
         Self {
@@ -246,6 +250,7 @@ impl FloodWindow {
 /// How often the writer thread reports on itself. One second, the same census
 /// interval every other levels line in this device shares, so a `log_writer`
 /// row reads against the `store_routes` and `drain_duty` rows beside it.
+#[cfg(any(test, not(feature = "testing")))]
 const WRITER_BEAT_MS: u64 = 1_000;
 
 /// Whether the writer should emit its heartbeat now.
@@ -255,6 +260,7 @@ const WRITER_BEAT_MS: u64 = 1_000;
 /// against the clock can only be checked by a boot. Unlike that one this has a
 /// single caller on a single thread, so it needs no atomic — but it does need
 /// to be checkable, because the whole value of the beat is its cadence.
+#[cfg(any(test, not(feature = "testing")))]
 fn writer_beat_due(last_ms: u128, now_ms: u128) -> bool {
     now_ms.saturating_sub(last_ms) >= u128::from(WRITER_BEAT_MS)
 }
@@ -287,7 +293,7 @@ fn writer_beat_due(last_ms: u128, now_ms: u128) -> bool {
 ///
 /// The wait is a timeout rather than a block, so an idle device still beats. A
 /// silent writer and a silent device must not look alike.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testing")))]
 mod writer {
     use super::{draw_log_path, fail_log_path, Sink};
     use std::io::{BufWriter, Write};
@@ -437,7 +443,7 @@ mod writer {
 }
 
 /// Test-only in-memory copy of the always-on stream, armed by [`FailCapture`].
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 static CAPTURED: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
 /// Records every always-on ([`fail`] / [`off`]) line emitted while it is alive.
@@ -452,10 +458,10 @@ static CAPTURED: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(N
 ///
 /// Relies on the crate's serial test convention (`--test-threads=1`); a second
 /// capture armed concurrently would see the other test's lines.
-#[cfg(test)]
-pub(crate) struct FailCapture;
+#[cfg(any(test, feature = "testing"))]
+pub struct FailCapture;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl FailCapture {
     /// Arm the capture, and drop every dedup latch first.
     ///
@@ -467,7 +473,7 @@ impl FailCapture {
     // resolve on any arm and would read as rot in the intra-doc pass.
     /// See `super::emit::forget_all_latches` for what that costs and why the
     /// clearing belongs here rather than at each fixture.
-    pub(crate) fn start() -> Self {
+    pub fn start() -> Self {
         super::emit::forget_all_latches();
         Self::arm()
     }
@@ -487,7 +493,7 @@ impl FailCapture {
     /// coupling `start` exists to remove — so a test that reaches for it is
     /// claiming the earlier windows are its own, and it must open the sequence
     /// with a `start`.
-    pub(crate) fn resume() -> Self {
+    pub fn resume() -> Self {
         Self::arm()
     }
 
@@ -497,7 +503,7 @@ impl FailCapture {
     }
 
     /// Every always-on line emitted since `start`, in order.
-    pub(crate) fn lines(&self) -> Vec<String> {
+    pub fn lines(&self) -> Vec<String> {
         CAPTURED
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -508,7 +514,7 @@ impl FailCapture {
     /// The one line whose first whitespace token is `slug`. Panics unless
     /// exactly one matched — "no line" and "several lines" are both reasons a
     /// downstream assertion would otherwise pass or fail for the wrong reason.
-    pub(crate) fn one(&self, slug: &str) -> String {
+    pub fn one(&self, slug: &str) -> String {
         let hits: Vec<String> = self
             .lines()
             .into_iter()
@@ -524,7 +530,7 @@ impl FailCapture {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl Drop for FailCapture {
     fn drop(&mut self) {
         *CAPTURED.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -536,6 +542,45 @@ pub fn line(msg: impl AsRef<str>) {
         return;
     }
     emit(Sink::Draw, msg.as_ref());
+}
+
+/// A verbose line whose *text* is expensive to build.
+///
+/// [`line`] already drops its argument when verbose logging is off, but the
+/// caller has paid for the `format!` by the time it is called. A hot path that
+/// wants to skip that cost used to ask whether the sink was open and branch, which
+/// put a query about observability state inside a product path — the one shape
+/// `AGENTS.md` and this module both rule out, because a path that can read the
+/// log's state is a path that could come to depend on it.
+///
+/// Taking the text as a closure moves the question back inside the sink. The
+/// caller states what it would say; whether saying it is worth building is not
+/// its decision to make.
+pub fn verbose(build: impl FnOnce() -> String) {
+    if !enabled() {
+        return;
+    }
+    emit(Sink::Draw, &build());
+}
+
+/// Run a diagnostic-only block, and only when verbose logging is on.
+///
+/// [`verbose`] covers a line whose text is expensive. This covers the wider
+/// case: a block that scans a frame for its byte statistics, walks a guest page
+/// table to describe a mapping, or emits several lines at once. Those cost more
+/// than a `format!` and none of them may run on a normal boot.
+///
+/// The closure returns nothing, which is the whole point. A caller that asked
+/// [`enabled`] and branched held a `bool` it could store, thread into a
+/// decision, or read a second time — and observability that a product path can
+/// read is observability a product path can come to depend on. Handing the work
+/// *to* the sink instead lets nothing escape the block: whatever it computes is
+/// for the log and dies there.
+pub fn when_verbose(diagnose: impl FnOnce()) {
+    if !enabled() {
+        return;
+    }
+    diagnose();
 }
 
 /// Always-on fail-visible line (writeback / Metal / missing resource / offline OFF).
@@ -828,6 +873,59 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Force the sink open or closed for one test and put it back.
+    ///
+    /// `ENABLED` is read once per process from the environment, so a test that
+    /// wants the other arm has to set it directly. Serialized against itself:
+    /// the suite runs `--test-threads=1`, and this makes the pairing explicit
+    /// rather than relying on that.
+    fn with_sink<R>(open: bool, body: impl FnOnce() -> R) -> R {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        redirect_logs_for_tests();
+        let was_init = INIT.swap(true, Ordering::Relaxed);
+        let was_enabled = ENABLED.swap(open, Ordering::Relaxed);
+        let out = body();
+        ENABLED.store(was_enabled, Ordering::Relaxed);
+        INIT.store(was_init, Ordering::Relaxed);
+        out
+    }
+
+    /// A diagnostic block does not run while the sink is closed.
+    ///
+    /// This is the property every caller gave up by asking whether logging was
+    /// on and branching itself: the answer stayed on the product path's side of
+    /// the call, and the work it guarded — a frame-wide byte scan, a guest
+    /// page-table walk, a per-binding `format!` — stayed the product path's to
+    /// skip, or to forget to skip. Here the sink owns both halves, and a caller
+    /// has nothing to get wrong because it is never told the answer.
+    #[test]
+    fn a_diagnostic_block_does_not_run_while_the_sink_is_closed() {
+        with_sink(false, || {
+            let mut ran = 0u32;
+            when_verbose(|| ran += 1);
+            verbose(|| {
+                ran += 1;
+                "unreachable_line".to_owned()
+            });
+            assert_eq!(ran, 0, "a closed sink ran a diagnostic block");
+        });
+    }
+
+    /// And does run while it is open, so the gate is a gate and not a deletion.
+    #[test]
+    fn a_diagnostic_block_runs_while_the_sink_is_open() {
+        with_sink(true, || {
+            let mut ran = 0u32;
+            when_verbose(|| ran += 1);
+            verbose(|| {
+                ran += 1;
+                "verbose_probe_line".to_owned()
+            });
+            assert_eq!(ran, 2, "an open sink skipped a diagnostic block");
+        });
+    }
 
     #[test]
     fn flood_key_is_the_slug_skipping_the_off_marker() {
