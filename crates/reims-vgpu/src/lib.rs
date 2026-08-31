@@ -54,16 +54,18 @@ compile_error!(
      any other host."
 );
 
-// Vulkan reaches the GPU through MoltenVK on macOS and a native ICD on Linux.
-// Any other host is untested rather than known-broken — name it here so a new
-// port is a deliberate edit to this list, not an accident.
+// Vulkan reaches the GPU through MoltenVK on macOS and a native ICD on
+// Linux; Windows hosts use their native ICDs (NVIDIA/AMD/Intel ship
+// VK_KHR_win32_surface and Vulkan 1.2+). Any other host is untested rather
+// than known-broken — name it here so a new port is a deliberate edit to this
+// list, not an accident.
 #[cfg(all(
     feature = "backend-vulkan",
-    not(any(target_os = "macos", target_os = "linux"))
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
 ))]
 compile_error!(
-    "backend-vulkan is supported on target_os = \"macos\" (MoltenVK) and \
-     target_os = \"linux\" (native ICD) only"
+    "backend-vulkan is supported on target_os = \"macos\" (MoltenVK), \
+     target_os = \"linux\", and target_os = \"windows\" (native ICDs)"
 );
 
 pub mod contract;
