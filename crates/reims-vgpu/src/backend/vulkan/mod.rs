@@ -126,6 +126,15 @@ impl Backend for VulkanBackend {
         ComputeStatus::NoMetal("compute_nested_no_vulkan_path")
     }
 
+    #[cfg(feature = "host-window")]
+    fn presents_host_window(&self) -> bool {
+        // The swapchain half of that window is `engine::window_present`, so
+        // this rail is the one that can fill it. Whether this *build* compiled
+        // the window at all is a different question with a different owner —
+        // `device::window_publish`, where the `host-window` feature is asked.
+        true
+    }
+
     fn guest_writes_outstanding(&self) -> bool {
         engine::guest_writes_outstanding()
     }

@@ -398,6 +398,33 @@ pub(crate) trait Backend: Copy {
         false
     }
 
+    /// Whether this rail presents into the host-owned window (kb host-window).
+    ///
+    /// That window is a `VkSurfaceKHR` and a swapchain the Vulkan engine drives,
+    /// so it is the only rail that can fill one; on any other rail QEMU's own
+    /// display owns the screen, and there is nothing here to fall back to.
+    ///
+    /// A trait method rather than a `cfg` for [`Self::emit_census`]'s reason,
+    /// and this is the case where the difference is fatal rather than
+    /// misleading. `host-window` is compiled unconditionally into a build
+    /// carrying both rails, so `feature = "host-window"` spelled "the Vulkan
+    /// rail" opened a `winit` event loop on a Metal boot, beside QEMU's Cocoa
+    /// display. Two windows is not what that costs: building the event loop
+    /// installs `winit`'s own `NSApplication` delegate and its main-run-loop
+    /// observers, `cocoa_display_init` then replaces the delegate with QEMU's,
+    /// and the first observer callback finds a delegate it does not recognise
+    /// and panics — inside a CoreFoundation frame that cannot unwind, which
+    /// aborts the process before the guest reaches the desktop.
+    ///
+    /// The `cfg` on the method is the lawful kind: it asks whether this build
+    /// compiled a window at all, which is a fact about the build and cannot
+    /// change at run time. A build without one has no rail to ask, and the
+    /// device's `window_start` is a stub there.
+    #[cfg(feature = "host-window")]
+    fn presents_host_window(&self) -> bool {
+        false
+    }
+
     /// Publish a FIFO completion stamp, ordered behind the guest-memory work it
     /// completes.
     ///
@@ -896,6 +923,16 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    fn presents_host_window(&self) -> bool {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.presents_host_window(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.presents_host_window(),
         }
     }
 
@@ -1598,6 +1635,27 @@ mod tests {
         assert_eq!(
             typo.refusal.as_ref().map(RailRefusal::slug),
             Some("rail_unrecognized")
+        );
+    }
+
+    /// The host-owned window belongs to the rail that can fill it.
+    ///
+    /// Named rails rather than [`selected`], because the case this guards is a
+    /// binary that compiled the window and is *not* running the rail that owns
+    /// it: on a `--backend both` build `feature = "host-window"` is on for the
+    /// Metal boot too, and answering it from the feature opened a `winit` event
+    /// loop next to QEMU's Cocoa display, which aborts the boot. The selected
+    /// handle is then checked to forward rather than take the trait default.
+    #[test]
+    #[cfg(feature = "host-window")]
+    fn only_the_vulkan_rail_presents_into_the_host_window() {
+        #[cfg(feature = "backend-metal")]
+        assert!(!metal::MetalBackend.presents_host_window());
+        #[cfg(feature = "backend-vulkan")]
+        assert!(vulkan::VulkanBackend::new().presents_host_window());
+        assert_eq!(
+            selected().presents_host_window(),
+            selected().rail() == Rail::Vulkan
         );
     }
 

@@ -118,9 +118,27 @@ pub(crate) struct EarlyFb {
 /// [`publish_window_frame`], called by the drain. Idempotent; `true` on success.
 #[cfg(feature = "host-window")]
 pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
+    use crate::backend::Backend as _;
     use crate::host_window::present::{
         FrameSlot, InputSink, WindowConfig, WindowMode, WindowWaker,
     };
+    // Two questions, two owners. The `cfg` above answers "did this build
+    // compile a window"; the running rail answers "is there a swapchain to fill
+    // one", and only the second can tell a `--backend both` binary's Metal boot
+    // from its Vulkan boot. Asking the feature for both is what put a `winit`
+    // event loop — and its `NSApplication` delegate — inside a Cocoa boot; see
+    // `Backend::presents_host_window`.
+    let backend = crate::backend::selected();
+    if !backend.presents_host_window() {
+        // Expected, and the operator still has to be able to read which display
+        // owned the screen this boot, so it is offline analysis rather than a
+        // refusal: nothing was dropped and no guest work was declined.
+        crate::observe::off(format!(
+            "host_window_skipped id={id} rail={} display=qemu",
+            backend.rail().name()
+        ));
+        return false;
+    }
     let Some(slot) = device_slot(id) else {
         return false;
     };
