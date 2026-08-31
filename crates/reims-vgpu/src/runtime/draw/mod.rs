@@ -670,8 +670,9 @@ fn degrade_log_first(pipeline_ref: u32, slug: &'static str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeStatus {
     Ok,
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    MetalBackend(crate::backend::metal::error::Status),
+    /// A rail refused with structure. See [`crate::runtime::compute_exec::ComputeStatus::RailRefused`]
+    /// — its twin, and the same reason for being neutral and ungated.
+    RailRefused(crate::backend::refusal::RailRefusal),
     MissingPipeline(&'static str),
     MissingMtlb(&'static str),
     MetalFailed(&'static str),
@@ -693,8 +694,7 @@ impl crate::observe::Refusal for EncodeStatus {
             // The only non-refusal, and the reason this is a `Refusal` rather
             // than a `Decline`: `Emit::refusal` cannot render a line for it.
             Self::Ok => None,
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            Self::MetalBackend(status) => status.refusal(),
+            Self::RailRefused(refusal) => refusal.refusal(),
             Self::MissingPipeline(slug)
             | Self::MissingMtlb(slug)
             | Self::MetalFailed(slug)
@@ -709,9 +709,8 @@ impl crate::observe::Refusal for EncodeStatus {
         // The class beside the reason: which recovery path the caller took is
         // not derivable from the slug, and a reader correlating a dropped draw
         // with a black frame needs both.
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        if let Self::MetalBackend(status) = self {
-            let mut fields = crate::observe::Refusal::fields(status);
+        if let Self::RailRefused(refusal) = self {
+            let mut fields = crate::observe::Refusal::fields(refusal);
             fields.push(("recovery", "metal_failed".to_string()));
             return fields;
         }
@@ -725,9 +724,10 @@ impl EncodeStatus {
     pub fn class(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            Self::MetalBackend(status) => {
-                if status.is_args() {
+            // The two names the boot logs have carried since this was
+            // `MetalBackend`; see `ComputeStatus::class`.
+            Self::RailRefused(refusal) => {
+                if refusal.is_args() {
                     "metal_args"
                 } else {
                     "metal_execute"

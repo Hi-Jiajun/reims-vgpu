@@ -166,7 +166,7 @@ mod tests {
         let status = crate::backend::metal::error::Status::execute(
             "metal_compute_reflection_pso_create_failed",
         );
-        let carried = ComputeStatus::MetalBackend(status);
+        let carried = ComputeStatus::RailRefused(status);
         assert_eq!(
             carried.refusal(),
             Some("metal_compute_reflection_pso_create_failed")

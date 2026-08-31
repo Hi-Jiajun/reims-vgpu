@@ -122,6 +122,10 @@ pub mod compute_session;
 /// A host capability, deliberately neither a rail decision nor a rail's module.
 pub mod heap_placement;
 
+/// How this device says no, with the check that said it — the payload the
+/// neutral status vocabularies carry in their `RailRefused` variant.
+pub mod refusal;
+
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus, ResidentServe};

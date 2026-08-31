@@ -1061,7 +1061,7 @@ fn encode_status_renders_its_check_beside_the_class_it_collapsed_to() {
     {
         let backend =
             crate::backend::metal::error::Status::execute("metal_render_command_buffer_failed");
-        let carried = EncodeStatus::MetalBackend(backend);
+        let carried = EncodeStatus::RailRefused(backend);
         assert_eq!(carried.class(), "metal_execute");
         assert_eq!(
             Emit::refusal("draw_encode_fail", &carried)

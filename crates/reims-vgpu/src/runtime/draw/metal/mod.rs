@@ -870,7 +870,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         &depth_stencil_state,
     );
     if !st.is_ok() {
-        return (EncodeStatus::MetalBackend(st), None);
+        return (EncodeStatus::RailRefused(st), None);
     }
 
     // Convert each color RT RGBA8 → guest format and writeback (mapper-ref-texture mapping

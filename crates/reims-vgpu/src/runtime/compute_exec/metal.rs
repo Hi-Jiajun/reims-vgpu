@@ -427,7 +427,7 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
     } else {
         match reflect_compute_textures_mtlb(&mtlb, (err_buf.as_mut_ptr(), err_buf.len())) {
             Ok(u) => u,
-            Err(st) => return ComputeStatus::MetalBackend(st),
+            Err(st) => return ComputeStatus::RailRefused(st),
         }
     };
 
@@ -513,7 +513,7 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
             (err_buf.as_mut_ptr(), err_buf.len()),
         ) {
             Ok(r) => r,
-            Err(st) => return ComputeStatus::MetalBackend(st),
+            Err(st) => return ComputeStatus::RailRefused(st),
         };
         // Split storage textures out of staged_tex for deferred writeback alignment.
         let storage_tex: Vec<StagedTexture<MetalStage>> =
@@ -550,7 +550,7 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
         (err_buf.as_mut_ptr(), err_buf.len()),
     );
     if !st.is_ok() {
-        return ComputeStatus::MetalBackend(st);
+        return ComputeStatus::RailRefused(st);
     }
 
     for s in &staged_bufs {

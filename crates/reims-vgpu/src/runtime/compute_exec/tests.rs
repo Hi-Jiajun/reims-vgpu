@@ -744,7 +744,7 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
             "metal_compute_reflection_usage_output_missing",
         )
         .field("capacity", 8usize);
-        let st = ComputeStatus::MetalBackend(status);
+        let st = ComputeStatus::RailRefused(status);
         assert_eq!(st.class(), "metal_args");
         assert_eq!(
             Emit::refusal("compute_record", &st)

@@ -485,8 +485,12 @@ impl ComputeAccum {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeStatus {
     Ok,
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    MetalBackend(crate::backend::metal::error::Status),
+    /// A rail refused with structure: the class of the failure, the registered
+    /// slug of the check, and the facts that check was looking at. Neutral and
+    /// ungated — see [`crate::backend::refusal::RailRefusal`] — because a
+    /// variant that named one rail gave this enum two shapes across a feature
+    /// boundary and left the other rail no way to refuse with structure.
+    RailRefused(crate::backend::refusal::RailRefusal),
     MissingPipeline(&'static str),
     MissingMtlb(&'static str),
     MissingBuffer(&'static str),
@@ -505,8 +509,7 @@ impl crate::observe::Refusal for ComputeStatus {
             // The only non-refusal. Keeping it in the same enum is what makes
             // `Emit::refusal` unable to log a success by accident.
             Self::Ok => None,
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            Self::MetalBackend(status) => status.refusal(),
+            Self::RailRefused(refusal) => refusal.refusal(),
             Self::MissingPipeline(slug)
             | Self::MissingMtlb(slug)
             | Self::MissingBuffer(slug)
@@ -524,9 +527,8 @@ impl crate::observe::Refusal for ComputeStatus {
         // The class next to the reason: `MissingTexture` vs `MetalFailed` is
         // what the caller acted on, and a reader correlating a log line with a
         // recovery path needs both.
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        if let Self::MetalBackend(status) = self {
-            let mut fields = crate::observe::Refusal::fields(status);
+        if let Self::RailRefused(refusal) = self {
+            let mut fields = crate::observe::Refusal::fields(refusal);
             fields.push(("recovery", "metal_failed".to_string()));
             return fields;
         }
@@ -540,9 +542,12 @@ impl ComputeStatus {
     pub fn class(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            Self::MetalBackend(status) => {
-                if status.is_args() {
+            // The two names the boot logs have carried since these were
+            // `MetalBackend`. They are the *refusal's* class, not the rail's,
+            // and stay spelled this way so a longitudinal grep still finds
+            // them.
+            Self::RailRefused(refusal) => {
+                if refusal.is_args() {
                     "metal_args"
                 } else {
                     "metal_execute"
