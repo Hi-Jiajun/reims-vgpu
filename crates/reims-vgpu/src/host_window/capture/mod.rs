@@ -20,11 +20,11 @@
 //!   than acting on its own shortcuts; destroying it restores them.
 //! - **X11** — `XGrabKeyboard`, which redirects key events to the grabbing
 //!   window and overrides the window manager's passive grabs for its duration.
-//! - **macOS** — `NSApplicationPresentationDisableProcessSwitching`, which
-//!   suppresses Cmd+Tab and the Dock/menu-bar chords for the presenting
-//!   application. It is the whole of what an unprivileged application may take;
-//!   see [`macos`] for what remains with the window system and why this is not
-//!   silently treated as full capture.
+//! - **macOS** — `NSApplicationPresentationDisableHideApplication`, which keeps
+//!   Cmd+H from hiding the presenting application without changing Dock
+//!   visibility. AppKit makes Dock hiding a prerequisite for suppressing
+//!   Cmd+Tab, so process switching remains host-owned; see [`macos`] for the
+//!   typed partial-capture result.
 //!
 //! # Refusal, not partial capture
 //!

@@ -2,11 +2,11 @@
 //!
 //! # Contract, and its limit
 //!
-//! `NSApplicationPresentationDisableProcessSwitching` stops the window server
-//! from acting on Cmd+Tab and the Dock's own chords for the presenting
-//! application; combined with `DisableHideApplication` it also keeps Cmd+H from
-//! being taken before the guest sees it. That is the whole of what an
-//! unprivileged application may claim.
+//! `NSApplicationPresentationDisableHideApplication` keeps Cmd+H from hiding
+//! the presenting application. AppKit permits `DisableProcessSwitching` only
+//! while the Dock is hidden or auto-hidden; this window must not change the
+//! operator's Dock, so Cmd+Tab remains host-owned. That is the whole of what an
+//! unprivileged, non-Dock-changing application may claim.
 //!
 //! It is **not** full capture, and this file does not pretend otherwise. The
 //! window server keeps a small reserved set regardless — Cmd+Space for the
@@ -18,7 +18,7 @@
 //! absent.
 //!
 //! So this reports [`CaptureError::PartialOnly`] on the first activation. The
-//! guest gets Cmd+Tab and Cmd+H; it does not get the reserved set, and the
+//! guest gets Cmd+H; it does not get Cmd+Tab or the reserved set, and the
 //! operator learns that from the fail log rather than from a guest that ignores
 //! a keystroke. Nothing here infers the reserved set or works around it.
 
@@ -27,11 +27,33 @@ use objc::{class, msg_send, sel, sel_impl};
 
 use super::{Capture, CaptureError};
 
-/// `NSApplicationPresentationDisableProcessSwitching` — suppresses Cmd+Tab and
-/// the Dock chords. From `NSApplication.h`.
-const DISABLE_PROCESS_SWITCHING: usize = 1 << 5;
 /// `NSApplicationPresentationDisableHideApplication` — suppresses Cmd+H.
 const DISABLE_HIDE_APPLICATION: usize = 1 << 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentationChange {
+    next: usize,
+    added: usize,
+}
+
+/// Add the non-Dock-changing capture option.
+///
+/// `DisableProcessSwitching` is deliberately absent: AppKit would require this
+/// application to hide or auto-hide the Dock alongside it. The delta remembers
+/// only the bit introduced here so release does not clobber fullscreen/window
+/// state.
+fn engage_options(current: usize) -> PresentationChange {
+    let added = DISABLE_HIDE_APPLICATION & !current;
+    PresentationChange {
+        next: current | added,
+        added,
+    }
+}
+
+/// Remove only the capture-owned bit.
+fn release_options(current: usize, added: usize) -> usize {
+    current & !added
+}
 
 /// Shortcut capture over the process's `NSApplication`.
 ///
@@ -40,6 +62,9 @@ const DISABLE_HIDE_APPLICATION: usize = 1 << 8;
 /// presentation options are an application-wide property.
 pub struct MacCapture {
     active: bool,
+    /// Bits this capture added on activation. Release removes this delta rather
+    /// than restoring a stale snapshot of the whole application property.
+    added_options: usize,
     /// Whether the partial-capture refusal has already been reported. It is a
     /// standing limitation, not a per-transition event, so it is logged once.
     reported_partial: bool,
@@ -49,6 +74,7 @@ impl MacCapture {
     pub fn new() -> Self {
         Self {
             active: false,
+            added_options: 0,
             reported_partial: false,
         }
     }
@@ -56,7 +82,7 @@ impl MacCapture {
     /// Set `NSApp.presentationOptions`, preserving every bit this file does not
     /// own — a fullscreen presentation sets its own options through the same
     /// property, and clobbering them would take the window out of fullscreen.
-    fn apply(&self, add: bool) {
+    fn apply(&mut self, add: bool) {
         // SAFETY: `NSApp` is the process's shared application object; both the
         // getter and the setter are main-thread-only, and on this platform the
         // window's event loop *is* the process main thread (see
@@ -67,9 +93,17 @@ impl MacCapture {
                 return;
             }
             let current: usize = msg_send![app, presentationOptions];
-            let ours = DISABLE_PROCESS_SWITCHING | DISABLE_HIDE_APPLICATION;
-            let next = if add { current | ours } else { current & !ours };
+            let next = if add {
+                let change = engage_options(current);
+                self.added_options = change.added;
+                change.next
+            } else {
+                release_options(current, self.added_options)
+            };
             let _: () = msg_send![app, setPresentationOptions: next];
+            if !add {
+                self.added_options = 0;
+            }
         }
     }
 }
@@ -91,7 +125,9 @@ impl Capture for MacCapture {
             self.reported_partial = true;
             // Say once, on the always-on channel, exactly which keystrokes the
             // guest will still not receive on this host.
-            return Err(CaptureError::PartialOnly("window_server_reserved_chords"));
+            return Err(CaptureError::PartialOnly(
+                "process_switching_and_window_server_reserved_chords",
+            ));
         }
         Ok(())
     }
@@ -106,5 +142,34 @@ impl Drop for MacCapture {
         if self.active {
             self.apply(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sized_window_capture_does_not_change_the_dock() {
+        let change = engage_options(0);
+        let dock_options = (1 << 0) | (1 << 1);
+        assert_eq!(change.next, DISABLE_HIDE_APPLICATION);
+        assert_eq!(change.next & dock_options, 0);
+        assert_eq!(release_options(change.next, change.added), 0);
+    }
+
+    #[test]
+    fn existing_presentation_options_are_preserved_and_not_owned() {
+        let unrelated = 1 << 10; // NSApplicationPresentationFullScreen
+        let current = (1 << 1) | unrelated; // NSApplicationPresentationHideDock
+        let change = engage_options(current);
+        assert_eq!(release_options(change.next, change.added), current);
+    }
+
+    #[test]
+    fn release_preserves_options_added_by_another_owner() {
+        let change = engage_options(0);
+        let later = 1 << 10; // NSApplicationPresentationFullScreen
+        assert_eq!(release_options(change.next | later, change.added), later);
     }
 }
