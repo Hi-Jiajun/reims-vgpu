@@ -1497,13 +1497,13 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
         crate::backend::vulkan::engine::take_released_host_aliases()
             .into_iter()
             .collect();
-    for alias @ (ptr, len) in state.retired_views.drain(..) {
+    for (ptr, len) in state.retired_views.drain(..) {
         #[cfg(feature = "backend-vulkan")]
-        if backend_owned.contains(&alias) {
+        if backend_owned.contains(&(ptr, len)) {
             continue;
         }
         #[cfg(feature = "backend-vulkan")]
-        released.remove(&alias);
+        released.remove(&(ptr, len));
         host.unmap_pages(ptr, len);
     }
     #[cfg(feature = "backend-vulkan")]

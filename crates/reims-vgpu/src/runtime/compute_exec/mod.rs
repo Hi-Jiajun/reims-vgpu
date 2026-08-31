@@ -689,6 +689,14 @@ pub enum ComputeReflectionDecline {
         feature: &'static str,
         count: usize,
     },
+    /// The reflected exact-thread dispatch names a push-constant offset whose
+    /// payload would not fit the range the translator publishes. Refused rather
+    /// than clamped: a truncated range is a shader reading bytes no one wrote.
+    DispatchPushRangeUnavailable { pipeline_ref: u32 },
+    /// The translator refused to plan this launch's regions, so the dispatch
+    /// does not reach the device. Its own text rides the emitter's `detail`
+    /// field rather than the reason, which stays a stable slug.
+    DispatchPlanRefused { pipeline_ref: u32 },
 }
 
 impl crate::observe::Decline for ComputeReflectionDecline {
@@ -698,6 +706,10 @@ impl crate::observe::Decline for ComputeReflectionDecline {
             Self::ReflectedInterfaceUnsupported { .. } => {
                 "compute_reflection_interface_unsupported"
             }
+            Self::DispatchPushRangeUnavailable { .. } => {
+                "compute_reflection_dispatch_push_range_unavailable"
+            }
+            Self::DispatchPlanRefused { .. } => "compute_reflection_dispatch_plan_refused",
         }
     }
 
@@ -726,6 +738,12 @@ impl crate::observe::Decline for ComputeReflectionDecline {
                 ("feature", (*feature).to_string()),
                 ("count", count.to_string()),
             ],
+            Self::DispatchPushRangeUnavailable { pipeline_ref } => {
+                vec![("pipeline_ref", pipeline_ref.to_string())]
+            }
+            Self::DispatchPlanRefused { pipeline_ref } => {
+                vec![("pipeline_ref", pipeline_ref.to_string())]
+            }
         }
     }
 }
@@ -4453,27 +4471,39 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         .reflection
         .local_size
         .expect("kernel cache admits only the requested reflected local size");
-    let threads_per_grid_push = match kernel_shader.reflection.kernel_dispatch {
-        Some(metal2vulkan::reflect::KernelDispatch::ThreadsPushConstant { offset }) => {
-            let exact = if dispatch_threads {
-                [grid_x, grid_y, grid_z]
-            } else {
-                let Some(x) = wg_x.checked_mul(tg_x) else {
-                    return ComputeStatus::BadGrid("compute_vk_grid_overflow");
-                };
-                let Some(y) = wg_y.checked_mul(tg_y) else {
-                    return ComputeStatus::BadGrid("compute_vk_grid_overflow");
-                };
-                let Some(z) = wg_z.checked_mul(tg_z) else {
-                    return ComputeStatus::BadGrid("compute_vk_grid_overflow");
-                };
-                [x, y, z]
+    let Some(kernel_dispatch) = kernel_shader.reflection.kernel_dispatch else {
+        return ComputeStatus::Unsupported("compute_kernel_dispatch_missing");
+    };
+    let dispatch = match kernel_dispatch_launch(
+        kernel_dispatch,
+        reflected_local_size,
+        [wg_x, wg_y, wg_z],
+        [tg_x, tg_y, tg_z],
+        dispatch_threads.then_some([grid_x, grid_y, grid_z]),
+    ) {
+        Ok(dispatch) => dispatch,
+        Err(decline) => {
+            let (status, detail) = match &decline {
+                KernelDispatchDecline::GridOverflow => {
+                    (ComputeStatus::BadGrid("compute_vk_grid_overflow"), None)
+                }
+                KernelDispatchDecline::PushRangeUnavailable => (
+                    ComputeStatus::Unsupported("compute_kernel_dispatch_push_range"),
+                    None,
+                ),
+                KernelDispatchDecline::PlanRefused(detail) => (
+                    ComputeStatus::BadGrid("compute_vk_dispatch_plan"),
+                    Some(detail.replace(char::is_whitespace, "_")),
+                ),
             };
-            Some((offset, exact))
+            let reason = decline.reason(acc.pipeline_ref);
+            let mut emit = crate::observe::Emit::decline("compute_linux_kernel_dispatch", &reason);
+            if let Some(detail) = detail {
+                emit = emit.field("detail", detail);
+            }
+            emit.fail_once(u64::from(acc.pipeline_ref));
+            return status;
         }
-        Some(metal2vulkan::reflect::KernelDispatch::Workgroups)
-        | Some(metal2vulkan::reflect::KernelDispatch::ThreadsFixed { .. }) => None,
-        None => return ComputeStatus::Unsupported("compute_kernel_dispatch_missing"),
     };
     let mut spirv = match spirv_words_le(&kernel_shader.spirv) {
         Ok(w) => w,
@@ -5069,8 +5099,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let req = ComputeRequest {
         spirv,
         entry: "main".into(),
-        grid: [wg_x, wg_y, wg_z],
-        threads_per_grid_push,
+        dispatch,
         storage_buffers,
         sampled_images,
         samplers,
@@ -5246,6 +5275,101 @@ pub(crate) fn linux_stage_input_or_imageblock_unsupported(
     pipeline_stage_input || acc.imageblock.is_some()
 }
 
+/// Why a reflected kernel dispatch contract could not become device work.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KernelDispatchDecline {
+    /// A `dispatchThreadgroups` record whose workgroup count times its
+    /// threadgroup size does not fit the logical thread grid's `u32`.
+    GridOverflow,
+    /// The reflected exact-thread payload has no representable byte range.
+    PushRangeUnavailable,
+    /// The translator refused to plan this launch's regions.
+    PlanRefused(String),
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl KernelDispatchDecline {
+    fn reason(&self, pipeline_ref: u32) -> ComputeReflectionDecline {
+        match self {
+            Self::GridOverflow | Self::PlanRefused(_) => {
+                ComputeReflectionDecline::DispatchPlanRefused { pipeline_ref }
+            }
+            Self::PushRangeUnavailable => {
+                ComputeReflectionDecline::DispatchPushRangeUnavailable { pipeline_ref }
+            }
+        }
+    }
+}
+
+/// Turn one translated kernel's reflected dispatch contract into the device
+/// work this launch performs.
+///
+/// The contract, not the record, decides the shape. A module translated for
+/// whole workgroups baked its local size and can only be dispatched as one
+/// rounded grid. A module translated for exact threads left its local size
+/// specializable, and the translator decomposes the logical thread grid into
+/// the interior plus each axis's boundary slab — at most eight regions, each
+/// its own dispatch at its own workgroup size. Issuing such a module as a
+/// single rounded dispatch would run invocations past the guest's grid; issuing
+/// only some of its regions would drop guest threads. Both are why this returns
+/// the whole plan rather than a grid and a correction.
+///
+/// `dispatch_threads_grid` is the exact thread count of a Metal
+/// `dispatchThreads` record, and `None` is a `dispatchThreadgroups` record —
+/// whose `workgroups * threadgroup` threads decompose to exactly one region at
+/// the nominal local size, so one cached translation serves both Metal forms.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn kernel_dispatch_launch(
+    kernel_dispatch: metal2vulkan::reflect::KernelDispatch,
+    nominal_local_size: [u32; 3],
+    workgroups: [u32; 3],
+    threadgroup: [u32; 3],
+    dispatch_threads_grid: Option<[u32; 3]>,
+) -> Result<crate::backend::vulkan::engine::ComputeDispatch, KernelDispatchDecline> {
+    use crate::backend::vulkan::engine as vk_engine;
+    use metal2vulkan::reflect::KernelDispatch;
+
+    if matches!(kernel_dispatch, KernelDispatch::Workgroups) {
+        return Ok(vk_engine::ComputeDispatch::Workgroups(workgroups));
+    }
+    let threads_per_grid = match dispatch_threads_grid {
+        Some(grid) => grid,
+        None => {
+            let mut threads = [0u32; 3];
+            for dimension in 0..3 {
+                threads[dimension] = workgroups[dimension]
+                    .checked_mul(threadgroup[dimension])
+                    .ok_or(KernelDispatchDecline::GridOverflow)?;
+            }
+            threads
+        }
+    };
+    // The reflected range, not a constructed one: `ThreadsFixed` puts its
+    // payload at the translator's default offset while `ThreadsDynamic` names
+    // its own, and an offset whose range would not fit is refused rather than
+    // truncated — a short range is a shader reading bytes no one wrote.
+    let range = kernel_dispatch
+        .push_constant_range()
+        .ok_or(KernelDispatchDecline::PushRangeUnavailable)?;
+    let plan = kernel_dispatch
+        .plan(nominal_local_size, Some(threads_per_grid))
+        .map_err(KernelDispatchDecline::PlanRefused)?;
+    Ok(vk_engine::ComputeDispatch::Regions {
+        push_offset: range.offset,
+        threadgroups_per_grid: plan.threadgroups_per_grid,
+        regions: plan
+            .regions
+            .iter()
+            .map(|region| vk_engine::ComputeDispatchRegion {
+                local_size: region.local_size,
+                group_count: region.group_count,
+                push_constants: plan.push_constants(*region),
+            })
+            .collect(),
+    })
+}
+
 #[cfg(feature = "backend-vulkan")]
 const COMPUTE_ENGINE_STALL_PROXY_MS: u64 = 2_000;
 
@@ -5265,7 +5389,7 @@ fn spawn_compute_engine_stall_watchdog(
     let done = Arc::new(AtomicBool::new(false));
     let thread_done = Arc::clone(&done);
     let spirv = req.spirv.clone();
-    let grid = req.grid;
+    let grid = req.dispatch.threadgroups_per_grid();
     let buffers = req.storage_buffers.len();
     let images = req.storage_images.len();
     let image_geometry: Vec<_> = req

@@ -16,11 +16,19 @@ use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::pools::{BufferSlot, ResourcePools, StorageImageKey, StorageImageSlot};
 use super::types::{
-    ComputeBufferOutput, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
-    ComputeSampledImageResource, ComputeSampledSource, ComputeStorageResidency, DrawError,
-    TargetIdentity,
+    ComputeBufferOutput, ComputeDispatch, ComputeDispatchPayload, ComputeOutput, ComputeRequest,
+    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+    ComputeStorageResidency, DrawError, TargetIdentity,
 };
 use super::vk_call::{VkCall, VkOp};
+
+/// One recorded `vkCmdDispatch`, with the pipeline its workgroup size selected
+/// and the payload that names its place in the logical grid.
+struct DispatchStep {
+    pipeline: vk::Pipeline,
+    group_count: [u32; 3],
+    push: Option<(u32, ComputeDispatchPayload)>,
+}
 
 struct PreparedStorageImage {
     binding: u32,
@@ -132,10 +140,31 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
             ComputeValidationDecline::EntryInteriorNul,
         ));
     }
-    if req.grid.contains(&0) {
+    let threadgroups_per_grid = req.dispatch.threadgroups_per_grid();
+    if threadgroups_per_grid.contains(&0) {
         return Err(DrawError::ComputeValidation(
-            ComputeValidationDecline::ZeroGrid { grid: req.grid },
+            ComputeValidationDecline::ZeroGrid {
+                grid: threadgroups_per_grid,
+            },
         ));
+    }
+    if let ComputeDispatch::Regions { regions, .. } = &req.dispatch {
+        if regions.is_empty() {
+            return Err(DrawError::ComputeValidation(
+                ComputeValidationDecline::NoDispatchRegions,
+            ));
+        }
+        for (index, region) in regions.iter().enumerate() {
+            if region.local_size.contains(&0) || region.group_count.contains(&0) {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::ZeroDispatchRegion {
+                        region: index,
+                        local_size: region.local_size,
+                        group_count: region.group_count,
+                    },
+                ));
+            }
+        }
     }
     let mut bindings = BTreeSet::new();
     for b in &req.storage_buffers {
@@ -442,28 +471,70 @@ pub(crate) unsafe fn execute_compute_inner(
 
     let layout_key = LayoutKey {
         bindings: layout_bindings,
-        push_constant: req.threads_per_grid_push.map(|(offset, _)| (offset, 12)),
+        push_constant: req.dispatch.push_constant_range(),
     };
 
     let (spirv_digest, module) = caches.get_or_create_shader(ctx, &req.spirv, counters, pools)?;
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
-    let cpipe_key = ComputePipelineKey {
-        spirv: spirv_digest,
-        entry: req.entry.clone(),
-        layout: layout_key.clone(),
+    let shader_source = super::caches::ShaderModuleSource {
+        module,
+        spirv: &req.spirv,
     };
-    // One cache, consulted once; `get_or_create_compute_pipeline` counts the hit.
-    let pipeline = caches.get_or_create_compute_pipeline(
-        ctx,
-        &cpipe_key,
-        super::caches::ShaderModuleSource {
-            module,
-            spirv: &req.spirv,
-        },
-        pipeline_layout,
-        counters,
-        pools,
-    )?;
+    // One pipeline per region workgroup size. A whole-workgroup module baked
+    // its local size and needs exactly one; an exact-thread launch needs the
+    // interior size plus whichever boundary sizes its grid produced. The cache
+    // is content-keyed on that size, so a steady dispatch shape pays no create
+    // after its first launch. `get_or_create_compute_pipeline` counts each hit.
+    let mut dispatch_steps: Vec<DispatchStep> = Vec::new();
+    match &req.dispatch {
+        ComputeDispatch::Workgroups(grid) => {
+            let cpipe_key = ComputePipelineKey {
+                spirv: spirv_digest,
+                entry: req.entry.clone(),
+                layout: layout_key.clone(),
+                local_size: None,
+            };
+            dispatch_steps.push(DispatchStep {
+                pipeline: caches.get_or_create_compute_pipeline(
+                    ctx,
+                    &cpipe_key,
+                    shader_source,
+                    pipeline_layout,
+                    counters,
+                    pools,
+                )?,
+                group_count: *grid,
+                push: None,
+            });
+        }
+        ComputeDispatch::Regions {
+            push_offset,
+            regions,
+            ..
+        } => {
+            dispatch_steps.reserve(regions.len());
+            for region in regions {
+                let cpipe_key = ComputePipelineKey {
+                    spirv: spirv_digest,
+                    entry: req.entry.clone(),
+                    layout: layout_key.clone(),
+                    local_size: Some(region.local_size),
+                };
+                dispatch_steps.push(DispatchStep {
+                    pipeline: caches.get_or_create_compute_pipeline(
+                        ctx,
+                        &cpipe_key,
+                        shader_source,
+                        pipeline_layout,
+                        counters,
+                        pools,
+                    )?,
+                    group_count: region.group_count,
+                    push: Some((*push_offset, region.push_constants)),
+                });
+            }
+        }
+    }
 
     // Storage buffers: host-visible staging used as SSBOs (same as draw path).
     let mut storage_slots = Vec::new();
@@ -1154,8 +1225,6 @@ pub(crate) unsafe fn execute_compute_inner(
         pools.registry_note_access(identity, *next_access);
     }
 
-    ctx.device
-        .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
     if push_descriptors {
         ctx.push_descriptor
             .as_ref()
@@ -1181,18 +1250,33 @@ pub(crate) unsafe fn execute_compute_inner(
             .descriptor_set_binds
             .fetch_add(1, Ordering::Relaxed);
     }
-    if let Some((offset, threads)) = req.threads_per_grid_push {
-        let bytes = std::slice::from_raw_parts(threads.as_ptr().cast::<u8>(), 12);
-        ctx.device.cmd_push_constants(
+    // Descriptors are bound once for the whole launch: every region pipeline
+    // shares this exact layout object, so a pipeline bind between them does not
+    // disturb the set. No barrier separates the regions either — they are one
+    // Metal `dispatchThreads`, whose threads have no ordering among themselves,
+    // and consecutive Vulkan dispatches without a barrier carry that same
+    // permission to overlap.
+    for step in &dispatch_steps {
+        ctx.device
+            .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, step.pipeline);
+        if let Some((offset, payload)) = &step.push {
+            let bytes =
+                std::slice::from_raw_parts(payload.as_ptr().cast::<u8>(), size_of_val(payload));
+            ctx.device.cmd_push_constants(
+                cb,
+                pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                *offset,
+                bytes,
+            );
+        }
+        ctx.device.cmd_dispatch(
             cb,
-            pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            offset,
-            bytes,
+            step.group_count[0],
+            step.group_count[1],
+            step.group_count[2],
         );
     }
-    ctx.device
-        .cmd_dispatch(cb, req.grid[0], req.grid[1], req.grid[2]);
 
     // SSBO → host
     if storage_slots.iter().any(|(_, _, _, writable)| *writable) {
@@ -1585,7 +1669,7 @@ mod tests {
         let req = ComputeRequest {
             spirv: vec![0x0723_0203],
             entry: "ma\0in".into(),
-            grid: [1, 1, 1],
+            dispatch: ComputeDispatch::Workgroups([1, 1, 1]),
             ..Default::default()
         };
         let decline = match validate_compute(&req) {
@@ -1606,7 +1690,7 @@ mod tests {
         let request = ComputeRequest {
             spirv: vec![0x0723_0203],
             entry: "main".into(),
-            grid: [1, 1, 1],
+            dispatch: ComputeDispatch::Workgroups([1, 1, 1]),
             sampled_images: vec![first, second],
             ..Default::default()
         };
@@ -1659,7 +1743,7 @@ mod tests {
         let mut req = ComputeRequest {
             spirv: vec![0x0723_0203],
             entry: "main".into(),
-            grid: [1, 1, 1],
+            dispatch: ComputeDispatch::Workgroups([1, 1, 1]),
             sampled_images: vec![ComputeSampledImageResource {
                 mip_levels: 1,
                 binding: 32,

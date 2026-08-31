@@ -62,15 +62,16 @@ pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue,
-    ColorWriteMask, ComputeBufferResource, ComputeImageDestination, ComputeImageResult,
-    ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
-    ComputeSampledSource, ComputeStorageImageResource, ComputeStorageResidency, CullMode,
-    DepthClipMode, DepthState, DrawError, DrawOutput, DrawRequest, FillMode, GuestRun,
-    GuestRunSource, GuestSampledBacking, GuestTargetBacking, GuestTargetMemory, GuestTargetSeed,
-    IndexType, IndexedDrawResource, PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin,
-    SampledContentIdentity, SampledImageResource, SampledSource, SamplerAddressMode,
-    SamplerBorderColor, SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource,
-    ScissorResource, SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    ColorWriteMask, ComputeBufferResource, ComputeDispatch, ComputeDispatchPayload,
+    ComputeDispatchRegion, ComputeImageDestination, ComputeImageResult, ComputeOutput,
+    ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+    ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
+    GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
+    PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
+    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
+    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
     StorageBufferResource, StorageImageFormat, TargetIdentity, TargetKeyDivergence,
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
     VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
@@ -2419,9 +2420,7 @@ pub fn retire_guest_import(
     import_id: crate::runtime::guest_ram::ImportId,
 ) -> Option<(usize, usize)> {
     let mut guard = lock_engine();
-    let Some(device) = guard.owner.ctx.as_ref().map(|ctx| ctx.device.clone()) else {
-        return None;
-    };
+    let device = guard.owner.ctx.as_ref().map(|ctx| ctx.device.clone())?;
     let alias = guard.pools.host_ram_import_alias(import_id);
     unsafe { guard.pools.retire_guest_import(&device, import_id) };
     alias

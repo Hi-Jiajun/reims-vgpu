@@ -589,11 +589,7 @@ impl ResourcePools {
     ) -> Result<usize, DrawError> {
         unsafe { self.batch_flush(ctx, counters)? };
         unsafe {
-            self.retire_signaled_slots(
-                ctx,
-                counters,
-                DeviceLostOp::PoolsFenceStatusMaintenance,
-            )
+            self.retire_signaled_slots(ctx, counters, DeviceLostOp::PoolsFenceStatusMaintenance)
         }
     }
 
@@ -1508,11 +1504,7 @@ impl ResourcePools {
         // order can drop `in_flight` to 0 while later slots still run, which
         // would let `gpu_work_open()` admit a graveyard drain under live work.
         unsafe {
-            self.retire_signaled_slots(
-                ctx,
-                counters,
-                DeviceLostOp::PoolsFenceStatusBeginEntry,
-            )?
+            self.retire_signaled_slots(ctx, counters, DeviceLostOp::PoolsFenceStatusBeginEntry)?
         };
         let next = (self.cur + 1) % self.slots.len();
         if self.slots[next].pending.is_some() {

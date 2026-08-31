@@ -218,8 +218,19 @@ fn assemble_spvasm(asm: &str, name: &str) -> Option<Vec<u32>> {
         std::process::id()
     ));
     std::fs::write(&asm_path, asm).ok()?;
+    // Pinned to the device's own baseline. `spirv-as` defaults to whatever its
+    // build considers current — SPIR-V 1.6 on a recent SPIRV-Tools — and the
+    // engine validates every module under Vulkan 1.2 semantics, so an
+    // unpinned fixture is rejected for its header version before any of these
+    // tests reach the behaviour they assert.
     let status = Command::new("spirv-as")
-        .args([asm_path.to_str().unwrap(), "-o", spv_path.to_str().unwrap()])
+        .args([
+            "--target-env",
+            "vulkan1.2",
+            asm_path.to_str().unwrap(),
+            "-o",
+            spv_path.to_str().unwrap(),
+        ])
         .status();
     if !matches!(status, Ok(s) if s.success()) {
         eprintln!("SKIP {name}: no spirv-as");
@@ -285,8 +296,7 @@ fn compute_inc_ssbo_known_result() {
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [grid, 1, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([grid, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: input,
@@ -348,8 +358,7 @@ fn compute_readonly_ssbo_has_zero_readback() {
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [1, 1, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: 0x1234_5678u32.to_le_bytes().to_vec(),
@@ -425,8 +434,7 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
     let req = ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [8, 8, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([8, 8, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: zeros.clone(),
@@ -479,8 +487,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let req = ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [w, h, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -529,8 +536,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let hit_req = ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [w, h, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -569,8 +575,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
     let mismatch_req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [1, 1, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -663,8 +668,7 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
     let request = |i: u32, seed_generation: u32| ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [w, h, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -755,8 +759,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [w, h, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -825,8 +828,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
         ComputeRequest {
             spirv: words.clone(),
             entry: "main".into(),
-            grid,
-        threads_per_grid_push: None,
+            dispatch: engine::ComputeDispatch::Workgroups(grid),
             storage_buffers: vec![],
             sampled_images: vec![],
             samplers: vec![],
@@ -926,8 +928,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     let fill_req = ComputeRequest {
         spirv: fill_words,
         entry: "main".into(),
-        grid: [w, h, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -960,8 +961,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     let make_fetch = |generation: u32| ComputeRequest {
         spirv: fetch_words.clone(),
         entry: "main".into(),
-        grid: [1, 1, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: vec![0; 16],
@@ -1044,8 +1044,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     let mut req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [1, 1, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: vec![0; 16],
@@ -1134,12 +1133,21 @@ fn compute_m2v_float_mul4_add3_known_result() {
     let inp: Vec<f32> = vec![1., 2., 3., 4., 5., 6., 7., 8.];
     let want: Vec<f32> = vec![7., 11., 15., 19., 23., 27., 31., 35.];
     let input: Vec<u8> = inp.iter().flat_map(|x| x.to_le_bytes()).collect();
-    let grid = 1u32; // LocalSize 64, one group covers ≤64
+    // LocalSize 64 against 8 threads: v30 decomposes that into one boundary
+    // region whose pipeline specializes a workgroup size of 8, so exactly the
+    // eight authored elements are launched and no lane runs past the buffer.
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [grid, 1, 1],
-        threads_per_grid_push: Some((0, [inp.len() as u32, 1, 1])),
+        dispatch: engine::ComputeDispatch::Regions {
+            push_offset: 0,
+            threadgroups_per_grid: [1, 1, 1],
+            regions: vec![engine::ComputeDispatchRegion {
+                local_size: [inp.len() as u32, 1, 1],
+                group_count: [1, 1, 1],
+                push_constants: [inp.len() as u32, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1],
+            }],
+        },
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: input,
@@ -1172,8 +1180,7 @@ fn warm_identical_dispatch_zero_creates_and_allocs() {
     let make_req = || ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [1, 1, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: input.clone(),
@@ -1260,8 +1267,7 @@ fn compute_storage_image_r16float_if_supported() {
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [2, 2, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([2, 2, 1]),
         storage_buffers: vec![],
         sampled_images: vec![],
         samplers: vec![],
@@ -1363,8 +1369,7 @@ fn a_short_bind_cannot_read_the_tail_of_the_slot_it_was_given() {
     let dispatch = |bytes: Vec<u8>| ComputeRequest {
         spirv: words.clone(),
         entry: "main".into(),
-        grid: [1, 1, 1],
-        threads_per_grid_push: None,
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes,
@@ -1443,7 +1448,7 @@ fn compute_sampled_image_serves_every_declared_mip_level() {
         let req = ComputeRequest {
             spirv: words,
             entry: "main".into(),
-            grid: [1, 1, 1],
+            dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
             storage_buffers: vec![ComputeBufferResource {
                 binding: 0,
                 bytes: vec![0; 16],
@@ -1495,7 +1500,7 @@ fn compute_sampled_resident_bind_refuses_a_pyramid() {
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: vec![0; 16],
@@ -1562,7 +1567,7 @@ fn compute_sampled_a8unorm_arrives_in_alpha() {
     let req = ComputeRequest {
         spirv: words,
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
         storage_buffers: vec![ComputeBufferResource {
             binding: 0,
             bytes: vec![0; 16],

@@ -1253,6 +1253,7 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
     };
     ShaderReflection {
         reflection_version: REFLECTION_VERSION,
+        descriptor_layout: Default::default(),
         stage: ShaderStage::Vertex,
         entry_point: None,
         bindings: bindings
@@ -1289,6 +1290,7 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
         depth_qualifier: None,
         stencil_members: vec![],
         local_size: None,
+        kernel_dispatch: None,
         vertex_builtins: Some(VertexBuiltins {
             uses_vertex_index: true,
             uses_instance_index: false,
@@ -1299,6 +1301,8 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
         implicit_imageblock_attachments: vec![],
         fragment_imageblock: None,
         datalayout: None,
+        runtime_sampler_specializations: vec![],
+        runtime_storage_image_specializations: vec![],
         function_constants: vec![],
     }
 }

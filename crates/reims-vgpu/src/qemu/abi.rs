@@ -1066,8 +1066,14 @@ mod tests {
         assert_eq!(std::mem::size_of::<ReimsVgpuMapPagesFailure>(), 16);
         assert_eq!(std::mem::align_of::<ReimsVgpuMapPagesFailure>(), 8);
         assert_eq!(std::mem::offset_of!(ReimsVgpuMapPagesFailure, stage), 0);
-        assert_eq!(std::mem::offset_of!(ReimsVgpuMapPagesFailure, host_errno), 4);
-        assert_eq!(std::mem::offset_of!(ReimsVgpuMapPagesFailure, page_index), 8);
+        assert_eq!(
+            std::mem::offset_of!(ReimsVgpuMapPagesFailure, host_errno),
+            4
+        );
+        assert_eq!(
+            std::mem::offset_of!(ReimsVgpuMapPagesFailure, page_index),
+            8
+        );
     }
 
     /// Every code the header defines maps to its own variant. A code that fell

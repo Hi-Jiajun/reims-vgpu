@@ -1461,18 +1461,118 @@ pub(crate) struct BlendKey {
 /// Named compute failure. Same `vk_engine_*` prefix family as draw.
 pub type ComputeError = DrawError;
 
+/// The translator's per-region dispatch payload: logical thread grid, thread
+/// base, threadgroup base, and logical threadgroup grid, three `u32` each.
+///
+/// Named once so the payload the runtime copies, the field that carries it, and
+/// the byte range the pipeline layout declares are the same width by
+/// construction rather than by three matching literals.
+pub type ComputeDispatchPayload = [u32; 12];
+
+/// One Vulkan dispatch of a Metal exact-thread launch.
+///
+/// `dispatchThreads` may end a dimension in a partial threadgroup, and Vulkan
+/// fixes a workgroup size per pipeline. The translator answers that by cutting
+/// the launch into at most eight rectangular regions — the interior plus the
+/// boundary slab of each axis — and giving each its own local size and its own
+/// logical origin. A region is a whole dispatch, not a correction to one, so a
+/// dropped region is dropped guest work rather than a rounding error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeDispatchRegion {
+    /// The workgroup size this region's pipeline is specialized to, written to
+    /// the translator's three local-size specialization constants.
+    pub local_size: [u32; 3],
+    /// Workgroup counts for this region's `vkCmdDispatch`.
+    pub group_count: [u32; 3],
+    /// The translator's complete dispatch payload for this region: logical
+    /// thread grid, thread base, threadgroup base, logical threadgroup grid.
+    pub push_constants: ComputeDispatchPayload,
+}
+
+/// How one compute request reaches the device.
+///
+/// The two forms are the translated kernel's own dispatch contract, not a
+/// device-side choice: a module built for whole workgroups bakes its local size
+/// as a constant and cannot serve a partial threadgroup, and a module built for
+/// exact threads leaves its local size specializable and reads its logical grid
+/// from push constants. Carrying them as one enum is what keeps an exact-thread
+/// launch from being issued as a single rounded-up dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComputeDispatch {
+    /// Whole-workgroup launch: one dispatch of these workgroup counts, no push
+    /// constants. Only for a module whose dispatch contract proved every
+    /// workgroup complete.
+    Workgroups([u32; 3]),
+    /// Exact-thread launch. Every region is issued, each against a pipeline
+    /// specialized to its own local size, each preceded by its own payload
+    /// written at `push_offset`.
+    Regions {
+        /// Reflected byte offset of the 48-byte dispatch payload.
+        push_offset: u32,
+        /// The logical threadgroup grid the regions tile. Census and
+        /// zero-work validation read this, so both stay answerable without
+        /// walking the regions.
+        threadgroups_per_grid: [u32; 3],
+        regions: Vec<ComputeDispatchRegion>,
+    },
+}
+
+impl Default for ComputeDispatch {
+    fn default() -> Self {
+        Self::Workgroups([0; 3])
+    }
+}
+
+impl ComputeDispatch {
+    /// The whole launch's workgroup counts, whichever form issues them.
+    pub fn threadgroups_per_grid(&self) -> [u32; 3] {
+        match self {
+            Self::Workgroups(grid) => *grid,
+            Self::Regions {
+                threadgroups_per_grid,
+                ..
+            } => *threadgroups_per_grid,
+        }
+    }
+
+    /// The push-constant range a pipeline layout for this launch must declare.
+    pub fn push_constant_range(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Workgroups(_) => None,
+            Self::Regions { push_offset, .. } => {
+                Some((*push_offset, COMPUTE_DISPATCH_PUSH_CONSTANT_SIZE))
+            }
+        }
+    }
+}
+
+/// Byte size of one region's dispatch payload.
+///
+/// Derived from the payload itself rather than restated, so the range a layout
+/// declares cannot drift from the bytes `vkCmdPushConstants` writes. The
+/// assertion below holds it against the translator's own published size; the
+/// two are independently derived — ours from the field, the translator's from
+/// its ABI — and a layout that declares fewer bytes than the shader reads is a
+/// validation error the driver reports, not a wrong answer we could see.
+pub const COMPUTE_DISPATCH_PUSH_CONSTANT_SIZE: u32 =
+    core::mem::size_of::<ComputeDispatchPayload>() as u32;
+
+const _: () = assert!(
+    COMPUTE_DISPATCH_PUSH_CONSTANT_SIZE
+        == metal2vulkan::reflect::KERNEL_DISPATCH_PUSH_CONSTANT_SIZE,
+    "the region payload must be exactly the translator's reflected dispatch range"
+);
+
 /// Inputs for one compute dispatch. Engine receives resolved bytes + SPIR-V only.
 #[derive(Debug, Default)]
 pub struct ComputeRequest {
-    /// Vulkan-dialect compute SPIR-V (LocalSize baked in by metal2vulkan).
+    /// Vulkan-dialect compute SPIR-V. A whole-workgroup module bakes its local
+    /// size; an exact-thread module leaves it specializable per region.
     pub spirv: Vec<u32>,
     /// Entry point name (m2v kernel entry is `"main"`).
     pub entry: String,
-    /// Workgroup counts in (x, y, z). Runtime converts threads→groups when needed.
-    pub grid: [u32; 3],
-    /// Reflected push-constant offset and exact Metal thread grid, when the
-    /// translated kernel's dispatch contract requires a rounded-invocation guard.
-    pub threads_per_grid_push: Option<(u32, [u32; 3])>,
+    /// The launch form the translated kernel's dispatch contract requires.
+    pub dispatch: ComputeDispatch,
     /// Storage-buffer descriptors with reflected shader write access.
     pub storage_buffers: Vec<ComputeBufferResource>,
     /// Sampled images (binding, format, geometry, immutable input bytes).
@@ -2803,7 +2903,7 @@ mod tests {
         assert!(!draw.color_input);
 
         let compute = ComputeRequest::default();
-        assert_eq!(compute.grid, [0, 0, 0]);
+        assert_eq!(compute.dispatch, ComputeDispatch::Workgroups([0, 0, 0]));
         assert!(compute.storage_buffers.is_empty());
         assert!(compute.storage_images.is_empty());
     }

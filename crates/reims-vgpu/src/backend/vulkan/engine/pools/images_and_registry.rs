@@ -2757,9 +2757,27 @@ pub(super) mod pin_count_tests {
         }
 
         let levels = pools.registry_levels();
-        assert_eq!(levels.current, NonPinnedTotals { count: 3, bytes: 3072 });
-        assert_eq!(levels.recoverable, NonPinnedTotals { count: 1, bytes: 1024 });
-        assert_eq!(levels.pinned, NonPinnedTotals { count: 1, bytes: 1024 });
+        assert_eq!(
+            levels.current,
+            NonPinnedTotals {
+                count: 3,
+                bytes: 3072
+            }
+        );
+        assert_eq!(
+            levels.recoverable,
+            NonPinnedTotals {
+                count: 1,
+                bytes: 1024
+            }
+        );
+        assert_eq!(
+            levels.pinned,
+            NonPinnedTotals {
+                count: 1,
+                bytes: 1024
+            }
+        );
     }
 
     /// The window presenter blits a resident with no format conversion and no

@@ -2792,7 +2792,11 @@ pub fn note_drain_setup(ns: u64) {
 }
 
 /// Accumulate one completed drain tranche; emits at most once per second.
-pub fn note_drain_tranche(host: &dyn crate::runtime::host::HostOps, drain_us: u64, publish_us: u64) {
+pub fn note_drain_tranche(
+    host: &dyn crate::runtime::host::HostOps,
+    drain_us: u64,
+    publish_us: u64,
+) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
         // Immediately after `drain_duty`, so the two read as one record: the

@@ -194,9 +194,7 @@ const _: () = assert!(
     SAMPLER_BINDING_BASE + reims_vgpu_wire::ops::bind_limit::SAMPLER <= COLOR_INPUT_BINDING_BASE
 );
 // The relocated fragment buffer band starts past every translator-owned band.
-const _: () = assert!(
-    FRAG_BUFFER_BINDING_OFFSET >= M2V_DEFAULT_DESCRIPTOR_LAYOUT.synthetic.end
-);
+const _: () = assert!(FRAG_BUFFER_BINDING_OFFSET >= M2V_DEFAULT_DESCRIPTOR_LAYOUT.synthetic.end);
 // ...and ends before the relocated fragment sampled bands begin.
 const _: () = assert!(
     SAMPLED_RESOURCE_BINDING_BASE - 1 + FRAG_BUFFER_BINDING_OFFSET
@@ -2196,6 +2194,11 @@ pub fn reflected_storage_image_format(
         TextureFormat::R16f => ImageFormat::R16Float,
         TextureFormat::R16ui => ImageFormat::Unsupported(16),
         TextureFormat::Rg16f => ImageFormat::Rg16Float,
+        // SPIR-V `Rg32f`. The device has no two-channel 32-bit float storage
+        // surface — neither `StorageImageSelector` nor `TexelLayout` names one
+        // — so the honest answer is the format's own SPIR-V ordinal carried as
+        // unsupported, which round-trips through `raw`/`from_raw` unchanged.
+        TextureFormat::Rg32f => ImageFormat::Unsupported(6),
         TextureFormat::R32f => ImageFormat::R32Float,
         TextureFormat::R32i => ImageFormat::Unsupported(17),
         TextureFormat::R32ui => ImageFormat::R32ui,
@@ -5075,12 +5078,10 @@ mod more_tests {
         assert_eq!(classes[31], Some(BindingClass::StorageTexture));
         assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 1);
         let bindings = declared_binding_numbers(&words);
-        assert!(bindings.contains(&(
-            TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-        )));
-        assert!(bindings.contains(&(
-            M2V_DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start + 3
-        )));
+        assert!(
+            bindings.contains(&(TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET))
+        );
+        assert!(bindings.contains(&(M2V_DEFAULT_DESCRIPTOR_LAYOUT.storage_textures.start + 3)));
     }
 
     /// The type rule replaces the band rule, so on the layout the band rule was

@@ -1771,7 +1771,7 @@ fn incomplete_compute_engine_call_fires_stall_proxy() {
     let req = ComputeRequest {
         spirv: vec![0x0723_0203],
         entry: "main".into(),
-        grid: [1, 1, 1],
+        dispatch: crate::backend::vulkan::engine::ComputeDispatch::Workgroups([1, 1, 1]),
         ..Default::default()
     };
     let done = spawn_compute_engine_stall_watchdog(pipe, &req, Duration::from_millis(10));
@@ -3213,5 +3213,227 @@ fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
         written.bytes.len(),
         (BASE * BASE * BPP) as usize,
         "a storage binding stages the base alone"
+    );
+}
+
+/// A `dispatchThreads` launch whose thread grid is not a multiple of its
+/// threadgroup must reach the device as regions that tile that grid exactly.
+///
+/// This is the external invariant the v30 dispatch contract replaced culling
+/// with, and it is the one a wrong port loses silently. Rounding the grid up
+/// and issuing one dispatch runs invocations past the guest's thread count —
+/// the surplus lanes write past the end of whatever the kernel indexes. Issuing
+/// only the interior region drops the guest's boundary threads instead. Neither
+/// failure shows up as an error: both produce a dispatch that returns, with the
+/// wrong bytes in the guest's buffer.
+///
+/// So the assertion is coverage itself: walk every thread coordinate the
+/// regions launch and require that the multiset of them is exactly the logical
+/// grid — nothing outside it, nothing twice, nothing missing.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn exact_thread_regions_tile_the_logical_grid_exactly() {
+    use crate::backend::vulkan::engine::ComputeDispatch;
+    use std::collections::HashSet;
+
+    // A boundary in every axis at once (the eight-region case), a boundary in
+    // one axis only, and an exact multiple that needs no boundary at all.
+    for (threads, local) in [
+        ([130u32, 5, 3], [64u32, 2, 2]),
+        ([8, 1, 1], [64, 1, 1]),
+        ([128, 4, 2], [64, 2, 2]),
+        ([1, 1, 1], [64, 1, 1]),
+    ] {
+        let dispatch = kernel_dispatch_launch(
+            metal2vulkan::reflect::KernelDispatch::safe_default(),
+            local,
+            [0, 0, 0],
+            local,
+            Some(threads),
+        )
+        .expect("an exact-thread launch plans its regions");
+        let ComputeDispatch::Regions {
+            threadgroups_per_grid,
+            regions,
+            ..
+        } = &dispatch
+        else {
+            panic!("an exact-thread contract must not collapse to one whole-workgroup dispatch");
+        };
+
+        let mut covered = HashSet::new();
+        for region in regions {
+            assert!(
+                !region.local_size.contains(&0) && !region.group_count.contains(&0),
+                "a region that launches nothing is a region that was not needed",
+            );
+            // Words 3..6 are the region's thread base; words 6..9 its
+            // threadgroup base. Read them back out of the payload the device
+            // will actually push, not out of the planner, so a payload written
+            // in the wrong order fails here rather than in a guest.
+            let thread_base = [
+                region.push_constants[3],
+                region.push_constants[4],
+                region.push_constants[5],
+            ];
+            let threadgroup_base = [
+                region.push_constants[6],
+                region.push_constants[7],
+                region.push_constants[8],
+            ];
+            for dimension in 0..3 {
+                assert_eq!(
+                    thread_base[dimension],
+                    threadgroup_base[dimension] * local[dimension],
+                    "a region's thread base is its threadgroup base scaled by the nominal size",
+                );
+            }
+            assert_eq!(
+                [
+                    region.push_constants[0],
+                    region.push_constants[1],
+                    region.push_constants[2]
+                ],
+                threads,
+                "every region reports the same logical thread grid",
+            );
+            assert_eq!(
+                [
+                    region.push_constants[9],
+                    region.push_constants[10],
+                    region.push_constants[11]
+                ],
+                *threadgroups_per_grid,
+                "every region reports the same logical threadgroup grid",
+            );
+            for z in 0..region.local_size[2] * region.group_count[2] {
+                for y in 0..region.local_size[1] * region.group_count[1] {
+                    for x in 0..region.local_size[0] * region.group_count[0] {
+                        let thread = [thread_base[0] + x, thread_base[1] + y, thread_base[2] + z];
+                        for dimension in 0..3 {
+                            assert!(
+                                thread[dimension] < threads[dimension],
+                                "{thread:?} launches outside the guest's {threads:?} grid",
+                            );
+                        }
+                        assert!(
+                            covered.insert(thread),
+                            "{thread:?} is launched by more than one region",
+                        );
+                    }
+                }
+            }
+        }
+        let total = threads.iter().map(|&d| d as usize).product::<usize>();
+        assert_eq!(
+            covered.len(),
+            total,
+            "the regions for {threads:?} at local size {local:?} left threads unlaunched",
+        );
+        for dimension in 0..3 {
+            assert_eq!(
+                threadgroups_per_grid[dimension],
+                threads[dimension].div_ceil(local[dimension]),
+                "the logical threadgroup grid is the rounded-up thread grid",
+            );
+        }
+    }
+}
+
+/// A `dispatchThreadgroups` record reaches the device as the whole-workgroup
+/// dispatch it always was: one region, the nominal local size, and exactly the
+/// requested workgroup counts.
+///
+/// The device asks for one exact-thread translation per kernel and serves both
+/// Metal launch forms from it, so this is what keeps that sharing honest — a
+/// complete launch must not acquire a boundary region, an extra pipeline, or a
+/// group count other than the one the guest encoded.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_whole_workgroup_record_plans_one_region_at_the_nominal_local_size() {
+    use crate::backend::vulkan::engine::ComputeDispatch;
+
+    let dispatch = kernel_dispatch_launch(
+        metal2vulkan::reflect::KernelDispatch::safe_default(),
+        [64, 1, 1],
+        [3, 2, 1],
+        [64, 1, 1],
+        None,
+    )
+    .expect("a whole-workgroup record plans one region");
+    let ComputeDispatch::Regions {
+        threadgroups_per_grid,
+        regions,
+        ..
+    } = dispatch
+    else {
+        panic!("an exact-thread contract stays an exact-thread contract");
+    };
+    assert_eq!(threadgroups_per_grid, [3, 2, 1]);
+    assert_eq!(regions.len(), 1, "a complete launch has no boundary slab");
+    assert_eq!(regions[0].local_size, [64, 1, 1]);
+    assert_eq!(regions[0].group_count, [3, 2, 1]);
+    assert_eq!(regions[0].push_constants[0..3], [192, 2, 1]);
+}
+
+/// A module translated for whole workgroups baked its local size, so it is the
+/// one form that must stay a single unadorned dispatch.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_whole_workgroup_contract_declares_no_push_constant_range() {
+    use crate::backend::vulkan::engine::ComputeDispatch;
+
+    let dispatch = kernel_dispatch_launch(
+        metal2vulkan::reflect::KernelDispatch::Workgroups,
+        [64, 1, 1],
+        [3, 2, 1],
+        [64, 1, 1],
+        Some([8, 1, 1]),
+    )
+    .expect("a whole-workgroup contract needs no plan");
+    assert_eq!(dispatch, ComputeDispatch::Workgroups([3, 2, 1]));
+    assert_eq!(dispatch.push_constant_range(), None);
+    assert_eq!(dispatch.threadgroups_per_grid(), [3, 2, 1]);
+}
+
+/// A `dispatchThreadgroups` record whose logical thread grid does not fit a
+/// `u32` is refused, not wrapped. A wrapped grid is a launch of the wrong size
+/// that reports success.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_threadgroup_record_whose_thread_grid_overflows_is_refused() {
+    assert_eq!(
+        kernel_dispatch_launch(
+            metal2vulkan::reflect::KernelDispatch::safe_default(),
+            [64, 1, 1],
+            [u32::MAX, 1, 1],
+            [64, 1, 1],
+            None,
+        ),
+        Err(KernelDispatchDecline::GridOverflow),
+    );
+}
+
+/// The reflected payload offset the device declares is the translator's own,
+/// and the range it declares is exactly the payload the regions push.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_declared_push_range_is_the_reflected_offset_and_the_pushed_payload() {
+    let dispatch = kernel_dispatch_launch(
+        metal2vulkan::reflect::KernelDispatch::ThreadsDynamic { offset: 16 },
+        [64, 1, 1],
+        [1, 1, 1],
+        [64, 1, 1],
+        Some([8, 1, 1]),
+    )
+    .expect("a dynamic contract at a nonzero offset plans its regions");
+    let (offset, size) = dispatch
+        .push_constant_range()
+        .expect("an exact-thread launch declares a range");
+    assert_eq!(offset, 16, "the reflected offset is used, not assumed zero");
+    assert_eq!(
+        size as usize,
+        std::mem::size_of::<crate::backend::vulkan::engine::ComputeDispatchPayload>(),
+        "the declared range is exactly the bytes a region pushes",
     );
 }

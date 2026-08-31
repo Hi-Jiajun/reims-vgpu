@@ -732,6 +732,61 @@ fn translation_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Directory [`capture_air`] writes into.
+fn air_capture_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/tmp/reims-vgpu-air")
+}
+
+/// Write one translated AIR blob beside the size of the SPIR-V it produced.
+///
+/// The name is the join this exists for. A driver quarantine line and a
+/// validator refusal both quote the emitted module's **word count**, and
+/// neither can name the AIR that produced it — so the count goes in the file
+/// name and a handover is a lookup rather than another boot.
+///
+/// Observation only, on both the guest path and the failure path: every write
+/// here is best-effort, and a failure is reported once and then ignored. This
+/// runs after the translation it describes, so it cannot change what that
+/// translation produced or whether it was cached.
+fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
+    if !matches!(
+        crate::env::switch(crate::env::AIR_CAPTURE),
+        crate::env::Switch::On
+    ) {
+        return;
+    }
+    let dir = air_capture_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        crate::observe::fail(format!(
+            "air_capture reason=mkdir_failed dir={} err={e}",
+            dir.display()
+        ));
+        return;
+    }
+    // The AIR digest disambiguates two shaders whose modules happen to be the
+    // same length; the word count is what a quarantine or validator line
+    // quotes, so it leads.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    air.hash(&mut hasher);
+    let digest = hasher.finish();
+    let words = spirv.len() / 4;
+    let name = format!("{}-w{words}-{digest:016x}.air", stage_name(stage));
+    let path = dir.join(&name);
+    if path.exists() {
+        return;
+    }
+    match std::fs::write(&path, air) {
+        Ok(()) => crate::observe::fail(format!(
+            "air_capture ok stage={} air_bytes={} spirv_words={words} file={name}",
+            stage_name(stage),
+            air.len()
+        )),
+        Err(e) => crate::observe::fail(format!(
+            "air_capture reason=write_failed file={name} err={e}"
+        )),
+    }
+}
+
 fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // metal2vulkan's tool boundary uses fixed scratch names inside `tmp_dir`.
     // Serialize sync and background calls so their AIR/LLVM/SPIR-V files never
@@ -751,6 +806,7 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     let (spirv, reflection) =
         metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
             .map_err(|e| translate_decline(stage, e.to_string()))?;
+    capture_air(air, stage, &spirv);
     finish_translated(spirv, reflection, stage)
 }
 
@@ -774,6 +830,7 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
     .map_err(|e| M2vCacheDecline::KernelTranslate {
         detail: e.to_string(),
     })?;
+    capture_air(air, Stage::Kernel, &spirv);
     if reflection.local_size != Some(local_size) {
         return Err(M2vCacheDecline::KernelLocalSizeMismatch {
             requested: local_size,

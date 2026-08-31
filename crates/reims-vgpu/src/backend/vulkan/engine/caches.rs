@@ -660,13 +660,19 @@ pub(crate) struct StencilKey {
     pub back: super::types::StencilFaceOps,
 }
 
-/// Lc: compute pipeline cache key — SPIR-V content digest + entry name + layout.
-/// Never funcId / pipeline ref.
+/// Lc: compute pipeline cache key — SPIR-V content digest + entry name + layout
+/// + the workgroup size the module is specialized to. Never funcId / pipeline ref.
+///
+/// The local size belongs in the key because an exact-thread module leaves it
+/// specializable: one translated kernel yields up to eight pipelines whose only
+/// difference is the boundary workgroup size, and they share every other term.
+/// `None` is a module that baked its local size as a constant.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct ComputePipelineKey {
     pub spirv: Digest128,
     pub entry: String,
     pub layout: LayoutKey,
+    pub local_size: Option<[u32; 3]>,
 }
 
 /// A shader module and the words the driver compiles from it.
@@ -2648,10 +2654,39 @@ impl ObjectCaches {
                 super::compute_validation::ComputeValidationDecline::EntryInteriorNul,
             )
         })?;
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+        // The translator decorates its three local-size specialization
+        // constants with `KERNEL_LOCAL_SIZE_SPEC_IDS`, so the map entries are
+        // its ids and the data is the three `u32` in that order.
+        let spec_data: Vec<u8> = key
+            .local_size
+            .iter()
+            .flat_map(|size| size.iter().flat_map(|value| value.to_ne_bytes()))
+            .collect();
+        let spec_entries: Vec<vk::SpecializationMapEntry> = key
+            .local_size
+            .iter()
+            .flat_map(|_| {
+                metal2vulkan::reflect::KERNEL_LOCAL_SIZE_SPEC_IDS
+                    .into_iter()
+                    .enumerate()
+                    .map(|(dimension, id)| {
+                        vk::SpecializationMapEntry::default()
+                            .constant_id(id)
+                            .offset((dimension * std::mem::size_of::<u32>()) as u32)
+                            .size(std::mem::size_of::<u32>())
+                    })
+            })
+            .collect();
+        let spec_info = vk::SpecializationInfo::default()
+            .map_entries(&spec_entries)
+            .data(&spec_data);
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader.module)
             .name(&entry_c);
+        if key.local_size.is_some() {
+            stage = stage.specialization_info(&spec_info);
+        }
         let cpci = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(pipeline_layout);

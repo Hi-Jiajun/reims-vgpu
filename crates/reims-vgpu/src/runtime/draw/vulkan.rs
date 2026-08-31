@@ -7387,8 +7387,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route(use_.slug());
             }
             if let Some((gap, _)) = uses.iter().find(|(gap, use_)| {
-                gap.class == crate::runtime::draw::FragUnboundClass::Buffer
-                    && use_.is_violation()
+                gap.class == crate::runtime::draw::FragUnboundClass::Buffer && use_.is_violation()
             }) {
                 return Err(DrawError::DrawPreparation(
                     DrawPreparationDecline::UnboundStorageBuffer {

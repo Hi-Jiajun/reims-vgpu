@@ -179,6 +179,7 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
     let reflection = |stage| {
         Arc::new(ShaderReflection {
             reflection_version: REFLECTION_VERSION,
+            descriptor_layout: Default::default(),
             stage,
             entry_point: None,
             bindings: vec![],
@@ -190,12 +191,15 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
             depth_qualifier: None,
             stencil_members: vec![],
             local_size: None,
+            kernel_dispatch: None,
             vertex_builtins: None,
             tessellation: None,
             imageblock_layouts: vec![],
             implicit_imageblock_attachments: vec![],
             fragment_imageblock: None,
             datalayout: None,
+            runtime_sampler_specializations: vec![],
+            runtime_storage_image_specializations: vec![],
             function_constants: vec![],
         })
     };
