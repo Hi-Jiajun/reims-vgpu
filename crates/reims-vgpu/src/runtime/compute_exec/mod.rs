@@ -2017,7 +2017,6 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("compute_heap_host_len"));
         };
-        #[cfg(feature = "backend-vulkan")]
         let key = crate::model::ComputeStorageResidencyKey::heap(
             task_id,
             texture_ref,
@@ -2025,10 +2024,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             height,
             format,
         );
-        #[cfg(feature = "backend-vulkan")]
         let serve = match state.compute_storage_residency.get(&key).copied() {
             None => None,
-            Some(generation) => match vulkan::resident_serve(key, generation, is_storage, format) {
+            Some(generation) => match crate::backend::selected()
+                .resident_serve(key, generation, is_storage, format)
+            {
                 // A heap texture has no guest window to re-read: once the mirror
                 // claims a resident, the engine's copy is the only content, so a
                 // resident the engine can no longer serve is a loss, not a
@@ -2046,8 +2046,6 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 serve => serve,
             },
         };
-        #[cfg(not(feature = "backend-vulkan"))]
-        let serve: Option<ResidentServe> = None;
         let seed_generation = serve.and_then(ResidentServe::seed_generation).unwrap_or(0);
         crate::observe::off(format!(
             "compute_stage_tex heap_ok ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} storage={} seed_gen={seed_generation} resident_sample={} use_offset={} offset={offset:#x}",
@@ -2329,10 +2327,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             .ok_or(ComputeStatus::MissingTexture(
                 "compute_stage_tex_mapping_gone",
             ))?;
-        #[cfg(feature = "backend-vulkan")]
         let map_generation = m.map_generation;
-        #[cfg(feature = "backend-vulkan")]
-        let mut seed_generation = m.content_generation;
+        // Read off `m` here because the borrow does not reach the staging
+        // below; what this generation *means* for the staging is decided there,
+        // once `serve` is known.
+        let content_generation = m.content_generation;
         let pages_n = m.page_entries.len();
         // Wire type-4 `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
         // Independent of plane w/h and of MapMemory2 IOAccelMemory length — measure-only.
@@ -2405,7 +2404,6 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_span"));
         }
-        #[cfg(feature = "backend-vulkan")]
         let residency_key = crate::model::ComputeStorageResidencyKey {
             mapping_id,
             map_generation,
@@ -2434,24 +2432,31 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // current content the engine already holds GPU-resident (a prior
         // dispatch's storage output — live class: the dispatch samples the very
         // window it storage-writes) never needs the guest read either.
-        #[cfg(feature = "backend-vulkan")]
         let serve = state
             .compute_storage_residency
             .get(&residency_key)
             .copied()
             .and_then(|mirror_generation| {
-                vulkan::resident_serve(residency_key, mirror_generation, is_storage, stage_fmt)
+                crate::backend::selected().resident_serve(
+                    residency_key,
+                    mirror_generation,
+                    is_storage,
+                    stage_fmt,
+                )
             });
-        #[cfg(not(feature = "backend-vulkan"))]
-        let serve: Option<ResidentServe> = None;
-        // Unlike the heap and linear rails, this one's fallback generation is
-        // the mapping's own content generation rather than zero, so a seed
-        // overwrites it and anything else leaves it alone. Gated with the
-        // generation it writes: `serve` is unconditionally `None` without the
-        // Vulkan backend, so this is a no-op there rather than a second policy.
-        #[cfg(feature = "backend-vulkan")]
-        if let Some(generation) = serve.and_then(ResidentServe::seed_generation) {
-            seed_generation = generation;
+        // The generation this staging is at. Unlike the heap and linear rails,
+        // this one's fallback is the mapping's own content generation rather
+        // than zero — a seed overrides it and anything else leaves it alone.
+        //
+        // Derived from `serve` rather than assigned into a `mut`, so the value
+        // the census reports and the value the candidate carries cannot get out
+        // of step, and so a rail that serves nothing needs no gate here: it
+        // answers `None` and this is `content_generation`, which is what that
+        // arm always used.
+        let seed_generation = serve
+            .and_then(ResidentServe::seed_generation)
+            .unwrap_or(content_generation);
+        if serve.and_then(ResidentServe::seed_generation).is_some() {
             crate::observe::off(format!(
                 "compute_stage_resident_skip mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={seed_generation} bytes={need}"
             ));
@@ -2764,21 +2769,24 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         (Some(key), Some(resident_gen)) => Some((
             key,
             resident_gen,
-            vulkan::resident_serve(key, resident_gen, is_storage, stage_format),
+            crate::backend::selected().resident_serve(key, resident_gen, is_storage, stage_format),
         )),
         _ => None,
     };
-    #[cfg(feature = "backend-vulkan")]
     // A resident is one window at one level, so it can only answer for the
     // base. Serving a pyramid from it would leave every level above the base
     // unwritten — which is exactly the defect the pyramid repairs — so a
-    // multi-level binding reads its own bytes and the engine refuses the pair
+    // multi-level binding reads its own bytes and the rail refuses the pair
     // outright as `vk_compute_exec_resident_sample_is_not_a_pyramid`.
+    #[cfg(feature = "backend-vulkan")]
     let serve = if level_sources.len() > 1 {
         None
     } else {
         resident.and_then(|(_, _, serve)| serve)
     };
+    // No `resident` to ask on this arm: `linear_texture_resident_gen` reads a
+    // deferred-writeback state only the engine rail arms, so there is no window
+    // to consult rather than a rail declining to answer about one.
     #[cfg(not(feature = "backend-vulkan"))]
     let serve: Option<ResidentServe> = None;
     if let Some(generation) = serve.and_then(ResidentServe::seed_generation) {

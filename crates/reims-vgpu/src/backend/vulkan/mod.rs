@@ -24,7 +24,7 @@ pub mod translate;
 use crate::backend::{Backend, CensusSite, GuestWriteReach, PlaneDrawReader, Rail, StampOrdering};
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
-use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
+use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus, ResidentServe};
 use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
@@ -251,6 +251,16 @@ impl Backend for VulkanBackend {
         site: SettleSite,
     ) -> StampOrdering {
         drain::vulkan::order_completion_stamp(state, host, index, value, site)
+    }
+
+    fn resident_serve(
+        &self,
+        key: ComputeStorageResidencyKey,
+        mirror_generation: u32,
+        is_storage: bool,
+        pixel_format: u16,
+    ) -> Option<ResidentServe> {
+        compute_exec::vulkan::resident_serve(key, mirror_generation, is_storage, pixel_format)
     }
 
     fn preflight_translations<M: HostMemory + HostOps>(

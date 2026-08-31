@@ -91,7 +91,7 @@ pub mod vulkan;
 
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, Type11Texture};
-use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus};
+use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus, ResidentServe};
 use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
@@ -575,6 +575,32 @@ pub(crate) trait Backend: Copy {
         _streams: &[Vec<u8>],
     ) -> bool {
         false
+    }
+
+    /// What this rail can already serve for one compute binding, so the guest
+    /// read that would have staged it is skipped.
+    ///
+    /// The third member of the "pixels the rail may already hold" group above,
+    /// and the one whose `None` is *not* uniformly free: two of its three
+    /// callers fall through to the guest read, but the heap rail has no guest
+    /// window to fall back to — once its mirror claims a resident, the rail's
+    /// copy is the only content there is — so a `None` there is a loss the
+    /// caller reports rather than a slower path it takes. Which of those a
+    /// `None` means belongs to the caller and not here, because it is a fact
+    /// about the binding's backing rather than about the rail.
+    ///
+    /// `mirror_generation` is the device's own record of what it believes the
+    /// rail holds; the rail answers only if what it holds still matches. That
+    /// is the whole check — a rail that has evicted or replaced the resident
+    /// says `None` rather than serving different pixels under the same key.
+    fn resident_serve(
+        &self,
+        _key: ComputeStorageResidencyKey,
+        _mirror_generation: u32,
+        _is_storage: bool,
+        _pixel_format: u16,
+    ) -> Option<ResidentServe> {
+        None
     }
 }
 
@@ -1113,6 +1139,21 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.preflight_translations(state, host, task_id, streams),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.preflight_translations(state, host, task_id, streams),
+        }
+    }
+
+    fn resident_serve(
+        &self,
+        key: ComputeStorageResidencyKey,
+        mirror_generation: u32,
+        is_storage: bool,
+        pixel_format: u16,
+    ) -> Option<ResidentServe> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.resident_serve(key, mirror_generation, is_storage, pixel_format),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.resident_serve(key, mirror_generation, is_storage, pixel_format),
         }
     }
 }
