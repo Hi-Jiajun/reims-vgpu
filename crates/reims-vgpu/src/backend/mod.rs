@@ -118,6 +118,10 @@ pub mod vulkan;
 /// rail's.
 pub mod compute_session;
 
+/// The host driver's answer to the guest's `heapTextureSizeAndAlign` contract.
+/// A host capability, deliberately neither a rail decision nor a rail's module.
+pub mod heap_placement;
+
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus, ResidentServe};
