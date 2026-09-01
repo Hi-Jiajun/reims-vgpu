@@ -697,3 +697,132 @@ pub(super) fn note_store_action_no_attachment(which: &'static str, action: u16) 
          action={action}"
     ));
 }
+
+/// An info-encoder record this rail did not answer.
+///
+/// # Why an unanswered query is not a dropped command
+///
+/// Every other encoder tells the device to do something, and a record this
+/// device drops costs the guest that one thing. The info encoder *asks*: each
+/// selector carries a `(reply_buffer_ref, reply_offset)` pair naming the memory
+/// the answer goes in, and the guest reads that memory back whether or not
+/// anything was written into it. So leaving a query unanswered does not lose a
+/// command — it hands the guest whatever the reply buffer last held and lets it
+/// be read as a pipeline's imageblock size, a heap's host address, or a
+/// coordinate mapping. A wrong answer travels further than a missing one.
+///
+/// Until this landed, seventeen of the eighteen info opcodes reached
+/// `handle_info_record`, matched nothing, and returned. The one that did match
+/// (`0x1d1`) declines every time. So the whole rail was silent, and a boot in
+/// which the guest asked eighteen questions and got none looked exactly like a
+/// boot in which it asked none.
+///
+/// # The three cases, and why they are not one slug
+///
+/// The reason comes from the closure ledger rather than from a list here, which
+/// is what keeps this line and the ledger from drifting apart: the ledger is
+/// where an operation's outcome is recorded, and the two disagreeing is itself
+/// one of the three things this can say.
+///
+/// * **Unresolved in the ledger** — expected. The ledger says nobody has
+///   established what this query owes the guest, and this is the traffic that
+///   would establish it.
+/// * **Judged non-blocking in the ledger** — a contradiction. The ledger claims
+///   the operation is implemented, a proven no-op, or refused by name, and the
+///   rail that would have to do that has no arm for it. One of the two is
+///   wrong.
+/// * **Absent from the ledger** — an opcode neither the serializer manifest nor
+///   the ledger knows about, on a rail whose opcode space is otherwise fully
+///   enumerated. That is a decode desync or a serializer this project has not
+///   seen.
+pub(super) struct InfoRecordUnanswered {
+    pub opcode: u32,
+    pub len: usize,
+    pub judged: Option<&'static reims_vgpu_protocol::closure::Op>,
+}
+
+impl crate::observe::Decline for InfoRecordUnanswered {
+    fn slug(&self) -> &'static str {
+        match self.judged {
+            Some(op) if op.closure.blocks_cutover() => "info_query_unanswered",
+            Some(_) => "info_query_ledger_disagrees",
+            None => "info_opcode_unjudged",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        let mut f = vec![
+            ("op", format!("{:#x}", self.opcode)),
+            ("len", self.len.to_string()),
+        ];
+        if let Some(op) = self.judged {
+            f.push(("closure", op.closure.name().to_string()));
+            f.push(("selector", op.selector.to_string()));
+        }
+        f
+    }
+}
+
+/// Which info query went unanswered, as a route-counter name.
+///
+/// Per opcode rather than one merged counter, because the distribution is the
+/// open question the rail leaves behind: ten of these selectors write the same
+/// record and differ only in which kind of object they ask about, so "the guest
+/// issued 4 000 info queries" cannot say whether the device owes it a heap's
+/// host address or a pipeline's imageblock geometry — and those cost very
+/// different things to answer.
+///
+/// Spelled against the wire crate's constants rather than literals, so a
+/// renumbering there fails the build here instead of silently re-labelling a
+/// counter.
+fn info_query_route(opcode: u32) -> &'static str {
+    use reims_vgpu_wire::ops::info as w;
+    match opcode {
+        w::OPCODE_COMPUTE_PIPELINE_STATE_INFO => "info_unanswered_compute_pipeline_state",
+        w::OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN => "info_unanswered_heap_texture_size",
+        w::OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN_WIDE => {
+            "info_unanswered_heap_texture_size_wide"
+        }
+        w::OPCODE_RATE_MAP_INFO => "info_unanswered_rate_map",
+        w::OPCODE_COPY_RATE_PARAMETER_BUFFER => "info_unanswered_rate_parameter_buffer",
+        w::OPCODE_MAP_SCREEN_TO_PHYSICAL => "info_unanswered_map_screen_to_physical",
+        w::OPCODE_MAP_PHYSICAL_TO_SCREEN => "info_unanswered_map_physical_to_screen",
+        w::OPCODE_RENDER_PIPELINE_STATE_INFO => "info_unanswered_render_pipeline_state",
+        w::OPCODE_RENDER_PIPELINE_IMAGEBLOCK => "info_unanswered_render_pipeline_imageblock",
+        w::OPCODE_COMPUTE_PIPELINE_IMAGEBLOCK => "info_unanswered_compute_pipeline_imageblock",
+        w::OPCODE_BUFFER_HOST_RESOURCE_INFO => "info_unanswered_buffer_host_resource",
+        w::OPCODE_TEXTURE_HOST_RESOURCE_INFO => "info_unanswered_texture_host_resource",
+        w::OPCODE_HEAP_HOST_RESOURCE_INFO => "info_unanswered_heap_host_resource",
+        w::OPCODE_SAMPLER_HOST_RESOURCE_INFO => "info_unanswered_sampler_host_resource",
+        w::OPCODE_ICB_HOST_RESOURCE_INFO => "info_unanswered_icb_host_resource",
+        w::OPCODE_RENDER_PIPELINE_HOST_RESOURCE_INFO => {
+            "info_unanswered_render_pipeline_host_resource"
+        }
+        w::OPCODE_COMPUTE_PIPELINE_HOST_RESOURCE_INFO => {
+            "info_unanswered_compute_pipeline_host_resource"
+        }
+        w::OPCODE_DEPTH_STENCIL_HOST_RESOURCE_INFO => "info_unanswered_depth_stencil_host_resource",
+        // Not a bucket standing in for a known opcode: the eighteen above are
+        // the whole declared info space, so a nineteenth is an opcode this
+        // project has not seen and the counter says so by name.
+        _ => "info_unanswered_undeclared_opcode",
+    }
+}
+
+/// Price and name one info record the rail left unanswered.
+///
+/// Latched per opcode: a guest re-asks the same question every frame, so an
+/// unlatched line would be one per frame for a fact that does not change. The
+/// route counter is not latched — the count is the measurement.
+pub(super) fn note_info_record_unanswered(task_id: u32, opcode: u32, len: usize) {
+    use reims_vgpu_protocol::closure::{find, Rail};
+    crate::runtime::drain::note_store_route(info_query_route(opcode));
+    let decline = InfoRecordUnanswered {
+        opcode,
+        len,
+        judged: find(Rail::Info, opcode),
+    };
+    crate::observe::Emit::decline("info_record", &decline)
+        .field("task", task_id)
+        .fail_once(u64::from(opcode));
+}

@@ -5495,3 +5495,72 @@ fn a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_cle
          silently is the one outcome the ground rules forbid"
     );
 }
+
+/// The info rail had exactly one arm and seventeen silences. A boot in which
+/// the guest asked eighteen questions and got no answers read identically to a
+/// boot in which it asked none, and the answer it read back was whatever its
+/// reply buffer last held.
+#[test]
+fn an_unanswered_info_query_names_the_question_it_did_not_answer() {
+    use reims_vgpu_wire::ops::info as w;
+    let cap = crate::observe::sink::FailCapture::start();
+    super::note_info_record_unanswered(9, w::OPCODE_HEAP_HOST_RESOURCE_INFO, 0x18);
+    let line = cap.one("info_record");
+    assert!(
+        line.contains("reason=info_query_unanswered"),
+        "the ledger has this query as unresolved, so the line must say so: {line}"
+    );
+    assert!(
+        line.contains("op=0x1cf") && line.contains("task=9"),
+        "the line must name the query and whose task asked it: {line}"
+    );
+    assert!(
+        line.contains("selector=heapHostResourceInfo"),
+        "ten of these selectors write the same record and differ only in what \
+         they ask about, so the selector is the whole content of the line: {line}"
+    );
+}
+
+/// An opcode on a rail whose whole space is enumerated is not a dropped
+/// command — it is a stream this project cannot frame.
+#[test]
+fn an_info_opcode_outside_the_declared_space_says_it_is_unjudged() {
+    let cap = crate::observe::sink::FailCapture::start();
+    super::note_info_record_unanswered(4, 0x1ff, 0x18);
+    let line = cap.one("info_record");
+    assert!(
+        line.contains("reason=info_opcode_unjudged"),
+        "an opcode the manifest and the ledger both lack must not read as a \
+         merely-unanswered query: {line}"
+    );
+}
+
+/// The ledger and the rail disagreeing is its own finding. Nothing in the
+/// shipped ledger produces it today — every info row is unresolved — so the
+/// arm is proved against a row rather than against the rail, which is also the
+/// only way it stays proved once a row is closed.
+#[test]
+fn a_ledger_row_the_rail_cannot_honour_reports_the_disagreement() {
+    use crate::observe::Decline as _;
+    use reims_vgpu_protocol::closure::{Closure, Op, Rail};
+    const CLAIMED: Op = Op {
+        rail: Rail::Info,
+        opcode: Some(0x1c2),
+        selector: "computePipelineStateInfo:info:",
+        closure: Closure::Implemented {
+            evidence: "a row that claims an answer this rail does not produce",
+        },
+    };
+    let decline = super::report::InfoRecordUnanswered {
+        opcode: 0x1c2,
+        len: 0x18,
+        judged: Some(&CLAIMED),
+    };
+    assert_eq!(decline.slug(), "info_query_ledger_disagrees");
+    let fields = decline.fields();
+    assert!(
+        fields.contains(&("closure", "implemented".to_string())),
+        "the line must carry what the ledger claimed, or the reader cannot tell \
+         which of the two is wrong: {fields:?}"
+    );
+}

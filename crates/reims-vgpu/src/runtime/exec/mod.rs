@@ -1055,6 +1055,13 @@ fn handle_info_record<M: HostMemory + HostOps>(
             }
         }
     }
+    // Every info record is a question, `0x1d1` included: the arm above logs
+    // where the answer would go and does not compute one, so the reply buffer
+    // is left holding whatever it held. Reporting them all through one site
+    // keeps that true — an arm that starts answering `0x1d1` has to return
+    // before it reaches here, which is a change this line makes visible rather
+    // than one it hides.
+    note_info_record_unanswered(task_id, opcode, bytes.len());
 }
 
 fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) {
@@ -4171,7 +4178,7 @@ use report::{
     is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
     note_empty_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
-    note_pass_array_length_unsupported, note_pass_extent_for_slot,
+    note_info_record_unanswered, note_pass_array_length_unsupported, note_pass_extent_for_slot,
     note_pass_raster_sample_count_unsupported, note_pass_target_extent,
     note_store_action_no_attachment, note_stream_draw_drops, note_unimplemented_render_opcode,
     note_unnamed_icb_execute,

@@ -1150,6 +1150,7 @@ dependencies = [
  "reims-vgpu-env",
  "reims-vgpu-observe",
  "reims-vgpu-paging",
+ "reims-vgpu-protocol",
  "reims-vgpu-wire",
  "serde_json",
  "wayland-backend",

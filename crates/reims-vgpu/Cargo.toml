@@ -52,6 +52,11 @@ parking_lot = "0.12"
 # Wire-format views inferred from macOS Oracles.
 # `no_std`, no allocation, no build script — it adds no runtime dependency.
 reims-vgpu-wire = { path = "../reims-vgpu-wire" }
+# What a decoded wire tag *means*: the refusal-closure ledger that records one
+# outcome per decodable operation. `no_std`, wire-only — it cannot reach back
+# into this crate, which is what keeps the ledger a statement about the
+# protocol rather than a description of this executor.
+reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }
 # Guest address resolution above the wire page-table format: span walks, GPA
 # run coalescing, window region planning. `no_std` + alloc, no host traits.
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }
