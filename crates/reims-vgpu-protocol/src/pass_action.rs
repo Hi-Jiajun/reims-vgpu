@@ -223,6 +223,151 @@ impl StoreActionOptions {
     }
 }
 
+/// `MTLMultisampleDepthResolveFilterSample0` — the resolve takes sample zero.
+pub const MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_SAMPLE_0: u16 = 0;
+/// `MTLMultisampleDepthResolveFilterMin` — the nearest of the samples.
+pub const MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_MIN: u16 = 1;
+/// `MTLMultisampleDepthResolveFilterMax` — the furthest of the samples.
+pub const MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_MAX: u16 = 2;
+
+/// `MTLMultisampleStencilResolveFilterSample0` — the resolve takes sample zero.
+pub const MTL_MULTISAMPLE_STENCIL_RESOLVE_FILTER_SAMPLE_0: u16 = 0;
+/// `MTLMultisampleStencilResolveFilterDepthResolvedSample` — the stencil of
+/// whichever sample the *depth* resolve selected.
+pub const MTL_MULTISAMPLE_STENCIL_RESOLVE_FILTER_DEPTH_RESOLVED_SAMPLE: u16 = 1;
+
+/// How a multisample depth attachment reduces its samples into the resolve
+/// target.
+///
+/// # Why a filter is not a decoration
+///
+/// The three values pick three different depths out of the same samples, so a
+/// pass that asked for [`Self::Max`] and got [`Self::Sample0`] produces a depth
+/// buffer whose every texel may differ — and the guest reads that buffer back
+/// as geometry rather than as an image, so the symptom is wrong occlusion
+/// somewhere later rather than a visibly wrong frame. There is no default that
+/// is safe to substitute: `Sample0` is what the API starts at, which makes it
+/// the *value a guest that never set one carries*, not a fallback for one that
+/// did.
+///
+/// # Depth and stencil are two ordinal spaces, not one
+///
+/// Ordinal `1` is `Min` here and `DepthResolvedSample` on the stencil slot.
+/// One type covering both would make the two interchangeable at exactly the
+/// point where they disagree, so they are two types and the record's two slots
+/// carry one each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DepthResolveFilter {
+    /// The default, in the sense that it is what the API starts at — so it is
+    /// the value a guest that never set a filter carries, and never a fallback
+    /// for one that did.
+    #[default]
+    Sample0,
+    Min,
+    Max,
+}
+
+impl DepthResolveFilter {
+    /// The declared filter, or `None` for a value the SDK does not name.
+    ///
+    /// Refused rather than narrowed for the reason
+    /// [`StoreActionOptions::parse`] gives: the set is closed, so a fourth
+    /// ordinal is a corrupt record or a wrong wire offset, and folding it onto
+    /// a neighbour resolves at a filter the guest did not ask for.
+    #[must_use]
+    pub const fn parse(raw: u16) -> Option<Self> {
+        Some(match raw {
+            MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_SAMPLE_0 => Self::Sample0,
+            MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_MIN => Self::Min,
+            MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_MAX => Self::Max,
+            _ => return None,
+        })
+    }
+
+    /// The ordinal a guest writes for this value.
+    #[must_use]
+    pub const fn raw(self) -> u16 {
+        match self {
+            Self::Sample0 => MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_SAMPLE_0,
+            Self::Min => MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_MIN,
+            Self::Max => MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_MAX,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sample0 => "sample0",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// How a multisample stencil attachment reduces its samples into the resolve
+/// target.
+///
+/// See [`DepthResolveFilter`] for why this is its own type and not a shared
+/// one: `1` means `Min` there and `DepthResolvedSample` here.
+///
+/// [`Self::DepthResolvedSample`] additionally makes the stencil resolve
+/// *depend* on the depth one — it takes the stencil of whichever sample the
+/// depth filter selected — so a model that dropped this word would also lose
+/// the ordering between the two slots' resolves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StencilResolveFilter {
+    /// What the API starts at; see [`DepthResolveFilter::Sample0`].
+    #[default]
+    Sample0,
+    DepthResolvedSample,
+}
+
+impl StencilResolveFilter {
+    /// The declared filter, or `None` for a value the SDK does not name.
+    #[must_use]
+    pub const fn parse(raw: u16) -> Option<Self> {
+        Some(match raw {
+            MTL_MULTISAMPLE_STENCIL_RESOLVE_FILTER_SAMPLE_0 => Self::Sample0,
+            MTL_MULTISAMPLE_STENCIL_RESOLVE_FILTER_DEPTH_RESOLVED_SAMPLE => {
+                Self::DepthResolvedSample
+            }
+            _ => return None,
+        })
+    }
+
+    /// The ordinal a guest writes for this value.
+    #[must_use]
+    pub const fn raw(self) -> u16 {
+        match self {
+            Self::Sample0 => MTL_MULTISAMPLE_STENCIL_RESOLVE_FILTER_SAMPLE_0,
+            Self::DepthResolvedSample => {
+                MTL_MULTISAMPLE_STENCIL_RESOLVE_FILTER_DEPTH_RESOLVED_SAMPLE
+            }
+        }
+    }
+
+    /// Whether this filter's answer is chosen by the depth resolve rather than
+    /// independently.
+    ///
+    /// A `match` rather than a comparison, so a third declared filter fails the
+    /// build here instead of being folded into "independent".
+    #[must_use]
+    pub const fn follows_the_depth_resolve(self) -> bool {
+        match self {
+            Self::Sample0 => false,
+            Self::DepthResolvedSample => true,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sample0 => "sample0",
+            Self::DepthResolvedSample => "depth_resolved_sample",
+        }
+    }
+}
+
 /// Whether the action publishes a single-sample destination the guest may
 /// subsequently read.
 #[must_use]
@@ -455,5 +600,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE]
         );
+    }
+
+    /// The two filters are two ordinal spaces, and `1` is the value that says
+    /// so. A shared type would read this pair as one fact.
+    #[test]
+    fn ordinal_one_means_two_different_things_on_the_two_slots() {
+        assert_eq!(DepthResolveFilter::parse(1), Some(DepthResolveFilter::Min));
+        assert_eq!(
+            StencilResolveFilter::parse(1),
+            Some(StencilResolveFilter::DepthResolvedSample)
+        );
+    }
+
+    #[test]
+    fn every_declared_resolve_filter_round_trips_and_nothing_else_parses() {
+        for f in [
+            DepthResolveFilter::Sample0,
+            DepthResolveFilter::Min,
+            DepthResolveFilter::Max,
+        ] {
+            assert_eq!(DepthResolveFilter::parse(f.raw()), Some(f));
+        }
+        for f in [
+            StencilResolveFilter::Sample0,
+            StencilResolveFilter::DepthResolvedSample,
+        ] {
+            assert_eq!(StencilResolveFilter::parse(f.raw()), Some(f));
+        }
+        for raw in [3u16, 4, 0x8000, 0xffff] {
+            assert_eq!(DepthResolveFilter::parse(raw), None, "{raw:#x}");
+        }
+        for raw in [2u16, 3, 0x8000, 0xffff] {
+            assert_eq!(StencilResolveFilter::parse(raw), None, "{raw:#x}");
+        }
+    }
+
+    /// What a guest that never set a filter carries, which is not the same
+    /// statement as "a value to fall back to".
+    #[test]
+    fn the_default_filter_is_the_apis_own_starting_value() {
+        assert_eq!(DepthResolveFilter::default(), DepthResolveFilter::Sample0);
+        assert_eq!(
+            StencilResolveFilter::default(),
+            StencilResolveFilter::Sample0
+        );
+        assert!(!StencilResolveFilter::Sample0.follows_the_depth_resolve());
+        assert!(StencilResolveFilter::DepthResolvedSample.follows_the_depth_resolve());
     }
 }

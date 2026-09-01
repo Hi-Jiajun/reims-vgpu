@@ -40,8 +40,8 @@ use crate::icb::{CommandRange, IcbOp};
 use crate::identity::ResourceId;
 use crate::operation::{classify, OperationClass, OperationHome};
 use crate::pass::{
-    Attachment, AttachmentSlot, LoadAction, PassDescriptor, RenderTargetExtent, StoreAction,
-    StoreActionOptions, VisibilityResultBuffer,
+    Attachment, AttachmentSlot, DepthResolveFilter, LoadAction, PassDescriptor, RenderTargetExtent,
+    StencilResolveFilter, StoreAction, StoreActionOptions, VisibilityResultBuffer,
 };
 use crate::render::{
     DrawOp, FloatBits, IndexSource, Instancing, PassDescriptorSlot, PrimitiveType, RenderOp,
@@ -817,6 +817,24 @@ pub fn pass_descriptor(
         AttachmentSlot::Stencil,
         &body.stencil.prefix,
         [u64::from(body.stencil.clear_stencil.get()), 0, 0, 0],
+    )?;
+    // The two words beside the depth and stencil clear values, which nothing
+    // read until now. An undeclared ordinal refuses for the reason the store
+    // action's does: both sets are closed, so a value outside one is a corrupt
+    // record or a wrong offset, and folding it onto a neighbour resolves at a
+    // filter the guest did not ask for.
+    let raw_depth_filter = body.depth.resolve_filter.get();
+    descriptor.depth_resolve_filter =
+        DepthResolveFilter::parse(raw_depth_filter).ok_or(ResolveRefusal::UndefinedOrdinal {
+            field: "depth_resolve_filter",
+            value: u32::from(raw_depth_filter),
+        })?;
+    let raw_stencil_filter = body.stencil.resolve_filter.get();
+    descriptor.stencil_resolve_filter = StencilResolveFilter::parse(raw_stencil_filter).ok_or(
+        ResolveRefusal::UndefinedOrdinal {
+            field: "stencil_resolve_filter",
+            value: u32::from(raw_stencil_filter),
+        },
     )?;
     descriptor.visibility_result_buffer = bound(resolver, body.visibility_result_buffer_ref.get())?
         .map(|buffer| VisibilityResultBuffer { buffer });
@@ -1679,6 +1697,78 @@ mod tests {
                 pass_descriptor(&body, &live),
                 Err(ResolveRefusal::UndefinedOrdinal {
                     field: "store_action_options",
+                    value: u32::from(raw),
+                }),
+                "{raw:#x}"
+            );
+        }
+    }
+
+    /// The depth and stencil slots each carry a resolve filter, and they are
+    /// two ordinal spaces.
+    ///
+    /// The words sat on the two attachment bodies from the day the layout was
+    /// measured and nothing read them, so a pass asking to resolve depth at the
+    /// furthest sample was indistinguishable from one asking for sample zero —
+    /// and the guest reads a resolved depth buffer back as geometry, so that
+    /// difference surfaces as wrong occlusion somewhere later rather than as a
+    /// wrong frame now.
+    ///
+    /// Both slots are driven with the *same* ordinal, because that is the
+    /// arrangement a shared filter type would pass: `1` is `Min` on the depth
+    /// slot and `DepthResolvedSample` on the stencil one.
+    #[test]
+    fn each_slots_resolve_filter_is_read_in_its_own_ordinal_space() {
+        let live = Live(Vec::new());
+        let mut body = pass_body();
+        body.depth.resolve_filter = u16le(1);
+        body.stencil.resolve_filter = u16le(1);
+        let descriptor = pass_descriptor(&body, &live).expect("resolved");
+        assert_eq!(descriptor.depth_resolve_filter, DepthResolveFilter::Min);
+        assert_eq!(
+            descriptor.stencil_resolve_filter,
+            StencilResolveFilter::DepthResolvedSample
+        );
+
+        // And the value the capture carries on each, which is not the same
+        // ordinal on the two slots.
+        let mut body = pass_body();
+        body.depth.resolve_filter = u16le(2);
+        let descriptor = pass_descriptor(&body, &live).expect("resolved");
+        assert_eq!(descriptor.depth_resolve_filter, DepthResolveFilter::Max);
+        assert_eq!(
+            descriptor.stencil_resolve_filter,
+            StencilResolveFilter::Sample0,
+            "a slot whose word is zero carries what the API starts at"
+        );
+    }
+
+    /// Both sets are closed, so a value outside one is a corrupt record or a
+    /// wrong offset rather than a filter with no contract yet. `2` is declared
+    /// on the depth slot and not on the stencil one, which is what makes the
+    /// pair worth driving separately.
+    #[test]
+    fn an_undeclared_resolve_filter_refuses_by_name() {
+        let live = Live(Vec::new());
+        for raw in [3u16, 4, 0xffff] {
+            let mut body = pass_body();
+            body.depth.resolve_filter = u16le(raw);
+            assert_eq!(
+                pass_descriptor(&body, &live),
+                Err(ResolveRefusal::UndefinedOrdinal {
+                    field: "depth_resolve_filter",
+                    value: u32::from(raw),
+                }),
+                "{raw:#x}"
+            );
+        }
+        for raw in [2u16, 3, 0xffff] {
+            let mut body = pass_body();
+            body.stencil.resolve_filter = u16le(raw);
+            assert_eq!(
+                pass_descriptor(&body, &live),
+                Err(ResolveRefusal::UndefinedOrdinal {
+                    field: "stencil_resolve_filter",
                     value: u32::from(raw),
                 }),
                 "{raw:#x}"

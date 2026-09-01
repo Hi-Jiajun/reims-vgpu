@@ -40,7 +40,9 @@
 use crate::access::{AccessMode, ByteRange, Participation, ParticipationExtent, SubresourceRange};
 use crate::identity::ResourceId;
 pub use reims_vgpu_protocol::pass_action::LoadAction;
-pub use reims_vgpu_protocol::pass_action::StoreActionOptions;
+pub use reims_vgpu_protocol::pass_action::{
+    DepthResolveFilter, StencilResolveFilter, StoreActionOptions,
+};
 
 /// Colour attachment slots the record always carries, written or not.
 ///
@@ -286,6 +288,28 @@ pub struct PassDescriptor {
     /// names no buffer, so a model that took the buffer from the draw record
     /// would find none.
     pub visibility_result_buffer: Option<VisibilityResultBuffer>,
+    /// How the depth slot reduces its samples into its resolve target.
+    ///
+    /// On the descriptor and not on [`Attachment`] because the record carries
+    /// it on the depth and stencil bodies only — a colour slot has no such
+    /// word — and because the two slots' filters are two ordinal spaces. A
+    /// field on the shared attachment type would be a colour slot able to hold
+    /// a depth filter, and a single filter type would make `1` mean `Min` and
+    /// `DepthResolvedSample` at once.
+    ///
+    /// It was decoded by the wire layer and read by nothing until now, which
+    /// made a pass asking to resolve depth at the furthest sample
+    /// indistinguishable from one asking for sample zero. Those pick different
+    /// depths out of the same samples, and the guest reads the result back as
+    /// geometry — so the symptom is wrong occlusion later rather than a wrong
+    /// frame now.
+    pub depth_resolve_filter: DepthResolveFilter,
+    /// How the stencil slot reduces its samples into its resolve target.
+    ///
+    /// [`StencilResolveFilter::DepthResolvedSample`] takes the stencil of
+    /// whichever sample the *depth* filter chose, so this word is also where
+    /// the dependency between the two resolves is stated.
+    pub stencil_resolve_filter: StencilResolveFilter,
     pub extent: RenderTargetExtent,
 }
 
@@ -302,6 +326,8 @@ impl PassDescriptor {
             depth: Attachment::unattached(AttachmentSlot::Depth),
             stencil: Attachment::unattached(AttachmentSlot::Stencil),
             visibility_result_buffer: None,
+            depth_resolve_filter: DepthResolveFilter::Sample0,
+            stencil_resolve_filter: StencilResolveFilter::Sample0,
             extent: RenderTargetExtent::default(),
         }
     }
