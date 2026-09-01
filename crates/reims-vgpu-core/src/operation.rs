@@ -308,6 +308,47 @@ mod tests {
         }
     }
 
+    /// Every class either has a payload module or is empty, and which of the
+    /// two is a checked fact rather than a reading of the source tree.
+    ///
+    /// This is the vocabulary's completeness claim, and the emptiness half is
+    /// the load-bearing one. `InfoQuery` is empty because every info opcode is
+    /// unresolved — eighteen questions with no established contract — and
+    /// `CompletionEffect` is empty because every completion-shaped record on
+    /// this wire *arms* an effect rather than being one. Neither is an omission,
+    /// and neither may become one silently: if a row closes, the count moves off
+    /// zero and this test asks for the payload.
+    ///
+    /// The populated classes are each checked against their own module's
+    /// vocabulary test — this only says they are populated, so that a class
+    /// quietly emptying out is also a failure.
+    #[test]
+    fn every_class_has_a_payload_or_a_reason_to_be_empty() {
+        let c = census();
+        let empty_by_contract = [OperationClass::InfoQuery, OperationClass::CompletionEffect];
+        for &class in OperationClass::ALL {
+            let count = c.of(class);
+            if empty_by_contract.contains(&class) {
+                assert_eq!(
+                    count,
+                    0,
+                    "{} has judged operations and now needs a payload module",
+                    class.name()
+                );
+            } else {
+                assert!(
+                    count > 0,
+                    "{} has emptied out; its payload module is describing nothing",
+                    class.name()
+                );
+            }
+        }
+        assert_eq!(
+            c.stream,
+            OperationClass::ALL.iter().map(|&k| c.of(k)).sum::<usize>()
+        );
+    }
+
     /// Printed rather than pinned: these numbers move every time a row is
     /// closed, and a test that had to be edited for that would be edited
     /// without being read.

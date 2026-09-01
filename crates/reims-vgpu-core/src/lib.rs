@@ -28,6 +28,7 @@ pub mod blit;
 pub mod compute;
 pub mod content;
 pub mod depend;
+pub mod icb;
 pub mod identity;
 pub mod operation;
 pub mod pass;
