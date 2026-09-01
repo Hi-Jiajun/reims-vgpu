@@ -34,11 +34,18 @@
 //! through the device that made them. So every rule above is tested with no
 //! GPU.
 
+// A refused publication returns the native it would not take, so the caller
+// destroys what it just made instead of leaking it. That makes the `Err`
+// variant as large as a native object by construction; boxing it would put a
+// heap allocation on the failure path in exchange for nothing.
+#![allow(clippy::result_large_err)]
+
 use ash::vk;
 use reims_vgpu_core::identity::{
     DeviceEpoch, ObjectListRef, ResourceId, SessionGeneration, SlotGeneration, TimelinePoint,
 };
 use reims_vgpu_core::retire::{Lifetime, NativeRetirement};
+use reims_vgpu_core::texture_shape::Texture;
 use std::collections::BTreeMap;
 
 use crate::buffer::BufferPlan;
@@ -60,6 +67,13 @@ pub struct NativeBuffer {
 /// wrong.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeImage {
+    /// The checked declaration this image was made from.
+    ///
+    /// Kept rather than re-derived from [`Self::plan`]: a transfer needs the
+    /// guest's own format code to convert a byte pitch into texels and to name
+    /// an aspect, and a `VkFormat` cannot answer either — several guest formats
+    /// map to one native one, and the mapping is not invertible.
+    pub texture: Texture,
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
     pub plan: ImagePlan,
@@ -441,6 +455,19 @@ mod tests {
 
     fn native_image(handle: u64) -> Native {
         Native::Image(NativeImage {
+            texture: reims_vgpu_core::texture_shape::TextureShape {
+                kind: reims_vgpu_core::texture_shape::TextureKind::D2.ordinal(),
+                width: 4,
+                height: 4,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                usage: reims_vgpu_core::texture_shape::TextureUsage::SHADER_READ,
+            }
+            .checked()
+            .expect("a valid declaration"),
             image: vk::Image::from_raw(handle),
             memory: vk::DeviceMemory::from_raw(handle),
             plan: ImagePlan {

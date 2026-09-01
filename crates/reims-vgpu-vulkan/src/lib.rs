@@ -62,6 +62,8 @@
 //! - [`submission`] — what happens to a timeline point between reserving it
 //!   and the GPU reaching it, and why a refused one is signalled rather than
 //!   forgotten.
+//! - [`transfer`] — the native copies a resolved transfer becomes, and the
+//!   byte-to-texel pitch conversion that is exact or is a refusal.
 //! - [`view`] — the whole-texture view a shader samples, and the one view per
 //!   attachable slice a render pass has no other way to select.
 //! - [`timeline`] — which value a submission signals, and the bookkeeping that
@@ -91,5 +93,6 @@ pub mod recording;
 pub mod resident;
 pub mod submission;
 pub mod timeline;
+pub mod transfer;
 pub mod variant;
 pub mod view;
