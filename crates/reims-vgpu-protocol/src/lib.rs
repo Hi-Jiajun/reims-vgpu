@@ -40,6 +40,8 @@
 //!   which rail its records are read on.
 //! - [`resource_state`] — what the content-representation records ask for:
 //!   which directive, at which granularity.
+//! - [`info_reply`] — the key/value table an info query is answered with, and
+//!   the three separate bounds on how much of it may be written.
 //! - [`render`] — which render-encoder record an opcode names, the eight draw
 //!   shapes behind its fourteen draw opcodes, and the stage no wire field
 //!   carries.
@@ -99,6 +101,7 @@ pub mod extent;
 pub mod fnv;
 pub mod gva;
 pub mod gva_resolve;
+pub mod info_reply;
 pub mod iosurface_pages;
 pub mod mipmap;
 pub mod packets;
