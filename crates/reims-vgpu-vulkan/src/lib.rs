@@ -22,6 +22,8 @@
 //!
 //! - [`bindings`] — what a draw has to re-emit, and far more often what it
 //!   does not.
+//! - [`descriptor`] — which mechanism carries a draw's descriptors on this
+//!   host, and what one emission is therefore allowed to write.
 //! - [`layout`] — which layout each image subresource is in, and the explicit
 //!   transitions and ownership moves that get it to the next one.
 //! - [`memory`] — how host and device memory relate on the bound physical
@@ -49,6 +51,7 @@
 
 pub mod barrier;
 pub mod bindings;
+pub mod descriptor;
 pub mod layout;
 pub mod memory;
 pub mod placement;
