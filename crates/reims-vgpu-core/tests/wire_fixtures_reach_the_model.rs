@@ -547,6 +547,107 @@ impl RefResolver for Recording {
     }
 }
 
+/// A draw declares the buffers Apple's own bind records named.
+///
+/// **The one claim in this file that spans two records.** Everything above puts
+/// one captured record through the model and asks what it made of it. A bind
+/// makes nothing of itself — it writes a slot and touches no memory — and a
+/// draw's own fields name at most an index buffer. What a draw reads is the
+/// join of the two, held by the encoder, and it is a join no per-record test
+/// can see.
+///
+/// `drawPrimitives:vertexStart:vertexCount:` names no memory at all, so every
+/// access the transaction carries came out of the binding table. The entry
+/// stride is what this puts at risk: a buffer bind's entries are twelve bytes
+/// each and not sixteen, and a model that read them at the wrong stride would
+/// bind whatever the next entry's low word spells — which is a resource, so it
+/// resolves, and only a fixture that named a *known* ref can tell the two
+/// apart.
+#[test]
+fn a_draw_declares_the_buffers_apples_own_bind_records_named() {
+    use reims_vgpu_core::exec::ExecBuilder;
+    use reims_vgpu_protocol::segment::{SegmentKind, SegmentLifetime};
+    use reims_vgpu_wire::ops::render::{is_buffer_bind, OPCODE_DRAW};
+
+    let all = cases();
+    let draw = all
+        .iter()
+        .find(|c| {
+            c.rail == Rail::Render && op(&c.bytes, 0).is_ok_and(|v| v.opcode() == OPCODE_DRAW)
+        })
+        .expect("the capture has a non-indexed draw");
+
+    let mut checked = 0usize;
+    for case in &all {
+        if case.rail != Rail::Render {
+            continue;
+        }
+        let Ok(view) = op(&case.bytes, 0) else { continue };
+        if !is_buffer_bind(view.opcode()) {
+            continue;
+        }
+
+        let mut builder = ExecBuilder::new();
+        let resolver = Recording::new();
+        let Ok(bind) = operation(Rail::Render, &view, &resolver, builder.arenas_mut()) else {
+            continue;
+        };
+        let named: std::collections::BTreeSet<u32> =
+            resolver.seen().into_iter().filter(|r| *r != 0).collect();
+        assert!(
+            !named.is_empty(),
+            "{}: a buffer bind that resolved no ref",
+            case.name
+        );
+        let draw_view = op(&draw.bytes, 0).expect("checked above");
+        let drawn = operation(Rail::Render, &draw_view, &resolver, builder.arenas_mut())
+            .expect("a draw the ledger judged");
+
+        let mut model = registry_holding(&resolver.seen());
+        builder
+            .begin_segment(
+                SegmentKind::Render.wire_type(),
+                SegmentLifetime::SELF_CONTAINED,
+            )
+            .expect("a render segment");
+        builder
+            .record(bind, &mut model.task_access(TASK, DOMAIN))
+            .expect("a bind Apple wrote");
+        builder
+            .record(drawn, &mut model.task_access(TASK, DOMAIN))
+            .expect("a draw Apple wrote");
+        builder.end_segment().expect("the segment ends");
+        let tx = builder.finish().expect("nothing left open");
+
+        // `registry_holding` gives slot `n` backing `n`, so the backing a
+        // declared access names is the ref the bind resolved.
+        let declared: std::collections::BTreeSet<u32> = tx
+            .accesses
+            .iter()
+            .filter_map(|a| match a.key {
+                reims_vgpu_core::access::AccessKey::Range(r, _)
+                | reims_vgpu_core::access::AccessKey::Subresource(r, _)
+                | reims_vgpu_core::access::AccessKey::Whole(r) => {
+                    u32::try_from(r.backing.0).ok()
+                }
+                reims_vgpu_core::access::AccessKey::Heap(_)
+                | reims_vgpu_core::access::AccessKey::DomainOnly => None,
+            })
+            .collect();
+        assert_eq!(
+            declared, named,
+            "{}: the draw declared {declared:?} and the bind named {named:?}",
+            case.name
+        );
+        checked += 1;
+    }
+    println!("bind-then-draw fixtures checked: {checked}");
+    assert!(
+        checked > 0,
+        "no buffer-bind fixture reached the join; the test proved nothing"
+    );
+}
+
 /// A record cannot participate in a resource it never named.
 ///
 /// The link after placement. [`ResolvedOperation::participations`] is what
