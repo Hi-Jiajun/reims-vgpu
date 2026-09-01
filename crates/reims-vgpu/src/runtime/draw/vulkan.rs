@@ -6545,7 +6545,6 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     primary: &crate::backend::vulkan::engine::TargetIdentity,
     fb_w: u32,
     fb_h: u32,
-    blend_constants: [f32; 4],
 ) -> Result<
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
@@ -6769,7 +6768,6 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 src_alpha: a.src_alpha,
                 dst_alpha: a.dst_alpha,
                 op_alpha: a.op_alpha,
-                constants: blend_constants,
             });
         out.push(SecondaryColorTarget {
             identity,
@@ -8990,6 +8988,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // guest is replacing rather than compositing.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.color_write_mask = pd.color0.write_mask;
+        // The encoder's blend colour, unconditionally: it is one value per
+        // draw whether or not any attachment names a constant factor. The
+        // substitution for a guest that issued no `setBlendColorRed:` is the
+        // one this device has always made.
+        resources.blend_color = req.blend_color.unwrap_or([0.0; 4]);
         if pd.color0.blending_enabled {
             resources.blend = Some(BlendStateResource {
                 src_rgb: pd.color0.src_rgb,
@@ -8998,7 +9001,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 src_alpha: pd.color0.src_alpha,
                 dst_alpha: pd.color0.dst_alpha,
                 op_alpha: pd.color0.op_alpha,
-                constants: req.blend_color.unwrap_or([0.0; 4]),
             });
         }
 
@@ -9494,7 +9496,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 &primary_id,
                 w,
                 h,
-                req.blend_color.unwrap_or([0.0; 4]),
             );
             // Second half of the census: `built` vs `refused` separates "the
             // guest issued an MRT draw and we render every attachment" from
@@ -13147,7 +13148,7 @@ mod vulkan_split_tests {
 
         let mut gen_of = |host: &mut FakeHost| {
             let secs = super::build_secondary_targets(
-                &mut state, host, 1, &colors, &pipeline, &primary, 8, 8, [0.0; 4],
+                &mut state, host, 1, &colors, &pipeline, &primary, 8, 8,
             )
             .expect("slot 1 is a resolvable secondary");
             assert_eq!(secs.len(), 1, "slot 1 is a resolvable secondary");

@@ -560,6 +560,21 @@ pub struct DrawRequest {
     /// materialize a converted frame to seed a draw with them.
     pub target_seed_order: SeedOrder,
     pub blend: Option<BlendStateResource>,
+    /// `setBlendColorRed:green:blue:alpha:`, which the four
+    /// `MTLBlendFactorBlendColor` factors read.
+    ///
+    /// Encoder state, not pipeline state: the guest changes it without
+    /// changing the pipeline, and one encoder has one of it however many
+    /// attachments name a constant factor. So it is here rather than inside
+    /// `blend`, it is not part of the pipeline key, and the rail supplies it
+    /// through `VK_DYNAMIC_STATE_BLEND_CONSTANTS` per draw. A guest animating
+    /// a fade used to compile a pipeline per frame.
+    ///
+    /// Unconditional rather than `Option`, because there is no state in which
+    /// an encoder does not have one. A guest that issued no
+    /// `setBlendColorRed:` reaches here as the all-zero value the runtime
+    /// substitutes, which is what this device has always used for it.
+    pub blend_color: [f32; 4],
     /// Which channels the primary colour attachment writes.
     ///
     /// Separate from `blend` because `MTLColorWriteMask` is independent of
@@ -1360,8 +1375,14 @@ pub(crate) struct SamplerStateKey {
 }
 
 /// One colour attachment's blend declaration, as the six `MTLBlendFactor` and
-/// `MTLBlendOperation` ordinals the guest serialized plus the encoder's blend
-/// colour.
+/// `MTLBlendOperation` ordinals the guest serialized.
+///
+/// The blend colour is **not** here. `setBlendColorRed:green:blue:alpha:` is a
+/// command on the render command encoder, not a property of the pipeline
+/// descriptor, so it is one value per draw rather than one per attachment —
+/// see [`DrawRequest::blend_color`]. Carrying it per attachment made four
+/// floats that could disagree with each other and could not, and put a value
+/// the guest animates into the pipeline cache key.
 ///
 /// The ordinals travel **unparsed**. Which nineteen values are factors, which
 /// five are operations, and which four of the factors need the second fragment
@@ -1385,7 +1406,6 @@ pub struct BlendStateResource {
     pub src_alpha: u32,
     pub dst_alpha: u32,
     pub op_alpha: u32,
-    pub constants: [f32; 4],
 }
 
 impl BlendStateResource {
@@ -1397,7 +1417,6 @@ impl BlendStateResource {
             src_alpha: self.src_alpha,
             dst_alpha: self.dst_alpha,
             op_alpha: self.op_alpha,
-            constants: self.constants.map(|c| c.to_bits()),
         }
     }
 }
@@ -1410,7 +1429,6 @@ pub(crate) struct BlendKey {
     pub src_alpha: u32,
     pub dst_alpha: u32,
     pub op_alpha: u32,
-    pub constants: [u32; 4],
 }
 
 // ---------------------------------------------------------------------------

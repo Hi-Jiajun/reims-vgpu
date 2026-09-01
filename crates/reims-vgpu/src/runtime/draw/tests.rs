@@ -5313,7 +5313,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
 
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
-        &mut state, &mut host, 1, &colors, &pipeline, &primary, 64, 64, [0.0; 4],
+        &mut state, &mut host, 1, &colors, &pipeline, &primary, 64, 64,
     )
     .expect("a contiguous, geometry-matching, resolvable secondary builds");
     assert_eq!(secs.len(), 1, "one secondary attachment expected");
@@ -5351,7 +5351,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     };
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
-        &mut state, &mut host, 1, &colors, &unblended, &primary, 64, 64, [0.0; 4],
+        &mut state, &mut host, 1, &colors, &unblended, &primary, 64, 64,
     )
     .expect("the same secondary builds whether or not its slot blends");
     assert_eq!(secs.len(), 1);
@@ -5434,7 +5434,6 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
             &primary,
             64,
             64,
-            [0.0; 4],
         )
     };
 
@@ -5514,7 +5513,6 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         &primary,
         64,
         64,
-        [0.0; 4],
     )
     .expect("a single-attachment draw is not a refusal");
     assert!(
@@ -5566,7 +5564,7 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
     let mut build = |colors: &[ColorRtRequest]| {
         let mut host = crate::runtime::host::FakeHost::new();
         build_secondary_targets(
-            &mut state, &mut host, 1, colors, &pipeline, &primary, 64, 64, [0.0; 4],
+            &mut state, &mut host, 1, colors, &pipeline, &primary, 64, 64,
         )
     };
 

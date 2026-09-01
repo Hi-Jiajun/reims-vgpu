@@ -847,6 +847,13 @@ pub(crate) struct CbGraphicsState {
     scissors: Vec<vk::Rect2D>,
     /// The front/back references last handed to `vkCmdSetStencilReference`.
     stencil: Option<(u32, u32)>,
+    /// The four floats last handed to `vkCmdSetBlendConstants`, by bit pattern.
+    ///
+    /// Compared as bits rather than as floats so the cache is a plain equality
+    /// on what was recorded. `f32` equality would re-record on every draw for a
+    /// guest that set a NaN component — which cannot reach here, because the
+    /// draw is refused for it — and would call two distinct zeroes equal.
+    blend_constants: Option<[u32; 4]>,
     /// The push-descriptor layout and exact descriptor values last recorded.
     push_layout: Option<vk::PipelineLayout>,
     push_bindings: Vec<PushDescriptorBinding>,

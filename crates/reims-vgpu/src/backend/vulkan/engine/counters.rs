@@ -604,6 +604,10 @@ engine_counters! {
         dynstate_viewport_held,
         dynstate_scissor_held,
         dynstate_stencil_held,
+        /// The blend colour a draw did not re-record. Out of every draw, like
+        /// the viewport and scissor pair and unlike `dynstate_stencil_held`:
+        /// every encoder has a blend colour whether or not any factor reads it.
+        dynstate_blend_constants_held,
         /// Vertex-buffer binding slots requested by draws. This must equal
         /// `vertex_buffer_bind_emitted`; compare either with
         /// `vertex_buffer_bind_calls` to measure contiguous bulk encoding.

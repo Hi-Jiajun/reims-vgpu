@@ -18,8 +18,8 @@ use reims_vgpu::backend::vulkan::engine::{
     VisibilityResultMode, MAX_DEVICE_RECREATES,
 };
 use reims_vgpu_core::blend::{
-    MTL_BLEND_FACTOR_ONE, MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA, MTL_BLEND_FACTOR_SOURCE_ALPHA,
-    MTL_BLEND_OPERATION_ADD,
+    MTL_BLEND_FACTOR_BLEND_COLOR, MTL_BLEND_FACTOR_ONE, MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+    MTL_BLEND_FACTOR_SOURCE_ALPHA, MTL_BLEND_FACTOR_ZERO, MTL_BLEND_OPERATION_ADD,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -983,12 +983,73 @@ fn blend_src_alpha_known_color() {
         src_alpha: MTL_BLEND_FACTOR_ONE,
         dst_alpha: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
         op_alpha: MTL_BLEND_OPERATION_ADD,
-        constants: [0.0; 4],
     });
     if let Some(px) = draw_or_skip("blend_src_alpha", &req) {
         // Fragment alpha=1 → same as replace over black seed.
         assert_fullscreen_fragment_color("blend_src_alpha", &px, 8, 8);
     }
+}
+
+/// The encoder's blend colour reaches the GPU, and one pipeline serves two of
+/// them.
+///
+/// `MTLBlendFactorBlendColor` reads a value `setBlendColorRed:` sets on the
+/// encoder, so it is `VK_DYNAMIC_STATE_BLEND_CONSTANTS` here and no longer part
+/// of the pipeline key. That makes this the load-bearing case: with the
+/// constants dropped from `VkPipelineColorBlendStateCreateInfo` and no
+/// `vkCmdSetBlendConstants` recorded, both draws below would composite against
+/// Vulkan's all-zero default and come out black — which is a whole surface
+/// rendered wrong with nothing to say so.
+///
+/// The equation is `src * blendColor + dst * 0`, so the pixel is the fragment
+/// colour scaled by the constant and the two draws must differ by exactly the
+/// factor between their constants.
+#[test]
+fn the_blend_colour_is_dynamic_state_and_two_of_them_share_a_pipeline() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let scaled = |constant: [f32; 4]| -> Option<Vec<u8>> {
+        let mut req = engine_req(&v, &f, 8, 8);
+        req.target_rgba8 = Some(std::sync::Arc::new([0, 0, 0, 255].repeat(8 * 8)));
+        req.blend = Some(BlendStateResource {
+            src_rgb: MTL_BLEND_FACTOR_BLEND_COLOR,
+            dst_rgb: MTL_BLEND_FACTOR_ZERO,
+            op_rgb: MTL_BLEND_OPERATION_ADD,
+            src_alpha: MTL_BLEND_FACTOR_ONE,
+            dst_alpha: MTL_BLEND_FACTOR_ZERO,
+            op_alpha: MTL_BLEND_OPERATION_ADD,
+        });
+        req.blend_color = constant;
+        draw_or_skip("blend_colour_dynamic", &req)
+    };
+    let center = |px: &[u8]| {
+        let i = ((8 / 2) * 8 + 8 / 2) as usize * 4;
+        (px[i], px[i + 1], px[i + 2], px[i + 3])
+    };
+
+    // A white constant is the identity, which is the assertion that the value
+    // arrived at all: the default this device would otherwise supply is zero.
+    let Some(full) = scaled([1.0, 1.0, 1.0, 1.0]) else {
+        return;
+    };
+    assert_eq!(
+        center(&full).0 as i32 - 64,
+        0,
+        "blend colour did not reach the draw: center={:?}",
+        center(&full)
+    );
+    assert_fullscreen_fragment_color("blend_colour_one", &full, 8, 8);
+
+    // Half the constant is half the pixel, through the same pipeline: nothing
+    // in the key changed between the two draws.
+    let Some(half) = scaled([0.5, 0.5, 0.5, 1.0]) else {
+        return;
+    };
+    let (r, g, b, a) = center(&half);
+    assert!(
+        near(r, 32) && near(g, 64) && near(b, 96) && near(a, 255),
+        "a halved blend colour must halve the pixel; got ({r},{g},{b},{a})"
+    );
 }
 
 #[test]
@@ -2832,7 +2893,6 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
         src_alpha: MTL_BLEND_FACTOR_ONE,
         dst_alpha: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
         op_alpha: MTL_BLEND_OPERATION_ADD,
-        constants: [0.0; 4],
     });
     let gpu_px = match engine::execute_draw_request(&gpu) {
         Ok(o) => o.pixels,

@@ -2417,7 +2417,19 @@ impl ObjectCaches {
         // Stencil reference is dynamic (Metal's `SetStencilReferenceValue` is a
         // command distinct from the state object) so distinct references reuse
         // one pipeline; only listed for stencil pipelines.
-        let mut dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        // The blend colour is dynamic on every graphics pipeline this cache
+        // builds, whether or not any attachment names a constant factor.
+        // Metal sets it on the encoder, so it changes without the pipeline
+        // changing: baking it in would key this cache on a value that is not
+        // part of a pipeline, and a guest animating a fade would compile one
+        // per frame. Unconditional rather than keyed on whether a factor reads
+        // it, because a key dimension that only decides which dynamic states
+        // are declared is a second way to spell the same pipeline.
+        let mut dynamic_states = vec![
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::BLEND_CONSTANTS,
+        ];
         if key.stencil.is_some() {
             dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
         }
@@ -2465,13 +2477,7 @@ impl ObjectCaches {
         // `reims_vgpu_vulkan::blend` performs it, above.
         let blend_att: Vec<vk::PipelineColorBlendAttachmentState> =
             blend_plans.iter().map(|p| p.native()).collect();
-        let blend_constants = key
-            .blend
-            .map(|b| b.constants.map(f32::from_bits))
-            .unwrap_or([0.0; 4]);
-        let blend = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(&blend_att)
-            .blend_constants(blend_constants);
+        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_att);
         // Depth-stencil state: attached ONLY when the pass carries a depth
         // attachment (Vulkan requires the pipeline's depth-stencil state to be
         // consistent with the subpass). Without it the color-only pipeline is
@@ -3104,7 +3110,6 @@ mod object_cache_tests {
             src_alpha: MTL_BLEND_FACTOR_ONE,
             dst_alpha: MTL_BLEND_FACTOR_DESTINATION_ALPHA,
             op_alpha: MTL_BLEND_OPERATION_MAX,
-            constants: [0; 4],
         };
         let blend = color_attachment_state(Some(key), ColorWriteMask::ALL)
             .expect("every ordinal is one the guest API declares")
@@ -3153,7 +3158,6 @@ mod object_cache_tests {
                 src_alpha: 1,
                 dst_alpha: 0,
                 op_alpha: 0,
-                constants: [0; 4],
             }),
             ColorWriteMask::ALL,
         )

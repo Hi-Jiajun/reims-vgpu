@@ -1867,6 +1867,7 @@ impl ResourcePools {
         self.cb_graphics.viewports.clear();
         self.cb_graphics.scissors.clear();
         self.cb_graphics.stencil = None;
+        self.cb_graphics.blend_constants = None;
         self.cb_graphics.push_layout = None;
         self.cb_graphics.push_bindings.clear();
     }
@@ -2239,6 +2240,7 @@ impl ResourcePools {
             g.viewports.clear();
             g.scissors.clear();
             g.stencil = None;
+            g.blend_constants = None;
             g.push_layout = None;
             g.push_bindings.clear();
         }
@@ -2259,6 +2261,7 @@ impl ResourcePools {
         g.viewports.clear();
         g.scissors.clear();
         g.stencil = None;
+        g.blend_constants = None;
         unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline) };
     }
 
@@ -2439,6 +2442,36 @@ impl ResourcePools {
             device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT, front);
             device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::BACK, back);
         }
+    }
+
+    /// Record `vkCmdSetBlendConstants` unless this command buffer already
+    /// carries exactly this value.
+    ///
+    /// Asked on every draw rather than only on the ones whose pipeline names a
+    /// constant factor. Which factors a pipeline names is not something this
+    /// layer holds, the held-value comparison makes a repeat free, and a guest
+    /// that never blends against a constant pays one call per command buffer.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_blend_constants(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        constants: [f32; 4],
+    ) {
+        let bits = constants.map(f32::to_bits);
+        let g = &mut self.cb_graphics;
+        if g.blend_constants == Some(bits) {
+            counters
+                .dynstate_blend_constants_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.blend_constants = Some(bits);
+        unsafe { device.cmd_set_blend_constants(cb, &constants) };
     }
 
     /// Clear the guest-read debt and answer whether there was one.

@@ -1500,12 +1500,10 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
     }
-    if let Some(blend) = req.blend {
-        if blend.constants.iter().any(|c| !c.is_finite()) {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::NonFiniteBlendConstants,
-            ));
-        }
+    if req.blend_color.iter().any(|c| !c.is_finite()) {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::NonFiniteBlendConstants,
+        ));
     }
     if let Some(target) = &req.target_rgba8 {
         // The seed is one tightly-packed RGBA8 slice of the target, and the
@@ -5187,6 +5185,10 @@ pub(crate) unsafe fn execute_draw_inner(
         }
     }));
     unsafe { pools.set_dynamic_viewport_scissor(&ctx.device, cb, counters) };
+    // Dynamic blend colour (Metal `setBlendColorRed:green:blue:alpha:`) — one
+    // encoder value, so one call per draw whatever the attachments declare,
+    // held against the last one recorded.
+    unsafe { pools.set_dynamic_blend_constants(&ctx.device, cb, counters, req.blend_color) };
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
     // dynamic state; front/back set together because Metal's split refs are one
