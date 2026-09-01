@@ -365,3 +365,98 @@ fn signature(verdict: Verdict) -> String {
         Verdict::WrongShape(reason) => format!("wrong-shape {reason}"),
     }
 }
+
+/// Every record Apple produced can be placed in the encoder that emitted it.
+///
+/// The tests above stop at [`operation`]: they prove a record decodes and
+/// resolves. This one carries it one link further and puts it through
+/// [`ExecBuilder`], which is the only way a resolved operation ever reaches a
+/// transaction — `begin_segment`, `record`, `end_segment`, `finish`.
+///
+/// That link asks a question resolution cannot. [`ExecBuilder::record`] routes
+/// on the operation's own [`OperationClass`]: five classes name exactly one
+/// rail and are refused inside any other segment, and the rest are admitted by
+/// whichever encoder is open only if that encoder carries the class at all. So
+/// an operation whose class disagrees with the encoder class the capture came
+/// from is `RailMismatch` here — and it is *nothing* in the tests above,
+/// because `resolve::operation` is handed the rail rather than deriving it.
+///
+/// The rail is the fixture's, from the serializer class that emitted the
+/// record. That is the whole point: the model is being asked to admit each
+/// record where Apple actually wrote it, not where the model would have
+/// preferred it.
+///
+/// A record the ledger declines is skipped rather than failed, for the same
+/// reason it is above — a contract answer is not a defect. What must not
+/// happen is a resolved operation the model then refuses to place.
+#[test]
+fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written() {
+    use reims_vgpu_core::exec::ExecBuilder;
+    use reims_vgpu_core::identity::{
+        ChannelId, ChannelSequence, IngressOrdinal, SessionGeneration,
+    };
+    use reims_vgpu_protocol::segment::SegmentKind;
+
+    let mut placed = 0usize;
+    let mut misplaced = Vec::new();
+    let mut per_rail: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for case in cases() {
+        let Case {
+            name, rail, bytes, ..
+        } = case;
+        if !is_stream_rail(rail) {
+            continue;
+        }
+        let Verdict::Resolved(op) = read(rail, &bytes) else {
+            continue;
+        };
+        // Every stream rail has a segment kind — `of_rail` answers `None` only
+        // for the root, which `is_stream_rail` already excluded.
+        let kind = SegmentKind::of_rail(rail).expect("a stream rail names a segment");
+
+        let mut builder = ExecBuilder::new(
+            SessionGeneration::FIRST,
+            ChannelId(0),
+            ChannelSequence(placed as u64),
+            IngressOrdinal(placed as u64),
+        );
+        let mut place = || -> Result<(), String> {
+            builder
+                .begin_segment(kind.wire_type(), false)
+                .map_err(|r| format!("begin: {}", r.reason()))?;
+            builder
+                .record(op)
+                .map_err(|r| format!("record: {}", r.reason()))?;
+            builder
+                .end_segment()
+                .map_err(|r| format!("end: {}", r.reason()))?;
+            Ok(())
+        };
+        match place() {
+            Ok(()) => {
+                let tx = builder
+                    .finish()
+                    .expect("an encoder that began and ended leaves nothing open");
+                assert_eq!(
+                    tx.record_count(),
+                    1,
+                    "{name}: the record was accepted and then not carried"
+                );
+                placed += 1;
+                *per_rail.entry(format!("{rail:?}")).or_default() += 1;
+            }
+            Err(why) => misplaced.push(format!("{name} ({rail:?}, {kind:?}): {why}")),
+        }
+    }
+
+    for (rail, count) in &per_rail {
+        println!("placed: {rail} x{count}");
+    }
+    assert!(
+        misplaced.is_empty(),
+        "records the serializer produced could not be placed in the encoder that wrote them:\n  {}",
+        misplaced.join("\n  ")
+    );
+    assert!(placed > 0, "no fixture reached a transaction at all");
+}
