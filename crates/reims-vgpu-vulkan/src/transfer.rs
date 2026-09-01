@@ -76,9 +76,12 @@ pub enum Refusal {
     /// and it is checked rather than truncated because a truncated extent is a
     /// copy that succeeds and moves the wrong bytes.
     ExtentTooLarge { axis: &'static str, value: u64 },
-    /// An operation this rail has no native form for yet, named so its
-    /// absence is a reading rather than silence.
-    NoNativeForm { op: &'static str },
+    /// A blit-encoder operation that is not a copy, and so has no native
+    /// transfer form at all.
+    ///
+    /// Named rather than absent: a caller reaching this has routed the
+    /// operation to the wrong planner, and the refusal says which one it is.
+    NotACopy { op: &'static str },
 }
 
 impl Refusal {
@@ -92,7 +95,7 @@ impl Refusal {
             Self::UnalignedFill { .. } => "vk_transfer_unaligned_fill",
             Self::EmptyRange => "vk_transfer_empty_range",
             Self::ExtentTooLarge { .. } => "vk_transfer_extent_too_large",
-            Self::NoNativeForm { .. } => "vk_transfer_no_native_form",
+            Self::NotACopy { .. } => "vk_transfer_not_a_copy",
         }
     }
 }
@@ -127,7 +130,7 @@ impl std::fmt::Display for Refusal {
             Self::ExtentTooLarge { axis, value } => {
                 write!(f, "{} axis={axis} value={value}", self.slug())
             }
-            Self::NoNativeForm { op } => write!(f, "{} op={op}", self.slug()),
+            Self::NotACopy { op } => write!(f, "{} op={op}", self.slug()),
         }
     }
 }
@@ -431,13 +434,15 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                 data: fill_word(pattern),
             })
         }
-        // A filtered reduction and a barrier between every pair of levels, not
-        // a copy. Named rather than absorbed into one of the copies above,
-        // because a mipmap generation recorded as a copy would produce level
-        // one and leave the rest of the chain undefined.
+        // A filtered reduction with a barrier between every pair of levels,
+        // not a copy: see [`crate::mipmap`]. Refused here rather than absorbed
+        // into one of the copies above, because a mipmap generation recorded
+        // as a copy would produce level one and leave the rest of the chain
+        // undefined. The name is still resolved first, so a generation naming
+        // nothing is that refusal and not this one.
         BlitOp::GenerateMipmaps { texture } => {
             resolved(residency.image(texture))?;
-            Err(Refusal::NoNativeForm {
+            Err(Refusal::NotACopy {
                 op: "generate_mipmaps",
             })
         }
@@ -1037,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mipmap_generation_is_named_rather_than_recorded_as_a_copy() {
+    fn a_mipmap_generation_is_sent_to_its_own_planner_rather_than_recorded_here() {
         let residency = populated();
         assert_eq!(
             plan(
@@ -1047,7 +1052,7 @@ mod tests {
                 &residency
             )
             .err(),
-            Some(Refusal::NoNativeForm {
+            Some(Refusal::NotACopy {
                 op: "generate_mipmaps"
             })
         );
@@ -1177,7 +1182,7 @@ mod tests {
                 axis: "width",
                 value: 1,
             },
-            Refusal::NoNativeForm { op: "x" },
+            Refusal::NotACopy { op: "x" },
         ];
         let slugs: BTreeSet<&str> = refusals.iter().map(|r| r.slug()).collect();
         assert_eq!(slugs.len(), refusals.len());

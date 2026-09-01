@@ -50,6 +50,8 @@
 //!   makes a `VkQueue` have exactly one owner.
 //! - [`barrier`] — what a declared barrier becomes on this host, and which of
 //!   the guest's stages this host has no equivalent for.
+//! - [`mipmap`] — the blit ladder that fills a texture's mip chain, and the
+//!   layout each rung has to be in before the next one reads it.
 //! - [`placement`] — where a resource's bytes live, decided in one order from
 //!   the guest's declaration and this host's measured capabilities.
 //! - [`pools`] — one command pool per worker, and the rule that a command
@@ -86,6 +88,7 @@ pub mod host;
 pub mod image;
 pub mod layout;
 pub mod memory;
+pub mod mipmap;
 pub mod placement;
 pub mod pools;
 pub mod queues;
