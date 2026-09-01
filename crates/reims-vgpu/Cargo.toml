@@ -109,6 +109,8 @@ foreign-types = "0.5"
 libc = "0.2"
 
 [dev-dependencies]
+# The oracle capture's loaders, shared with every suite that reads it.
+reims-vgpu-testkit = { path = "../reims-vgpu-testkit" }
 # Same dependency, with the test-only sink surface turned on. `FailCapture` and
 # the slug-collision panic are compiled separately from the crate that defines
 # them, so `#[cfg(test)]` cannot reach them; Cargo unifies this with the
@@ -121,6 +123,8 @@ reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["testing"] }
 serde_json = "1"
 
 [build-dependencies]
+# The oracle-capture presence probe, shared with every suite that reads it.
+reims-vgpu-testkit = { path = "../reims-vgpu-testkit" }
 cc = "1"
 
 # Standalone visual smoke test for the host-owned window (needs a display + the

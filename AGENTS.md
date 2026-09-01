@@ -43,6 +43,8 @@ Persist only the resulting field, layout, lifetime, ordering, or calling-convent
   override may only narrow what the device does; it may never widen it.
 - `crates/reims-vgpu-observe`: typed observations and refusals. It describes decisions but does not
   select behavior.
+- `crates/reims-vgpu-testkit`: shared behavioral fixtures — where the oracle's
+  capture is, whether it is there, and how the suites that read it read it.
 - `conformance`: native-oracle and guest-visible compatibility cases.
 - `vm`: rail-selected, snapshot-reverting boot harnesses.
 

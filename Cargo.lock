@@ -1151,6 +1151,7 @@ dependencies = [
  "reims-vgpu-observe",
  "reims-vgpu-paging",
  "reims-vgpu-protocol",
+ "reims-vgpu-testkit",
  "reims-vgpu-wire",
  "serde_json",
  "wayland-backend",
@@ -1169,6 +1170,7 @@ name = "reims-vgpu-core"
 version = "0.1.0"
 dependencies = [
  "reims-vgpu-protocol",
+ "reims-vgpu-testkit",
  "reims-vgpu-wire",
  "serde_json",
 ]
@@ -1206,9 +1208,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "reims-vgpu-testkit"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "reims-vgpu-wire"
 version = "0.1.0"
 dependencies = [
+ "reims-vgpu-testkit",
  "serde_json",
 ]
 

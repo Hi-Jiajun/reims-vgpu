@@ -43,29 +43,7 @@ use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
 use reims_vgpu_core::resolve::{operation, RefResolver, ResolveRefusal};
 use reims_vgpu_protocol::closure::{Rail, LEDGER};
 use reims_vgpu_protocol::decode::{op, DecodeRefusal};
-use serde_json::Value;
-
-/// Apple's captured records.
-fn fixtures() -> Value {
-    let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR")
-        .unwrap_or_else(|_| format!("{}/../reims-vgpu-wire/fixtures", env!("CARGO_MANIFEST_DIR")));
-    let path = format!("{dir}/fixtures.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "{path} was present when this test was built and is not now ({e}); \
-             regenerate with scripts/wire-oracle/wire-oracle.sh"
-        )
-    });
-    serde_json::from_str(&text).expect("fixtures.json is valid JSON")
-}
-
-fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len().is_multiple_of(2), "hex buffer has an odd length");
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
-        .collect()
-}
+use reims_vgpu_testkit::{fixtures, unhex};
 
 /// A resolver that answers every ref.
 ///

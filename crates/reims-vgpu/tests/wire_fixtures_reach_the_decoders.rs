@@ -36,39 +36,15 @@
 //! them quietly stops covering a record the other learned about.
 //!
 //! Fixtures are not committed. With none present both tests are `ignored`,
-//! decided at build time by `build.rs` — see `../../reims-vgpu-wire/oracle/
-//! fixture_presence.rs` for why that is a `cfg` and not a runtime early-return.
+//! decided at build time by `build.rs` — see
+//! `reims_vgpu_testkit::probe_wire_fixtures` for why that is a `cfg` and not a
+//! runtime early-return.
 //! Regenerate with `scripts/wire-oracle/wire-oracle.sh`;
 //! `REIMS_WIRE_FIXTURES_REQUIRED=1` (any Apple host, and CI) makes their
 //! absence fail the build rather than stand the tests down.
 
 use reims_vgpu::runtime::decode::{blit, compute, render};
-use serde_json::Value;
-
-/// Apple's captured records.
-///
-/// Only reachable when `wire_fixtures` is set, so absence here means the
-/// capture was deleted between building the test and running it.
-fn fixtures() -> Value {
-    let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR")
-        .unwrap_or_else(|_| format!("{}/../reims-vgpu-wire/fixtures", env!("CARGO_MANIFEST_DIR")));
-    let path = format!("{dir}/fixtures.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "{path} was present when this test was built and is not now ({e}); \
-             regenerate with scripts/wire-oracle/wire-oracle.sh"
-        )
-    });
-    serde_json::from_str(&text).expect("fixtures.json is valid JSON")
-}
-
-fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len().is_multiple_of(2), "hex buffer has an odd length");
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
-        .collect()
-}
+use reims_vgpu_testkit::{fixtures, unhex};
 
 /// One decoder's answer for one record: what it made of the bytes, and what
 /// its refusal — if it refused — says about whose fault that is.
