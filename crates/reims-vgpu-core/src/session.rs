@@ -22,6 +22,7 @@
 //! behind a lease whose identity carries this session's generation, and the
 //! crate they live in is not this one.
 
+use crate::control::{ChannelTransition, ControlOp};
 use crate::depend::DependencyGraph;
 use crate::identity::{
     ChannelId, ChannelSequence, CompletionStamp, DeviceEpoch, IngressOrdinal, ResourceId,
@@ -96,6 +97,31 @@ impl Refusal {
             Self::PayloadMismatch { .. } => "ingress_payload_mismatch",
             Self::UnleasedPipelineWait { .. } => "ingress_unleased_pipeline_wait",
             Self::GenerationClosed { .. } => "ingress_generation_closed",
+        }
+    }
+}
+
+/// Why a control operation's transition did not happen.
+///
+/// Two variants because there are two owners, and neither refusal is invented
+/// here: opening is this model's own [`Refusal::ChannelAlreadyOpen`] and
+/// freeing is the publisher's [`RetireRefusal::LivePositions`]. Folding them
+/// into one reason would lose which half of a channel's lifetime went wrong,
+/// and restating either would be a second copy of a check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlRefusal {
+    Open(Refusal),
+    Free(RetireRefusal),
+}
+
+impl ControlRefusal {
+    /// The name this reaches a failure channel under: the forwarded owner's,
+    /// unchanged.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Open(refusal) => refusal.slug(),
+            Self::Free(refusal) => refusal.slug(),
         }
     }
 }
@@ -439,15 +465,18 @@ impl SessionModel {
         &self.publisher
     }
 
-    /// Open a submission domain, as a channel definition does.
+    /// Open a submission domain that no guest command asked for.
     ///
     /// A domain has to be opened before anything may be admitted to it.
     /// Creating it on first use instead would mean a packet naming a channel
     /// the guest never defined gets an ordering position and a completion
     /// obligation in a publication order nothing drains — and the guest waits
-    /// on that word forever. Which integer the root channel is, is not decided
-    /// here: the caller that opened the ring knows it and opens it like any
-    /// other.
+    /// on that word forever.
+    ///
+    /// **This is the bootstrap door, not the guest's.** The root ring exists
+    /// before the guest can name anything, so whoever opened it opens its
+    /// domain like any other; every domain the guest itself defines arrives as
+    /// a `CmdDefineFifo` and goes through [`Self::apply_control`].
     ///
     /// # Errors
     ///
@@ -466,7 +495,10 @@ impl SessionModel {
         self.open_channels.contains(&domain)
     }
 
-    /// End a channel's publication lifetime, as a channel free does.
+    /// End a channel's publication lifetime.
+    ///
+    /// The bootstrap door's other half — see [`Self::open_channel`]. A guest's
+    /// `CmdFreeFifo` reaches it through [`Self::apply_control`].
     ///
     /// # Errors
     ///
@@ -478,6 +510,48 @@ impl SessionModel {
         self.channel_sequence.remove(&domain);
         self.open_channels.remove(&domain);
         Ok(())
+    }
+
+    /// Perform a control operation's effect on this session.
+    ///
+    /// **The join between a resolved control packet and the state it changes.**
+    /// [`crate::control::resolve`] turned the guest's bytes into a
+    /// [`ControlOp`] and this model held the channel set, and nothing carried
+    /// one to the other — so a guest's `CmdDefineFifo` decoded into an
+    /// operation whose entire effect, opening the domain its next packet names,
+    /// nobody performed. Every packet on that channel is then refused
+    /// [`Refusal::ChannelNotOpen`], which is a device that answers a correct
+    /// guest with a wall.
+    ///
+    /// The two other operation shapes are `Ok(())` and that is the claim, not
+    /// an omission: [`ControlOp::Inert`]'s payload does nothing and
+    /// [`ControlOp::Display`]'s belongs to the layer that has a display.
+    /// Neither touches ordering, which is what this model owns. Matching
+    /// exhaustively is what makes a fourth shape a compile error here rather
+    /// than a silently ignored command.
+    ///
+    /// The envelope is *not* this call's business. A control transaction takes
+    /// its ordering position and publishes its completion word like every other
+    /// class, whether its transition happened or not — which is why a refusal
+    /// here is a value the caller reports and not a reason to withhold a stamp.
+    ///
+    /// # Errors
+    ///
+    /// [`ControlRefusal`], forwarding whichever owner refused: a definition
+    /// naming a domain that is already open, or a free naming one that still
+    /// owes publication.
+    pub fn apply_control(&mut self, op: ControlOp) -> Result<(), ControlRefusal> {
+        match op {
+            ControlOp::Channel {
+                transition: ChannelTransition::Open,
+                domain,
+            } => self.open_channel(domain).map_err(ControlRefusal::Open),
+            ControlOp::Channel {
+                transition: ChannelTransition::Free,
+                domain,
+            } => self.retire_channel(domain).map_err(ControlRefusal::Free),
+            ControlOp::Display { .. } | ControlOp::Inert { .. } => Ok(()),
+        }
     }
 
     /// Transactions that have become ready since the last call.
@@ -1047,6 +1121,116 @@ mod tests {
         assert_eq!(
             next.transaction.identity.domain_sequence,
             ChannelSequence(1)
+        );
+    }
+
+    /// A guest's own channel commands reach the channel set, end to end.
+    ///
+    /// Bytes, resolve, apply, admit — because the defect this closes was
+    /// exactly a missing link in that chain: the operation resolved, the model
+    /// held the channels, and nothing joined them, so a correct guest that
+    /// defined a FIFO and used it got `ChannelNotOpen` on every packet.
+    ///
+    /// The bootstrap door is deliberately not used here. Only the root domain
+    /// is opened by hand, which is what a real session does — the ring exists
+    /// before the guest can name anything — and everything after that is the
+    /// guest's own bytes.
+    #[test]
+    fn a_guests_channel_commands_open_and_end_the_domain_it_then_submits_on() {
+        const DEFINE: u16 = 0x30;
+        const FREE: u16 = 0x31;
+        let mut s = SessionModel::new(SessionId(1));
+        s.open_channel(ChannelId(0)).expect("the root ring");
+
+        let domain = ChannelId(2).0.to_le_bytes();
+        let define = crate::control::resolve(Channel::Root, DEFINE, &domain).expect("a definition");
+        let free = crate::control::resolve(Channel::Root, FREE, &domain).expect("a free");
+
+        // Before the definition is applied, the domain it names is not one.
+        assert_eq!(
+            s.admit(&packet(0x37)),
+            Err(Refusal::ChannelNotOpen {
+                channel: ChannelId(2)
+            })
+        );
+        assert_eq!(s.apply_control(define), Ok(()));
+        assert!(s.channel_open(ChannelId(2)));
+        let admitted = s.admit(&packet(0x37)).expect("the domain is open now");
+
+        // The free is refused while that packet still owes publication, and the
+        // domain stays open — a refused transition changes nothing.
+        assert_eq!(
+            s.apply_control(free),
+            Err(ControlRefusal::Free(RetireRefusal::LivePositions {
+                outstanding: 1
+            }))
+        );
+        assert!(s.channel_open(ChannelId(2)));
+
+        s.complete(admitted.transaction.identity.ingress);
+        assert_eq!(s.apply_control(free), Ok(()));
+        assert_eq!(
+            s.admit(&packet(0x37)),
+            Err(Refusal::ChannelNotOpen {
+                channel: ChannelId(2)
+            }),
+            "the lifetime the guest ended is over"
+        );
+    }
+
+    /// Redefining a live domain is refused rather than resetting its
+    /// publication order, and the refusal is the opening owner's own.
+    #[test]
+    fn a_second_definition_of_a_live_domain_is_refused() {
+        let mut s = session();
+        let domain = ChannelId(2).0.to_le_bytes();
+        let define = crate::control::resolve(Channel::Root, 0x30, &domain).expect("a definition");
+        assert_eq!(
+            s.apply_control(define),
+            Err(ControlRefusal::Open(Refusal::ChannelAlreadyOpen {
+                channel: ChannelId(2)
+            }))
+        );
+        assert_eq!(
+            s.apply_control(define).unwrap_err().slug(),
+            "ingress_channel_already_open"
+        );
+    }
+
+    /// Every control operation that is not a channel transition leaves this
+    /// model alone — which is the claim, not an omission.
+    ///
+    /// A display command's content belongs to the layer that has a display and
+    /// an inert payload does nothing; neither touches ordering. The census is
+    /// over the whole ledger so a control row that grows an ordering effect
+    /// cannot be added without this failing.
+    #[test]
+    fn only_the_two_channel_commands_change_what_this_model_holds() {
+        use reims_vgpu_protocol::packets::LEDGER;
+        let mut applied = 0usize;
+        for p in LEDGER {
+            let Some(kind) = crate::control::ControlKind::of(p.channel, p.opcode) else {
+                continue;
+            };
+            if kind.channel_transition().is_some() {
+                continue;
+            }
+            let op =
+                crate::control::resolve(p.channel, p.opcode, &[0u8; 8]).expect("a control packet");
+            let mut s = session();
+            let before = (s.channel_open(ChannelId(2)), s.channel_open(ChannelId(3)));
+            assert_eq!(s.apply_control(op), Ok(()), "{}", kind.name());
+            assert_eq!(
+                (s.channel_open(ChannelId(2)), s.channel_open(ChannelId(3))),
+                before,
+                "{} moved a channel",
+                kind.name()
+            );
+            applied += 1;
+        }
+        assert_eq!(
+            applied, 21,
+            "the ledger's control rows less the two channel commands"
         );
     }
 
