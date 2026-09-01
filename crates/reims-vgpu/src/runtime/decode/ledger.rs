@@ -37,6 +37,28 @@ fn zero_record(opcode: u32, payload: usize) -> Vec<u8> {
 /// the point is to reach the opcode arm, not to satisfy a layout.
 const GENEROUS_PAYLOAD: usize = 256;
 
+/// Candidate records for one opcode, for the tests that need a decode to
+/// *succeed* rather than merely not be refused by opcode.
+///
+/// Several of these families check the payload length exactly — "the product
+/// refuses slack the guest did not size for" — so one generous buffer reaches
+/// almost none of them. The probe walks the plausible lengths instead, with and
+/// without a leading `1` for the count-led families, and the caller takes
+/// whichever spelling decodes. Nothing here claims to synthesise a *meaningful*
+/// record; it only has to reach the arm.
+fn probe_records(opcode: u32) -> impl Iterator<Item = Vec<u8>> {
+    (0..=GENEROUS_PAYLOAD).flat_map(move |len| {
+        let plain = zero_record(opcode, len);
+        let counted = (len >= 4).then(|| {
+            let mut v = zero_record(opcode, len);
+            v[reims_vgpu_wire::OP_HEADER_LEN..reims_vgpu_wire::OP_HEADER_LEN + 4]
+                .copy_from_slice(&1u32.to_le_bytes());
+            v
+        });
+        core::iter::once(plain).chain(counted)
+    })
+}
+
 #[test]
 fn the_render_decoder_recognises_every_render_operation_the_ledger_records() {
     use super::render::{decode, DecodeStatus};
@@ -96,6 +118,44 @@ fn the_blit_decoder_recognises_every_blit_operation_the_ledger_records() {
              refuses the opcode itself"
         );
     }
+}
+
+/// Recognising an opcode is not claiming it.
+///
+/// The render decoder accepts a contiguous range and falls through to
+/// `Kind::OtherAccepted` inside it, which is how an opcode can be accepted with
+/// no arm decoding it — and the rail then reports the record as
+/// `accepted_without_executor` and drops it. That is precisely the state the
+/// opcode-recognition test above cannot see, because a fall-through is not a
+/// refusal. So this is the sharper claim: an operation the ledger judges must
+/// reach an arm that names what it is.
+///
+/// A record that decodes under none of [`probe_records`]' spellings is
+/// inconclusive rather than a failure: this test is about which arm claims an
+/// opcode, not about whether this file can synthesise a legal record for every
+/// family. The reached count is printed rather than asserted, because it is a
+/// property of the probe.
+#[test]
+fn no_render_operation_the_ledger_judges_decodes_as_unclaimed() {
+    use super::render::{decode, Kind};
+    let mut conclusive = 0usize;
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Render)
+        .filter_map(|o| o.opcode)
+    {
+        let Some(cmd) = probe_records(op).find_map(|r| decode(&r).ok()) else {
+            continue;
+        };
+        conclusive += 1;
+        assert_ne!(
+            cmd.kind,
+            Kind::OtherAccepted,
+            "the closure ledger judges render {op:#x} and the decoder has no arm for it, so the \
+             rail reports it as accepted-without-executor and drops it whatever the ledger says"
+        );
+    }
+    println!("{conclusive} of the ledger's render operations reached a decode arm");
 }
 
 /// The other direction on the one rail that can state its own window.
