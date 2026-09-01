@@ -1261,6 +1261,49 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let mut cache = crate::runtime::surface_cache::take_frame_buffer(state, mapping_id, mw, mh);
     {
         let _span_cache = crate::runtime::chain_phase::CostSpan::new("surface_changed_cache_us");
+        // Converted straight into the cache buffer, overwriting the previous
+        // frame. What that costs is measured: ~0.90 ms a flush moving 16.6 MB,
+        // which is memory-bound.
+        //
+        // # The previous frame is under this write, and using it does not pay
+        //
+        // `take_frame_buffer` reuses the buffer the *previous* frame is in, so
+        // the bytes being overwritten here are the last frame this device
+        // published — and a BGRA8 row equals its predecessor exactly when the
+        // RGBA8 row it came from does. That is a free damage map, in principle:
+        // 1c81555a puts the row loop's convert at ~88 % of this writer and
+        // `surface_row_no_seed` at 200 of 201 flushes, so every row is converted
+        // and landed because nothing says which rows changed.
+        //
+        // It was built, measured on a driven macos-13 Metal boot, and removed.
+        // **71 % of rows are unchanged under a full-screen drag and 96 % at
+        // idle** — the win is real and large. Detecting it is not free, and the
+        // cost lands in a place the offline numbers did not predict:
+        //
+        // ```text
+        //                                     offline bench   live
+        //   convert straight into the cache        0.15 ms    0.90 ms
+        //   convert into a scratch, then bcmp      0.75 ms   11.57 ms
+        // ```
+        //
+        // Split three ways live, the scratch version spends 10.05 ms in the
+        // *conversion*, 1.15 ms in the comparison and 0.28 ms in the copy back.
+        // The comparison is as cheap as the bench said; converting a row into a
+        // small reused buffer instead of into its place in the frame is what
+        // costs, by an order of magnitude, and no reading of the two loops
+        // explains it. The cache loop's share of the row loop went from 0.14 to
+        // 0.83 across the change, so this is not boot-to-boot drift.
+        //
+        // Net: the detection costs about what skipping the unchanged rows would
+        // save. Two other shapes were tried and are worse — see the table in the
+        // commit and note that both were written as `Rgba8ToRow` methods and
+        // neither survived its measurement, so neither is in the tree.
+        //
+        // What is worth trying next is not a cheaper comparison. It is not
+        // needing one: the guest's Load attachment already carries the previous
+        // content as `seed_rgba`, and it arrived on 1 of 201 flushes. Why the
+        // other 200 have no seed is a question about `seed_color_load` and the
+        // pass's load action, not about this loop.
         for y in 0..mh as usize {
             let off = y * rgba_stride as usize;
             let src_row = &rgba[off..off + rgba_stride as usize];
