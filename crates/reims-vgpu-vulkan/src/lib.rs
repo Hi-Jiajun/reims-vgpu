@@ -27,6 +27,8 @@
 //!   may branch on topology in a way the guest can observe.
 //! - [`queues`] — which queue family this rail submits to, and the value that
 //!   makes a `VkQueue` have exactly one owner.
+//! - [`timeline`] — which value a submission signals, and the bookkeeping that
+//!   keeps "reserved" and "reached" from being confused for each other.
 
 // Calling Vulkan is unsafe by construction; a `forbid` here would be a lie the
 // first entry point breaks. `unsafe_op_in_unsafe_fn` is the rule that actually
@@ -36,3 +38,4 @@
 
 pub mod memory;
 pub mod queues;
+pub mod timeline;
