@@ -226,11 +226,22 @@ impl Interpreter {
             });
         }
         if let Some(stamp) = tx.publication.stamp {
-            self.stamps.insert(stamp.slot, stamp.value);
-            self.trace.push(Observation::StampPublished {
-                slot: stamp.slot,
-                value: stamp.value,
-            });
+            // Later in the wrapping order, and only observed when it advances.
+            // A completion word is a monotone point the guest polls: a value
+            // that does not advance it writes nothing the guest can read, and
+            // a plain overwrite would let the slot go backwards. This is the
+            // same rule [`crate::ready::Scheduler::publish`] applies and the
+            // same rule a signal that does not advance an event gets above —
+            // stating it in one of the three places and not the others is how
+            // the reference and the scheduler come to mean different things.
+            let standing = self.stamps.get(&stamp.slot).copied();
+            if standing.is_none_or(|at| stamp.value.follows(at)) {
+                self.stamps.insert(stamp.slot, stamp.value);
+                self.trace.push(Observation::StampPublished {
+                    slot: stamp.slot,
+                    value: stamp.value,
+                });
+            }
         }
         self.ran += 1;
         Outcome::Ran
@@ -372,6 +383,55 @@ mod tests {
             input_content_version: None,
             output_content_version: Some(ContentVersion(1)),
         }
+    }
+
+    /// A completion word is a monotone point, so a stamp that does not advance
+    /// it is not something a guest polling that word can observe — and a plain
+    /// overwrite would let the slot go backwards, which is the failure a guest
+    /// waiting on the higher value never wakes from.
+    #[test]
+    fn a_stamp_that_does_not_advance_its_slot_publishes_nothing() {
+        let mut interp = Interpreter::new();
+        for value in [9u32, 4, 9, 10] {
+            let mut b = builder(u64::from(value));
+            b.publish_stamp(CompletionStamp {
+                slot: StampSlot(3),
+                value: StampValue(value),
+            });
+            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+        }
+        assert_eq!(
+            interp.trace(),
+            &[
+                Observation::StampPublished {
+                    slot: StampSlot(3),
+                    value: StampValue(9)
+                },
+                Observation::StampPublished {
+                    slot: StampSlot(3),
+                    value: StampValue(10)
+                },
+            ],
+            "4 is behind 9 and the second 9 is 9; neither is a new reading"
+        );
+        assert_eq!(interp.stamp(StampSlot(3)), Some(StampValue(10)));
+    }
+
+    /// And the wrapping order is the one that decides, so a timeline that
+    /// wraps keeps advancing rather than freezing at `u32::MAX`.
+    #[test]
+    fn a_wrapped_stamp_still_advances_its_slot() {
+        let mut interp = Interpreter::new();
+        for value in [u32::MAX - 1, u32::MAX, 0, 1] {
+            let mut b = builder(u64::from(value) + 1);
+            b.publish_stamp(CompletionStamp {
+                slot: StampSlot(3),
+                value: StampValue(value),
+            });
+            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+        }
+        assert_eq!(interp.trace().len(), 4, "every step advanced");
+        assert_eq!(interp.stamp(StampSlot(3)), Some(StampValue(1)));
     }
 
     /// The publication order is versions then stamp, and it is the rule the
