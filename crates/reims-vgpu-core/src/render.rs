@@ -456,15 +456,20 @@ mod tests {
         assert_eq!(from_ledger, from_kinds);
     }
 
-    /// The one refused render-class row keeps its class and its route and has
-    /// no payload.
+    /// Every settled refusal on this rail keeps its class and its route and
+    /// gains no payload.
     ///
-    /// `writeDescriptor` emits the pass's default raster sample count as a
-    /// record of its own, and this rail renders at one sample. Any other value
-    /// is refused by name rather than rendered at the wrong rate — so the
-    /// vocabulary must not be able to represent it.
+    /// A refusal is a record the device declines by name, so the vocabulary
+    /// must not be able to represent it: a `RenderKind` for one would let a
+    /// resolver build an operation for work that is refused, and the refusal
+    /// would then have to be found again somewhere downstream.
+    ///
+    /// The four are the pass's default raster sample count, which this rail
+    /// renders at one and refuses above, and the three store-action options
+    /// records, whose only declared flag asks for programmable sample positions
+    /// this rail does not set.
     #[test]
-    fn the_refused_raster_sample_count_gains_no_payload() {
+    fn every_refused_render_row_gains_no_payload() {
         let refused: Vec<_> = LEDGER
             .iter()
             .filter(|o| {
@@ -472,15 +477,32 @@ mod tests {
                     && is_refused(o)
                     && classify(o) == Some(OperationHome::Stream(OperationClass::Render))
             })
+            .map(|o| {
+                let reims_vgpu_protocol::closure::Closure::Refused { route, .. } = o.closure else {
+                    unreachable!("filtered")
+                };
+                (
+                    o.opcode.expect("a refused render record carries an opcode"),
+                    route,
+                )
+            })
             .collect();
-        assert_eq!(refused.len(), 1);
-        let only = refused[0];
-        assert_eq!(only.opcode, Some(0x1e));
-        assert_eq!(RenderKind::of_opcode(0x1e), None);
-        let reims_vgpu_protocol::closure::Closure::Refused { route, .. } = only.closure else {
-            unreachable!("filtered")
-        };
-        assert_eq!(route, "render_pass_raster_sample_count_dropped");
+        assert_eq!(
+            refused,
+            [
+                (0x1e, "render_pass_raster_sample_count_dropped"),
+                (0x67, "render_store_action_options_dropped"),
+                (0x6a, "render_store_action_options_dropped"),
+                (0x79, "render_store_action_options_dropped"),
+            ]
+        );
+        for (opcode, _) in refused {
+            assert_eq!(
+                RenderKind::of_opcode(opcode),
+                None,
+                "{opcode:#x} is refused and the vocabulary can represent it"
+            );
+        }
     }
 
     /// Every draw shape is reachable from the payload, and the instancing

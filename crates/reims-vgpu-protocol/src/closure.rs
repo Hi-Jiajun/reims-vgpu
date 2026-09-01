@@ -785,9 +785,9 @@ pub const LEDGER: &[Op] = &[
         rail: Rail::Render,
         opcode: Some(0x0067),
         selector: "setColorStoreActionOptions:atIndex:",
-        closure: Closure::Unresolved {
-            question: "store-action options carry custom sample positions, which this rail neither sets nor resolves against; dropped with a count",
-        },
+        closure: Closure::Refused {
+            route: "render_store_action_options_dropped",
+            evidence: "store-action options carry only MTLStoreActionOptionCustomSamplePositions, which asks a multisample resolve to use the pass's programmable sample positions; this rail sets none, so the none value is honoured because it is the API default and asks for nothing, and every other value — including the undeclared bits a mask would fold onto the flag — is refused by name rather than counted",        },
     },
     Op {
         rail: Rail::Render,
@@ -809,9 +809,9 @@ pub const LEDGER: &[Op] = &[
         rail: Rail::Render,
         opcode: Some(0x006a),
         selector: "setDepthStoreActionOptions:",
-        closure: Closure::Unresolved {
-            question: "depth store-action options; as 0x67",
-        },
+        closure: Closure::Refused {
+            route: "render_store_action_options_dropped",
+            evidence: "depth store-action options; as 0x67",        },
     },
     Op {
         rail: Rail::Render,
@@ -929,9 +929,9 @@ pub const LEDGER: &[Op] = &[
         rail: Rail::Render,
         opcode: Some(0x0079),
         selector: "setStencilStoreActionOptions:",
-        closure: Closure::Unresolved {
-            question: "stencil store-action options; as 0x67",
-        },
+        closure: Closure::Refused {
+            route: "render_store_action_options_dropped",
+            evidence: "stencil store-action options; as 0x67",        },
     },
     Op {
         rail: Rail::Render,

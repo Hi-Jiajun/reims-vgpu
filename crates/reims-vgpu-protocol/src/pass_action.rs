@@ -1,4 +1,5 @@
-//! The `MTLLoadAction` and `MTLStoreAction` ordinals a render-pass attachment
+//! The `MTLLoadAction`, `MTLStoreAction` and `MTLStoreActionOptions` ordinals a
+//! render-pass attachment
 //! prefix carries, and the closed sets this device implements.
 //!
 //! Two adjacent 16-bit words of every colour, depth and stencil attachment. The
@@ -148,6 +149,80 @@ pub fn is_declared_store_action(raw: u16) -> bool {
     raw <= MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
 }
 
+/// `MTLStoreActionOptionNone` — nothing beyond the store action itself.
+pub const MTL_STORE_ACTION_OPTION_NONE: u64 = 0;
+/// `MTLStoreActionOptionCustomSamplePositions` — a multisample resolve is to
+/// use the pass's programmable sample positions rather than the default ones.
+pub const MTL_STORE_ACTION_OPTION_CUSTOM_SAMPLE_POSITIONS: u64 = 1 << 0;
+
+/// What an attachment's store-action *options* ask for, beside its action.
+///
+/// # Closed at one bit, and refused above it
+///
+/// `MTLStoreActionOptions` is an option set with exactly one flag declared.
+/// That makes it closed in the strong sense: every other bit is a value the
+/// SDK does not define, so a record carrying one is a corrupt payload or a
+/// wrong wire offset rather than a feature with no contract yet. Masking the
+/// undefined bits away and reading what is left would turn `0x1111` — a value
+/// three fixtures actually carry — into a request for custom sample positions
+/// the guest never made.
+///
+/// # Where the two answers are decided is not the same place
+///
+/// [`Self::None`] asks for nothing, and it is what the API defaults to. It is a
+/// *semantic* answer and belongs here. Whether a host can honour
+/// [`Self::CustomSamplePositions`] is not: it is a question about programmable
+/// sample positions, which is a capability, so the executor refuses it. This
+/// type's job is to make the two distinguishable, which a raw `u64` does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StoreActionOptions {
+    /// The store action alone.
+    None,
+    /// The resolve uses the pass's programmable sample positions.
+    CustomSamplePositions,
+}
+
+impl StoreActionOptions {
+    /// The declared options, or `None` for any value the SDK does not name.
+    #[must_use]
+    pub const fn parse(raw: u64) -> Option<Self> {
+        Some(match raw {
+            MTL_STORE_ACTION_OPTION_NONE => Self::None,
+            MTL_STORE_ACTION_OPTION_CUSTOM_SAMPLE_POSITIONS => Self::CustomSamplePositions,
+            _ => return None,
+        })
+    }
+
+    /// The ordinal a guest writes for this value.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        match self {
+            Self::None => MTL_STORE_ACTION_OPTION_NONE,
+            Self::CustomSamplePositions => MTL_STORE_ACTION_OPTION_CUSTOM_SAMPLE_POSITIONS,
+        }
+    }
+
+    /// Whether this asks for anything beyond the store action beside it.
+    ///
+    /// A `match` rather than a comparison, so a second declared flag fails the
+    /// build here instead of being folded into "asks for nothing".
+    #[must_use]
+    pub const fn asks_for_nothing(self) -> bool {
+        match self {
+            Self::None => true,
+            Self::CustomSamplePositions => false,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CustomSamplePositions => "custom_sample_positions",
+        }
+    }
+}
+
 /// Whether the action publishes a single-sample destination the guest may
 /// subsequently read.
 #[must_use]
@@ -202,6 +277,50 @@ mod tests {
             );
         }
         assert!(!is_declared_store_action(u16::MAX));
+    }
+
+    /// The options set is closed at its one declared flag, and the values the
+    /// fixtures carry are outside it.
+    ///
+    /// `0x1111`, `0x2222` and `0x3333` are what the three capture cases pass.
+    /// A parse that masked to the low bit would read `0x1111` as a request for
+    /// custom sample positions and `0x2222` as a request for nothing, from two
+    /// values that are equally undeclared.
+    #[test]
+    fn the_store_action_options_are_closed_at_one_flag() {
+        assert_eq!(
+            StoreActionOptions::parse(MTL_STORE_ACTION_OPTION_NONE),
+            Some(StoreActionOptions::None)
+        );
+        assert_eq!(
+            StoreActionOptions::parse(MTL_STORE_ACTION_OPTION_CUSTOM_SAMPLE_POSITIONS),
+            Some(StoreActionOptions::CustomSamplePositions)
+        );
+        for raw in [2u64, 3, 0x1111, 0x2222, 0x3333, 1 << 16, u64::MAX] {
+            assert_eq!(
+                StoreActionOptions::parse(raw),
+                None,
+                "{raw:#x} is not a declared MTLStoreActionOptions"
+            );
+        }
+    }
+
+    /// Each value round-trips through the ordinal a guest writes, and only the
+    /// none value asks for nothing.
+    #[test]
+    fn only_the_none_option_asks_for_nothing() {
+        for options in [
+            StoreActionOptions::None,
+            StoreActionOptions::CustomSamplePositions,
+        ] {
+            assert_eq!(StoreActionOptions::parse(options.raw()), Some(options));
+        }
+        assert!(StoreActionOptions::None.asks_for_nothing());
+        assert!(!StoreActionOptions::CustomSamplePositions.asks_for_nothing());
+        assert_ne!(
+            StoreActionOptions::None.name(),
+            StoreActionOptions::CustomSamplePositions.name()
+        );
     }
 
     #[test]

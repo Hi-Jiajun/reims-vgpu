@@ -400,6 +400,31 @@ enum StreamDrawDrop {
     /// guest is entitled to ask. This is the refusal that says what that
     /// advertisement costs when it does.
     PassRasterSampleCountUnsupported { count: u64 },
+    /// An attachment's store-action *options* asking for something beyond the
+    /// store action itself.
+    ///
+    /// `MTLStoreActionOptions` declares exactly one flag,
+    /// `CustomSamplePositions`, and it asks that a multisample resolve use the
+    /// pass's programmable sample positions. This device sets none — the pass
+    /// record that carries them is dropped — so the resolve it would produce
+    /// is not the one the option names, and a value outside the declared set
+    /// is not an `MTLStoreActionOptions` at all.
+    ///
+    /// `MTLStoreActionOptionNone` is the API default and asks for nothing, so
+    /// it is honoured rather than refused, on exactly the reading
+    /// [`Self::PassRasterSampleCountUnsupported`] takes about a count of 1.
+    /// Everything else is refused rather than counted, because a resolve done
+    /// with the default sample positions is byte-for-byte what a guest that
+    /// asked for the default also gets — nothing downstream can tell the
+    /// substitution happened.
+    StoreActionOptionsUnsupported {
+        /// Which attachment the record names: `color`, `depth` or `stencil`.
+        aspect: &'static str,
+        /// The colour attachment index. Zero for the depth and stencil forms,
+        /// which name their attachment by being themselves and carry no index.
+        slot: u32,
+        options: u64,
+    },
 }
 
 impl crate::observe::Decline for StreamDrawDrop {
@@ -412,6 +437,7 @@ impl crate::observe::Decline for StreamDrawDrop {
             Self::PassRasterSampleCountUnsupported { .. } => {
                 "stream_pass_raster_sample_count_unsupported"
             }
+            Self::StoreActionOptionsUnsupported { .. } => "stream_store_action_options_unsupported",
         }
     }
 
@@ -450,6 +476,15 @@ impl crate::observe::Decline for StreamDrawDrop {
             Self::PassRasterSampleCountUnsupported { count } => {
                 vec![("count", count.to_string())]
             }
+            Self::StoreActionOptionsUnsupported {
+                aspect,
+                slot,
+                options,
+            } => vec![
+                ("aspect", (*aspect).to_string()),
+                ("slot", slot.to_string()),
+                ("options", format!("{options:#x}")),
+            ],
         }
     }
 }
@@ -515,6 +550,23 @@ impl StreamDrawDrop {
             // different readings, and the count is the whole of what this arm
             // reports.
             Self::PassRasterSampleCountUnsupported { count } => count,
+            // The options value and which attachment asked for it. A guest
+            // asking for custom sample positions on colour 0 and one asking on
+            // the depth attachment are different readings, and the two forms
+            // do not even share a record length.
+            Self::StoreActionOptionsUnsupported {
+                aspect,
+                slot,
+                options,
+            } => {
+                options << 8
+                    | u64::from(slot) << 2
+                    | match aspect {
+                        "depth" => 1,
+                        "stencil" => 2,
+                        _ => 0,
+                    }
+            }
         }
     }
 }
@@ -2311,18 +2363,42 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
         RenderKind::SetStoreActionOptions => {
             // The options sibling of the store action beside it, which *is*
-            // applied now — this is the half that is not. `MTLStoreActionOptions`
-            // carries `CustomSamplePositions`, asking that a multisample resolve
-            // use the pass's programmable sample positions, and this device
-            // neither sets those (`render_pass_sample_positions_dropped`) nor
-            // renders at more than one sample per pixel, where the option means
-            // nothing. Applying it here would be recording a number no resolve
-            // reads.
+            // applied. `MTLStoreActionOptions` declares exactly one flag,
+            // `CustomSamplePositions`, asking that a multisample resolve use
+            // the pass's programmable sample positions — which this device does
+            // not set (`render_pass_sample_positions_dropped`).
             //
-            // No default to compare against — `MTLStoreActionOptionNone` is 0,
-            // but a guest that writes 0 is still overriding whatever the pass
-            // descriptor said.
-            crate::runtime::drain::note_store_route("render_store_action_options_dropped");
+            // `MTLStoreActionOptionNone` is honoured. This doc used to argue
+            // there was "no default to compare against", because a guest that
+            // writes 0 is still overriding whatever the pass descriptor said —
+            // and that is true and does not matter: overriding to the value
+            // that asks for nothing is asking for nothing, and this device's
+            // resolve already uses the default sample positions the option
+            // would have to change. It is the same reading the pass's default
+            // raster sample count takes about a count of 1, and it is why that
+            // arm counts nothing at its API default either.
+            //
+            // Everything else is refused rather than counted, on the reading
+            // `StreamDrawDrop::StoreActionOptionsUnsupported` records: a
+            // resolve produced with the default sample positions is
+            // byte-for-byte what a guest asking for the default also gets, so
+            // nothing downstream can tell the substitution happened. Undeclared
+            // bits reach the same refusal — masking them away would read the
+            // capture's own `0x1111` as a request for custom sample positions
+            // the guest never made.
+            let honoured = reims_vgpu_protocol::pass_action::StoreActionOptions::parse(cmd.mode)
+                .is_some_and(
+                    reims_vgpu_protocol::pass_action::StoreActionOptions::asks_for_nothing,
+                );
+            if !honoured {
+                let (aspect, slot) = match cmd.opcode {
+                    wire_render::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS => ("depth", 0),
+                    wire_render::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS => ("stencil", 0),
+                    _ => ("color", cmd.first),
+                };
+                let drop = note_store_action_options_unsupported(task_id, aspect, slot, cmd.mode);
+                acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
+            }
         }
         RenderKind::DrawPatches => {
             // A tessellated draw. Geometry the guest asked for and did not get,
@@ -4210,8 +4286,8 @@ use report::{
     note_empty_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
     note_info_record_unanswered, note_pass_array_length_unsupported, note_pass_extent_for_slot,
     note_pass_raster_sample_count_unsupported, note_pass_target_extent, note_residency_declaration,
-    note_store_action_no_attachment, note_stream_draw_drops, note_unimplemented_render_opcode,
-    note_unnamed_icb_execute,
+    note_store_action_no_attachment, note_store_action_options_unsupported, note_stream_draw_drops,
+    note_unimplemented_render_opcode, note_unnamed_icb_execute,
 };
 // The unimplemented-opcode latch is test-only on both sides, so its import has
 // to carry the same gate the items do.

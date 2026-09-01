@@ -793,6 +793,112 @@ fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws()
     );
 }
 
+/// An attachment's store-action options asking for programmable sample
+/// positions refuse the stream's draws.
+///
+/// `MTLStoreActionOptions` declares exactly one flag,
+/// `CustomSamplePositions`, and it changes where the samples a resolve reads
+/// were taken. This device sets no programmable sample positions, so a resolve
+/// it produces reads the default ones — and that is byte-for-byte what a guest
+/// asking for the default also gets, which is why this used to be a count
+/// nothing downstream could act on.
+///
+/// `MTLStoreActionOptionNone` is honoured. It is the API default, it asks for
+/// nothing, and the resolve this device already performs is the one it names.
+///
+/// The three forms are driven separately because they do not share a record:
+/// the colour options are a `u64` followed by an index in a 20-byte record, and
+/// the depth and stencil forms are 16 bytes with no index at all. An arm
+/// reading the wrong one would take the index for the options.
+#[test]
+fn store_action_options_asking_for_custom_sample_positions_refuse_the_draws() {
+    use crate::protocol::endian::{st32, st64};
+
+    let record = |opcode: u32, options: u64| {
+        let total = if opcode == wire_render::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS {
+            wire_render::SET_COLOR_STORE_ACTION_OPTIONS_TOTAL_LEN
+        } else {
+            wire_render::SET_STORE_ACTION_OPTIONS_TOTAL_LEN
+        } as usize;
+        let mut cmd = vec![0u8; total];
+        st32(&mut cmd[0..], opcode);
+        st32(&mut cmd[4..], total as u32);
+        st64(&mut cmd[OP_HEADER_LEN..], options);
+        if opcode == wire_render::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS {
+            st32(&mut cmd[OP_HEADER_LEN + 8..], 3);
+        }
+        cmd
+    };
+    let run = |opcode: u32, options: u64| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            opcode,
+            &record(opcode, options),
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    for opcode in [
+        wire_render::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
+        wire_render::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
+        wire_render::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
+    ] {
+        assert!(
+            run(opcode, 0).bind_snapshot().is_ok(),
+            "op {opcode:#x}: the none option asks for nothing and is what this \
+             device already does; nothing is refused"
+        );
+        // Which attachment asked, and — for the colour form alone — which slot.
+        // Read off the refusal rather than off the shared fail log: three other
+        // arms report an `aspect` too, so a log line saying `aspect=stencil`
+        // does not say that *this* record named the stencil attachment.
+        let (expected_aspect, expected_slot) = match opcode {
+            wire_render::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS => ("depth", 0),
+            wire_render::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS => ("stencil", 0),
+            _ => ("color", 3),
+        };
+        // The declared flag, and three values the SDK does not declare — the
+        // ones the capture's own fixtures carry. A parse that masked to the low
+        // bit would read `0x1111` as the flag and `0x2222` as none, from two
+        // values that are equally undeclared.
+        for requested in [1u64, 0x1111, 0x2222, 0x3333] {
+            let Err(StreamRefusal::Pass(StreamDrawDrop::StoreActionOptionsUnsupported {
+                aspect,
+                slot,
+                options,
+            })) = run(opcode, requested).bind_snapshot()
+            else {
+                panic!(
+                    "op {opcode:#x} options={requested:#x}: a resolve taken at \
+                     the default sample positions is what a guest asking for \
+                     the default also gets, so this must refuse rather than \
+                     count"
+                );
+            };
+            assert_eq!(
+                (aspect, slot, options),
+                (expected_aspect, expected_slot, requested),
+                "op {opcode:#x}: the refusal named a different record than the \
+                 one that produced it"
+            );
+        }
+    }
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("stream_store_action_options_unsupported"),
+        "an attachment asking for programmable sample positions said nothing"
+    );
+}
+
 /// A pass declaring a default raster sample count this device cannot rasterize
 /// at refuses the stream's draws.
 ///
@@ -4454,7 +4560,9 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         ),
         // The store-action options. Their record is four bytes longer on
         // the colour form than on the other two, so a route reached from
-        // the wrong arm would have had to accept the wrong length first.
+        // the wrong arm would have had to accept the wrong length first. The
+        // default arm is `MTLStoreActionOptionNone`, which asks for nothing and
+        // must not count.
         (
             wire_render::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
             20,
@@ -4462,21 +4570,24 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
                 st64(p, 0x1111);
                 st32(&mut p[8..], 3);
             },
-            None,
+            Some(|p| {
+                st64(p, 0);
+                st32(&mut p[8..], 3);
+            }),
             "render_store_action_options_dropped",
         ),
         (
             wire_render::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
             16,
             |p| st64(p, 0x2222),
-            None,
+            Some(|p| st64(p, 0)),
             "render_store_action_options_dropped",
         ),
         (
             wire_render::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
             16,
             |p| st64(p, 0x3333),
-            None,
+            Some(|p| st64(p, 0)),
             "render_store_action_options_dropped",
         ),
         (

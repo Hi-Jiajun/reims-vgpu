@@ -1841,18 +1841,23 @@ mod tests {
                 row.rail
             );
         }
-        // The census the vocabulary prints is 102 stream operations. Six of
+        // The census the vocabulary prints is 105 stream operations. Six of
         // them carry no opcode at all — the four `beginSegment:` boundaries,
         // and the blit `withCommand:` selectors that write their command
         // argument into the record's opcode field, so they *are* whichever
         // opcode they emitted. Neither shape is dispatched by opcode, so
-        // neither reaches this path, and 96 is what remains.
+        // neither reaches this path, and 99 is what remains.
         //
-        // Two of those 96 are settled refusals, counted apart rather than
-        // folded into either total: a refusal that reads as an unwritten path
-        // would send someone to write it.
-        assert_eq!(seen + refused, 96);
-        assert_eq!(refused, 2);
+        // This total grows as the ledger closes rows: an unresolved row is not
+        // a judged operation and reaches neither counter, so a row settling
+        // either way moves it. That is the intent — it is the number of
+        // operations the model claims a path for.
+        //
+        // Five of the 99 are settled refusals, counted apart rather than folded
+        // into either total: a refusal that reads as an unwritten path would
+        // send someone to write it.
+        assert_eq!(seen + refused, 99);
+        assert_eq!(refused, 5);
     }
 
     /// An opcode the ledger has never heard of stops at the dispatcher, and an
