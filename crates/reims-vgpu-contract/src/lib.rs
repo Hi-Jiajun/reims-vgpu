@@ -35,17 +35,16 @@
 //! refusal, and the [`Decline`](reims_vgpu_observe::Decline) vocabulary is that
 //! name. It carries no policy and selects nothing.
 
-pub mod checked;
-pub mod dispatch;
 pub mod draw;
-pub mod endian;
-pub mod fnv;
 pub mod gva;
 pub mod gva_resolve;
 pub mod iosurface_pages;
 pub mod mipmap;
 pub mod pixel_format;
-pub mod vertex_step;
-pub mod visibility;
+
+// Moved into `reims-vgpu-protocol`, which is the layer that assigns meaning to
+// a wire tag and is where this vocabulary belongs. Re-exported at the old path
+// so the move is one commit and the call-site rewrite is another.
+pub use reims_vgpu_protocol::{checked, dispatch, endian, fnv, vertex_step, visibility};
 
 pub use checked::*;
