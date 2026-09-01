@@ -25,8 +25,8 @@
 use crate::access::AccessIntent;
 use crate::depend::DependencyGraph;
 use crate::identity::{
-    ChannelId, ChannelSequence, CompletionStamp, DeviceEpoch, IngressOrdinal, SessionGeneration,
-    SessionId, StampWait,
+    ChannelId, ChannelSequence, CompletionStamp, DeviceEpoch, IngressOrdinal, ResourceId,
+    SessionGeneration, SessionId, StampWait,
 };
 use crate::publish::{Publisher, Release, RetireRefusal};
 use crate::ready::Scheduler;
@@ -113,6 +113,13 @@ pub struct Packet {
     /// What the packet touches, already resolved. Resolution is the caller's:
     /// it needs the namespaces, and this is the ordering plane.
     pub accesses: Vec<AccessIntent>,
+    /// Pipelines this packet needs whose leases came back pending.
+    ///
+    /// Only the pending ones: a lease that was already ready is not a wait, and
+    /// passing it would hold the transaction for a compilation that has already
+    /// finished. Taking the leases is the caller's, because the pipeline table
+    /// lives beside this plane rather than in it.
+    pub pipeline_waits: Vec<ResourceId>,
 }
 
 /// What admitting a packet produced.
@@ -305,6 +312,7 @@ impl SessionModel {
             ingress,
             &hazard_waits,
             &packet.stamp_waits,
+            &packet.pipeline_waits,
             packet.completion,
         );
         Ok(Admitted {
@@ -473,6 +481,7 @@ mod tests {
             stamp_waits: Vec::new(),
             completion: None,
             accesses: Vec::new(),
+            pipeline_waits: Vec::new(),
         }
     }
 

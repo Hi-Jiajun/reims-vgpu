@@ -467,6 +467,11 @@ pub fn parallel_with(
             tx.ingress,
             &prerequisites,
             &stamp_waits,
+            // A batch is compared for schedule equivalence, and a pipeline that
+            // is still compiling is not a property of the schedule: every arm
+            // of the comparison would hold on the same transaction. Pipeline
+            // readiness is tested where it lives, in `crate::ready`.
+            &[],
             tx.publication.stamp,
         );
     }

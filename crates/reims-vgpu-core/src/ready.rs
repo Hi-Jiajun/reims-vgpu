@@ -1,7 +1,7 @@
 //! When an admitted transaction may begin, and how a wait that will never be
 //! answered is told from one that has simply not been answered yet.
 //!
-//! # Two kinds of prerequisite, and only one of them is ordered by arrival
+//! # Three kinds of prerequisite, and only one of them is ordered by arrival
 //!
 //! A hazard edge points backwards in ingress order by construction, so a
 //! transaction's hazard prerequisites are always transactions that already
@@ -10,6 +10,21 @@
 //! will produce it may not have arrived. That is legal and ordinary, and it is
 //! why the two are tracked apart — counting them together would make "waiting
 //! for work that exists" and "waiting for work that does not" the same state.
+//!
+//! A **pipeline wait** is the third, and it is here rather than at the draw for
+//! the reason [`crate::pipeline`] exists: a draw may not block, wait on a host,
+//! or discover work. A transaction whose pipeline is still being built is
+//! therefore not ready, and everything that does not want that pipeline is —
+//! which is the whole claim, and it is only structurally true if the wait lives
+//! in the readiness service beside the other two rather than in a check the
+//! draw performs.
+//!
+//! Its terminal case is unlike the other two. A hazard is discharged by
+//! completion and a stamp by publication, but a pipeline can be *refused*, and
+//! a transaction waiting on a refused pipeline will never be ready. That is not
+//! a stall to diagnose later: [`Scheduler::pipeline_refused`] returns those
+//! transactions at once, so the caller withdraws them and names the reason
+//! instead of leaving them holding their channel's head forever.
 //!
 //! # Nothing here blocks a thread
 //!
@@ -27,7 +42,9 @@
 //! waiting on a stamp nobody will write is a hang with a cause, and this is the
 //! cause.
 
-use crate::identity::{CompletionStamp, IngressOrdinal, StampSlot, StampValue, StampWait};
+use crate::identity::{
+    CompletionStamp, IngressOrdinal, ResourceId, StampSlot, StampValue, StampWait,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// One admitted transaction's unfinished business.
@@ -38,8 +55,19 @@ struct Pending {
     remaining_hazards: usize,
     /// Stamp points that must be published before this may begin.
     stamp_waits: Vec<StampWait>,
+    /// Pipelines that must become usable before this may begin.
+    pipeline_waits: Vec<ResourceId>,
     /// What this transaction publishes when it completes.
     completion: Option<CompletionStamp>,
+}
+
+impl Pending {
+    /// Whether every prerequisite is discharged. One place, so a new kind of
+    /// prerequisite cannot be added and then forgotten in one of the three
+    /// release paths.
+    fn is_ready(&self) -> bool {
+        self.remaining_hazards == 0 && self.stamp_waits.is_empty() && self.pipeline_waits.is_empty()
+    }
 }
 
 /// The readiness service for one session.
@@ -51,6 +79,9 @@ pub struct Scheduler {
     published: HashMap<StampSlot, StampValue>,
     /// Transactions blocked on each slot, so publishing does not scan.
     waiters_by_slot: HashMap<StampSlot, BTreeSet<IngressOrdinal>>,
+    /// Transactions blocked on each pipeline, so a compilation finishing does
+    /// not scan either.
+    waiters_by_pipeline: HashMap<ResourceId, BTreeSet<IngressOrdinal>>,
     /// For each transaction, the transactions that must not overtake it.
     dependents: HashMap<IngressOrdinal, Vec<IngressOrdinal>>,
     ready: BTreeSet<IngressOrdinal>,
@@ -68,6 +99,10 @@ impl Scheduler {
     /// already completed are discharged here rather than counted, so a
     /// transaction admitted behind finished work is ready at once.
     ///
+    /// `pipeline_waits` are the pipelines whose leases came back pending. A
+    /// lease that was already ready is not a wait and must not be passed, or
+    /// the transaction would hold for a compilation that has already finished.
+    ///
     /// Returns whether it is ready immediately. The ready set is also
     /// accumulated for [`Self::take_ready`], so a caller may use either and
     /// will not see the same transaction twice.
@@ -76,6 +111,7 @@ impl Scheduler {
         ordinal: IngressOrdinal,
         hazard_waits: &[IngressOrdinal],
         stamp_waits: &[StampWait],
+        pipeline_waits: &[ResourceId],
         completion: Option<CompletionStamp>,
     ) -> bool {
         let live: Vec<_> = hazard_waits
@@ -97,12 +133,19 @@ impl Scheduler {
         for dep in &live {
             self.dependents.entry(*dep).or_default().push(ordinal);
         }
-        let ready = live.is_empty() && unmet.is_empty();
+        for pipeline in pipeline_waits {
+            self.waiters_by_pipeline
+                .entry(*pipeline)
+                .or_default()
+                .insert(ordinal);
+        }
+        let ready = live.is_empty() && unmet.is_empty() && pipeline_waits.is_empty();
         self.pending.insert(
             ordinal,
             Pending {
                 remaining_hazards: live.len(),
                 stamp_waits: unmet,
+                pipeline_waits: pipeline_waits.to_vec(),
                 completion,
             },
         );
@@ -156,10 +199,15 @@ impl Scheduler {
                 set.remove(&ordinal);
             }
         }
+        for pipeline in &done.pipeline_waits {
+            if let Some(set) = self.waiters_by_pipeline.get_mut(pipeline) {
+                set.remove(&ordinal);
+            }
+        }
         for dep in self.dependents.remove(&ordinal).unwrap_or_default() {
             if let Some(p) = self.pending.get_mut(&dep) {
                 p.remaining_hazards -= 1;
-                if p.remaining_hazards == 0 && p.stamp_waits.is_empty() {
+                if p.is_ready() {
                     self.ready.insert(dep);
                 }
             }
@@ -189,7 +237,7 @@ impl Scheduler {
             p.stamp_waits
                 .retain(|wait| wait.slot != stamp.slot || !wait.satisfied_by(published));
             if p.stamp_waits.is_empty() {
-                if p.remaining_hazards == 0 {
+                if p.is_ready() {
                     self.ready.insert(w);
                 }
                 if let Some(set) = self.waiters_by_slot.get_mut(&stamp.slot) {
@@ -197,6 +245,54 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// A pipeline became usable: discharge every transaction waiting on it.
+    ///
+    /// Indexed rather than scanned, so a compilation finishing costs the
+    /// waiters it actually had.
+    pub fn pipeline_ready(&mut self, pipeline: ResourceId) {
+        let Some(waiters) = self.waiters_by_pipeline.remove(&pipeline) else {
+            return;
+        };
+        for w in waiters {
+            let Some(p) = self.pending.get_mut(&w) else {
+                continue;
+            };
+            p.pipeline_waits.retain(|id| *id != pipeline);
+            if p.is_ready() {
+                self.ready.insert(w);
+            }
+        }
+    }
+
+    /// A pipeline will never be usable: name the transactions that can
+    /// therefore never be ready.
+    ///
+    /// They are returned rather than dropped or made ready. Made ready they
+    /// would execute against a pipeline that does not exist; dropped they would
+    /// hold their channel's publication head forever. The caller withdraws them
+    /// and says why on its failure channel — which is the same division of
+    /// labour [`Scheduler::stalled`] follows, except that this one is certain
+    /// rather than diagnosed.
+    #[must_use]
+    pub fn pipeline_refused(&mut self, pipeline: ResourceId) -> Vec<IngressOrdinal> {
+        let Some(waiters) = self.waiters_by_pipeline.remove(&pipeline) else {
+            return Vec::new();
+        };
+        waiters
+            .into_iter()
+            .filter(|w| self.pending.contains_key(w))
+            .collect()
+    }
+
+    /// Transactions waiting on a pipeline that is still being built.
+    #[must_use]
+    pub fn waiting_on_pipelines(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|p| !p.pipeline_waits.is_empty())
+            .count()
     }
 
     /// Take the transactions that have become ready since the last call.
@@ -263,10 +359,17 @@ mod tests {
         }
     }
 
+    fn pipe(slot: u32) -> ResourceId {
+        ResourceId {
+            slot: crate::identity::ObjectListRef(slot),
+            generation: crate::identity::SlotGeneration::default().next(),
+        }
+    }
+
     #[test]
     fn a_transaction_with_no_prerequisites_is_ready_at_once() {
         let mut s = Scheduler::new();
-        assert!(s.admit(ord(1), &[], &[], None));
+        assert!(s.admit(ord(1), &[], &[], &[], None));
         assert_eq!(s.take_ready(), vec![ord(1)]);
         assert!(
             s.take_ready().is_empty(),
@@ -277,8 +380,8 @@ mod tests {
     #[test]
     fn a_hazard_dependent_becomes_ready_when_its_predecessor_completes() {
         let mut s = Scheduler::new();
-        s.admit(ord(1), &[], &[], None);
-        assert!(!s.admit(ord(2), &[ord(1)], &[], None));
+        s.admit(ord(1), &[], &[], &[], None);
+        assert!(!s.admit(ord(2), &[ord(1)], &[], &[], None));
         assert_eq!(s.take_ready(), vec![ord(1)]);
         s.complete(ord(1));
         assert_eq!(s.take_ready(), vec![ord(2)]);
@@ -290,15 +393,15 @@ mod tests {
     #[test]
     fn a_hazard_against_a_completed_transaction_is_already_discharged() {
         let mut s = Scheduler::new();
-        s.admit(ord(1), &[], &[], None);
+        s.admit(ord(1), &[], &[], &[], None);
         s.complete(ord(1));
-        assert!(s.admit(ord(2), &[ord(1)], &[], None));
+        assert!(s.admit(ord(2), &[ord(1)], &[], &[], None));
     }
 
     #[test]
     fn a_stamp_wait_holds_until_the_value_is_published() {
         let mut s = Scheduler::new();
-        assert!(!s.admit(ord(1), &[], &[wait(4, 10)], None));
+        assert!(!s.admit(ord(1), &[], &[wait(4, 10)], &[], None));
         s.publish(stamp(4, 9));
         assert!(s.take_ready().is_empty(), "nine does not reach ten");
         s.publish(stamp(4, 10));
@@ -312,7 +415,7 @@ mod tests {
     fn a_stamp_wait_already_satisfied_at_admission_does_not_hold() {
         let mut s = Scheduler::new();
         s.publish(stamp(4, 12));
-        assert!(s.admit(ord(1), &[], &[wait(4, 10)], None));
+        assert!(s.admit(ord(1), &[], &[wait(4, 10)], &[], None));
     }
 
     /// The slot keeps the later value in the *wrapping* order. A `max` here
@@ -323,7 +426,7 @@ mod tests {
         s.publish(stamp(0, u32::MAX - 1));
         s.publish(stamp(0, 3));
         assert_eq!(s.published_value(StampSlot(0)), Some(StampValue(3)));
-        assert!(s.admit(ord(1), &[], &[wait(0, 2)], None));
+        assert!(s.admit(ord(1), &[], &[wait(0, 2)], &[], None));
     }
 
     /// And an out-of-order publication does not walk the slot backwards.
@@ -341,9 +444,9 @@ mod tests {
     #[test]
     fn completion_releases_hazard_dependents_and_owes_its_stamp() {
         let mut s = Scheduler::new();
-        s.admit(ord(1), &[], &[], Some(stamp(7, 1)));
-        s.admit(ord(2), &[ord(1)], &[], None);
-        s.admit(ord(3), &[], &[wait(7, 1)], None);
+        s.admit(ord(1), &[], &[], &[], Some(stamp(7, 1)));
+        s.admit(ord(2), &[ord(1)], &[], &[], None);
+        s.admit(ord(3), &[], &[wait(7, 1)], &[], None);
         s.take_ready();
         let owed = s.complete(ord(1));
         assert_eq!(owed, Some(stamp(7, 1)));
@@ -359,8 +462,8 @@ mod tests {
     #[test]
     fn a_transaction_with_both_kinds_of_prerequisite_waits_for_both() {
         let mut s = Scheduler::new();
-        s.admit(ord(1), &[], &[], None);
-        s.admit(ord(2), &[ord(1)], &[wait(3, 5)], None);
+        s.admit(ord(1), &[], &[], &[], None);
+        s.admit(ord(2), &[ord(1)], &[wait(3, 5)], &[], None);
         s.take_ready();
         s.complete(ord(1));
         assert!(s.take_ready().is_empty(), "the stamp is still unpublished");
@@ -372,11 +475,11 @@ mod tests {
     #[test]
     fn a_wait_nobody_will_publish_is_named() {
         let mut s = Scheduler::new();
-        s.admit(ord(1), &[], &[wait(2, 100)], None);
+        s.admit(ord(1), &[], &[wait(2, 100)], &[], None);
         assert_eq!(s.stalled(), vec![ord(1)]);
         // A packet that *will* publish it arrives: no longer stalled, and the
         // answer changed without a clock being involved.
-        s.admit(ord(2), &[], &[], Some(stamp(2, 100)));
+        s.admit(ord(2), &[], &[], &[], Some(stamp(2, 100)));
         assert!(s.stalled().is_empty());
         let owed = s.complete(ord(2)).expect("a stamp");
         s.publish(owed);
@@ -387,8 +490,8 @@ mod tests {
     #[test]
     fn a_publisher_that_stops_short_does_not_discharge_the_wait() {
         let mut s = Scheduler::new();
-        s.admit(ord(1), &[], &[wait(2, 100)], None);
-        s.admit(ord(2), &[], &[], Some(stamp(2, 99)));
+        s.admit(ord(1), &[], &[wait(2, 100)], &[], None);
+        s.admit(ord(2), &[], &[], &[], Some(stamp(2, 99)));
         assert_eq!(s.stalled(), vec![ord(1)]);
     }
 
@@ -397,8 +500,8 @@ mod tests {
     #[test]
     fn a_mutual_wait_names_both_sides() {
         let mut s = Scheduler::new();
-        s.admit(ord(1), &[], &[wait(1, 5)], Some(stamp(2, 5)));
-        s.admit(ord(2), &[], &[wait(2, 5)], Some(stamp(1, 5)));
+        s.admit(ord(1), &[], &[wait(1, 5)], &[], Some(stamp(2, 5)));
+        s.admit(ord(2), &[], &[wait(2, 5)], &[], Some(stamp(1, 5)));
         assert!(
             s.stalled().is_empty(),
             "each side's stamp is publishable by the other, so this is a \
@@ -413,8 +516,113 @@ mod tests {
     #[should_panic(expected = "not pending")]
     fn completing_twice_is_loud() {
         let mut s = Scheduler::new();
-        s.admit(ord(1), &[], &[], None);
+        s.admit(ord(1), &[], &[], &[], None);
         s.complete(ord(1));
         s.complete(ord(1));
+    }
+    /// The plan's claim, and the reason the wait lives here rather than at the
+    /// draw: slow pipeline compilation blocks only the transactions that want
+    /// that pipeline.
+    #[test]
+    fn a_compiling_pipeline_blocks_only_what_wants_it() {
+        let mut s = Scheduler::new();
+        assert!(
+            !s.admit(ord(1), &[], &[], &[pipe(4)], None),
+            "the transaction that wants the pipeline is not ready"
+        );
+        assert!(
+            s.admit(ord(2), &[], &[], &[], None),
+            "and independent work is"
+        );
+        assert!(
+            !s.admit(ord(3), &[], &[], &[pipe(9)], None),
+            "as is a transaction wanting a different pipeline — separately"
+        );
+        assert_eq!(s.take_ready(), vec![ord(2)]);
+        assert_eq!(s.waiting_on_pipelines(), 2);
+
+        s.pipeline_ready(pipe(4));
+        assert_eq!(s.take_ready(), vec![ord(1)]);
+        assert_eq!(s.waiting_on_pipelines(), 1, "the other one still waits");
+        s.pipeline_ready(pipe(9));
+        assert_eq!(s.take_ready(), vec![ord(3)]);
+        assert_eq!(s.waiting_on_pipelines(), 0);
+    }
+
+    /// A pipeline is one prerequisite among three, and discharging it alone
+    /// does not make a transaction ready.
+    #[test]
+    fn a_pipeline_wait_is_not_the_only_prerequisite() {
+        let mut s = Scheduler::new();
+        s.admit(ord(1), &[], &[], &[], None);
+        assert!(!s.admit(ord(2), &[ord(1)], &[wait(0, 5)], &[pipe(4)], None));
+        s.take_ready();
+
+        s.pipeline_ready(pipe(4));
+        assert!(s.take_ready().is_empty(), "the hazard and the stamp remain");
+        s.complete(ord(1));
+        assert!(s.take_ready().is_empty(), "the stamp remains");
+        s.publish(stamp(0, 5));
+        assert_eq!(s.take_ready(), vec![ord(2)]);
+    }
+
+    /// And the same from each other direction: whichever prerequisite is
+    /// discharged last is the one that makes it ready, so no release path may
+    /// forget to ask about the others.
+    #[test]
+    fn the_pipeline_may_be_the_last_prerequisite_or_the_first() {
+        let mut s = Scheduler::new();
+        s.admit(ord(1), &[], &[], &[], None);
+        s.admit(ord(2), &[ord(1)], &[wait(0, 5)], &[pipe(4)], None);
+        s.take_ready();
+        s.complete(ord(1));
+        assert!(s.take_ready().is_empty());
+        s.publish(stamp(0, 5));
+        assert!(
+            s.take_ready().is_empty(),
+            "the pipeline is the last one standing"
+        );
+        s.pipeline_ready(pipe(4));
+        assert_eq!(s.take_ready(), vec![ord(2)]);
+    }
+
+    /// A refused pipeline is certain rather than diagnosed. Its waiters can
+    /// never be ready, so they come back at once — made ready they would
+    /// execute against a pipeline that does not exist, and dropped they would
+    /// hold their channel's publication head forever.
+    #[test]
+    fn a_refused_pipeline_names_the_transactions_that_can_never_run() {
+        let mut s = Scheduler::new();
+        s.admit(ord(1), &[], &[], &[pipe(4)], None);
+        s.admit(ord(2), &[], &[], &[pipe(4)], None);
+        s.admit(ord(3), &[], &[], &[pipe(7)], None);
+        assert_eq!(s.pipeline_refused(pipe(4)), vec![ord(1), ord(2)]);
+        assert!(s.take_ready().is_empty(), "and none of them was made ready");
+        assert_eq!(
+            s.pipeline_refused(pipe(4)),
+            vec![],
+            "asking twice names nobody twice"
+        );
+        assert_eq!(
+            s.waiting_on_pipelines(),
+            3,
+            "they are still pending until the caller withdraws them"
+        );
+        assert_eq!(s.pipeline_refused(pipe(7)), vec![ord(3)]);
+    }
+
+    /// A transaction that completed is no longer a waiter, so a compilation
+    /// finishing afterwards finds nothing and says nothing.
+    #[test]
+    fn a_completed_transaction_stops_waiting_on_its_pipeline() {
+        let mut s = Scheduler::new();
+        s.admit(ord(1), &[], &[], &[pipe(4)], None);
+        s.pipeline_ready(pipe(4));
+        s.take_ready();
+        s.complete(ord(1));
+        assert_eq!(s.waiting_on_pipelines(), 0);
+        s.pipeline_ready(pipe(4));
+        assert!(s.take_ready().is_empty());
+        assert_eq!(s.pipeline_refused(pipe(4)), vec![]);
     }
 }
