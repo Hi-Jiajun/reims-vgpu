@@ -86,6 +86,40 @@ impl ResolvedOperation {
         }
     }
 
+    /// The pipeline this record binds, if it binds one.
+    ///
+    /// **The link between "a record names a pipeline" and "a transaction is
+    /// held for its compilation".** [`crate::session::SessionModel::admit`]
+    /// checks every `pipeline_wait` against this transaction's leases, and
+    /// [`ExecWork::pipeline_leases`] was filled by nothing but a test — so a
+    /// transaction built from a guest's stream leased nothing, every wait
+    /// naming a pipeline it plainly uses read as `UnleasedPipelineWait`, and a
+    /// caller that dropped the waits instead would run a draw against a
+    /// pipeline still being compiled.
+    ///
+    /// Exhaustive over the classes for the same reason [`Self::class`] is: a
+    /// tenth operation that binds a pipeline must not inherit "no" from
+    /// whichever arm was last. The two that bind one are the render and compute
+    /// pipeline-state records; an indirect command buffer's slots name
+    /// pipelines too, but not at the record that executes it, so the lease for
+    /// those belongs to whoever built the buffer.
+    #[must_use]
+    pub const fn pipeline_lease(&self) -> Option<ResourceId> {
+        match self {
+            Self::Render(RenderOp::SetPipeline { pipeline })
+            | Self::Compute(ComputeOp::SetPipeline { pipeline }) => Some(*pipeline),
+            Self::Render(_)
+            | Self::Compute(_)
+            | Self::EncoderBoundary(_)
+            | Self::Blit(_)
+            | Self::Event(_)
+            | Self::Fence(_)
+            | Self::Barrier(_)
+            | Self::ResourceState(_)
+            | Self::IndirectCommand(_) => None,
+        }
+    }
+
     /// Every participation this record declares by itself, appended to `out`.
     ///
     /// **The link between "a record resolves" and "a transaction has
@@ -528,8 +562,17 @@ impl ExecBuilder {
             }
         }
         self.participation_scratch = parts;
+        // Derived from the record, exactly as the accesses above are, and after
+        // placement so a record the cursor refuses leaves no lease behind
+        // claiming it ran.
+        let lease = op.pipeline_lease();
         match refused.map_or_else(|| self.place(op), Err) {
-            Ok(at) => Ok(at),
+            Ok(at) => {
+                if let Some(pipeline) = lease {
+                    self.lease_pipeline(pipeline);
+                }
+                Ok(at)
+            }
             Err(refusal) => {
                 // Nothing half-applied: a record the cursor would not take
                 // leaves no accesses behind claiming it ran.
@@ -597,7 +640,18 @@ impl ExecBuilder {
         self.accesses.push(access);
     }
 
-    pub fn lease_pipeline(&mut self, pipeline: ResourceId) {
+    /// Hold this transaction for one pipeline's compilation.
+    ///
+    /// Private, and the privacy is the invariant: a lease list that could be
+    /// added to beside [`Self::record`] is one that could name a pipeline no
+    /// record binds, or omit one every draw uses, and nothing downstream reads
+    /// the records to notice. The one door is the record, which is the same
+    /// rule the accesses are under — see [`Self::declare_access`].
+    ///
+    /// Deduplicated, because the guest re-binds the same pipeline on every
+    /// draw: without this the list is one entry per draw and the admission
+    /// check one lookup per entry.
+    fn lease_pipeline(&mut self, pipeline: ResourceId) {
         if !self.pipeline_leases.contains(&pipeline) {
             self.pipeline_leases.push(pipeline);
         }
@@ -954,17 +1008,96 @@ mod tests {
         );
     }
 
-    /// A pipeline leased twice is leased once. The guest re-binds the same
-    /// pipeline on every draw, so the list would otherwise be one entry per
-    /// draw and the lease check one lookup per entry.
+    /// Binding a pipeline leases it, on both rails, and binding it again does
+    /// not lease it twice.
+    ///
+    /// Through `record`, because that is the only door: the lease list used to
+    /// be fillable beside the records and was filled by nothing but a test, so
+    /// a transaction built from a guest's stream leased nothing at all and
+    /// every wait naming a pipeline it plainly uses read as unleased.
+    ///
+    /// The guest re-binds the same pipeline on every draw, so without the
+    /// dedup the list is one entry per draw and the admission check one lookup
+    /// per entry.
     #[test]
-    fn a_pipeline_is_leased_once_however_often_it_is_bound() {
+    fn binding_a_pipeline_leases_it_once_however_often_it_is_bound() {
+        for (kind, bind) in [
+            (SegmentKind::Render, |p| {
+                ResolvedOperation::Render(RenderOp::SetPipeline { pipeline: p })
+            }),
+            (SegmentKind::Compute, |p| {
+                ResolvedOperation::Compute(crate::compute::ComputeOp::SetPipeline { pipeline: p })
+            }),
+        ] as [(SegmentKind, fn(ResourceId) -> ResolvedOperation); 2]
+        {
+            let mut b = builder();
+            b.begin_segment(kind.wire_type(), SegmentLifetime::SELF_CONTAINED)
+                .expect("open");
+            for pipeline in [res(3), res(3), res(4)] {
+                b.record(bind(pipeline), &mut StubRegistry(ChannelId(1)))
+                    .expect("its own rail");
+            }
+            b.end_segment().expect("end");
+            let work = b.finish().expect("frozen");
+            assert_eq!(work.pipeline_leases, vec![res(3), res(4)], "{kind:?}");
+            assert_eq!(work.record_count(), 3, "{kind:?}: every bind is a record");
+        }
+    }
+
+    /// A record the cursor refuses leaves no lease behind claiming it ran.
+    ///
+    /// The same rollback the accesses get, and it has to be the same one: a
+    /// transaction holding a lease for a pipeline no record of its own binds
+    /// waits for a compilation it has no interest in, which the guest
+    /// experiences as a frame that never arrives.
+    #[test]
+    fn a_refused_bind_leases_nothing() {
         let mut b = builder();
-        b.lease_pipeline(res(3));
-        b.lease_pipeline(res(3));
-        b.lease_pipeline(res(4));
-        let tx = b.finish().expect("frozen");
-        assert_eq!(tx.pipeline_leases, vec![res(3), res(4)]);
+        b.begin_segment(
+            SegmentKind::Blit.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        assert!(b
+            .record(
+                ResolvedOperation::Render(RenderOp::SetPipeline { pipeline: res(3) }),
+                &mut StubRegistry(ChannelId(1)),
+            )
+            .is_err());
+        b.end_segment().expect("end");
+        assert!(b.finish().expect("frozen").pipeline_leases.is_empty());
+    }
+
+    /// Only the two pipeline-state records lease anything.
+    ///
+    /// A census rather than a spot check: the answer is exhaustive over
+    /// `ResolvedOperation`, and an operation that grew a pipeline reference
+    /// without being added to it would silently lease nothing.
+    #[test]
+    fn no_other_record_class_leases_a_pipeline() {
+        for op in [
+            a_blit(),
+            a_barrier(),
+            ResolvedOperation::Render(RenderOp::SetDepthStencilState { state: res(3) }),
+            ResolvedOperation::IndirectCommand(crate::icb::IcbOp::ExecuteRange {
+                icb: res(3),
+                commands: crate::icb::CommandRange {
+                    location: 0,
+                    length: 1,
+                },
+            }),
+        ] {
+            assert_eq!(op.pipeline_lease(), None, "{:?}", op.class());
+        }
+        assert_eq!(
+            ResolvedOperation::Render(RenderOp::SetPipeline { pipeline: res(3) }).pipeline_lease(),
+            Some(res(3))
+        );
+        assert_eq!(
+            ResolvedOperation::Compute(crate::compute::ComputeOp::SetPipeline { pipeline: res(4) })
+                .pipeline_lease(),
+            Some(res(4))
+        );
     }
 
     /// Prerequisites are kept apart from accesses, because one of them may name
