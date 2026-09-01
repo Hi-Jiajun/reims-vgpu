@@ -48,10 +48,85 @@
 //! exactness [`crate::retire`] applies to every other native object — and the
 //! caller gets it back when that point is reached, never before.
 
-use crate::identity::{CompletionStamp, IngressOrdinal, TimelinePoint};
+use crate::identity::{CompletionStamp, IngressOrdinal, MappingId, TaskId, TimelinePoint};
+use reims_vgpu_protocol::packets::Channel;
 pub use reims_vgpu_protocol::present::PresentForm;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
+
+/// One present packet, decoded.
+///
+/// What the guest asked to show, and — for the two forms that name one — the
+/// task that owns it. The pipe or display index at word zero is deliberately
+/// absent: no path in this device reads it, and a field nothing reads is one
+/// that quietly acquires a wrong meaning. It stays available on
+/// [`reims_vgpu_protocol::present::Trailer`] for the layer that has a display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentPacket {
+    pub form: PresentForm,
+    /// What to show. See [`MappingId`] for why this is not an object-list ref
+    /// even though both arrive as `u32`.
+    pub mapping: MappingId,
+    /// The task that owns what is being shown, for the two forms whose trailer
+    /// names one. `None` for [`PresentForm::SwapMapping`], whose word at that
+    /// position is unidentified — reading it as a task would report whatever it
+    /// happens to hold.
+    pub task: Option<TaskId>,
+}
+
+/// Why a present packet's bytes did not become one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveRefusal {
+    /// The packet is not a present.
+    NotPresent { channel: Channel, opcode: u16 },
+    /// The payload is shorter than the emitting command's own trailer, so
+    /// there is nothing to show. Refused rather than clamped: presenting
+    /// mapping zero and completing the packet in silence is a frame the guest
+    /// believes it showed.
+    Payload(reims_vgpu_protocol::present::Refusal),
+}
+
+impl ResolveRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::NotPresent { .. } => "present_not_a_present_packet",
+            Self::Payload(inner) => inner.slug(),
+        }
+    }
+}
+
+/// Turn one present packet into what it asks to show.
+///
+/// **The join between the three trailers and the model.** The wire could read
+/// a present's words and this crate could name which of the three forms a
+/// packet is, and nothing carried a packet from one to the other — so
+/// [`crate::transaction::Payload::Present`] named a form and lost the target.
+///
+/// Where the frame goes and what has to happen for it to arrive are
+/// [`PresentStream`]'s and the display layer's. This says what the guest asked
+/// for.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a packet that is not a present, or one too short to
+/// carry its own trailer.
+pub fn resolve(
+    channel: Channel,
+    opcode: u16,
+    payload: &[u8],
+) -> Result<PresentPacket, ResolveRefusal> {
+    let Some(form) = PresentForm::of(channel, opcode) else {
+        return Err(ResolveRefusal::NotPresent { channel, opcode });
+    };
+    let trailer =
+        reims_vgpu_protocol::present::trailer(form, payload).map_err(ResolveRefusal::Payload)?;
+    Ok(PresentPacket {
+        form,
+        mapping: MappingId(trailer.target),
+        task: trailer.task.map(TaskId),
+    })
+}
 
 /// One configuration of a surface's swapchain.
 ///
@@ -568,6 +643,132 @@ mod tests {
     use super::*;
     use crate::transaction::{classify, PayloadClass};
     use reims_vgpu_protocol::packets::LEDGER;
+
+    /// A present payload whose target word sits where `form` puts it, with a
+    /// different value in every other word — so a decoder reading the wrong
+    /// slot cannot accidentally read the right number.
+    fn present_bytes(form: PresentForm, mapping: u32, task: u32) -> Vec<u8> {
+        let mut out = vec![0u8; form.trailer_len()];
+        out[0..4].copy_from_slice(&0xDEADu32.to_le_bytes());
+        let t = form.target_offset();
+        out[t..t + 4].copy_from_slice(&mapping.to_le_bytes());
+        if let Some(k) = form.task_offset() {
+            out[k..k + 4].copy_from_slice(&task.to_le_bytes());
+        }
+        out
+    }
+
+    /// The join: a guest's present bytes become what it asked to show, on all
+    /// three forms, with each form reading its own slots.
+    #[test]
+    fn a_present_payload_becomes_what_the_guest_asked_to_show() {
+        for (channel, opcode, form) in [
+            (Channel::Child, 0x06u16, PresentForm::Transaction2),
+            (Channel::Child, 0x07, PresentForm::Transaction3),
+            (Channel::Child, 0x08, PresentForm::SwapMapping),
+        ] {
+            let bytes = present_bytes(form, 0x5e, 0x77);
+            assert_eq!(
+                resolve(channel, opcode, &bytes),
+                Ok(PresentPacket {
+                    form,
+                    mapping: MappingId(0x5e),
+                    task: form.names_a_task().then_some(TaskId(0x77)),
+                }),
+                "{}",
+                form.name()
+            );
+        }
+    }
+
+    /// The swap form's second word is unidentified, so nothing may report it as
+    /// a task — and the two transaction forms keep theirs in *different* slots,
+    /// so one read at the other's would be a plausible wrong answer.
+    #[test]
+    fn no_form_reads_another_forms_slots() {
+        // op6's twelve bytes, padded to op7's thirty-six so the short refusal
+        // is not what this test measures.
+        let mut two = present_bytes(PresentForm::Transaction2, 0x5e, 0x77);
+        two.resize(PresentForm::Transaction3.trailer_len(), 0);
+        assert_eq!(
+            resolve(Channel::Child, 0x07, &two).expect("long enough"),
+            PresentPacket {
+                form: PresentForm::Transaction3,
+                mapping: MappingId(0x77),
+                task: Some(TaskId(0x5e)),
+            },
+            "reading op6's payload as op7 must swap the two, not agree with it"
+        );
+        let swap = present_bytes(PresentForm::SwapMapping, 0x5e, 0);
+        assert_eq!(
+            resolve(Channel::Child, 0x08, &swap)
+                .expect("long enough")
+                .task,
+            None
+        );
+    }
+
+    /// Zero is a value the guest sends and it means nothing to show. A present
+    /// carrying it is well formed, and its completion is owed in full.
+    #[test]
+    fn a_present_of_nothing_is_a_well_formed_present() {
+        let bytes = present_bytes(PresentForm::SwapMapping, 0, 0);
+        assert_eq!(
+            resolve(Channel::Child, 0x08, &bytes)
+                .expect("well formed")
+                .mapping,
+            MappingId(0)
+        );
+    }
+
+    /// A payload too short to carry its own trailer is refused, not clamped:
+    /// presenting mapping zero and completing in silence is a frame the guest
+    /// believes it showed.
+    #[test]
+    fn a_present_too_short_for_its_trailer_is_refused() {
+        for (opcode, form) in [
+            (0x06u16, PresentForm::Transaction2),
+            (0x07, PresentForm::Transaction3),
+            (0x08, PresentForm::SwapMapping),
+        ] {
+            let need = form.trailer_len();
+            let bytes = present_bytes(form, 0x5e, 0x77);
+            let refusal = resolve(Channel::Child, opcode, &bytes[..need - 1])
+                .expect_err("one byte under its trailer");
+            assert_eq!(
+                refusal,
+                ResolveRefusal::Payload(reims_vgpu_protocol::present::Refusal::Short {
+                    have: need - 1,
+                    need,
+                }),
+                "{}",
+                form.name()
+            );
+            assert_eq!(refusal.slug(), "display_present_short");
+        }
+    }
+
+    /// And a packet that is not a present does not become one, whatever its
+    /// payload holds.
+    #[test]
+    fn a_packet_that_is_not_a_present_does_not_resolve_to_one() {
+        for p in LEDGER {
+            if PresentForm::of(p.channel, p.opcode).is_some() {
+                continue;
+            }
+            assert_eq!(
+                resolve(p.channel, p.opcode, &[0u8; 64]),
+                Err(ResolveRefusal::NotPresent {
+                    channel: p.channel,
+                    opcode: p.opcode
+                }),
+                "{} {:#04x} ({})",
+                p.channel.name(),
+                p.opcode,
+                p.name
+            );
+        }
+    }
 
     /// The claim every other payload class already makes about itself: the
     /// class's vocabulary is exhaustive over what the ledger judged into it,

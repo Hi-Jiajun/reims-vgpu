@@ -142,6 +142,22 @@ impl TimelinePoint {
     }
 }
 
+/// What a present names as the thing to show.
+///
+/// **A third namespace, numerically overlapping the other two and unrelated to
+/// them.** The device's own state keeps this apart from object-list refs in as
+/// many words — "surface_id namespace only, never texture_ref (object list ids
+/// collide)" — because a host render cache keyed by one and fed by the other
+/// serves a frame from whatever texture happened to share a number. That is the
+/// hazard this module exists to make a type error, so a present's target is its
+/// own type rather than the `u32` it arrives as.
+///
+/// Not `NonZero`. Zero is a value the guest sends and it means "nothing to
+/// show": a present carrying it is a well-formed packet whose completion is
+/// owed in full, not a malformed one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MappingId(pub u32);
+
 /// A guest task ordinal, as it arrives on the wire.
 ///
 /// Task 0 is the kernel task and is a legal value, so this is not `NonZero`.

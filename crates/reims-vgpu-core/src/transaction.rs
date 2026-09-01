@@ -31,7 +31,7 @@ use crate::control::ControlOp;
 use crate::exec::ExecWork;
 use crate::identity::{CompletionStamp, StampWait, TransactionIdentity};
 use crate::lifecycle::LifecycleOp;
-use crate::present::PresentForm;
+use crate::present::PresentPacket;
 use crate::query::QueryRequest;
 use reims_vgpu_protocol::closure::Closure;
 use reims_vgpu_protocol::packets::{find, Channel};
@@ -177,9 +177,9 @@ pub enum Payload {
         request: QueryRequest,
         accesses: Vec<AccessIntent>,
     },
-    /// Which of the three present commands, and the frame it reads.
+    /// What the guest asked to show, and the frame reading it.
     Present {
-        form: PresentForm,
+        packet: PresentPacket,
         accesses: Vec<AccessIntent>,
     },
     /// A control operation. **No access list, and that is a contract claim
@@ -395,7 +395,6 @@ mod tests {
     fn every_judged_packet_reaches_a_class_and_a_meaning_within_it() {
         use crate::control::ControlKind;
         use crate::lifecycle::LifecycleKind;
-        use crate::present::PresentForm;
         use crate::query::QueryKind;
         let mut counts = [0usize; 5];
         for p in LEDGER {
@@ -407,7 +406,9 @@ mod tests {
                 PayloadClass::ResourceLifecycle => LifecycleKind::of(p.channel, p.opcode).is_some(),
                 PayloadClass::Query => QueryKind::of(p.channel, p.opcode).is_some(),
                 PayloadClass::Control => ControlKind::of(p.channel, p.opcode).is_some(),
-                PayloadClass::Present => PresentForm::of(p.channel, p.opcode).is_some(),
+                PayloadClass::Present => {
+                    crate::present::PresentForm::of(p.channel, p.opcode).is_some()
+                }
             };
             assert!(
                 named,

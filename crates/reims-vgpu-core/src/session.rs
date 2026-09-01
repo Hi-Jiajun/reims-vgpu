@@ -565,7 +565,8 @@ mod tests {
                 accesses: Vec::new(),
             },
             Some(PayloadClass::Present) => Payload::Present {
-                form: crate::present::PresentForm::of(channel, opcode).expect("a present"),
+                packet: crate::present::resolve(channel, opcode, &0u32.to_le_bytes())
+                    .expect("a present with a trailer"),
                 accesses: Vec::new(),
             },
             // A packet the model refuses never reaches its payload, so the
