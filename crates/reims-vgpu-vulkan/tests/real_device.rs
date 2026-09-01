@@ -24,6 +24,7 @@ use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SessionGeneration, Sl
 use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM;
 use reims_vgpu_core::retire::{Lifetime, NativeRetirement};
 use reims_vgpu_core::texture_shape::{TextureKind, TextureShape, TextureUsage};
+use reims_vgpu_core::vertex_format::VertexFormat;
 use reims_vgpu_vulkan::buffer;
 use reims_vgpu_vulkan::device::DeviceEpoch;
 use reims_vgpu_vulkan::host::VulkanHost;
@@ -38,6 +39,7 @@ use reims_vgpu_vulkan::resident;
 use reims_vgpu_vulkan::staging;
 use reims_vgpu_vulkan::timeline::Timeline;
 use reims_vgpu_vulkan::transfer;
+use reims_vgpu_vulkan::vertex;
 use reims_vgpu_vulkan::view;
 
 /// What the GPU writes, and what the CPU has to read back.
@@ -1124,4 +1126,73 @@ fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
     }
     epoch.queues().release(owner);
     drop(epoch);
+}
+
+/// What this driver actually declines as a vertex attribute, and whether the
+/// substitute the rail would reach for is there.
+///
+/// The unit tests exercise the widening path against a synthetic cell. This
+/// asks a real driver which formats it refuses — Vulkan mandates only a subset
+/// and every three-channel 8- and 16-bit format is outside it — and then holds
+/// the invariant the widening rests on: a declined format either has a
+/// supported wider sibling to substitute, or it has no wider sibling at all,
+/// in which case the rail refuses by name rather than binding something wrong.
+///
+/// It asserts nothing about *which* formats a host declines, because that is
+/// the fact being measured. What it prints is that list, so a host where the
+/// widening path is never reached is distinguishable from one where it is.
+#[test]
+fn a_declined_vertex_format_has_a_substitute_or_no_sibling_at_all() {
+    let Ok(host) = VulkanHost::open("reims-vgpu-vulkan integration") else {
+        println!("no real device: nothing to compose");
+        return;
+    };
+    let cell = host.census().vertex();
+
+    let declined: Vec<VertexFormat> = VertexFormat::ALL
+        .into_iter()
+        .filter(|f| !cell.formats.has(*f))
+        .collect();
+    println!(
+        "vertex formats: {} of {} supported; declined: {:?}",
+        cell.formats.count(),
+        VertexFormat::ALL.len(),
+        declined.iter().map(|f| f.name()).collect::<Vec<_>>()
+    );
+
+    for guest in declined {
+        let planned = vertex::attribute(0, 0, guest, 0, 64, cell, || {
+            vertex::ShaderInput::Channels(guest.components())
+        });
+        match guest.widened() {
+            Some(wider) if cell.formats.has(wider) => {
+                let plan = planned.expect("a supported wider sibling is the substitute");
+                assert_eq!(plan.widened_from, Some(guest));
+                assert_eq!(plan.format, vertex::format(wider));
+            }
+            // No sibling, or a sibling this driver also declined: refused by
+            // name, and never bound as something else.
+            _ => assert_eq!(
+                planned,
+                Err(vertex::Refusal::NoFormat { guest }),
+                "{} was declined and not refused",
+                guest.name()
+            ),
+        }
+    }
+
+    // Whatever this host declines, every four-channel 32-bit format is
+    // mandatory in Vulkan, so the substitutes the rail relies on are there.
+    for mandatory in [
+        VertexFormat::Float4,
+        VertexFormat::UInt4,
+        VertexFormat::UChar4,
+        VertexFormat::UShort4,
+    ] {
+        assert!(
+            cell.formats.has(mandatory),
+            "{} is mandatory and this driver declined it",
+            mandatory.name()
+        );
+    }
 }

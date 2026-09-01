@@ -743,6 +743,43 @@ impl VertexFormat {
         self.layout().components()
     }
 
+    /// The format with the same channel kind and order and one more channel,
+    /// when there is one.
+    ///
+    /// A geometric relation and not a policy: components `0..count` sit at
+    /// identical byte offsets in both, because these layouts are
+    /// component-packed. Whether substituting the wider one is *safe* depends
+    /// on what the shader declares and on whether the wider read still fits
+    /// the vertex stride, and both of those belong to the executor.
+    ///
+    /// `None` for a four-channel format, which has nothing wider, and for
+    /// every packed one, whose channels are not whole.
+    #[must_use]
+    pub const fn widened(self) -> Option<Self> {
+        let Layout::Separate { count, kind, order } = self.layout() else {
+            return None;
+        };
+        if count >= 4 {
+            return None;
+        }
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            let candidate = Self::ALL[i];
+            if let Layout::Separate {
+                count: wider,
+                kind: k,
+                order: o,
+            } = candidate.layout()
+            {
+                if wider == count + 1 && kind_eq(k, kind) && order_eq(o, order) {
+                    return Some(candidate);
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -801,6 +838,15 @@ impl VertexFormat {
             Self::FloatRgb9E5 => "float_rgb9e5",
         }
     }
+}
+
+/// `PartialEq` is not `const`, and this is a `const fn`.
+const fn kind_eq(a: ComponentKind, b: ComponentKind) -> bool {
+    a as u32 == b as u32
+}
+
+const fn order_eq(a: ChannelOrder, b: ChannelOrder) -> bool {
+    a as u32 == b as u32
 }
 
 #[cfg(test)]
@@ -951,6 +997,60 @@ mod tests {
             .map(|f| f.ordinal())
             .collect();
         assert_eq!(reordered, BTreeSet::from([42]));
+    }
+
+    /// The widening relation, and the two facts that make it usable: the
+    /// wider format's leading channels sit at the same offsets, and it is one
+    /// step wider rather than any wider format at all.
+    #[test]
+    fn widening_climbs_one_channel_and_stops_at_four() {
+        assert_eq!(VertexFormat::Short3.widened(), Some(VertexFormat::Short4));
+        assert_eq!(
+            VertexFormat::UChar2Normalized.widened(),
+            Some(VertexFormat::UChar3Normalized)
+        );
+        assert_eq!(VertexFormat::Short4.widened(), None);
+        assert_eq!(VertexFormat::FloatRgb9E5.widened(), None);
+        assert_eq!(VertexFormat::Int1010102Normalized.widened(), None);
+
+        let mut widened = 0;
+        for format in VertexFormat::ALL {
+            let Layout::Separate { count, kind, order } = format.layout() else {
+                assert_eq!(format.widened(), None, "{} is packed", format.name());
+                continue;
+            };
+            match format.widened() {
+                Some(wider) => {
+                    widened += 1;
+                    assert!(count < 4);
+                    let Layout::Separate {
+                        count: c,
+                        kind: k,
+                        order: o,
+                    } = wider.layout()
+                    else {
+                        panic!("a widened format is still separate");
+                    };
+                    // One step, same channels, and therefore exactly one more
+                    // channel's worth of bytes.
+                    assert_eq!(c, count + 1);
+                    assert_eq!(k, kind);
+                    assert_eq!(o, order);
+                    assert_eq!(wider.bytes(), format.bytes() + kind.bytes());
+                }
+                None => assert_eq!(count, 4, "{} has no wider sibling", format.name()),
+            }
+        }
+        // Non-vacuity: most of this set widens.
+        assert!(widened >= 30, "only {widened} formats widened");
+
+        // The BGRA format is four channels, so it never widens and never
+        // becomes the substitute for an RGBA one.
+        assert_eq!(VertexFormat::UChar4NormalizedBgra.widened(), None);
+        assert_eq!(
+            VertexFormat::UChar3Normalized.widened(),
+            Some(VertexFormat::UChar4Normalized)
+        );
     }
 
     #[test]

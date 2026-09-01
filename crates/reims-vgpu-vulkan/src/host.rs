@@ -420,6 +420,7 @@ unsafe fn judge(
     let properties = unsafe { instance.get_physical_device_properties(physical) };
     let class = DeviceClass::of(properties.device_type);
     let effective = effective_api(properties.api_version, requested);
+    let api = ApiVersion::decode(effective);
 
     let extension_properties =
         unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
@@ -445,6 +446,10 @@ unsafe fn judge(
     let mut synchronization2 = vk::PhysicalDeviceSynchronization2Features::default();
     let mut dynamic_rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default();
     let mut extended_dynamic_state = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
+    // One structure for both spellings: `VK_EXT_vertex_attribute_divisor`'s
+    // feature struct is an alias of the KHR one that 1.4 promoted, so the same
+    // query answers on all three routes.
+    let mut divisor = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default();
     let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan12);
     if has(extension::MESH_SHADER) {
         features = features.push_next(&mut mesh);
@@ -460,6 +465,14 @@ unsafe fn judge(
     }
     if has(extension::EXTENDED_DYNAMIC_STATE) {
         features = features.push_next(&mut extended_dynamic_state);
+    }
+    // 1.4 promoted the structure, so a 1.4 device answers it whether or not it
+    // enumerates either extension name; below that, either name is a route.
+    let divisor_route = api.at_least(1, 4)
+        || has(extension::VERTEX_ATTRIBUTE_DIVISOR)
+        || has(extension::VERTEX_ATTRIBUTE_DIVISOR_EXT);
+    if divisor_route {
+        features = features.push_next(&mut divisor);
     }
     unsafe { instance.get_physical_device_features2(physical, &mut features) };
     // `VkPhysicalDeviceFeatures2::features` is the 1.0 boolean block, filled
@@ -479,7 +492,6 @@ unsafe fn judge(
     // `VK_KHR_maintenance4`. Asked for only when one of those is true, so that
     // a device that never answered is distinguishable from one that answered
     // zero — see `crate::buffer::BufferLimits`.
-    let api = ApiVersion::decode(effective);
     let max_buffer_size = (api.at_least(1, 3) || has(extension::MAINTENANCE_4)).then(|| {
         let mut maintenance4 = vk::PhysicalDeviceMaintenance4Properties::default();
         let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance4);
@@ -499,6 +511,40 @@ unsafe fn judge(
             state3.dynamic_primitive_topology_unrestricted == vk::TRUE
         });
 
+    // The divisor limit, asked only where the capability has a route. Zero
+    // where it does not — a value nothing reads without the feature beside it.
+    //
+    // The *properties* structures are not aliases the way the feature ones
+    // are: KHR's carries a second field and has its own structure type, so the
+    // one asked for has to match the route this device actually offers.
+    let max_vertex_attrib_divisor = if api.at_least(1, 4)
+        || has(extension::VERTEX_ATTRIBUTE_DIVISOR)
+    {
+        let mut properties = vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR::default();
+        let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut properties);
+        unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+        properties.max_vertex_attrib_divisor
+    } else if has(extension::VERTEX_ATTRIBUTE_DIVISOR_EXT) {
+        let mut properties = vk::PhysicalDeviceVertexAttributeDivisorPropertiesEXT::default();
+        let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut properties);
+        unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+        properties.max_vertex_attrib_divisor
+    } else {
+        0
+    };
+
+    // One query per format, once. Vulkan mandates only a subset of formats as
+    // vertex attributes — every three-channel 8- and 16-bit format is outside
+    // it — so this is measured rather than assumed, and the result is a single
+    // word the census carries beside every other measured fact.
+    let vertex_formats = crate::vertex::VertexFormatSupport::measured(|format| {
+        let properties =
+            unsafe { instance.get_physical_device_format_properties(physical, format) };
+        properties
+            .buffer_features
+            .contains(vk::FormatFeatureFlags::VERTEX_BUFFER)
+    });
+
     let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
     let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
 
@@ -513,6 +559,13 @@ unsafe fn judge(
         sampler_anisotropy: core_features.sampler_anisotropy == vk::TRUE,
         extended_dynamic_state: extended_dynamic_state.extended_dynamic_state == vk::TRUE,
         dynamic_primitive_topology_unrestricted,
+        vertex_attribute_instance_rate_divisor: divisor.vertex_attribute_instance_rate_divisor
+            == vk::TRUE,
+        vertex_attribute_instance_rate_zero_divisor: divisor
+            .vertex_attribute_instance_rate_zero_divisor
+            == vk::TRUE,
+        max_vertex_attrib_divisor,
+        vertex_formats,
         dual_src_blend: core_features.dual_src_blend == vk::TRUE,
         independent_blend: core_features.independent_blend == vk::TRUE,
         max_sampler_anisotropy: properties.limits.max_sampler_anisotropy,
@@ -556,6 +609,10 @@ mod tests {
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
             dynamic_primitive_topology_unrestricted: None,
+            vertex_attribute_instance_rate_divisor: false,
+            vertex_attribute_instance_rate_zero_divisor: false,
+            max_vertex_attrib_divisor: 0,
+            vertex_formats: crate::vertex::VertexFormatSupport::NONE,
             dual_src_blend: false,
             independent_blend: false,
             sampler_mirror_clamp_to_edge: false,
@@ -784,6 +841,10 @@ mod tests {
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
             dynamic_primitive_topology_unrestricted: None,
+            vertex_attribute_instance_rate_divisor: false,
+            vertex_attribute_instance_rate_zero_divisor: false,
+            max_vertex_attrib_divisor: 0,
+            vertex_formats: crate::vertex::VertexFormatSupport::NONE,
             dual_src_blend: false,
             independent_blend: false,
             sampler_mirror_clamp_to_edge: false,

@@ -109,11 +109,18 @@ pub mod extension {
     /// and has no core promotion — a 1.4 device that does not enumerate this
     /// extension has not said it is unrestricted.
     ///
-    /// Deliberately absent from [`DeviceExtensions`]: a physical-device
+    /// Deliberately absent from [`super::DeviceExtensions`]: a physical-device
     /// property is readable from a *supported* extension and nothing here
     /// calls a command this one adds, so requesting it at device creation
     /// would be asking for something this rail does not use.
     pub const EXTENDED_DYNAMIC_STATE_3: &str = "VK_EXT_extended_dynamic_state3";
+    /// Carries the two instance-divisor features and `maxVertexAttribDivisor`,
+    /// which 1.4 promoted to core.
+    pub const VERTEX_ATTRIBUTE_DIVISOR: &str = "VK_KHR_vertex_attribute_divisor";
+    /// The same capability under its earlier vendor name. A device may
+    /// enumerate either, and the feature is the question rather than which
+    /// spelling it arrived under.
+    pub const VERTEX_ATTRIBUTE_DIVISOR_EXT: &str = "VK_EXT_vertex_attribute_divisor";
 }
 
 /// What the driver said, as the caller read it off the device.
@@ -158,6 +165,19 @@ pub struct Reported<'a> {
     /// substituting one for the other here would make the census say a driver
     /// answered when it did not.
     pub dynamic_primitive_topology_unrestricted: Option<bool>,
+    /// `…VertexAttributeDivisorFeatures::vertexAttributeInstanceRateDivisor`.
+    pub vertex_attribute_instance_rate_divisor: bool,
+    /// `…VertexAttributeDivisorFeatures::vertexAttributeInstanceRateZeroDivisor`.
+    pub vertex_attribute_instance_rate_zero_divisor: bool,
+    /// `…VertexAttributeDivisorProperties::maxVertexAttribDivisor`. Meaningless
+    /// without the feature above, and never read without it.
+    pub max_vertex_attrib_divisor: u32,
+    /// Which formats reported `VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT`.
+    ///
+    /// Measured by the caller because it is one
+    /// `vkGetPhysicalDeviceFormatProperties` per format, and the census asks
+    /// no driver anything.
+    pub vertex_formats: crate::vertex::VertexFormatSupport,
     /// `VkPhysicalDeviceFeatures::dualSrcBlend`.
     pub dual_src_blend: bool,
     /// `VkPhysicalDeviceFeatures::independentBlend`.
@@ -256,6 +276,9 @@ pub struct DeviceExtensions {
     pub synchronization2: bool,
     pub dynamic_rendering: bool,
     pub extended_dynamic_state: bool,
+    /// Whichever spelling this device enumerated, when the capability did not
+    /// arrive through core.
+    pub vertex_attribute_divisor: Option<&'static str>,
 }
 
 impl DeviceExtensions {
@@ -279,6 +302,9 @@ impl DeviceExtensions {
             if wanted {
                 names.push(name);
             }
+        }
+        if let Some(name) = self.vertex_attribute_divisor {
+            names.push(name);
         }
         names
     }
@@ -321,6 +347,7 @@ pub struct Census {
     samplers: crate::sampler::SamplerCell,
     blend: crate::blend::BlendCell,
     topology: crate::topology::TopologyCell,
+    vertex: crate::vertex::VertexCell,
     host_pointer_import: bool,
     synchronization2: bool,
     can_present: bool,
@@ -350,6 +377,12 @@ impl Census {
         if !reported.has(extension::SWAPCHAIN) {
             return Err(Floor::NoSwapchain);
         }
+
+        // Whether the divisor capability has any route onto this device at
+        // all, named once because three decisions below read it.
+        let divisor_route = api.at_least(1, 4)
+            || reported.has(extension::VERTEX_ATTRIBUTE_DIVISOR)
+            || reported.has(extension::VERTEX_ATTRIBUTE_DIVISOR_EXT);
 
         let families = queues::families(reported.queue_families);
         let queues = QueueChoice::from_families(&families)
@@ -390,6 +423,16 @@ impl Census {
             },
             buffers: crate::buffer::BufferLimits {
                 max_buffer_size: reported.max_buffer_size,
+            },
+            vertex: crate::vertex::VertexCell {
+                formats: reported.vertex_formats,
+                // Either spelling of the extension, or 1.4 core, and the
+                // feature in every case: a capability that arrived by
+                // promotion is still one that has to be reported.
+                instance_rate_divisor: divisor_route
+                    && reported.vertex_attribute_instance_rate_divisor,
+                zero_divisor: divisor_route && reported.vertex_attribute_instance_rate_zero_divisor,
+                max_divisor: reported.max_vertex_attrib_divisor,
             },
             topology: crate::topology::TopologyCell {
                 // Core from 1.3, and both halves below it — for the reason
@@ -443,6 +486,21 @@ impl Census {
                 extended_dynamic_state: reported.has(extension::EXTENDED_DYNAMIC_STATE)
                     && reported.extended_dynamic_state
                     && !api.at_least(1, 3),
+                // Only where a divisor capability was actually admitted, and
+                // under the name this device enumerated. The KHR spelling wins
+                // where both are present, because it is the one core promoted.
+                vertex_attribute_divisor: if api.at_least(1, 4)
+                    || !(reported.vertex_attribute_instance_rate_divisor
+                        || reported.vertex_attribute_instance_rate_zero_divisor)
+                {
+                    None
+                } else if reported.has(extension::VERTEX_ATTRIBUTE_DIVISOR) {
+                    Some(extension::VERTEX_ATTRIBUTE_DIVISOR)
+                } else if reported.has(extension::VERTEX_ATTRIBUTE_DIVISOR_EXT) {
+                    Some(extension::VERTEX_ATTRIBUTE_DIVISOR_EXT)
+                } else {
+                    None
+                },
             },
         })
     }
@@ -513,6 +571,13 @@ impl Census {
         self.buffers
     }
 
+    /// The cell [`crate::vertex::attribute`] and [`crate::vertex::binding`]
+    /// decide a format substitution and a divisor from.
+    #[must_use]
+    pub const fn vertex(&self) -> crate::vertex::VertexCell {
+        self.vertex
+    }
+
     /// The cell [`crate::topology::key`] reads to decide what a built
     /// pipeline can serve.
     #[must_use]
@@ -572,7 +637,8 @@ impl Census {
             "vk_census api={} topology={} signal={} import={} sync2={} mesh={} push={} \
              push_max={} desc_buffer={} desc_qualified={} queue_family={} compute={} \
              mirror_clamp={} aniso={} aniso_max={} dual_src={} independent_blend={} \
-             dyn_topology={} topology_unrestricted={}",
+             dyn_topology={} topology_unrestricted={} vertex_formats={} \
+             vertex_divisor={} vertex_zero_divisor={} vertex_max_divisor={}",
             self.api,
             self.memory.topology.slug(),
             self.memory.signal.slug(),
@@ -592,6 +658,10 @@ impl Census {
             self.blend.independent,
             self.topology.dynamic,
             self.topology.unrestricted,
+            self.vertex.formats.count(),
+            self.vertex.instance_rate_divisor,
+            self.vertex.zero_divisor,
+            self.vertex.max_divisor,
         )
     }
 }
@@ -660,6 +730,10 @@ mod tests {
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
             dynamic_primitive_topology_unrestricted: None,
+            vertex_attribute_instance_rate_divisor: false,
+            vertex_attribute_instance_rate_zero_divisor: false,
+            max_vertex_attrib_divisor: 0,
+            vertex_formats: crate::vertex::VertexFormatSupport::NONE,
             dual_src_blend: false,
             independent_blend: false,
             sampler_mirror_clamp_to_edge: false,
@@ -915,6 +989,10 @@ mod tests {
             "independent_blend=false",
             "dyn_topology=false",
             "topology_unrestricted=false",
+            "vertex_formats=0",
+            "vertex_divisor=false",
+            "vertex_zero_divisor=false",
+            "vertex_max_divisor=0",
         ] {
             assert!(line.contains(fact), "{fact} missing from {line}");
         }
@@ -1140,6 +1218,116 @@ mod tests {
         let mut r = reported(packed(1, 4), named, &memory, &families);
         r.dynamic_primitive_topology_unrestricted = Some(false);
         assert!(!Census::take(r).expect("admitted").topology().unrestricted);
+    }
+
+    /// The divisor capability has three routes and one feature question, and
+    /// the extension is requested under the name this device enumerated.
+    #[test]
+    fn the_divisor_capability_takes_any_route_and_still_needs_the_feature() {
+        let memory = mem::intel_igpu();
+        let families = integrated_families();
+
+        // 1.2 with neither name: no route, so the feature bits are ignored and
+        // nothing is requested.
+        let mut r = reported(packed(1, 2), BASELINE, &memory, &families);
+        r.vertex_attribute_instance_rate_divisor = true;
+        r.vertex_attribute_instance_rate_zero_divisor = true;
+        let none = Census::take(r).expect("admitted");
+        assert!(!none.vertex().instance_rate_divisor);
+        assert!(!none.vertex().zero_divisor);
+        assert_eq!(none.extensions().vertex_attribute_divisor, None);
+
+        // 1.2 with the EXT name and the feature: admitted, and asked for under
+        // that name.
+        let ext = &[
+            extension::SWAPCHAIN,
+            extension::VERTEX_ATTRIBUTE_DIVISOR_EXT,
+        ];
+        let mut r = reported(packed(1, 2), ext, &memory, &families);
+        r.vertex_attribute_instance_rate_divisor = true;
+        r.max_vertex_attrib_divisor = 8;
+        let by_ext = Census::take(r).expect("admitted");
+        assert!(by_ext.vertex().instance_rate_divisor);
+        // The two halves are separate facts, and only one was reported.
+        assert!(!by_ext.vertex().zero_divisor);
+        assert_eq!(by_ext.vertex().max_divisor, 8);
+        assert_eq!(
+            by_ext.extensions().vertex_attribute_divisor,
+            Some(extension::VERTEX_ATTRIBUTE_DIVISOR_EXT)
+        );
+        assert!(by_ext
+            .extensions()
+            .names()
+            .contains(&extension::VERTEX_ATTRIBUTE_DIVISOR_EXT));
+
+        // Both names present: the promoted spelling is the one requested.
+        let both = &[
+            extension::SWAPCHAIN,
+            extension::VERTEX_ATTRIBUTE_DIVISOR,
+            extension::VERTEX_ATTRIBUTE_DIVISOR_EXT,
+        ];
+        let mut r = reported(packed(1, 2), both, &memory, &families);
+        r.vertex_attribute_instance_rate_zero_divisor = true;
+        let by_khr = Census::take(r).expect("admitted");
+        assert!(by_khr.vertex().zero_divisor);
+        assert_eq!(
+            by_khr.extensions().vertex_attribute_divisor,
+            Some(extension::VERTEX_ATTRIBUTE_DIVISOR)
+        );
+
+        // The name without the feature is not a capability, and nothing is
+        // requested for a capability that was not admitted.
+        let bare = Census::take(reported(packed(1, 2), ext, &memory, &families)).expect("admitted");
+        assert!(!bare.vertex().instance_rate_divisor);
+        assert!(!bare.vertex().zero_divisor);
+        assert_eq!(bare.extensions().vertex_attribute_divisor, None);
+
+        // 1.4 has it in core and never asks for a name.
+        let mut r = reported(packed(1, 4), BASELINE, &memory, &families);
+        r.vertex_attribute_instance_rate_divisor = true;
+        r.vertex_attribute_instance_rate_zero_divisor = true;
+        let promoted = Census::take(r).expect("admitted");
+        assert!(promoted.vertex().instance_rate_divisor);
+        assert!(promoted.vertex().zero_divisor);
+        assert_eq!(promoted.extensions().vertex_attribute_divisor, None);
+    }
+
+    /// The measured vertex formats reach the planner, and a declined one is
+    /// the case the widening substitute exists for.
+    #[test]
+    fn the_measured_vertex_formats_reach_the_planner() {
+        use crate::vertex::{attribute, Refusal, ShaderInput, VertexFormatSupport};
+        use reims_vgpu_core::vertex_format::VertexFormat;
+
+        let memory = mem::intel_igpu();
+        let families = integrated_families();
+        let mut r = reported(packed(1, 2), BASELINE, &memory, &families);
+        r.vertex_formats = VertexFormatSupport::all().without(VertexFormat::Short3);
+        let census = Census::take(r).expect("admitted");
+
+        assert!(!census.vertex().formats.has(VertexFormat::Short3));
+        assert!(census.vertex().formats.has(VertexFormat::Short4));
+
+        // The declined format widens where the shader reads three.
+        let widened = attribute(0, 0, VertexFormat::Short3, 0, 8, census.vertex(), || {
+            ShaderInput::Channels(3)
+        })
+        .expect("the wider sibling is mandatory");
+        assert_eq!(widened.widened_from, Some(VertexFormat::Short3));
+
+        // A device that declined everything has nothing to substitute with.
+        let mut r = reported(packed(1, 2), BASELINE, &memory, &families);
+        r.vertex_formats = VertexFormatSupport::NONE;
+        let empty = Census::take(r).expect("admitted");
+        assert_eq!(empty.vertex().formats.count(), 0);
+        assert_eq!(
+            attribute(0, 0, VertexFormat::Short3, 0, 8, empty.vertex(), || {
+                ShaderInput::Channels(3)
+            }),
+            Err(Refusal::NoFormat {
+                guest: VertexFormat::Short3
+            })
+        );
     }
 
     /// The rule a device creation gets refused for breaking: a capability that

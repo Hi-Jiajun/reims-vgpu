@@ -76,6 +76,12 @@ pub struct Enabled {
     /// `synchronization2` beside it, there is nothing to request at 1.3 and
     /// above, and below it the extension's own structure is the only asker.
     pub extended_dynamic_state: bool,
+    /// The two instance-divisor features, which a constant-rate and a
+    /// divisor-above-one vertex binding respectively need — see
+    /// [`crate::vertex`]. Requested together because they arrive in one
+    /// structure and the census admitted each on its own.
+    pub vertex_attribute_divisor: bool,
+    pub vertex_attribute_zero_divisor: bool,
     pub mesh_shader: bool,
     pub descriptor_buffer: bool,
     /// The 1.0 boolean block, requested through
@@ -118,6 +124,8 @@ impl Enabled {
             synchronization2: census.synchronization2(),
             dynamic_rendering: census.passes().dynamic_rendering,
             extended_dynamic_state: census.topology().dynamic,
+            vertex_attribute_divisor: census.vertex().instance_rate_divisor,
+            vertex_attribute_zero_divisor: census.vertex().zero_divisor,
             mesh_shader: census.stages().mesh_shader,
             descriptor_buffer: census.descriptors().descriptor_buffer,
             depth_clamp: census.raster().depth_clamp,
@@ -230,6 +238,13 @@ impl DeviceEpoch {
         let mut extended_dynamic_state =
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
                 .extended_dynamic_state(true);
+        // One structure whichever route the capability arrived by, and each
+        // half requested only where the census admitted it: a device that
+        // reports the divisor and not the zero divisor is asked for exactly
+        // what it reported.
+        let mut divisor = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default()
+            .vertex_attribute_instance_rate_divisor(enabled.vertex_attribute_divisor)
+            .vertex_attribute_instance_rate_zero_divisor(enabled.vertex_attribute_zero_divisor);
         let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
         let mut descriptor_buffer =
             vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
@@ -264,6 +279,14 @@ impl DeviceEpoch {
             if enabled.extensions.extended_dynamic_state {
                 create = create.push_next(&mut extended_dynamic_state);
             }
+        }
+        // Outside the `core_promotions` split: 1.4 promoted this and the
+        // baseline is 1.2, so a device on any route asks through the same
+        // structure. Chained only where something was admitted, so a device
+        // that reported neither half is not handed a structure asking for
+        // both to be off.
+        if enabled.vertex_attribute_divisor || enabled.vertex_attribute_zero_divisor {
+            create = create.push_next(&mut divisor);
         }
         if enabled.mesh_shader {
             create = create.push_next(&mut mesh);
@@ -405,6 +428,10 @@ mod tests {
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
             dynamic_primitive_topology_unrestricted: None,
+            vertex_attribute_instance_rate_divisor: false,
+            vertex_attribute_instance_rate_zero_divisor: false,
+            max_vertex_attrib_divisor: 0,
+            vertex_formats: crate::vertex::VertexFormatSupport::NONE,
             dual_src_blend: false,
             independent_blend: false,
             sampler_mirror_clamp_to_edge: false,
@@ -547,6 +574,10 @@ mod tests {
                         max_sampler_anisotropy: 1.0,
                         extended_dynamic_state: false,
                         dynamic_primitive_topology_unrestricted: None,
+                        vertex_attribute_instance_rate_divisor: false,
+                        vertex_attribute_instance_rate_zero_divisor: false,
+                        max_vertex_attrib_divisor: 0,
+                        vertex_formats: crate::vertex::VertexFormatSupport::NONE,
                         dual_src_blend: false,
                         independent_blend: false,
                         sampler_mirror_clamp_to_edge: false,
@@ -596,6 +627,10 @@ mod tests {
                         max_sampler_anisotropy: 16.0,
                         extended_dynamic_state: false,
                         dynamic_primitive_topology_unrestricted: None,
+                        vertex_attribute_instance_rate_divisor: false,
+                        vertex_attribute_instance_rate_zero_divisor: false,
+                        max_vertex_attrib_divisor: 0,
+                        vertex_formats: crate::vertex::VertexFormatSupport::NONE,
                         dual_src_blend: false,
                         independent_blend: false,
                         sampler_mirror_clamp_to_edge: false,
@@ -641,6 +676,10 @@ mod tests {
                         max_sampler_anisotropy: 16.0,
                         extended_dynamic_state: false,
                         dynamic_primitive_topology_unrestricted: None,
+                        vertex_attribute_instance_rate_divisor: false,
+                        vertex_attribute_instance_rate_zero_divisor: false,
+                        max_vertex_attrib_divisor: 0,
+                        vertex_formats: crate::vertex::VertexFormatSupport::NONE,
                         dual_src_blend: false,
                         independent_blend: false,
                         sampler_mirror_clamp_to_edge: false,
@@ -752,6 +791,10 @@ mod tests {
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
             dynamic_primitive_topology_unrestricted: None,
+            vertex_attribute_instance_rate_divisor: false,
+            vertex_attribute_instance_rate_zero_divisor: false,
+            max_vertex_attrib_divisor: 0,
+            vertex_formats: crate::vertex::VertexFormatSupport::NONE,
             dual_src_blend: false,
             independent_blend: false,
             sampler_mirror_clamp_to_edge: false,

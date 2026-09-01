@@ -116,4 +116,5 @@ pub mod timeline;
 pub mod topology;
 pub mod transfer;
 pub mod variant;
+pub mod vertex;
 pub mod view;
