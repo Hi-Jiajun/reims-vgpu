@@ -53,8 +53,8 @@ pub trait Decline {
     /// that caused it, which is half a diagnostic. Allocation here is fine:
     /// declines are rare by construction, and a flood is a bug the sink's own
     /// detector will report.
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        Vec::new()
+    fn fields(&self) -> alloc::vec::Vec<(&'static str, alloc::string::String)> {
+        alloc::vec::Vec::new()
     }
 
     /// The type that spells this slug, for the crate-wide "no two checks share
@@ -67,7 +67,7 @@ pub trait Decline {
     /// slug and the collision report fires on a wrapper that shares no check
     /// with anything.
     fn owner(&self) -> &'static str {
-        std::any::type_name::<Self>()
+        core::any::type_name::<Self>()
     }
 }
 
@@ -90,8 +90,8 @@ pub trait Decline {
 #[macro_export]
 macro_rules! decline_display {
     ($ty:ty) => {
-        impl std::fmt::Display for $ty {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        impl ::core::fmt::Display for $ty {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
                 use $crate::Decline as _;
                 write!(f, "reason={}", self.slug())?;
                 for (key, value) in self.fields() {
@@ -124,8 +124,8 @@ pub trait Refusal {
     /// The load-bearing values behind the refusal, as for [`Decline::fields`].
     /// Returning nothing is normal here: a status usually carries no payload and
     /// the failing site adds the refs and sizes with [`super::Emit::field`].
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        Vec::new()
+    fn fields(&self) -> alloc::vec::Vec<(&'static str, alloc::string::String)> {
+        alloc::vec::Vec::new()
     }
 
     /// The type that spells this slug, for the crate-wide "no two checks share
@@ -138,7 +138,7 @@ pub trait Refusal {
     /// slug and the collision report fires on a wrapper that shares no check
     /// with anything.
     fn owner(&self) -> &'static str {
-        std::any::type_name::<Self>()
+        core::any::type_name::<Self>()
     }
 }
 

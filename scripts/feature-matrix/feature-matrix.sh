@@ -336,6 +336,14 @@ count_cell "support crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
 # module move cannot empty it quietly.
 run_cell "replacement crates / $HOST_TRIPLE" "" "" "$WORKSPACE_DIR" \
   "-p reims-vgpu-protocol -p reims-vgpu-core"
+
+# The decline vocabulary without the sink. `reims-vgpu-observe` is `no_std` plus
+# `alloc` with its `std` feature off, so a layer below the device can name its
+# own refusals in the same words the device logs them in. Nothing else in the
+# matrix builds that configuration, and a `std::` that creeps into the
+# vocabulary compiles fine everywhere else.
+run_cell "observe / no_std vocabulary" "" "--no-default-features" \
+  "$WORKSPACE_DIR" "-p reims-vgpu-observe" "--lib"
 count_cell "replacement crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
   "-p reims-vgpu-protocol -p reims-vgpu-core"
 if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then

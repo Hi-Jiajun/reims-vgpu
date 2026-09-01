@@ -72,20 +72,32 @@
 //! speculative returns (a resolver legitimately answering "not ready yet" every
 //! poll, a genuinely-unbound `ref==0`). Those flood the log.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
 pub mod decline;
+#[cfg(feature = "std")]
 pub mod driver_watch;
+#[cfg(feature = "std")]
 pub mod emit;
+#[cfg(feature = "std")]
 pub mod footprint;
+#[cfg(feature = "std")]
 pub mod phase_clock;
+#[cfg(feature = "std")]
 pub mod sink;
+#[cfg(feature = "std")]
 pub mod slugs;
 
 pub use decline::{Decline, Refusal};
+#[cfg(feature = "std")]
 pub use emit::{first_sight, state_changed, Emit};
 
 // The sink's surface is re-exported flat so call sites read `observe::fail(…)`
 // rather than `observe::sink::fail(…)`. `sink` stays public for readers who
 // want the machinery.
+#[cfg(feature = "std")]
 pub use sink::{
     bgra_present_stats, bgra_rgb_stats, elapsed_ms, elapsed_us, fail, line, nonzero_stats, off,
     redirect_logs_for_tests, rgba_rgb_stats, verbose, when_verbose, RgbaRgbStats,
@@ -95,5 +107,5 @@ pub use sink::{
 // real sink rather than a mock; production never reads them back. Gated on
 // `testing` as well as `test` because the tests that use them are compiled
 // separately from this crate — see the feature's comment in `Cargo.toml`.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(all(feature = "std", any(test, feature = "testing")))]
 pub use sink::{fail_log_path, FailCapture};
