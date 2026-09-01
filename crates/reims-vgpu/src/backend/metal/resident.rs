@@ -53,8 +53,8 @@
 
 use crate::backend::metal::raw_metal;
 use metal::{
-    DeviceRef, MTLPixelFormat, MTLStorageMode, MTLTextureType, MTLTextureUsage, Texture,
-    TextureDescriptor,
+    DeviceRef, MTLPixelFormat, MTLResourceOptions, MTLStorageMode, MTLTextureType, MTLTextureUsage,
+    Texture, TextureDescriptor,
 };
 use parking_lot::Mutex;
 
@@ -382,15 +382,27 @@ pub fn read_published_rgba8(key: &ResidentColorKey, content_gen: u64) -> Option<
     // more here than the host copy it removed has to be able to say so.
     let _span = crate::runtime::chain_phase::CostSpan::new("metal_resident_read_us");
     let mut rgba = vec![0u8; need];
-    let region = metal::MTLRegion {
-        origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
-        size: metal::MTLSize {
-            width: u64::from(key.width),
-            height: u64::from(key.height),
-            depth: 1,
-        },
-    };
-    texture.get_bytes(rgba.as_mut_ptr() as *mut _, stride as u64, region, 0);
+    // SAFETY: every render into a resident colour target completes before its
+    // Store publishes it (`render_core_mrt` waits), and `borrow_published`
+    // succeeded, so the claim this reads under is one a completed Store made.
+    // The slice does not outlive `texture`.
+    if let Some(linear) =
+        unsafe { raw_metal::linear_pixels(&texture, stride as u64, u64::from(key.height)) }
+    {
+        crate::runtime::drain::note_store_route("metal_resident_read_linear");
+        rgba.copy_from_slice(linear);
+    } else {
+        crate::runtime::drain::note_store_route("metal_resident_read_tiled");
+        let region = metal::MTLRegion {
+            origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: metal::MTLSize {
+                width: u64::from(key.width),
+                height: u64::from(key.height),
+                depth: 1,
+            },
+        };
+        texture.get_bytes(rgba.as_mut_ptr() as *mut _, stride as u64, region, 0);
+    }
     // Count and bytes together: the rate is what says whether a reader is asking
     // for whole frames it does not need, and neither number can say it alone.
     crate::runtime::drain::note_store_route("metal_resident_reads");
@@ -415,9 +427,55 @@ pub fn create(
     descriptor.set_height(u64::from(key.height));
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-    let texture = raw_metal::new_texture(device, &descriptor)?;
+    let texture = linear_target(device, key, format, bpp, &descriptor)
+        .or_else(|| raw_metal::new_texture(device, &descriptor))?;
     REGISTRY.lock().admit(*key, texture.clone(), key.bytes(bpp));
     Some(texture)
+}
+
+/// A colour target whose texels are a CPU-visible buffer's bytes, so that
+/// reading them back is a pointer rather than a de-tiling copy. See
+/// [`raw_metal::new_linear_texture`].
+///
+/// `None` sends [`create`] to the ordinary tiled texture, and that is the
+/// capability gate: a host whose GPU will not render into a linear texture
+/// answers nil at `newTextureWithDescriptor:offset:bytesPerRow:` and this rail
+/// keeps the behaviour it had, one counter poorer. Nothing downstream has to
+/// know which it got — [`read_published_rgba8`] and the draw's own readback both
+/// ask the *texture* where its pixels are.
+///
+/// Row pitch is the tight row, rounded up to what the device requires. Padding
+/// it would be lawful and is not done: every reader of these pixels wants a
+/// tight frame, so a padded pitch would trade the copy this removes for a
+/// per-row one. `RGBA8Unorm` needs 16-byte alignment on this host and a 1920-wide
+/// tight row is 7680, so the rounding is a no-op at the geometry that matters
+/// and a correctness requirement at the ones that do not.
+fn linear_target(
+    device: &DeviceRef,
+    key: &ResidentColorKey,
+    format: MTLPixelFormat,
+    bpp: usize,
+    descriptor: &metal::TextureDescriptorRef,
+) -> Option<Texture> {
+    let alignment = device.minimum_linear_texture_alignment_for_pixel_format(format);
+    let tight = u64::from(key.width).checked_mul(bpp as u64)?;
+    let bytes_per_row = if alignment == 0 {
+        tight
+    } else {
+        tight.div_ceil(alignment).checked_mul(alignment)?
+    };
+    let length = bytes_per_row.checked_mul(u64::from(key.height))?;
+    let buffer = raw_metal::new_buffer(device, length, MTLResourceOptions::StorageModeShared)?;
+    let texture = raw_metal::new_linear_texture(&buffer, descriptor, 0, bytes_per_row);
+    crate::runtime::drain::note_store_route(if texture.is_some() {
+        "metal_resident_linear"
+    } else {
+        // Counted rather than logged per target: a host that cannot render into
+        // a linear texture answers this for every target it ever creates, and
+        // the census is where a rail-wide capability belongs.
+        "metal_resident_tiled"
+    });
+    texture
 }
 
 /// Record that the retained texture for `key` now holds exactly the surface

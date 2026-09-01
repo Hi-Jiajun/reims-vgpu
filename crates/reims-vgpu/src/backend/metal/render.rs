@@ -2589,14 +2589,61 @@ pub fn render_core_mrt(
             // each per colour target per draw at 1080p, on the phase
             // `chain_phase` reports as `store_us`, which a driven macos-13
             // Metal boot measured at 8.7 ms per draw.
-            if out.len() >= target_len {
+            //
+            // Asked of the texture first, because a retained target is linear
+            // over a shared buffer where the host GPU will render into one
+            // (`resident::linear_target`) and its texels are then already in
+            // the order this copy exists to produce. `getBytes:` is the arm for
+            // a per-draw target and for a host that declined the linear one;
+            // both are counted, because "this rail is linearizing every frame"
+            // reads as slowness and never as a failure.
+            //
+            // SAFETY: the pass above has completed — `render_core_mrt` waits
+            // before reaching this loop — so nothing is writing these texels.
+            // The slice is consumed inside this `if`.
+            let linear = unsafe {
+                crate::backend::metal::raw_metal::linear_pixels(
+                    target,
+                    bytes_per_row,
+                    height as u64,
+                )
+            };
+            //
+            // Each arm carries its own clock as well as its own counter, and
+            // that is the only way this comparison can be made honestly: two
+            // boots of this rail with *identical* rendering code measured
+            // `metal_commit_us` 1.44 and 2.75 ms a chain, so a bar read from one
+            // boot against another says almost nothing. Both arms priced inside
+            // one boot share the guest's state, the memory pressure and the
+            // draw mix, and their ratio is evidence.
+            let arm_started = std::time::Instant::now();
+            let arm = if let Some(linear) = linear {
+                let n = out.len().min(linear.len());
+                out[..n].copy_from_slice(&linear[..n]);
+                ("metal_readback_linear", "metal_readback_linear_ns")
+            } else if out.len() >= target_len {
                 target.get_bytes(out.as_mut_ptr() as *mut _, bytes_per_row, region, 0);
+                ("metal_readback_tiled", "metal_readback_tiled_ns")
             } else {
                 let mut readback = vec![0u8; target_len];
                 target.get_bytes(readback.as_mut_ptr() as *mut _, bytes_per_row, region, 0);
                 let n = out.len();
                 out.copy_from_slice(&readback[..n]);
-            }
+                ("metal_readback_tiled", "metal_readback_tiled_ns")
+            };
+            crate::runtime::drain::note_store_route(arm.0);
+            crate::runtime::drain::note_store_route_n(
+                arm.1,
+                arm_started.elapsed().as_nanos() as u64,
+            );
+            crate::runtime::drain::note_store_route_n(
+                if arm.0 == "metal_readback_linear" {
+                    "metal_readback_linear_bytes"
+                } else {
+                    "metal_readback_tiled_bytes"
+                },
+                target_len as u64,
+            );
         }
     }
     drop(span_readback);
