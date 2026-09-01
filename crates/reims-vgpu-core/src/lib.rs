@@ -54,5 +54,6 @@ pub mod retire;
 pub mod schedule;
 pub mod session;
 pub mod stream;
+pub mod submit;
 pub mod sync;
 pub mod transaction;
