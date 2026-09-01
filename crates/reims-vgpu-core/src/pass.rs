@@ -130,6 +130,24 @@ pub struct Attachment {
     pub resolve_depth_plane: u16,
     pub load: LoadAction,
     pub store: StoreAction,
+    /// The value this slot is cleared to, as the guest's bits.
+    ///
+    /// Four words, interpreted by [`Self::slot`] rather than by a tag: a colour
+    /// slot's clear is four `double` components, a depth slot's is one, and a
+    /// stencil slot's is a `uint32`. Storing the tag beside the slot would make
+    /// "a colour slot holding a depth clear" representable, and the slot is
+    /// already the answer — so the accessors read it and there is nothing for a
+    /// second field to disagree with.
+    ///
+    /// Bits rather than floats for the reason [`crate::render::FloatBits`]
+    /// gives: a descriptor is compared, and float equality makes a NaN clear
+    /// colour differ from itself.
+    ///
+    /// It is carried at all because a `LoadAction::Clear` without it is not
+    /// executable. The load action says the attachment is cleared and this says
+    /// to what; a model that dropped it would turn every guest clear into a
+    /// clear to whatever the executor happened to pick.
+    pub clear_bits: [u64; 4],
 }
 
 impl Attachment {
@@ -149,7 +167,32 @@ impl Attachment {
             resolve_depth_plane: 0,
             load: LoadAction::DontCare,
             store: StoreAction::DontCare,
+            clear_bits: [0; 4],
         }
+    }
+
+    /// The colour this slot is cleared to, if it is a colour slot.
+    #[must_use]
+    pub fn clear_color(&self) -> Option<[f64; 4]> {
+        self.slot.is_color().then(|| {
+            let mut out = [0.0f64; 4];
+            for (component, bits) in out.iter_mut().zip(self.clear_bits) {
+                *component = f64::from_bits(bits);
+            }
+            out
+        })
+    }
+
+    /// The depth this slot is cleared to, if it is the depth slot.
+    #[must_use]
+    pub fn clear_depth(&self) -> Option<f64> {
+        matches!(self.slot, AttachmentSlot::Depth).then(|| f64::from_bits(self.clear_bits[0]))
+    }
+
+    /// The stencil value this slot is cleared to, if it is the stencil slot.
+    #[must_use]
+    pub fn clear_stencil(&self) -> Option<u32> {
+        matches!(self.slot, AttachmentSlot::Stencil).then(|| self.clear_bits[0] as u32)
     }
 
     /// The subresource this attachment renders into.
@@ -329,6 +372,40 @@ const NO_STAGES: u32 = 0;
 
 #[cfg(test)]
 mod tests {
+
+    /// A clear value is read through the slot that owns it, and every other
+    /// reading is `None`. There is no tag to disagree with the slot, which is
+    /// what makes "a colour slot holding a depth clear" unrepresentable rather
+    /// than merely unlikely.
+    #[test]
+    fn a_clear_value_is_read_through_the_slot_that_owns_it() {
+        let mut colour = Attachment::unattached(AttachmentSlot::Color(3));
+        colour.clear_bits = [0.25f64, 0.5, 0.75, 1.0].map(f64::to_bits);
+        assert_eq!(colour.clear_color(), Some([0.25, 0.5, 0.75, 1.0]));
+        assert_eq!(colour.clear_depth(), None);
+        assert_eq!(colour.clear_stencil(), None);
+
+        let mut depth = Attachment::unattached(AttachmentSlot::Depth);
+        depth.clear_bits[0] = 1.0f64.to_bits();
+        assert_eq!(depth.clear_depth(), Some(1.0));
+        assert_eq!(depth.clear_color(), None);
+
+        let mut stencil = Attachment::unattached(AttachmentSlot::Stencil);
+        stencil.clear_bits[0] = 0x1234;
+        assert_eq!(stencil.clear_stencil(), Some(0x1234));
+        assert_eq!(stencil.clear_depth(), None);
+    }
+
+    /// A NaN clear colour compares equal to itself, which is what a descriptor
+    /// held in a state table needs and what `f64` equality would not give.
+    #[test]
+    fn a_nan_clear_colour_compares_equal_to_itself() {
+        let mut a = Attachment::unattached(AttachmentSlot::Color(0));
+        a.clear_bits = [f64::NAN.to_bits(); 4];
+        let b = a;
+        assert_eq!(a, b);
+        assert!(a.clear_color().expect("colour")[0].is_nan());
+    }
     use super::*;
     use crate::identity::{ObjectListRef, SlotGeneration};
 
