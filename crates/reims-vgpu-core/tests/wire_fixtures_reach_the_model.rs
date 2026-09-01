@@ -547,7 +547,8 @@ impl RefResolver for Recording {
     }
 }
 
-/// A draw declares the memory Apple's own bind records named, and only that.
+/// A draw or a dispatch declares the memory Apple's own bind records named,
+/// and only that.
 ///
 /// **The one claim in this file that spans two records.** Everything above puts
 /// one captured record through the model and asks what it made of it. A bind
@@ -556,8 +557,9 @@ impl RefResolver for Recording {
 /// join of the two, held by the encoder, and it is a join no per-record test
 /// can see.
 ///
-/// `drawPrimitives:vertexStart:vertexCount:` names no memory at all, so every
-/// access the transaction carries came out of the binding table. The entry
+/// `drawPrimitives:vertexStart:vertexCount:` and
+/// `dispatchThreadgroups:threadsPerThreadgroup:` name no memory at all, so
+/// every access their transactions carry came out of the binding table. The entry
 /// stride is what this puts at risk: a buffer bind's entries are twelve bytes
 /// each and not sixteen, and a model that read them at the wrong stride would
 /// bind whatever the next entry's low word spells — which is a resource, so it
@@ -569,6 +571,12 @@ impl RefResolver for Recording {
 /// thing that says one contributes memory and the other does not is which
 /// opcode carried it. So the sampler fixtures run through the same join and are
 /// required to leave the draw declaring nothing.
+///
+/// Both encoders, because they are two vocabularies. The render binds carry
+/// their stage in the opcode and the compute ones have no stage at all, so the
+/// tables they land in are chosen by two separate matches — and a compute bind
+/// that reached a render table, or the other way round, is a footprint that
+/// silently loses everything the encoder bound.
 #[test]
 fn a_draw_declares_the_memory_apples_own_bind_records_named() {
     use reims_vgpu_core::exec::ExecBuilder;
@@ -584,48 +592,85 @@ fn a_draw_declares_the_memory_apples_own_bind_records_named() {
     /// Buffers and textures do; samplers do not. Keyed on the opcode because
     /// that is the only thing that distinguishes them — the entries are the
     /// same layout.
-    fn binds_memory(opcode: u32) -> Option<bool> {
-        if is_buffer_bind(opcode)
-            || matches!(
-                opcode,
-                OPCODE_SET_VERTEX_TEXTURE | OPCODE_SET_FRAGMENT_TEXTURE
-            )
-        {
-            return Some(true);
+    fn binds_memory(rail: Rail, opcode: u32) -> Option<bool> {
+        use reims_vgpu_wire::ops::compute;
+        match rail {
+            Rail::Render => {
+                if is_buffer_bind(opcode)
+                    || matches!(
+                        opcode,
+                        OPCODE_SET_VERTEX_TEXTURE | OPCODE_SET_FRAGMENT_TEXTURE
+                    )
+                {
+                    return Some(true);
+                }
+                matches!(
+                    opcode,
+                    OPCODE_SET_VERTEX_SAMPLER
+                        | OPCODE_SET_FRAGMENT_SAMPLER
+                        | OPCODE_SET_VERTEX_SAMPLER_LOD
+                        | OPCODE_SET_FRAGMENT_SAMPLER_LOD
+                )
+                .then_some(false)
+            }
+            Rail::Compute => {
+                if matches!(
+                    opcode,
+                    compute::OPCODE_SET_BUFFER
+                        | compute::OPCODE_SET_BUFFER_STRIDE
+                        | compute::OPCODE_SET_TEXTURE
+                ) {
+                    return Some(true);
+                }
+                matches!(
+                    opcode,
+                    compute::OPCODE_SET_SAMPLER | compute::OPCODE_SET_SAMPLER_LOD
+                )
+                .then_some(false)
+            }
+            _ => None,
         }
-        matches!(
-            opcode,
-            OPCODE_SET_VERTEX_SAMPLER
-                | OPCODE_SET_FRAGMENT_SAMPLER
-                | OPCODE_SET_VERTEX_SAMPLER_LOD
-                | OPCODE_SET_FRAGMENT_SAMPLER_LOD
-        )
-        .then_some(false)
+    }
+
+    /// The record that reads the tables on each rail, and names nothing itself.
+    fn trigger_opcode(rail: Rail) -> u32 {
+        match rail {
+            Rail::Compute => reims_vgpu_wire::ops::compute::OPCODE_DISPATCH_THREADGROUPS,
+            _ => OPCODE_DRAW,
+        }
     }
 
     let all = cases();
-    let draw = all
-        .iter()
-        .find(|c| {
-            c.rail == Rail::Render && op(&c.bytes, 0).is_ok_and(|v| v.opcode() == OPCODE_DRAW)
+    let triggers: Vec<&Case> = [Rail::Render, Rail::Compute]
+        .into_iter()
+        .map(|rail| {
+            all.iter()
+                .find(|c| {
+                    c.rail == rail
+                        && op(&c.bytes, 0).is_ok_and(|v| v.opcode() == trigger_opcode(rail))
+                })
+                .unwrap_or_else(|| panic!("the capture has a direct {rail:?} trigger"))
         })
-        .expect("the capture has a non-indexed draw");
+        .collect();
 
     let mut checked = 0usize;
     let mut with_memory = 0usize;
     let mut without_memory = 0usize;
     for case in &all {
-        if case.rail != Rail::Render {
-            continue;
-        }
+        let rail = case.rail;
         let Ok(view) = op(&case.bytes, 0) else { continue };
-        let Some(binds_memory) = binds_memory(view.opcode()) else {
+        let Some(binds_memory) = binds_memory(rail, view.opcode()) else {
             continue;
         };
+        let trigger = triggers
+            .iter()
+            .find(|t| t.rail == rail)
+            .expect("both rails have one");
+        let kind = SegmentKind::of_rail(rail).expect("a stream rail names a segment");
 
         let mut builder = ExecBuilder::new();
         let resolver = Recording::new();
-        let Ok(bind) = operation(Rail::Render, &view, &resolver, builder.arenas_mut()) else {
+        let Ok(bind) = operation(rail, &view, &resolver, builder.arenas_mut()) else {
             continue;
         };
         let named: std::collections::BTreeSet<u32> =
@@ -635,23 +680,20 @@ fn a_draw_declares_the_memory_apples_own_bind_records_named() {
             "{}: a bind that resolved no ref",
             case.name
         );
-        let draw_view = op(&draw.bytes, 0).expect("checked above");
-        let drawn = operation(Rail::Render, &draw_view, &resolver, builder.arenas_mut())
-            .expect("a draw the ledger judged");
+        let trigger_view = op(&trigger.bytes, 0).expect("checked above");
+        let drawn = operation(rail, &trigger_view, &resolver, builder.arenas_mut())
+            .expect("a draw or dispatch the ledger judged");
 
         let mut model = registry_holding(&resolver.seen());
         builder
-            .begin_segment(
-                SegmentKind::Render.wire_type(),
-                SegmentLifetime::SELF_CONTAINED,
-            )
-            .expect("a render segment");
+            .begin_segment(kind.wire_type(), SegmentLifetime::SELF_CONTAINED)
+            .expect("a segment of the rail's own kind");
         builder
             .record(bind, &mut model.task_access(TASK, DOMAIN))
             .expect("a bind Apple wrote");
         builder
             .record(drawn, &mut model.task_access(TASK, DOMAIN))
-            .expect("a draw Apple wrote");
+            .expect("a draw or dispatch Apple wrote");
         builder.end_segment().expect("the segment ends");
         let tx = builder.finish().expect("nothing left open");
 
