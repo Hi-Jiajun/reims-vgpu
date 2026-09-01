@@ -856,6 +856,17 @@ pub(crate) struct CbGraphicsState {
     /// going *unset*, which is undefined for a pipeline that declares it
     /// dynamic.
     depth_bias_set: bool,
+    /// The width last handed to `vkCmdSetLineWidth`, by bit pattern.
+    ///
+    /// A value and not a flag, unlike [`Self::depth_bias_set`] beside it: the
+    /// bias this device asks for is always zero, and the width is the guest's
+    /// wherever the draw rasterizes lines and the default wherever it does
+    /// not. Held by bits for the reason [`Self::blend_constants`] is.
+    ///
+    /// `VK_DYNAMIC_STATE_LINE_WIDTH` is Vulkan 1.0 core, so every pipeline
+    /// declares it and every draw must set it — a pipeline that declares a
+    /// state and never receives it draws undefined.
+    line_width: Option<u32>,
     /// The rasterization members last handed to `vkCmdSetCullModeEXT`,
     /// `vkCmdSetFrontFaceEXT`, `vkCmdSetPolygonModeEXT` and
     /// `vkCmdSetDepthClampEnableEXT`.
@@ -927,6 +938,7 @@ impl CbGraphicsState {
             scissors,
             stencil,
             depth_bias_set,
+            line_width,
             raster,
             topology,
             depth_stencil,
@@ -946,6 +958,7 @@ impl CbGraphicsState {
         scissors.clear();
         *stencil = None;
         *depth_bias_set = false;
+        *line_width = None;
         *raster = None;
         *topology = None;
         *depth_stencil = None;

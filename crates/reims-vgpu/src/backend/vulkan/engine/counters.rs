@@ -617,6 +617,15 @@ engine_counters! {
         /// buffer and held for every draw after it, because the value this
         /// device sets does not vary.
         dynstate_depth_bias_held,
+        /// The line width a draw did not re-record. Out of every draw, like
+        /// the depth bias above and unlike `dynstate_raster_held`: the width
+        /// is `VK_DYNAMIC_STATE_LINE_WIDTH`, which is 1.0 core, so every
+        /// pipeline this rail builds declares it and every draw is asked. A
+        /// boot where this is far below the draw count is one whose guest
+        /// alternates between line and non-line draws — the recorded width is
+        /// the guest's where the draw rasterizes lines and 1.0 where it does
+        /// not, so the two alternate rather than one being held.
+        dynstate_line_width_held,
         /// The rasterization members a draw did not re-record, counted per
         /// draw and not per member: the cull mode, winding, fill mode and
         /// depth-clip mode are one Metal encoder state set, and a draw either

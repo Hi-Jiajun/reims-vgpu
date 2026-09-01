@@ -104,6 +104,9 @@ struct PendingDraw {
     /// `setDepthClipMode:` — `MTLDepthClipMode`, `None` for the Metal default
     /// (clip).
     depth_clip_mode: Option<u32>,
+    /// `setLineWidth:` — the width the stream last set, `None` where it set
+    /// none and the Metal default (1.0) applies.
+    line_width: Option<f32>,
     depth_bias: Option<[f32; 3]>,
     depth_stencil_ref: u32,
     stencil_ref: Option<(u32, u32)>,
@@ -161,6 +164,9 @@ struct StreamAccum {
     /// `setDepthClipMode:` — `MTLDepthClipMode`, `None` for the Metal default
     /// (clip).
     depth_clip_mode: Option<u32>,
+    /// `setLineWidth:` — the width the stream last set, `None` where it set
+    /// none and the Metal default (1.0) applies.
+    line_width: Option<f32>,
     depth_bias: Option<[f32; 3]>,
     depth_stencil_ref: u32,
     stencil_ref: Option<(u32, u32)>,
@@ -273,6 +279,7 @@ impl StreamAccum {
             front_facing: self.front_facing,
             fill_mode: self.fill_mode,
             depth_clip_mode: self.depth_clip_mode,
+            line_width: self.line_width,
             depth_bias: self.depth_bias,
             depth_stencil_ref: self.depth_stencil_ref,
             stencil_ref: self.stencil_ref,
@@ -2113,14 +2120,27 @@ fn handle_render_record<M: HostMemory + HostOps>(
             *slot = Some(u32::try_from(cmd.mode).unwrap_or(u32::MAX));
         }
         RenderKind::SetFloatState => {
-            // Both default to 1.0. Compared exactly rather than with a
-            // tolerance: the guest wrote a literal and the question is whether
-            // it wrote *the* literal, not whether it is close to it.
-            if cmd.float_value != 1.0 {
-                crate::runtime::drain::note_store_route(match cmd.opcode {
-                    wire_render::OPCODE_SET_LINE_WIDTH => "render_line_width_dropped",
-                    _ => "render_tessellation_scale_dropped",
-                });
+            // Two selectors share the one-`float` record; the opcode says
+            // which.
+            //
+            // `setLineWidth:` is latched whatever the value, including the
+            // Metal default — a stream that widens a line and then narrows it
+            // again is asking for the narrow one, and dropping the second
+            // record would leave the rest of the pass thick. Latched unparsed
+            // for the reason the four raster ordinals beside it are: only the
+            // running rail knows whether it can spell the width, and only the
+            // Vulkan rail additionally knows whether *this draw* rasterizes
+            // any lines to apply it to.
+            //
+            // The tessellation factor scale has no carrier on either rail. Its
+            // loss is still counted here, and only where the value is not the
+            // 1.0 default — compared exactly rather than with a tolerance,
+            // because the guest wrote a literal and the question is whether it
+            // wrote *the* literal.
+            if cmd.opcode == wire_render::OPCODE_SET_LINE_WIDTH {
+                acc.line_width = Some(cmd.float_value);
+            } else if cmd.float_value != 1.0 {
+                crate::runtime::drain::note_store_route("render_tessellation_scale_dropped");
             }
         }
         RenderKind::SetStoreAction => {
@@ -3863,6 +3883,7 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.front_facing = pd.front_facing;
     req.fill_mode = pd.fill_mode;
     req.depth_clip_mode = pd.depth_clip_mode;
+    req.line_width = pd.line_width;
     req.depth_bias = pd.depth_bias;
     req.depth_stencil_ref = pd.depth_stencil_ref;
     req.stencil_ref = pd.stencil_ref;

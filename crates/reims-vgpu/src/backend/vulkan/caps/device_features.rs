@@ -356,6 +356,26 @@ pub struct DeviceFeatures {
     /// pipeline invalid. Same shape as [`Self::dual_src_blend`] — optional
     /// core, asked rather than assumed, declined by name where absent.
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::wideLines` — whether `vkCmdSetLineWidth` may
+    /// be given anything but 1.0.
+    ///
+    /// `setLineWidth:` is a Metal render-encoder command and the width is
+    /// dynamic state on every host this rail admits, so unlike its neighbours
+    /// this bit gates no pipeline member: it gates a *value*. Without it, a
+    /// width other than the default is invalid use rather than a thin line, so
+    /// `reims_vgpu_vulkan::raster::line_width` refuses by name — and only for
+    /// a draw that rasterizes lines, which is why the refusal is at the draw
+    /// seam and not in the pipeline plan.
+    pub wide_lines: bool,
+    /// `VkPhysicalDeviceLimits::lineWidthRange`, `[min, max]`.
+    ///
+    /// The bound [`Self::wide_lines`] admits widths within. Vulkan requires it
+    /// to contain 1.0, which is what makes a device with neither the feature
+    /// nor a useful range still able to serve every guest that never calls
+    /// `setLineWidth:`. `lineWidthGranularity` is deliberately absent: the
+    /// spec asks nothing of the caller for it and the implementation rounds
+    /// within its own range, so a limit recorded here would gate nothing.
+    pub line_width_range: [f32; 2],
     /// `VK_EXT_extended_dynamic_state`'s `extendedDynamicState`.
     ///
     /// **The feature bit, not what any one layer does with it.** It reaches
@@ -527,6 +547,7 @@ impl DeviceFeatures {
             .dual_src_blend(self.dual_src_blend)
             .independent_blend(self.independent_blend)
             .fill_mode_non_solid(self.fill_mode_non_solid)
+            .wide_lines(self.wide_lines)
             .texture_compression_bc(self.texture_compression_bc)
             .depth_clamp(self.depth_clamp)
             .multi_viewport(self.multi_viewport)
@@ -683,6 +704,8 @@ impl DeviceFeatures {
             dual_src_blend,
             independent_blend,
             fill_mode_non_solid,
+            wide_lines,
+            line_width_range,
             extended_dynamic_state,
             dynamic_polygon_mode,
             dynamic_depth_clamp,
@@ -735,6 +758,7 @@ impl DeviceFeatures {
              mirror_clamp_to_edge={mirror_clamp_to_edge:?} \
              dual_src_blend={dual_src_blend} independent_blend={independent_blend} \
              fill_mode_non_solid={fill_mode_non_solid} \
+             wide_lines={wide_lines} line_width_range={line_width_range:?} \
              extended_dynamic_state={extended_dynamic_state} \
              dyn_polygon_mode={dynamic_polygon_mode} \
              dyn_depth_clamp={dynamic_depth_clamp} \
@@ -961,6 +985,12 @@ pub unsafe fn query(
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
         independent_blend: supported.independent_blend == vk::TRUE,
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
+        wide_lines: supported.wide_lines == vk::TRUE,
+        // Taken as reported. No `max`/`min` correction: a device out of spec
+        // here would be one whose own bound is wrong, and substituting a
+        // guessed range would turn a refusal this device can explain into
+        // invalid use it cannot.
+        line_width_range: props.limits.line_width_range,
         extended_dynamic_state,
         dynamic_polygon_mode,
         dynamic_depth_clamp,
@@ -1036,6 +1066,8 @@ mod tests {
             dynamic_polygon_mode: true,
             dynamic_depth_clamp: true,
             dynamic_primitive_topology_unrestricted: true,
+            wide_lines: true,
+            line_width_range: [1.0, 8.0],
             robust_buffer_access: true,
             texture_compression_bc: true,
             sampler_anisotropy: true,

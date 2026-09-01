@@ -3277,6 +3277,40 @@ pub(crate) unsafe fn execute_draw_inner(
     );
     let topology_dynamic =
         reims_vgpu_vulkan::topology::dynamic(req.primitive_topology.0, topology_cell);
+    // The line width: the one rasterization state neither the raster plan nor
+    // the topology can decide alone. Vulkan applies it to line primitives and
+    // to `POLYGON_MODE_LINE` and to nothing else, so a guest that sets a width
+    // and then draws filled triangles has asked this device for nothing — and
+    // refusing that draw would be refusing it for a state it never uses. Both
+    // halves meet here and nowhere else, which is why the joint question is
+    // asked at the draw seam rather than inside either plan.
+    //
+    // The effective polygon mode is read off the plan rather than off
+    // `req.raster.fill_mode`: on a host with `vkCmdSetPolygonModeEXT` the
+    // pipeline's member is a placeholder, and a second reading of the guest's
+    // ordinal here could disagree with the one the plan made.
+    //
+    // Decided before anything is recorded, like the occlusion query and the
+    // four ordinals above: a width this host cannot serve refuses the draw
+    // rather than reaching `vkCmdSetLineWidth` as invalid use.
+    let line_width = match reims_vgpu_vulkan::raster::line_width(
+        req.line_width,
+        reims_vgpu_vulkan::raster::rasterizes_lines(
+            raster_plan.polygon_mode(),
+            req.primitive_topology.0.class(),
+        ),
+        reims_vgpu_vulkan::raster::LineWidthCell {
+            wide_lines: ctx.features.wide_lines,
+            range: ctx.features.line_width_range,
+        },
+    ) {
+        Ok(width) => width,
+        Err(refusal) => {
+            let reason = super::reason::DrawReason::Raster(refusal);
+            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            return Err(DrawError::Unsupported(reason));
+        }
+    };
     let pipeline_key = PipelineKey {
         vert: vert_digest,
         frag: frag_digest,
@@ -5247,6 +5281,12 @@ pub(crate) unsafe fn execute_draw_inner(
     // every draw must have been given values — see `set_dynamic_depth_bias`
     // for why they are zero.
     unsafe { pools.set_dynamic_depth_bias(&ctx.device, cb, counters) };
+    // The line width, on every pipeline for the same reason: `LINE_WIDTH` is
+    // 1.0 core dynamic state, so every pipeline this rail builds declares it.
+    // `line_width` above already answered "does this draw rasterize lines" and
+    // "can this host serve that width", so what arrives here is a width the
+    // device will take.
+    unsafe { pools.set_dynamic_line_width(&ctx.device, cb, counters, line_width) };
     // The rasterization members this host supplies per draw, `Some` exactly
     // where the pipeline above baked a placeholder. A pipeline that declares a
     // state dynamic and never receives it draws undefined, so the same `Plan`

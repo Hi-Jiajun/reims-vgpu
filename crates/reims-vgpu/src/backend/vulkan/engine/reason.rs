@@ -765,6 +765,12 @@ mod tests {
             field: "x",
             value: 0,
         }),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::NoWideLines { width_bits: 0 }),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::LineWidthOutOfRange {
+            width_bits: 0,
+            min_bits: 0,
+            max_bits: 0,
+        }),
     ];
 
     /// The rule this enum exists to enforce: two checks sharing a slug means a

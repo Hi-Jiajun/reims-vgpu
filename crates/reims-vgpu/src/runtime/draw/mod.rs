@@ -609,6 +609,13 @@ pub struct DrawEncodeRequest {
     /// default (clip).
     pub depth_clip_mode: Option<u32>,
     pub depth_bias: Option<[f32; 3]>,
+    /// `setLineWidth:` — the width the stream last set, `None` where it set
+    /// none and Metal's own default (1.0) stands.
+    ///
+    /// Raw, and not folded into a default here: `None` and `Some(1.0)` are the
+    /// same rasterization but not the same stream, and the rail that cannot
+    /// spell this command reports only the second.
+    pub line_width: Option<f32>,
     pub depth_stencil_ref: u32,
     pub stencil_ref: Option<(u32, u32)>,
     pub depth_attach: Option<DepthAttachment>,

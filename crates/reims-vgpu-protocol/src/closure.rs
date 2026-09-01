@@ -1034,8 +1034,8 @@ pub const LEDGER: &[Op] = &[
         rail: Rail::Render,
         opcode: Some(0x0088),
         selector: "setLineWidth:",
-        closure: Closure::Unresolved {
-            question: "line width; dropped with a count whenever it is not the 1.0 default",
+        closure: Closure::Implemented {
+            evidence: "line width, latched per encoder and set per draw by the running rail; the Vulkan rail sets it wherever the draw rasterizes lines and refuses a width its host cannot serve, and the Metal rail names the loss its encoder has no setter for",
         },
     },
     Op {

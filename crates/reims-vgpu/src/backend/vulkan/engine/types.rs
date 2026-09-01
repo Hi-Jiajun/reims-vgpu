@@ -641,6 +641,22 @@ pub struct DrawRequest {
     /// one place that decides what they mean and whether this device can
     /// serve them.
     pub raster: reims_vgpu_vulkan::raster::GuestRasterState,
+    /// `setLineWidth:` — the width the stream last set, `None` where it set
+    /// none and Metal's own default stands.
+    ///
+    /// Beside [`Self::raster`] rather than inside it, because it is not the
+    /// same kind of state: those four are closed ordinals that decide how a
+    /// pipeline is built, and this is a float that decides nothing about the
+    /// pipeline at all — `VK_DYNAMIC_STATE_LINE_WIDTH` is 1.0 core, so it is
+    /// dynamic on every host and never a cache dimension. Folding it into that
+    /// aggregate would also cost it `Ord` and `Hash`, which the pipeline key
+    /// needs and a float cannot give.
+    ///
+    /// Unparsed, like the ordinals beside it:
+    /// `reims_vgpu_vulkan::raster::line_width` is the one place that decides
+    /// whether this device can serve it, and it needs the draw's topology to
+    /// decide — which only exists here.
+    pub line_width: Option<f32>,
     /// Depth test + transient depth attachment. `None` (default) = no depth
     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
     /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).

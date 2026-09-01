@@ -163,6 +163,13 @@ pub enum RenderRecord<'a> {
         slope_scale_bits: u32,
         clamp_bits: u32,
     },
+    /// One `float`, as the guest's bits, for the reason
+    /// [`Self::SetDepthBias`]'s three are. `setLineWidth:` shares its wire form
+    /// with `setTessellationFactorScale:`, so the opcode is the only thing that
+    /// separates a state this device carries from one it does not.
+    SetLineWidth {
+        width_bits: u32,
+    },
     SetBlendColor {
         red_bits: u32,
         green_bits: u32,
@@ -358,6 +365,13 @@ fn state<'a>(kind: RenderKind, op: &Op<'a>) -> Result<RenderRecord<'a>, DecodeRe
                 bias_bits: r.bias.get().to_bits(),
                 slope_scale_bits: r.slope_scale.get().to_bits(),
                 clamp_bits: r.clamp.get().to_bits(),
+            }
+        }
+        RenderKind::SetLineWidth => {
+            let r = wire::float_state(op)
+                .map_err(|_| fail(core::mem::size_of::<wire::FloatState>()))?;
+            RenderRecord::SetLineWidth {
+                width_bits: r.value.get().to_bits(),
             }
         }
         RenderKind::SetBlendColor => {

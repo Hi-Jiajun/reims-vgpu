@@ -706,6 +706,132 @@ fn cull_mode_honored_and_winding_correct() {
     );
 }
 
+/// The guest's line width reaches the rasterizer, and only where the draw
+/// rasterizes lines.
+///
+/// Two claims, and neither can be made by either half alone. Wireframing the
+/// fixture triangle turns a fullscreen fill into its three edges, so widening
+/// the width must cover *more* pixels than the default did — that is
+/// `vkCmdSetLineWidth` carrying the guest's own number to the driver, and a
+/// rail that declared `LINE_WIDTH` dynamic and never set it would draw at an
+/// undefined width rather than at the two this compares.
+///
+/// The second claim is the conditional one, and it is measured by a refusal
+/// rather than by pixels: an absurd width is refused for the wireframe draw
+/// and accepted for the filled one, from the same request and the same host.
+/// A rail that asked `raster::line_width` without the topology — or that put
+/// the check in the pipeline plan, where the topology is not known — would
+/// refuse both, and every guest that ever set a width would lose every filled
+/// draw after it.
+///
+/// Skipped where the host has neither `fillModeNonSolid` nor `wideLines`;
+/// there is nothing to measure on a device that cannot draw a wide wireframe.
+#[test]
+fn line_width_widens_a_wireframe_and_is_not_asked_of_a_filled_draw() {
+    use reims_vgpu_vulkan::raster::{GuestRasterState, MTL_TRIANGLE_FILL_MODE_LINES};
+
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (64u32, 64u32);
+
+    // The fixture triangle covers its viewport, so its three edges lie on the
+    // viewport's own border. At full size that border is the target's, and a
+    // one-pixel wireframe of it rasterizes nothing: the line's half-pixel
+    // extent straddles the edge of the image. Inset the viewport by a half
+    // pixel and the same edges fall on pixel centres inside the target, where
+    // both a thin line and a wide one can be counted. The scissor stays the
+    // full target, so nothing clips what a wider line adds.
+    let inset = 8.5f32;
+    let run = |wireframe: bool, width: Option<f32>| -> Result<Vec<u8>, String> {
+        let mut req = engine_req(&v, &f, w, h);
+        req.viewports = vec![ViewportResource {
+            x: inset,
+            y: inset,
+            width: w as f32 - 2.0 * inset,
+            height: h as f32 - 2.0 * inset,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        req.scissors = vec![ScissorResource {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }];
+        if wireframe {
+            req.raster = GuestRasterState {
+                fill_mode: MTL_TRIANGLE_FILL_MODE_LINES,
+                ..GuestRasterState::DEFAULT
+            };
+        }
+        req.line_width = width;
+        engine::execute_draw_request(&req)
+            .map(|o| semantic_rgba(&o))
+            .map_err(|e| e.to_string())
+    };
+    // Fragment is ~(64,128,191) and the clear is black, so the green channel
+    // says covered — the same discriminator `triangle_covered` uses, counted
+    // rather than sampled at one point.
+    let covered = |px: &[u8]| px.chunks_exact(4).filter(|p| p[1] > 32).count();
+
+    let thin = match run(true, None) {
+        Ok(px) => px,
+        Err(e) => {
+            if skip_if_no_gpu(&e) || e.contains("vk_raster_no_non_solid_fill") {
+                eprintln!("SKIP line_width: {e}");
+                return;
+            }
+            panic!("line_width thin wireframe: {e}");
+        }
+    };
+    let filled = run(false, None).expect("a filled draw needs no capability");
+    let thin_covered = covered(&thin);
+    let filled_covered = covered(&filled);
+    assert_eq!(
+        filled_covered,
+        ((w as f32 - 2.0 * inset) * (h as f32 - 2.0 * inset)) as usize,
+        "the fixture triangle covers its viewport and nothing outside it"
+    );
+    assert!(
+        thin_covered > 0 && thin_covered < filled_covered,
+        "a wireframe must draw its edges and nothing else ({thin_covered} of \
+         {filled_covered}); is the polygon mode reaching the pipeline?"
+    );
+
+    // The same draw at a width the host can serve. Four is inside every
+    // `lineWidthRange` a device with `wideLines` reports (the guaranteed
+    // minimum maximum is 8).
+    match run(true, Some(4.0)) {
+        Ok(wide) => assert!(
+            covered(&wide) > thin_covered,
+            "a wider line must cover more pixels ({} vs {thin_covered}); \
+             is vkCmdSetLineWidth being given the guest\'s width?",
+            covered(&wide)
+        ),
+        Err(e) if e.contains("vk_raster_no_wide_lines") => {
+            eprintln!("SKIP line_width wide arm: no wideLines");
+        }
+        Err(e) => panic!("line_width wide wireframe: {e}"),
+    }
+
+    // The conditional half. A width no device serves is refused for the draw
+    // that would rasterize lines with it, and never asked of the draw that
+    // would not — the joint fact, measured against a real driver's limits.
+    let absurd = 1.0e9f32;
+    let refused = run(true, Some(absurd)).expect_err("an absurd width must be refused");
+    assert!(
+        refused.contains("vk_raster_line_width_out_of_range")
+            || refused.contains("vk_raster_no_wide_lines"),
+        "expected a line-width refusal, got {refused}"
+    );
+    let ignored = run(false, Some(absurd)).expect("a filled draw uses no line width");
+    assert_eq!(
+        covered(&ignored),
+        filled_covered,
+        "a filled draw must rasterize identically whatever width preceded it"
+    );
+}
+
 /// Depth test is honored end to end: a transient depth buffer is attached, the
 /// compare op + clear value are wired, and the 2D path (`depth: None`) stays
 /// byte-identical (proven by every other test here running with no depth).

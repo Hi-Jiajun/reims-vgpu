@@ -308,6 +308,12 @@ pub enum RenderOp {
         slope_scale: FloatBits,
         clamp: FloatBits,
     },
+    /// `setLineWidth:`. One float, and unlike the four ordinals above it is
+    /// not a pipeline decision on any host: `VK_DYNAMIC_STATE_LINE_WIDTH` is
+    /// Vulkan 1.0 core and Metal sets it on the encoder, so it is per-draw
+    /// state everywhere. Whether a draw uses it at all is a joint fact of the
+    /// fill mode and the topology, which only the executor holds.
+    SetLineWidth(FloatBits),
     SetBlendColor {
         red: FloatBits,
         green: FloatBits,

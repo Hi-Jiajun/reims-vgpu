@@ -2281,6 +2281,7 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         front_facing: None,
         fill_mode: None,
         depth_clip_mode: None,
+        line_width: None,
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -2389,6 +2390,7 @@ fn nometal_draw_falls_back_to_backing_clear() {
         front_facing: None,
         fill_mode: None,
         depth_clip_mode: None,
+        line_width: None,
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -4293,14 +4295,12 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
     let float_non_default: Writer = |p| st32(p, 2.5f32.to_bits());
     let float_at_default: Writer = |p| st32(p, 1.0f32.to_bits());
 
+    // `OPCODE_SET_LINE_WIDTH` is no longer here: it shares the float record's
+    // decode arm with the tessellation scale below, but it is now latched into
+    // the stream's state and carried to the running rail, so it drops nothing
+    // and counts nothing. See
+    // `a_line_width_reaches_the_stream_state_and_a_draw`.
     let cases: &[(u32, usize, Writer, Option<Writer>, &str)] = &[
-        (
-            wire_render::OPCODE_SET_LINE_WIDTH,
-            12,
-            float_non_default,
-            Some(float_at_default),
-            "render_line_width_dropped",
-        ),
         (
             wire_render::OPCODE_SET_TESSELLATION_FACTOR_SCALE,
             12,
@@ -4633,6 +4633,62 @@ fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
     fill_draw_binds_from_pending(&mut req, &pd);
     assert_eq!(req.fill_mode, Some(1));
     assert_eq!(req.depth_clip_mode, Some(1));
+}
+
+/// `setLineWidth:` lands in the stream's state and travels to a draw, bit for
+/// bit.
+///
+/// The fifth encoder raster state, and it used to be dropped with a count
+/// whenever it was not 1.0. It shares its decode arm and its wire form with
+/// `setTessellationFactorScale:`, which still has no carrier — so the opcode
+/// is the only thing separating a state that is now honoured from one that is
+/// still lost, and an arm that latched the wrong one would compile and would
+/// widen every line by the tessellation scale.
+///
+/// The default is latched too, for the reason the fill mode's is: a stream
+/// that widens a line and then narrows it again is asking for the narrow one,
+/// and an arm that skipped 1.0 would leave the rest of the pass thick.
+#[test]
+fn a_line_width_reaches_the_stream_state_and_a_draw() {
+    let drive = |op: u32, width: f32| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let mut command = vec![0u8; 12];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], 12);
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN..],
+            width.to_bits(),
+        );
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        acc
+    };
+
+    for width in [1.0f32, 2.5, 0.5] {
+        let acc = drive(wire_render::OPCODE_SET_LINE_WIDTH, width);
+        assert_eq!(
+            acc.line_width.map(f32::to_bits),
+            Some(width.to_bits()),
+            "line width {width}"
+        );
+    }
+
+    // The sibling opcode must not reach the same slot. Both are one `f32` in
+    // one twelve-byte record; only the opcode tells them apart.
+    let acc = drive(wire_render::OPCODE_SET_TESSELLATION_FACTOR_SCALE, 2.5);
+    assert_eq!(acc.line_width, None);
+
+    // And a draw carries it — `bind_snapshot` builds with
+    // `..Default::default()`, so a field added to the accumulator and not to
+    // the snapshot reaches no draw at all.
+    let acc = drive(wire_render::OPCODE_SET_LINE_WIDTH, 2.5);
+    let pd = acc.bind_snapshot().expect("state is representable");
+    assert_eq!(pd.line_width, Some(2.5));
+    let mut req = crate::runtime::draw::DrawEncodeRequest::default();
+    fill_draw_binds_from_pending(&mut req, &pd);
+    assert_eq!(req.line_width, Some(2.5));
 }
 
 /// Every command buffer the submission declares is visited, however many

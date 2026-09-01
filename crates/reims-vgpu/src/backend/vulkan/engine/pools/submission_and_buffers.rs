@@ -2287,11 +2287,11 @@ impl ResourcePools {
         // does *not* declare it dynamic, which is why this list is not
         // `forget_recorded`:
         //
-        // - The viewport, scissor, blend colour and depth bias are declared by
-        //   every graphics pipeline this cache builds, so clearing them is
-        //   conservative rather than required. Kept, because it costs one
-        //   re-record per pipeline change and the alternative is a claim about
-        //   an unconditional list that a future conditional would break.
+        // - The viewport, scissor, blend colour, depth bias and line width are
+        //   declared by every graphics pipeline this cache builds, so clearing
+        //   them is conservative rather than required. Kept, because it costs
+        //   one re-record per pipeline change and the alternative is a claim
+        //   about an unconditional list that a future conditional would break.
         // - The stencil reference and the depth-stencil state are declared
         //   *conditionally* — see `DepthStencilPlan::states`, which lists the
         //   reference only for a pipeline whose stencil test is on, and the
@@ -2311,6 +2311,7 @@ impl ResourcePools {
         g.depth_stencil = None;
         g.blend_constants = None;
         g.depth_bias_set = false;
+        g.line_width = None;
         unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline) };
     }
 
@@ -2579,6 +2580,48 @@ impl ResourcePools {
                 unsafe { eds3.cmd_set_depth_clamp_enable(cb, clamp) };
             }
         }
+    }
+
+    /// Record the line width this draw rasterizes with, unless this command
+    /// buffer already carries exactly it.
+    ///
+    /// `width` is `reims_vgpu_vulkan::raster::line_width`'s answer, and never
+    /// the guest's number unchecked: that function is where a width this host
+    /// cannot serve is refused and where a draw that rasterizes no lines is
+    /// given the default. Recording anything else would be invalid use on a
+    /// device without `wideLines` — undefined behaviour, not a thin line.
+    ///
+    /// Every pipeline this rail builds declares `VK_DYNAMIC_STATE_LINE_WIDTH`
+    /// — it is 1.0 core, so there is no baking rung and no cell to ask — which
+    /// is why this is unconditional like the depth bias and unlike the four
+    /// members beside it. Held by value rather than by a `bool`, because
+    /// unlike the bias the value varies: a guest that draws a wireframe and
+    /// then a filled mesh alternates between its width and the default.
+    ///
+    /// Compared by bit pattern, for the reason
+    /// [`CbGraphicsState::blend_constants`] is: the cache is an equality on
+    /// what was recorded, and a float comparison would call two distinct
+    /// zeroes equal.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_line_width(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        width: f32,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.line_width == Some(width.to_bits()) {
+            counters
+                .dynstate_line_width_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.line_width = Some(width.to_bits());
+        unsafe { device.cmd_set_line_width(cb, width) };
     }
 
     /// Record the guest's whole `MTLDepthStencilState` unless this command

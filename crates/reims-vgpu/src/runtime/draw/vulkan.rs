@@ -8621,6 +8621,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     u64::from,
                 ),
             },
+            // `setLineWidth:`, passed through unparsed like the four above.
+            // `None` is the stream that set none, and the engine's draw seam
+            // is where that becomes Metal's default — it is also the only
+            // place that knows whether this draw rasterizes any lines for the
+            // width to apply to, which is what the answer depends on.
+            line_width: req.line_width,
             first_vertex: req.first_vertex,
             // Passed through. `decode::render`'s `wire_instance_count` is where
             // a zero instance count is decided, and it is decided once — a

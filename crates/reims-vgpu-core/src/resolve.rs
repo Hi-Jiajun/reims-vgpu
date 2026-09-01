@@ -894,6 +894,7 @@ pub fn render(
             slope_scale: FloatBits(slope_scale_bits),
             clamp: FloatBits(clamp_bits),
         },
+        RenderRecord::SetLineWidth { width_bits } => RenderOp::SetLineWidth(FloatBits(width_bits)),
         RenderRecord::SetBlendColor {
             red_bits,
             green_bits,
@@ -1840,17 +1841,17 @@ mod tests {
                 row.rail
             );
         }
-        // The census the vocabulary prints is 101 stream operations. Six of
+        // The census the vocabulary prints is 102 stream operations. Six of
         // them carry no opcode at all — the four `beginSegment:` boundaries,
         // and the blit `withCommand:` selectors that write their command
         // argument into the record's opcode field, so they *are* whichever
         // opcode they emitted. Neither shape is dispatched by opcode, so
-        // neither reaches this path, and 95 is what remains.
+        // neither reaches this path, and 96 is what remains.
         //
-        // Two of those 95 are settled refusals, counted apart rather than
+        // Two of those 96 are settled refusals, counted apart rather than
         // folded into either total: a refusal that reads as an unwritten path
         // would send someone to write it.
-        assert_eq!(seen + refused, 95);
+        assert_eq!(seen + refused, 96);
         assert_eq!(refused, 2);
     }
 
