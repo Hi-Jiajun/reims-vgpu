@@ -17,7 +17,7 @@
 //! reports each failure as a fault. Nothing here touches memory it was not
 //! handed.
 
-use crate::endian::{ld32, ld64, st16, st32};
+use crate::endian::{ld32, ld64, st16, st32, st64};
 use alloc::string::{String, ToString as _};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -563,6 +563,183 @@ pub fn decode_compute_info(payload: &[u8]) -> Result<ComputeInfoRequest, ShortPa
         pair_capacity: ld32(&payload[12..]),
         // Bounded by the length check above, so the two halves are there.
         reply_gva: u64::from(ld32(&payload[16..])) | (u64::from(ld32(&payload[20..])) << 32),
+    })
+}
+
+// --- CmdHeapTextureSizeAndAlign request and reply framing ---
+
+/// Byte offset of the task word. Raw, as every request layout here carries it:
+/// which task it names is device state and not the wire's.
+pub const HEAP_TEXTURE_TASK_ID: usize = 0x00;
+/// Byte offset of the reply destination — a full guest address, not a page
+/// frame.
+pub const HEAP_TEXTURE_REPLY_GVA: usize = HEAP_TEXTURE_TASK_ID + 4;
+/// Byte offset of how many bytes the guest has set aside at that address.
+pub const HEAP_TEXTURE_REPLY_LENGTH: usize = HEAP_TEXTURE_REPLY_GVA + 8;
+/// Byte offset of the embedded record's declared length.
+pub const HEAP_TEXTURE_SERIALIZER_LENGTH: usize = HEAP_TEXTURE_REPLY_LENGTH + 8;
+/// Bytes the request header occupies, and therefore where the embedded
+/// serializer record starts.
+pub const HEAP_TEXTURE_REQUEST_HEADER_LEN: usize = HEAP_TEXTURE_SERIALIZER_LENGTH + 4;
+
+/// Byte offset of the size the host requires, within the reply.
+pub const HEAP_TEXTURE_REPLY_SIZE: usize = 0x00;
+/// Byte offset of the alignment the host requires.
+pub const HEAP_TEXTURE_REPLY_ALIGN: usize = HEAP_TEXTURE_REPLY_SIZE + 8;
+/// Bytes the reply occupies: an `MTLSizeAndAlign`, two little-endian `u64`s.
+///
+/// This is the floor the request's own `reply_len` is checked against, and it
+/// is the whole of the answer — the reply has no variable part, which is why
+/// [`crate::info_reply`]'s bounds do not apply to it.
+pub const HEAP_TEXTURE_REPLY_LEN: usize = HEAP_TEXTURE_REPLY_ALIGN + 8;
+
+/// The record the request embeds: `heapTextureSizeAndAlignWithDescriptor:`.
+///
+/// Its tag is that selector's opcode and its length is that record's length,
+/// both taken from the crate that derived them rather than written again here.
+pub const HEAP_TEXTURE_SERIALIZED_TAG: u32 =
+    reims_vgpu_wire::ops::texture::OPCODE_HEAP_TEXTURE_SIZE_AND_ALIGN;
+pub const HEAP_TEXTURE_SERIALIZED_LEN: usize =
+    reims_vgpu_wire::ops::texture::HEAP_TEXTURE_SIZE_AND_ALIGN_TOTAL_LEN as usize;
+
+/// The host's answer: an `MTLSizeAndAlign`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SizeAndAlign {
+    pub size: u64,
+    pub align: u64,
+}
+
+impl SizeAndAlign {
+    /// The bytes the guest reads back, at the offsets above.
+    #[must_use]
+    pub fn encode(self) -> [u8; HEAP_TEXTURE_REPLY_LEN] {
+        let mut out = [0u8; HEAP_TEXTURE_REPLY_LEN];
+        st64(&mut out[HEAP_TEXTURE_REPLY_SIZE..], self.size);
+        st64(&mut out[HEAP_TEXTURE_REPLY_ALIGN..], self.align);
+        out
+    }
+}
+
+/// A heap-texture query request, framed.
+///
+/// The descriptor is borrowed rather than decoded: which of the two
+/// `PGSerializedTextureDescriptor` bodies a record carries is a property of the
+/// record's opcode, and this request's opcode names the narrow one — but
+/// turning those bytes into fields is the reader's, not the framing's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapTextureRequest<'a> {
+    /// The task word as the guest sent it.
+    pub raw_task: u32,
+    /// Where the reply goes.
+    pub reply_gva: u64,
+    /// How many bytes the guest set aside there. At least
+    /// [`HEAP_TEXTURE_REPLY_LEN`], which [`decode_heap_texture_query`] checks.
+    pub reply_len: u64,
+    /// The embedded record's payload: a `PGSerializedTextureDescriptor` body.
+    pub descriptor: &'a [u8],
+}
+
+/// Why a heap-texture query request is not one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeapTextureRefusal {
+    /// Too short to hold the request header.
+    Short(ShortPayload),
+    /// There is nowhere to write the reply: a null address, or a window that
+    /// cannot hold an `MTLSizeAndAlign`.
+    ///
+    /// Refused rather than clamped. A short window means the guest and this
+    /// device disagree about what the answer is, and writing the part that fits
+    /// hands it a size with no alignment.
+    ReplyDestination { gva: u64, len: u64 },
+    /// The declared serializer length is not the embedded record's length, or
+    /// is not the rest of the payload.
+    ///
+    /// One refusal for both because they are one claim: the request declares
+    /// how long its record is, and that number has to agree with the record
+    /// this opcode carries *and* with the bytes that arrived. A request where
+    /// either fails is one whose two halves were written by different ideas of
+    /// how long it is.
+    SerializerLength { declared: u32, plen: usize },
+    /// The embedded record is not the selector this request asks with.
+    SerializerTag { found: u32 },
+}
+
+impl HeapTextureRefusal {
+    /// The slug this refusal reports under.
+    ///
+    /// Inherent, because a caller that may not depend on `observe` still has to
+    /// name the refusal it forwards — the same rule [`ShortPayload::SLUG`] is
+    /// stated by.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Short(_) => "heap_query_short_payload",
+            Self::ReplyDestination { .. } => "heap_query_bad_reply_length",
+            Self::SerializerLength { .. } => "heap_query_bad_serializer_length",
+            Self::SerializerTag { .. } => "heap_query_unknown_serializer_tag",
+        }
+    }
+}
+
+/// Frame a `CmdHeapTextureSizeAndAlign` request.
+///
+/// Returns the request's three words and a borrow of the embedded descriptor
+/// body. The record's own `{opcode, length}` head is read through
+/// [`reims_vgpu_wire::op`] rather than at offsets restated here, so the
+/// framing this device checks is the framing that crate derived.
+///
+/// # Errors
+///
+/// [`HeapTextureRefusal`]: too short for the header, a reply destination that
+/// cannot hold the answer, a declared record length that disagrees with either
+/// the opcode or the bytes, or a record of another selector.
+pub fn decode_heap_texture_query(
+    payload: &[u8],
+) -> Result<HeapTextureRequest<'_>, HeapTextureRefusal> {
+    if payload.len() < HEAP_TEXTURE_REQUEST_HEADER_LEN {
+        return Err(HeapTextureRefusal::Short(ShortPayload {
+            plen: payload.len(),
+            need: HEAP_TEXTURE_REQUEST_HEADER_LEN,
+        }));
+    }
+    let reply_gva = ld64(&payload[HEAP_TEXTURE_REPLY_GVA..]);
+    let reply_len = ld64(&payload[HEAP_TEXTURE_REPLY_LENGTH..]);
+    if reply_gva == 0 || reply_len < HEAP_TEXTURE_REPLY_LEN as u64 {
+        return Err(HeapTextureRefusal::ReplyDestination {
+            gva: reply_gva,
+            len: reply_len,
+        });
+    }
+    let declared = ld32(&payload[HEAP_TEXTURE_SERIALIZER_LENGTH..]);
+    if declared as usize != HEAP_TEXTURE_SERIALIZED_LEN
+        || payload.len() != HEAP_TEXTURE_REQUEST_HEADER_LEN + declared as usize
+    {
+        return Err(HeapTextureRefusal::SerializerLength {
+            declared,
+            plen: payload.len(),
+        });
+    }
+    // The record's head is the serializer's own, so it is read through the
+    // crate that derived it. `op` refuses a declared length that is under the
+    // head or over the bytes present; the check above has already pinned it to
+    // this opcode's one length, so the only thing left to judge is the tag.
+    let record =
+        reims_vgpu_wire::op(&payload[HEAP_TEXTURE_REQUEST_HEADER_LEN..], 0).map_err(|_| {
+            HeapTextureRefusal::SerializerLength {
+                declared,
+                plen: payload.len(),
+            }
+        })?;
+    if record.opcode() != HEAP_TEXTURE_SERIALIZED_TAG {
+        return Err(HeapTextureRefusal::SerializerTag {
+            found: record.opcode(),
+        });
+    }
+    Ok(HeapTextureRequest {
+        raw_task: ld32(&payload[HEAP_TEXTURE_TASK_ID..]),
+        reply_gva,
+        reply_len,
+        descriptor: record.payload,
     })
 }
 
@@ -1692,6 +1869,19 @@ mod tests {
                 );
             }
             assert_eq!(decode_task_object(&payload).is_ok(), len >= TASK_OBJECT_LEN);
+            // No length in this sweep can carry a well-formed record, so what
+            // this pins is the refusal path: every rejection is a value and
+            // none of the four checks indexes past what it was handed.
+            if let Ok(request) = decode_heap_texture_query(&payload) {
+                assert_eq!(
+                    len,
+                    HEAP_TEXTURE_REQUEST_HEADER_LEN + HEAP_TEXTURE_SERIALIZED_LEN
+                );
+                assert_eq!(
+                    request.descriptor.len(),
+                    HEAP_TEXTURE_SERIALIZED_LEN - reims_vgpu_wire::op::OP_HEADER_LEN,
+                );
+            }
         }
         // A sweep where everything refuses proves only that refusing does not
         // panic, and one where nothing does proves only the happy path.
@@ -1823,6 +2013,150 @@ mod tests {
                     plen,
                     need: COMPUTE_INFO_REQUEST_LEN
                 }),
+                "{plen}"
+            );
+        }
+    }
+
+    /// A live `CmdHeapTextureSizeAndAlign` request, framed.
+    ///
+    /// The words are the capture's: task 1, a reply at `0x162200` sixteen bytes
+    /// long, then a forty-byte `heapTextureSizeAndAlignWithDescriptor:` record.
+    fn heap_texture_request() -> Vec<u8> {
+        let words = [
+            0x1u32, 0x162200, 0x0, 0x10, 0x0, 0x28, 0x16, 0x28, 0x7d0342, 0xb4, 0x87, 0x1, 0x10001,
+            0x200001, 0x0, 0x0,
+        ];
+        words.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+
+    /// The header's four fields, and the record it hands back.
+    ///
+    /// The descriptor is the record's *payload*, not the record: a caller that
+    /// received the head as well would read the opcode as a texture type.
+    #[test]
+    fn a_heap_texture_request_frames_its_words_and_its_record() {
+        let bytes = heap_texture_request();
+        let request = decode_heap_texture_query(&bytes).expect("framed");
+        assert_eq!(request.raw_task, 1);
+        assert_eq!(request.reply_gva, 0x162200);
+        assert_eq!(request.reply_len, HEAP_TEXTURE_REPLY_LEN as u64);
+        assert_eq!(
+            request.descriptor.len(),
+            HEAP_TEXTURE_SERIALIZED_LEN - reims_vgpu_wire::op::OP_HEADER_LEN,
+        );
+        assert_eq!(
+            request.descriptor,
+            &bytes[HEAP_TEXTURE_REQUEST_HEADER_LEN + reims_vgpu_wire::op::OP_HEADER_LEN..],
+        );
+    }
+
+    /// Every offset is where the one before it ends, and the reply is two
+    /// `u64`s.
+    #[test]
+    fn the_request_header_and_the_reply_are_each_their_fields() {
+        assert_eq!(HEAP_TEXTURE_REQUEST_HEADER_LEN, 24);
+        assert_eq!(HEAP_TEXTURE_REPLY_LEN, 16);
+        assert_eq!(HEAP_TEXTURE_SERIALIZED_LEN, 40);
+        let reply = SizeAndAlign {
+            size: 0x78000,
+            align: 0x80,
+        }
+        .encode();
+        assert_eq!(ld64(&reply[HEAP_TEXTURE_REPLY_SIZE..]), 0x78000);
+        assert_eq!(ld64(&reply[HEAP_TEXTURE_REPLY_ALIGN..]), 0x80);
+    }
+
+    /// A reply window that cannot hold both words is refused, not clamped.
+    ///
+    /// Writing the size and dropping the alignment would leave the guest
+    /// placing a heap texture at whatever alignment its buffer already held.
+    #[test]
+    fn a_reply_window_under_an_mtl_size_and_align_is_refused() {
+        for len in 0..HEAP_TEXTURE_REPLY_LEN as u64 {
+            let mut bytes = heap_texture_request();
+            st64(&mut bytes[HEAP_TEXTURE_REPLY_LENGTH..], len);
+            assert_eq!(
+                decode_heap_texture_query(&bytes),
+                Err(HeapTextureRefusal::ReplyDestination { gva: 0x162200, len }),
+                "{len}"
+            );
+        }
+    }
+
+    /// A null destination is refused however long the window claims to be.
+    #[test]
+    fn a_reply_address_of_zero_is_nowhere_to_write() {
+        let mut bytes = heap_texture_request();
+        st64(&mut bytes[HEAP_TEXTURE_REPLY_GVA..], 0);
+        st64(&mut bytes[HEAP_TEXTURE_REPLY_LENGTH..], 4096);
+        assert_eq!(
+            decode_heap_texture_query(&bytes),
+            Err(HeapTextureRefusal::ReplyDestination { gva: 0, len: 4096 }),
+        );
+    }
+
+    /// The declared record length has to be this opcode's length *and* the rest
+    /// of the payload — one refusal, because it is one claim.
+    #[test]
+    fn a_declared_record_length_must_be_the_opcode_s_and_the_payload_s() {
+        let bytes = heap_texture_request();
+        for declared in [
+            HEAP_TEXTURE_SERIALIZED_LEN as u32 - 1,
+            HEAP_TEXTURE_SERIALIZED_LEN as u32 + 1,
+        ] {
+            let mut short = bytes.clone();
+            st32(&mut short[HEAP_TEXTURE_SERIALIZER_LENGTH..], declared);
+            assert_eq!(
+                decode_heap_texture_query(&short),
+                Err(HeapTextureRefusal::SerializerLength {
+                    declared,
+                    plen: bytes.len(),
+                }),
+                "{declared}"
+            );
+        }
+        // The declared length is right and the bytes are not — in both
+        // directions. Short is also what the record view refuses, since a
+        // record cannot declare more than it was handed; **long is not**, and
+        // it is the half that matters: a request with a tail decodes to a
+        // record whose trailing bytes belong to whatever follows it.
+        for plen in [bytes.len() - 4, bytes.len() + 4] {
+            let mut resized = bytes.clone();
+            resized.resize(plen, 0);
+            assert_eq!(
+                decode_heap_texture_query(&resized),
+                Err(HeapTextureRefusal::SerializerLength {
+                    declared: HEAP_TEXTURE_SERIALIZED_LEN as u32,
+                    plen,
+                }),
+                "{plen}"
+            );
+        }
+    }
+
+    /// A record of another selector is a routing mistake, and is named as one.
+    #[test]
+    fn a_record_of_another_selector_is_refused_by_tag() {
+        let mut bytes = heap_texture_request();
+        st32(&mut bytes[HEAP_TEXTURE_REQUEST_HEADER_LEN..], 0x99);
+        assert_eq!(
+            decode_heap_texture_query(&bytes),
+            Err(HeapTextureRefusal::SerializerTag { found: 0x99 }),
+        );
+    }
+
+    /// One byte under the header is refused, at exactly the length it declares.
+    #[test]
+    fn a_heap_texture_request_under_its_header_is_refused() {
+        let bytes = heap_texture_request();
+        for plen in 0..HEAP_TEXTURE_REQUEST_HEADER_LEN {
+            assert_eq!(
+                decode_heap_texture_query(&bytes[..plen]),
+                Err(HeapTextureRefusal::Short(ShortPayload {
+                    plen,
+                    need: HEAP_TEXTURE_REQUEST_HEADER_LEN,
+                })),
                 "{plen}"
             );
         }
