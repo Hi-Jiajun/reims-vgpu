@@ -32,6 +32,7 @@ pub mod encoder;
 pub mod exec;
 pub mod icb;
 pub mod identity;
+pub mod interpret;
 pub mod operation;
 pub mod pass;
 pub mod pipeline;
