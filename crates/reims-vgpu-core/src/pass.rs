@@ -40,6 +40,7 @@
 use crate::access::{AccessMode, ByteRange, Participation, ParticipationExtent, SubresourceRange};
 use crate::identity::ResourceId;
 pub use reims_vgpu_protocol::pass_action::LoadAction;
+pub use reims_vgpu_protocol::pass_action::StoreActionOptions;
 
 /// Colour attachment slots the record always carries, written or not.
 ///
@@ -130,6 +131,18 @@ pub struct Attachment {
     pub resolve_depth_plane: u16,
     pub load: LoadAction,
     pub store: StoreAction,
+    /// What the store action is asked to do beyond storing.
+    ///
+    /// The wire prefix has carried this word since the layout was measured and
+    /// nothing here read it, which made a pass asking for a resolve at
+    /// programmable sample positions indistinguishable from one asking for the
+    /// ordinary resolve. It is on the attachment rather than on the pass
+    /// because the guest sets it per slot — the capture drives colour, depth
+    /// and stencil separately and gets three independent words.
+    ///
+    /// Carried, not decided. Whether a host can resolve at custom sample
+    /// positions is an executor's question, and this crate names none.
+    pub store_options: StoreActionOptions,
     /// The value this slot is cleared to, as the guest's bits.
     ///
     /// Four words, interpreted by [`Self::slot`] rather than by a tag: a colour
@@ -167,6 +180,7 @@ impl Attachment {
             resolve_depth_plane: 0,
             load: LoadAction::DontCare,
             store: StoreAction::DontCare,
+            store_options: StoreActionOptions::None,
             clear_bits: [0; 4],
         }
     }

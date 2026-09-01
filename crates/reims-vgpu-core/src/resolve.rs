@@ -41,7 +41,7 @@ use crate::identity::ResourceId;
 use crate::operation::{classify, OperationClass, OperationHome};
 use crate::pass::{
     Attachment, AttachmentSlot, LoadAction, PassDescriptor, RenderTargetExtent, StoreAction,
-    VisibilityResultBuffer,
+    StoreActionOptions, VisibilityResultBuffer,
 };
 use crate::render::{
     DrawOp, FloatBits, IndexSource, Instancing, PassDescriptorSlot, PrimitiveType, RenderOp,
@@ -745,6 +745,18 @@ fn attachment(
         field: "store_action",
         value: u32::from(raw_store),
     })?;
+    // The word beside the store action, which nothing read until now. An
+    // undeclared value refuses for the reason the store action's does: the set
+    // has one flag, so a value outside it is a corrupt record or a wrong
+    // offset, and folding it onto the flag would claim the guest asked for
+    // programmable sample positions it never asked for.
+    let raw_options = prefix.store_action_options.get();
+    let store_options = StoreActionOptions::parse(u64::from(raw_options)).ok_or(
+        ResolveRefusal::UndefinedOrdinal {
+            field: "store_action_options",
+            value: u32::from(raw_options),
+        },
+    )?;
     Ok(Attachment {
         slot,
         texture: bound(resolver, prefix.texture_ref.get())?,
@@ -757,6 +769,7 @@ fn attachment(
         resolve_depth_plane: prefix.resolve_depth_plane.get(),
         load: LoadAction::from_declared(prefix.load_action.get()),
         store,
+        store_options,
         clear_bits,
     })
 }
@@ -1611,6 +1624,52 @@ mod tests {
                 value: 9,
             })
         );
+    }
+
+    /// Each slot's store-action options are its own, and an undeclared value
+    /// refuses.
+    ///
+    /// The word sat in the wire prefix from the day the layout was measured and
+    /// nothing read it, so a pass asking for a resolve at programmable sample
+    /// positions was indistinguishable from one asking for the ordinary
+    /// resolve. Driven per slot because the guest sets it per slot — a resolver
+    /// that read one slot's word for every slot would pass a test that only set
+    /// one.
+    #[test]
+    fn each_slots_store_action_options_are_read_from_its_own_prefix() {
+        let live = Live(vec![4242]);
+        let mut body = pass_body();
+        body.color[0].prefix.texture_ref = u32le(4242);
+        body.color[1].prefix.texture_ref = u32le(4242);
+        body.color[0].prefix.store_action_options = u16le(1);
+        body.depth.prefix.store_action_options = u16le(1);
+        let descriptor = pass_descriptor(&body, &live).expect("resolved");
+        assert_eq!(
+            descriptor.color[0].store_options,
+            StoreActionOptions::CustomSamplePositions
+        );
+        assert_eq!(descriptor.color[1].store_options, StoreActionOptions::None);
+        assert_eq!(
+            descriptor.depth.store_options,
+            StoreActionOptions::CustomSamplePositions
+        );
+        assert_eq!(descriptor.stencil.store_options, StoreActionOptions::None);
+
+        // The set has one declared flag, so a value outside it is a corrupt
+        // record or a wrong offset. Folding it onto the flag would claim the
+        // guest asked for programmable sample positions it never asked for.
+        for raw in [2u16, 3, 0x1111] {
+            let mut body = pass_body();
+            body.stencil.prefix.store_action_options = u16le(raw);
+            assert_eq!(
+                pass_descriptor(&body, &live),
+                Err(ResolveRefusal::UndefinedOrdinal {
+                    field: "store_action_options",
+                    value: u32::from(raw),
+                }),
+                "{raw:#x}"
+            );
+        }
     }
 
     /// The visibility buffer lives on the pass and nowhere else, so a pass
