@@ -31,7 +31,9 @@
 //! census that prices precision rungs is what makes the coarseness visible
 //! rather than permanent.
 
-use crate::access::{AccessMode, ByteRange, Participation, ParticipationExtent, SubresourceRange};
+use crate::access::{
+    AccessMode, ByteRange, Participation, ParticipationExtent, Participations, SubresourceRange,
+};
 use crate::identity::ResourceId;
 pub use reims_vgpu_protocol::blit::BlitKind;
 
@@ -222,48 +224,6 @@ pub enum BlitOp {
     },
     /// Every level below the top of a texture, rebuilt from the one above it.
     GenerateMipmaps { texture: ResourceId },
-}
-
-/// Up to two participations, without an allocation.
-///
-/// A transfer touches one resource or two, always. A `Vec` here would be a heap
-/// allocation per record on the hottest decode path in the device, bought to
-/// hold at most two elements — so the bound is in the type instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Participations {
-    items: [Participation; 2],
-    len: u8,
-}
-
-impl Participations {
-    fn one(a: Participation) -> Self {
-        Self {
-            items: [a, a],
-            len: 1,
-        }
-    }
-
-    fn two(a: Participation, b: Participation) -> Self {
-        Self {
-            items: [a, b],
-            len: 2,
-        }
-    }
-
-    #[must_use]
-    pub fn as_slice(&self) -> &[Participation] {
-        &self.items[..self.len as usize]
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
 }
 
 /// A transfer declares no shader stage; see [`Participation::api_stages`].
@@ -504,17 +464,17 @@ mod tests {
         };
         let p = op.participations();
         assert_eq!(p.len(), 2);
-        assert_eq!(p.as_slice()[0].mode, AccessMode::Read);
+        assert_eq!(p[0].mode, AccessMode::Read);
         assert_eq!(
-            p.as_slice()[0].extent,
+            p[0].extent,
             ParticipationExtent::Range(ByteRange {
                 offset: 0x100,
                 length: 0x40
             })
         );
-        assert_eq!(p.as_slice()[1].mode, AccessMode::Write);
+        assert_eq!(p[1].mode, AccessMode::Write);
         assert_eq!(
-            p.as_slice()[1].extent,
+            p[1].extent,
             ParticipationExtent::Range(ByteRange {
                 offset: 0x200,
                 length: 0x40
@@ -607,10 +567,7 @@ mod tests {
             dest: point(2, 0, 0),
             options: BlitOptions(0),
         };
-        assert_eq!(
-            op.participations().as_slice()[0].extent,
-            ParticipationExtent::Whole
-        );
+        assert_eq!(op.participations()[0].extent, ParticipationExtent::Whole);
     }
 
     /// An overflowing pitch product is not a span. Wrapping it would name a
@@ -647,8 +604,8 @@ mod tests {
     fn mipmap_generation_is_one_read_write_over_the_whole_texture() {
         let p = BlitOp::GenerateMipmaps { texture: res(3) }.participations();
         assert_eq!(p.len(), 1);
-        assert_eq!(p.as_slice()[0].mode, AccessMode::ReadWrite);
-        assert_eq!(p.as_slice()[0].extent, ParticipationExtent::Whole);
+        assert_eq!(p[0].mode, AccessMode::ReadWrite);
+        assert_eq!(p[0].extent, ParticipationExtent::Whole);
     }
 
     /// A fill writes and reads nothing.
@@ -671,7 +628,7 @@ mod tests {
         assert_eq!(word.kind(), BlitKind::FillBufferPattern4);
         let p = byte.participations();
         assert_eq!(p.len(), 1);
-        assert_eq!(p.as_slice()[0].mode, AccessMode::Write);
+        assert_eq!(p[0].mode, AccessMode::Write);
     }
 
     /// Every variant declares a participation, and none declares none: a
@@ -765,7 +722,7 @@ mod tests {
             let p = op.participations();
             assert!(!p.is_empty(), "{:?} declares nothing", op.kind());
             assert!(
-                p.as_slice().iter().any(|x| x.mode.writes()),
+                p.iter().any(|x| x.mode.writes()),
                 "{:?} writes nothing, so it is not a transfer",
                 op.kind()
             );

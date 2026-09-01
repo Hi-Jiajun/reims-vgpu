@@ -30,7 +30,7 @@
 //! about: `operation::tests::every_class_has_a_payload_or_a_reason_to_be_empty`
 //! fails the moment either count moves off zero.
 
-use crate::access::{AccessIntent, AccessKey, BackingId, ContentVersion};
+use crate::access::{AccessIntent, AccessKey, BackingId, ContentVersion, Participation};
 use crate::bind::{BufferBinding, ObjectBinding};
 use crate::blit::BlitOp;
 use crate::compute::ComputeOp;
@@ -81,6 +81,56 @@ impl ResolvedOperation {
             Self::Barrier(_) => OperationClass::Barrier,
             Self::ResourceState(_) => OperationClass::ResourceState,
             Self::IndirectCommand(_) => OperationClass::IndirectCommand,
+        }
+    }
+
+    /// Every participation this record declares by itself, appended to `out`.
+    ///
+    /// **The link between "a record resolves" and "a transaction has
+    /// accesses".** Each payload module states what its own records name — a
+    /// draw's index buffer, a copy's two ends, a synchronise's content, and the
+    /// classes that name nothing say so — and this is the one place those
+    /// answers are collected. Before it, every one of those methods was
+    /// reachable only from its own tests, and no caller could ask a resolved
+    /// stream what it touched without knowing the whole vocabulary itself.
+    ///
+    /// Exhaustive, like [`Self::class`], and for the same reason: a variant
+    /// added without an arm here would silently contribute no accesses, and an
+    /// operation missing from the access list is a hazard edge that does not
+    /// get built — a race, not a slowdown.
+    ///
+    /// `arenas` is the transaction's own, and only one arm reads it: a render
+    /// `WriteDescriptor` carries a [`crate::render::PassDescriptorSlot`],
+    /// because the descriptor is 592 bytes and a record that carried it by
+    /// value would make every eight-byte record that size. Its participations
+    /// are the pass's cost *before any draw* — which is what makes a pass with
+    /// no draws still a write — and this is the only scope that can reach it.
+    /// A slot past the end of the arena contributes nothing rather than
+    /// panicking: the arena and the slot are built together by
+    /// [`ExecBuilder`], so a mismatch is a bug in this crate, and taking a
+    /// stream down over it would lose the whole packet.
+    ///
+    /// Appended rather than returned so a caller walking a whole EXEC keeps one
+    /// buffer. A `Vec` per record would be an allocation per record on the
+    /// hottest path this crate has.
+    pub fn participations(&self, arenas: &ExecArenas, out: &mut Vec<Participation>) {
+        match self {
+            Self::EncoderBoundary(op) => out.extend(op.participations()),
+            Self::Render(op) => {
+                out.extend(op.participations());
+                if let RenderOp::WriteDescriptor { descriptor } = op {
+                    if let Some(pass) = arenas.pass_descriptors.get(descriptor.0 as usize) {
+                        pass.extend_participations(out);
+                    }
+                }
+            }
+            Self::Compute(op) => out.extend(op.participations()),
+            Self::Blit(op) => out.extend(op.participations()),
+            Self::Event(op) => out.extend(op.participations()),
+            Self::Fence(op) => out.extend(op.participations()),
+            Self::Barrier(op) => out.extend(op.participations()),
+            Self::ResourceState(op) => out.extend(op.participations()),
+            Self::IndirectCommand(op) => out.extend(op.participations()),
         }
     }
 }
@@ -794,5 +844,115 @@ mod tests {
         }
         let tx = b.finish().expect("frozen");
         assert_eq!(tx.published_versions().count(), 0);
+    }
+
+    /// Every operation class answers the participation question, and the two
+    /// that route through something other than their own fields answer it
+    /// correctly.
+    ///
+    /// The aggregation is exhaustive by construction — the match in
+    /// `participations` has no wildcard — so what a test can still catch is an
+    /// arm wired to the wrong source. Two are:
+    ///
+    /// * `WriteDescriptor` is the only arm that reads the arena, and it is the
+    ///   only participation a *pass* contributes. Wiring it to the record's own
+    ///   (empty) answer would lose every attachment of every pass, and a pass
+    ///   with no draws would become a transaction that touches nothing.
+    /// * A barrier carries a resource list and declares no participation on it.
+    ///   Reading that list as accesses would order every barrier against
+    ///   everything it named.
+    #[test]
+    fn every_class_answers_what_it_touches_and_only_the_pass_reads_the_arena() {
+        let mut arenas = ExecArenas::default();
+        let mut pass = crate::pass::PassDescriptor::empty();
+        pass.visibility_result_buffer =
+            Some(crate::pass::VisibilityResultBuffer { buffer: res(11) });
+        arenas.pass_descriptors.push(pass);
+        arenas.resources.push(res(1));
+
+        let ask = |op: ResolvedOperation, arenas: &ExecArenas| -> Vec<Participation> {
+            let mut out = Vec::new();
+            op.participations(arenas, &mut out);
+            out
+        };
+
+        // The pass's own footprint, reached only through the arena.
+        let write_descriptor = ResolvedOperation::Render(RenderOp::WriteDescriptor {
+            descriptor: crate::render::PassDescriptorSlot(0),
+        });
+        let parts = ask(write_descriptor, &arenas);
+        assert_eq!(parts.len(), 1, "the visibility buffer is the pass's write");
+        assert_eq!(parts[0].resource, res(11));
+        assert_eq!(parts[0].mode, AccessMode::Write);
+        // And it really is the arena that supplied it: the same record against
+        // an arena that does not hold the slot contributes nothing rather than
+        // panicking.
+        assert!(ask(write_descriptor, &ExecArenas::default()).is_empty());
+
+        // A barrier names a resource list and participates in none of it.
+        assert!(ask(a_barrier(), &arenas).is_empty());
+        // A fence and an event name their own object and no memory.
+        assert!(ask(
+            ResolvedOperation::Fence(crate::sync::FenceOp {
+                kind: crate::sync::FenceKind::Update,
+                fence: res(2),
+                stages: None,
+            }),
+            &arenas
+        )
+        .is_empty());
+        assert!(ask(
+            ResolvedOperation::Event(crate::sync::EventOp {
+                kind: crate::sync::EventKind::Signal,
+                event: res(3),
+                value: 9,
+            }),
+            &arenas
+        )
+        .is_empty());
+        // A boundary names nothing.
+        assert!(ask(
+            ResolvedOperation::EncoderBoundary(EncoderBoundary::End { records: 0 }),
+            &arenas
+        )
+        .is_empty());
+
+        // A transfer names its operand.
+        let blit = ask(a_blit(), &arenas);
+        assert_eq!(blit.len(), 1);
+        assert_eq!(blit[0].resource, res(1));
+
+        // A synchronise reads the content it publishes; the four directives
+        // with no modelled effect name nothing.
+        use crate::resource_state::{ContentDirective, ResourceStateOp, ResourceStateTarget};
+        let target = ResourceStateTarget::Resource {
+            resource: res(4),
+            subresource: None,
+        };
+        let sync = ask(
+            ResolvedOperation::ResourceState(ResourceStateOp {
+                directive: ContentDirective::Synchronize,
+                target,
+            }),
+            &arenas,
+        );
+        assert_eq!(sync.len(), 1);
+        assert_eq!(sync[0].resource, res(4));
+        assert_eq!(sync[0].mode, AccessMode::Read);
+        for directive in [
+            ContentDirective::OptimizeForCpu,
+            ContentDirective::OptimizeForGpu,
+            ContentDirective::InvalidateCompressed,
+            ContentDirective::FlushCompressedReinterpretation,
+        ] {
+            assert!(
+                ask(
+                    ResolvedOperation::ResourceState(ResourceStateOp { directive, target }),
+                    &arenas
+                )
+                .is_empty(),
+                "{directive:?}"
+            );
+        }
     }
 }

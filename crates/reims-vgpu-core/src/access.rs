@@ -373,6 +373,144 @@ impl Participation {
     }
 }
 
+/// Up to two participations, without an allocation.
+///
+/// Two, because that is the widest thing any *record* declares by itself: a
+/// draw's index buffer and its indirect arguments, a copy's source and its
+/// destination, an ICB and its argument buffer. A pass descriptor names more,
+/// and that is exactly why it is not a record's own claim — it lives in the
+/// transaction's arena and is aggregated in [`crate::exec::ResolvedOperation`],
+/// where the arena is in scope.
+///
+/// An inline array rather than a `Vec` because this is answered once per
+/// record of every stream. A heap allocation per record is a cost the shape of
+/// the answer does not require, and the two operations that used to return
+/// `Vec` were paying it for at most two items.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Participations {
+    /// Both slots are always initialized — `len` says how many are the
+    /// answer. A slot past `len` is a copy of an earlier one and never read,
+    /// which is what lets this be `Copy` with no `Option` per element.
+    items: [Option<Participation>; 2],
+}
+
+impl Participations {
+    /// The record names no memory of its own.
+    ///
+    /// A real answer and not an absence: every operation class answers this
+    /// question, and the classes that touch nothing say so rather than being
+    /// skipped by a caller that knows which ones they are.
+    pub const NONE: Self = Self { items: [None; 2] };
+
+    #[must_use]
+    pub const fn one(a: Participation) -> Self {
+        Self {
+            items: [Some(a), None],
+        }
+    }
+
+    #[must_use]
+    pub const fn two(a: Participation, b: Participation) -> Self {
+        Self {
+            items: [Some(a), Some(b)],
+        }
+    }
+
+    /// One participation, or none, from an `Option` — the shape a record with
+    /// a single optional read has.
+    #[must_use]
+    pub const fn maybe(a: Option<Participation>) -> Self {
+        Self { items: [a, None] }
+    }
+
+    /// The two optional slots, in record order, with the gaps closed.
+    ///
+    /// A draw may name arguments and no index buffer, so the slots are
+    /// independently optional and the answer must not have a hole in it.
+    #[must_use]
+    pub fn pair(a: Option<Participation>, b: Option<Participation>) -> Self {
+        match (a, b) {
+            (Some(a), Some(b)) => Self::two(a, b),
+            (Some(only), None) | (None, Some(only)) => Self::one(only),
+            (None, None) => Self::NONE,
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Participation> {
+        self.items.iter().flatten()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl core::ops::Index<usize> for Participations {
+    type Output = Participation;
+
+    /// The `index`th participation, in the order the record names them.
+    ///
+    /// Indexable because the order is part of the answer — a copy's source is
+    /// first and its destination second — and because the slots are packed:
+    /// [`Participations::pair`] closes the gap, so a present slot never
+    /// follows an absent one and `p[1]` cannot mean "the second slot, which
+    /// happens to be empty".
+    ///
+    /// # Panics
+    ///
+    /// Past the answer's length, like any slice.
+    fn index(&self, index: usize) -> &Participation {
+        self.items
+            .get(index)
+            .and_then(Option::as_ref)
+            .expect("participation index past the answer")
+    }
+}
+
+impl IntoIterator for Participations {
+    type Item = Participation;
+    type IntoIter = core::iter::Flatten<core::array::IntoIter<Option<Participation>, 2>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter().flatten()
+    }
+}
+
+impl Participation {
+    /// A read of a buffer window a record named, with the extent it
+    /// established.
+    ///
+    /// `length: None` is a record that named an offset and no size — an
+    /// indirect argument block whose layout is not established, say — and it
+    /// widens to [`ParticipationExtent::Whole`] rather than narrowing to a
+    /// guessed span. The offset is not lost: it is not *carried*, because a
+    /// range starting at an offset and running to an unknown end is exactly
+    /// the whole resource from the hazard test's point of view, and a shorter
+    /// claim is an edge that does not get built, which is a race.
+    ///
+    /// No shader stage: a record that names a buffer window in its own fields
+    /// carries no stage mask. A participation with stages always came from a
+    /// record that had them.
+    #[must_use]
+    pub const fn buffer_read(resource: ResourceId, offset: u64, length: Option<u64>) -> Self {
+        Self {
+            resource,
+            extent: match length {
+                Some(length) => ParticipationExtent::Range(ByteRange { offset, length }),
+                None => ParticipationExtent::Whole,
+            },
+            mode: AccessMode::Read,
+            api_stages: 0,
+        }
+    }
+}
+
 /// Whether an earlier access and a later one require an ordering edge.
 ///
 /// Read against read is the only free pair, and only when both directions are

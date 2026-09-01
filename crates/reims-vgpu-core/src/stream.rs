@@ -94,6 +94,19 @@ pub enum EncoderBoundary {
     End { records: u32 },
 }
 
+impl EncoderBoundary {
+    /// The memory this record names: none.
+    ///
+    /// A boundary opens or closes an encoder. It is here, answering the same
+    /// question every other operation class answers, so that "touches nothing"
+    /// is a claim this type makes rather than a case the aggregation in
+    /// [`crate::exec::ResolvedOperation::participations`] has to know to skip.
+    #[must_use]
+    pub const fn participations(&self) -> crate::access::Participations {
+        crate::access::Participations::NONE
+    }
+}
+
 /// Which segment, and which record inside it.
 ///
 /// [`Ord`] is the execution order, and it is total: the model has no way to

@@ -23,7 +23,7 @@
 //! That is not lost work; it is wrong work, and it is why they must not be
 //! given a shape the model can run.
 
-use crate::access::{AccessMode, Participation, ParticipationExtent};
+use crate::access::{AccessMode, Participation, ParticipationExtent, Participations};
 use crate::bind::IndirectSource;
 use crate::identity::ResourceId;
 
@@ -115,9 +115,8 @@ impl IcbOp {
     /// unresolved. An operation here that claimed to know them would be
     /// claiming the contract that is open.
     #[must_use]
-    pub fn participations(&self) -> Vec<Participation> {
-        let mut out = Vec::with_capacity(2);
-        out.push(Participation {
+    pub fn participations(&self) -> Participations {
+        let commands = Participation {
             resource: self.icb(),
             extent: ParticipationExtent::Whole,
             mode: if self.executes() {
@@ -130,16 +129,16 @@ impl IcbOp {
                 AccessMode::ReadWrite
             },
             api_stages: NO_STAGES,
-        });
-        if let Some(arguments) = self.argument_read() {
-            out.push(Participation {
+        };
+        Participations::pair(
+            Some(commands),
+            self.argument_read().map(|arguments| Participation {
                 resource: arguments.buffer,
                 extent: ParticipationExtent::Whole,
                 mode: AccessMode::Read,
                 api_stages: NO_STAGES,
-            });
-        }
-        out
+            }),
+        )
     }
 }
 

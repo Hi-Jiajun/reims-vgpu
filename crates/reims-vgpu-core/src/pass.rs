@@ -314,6 +314,17 @@ impl PassDescriptor {
     #[must_use]
     pub fn participations(&self) -> Vec<Participation> {
         let mut out = Vec::with_capacity(COLOR_ATTACHMENTS + 4);
+        self.extend_participations(&mut out);
+        out
+    }
+
+    /// [`Self::participations`], appended to a buffer the caller owns.
+    ///
+    /// The shape [`crate::exec::ResolvedOperation::participations`] needs: a
+    /// pass descriptor is reached once per `writeDescriptor` record, and a
+    /// fresh `Vec` for each would be an allocation per pass. The owning method
+    /// above stays for the readings that want a value.
+    pub fn extend_participations(&self, out: &mut Vec<Participation>) {
         for attachment in self.attached() {
             let (Some(texture), Some(mode)) = (attachment.texture, attachment.access_mode()) else {
                 continue;
@@ -346,7 +357,6 @@ impl PassDescriptor {
                 api_stages: NO_STAGES,
             });
         }
-        out
     }
 
     /// The byte range one occlusion query occupies, at `offset`.

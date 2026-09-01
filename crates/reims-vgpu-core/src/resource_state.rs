@@ -34,7 +34,9 @@
 //! content the guest never wrote. So they are carried, reported, and left for
 //! an executor that has a representation to act on.
 
-use crate::access::SubresourceRange;
+use crate::access::{
+    AccessMode, Participation, ParticipationExtent, Participations, SubresourceRange,
+};
 use crate::content::Replica;
 use crate::identity::ResourceId;
 pub use reims_vgpu_protocol::resource_state::{ContentDirective, ContentTarget};
@@ -127,6 +129,51 @@ impl ResourceStateOp {
             | ContentDirective::InvalidateCompressed
             | ContentDirective::FlushCompressedReinterpretation => None,
         }
+    }
+
+    /// The memory this record names by itself.
+    ///
+    /// A **read** of the named content for a synchronise, and nothing for the
+    /// other four.
+    ///
+    /// The read follows directly from [`Self::publication_requirement`]: a
+    /// synchronise says the guest's own pages must be current for this
+    /// content, and making them current means the content is read. So a
+    /// synchronise must not be ordered before the writes it is publishing, and
+    /// a read participation is exactly the edge that says so. Declaring it a
+    /// write instead would be claiming this operation produces the resource's
+    /// next content, which it does not — what it produces is the guest replica,
+    /// and that is `publication_requirement`'s statement rather than a
+    /// participation.
+    ///
+    /// The other four name nothing because the model has no representation for
+    /// what they change; see the module doc for why inventing one has a cost.
+    /// `ResourceStateTarget::Encoder` names nothing because the record did.
+    #[must_use]
+    pub fn participations(&self) -> Participations {
+        if self.publication_requirement().is_none() {
+            return Participations::NONE;
+        }
+        let ResourceStateTarget::Resource {
+            resource,
+            subresource,
+        } = self.target
+        else {
+            return Participations::NONE;
+        };
+        Participations::one(Participation {
+            resource,
+            // A whole-resource synchronise covers every level, and the record
+            // carried no level count — so the honest extent is the resource
+            // and not its top level. Narrowing here is the hazard edge that
+            // does not get built.
+            extent: subresource.map_or(ParticipationExtent::Whole, |s| {
+                ParticipationExtent::Subresource(s.subresource())
+            }),
+            mode: AccessMode::Read,
+            // A content request names no shader stage.
+            api_stages: 0,
+        })
     }
 
     /// Whether an executor is free to do nothing at all for this operation

@@ -460,3 +460,95 @@ fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written()
     );
     assert!(placed > 0, "no fixture reached a transaction at all");
 }
+
+/// A record cannot participate in a resource it never named.
+///
+/// The link after placement. [`ResolvedOperation::participations`] is what
+/// turns a resolved stream into the accesses a transaction is built from, and
+/// nothing before this asks Apple's own records for them: the per-class methods
+/// it aggregates were each reachable only from their own unit tests.
+///
+/// The invariant checked here is the one an aggregation can get wrong without
+/// any test noticing. Every participation names a `ResourceId`, and the only
+/// place a `ResourceId` can come from is [`RefResolver::resource`] — so a
+/// resource in the answer that the resolver was never asked for is one an arm
+/// fabricated, whether from a stale field, a mis-transcribed variant or a copy
+/// of the wrong operand. The resolver records what it was asked, and the
+/// answer must be a subset of that.
+///
+/// The counts are printed rather than asserted per class, because which
+/// fixtures exist is the oracle's business. What *is* asserted is that some
+/// record named memory at all — an aggregation that returned nothing for
+/// everything would satisfy the subset rule perfectly.
+#[test]
+fn a_record_never_participates_in_a_resource_it_did_not_name() {
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    /// [`Everything`], with a note of every ref it answered.
+    struct Recording(RefCell<BTreeSet<u32>>);
+
+    impl RefResolver for Recording {
+        fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+            self.0.borrow_mut().insert(object_ref);
+            Some(ResourceId {
+                slot: ObjectListRef(object_ref),
+                generation: SlotGeneration(1),
+            })
+        }
+    }
+
+    let mut fabricated = Vec::new();
+    let mut naming = 0usize;
+    let mut participations_total = 0usize;
+    let mut per_class: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for case in cases() {
+        let Case {
+            name, rail, bytes, ..
+        } = case;
+        if !is_stream_rail(rail) {
+            continue;
+        }
+        let Ok(view) = op(&bytes, 0) else { continue };
+        let resolver = Recording(RefCell::new(BTreeSet::new()));
+        let mut arenas = ExecArenas::default();
+        let Ok(resolved) = operation(rail, &view, &resolver, &mut arenas) else {
+            continue;
+        };
+        let asked = resolver.0.into_inner();
+
+        let mut parts = Vec::new();
+        resolved.participations(&arenas, &mut parts);
+        if !parts.is_empty() {
+            naming += 1;
+            participations_total += parts.len();
+            *per_class
+                .entry(format!("{:?}", resolved.class()))
+                .or_default() += parts.len();
+        }
+        for part in &parts {
+            if !asked.contains(&part.resource.slot.0) {
+                fabricated.push(format!(
+                    "{name} ({rail:?}): participation names ref {} and the record asked for {asked:?}",
+                    part.resource.slot.0
+                ));
+            }
+        }
+    }
+
+    for (class, count) in &per_class {
+        println!("participations: {class} x{count}");
+    }
+    println!("records naming memory: {naming}, participations: {participations_total}");
+    assert!(
+        fabricated.is_empty(),
+        "a participation named a resource its record never resolved:\n  {}",
+        fabricated.join("\n  ")
+    );
+    assert!(
+        naming > 0,
+        "no fixture named any memory; the aggregation reached nothing"
+    );
+}
