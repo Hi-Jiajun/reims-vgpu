@@ -20,6 +20,8 @@
 //!
 //! # The parts
 //!
+//! - [`bindings`] — what a draw has to re-emit, and far more often what it
+//!   does not.
 //! - [`layout`] — which layout each image subresource is in, and the explicit
 //!   transitions and ownership moves that get it to the next one.
 //! - [`memory`] — how host and device memory relate on the bound physical
@@ -46,6 +48,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod barrier;
+pub mod bindings;
 pub mod layout;
 pub mod memory;
 pub mod placement;
