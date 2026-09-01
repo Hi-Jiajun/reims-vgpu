@@ -1238,17 +1238,54 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
     // SAFETY: when Some, contig covers span_end.
     let base = contig.map(|(ptr, _)| unsafe { (ptr as *mut u8).add(base_off as usize) });
-    // The two halves of this writer, which is the whole of the Metal rail's
-    // `store_us` and which nothing has ever divided — `SurfaceWritePhase` is
-    // emitted by `write_bgra8_inner`, the writer the *other* rail's Store takes.
-    // They are named neutrally because this function is neutral; its other two
-    // callers (`exec`'s attachment clear and `draw`'s abandoned-chain recovery)
-    // are rare enough that a reading is about the Metal Store.
+
+    // The host-cache frame, built once, up here, into the buffer the previous
+    // frame is already in.
+    //
+    // It used to be built after the row loop, into a fresh `vec![0u8; need]`,
+    // by a second whole-frame pass over `rgba` — and that was 45.9 % of the
+    // Metal rail's `store_us`, 2 296 us a draw, for a conversion the row loop
+    // below had already performed. `tight_row_is_bgra8` is when the two are the
+    // same bytes: a BGRA8 mapping's native texel *is* the cache's, so the rows
+    // are taken from here and converted once instead of twice.
+    //
+    // Building it before the write rather than after is what lets the rows read
+    // from it, and it is safe in the direction that matters: `take_frame_buffer`
+    // has already removed the entry, so a refusal below leaves this cache
+    // holding nothing rather than holding a frame the guest's half-written pages
+    // no longer match. Publishing happens at the bottom, on success only.
+    let mut cache = crate::runtime::surface_cache::take_frame_buffer(state, mapping_id, mw, mh);
+    {
+        let _span_cache = crate::runtime::chain_phase::CostSpan::new("surface_changed_cache_us");
+        for y in 0..mh as usize {
+            let off = y * rgba_stride as usize;
+            let src_row = &rgba[off..off + rgba_stride as usize];
+            let dst_row = &mut cache[off..off + rgba_stride as usize];
+            for x in 0..mw as usize {
+                let i = x * 4;
+                dst_row[i] = src_row[i + 2];
+                dst_row[i + 1] = src_row[i + 1];
+                dst_row[i + 2] = src_row[i];
+                dst_row[i + 3] = src_row[i + 3];
+            }
+        }
+    }
+    // Whether a cache row is byte for byte this mapping's native texel row, so
+    // the row loop can read it instead of converting again. Both halves must
+    // hold: the format's tight row is BGRA8, and the tight row is the whole of
+    // the cache's row — `tight_row_bytes` and `rgba_stride` are computed from
+    // different places and a format that made them differ would slice the wrong
+    // bytes.
+    let cache_rows_are_native = matches!(
+        format,
+        MTL_FORMAT_BGRA8_UNORM | pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
+    ) && tight == rgba_stride as usize;
+
     let span_rows = crate::runtime::chain_phase::CostSpan::new("surface_changed_rows_us");
     for y in 0..mh as usize {
         let src_off = y * rgba_stride as usize;
         let src_row = &rgba[src_off..src_off + rgba_stride as usize];
-        if !rgba8_row_to_native(format, src_row, mw, &mut native) {
+        if !cache_rows_are_native && !rgba8_row_to_native(format, src_row, mw, &mut native) {
             return refuse(
                 mapping_id,
                 SurfaceWriteRefusal::RowConvert {
@@ -1257,6 +1294,13 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                 },
             );
         }
+        // One name for the row's native bytes, whichever produced them, so the
+        // three readers below cannot disagree about which buffer they are in.
+        let native: &[u8] = if cache_rows_are_native {
+            &cache[src_off..src_off + tight]
+        } else {
+            &native
+        };
         let seed_row = if let Some(seed) = seed_rgba {
             let s = &seed[src_off..src_off + rgba_stride as usize];
             if !rgba8_row_to_native(format, s, mw, &mut seed_native) {
@@ -1273,7 +1317,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             None
         };
         if let Some(srow) = seed_row {
-            if srow == native.as_slice() {
+            if srow == native {
                 continue;
             }
         }
@@ -1337,7 +1381,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                     );
                 }
             }
-        } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, &native, &vouched)
+        } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, native, &vouched)
         {
             return refuse(
                 mapping_id,
@@ -1351,27 +1395,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     drop(span_rows);
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
-    // Host render-cache (Linux §8.5): full-frame BGRA from the Store rgba.
-    //
-    // A whole second conversion of the same frame, into a whole second
-    // allocation — and for a BGRA8 mapping it is byte for byte the conversion
-    // the row loop above already performed into `native`. Charged apart so the
-    // duplication has a number before it is removed.
-    let _span_cache = crate::runtime::chain_phase::CostSpan::new("surface_changed_cache_us");
-    let mut cache = vec![0u8; need];
-    for y in 0..mh as usize {
-        let so = y * rgba_stride as usize;
-        let doff = y * rgba_stride as usize;
-        let src_row = &rgba[so..so + rgba_stride as usize];
-        // rgba → bgra for host cache (same as write_bgra8 source convention).
-        for x in 0..mw as usize {
-            let i = x * 4;
-            cache[doff + i] = src_row[i + 2];
-            cache[doff + i + 1] = src_row[i + 1];
-            cache[doff + i + 2] = src_row[i];
-            cache[doff + i + 3] = src_row[i + 3];
-        }
-    }
+    // Host render-cache (Linux §8.5): the frame built above, published now that
+    // the guest's pages hold it too.
     crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
     // This write just made the host copy and the guest pages agree, so it is the
     // moment the copy's currency can be pinned. Nothing else arms this mapping:

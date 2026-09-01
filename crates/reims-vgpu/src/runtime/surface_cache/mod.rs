@@ -219,6 +219,57 @@ pub fn get_shared_with_gen(
     Some((get_shared(state, surface_id, width, height)?, host_gen))
 }
 
+/// Take a frame buffer for `surface_id` at this geometry, leaving no entry
+/// behind.
+///
+/// For a writer about to produce this surface's next frame. Instead of
+/// allocating a fresh multi-megabyte `Vec` — which comes back as untouched pages
+/// and faults every one of them in, measured at 1.21 ms a flush on the sibling
+/// writer and 2 296 us a draw on this one — it reuses the buffer the previous
+/// frame is in, whenever nothing else holds that frame.
+///
+/// The returned buffer is exactly `width * height * 4` bytes and its contents
+/// are **the previous frame, or zeroes, arbitrarily**. Every byte must be
+/// written before it is published with [`store`]; that is the price of not
+/// zeroing it, and it is why this is not a `get_mut`.
+///
+/// # Why the entry goes rather than empties
+///
+/// A writer that has started producing a new frame has, from that moment, guest
+/// pages the old frame no longer describes — so the old frame must not be
+/// servable, and a writer that refuses partway leaves this cache holding
+/// nothing rather than holding a lie. That is the same rule every writer in
+/// `mapping_write` now follows, applied to the window in which one of them is
+/// running.
+///
+/// Removing loses nothing this map carries: `host_surfaces` uses `host_gen`,
+/// geometry, the bytes and `guest_holds_bytes`, all of which [`store`] sets.
+/// `backing`, `source_gva` and `last_touch` belong to the GVA and texture maps.
+pub fn take_frame_buffer(
+    state: &mut DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let need = (height as usize)
+        .saturating_mul(width as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    if let Some(entry) = state.host_surfaces.remove(&surface_id) {
+        if let Ok(mut buffer) = std::sync::Arc::try_unwrap(entry.bgra) {
+            if buffer.len() == need {
+                return buffer;
+            }
+            // Wrong geometry, so the bytes are useless — but the allocation may
+            // not be. `resize` keeps the capacity when it is large enough,
+            // which is the whole saving on a surface that changes size.
+            buffer.clear();
+            buffer.resize(need, 0);
+            return buffer;
+        }
+    }
+    vec![0u8; need]
+}
+
 /// The generation of the frame this cache would serve for `surface_id` at this
 /// geometry, without taking the frame.
 ///

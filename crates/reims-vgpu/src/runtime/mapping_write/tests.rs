@@ -2149,6 +2149,125 @@ fn rgba8_image_changed_writes_only_diff_spans() {
 /// Every writer in this file is asserted, including the ones that already
 /// published or forgot, because the value of the rule is that it has no
 /// exceptions to remember.
+/// The fast arm's premise: for a BGRA8 mapping, this writer's native row *is*
+/// the host cache's row, byte for byte.
+///
+/// `write_rgba8_image_changed` used to convert the frame twice — once per row
+/// into the mapping's native texels for the guest write, and once whole-frame
+/// into BGRA for the cache — and the second pass was 45.9 % of the Metal rail's
+/// `store_us`. It now converts once and the row loop reads the cache. That is
+/// only sound while these two produce identical bytes, so the equality is
+/// asserted directly rather than left to the reader of two loops in different
+/// parts of the file.
+///
+/// The sRGB spelling is included because it is the other format the fast arm
+/// admits, and a transfer function applied on one side and not the other would
+/// be invisible in any test that used only one of them.
+#[test]
+fn a_bgra8_native_row_is_the_host_cache_row() {
+    const W: u32 = 4;
+    let rgba: Vec<u8> = (0..W * 4)
+        .map(|i| (i as u8).wrapping_mul(7).wrapping_add(3))
+        .collect();
+    // What the cache build performs: RGBA8 in, BGRA8 out.
+    let mut cache_row = vec![0u8; (W * 4) as usize];
+    for x in 0..W as usize {
+        let i = x * 4;
+        cache_row[i] = rgba[i + 2];
+        cache_row[i + 1] = rgba[i + 1];
+        cache_row[i + 2] = rgba[i];
+        cache_row[i + 3] = rgba[i + 3];
+    }
+    for format in [
+        MTL_FORMAT_BGRA8_UNORM,
+        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
+    ] {
+        let mut native = vec![0u8; (W * 4) as usize];
+        assert!(super::rgba8_row_to_native(format, &rgba, W, &mut native));
+        assert_eq!(
+            native, cache_row,
+            "format {format:#x} takes the fast arm, so its native row must be the cache row"
+        );
+        assert_eq!(
+            crate::contract::pixel_format::tight_row_bytes(W, format),
+            Some(W * 4),
+            "the fast arm also requires the tight row to be the whole of the cache row"
+        );
+    }
+}
+
+/// A changed-span write publishes the *whole* frame to the host cache, even
+/// though it lands only the rows that differ in the guest's pages.
+///
+/// This is what `take_frame_buffer`'s contract is for. The buffer it hands back
+/// holds the previous frame, not zeroes, so a cache build that skipped a row —
+/// for instance by following the row loop's own skip — would republish that
+/// row's *old* pixels under a fresh generation. Every reader of this cache,
+/// including the Metal rail's LOAD seed and its sampled rung, would then serve
+/// them as current.
+///
+/// The fixture makes that failure visible: the second frame differs from the
+/// first in exactly one row, so a whole-frame cache and a skipping one differ in
+/// three of the four rows.
+#[test]
+fn a_changed_span_write_republishes_the_whole_frame_to_the_host_cache() {
+    const W: u32 = 4;
+    const H: u32 = 4;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let pfn = 0x12u32;
+    host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+    state.map_surface(5);
+    let m = state.mappings.get_mut(&5).unwrap();
+    m.mapped = true;
+    m.mapping_internal = 1;
+    m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    assert!(state.set_mapping_geom(5, W, H, MTL_FORMAT_BGRA8_UNORM));
+
+    let first: Vec<u8> = [0x10u8, 0x20, 0x30, 0xff].repeat((W * H) as usize);
+    assert!(write_rgba8_image_changed(
+        &mut state, &mut host, 5, &first, None, W, H
+    ));
+    assert_eq!(
+        crate::runtime::surface_cache::get(&state, 5, W, H).map(|f| f[..4].to_vec()),
+        // RGBA 10/20/30 stored as BGRA.
+        Some(vec![0x30, 0x20, 0x10, 0xff])
+    );
+
+    // The second frame differs from the first in row 2 only, and is handed the
+    // first as its seed — so the guest write lands one row and the cache must
+    // still carry four.
+    let mut second = first.clone();
+    let row = (W * 4) as usize;
+    second[2 * row..3 * row].copy_from_slice(&[0x77u8, 0x88, 0x99, 0xff].repeat(W as usize));
+    assert!(write_rgba8_image_changed(
+        &mut state,
+        &mut host,
+        5,
+        &second,
+        Some(&first),
+        W,
+        H
+    ));
+
+    let published = crate::runtime::surface_cache::get(&state, 5, W, H)
+        .expect("a successful write publishes its frame")
+        .to_vec();
+    let mut expect = vec![0u8; second.len()];
+    for x in 0..(W * H) as usize {
+        let i = x * 4;
+        expect[i] = second[i + 2];
+        expect[i + 1] = second[i + 1];
+        expect[i + 2] = second[i];
+        expect[i + 3] = second[i + 3];
+    }
+    assert_eq!(
+        published, expect,
+        "the cache carries the whole frame, not only the rows the guest write touched"
+    );
+}
+
 #[test]
 fn no_writer_of_a_mappings_pages_leaves_a_host_copy_claiming_to_be_them() {
     const W: u32 = 4;
