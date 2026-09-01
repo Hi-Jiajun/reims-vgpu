@@ -419,6 +419,19 @@ impl SessionModel {
             });
         }
 
+        // Shape before content, and before anything is charged: a domain no
+        // channel definition opened is an envelope fact like the generation and
+        // the payload class above it. It used to be checked *after* the
+        // pipeline leases below, which took — and charged the census for —
+        // leases for a packet that was then refused, so the number that says
+        // whether compilation starts early enough grew with refused packets.
+        if !self.open_channels.contains(&packet.domain) {
+            self.refusals += 1;
+            return Err(Refusal::ChannelNotOpen {
+                channel: packet.domain,
+            });
+        }
+
         // The waits are the table's answer about this payload's own leases, not
         // a list the caller brought. A caller that could state them could state
         // ones the payload does not lease — parking the transaction for a
@@ -440,13 +453,6 @@ impl SessionModel {
                 return Err(Refusal::PipelineUnusable(refusal));
             }
         };
-
-        if !self.open_channels.contains(&packet.domain) {
-            self.refusals += 1;
-            return Err(Refusal::ChannelNotOpen {
-                channel: packet.domain,
-            });
-        }
 
         let ingress = self.next_ingress;
         self.next_ingress = ingress.next();
@@ -771,6 +777,72 @@ mod tests {
             completion: None,
             payload: empty_payload(Channel::Child, opcode),
         }
+    }
+
+    /// **A refused admission takes nothing.**
+    ///
+    /// `admit` promises that nothing is mutated on a refusal, and the pipeline
+    /// leases were the exception: they were taken before the channel-open check
+    /// below them, so a packet naming a domain no channel definition opened
+    /// charged the census for leases the transaction never held. That number is
+    /// what says whether starting compilation at declaration is early enough,
+    /// and one that grows with refused packets cannot answer it.
+    #[test]
+    fn a_refused_admission_takes_no_pipeline_lease() {
+        let mut s = SessionModel::new(SessionId(1));
+        s.open_channel(ChannelId(2)).expect("fresh");
+        let pipe = ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration(1),
+        };
+        s.pipelines().declare(pipe, SessionGeneration::FIRST);
+        let before = s.pipelines().census();
+
+        // A domain no definition opened.
+        let mut closed = packet(0x37);
+        closed.domain = ChannelId(7);
+        if let Payload::Exec(work) = &mut closed.payload {
+            work.pipeline_leases.push(pipe);
+        }
+        assert_eq!(
+            s.admit(&closed),
+            Err(Refusal::ChannelNotOpen {
+                channel: ChannelId(7)
+            })
+        );
+        assert_eq!(s.pipelines().census(), before, "a refusal took a lease");
+
+        // And a lease list that refuses part way charges nothing for the part
+        // ahead of the refusal.
+        let absent = ResourceId {
+            slot: ObjectListRef(10),
+            generation: SlotGeneration(1),
+        };
+        let mut partial = packet(0x37);
+        if let Payload::Exec(work) = &mut partial.payload {
+            work.pipeline_leases.push(pipe);
+            work.pipeline_leases.push(absent);
+        }
+        assert!(matches!(
+            s.admit(&partial),
+            Err(Refusal::PipelineUnusable(_))
+        ));
+        assert_eq!(
+            s.pipelines().census(),
+            before,
+            "the pipelines ahead of the refused one were charged"
+        );
+
+        // The lease the admitted packet does hold is counted.
+        let mut good = packet(0x37);
+        if let Payload::Exec(work) = &mut good.payload {
+            work.pipeline_leases.push(pipe);
+        }
+        s.admit(&good).expect("open domain, declared pipeline");
+        assert_eq!(
+            s.pipelines().census().leases_pending,
+            before.leases_pending + 1
+        );
     }
 
     /// An access naming no memory: the vocabulary for a target that could not

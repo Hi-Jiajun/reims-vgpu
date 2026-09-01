@@ -355,6 +355,20 @@ impl PipelineTable {
     /// declared in a closed generation is absent to work from a later one even
     /// though the object is intact.
     pub fn lease(&mut self, id: ResourceId, generation: SessionGeneration) -> Lease {
+        let lease = self.peek(id, generation);
+        self.charge(lease);
+        lease
+    }
+
+    /// What a lease would answer, without charging the census for it.
+    ///
+    /// The census counts leases *taken*, and a lease is taken only if the
+    /// transaction that wanted it is admitted. [`Self::waits_for`] therefore
+    /// asks this for every pipeline first and charges only once it knows it is
+    /// returning `Ok` — otherwise a list whose third pipeline is refused
+    /// charges two leases for a transaction that never ran, and the number that
+    /// says whether compilation starts early enough grows with refusals.
+    fn peek(&self, id: ResourceId, generation: SessionGeneration) -> Lease {
         let Some(p) = self.pipelines.get(&id) else {
             return Lease::Absent;
         };
@@ -362,18 +376,23 @@ impl PipelineTable {
             return Lease::Absent;
         }
         match p.state {
-            PipelineState::Ready => {
-                self.census.leases_ready += 1;
-                Lease::Ready
-            }
+            PipelineState::Ready => Lease::Ready,
             PipelineState::Refused => {
                 Lease::Refused(p.refusal.expect("a refused pipeline carries its reason"))
             }
             PipelineState::Declared | PipelineState::Translating | PipelineState::Compiling => {
-                self.census.leases_pending += 1;
                 Lease::Pending
             }
             PipelineState::Retired => Lease::Absent,
+        }
+    }
+
+    /// Charge the census for a lease that was actually taken.
+    const fn charge(&mut self, lease: Lease) {
+        match lease {
+            Lease::Ready => self.census.leases_ready += 1,
+            Lease::Pending => self.census.leases_pending += 1,
+            Lease::Refused(_) | Lease::Absent => {}
         }
     }
 
@@ -407,14 +426,22 @@ impl PipelineTable {
         leases: &[ResourceId],
         generation: SessionGeneration,
     ) -> Result<Vec<ResourceId>, LeaseRefusal> {
+        let mut taken = Vec::new();
         let mut waits = Vec::new();
         for &pipeline in leases {
-            match self.lease(pipeline, generation) {
-                Lease::Ready => {}
-                Lease::Pending => waits.push(pipeline),
+            match self.peek(pipeline, generation) {
+                Lease::Ready => taken.push(Lease::Ready),
+                Lease::Pending => {
+                    taken.push(Lease::Pending);
+                    waits.push(pipeline);
+                }
                 Lease::Refused(reason) => return Err(LeaseRefusal::Refused { pipeline, reason }),
                 Lease::Absent => return Err(LeaseRefusal::Absent { pipeline }),
             }
+        }
+        // Decided in full first: nothing is charged for a list that refuses.
+        for lease in taken {
+            self.charge(lease);
         }
         Ok(waits)
     }
@@ -554,10 +581,17 @@ mod tests {
         );
     }
 
-    /// The first unusable pipeline ends the answer, and the leases taken before
-    /// it stay counted.
+    /// **The first unusable pipeline ends the answer, and nothing is counted.**
+    ///
+    /// This used to charge the pipelines ahead of the refused one, on the
+    /// reading that the walk had already leased them. It had not: a
+    /// `waits_for` that refuses refuses the whole list, its caller refuses the
+    /// packet, and no transaction ever holds any of them. `leases_pending` is
+    /// the number that says whether starting compilation at declaration is
+    /// early enough, and a lease charged for work that never ran cannot be part
+    /// of that answer.
     #[test]
-    fn an_unusable_pipeline_stops_the_walk_and_what_happened_stays_counted() {
+    fn an_unusable_pipeline_stops_the_walk_and_nothing_is_counted() {
         let mut t = PipelineTable::new();
         for slot in [1, 2, 3] {
             t.declare(id(slot), GEN);
@@ -569,9 +603,12 @@ mod tests {
         ));
         assert_eq!(
             t.census().leases_pending,
-            1,
-            "the pipeline before it was leased; the one after it was not"
+            0,
+            "no transaction held any of them"
         );
+        // The same list without the refusal charges every one of them.
+        assert_eq!(t.waits_for(&[id(1), id(3)], GEN), Ok(vec![id(1), id(3)]));
+        assert_eq!(t.census().leases_pending, 2);
     }
 
     /// Skipping a step is not a shortcut. A pipeline that reached `Ready`
