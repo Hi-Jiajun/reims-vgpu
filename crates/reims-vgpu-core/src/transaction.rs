@@ -26,6 +26,10 @@
 //! the closure ledger: every packet class the ledger has judged maps to exactly
 //! one payload, and every class it has *not* judged maps to none.
 
+use crate::access::AccessIntent;
+use crate::identity::{
+    ChannelId, ChannelSequence, CompletionStamp, IngressOrdinal, SessionGeneration, StampWait,
+};
 use reims_vgpu_protocol::closure::Closure;
 use reims_vgpu_protocol::packets::{find, Channel};
 
@@ -132,6 +136,41 @@ pub fn is_acknowledged_noop(channel: Channel, opcode: u16) -> bool {
         find(channel, opcode).map(|p| p.closure),
         Some(Closure::ProvenNoOp { .. })
     )
+}
+
+/// One accepted packet, with everything the model needs and nothing a host
+/// would.
+///
+/// The envelope is identical for an EXEC, a resource delete and a present.
+/// That is the point: ordering, prerequisites and publication are owed to all
+/// three equally, and the architecture this replaces gave each of them its own
+/// partial mechanism. What differs between them is [`Self::payload`] and
+/// [`Self::accesses`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceTransaction {
+    /// The semantic lifetime this was accepted in. A reset opens a new one and
+    /// does not invalidate this.
+    pub session: SessionGeneration,
+    /// The submission ordering domain.
+    pub channel: ChannelId,
+    /// Position within that domain.
+    pub channel_sequence: ChannelSequence,
+    /// Position in the device's single arrival order. Assigned once and never
+    /// re-derived; see [`crate::depend`] for what that buys.
+    pub ingress: IngressOrdinal,
+    /// Points that must be published before this may begin. Decoded at ingress
+    /// and before any packet side effect, because a packet that acted and then
+    /// discovered it had to wait has already happened.
+    pub stamp_waits: Vec<StampWait>,
+    /// What this publishes when its work has completed, if it publishes
+    /// anything.
+    pub completion: Option<CompletionStamp>,
+    pub payload: PayloadClass,
+    /// Everything this transaction touches, at the precision the contract
+    /// supplied. Empty is a claim — that the transaction touches no resource —
+    /// and not an absence of information; imprecision is
+    /// [`crate::access::AccessKey::DomainOnly`].
+    pub accesses: Vec<AccessIntent>,
 }
 
 #[cfg(test)]
