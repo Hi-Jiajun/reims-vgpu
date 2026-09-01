@@ -23,6 +23,7 @@
 //! is a failure nobody can act on.
 
 pub mod blit;
+pub mod compute;
 pub mod resource_state;
 pub mod sync;
 
@@ -67,6 +68,21 @@ pub enum DecodeRefusal {
         opcode: u32,
         have: usize,
     },
+    /// A field's value names nothing the API defines.
+    ///
+    /// The guest wrote an ordinal outside the enumeration the field carries.
+    /// Refused here rather than carried on, because the whole reason a record
+    /// becomes a typed value at this layer is that everything above it can stop
+    /// asking whether the value means anything — and because the alternative,
+    /// folding an unknown ordinal onto its nearest neighbour, reports a
+    /// decision the guest did not make.
+    UndefinedOrdinal {
+        rail: Rail,
+        opcode: u32,
+        /// The record's own name for the field, so the report says which.
+        field: &'static str,
+        value: u32,
+    },
     /// A counted array does not fit the record that declares it.
     ///
     /// The count is the guest's, so this is an ordinary hostile-input case and
@@ -91,6 +107,7 @@ impl DecodeRefusal {
             Self::Unjudged { .. } => "decode_opcode_unjudged",
             Self::RefusedByContract { .. } => "decode_opcode_refused_by_contract",
             Self::UnexpectedPayload { .. } => "decode_record_has_payload_and_takes_none",
+            Self::UndefinedOrdinal { .. } => "decode_field_ordinal_undefined",
             Self::CountOverruns { .. } => "decode_count_overruns_record",
         }
     }
@@ -103,6 +120,7 @@ impl DecodeRefusal {
             | Self::Unjudged { rail, .. }
             | Self::RefusedByContract { rail, .. }
             | Self::UnexpectedPayload { rail, .. }
+            | Self::UndefinedOrdinal { rail, .. }
             | Self::CountOverruns { rail, .. } => rail,
         }
     }
@@ -115,6 +133,7 @@ impl DecodeRefusal {
             | Self::Unjudged { opcode, .. }
             | Self::RefusedByContract { opcode, .. }
             | Self::UnexpectedPayload { opcode, .. }
+            | Self::UndefinedOrdinal { opcode, .. }
             | Self::CountOverruns { opcode, .. } => opcode,
         }
     }
@@ -187,6 +206,12 @@ mod tests {
                 rail: Rail::Blit,
                 opcode: 1,
                 have: 4,
+            },
+            DecodeRefusal::UndefinedOrdinal {
+                rail: Rail::Blit,
+                opcode: 1,
+                field: "field",
+                value: 9,
             },
             DecodeRefusal::CountOverruns {
                 rail: Rail::Blit,

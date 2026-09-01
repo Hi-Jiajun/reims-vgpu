@@ -762,10 +762,16 @@ unsafe impl Wire for BindHeader {}
 /// `render_set_fragment_sampler` (the stub sampler's 6363). The two families
 /// differ only in opcode, which is also how the stage is decided — no wire
 /// field names it.
-/// Comparable, unlike most bodies here: a caller that borrows a counted array
-/// of these out of one record and compares it with another's is comparing what
-/// the guest wrote, and there is nothing in a single `le` scalar for equality
-/// to get wrong.
+/// # Why the bind entry types are comparable
+///
+/// [`RefBind`], [`BufferBind`], [`BufferStrideBind`] and
+/// [`crate::ops::compute::SamplerLodBind`] derive equality where most bodies
+/// here do not. They are the types a caller borrows a *counted array* of, and
+/// comparing two such windows is comparing what the guest wrote — there is
+/// nothing in a run of `le` scalars for equality to get wrong, and the float
+/// clamps compare bitwise, which is what `le` already does. The bodies that
+/// stay incomparable are the ones with an `unidentified_` field, where equality
+/// would quietly assert something about bytes nobody has derived.
 #[repr(C)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct RefBind {
@@ -781,7 +787,7 @@ unsafe impl Wire for RefBind {}
 /// `render_set_fragment_buffers_range`, whose two entries carry `0x1111` and
 /// `0x2222` and so show the entry stride is 12 rather than 16.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct BufferBind {
     pub buffer_ref: U32le,
     pub offset: U64le,
@@ -956,7 +962,7 @@ pub const SET_BUFFER_OFFSET_STRIDE_TOTAL_LEN: u32 = 28;
 /// false claim about Apple. Driven through `withCapability` with the flag
 /// forced on, all four emit. See the crate `AGENTS.md`.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct BufferStrideBind {
     pub buffer_ref: U32le,
     pub offset: U64le,

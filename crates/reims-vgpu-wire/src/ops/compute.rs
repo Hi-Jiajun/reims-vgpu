@@ -246,7 +246,7 @@ pub const OPCODE_SET_SAMPLER_LOD: u32 = 0xcd;
 /// The clamps are 32-bit floats where every viewport depth bound in this
 /// protocol is 64-bit. Both widths are carried and they are not interchangeable.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SamplerLodBind {
     pub sampler_ref: U32le,
     pub lod_min_clamp: F32le,
