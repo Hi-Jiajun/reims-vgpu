@@ -389,6 +389,7 @@ enum Colour {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::StubRegistry;
     use crate::exec::ExecBuilder;
     use crate::identity::{
         ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SessionGeneration,
@@ -426,11 +427,14 @@ mod tests {
             b.begin_segment(SegmentKind::Event.wire_type(), false)
                 .expect("segment opens");
             for &(event, value) in signals {
-                b.record(ResolvedOperation::Event(EventOp {
-                    kind: EventKind::Signal,
-                    event: res(event),
-                    value,
-                }))
+                b.record(
+                    ResolvedOperation::Event(EventOp {
+                        kind: EventKind::Signal,
+                        event: res(event),
+                        value,
+                    }),
+                    &mut StubRegistry(ChannelId(1)),
+                )
                 .expect("a signal records");
             }
             b.end_segment().expect("segment closes");

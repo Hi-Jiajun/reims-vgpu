@@ -38,8 +38,10 @@
 
 #![cfg(wire_fixtures)]
 
+use reims_vgpu_core::access::{BackingId, ByteRange};
 use reims_vgpu_core::exec::{ExecArenas, ResolvedOperation};
-use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
+use reims_vgpu_core::identity::{ChannelId, ObjectListRef, ResourceId, SlotGeneration, TaskId};
+use reims_vgpu_core::lifecycle::{Lifecycle, LifecycleOp, Storage};
 use reims_vgpu_core::resolve::{operation, RefResolver, ResolveRefusal};
 use reims_vgpu_protocol::closure::{Rail, LEDGER};
 use reims_vgpu_protocol::decode::{op, DecodeRefusal};
@@ -392,12 +394,12 @@ fn signature(verdict: Verdict) -> String {
 #[test]
 fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written() {
     use reims_vgpu_core::exec::ExecBuilder;
-    use reims_vgpu_core::identity::{
-        ChannelId, ChannelSequence, IngressOrdinal, SessionGeneration,
-    };
+    use reims_vgpu_core::identity::{ChannelSequence, IngressOrdinal, SessionGeneration};
     use reims_vgpu_protocol::segment::SegmentKind;
 
     let mut placed = 0usize;
+    let mut accesses = 0usize;
+    let mut with_accesses = 0usize;
     let mut misplaced = Vec::new();
     let mut per_rail: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
 
@@ -408,25 +410,33 @@ fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written()
         if !is_stream_rail(rail) {
             continue;
         }
-        let Verdict::Resolved(op) = read(rail, &bytes) else {
-            continue;
-        };
+        let Ok(view) = op(&bytes, 0) else { continue };
         // Every stream rail has a segment kind — `of_rail` answers `None` only
         // for the root, which `is_stream_rail` already excluded.
         let kind = SegmentKind::of_rail(rail).expect("a stream rail names a segment");
 
         let mut builder = ExecBuilder::new(
             SessionGeneration::FIRST,
-            ChannelId(0),
+            DOMAIN,
             ChannelSequence(placed as u64),
             IngressOrdinal(placed as u64),
         );
+        // The builder's own arenas, because a pass descriptor filed during
+        // resolution is the one `ResolvedOperation::participations` reads back.
+        let resolver = Recording::new();
+        let Ok(op) = operation(rail, &view, &resolver, builder.arenas_mut()) else {
+            continue;
+        };
+        // A registry holding every name this record resolved, so the accesses
+        // it declares are placed by the owner that owns names, heaps and
+        // content rather than by a stub.
+        let mut model = registry_holding(&resolver.seen());
         let mut place = || -> Result<(), String> {
             builder
                 .begin_segment(kind.wire_type(), false)
                 .map_err(|r| format!("begin: {}", r.reason()))?;
             builder
-                .record(op)
+                .record(op, &mut model.task_access(TASK, DOMAIN))
                 .map_err(|r| format!("record: {}", r.reason()))?;
             builder
                 .end_segment()
@@ -443,6 +453,20 @@ fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written()
                     1,
                     "{name}: the record was accepted and then not carried"
                 );
+                // Every access the transaction carries came from this
+                // record's own participation, so the two cannot disagree —
+                // which they could for as long as the accesses were declared
+                // beside the record instead of derived from it.
+                for access in &tx.accesses {
+                    assert_eq!(
+                        access.domain, DOMAIN,
+                        "{name}: an access landed in another submission domain"
+                    );
+                }
+                accesses += tx.accesses.len();
+                if !tx.accesses.is_empty() {
+                    with_accesses += 1;
+                }
                 placed += 1;
                 *per_rail.entry(format!("{rail:?}")).or_default() += 1;
             }
@@ -453,12 +477,76 @@ fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written()
     for (rail, count) in &per_rail {
         println!("placed: {rail} x{count}");
     }
+    println!("transactions carrying accesses: {with_accesses}, accesses: {accesses}");
     assert!(
         misplaced.is_empty(),
         "records the serializer produced could not be placed in the encoder that wrote them:\n  {}",
         misplaced.join("\n  ")
     );
     assert!(placed > 0, "no fixture reached a transaction at all");
+    assert!(
+        with_accesses > 0,
+        "no record's participation became an access; the derivation reached nothing"
+    );
+}
+
+/// The task and submission domain every fixture transaction is admitted into.
+const TASK: TaskId = TaskId(1);
+const DOMAIN: ChannelId = ChannelId(0);
+
+/// A lifecycle owner with a dedicated resource in every slot `seen` names.
+///
+/// Dedicated rather than heap-placed, because a fixture's refs are the oracle
+/// stub's and nothing in a capture says which of them share storage. The extent
+/// is generous for the same reason: the stub's offsets are its own, and a
+/// window that left the resource would report this test's setup as a model
+/// refusal.
+fn registry_holding(seen: &std::collections::BTreeSet<u32>) -> Lifecycle {
+    let mut model = Lifecycle::new();
+    // The effects are the caller's obligation and there are none here: a task
+    // definition owes no transfer and frees no storage.
+    let _ = model
+        .apply(&LifecycleOp::DefineTask { task: TASK })
+        .expect("a fresh task");
+    for slot in seen {
+        let _ = model
+            .apply(&LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(*slot),
+                storage: Storage::Dedicated {
+                    backing: BackingId(u64::from(*slot)),
+                    extent: ByteRange {
+                        offset: 0,
+                        length: 1 << 40,
+                    },
+                },
+            })
+            .expect("a free slot");
+    }
+    model
+}
+
+/// [`Everything`], with a note of every ref it answered.
+struct Recording(std::cell::RefCell<std::collections::BTreeSet<u32>>);
+
+impl Recording {
+    fn new() -> Self {
+        Self(std::cell::RefCell::new(std::collections::BTreeSet::new()))
+    }
+
+    fn seen(&self) -> std::collections::BTreeSet<u32> {
+        self.0.borrow().clone()
+    }
+}
+
+impl RefResolver for Recording {
+    fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+        self.0.borrow_mut().insert(object_ref);
+        Some(ResourceId {
+            slot: ObjectListRef(object_ref),
+            generation: SlotGeneration(1),
+        })
+    }
 }
 
 /// A record cannot participate in a resource it never named.
@@ -482,22 +570,6 @@ fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written()
 /// everything would satisfy the subset rule perfectly.
 #[test]
 fn a_record_never_participates_in_a_resource_it_did_not_name() {
-    use std::cell::RefCell;
-    use std::collections::BTreeSet;
-
-    /// [`Everything`], with a note of every ref it answered.
-    struct Recording(RefCell<BTreeSet<u32>>);
-
-    impl RefResolver for Recording {
-        fn resource(&self, object_ref: u32) -> Option<ResourceId> {
-            self.0.borrow_mut().insert(object_ref);
-            Some(ResourceId {
-                slot: ObjectListRef(object_ref),
-                generation: SlotGeneration(1),
-            })
-        }
-    }
-
     let mut fabricated = Vec::new();
     let mut naming = 0usize;
     let mut participations_total = 0usize;
@@ -512,12 +584,12 @@ fn a_record_never_participates_in_a_resource_it_did_not_name() {
             continue;
         }
         let Ok(view) = op(&bytes, 0) else { continue };
-        let resolver = Recording(RefCell::new(BTreeSet::new()));
+        let resolver = Recording::new();
         let mut arenas = ExecArenas::default();
         let Ok(resolved) = operation(rail, &view, &resolver, &mut arenas) else {
             continue;
         };
-        let asked = resolver.0.into_inner();
+        let asked = resolver.seen();
 
         let mut parts = Vec::new();
         resolved.participations(&arenas, &mut parts);

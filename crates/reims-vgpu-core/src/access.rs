@@ -511,6 +511,81 @@ impl Participation {
     }
 }
 
+/// What turns a record's own participation claim into the access a scheduler
+/// can order.
+///
+/// The step [`Participation`]'s doc names, given an owner. A record names a
+/// *ref* and a region; an access names a backing, a heap membership, the
+/// region in that backing's coordinates and the content versions it consumes
+/// and produces. Every one of those comes from a registry this module cannot
+/// see, and there is exactly one implementation that has them all —
+/// [`crate::lifecycle::Lifecycle`], which owns the names, the heaps and the
+/// content authority together.
+///
+/// It is a trait rather than a concrete parameter so that
+/// [`crate::exec::ExecBuilder`] can require one without depending on the
+/// lifecycle owner, and so a model test can state the accesses it means to
+/// exercise. There is a blanket implementation for any `FnMut` of the same
+/// shape, which is what a test uses; a closure is not a second semantic model,
+/// it is the same model with the registry stubbed.
+pub trait AccessSource {
+    /// The access this participation is.
+    ///
+    /// # Errors
+    ///
+    /// Where the name no longer resolves or the window leaves the resource.
+    /// Both refuse the whole transaction rather than dropping the access: an
+    /// operation missing from the access list is a hazard edge that does not
+    /// get built.
+    fn access(&mut self, participation: &Participation) -> Result<AccessIntent, AccessRefusal>;
+}
+
+impl<F> AccessSource for F
+where
+    F: FnMut(&Participation) -> Result<AccessIntent, AccessRefusal>,
+{
+    fn access(&mut self, participation: &Participation) -> Result<AccessIntent, AccessRefusal> {
+        self(participation)
+    }
+}
+
+/// Why a participation could not become an access.
+///
+/// Carries the owner's own reason string rather than re-encoding it: every
+/// refusal in this crate is greppable by the slug of the check that produced
+/// it, and a second enum here would give the same failure two names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccessRefusal {
+    pub resource: ResourceId,
+    pub reason: &'static str,
+}
+
+/// A stub registry for the in-crate tests whose subject is the stream rather
+/// than the resolution.
+///
+/// Every name places onto a backing named after its slot, with no heap and no
+/// content versions, so a test about encoder admission or scheduling does not
+/// have to stand up a [`crate::lifecycle::Lifecycle`] to say what a record
+/// touched. Not reachable outside the test build: a production caller that
+/// wanted this would be one inventing a backing.
+#[cfg(test)]
+pub(crate) struct StubRegistry(pub ChannelId);
+
+#[cfg(test)]
+impl AccessSource for StubRegistry {
+    fn access(&mut self, participation: &Participation) -> Result<AccessIntent, AccessRefusal> {
+        Ok(participation.resolve(
+            self.0,
+            ResourceKey {
+                backing: BackingId(u64::from(participation.resource.slot.0)),
+                heap: None,
+            },
+            None,
+            None,
+        ))
+    }
+}
+
 /// Whether an earlier access and a later one require an ordering edge.
 ///
 /// Read against read is the only free pair, and only when both directions are

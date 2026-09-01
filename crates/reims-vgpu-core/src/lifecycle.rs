@@ -51,10 +51,13 @@
 //! refuses whole. A caller that saw a refusal after three of five resources had
 //! been invalidated would have no way to describe the state it was left in.
 
-use crate::access::{BackingId, ByteRange};
+use crate::access::{
+    AccessIntent, AccessRefusal, AccessSource, BackingId, ByteRange, Participation,
+    ParticipationExtent, ResourceKey,
+};
 use crate::content::{ContentLedger, Replica, Transfer};
 use crate::heap::{self, HeapPlacement, Heaps, Retirement};
-use crate::identity::{ObjectListRef, ResourceId, TaskId};
+use crate::identity::{ChannelId, ObjectListRef, ResourceId, TaskId};
 use crate::namespace::{self, Namespace, Teardown};
 use crate::transaction::{classify, PayloadClass};
 use reims_vgpu_protocol::packets::Channel;
@@ -316,6 +319,29 @@ impl Refusal {
     }
 }
 
+/// One task's records, in one submission domain, as an [`AccessSource`].
+///
+/// A borrow of the owner rather than a copy of anything out of it: the content
+/// authority reserves versions while the transaction is being built, so a
+/// source that held a snapshot would hand two records of one packet the same
+/// reservation.
+pub struct TaskAccess<'a> {
+    lifecycle: &'a mut Lifecycle,
+    task: TaskId,
+    domain: ChannelId,
+}
+
+impl AccessSource for TaskAccess<'_> {
+    fn access(&mut self, participation: &Participation) -> Result<AccessIntent, AccessRefusal> {
+        self.lifecycle
+            .access(self.task, self.domain, participation)
+            .map_err(|refusal| AccessRefusal {
+                resource: participation.resource,
+                reason: refusal.slug(),
+            })
+    }
+}
+
 /// Where a live resource's bytes are, derived once at creation.
 #[derive(Clone, Copy, Debug)]
 enum Resident {
@@ -449,6 +475,133 @@ impl Lifecycle {
             },
             Resident::extent,
         ))
+    }
+
+    /// This owner as an [`AccessSource`] for one task's records, in one
+    /// submission domain.
+    ///
+    /// Both are properties of the *packet* and not of any one participation,
+    /// which is why they are bound here rather than passed to
+    /// [`Self::access`] by a caller that would have to repeat them per record.
+    pub fn task_access(&mut self, task: TaskId, domain: ChannelId) -> TaskAccess<'_> {
+        TaskAccess {
+            lifecycle: self,
+            task,
+            domain,
+        }
+    }
+
+    /// Place one participation: which backing it names, where in that
+    /// backing's coordinates, and which content versions it consumes and
+    /// produces.
+    ///
+    /// The single step from what a record said to what a scheduler can order,
+    /// and it is here because this is the only owner that holds all three
+    /// registries at once — the task's names, its heaps, and the session's
+    /// content authority. Anywhere else it would be three lookups a caller
+    /// could get out of step with each other.
+    ///
+    /// # The extent is translated, and a heap placement is not widened
+    ///
+    /// A record names a window of a *resource*; the dependency graph compares
+    /// windows of a *backing*. For a resource with its own pages those are the
+    /// same coordinates; for one placed in a heap they are not, and the single
+    /// checked conversion is [`crate::heap::HeapPlacement::within`].
+    ///
+    /// A whole-resource participation is therefore two different keys. A
+    /// dedicated resource *is* its backing, so it stays
+    /// [`crate::access::AccessKey::Whole`] — the record named no range and the
+    /// precision census should keep saying so. A placed resource is a window of
+    /// a heap someone else's resource also sits in, so "the whole resource" is
+    /// an exact range and naming the whole backing would alias every
+    /// neighbour into it. The model knows that window exactly; claiming less
+    /// would buy ordering the record never asked for.
+    ///
+    /// A subresource is not translated. Relating image coordinates to bytes
+    /// needs a layout, which is an executor's — so it travels as the record
+    /// wrote it and `may_alias` compares it against the backing.
+    ///
+    /// # Versions
+    ///
+    /// The input version is what is current over the memory named, and it is
+    /// `None` where nothing has written it. A write reserves the next version
+    /// now and commits it at completion, which is the reservation rule
+    /// [`crate::coverage`] states: a reader planned against it waits for the
+    /// work rather than for the plan.
+    ///
+    /// # Errors
+    ///
+    /// If the task or the name does not resolve, or the window leaves the
+    /// resource. Nothing is reserved on a refusal.
+    pub fn access(
+        &mut self,
+        task: TaskId,
+        domain: ChannelId,
+        participation: &Participation,
+    ) -> Result<AccessIntent, Refusal> {
+        let t = self
+            .tasks
+            .get_mut(&task)
+            .ok_or(Refusal::NoSuchTask { task })?;
+        t.namespace
+            .resolve(participation.resource)
+            .map_err(|refusal| Refusal::Namespace { task, refusal })?;
+        let resident = *t
+            .resident
+            .get(&participation.resource)
+            .ok_or(Refusal::Namespace {
+                task,
+                refusal: namespace::Refusal::NotDeclared {
+                    slot: participation.resource.slot,
+                },
+            })?;
+        let key = ResourceKey {
+            backing: resident.backing(),
+            heap: match resident {
+                // The membership generation the participation is recorded
+                // against, so a `useHeap` written before a neighbour arrived
+                // still meets the resource that never moved — see
+                // `HeapId::same_heap`.
+                Resident::Placed(p) => t
+                    .heaps
+                    .membership(p.heap)
+                    .map_err(|refusal| Refusal::Heap { task, refusal })
+                    .map(Some)?,
+                Resident::Dedicated { .. } => None,
+            },
+        };
+        let extent = match participation.extent {
+            ParticipationExtent::Range(range) => ParticipationExtent::Range(
+                resident
+                    .window(range.offset, range.length)
+                    .map_err(|refusal| Refusal::Heap { task, refusal })?,
+            ),
+            ParticipationExtent::Subresource(range) => ParticipationExtent::Subresource(range),
+            ParticipationExtent::Whole => match resident {
+                Resident::Dedicated { .. } => ParticipationExtent::Whole,
+                Resident::Placed(p) => ParticipationExtent::Range(p.region),
+            },
+        };
+        let bytes = match extent {
+            ParticipationExtent::Range(range) => Some(range),
+            // The whole of a dedicated resource is the extent it was declared
+            // with, which the content authority already knows.
+            ParticipationExtent::Whole => self.content.extent(key.backing),
+            ParticipationExtent::Subresource(_) => None,
+        };
+        let input = bytes.map_or_else(
+            || self.content.newest_version(key.backing),
+            |range| self.content.version_of(key.backing, range),
+        );
+        let output = participation
+            .mode
+            .writes()
+            .then(|| self.content.reserve(key.backing));
+        Ok(Participation {
+            extent,
+            ..*participation
+        }
+        .resolve(domain, key, input, output))
     }
 
     /// Apply one lifecycle operation.

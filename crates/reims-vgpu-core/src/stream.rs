@@ -164,6 +164,13 @@ pub enum StreamRefusal {
     ProtectionEnvelopeUnclaimed,
     /// The stream ended with an encoder still open.
     EncoderNeverEnded(SegmentKind),
+    /// A record named memory the access source could not place.
+    ///
+    /// The whole transaction refuses. A record whose participation cannot
+    /// become an access is one the scheduler cannot order, and admitting it
+    /// with the access dropped is a hazard edge that does not get built —
+    /// which is a race and not a slowdown.
+    Access(crate::access::AccessRefusal),
 }
 
 impl StreamRefusal {
@@ -178,6 +185,8 @@ impl StreamRefusal {
             Self::EndWithoutBegin => "stream_encoder_end_without_begin",
             Self::ProtectionEnvelopeUnclaimed => "stream_protection_envelope_unclaimed",
             Self::EncoderNeverEnded(_) => "stream_encoder_never_ended",
+            // The owner's own reason, not a second name for it.
+            Self::Access(refusal) => refusal.reason,
         }
     }
 }

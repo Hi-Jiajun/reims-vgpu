@@ -425,7 +425,9 @@ fn written_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::{AccessIntent, AccessMode, BackingId, ByteRange, ResourceKey};
+    use crate::access::{
+        AccessIntent, AccessMode, BackingId, ByteRange, ResourceKey, StubRegistry,
+    };
     use crate::exec::ExecBuilder;
     use crate::identity::{
         ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration, StampWait,
@@ -597,9 +599,12 @@ mod tests {
         let mut b = builder(1);
         b.begin_segment(SegmentKind::Event.wire_type(), false)
             .expect("open");
-        b.record(signal(res(4), 5)).expect("record");
-        b.record(signal(res(4), 3)).expect("record");
-        b.record(signal(res(4), 7)).expect("record");
+        b.record(signal(res(4), 5), &mut StubRegistry(ChannelId(1)))
+            .expect("record");
+        b.record(signal(res(4), 3), &mut StubRegistry(ChannelId(1)))
+            .expect("record");
+        b.record(signal(res(4), 7), &mut StubRegistry(ChannelId(1)))
+            .expect("record");
         b.end_segment().expect("end");
         let tx = b.finish().expect("frozen");
 
@@ -629,7 +634,9 @@ mod tests {
         producer
             .begin_segment(SegmentKind::Event.wire_type(), false)
             .expect("open");
-        producer.record(signal(res(4), 5)).expect("record");
+        producer
+            .record(signal(res(4), 5), &mut StubRegistry(ChannelId(1)))
+            .expect("record");
         producer.end_segment().expect("end");
         let producer = producer.finish().expect("frozen");
 
@@ -813,7 +820,8 @@ mod tests {
             let mut b = builder(1);
             b.begin_segment(SegmentKind::Event.wire_type(), false)
                 .expect("open");
-            b.record(signal(res(4), 2)).expect("record");
+            b.record(signal(res(4), 2), &mut StubRegistry(ChannelId(1)))
+                .expect("record");
             b.end_segment().expect("end");
             b.publish_stamp(CompletionStamp {
                 slot: StampSlot(1),

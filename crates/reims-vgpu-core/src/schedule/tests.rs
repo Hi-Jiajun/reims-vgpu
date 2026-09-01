@@ -6,7 +6,7 @@
 //! wrong reason, and it passes just as happily after the property breaks.
 
 use super::*;
-use crate::access::{AccessIntent, AccessKey, AccessMode, ByteRange, ResourceKey};
+use crate::access::{AccessIntent, AccessKey, AccessMode, ByteRange, ResourceKey, StubRegistry};
 use crate::exec::{ExecBuilder, ResolvedOperation};
 use crate::identity::{ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration};
 use crate::prereq::Diagnosis;
@@ -163,11 +163,14 @@ fn mixed(seed: u64, count: u64) -> Vec<ExecTransaction> {
                     .unwrap_or(0);
                 b.begin_segment(SegmentKind::Event.wire_type(), false)
                     .expect("event encoder opens");
-                b.record(ResolvedOperation::Event(EventOp {
-                    kind: EventKind::Signal,
-                    event,
-                    value: at + 1,
-                }))
+                b.record(
+                    ResolvedOperation::Event(EventOp {
+                        kind: EventKind::Signal,
+                        event,
+                        value: at + 1,
+                    }),
+                    &mut StubRegistry(ChannelId(domain)),
+                )
                 .expect("a signal records");
                 b.end_segment().expect("event encoder closes");
                 signalled.push((event, at + 1));
@@ -175,11 +178,14 @@ fn mixed(seed: u64, count: u64) -> Vec<ExecTransaction> {
             1 => {
                 b.begin_segment(SegmentKind::Blit.wire_type(), false)
                     .expect("blit encoder opens");
-                b.record(ResolvedOperation::Fence(FenceOp {
-                    kind: FenceKind::Update,
-                    fence: res(u32::try_from(rng.next() % 2).expect("small") + 30),
-                    stages: None,
-                }))
+                b.record(
+                    ResolvedOperation::Fence(FenceOp {
+                        kind: FenceKind::Update,
+                        fence: res(u32::try_from(rng.next() % 2).expect("small") + 30),
+                        stages: None,
+                    }),
+                    &mut StubRegistry(ChannelId(domain)),
+                )
                 .expect("a fence update records");
                 b.end_segment().expect("blit encoder closes");
             }
@@ -587,11 +593,14 @@ fn the_equivalence_relation_rejects_a_missing_fence_update() {
     let mut b = builder(1, 1);
     b.begin_segment(SegmentKind::Blit.wire_type(), false)
         .expect("blit encoder opens");
-    b.record(ResolvedOperation::Fence(FenceOp {
-        kind: FenceKind::Update,
-        fence: res(30),
-        stages: None,
-    }))
+    b.record(
+        ResolvedOperation::Fence(FenceOp {
+            kind: FenceKind::Update,
+            fence: res(30),
+            stages: None,
+        }),
+        &mut StubRegistry(ChannelId(1)),
+    )
     .expect("a fence update records");
     b.end_segment().expect("blit encoder closes");
     let reference = serial(&[b.finish().expect("frozen")]);
@@ -610,11 +619,14 @@ fn the_equivalence_relation_rejects_an_event_that_came_to_rest_elsewhere() {
     let mut b = builder(1, 1);
     b.begin_segment(SegmentKind::Event.wire_type(), false)
         .expect("event encoder opens");
-    b.record(ResolvedOperation::Event(EventOp {
-        kind: EventKind::Signal,
-        event: res(20),
-        value: 4,
-    }))
+    b.record(
+        ResolvedOperation::Event(EventOp {
+            kind: EventKind::Signal,
+            event: res(20),
+            value: 4,
+        }),
+        &mut StubRegistry(ChannelId(1)),
+    )
     .expect("a signal records");
     b.end_segment().expect("event encoder closes");
     let reference = serial(&[b.finish().expect("frozen")]);

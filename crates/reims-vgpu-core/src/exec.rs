@@ -30,7 +30,9 @@
 //! about: `operation::tests::every_class_has_a_payload_or_a_reason_to_be_empty`
 //! fails the moment either count moves off zero.
 
-use crate::access::{AccessIntent, AccessKey, BackingId, ContentVersion, Participation};
+use crate::access::{
+    AccessIntent, AccessKey, AccessSource, BackingId, ContentVersion, Participation,
+};
 use crate::bind::{BufferBinding, ObjectBinding};
 use crate::blit::BlitOp;
 use crate::compute::ComputeOp;
@@ -309,6 +311,9 @@ pub struct ExecBuilder {
     prerequisites: Vec<Prerequisite>,
     publication: PublicationContract,
     arenas: ExecArenas,
+    /// Scratch [`Self::record`] gathers each operation's participations into,
+    /// so the walk costs no allocation after the first record.
+    participation_scratch: Vec<Participation>,
 }
 
 impl ExecBuilder {
@@ -332,6 +337,7 @@ impl ExecBuilder {
             prerequisites: Vec::new(),
             publication: PublicationContract::default(),
             arenas: ExecArenas::default(),
+            participation_scratch: Vec::new(),
         }
     }
 
@@ -359,12 +365,65 @@ impl ExecBuilder {
         Ok(())
     }
 
-    /// Record one resolved operation inside the open encoder.
+    /// Record one resolved operation inside the open encoder, and declare
+    /// every access it names.
     ///
     /// The rail is taken from the operation's own class rather than passed
     /// alongside it, so a caller cannot hand a compute payload in under a
     /// render rail and have it accepted by the segment it is standing in.
-    pub fn record(&mut self, op: ResolvedOperation) -> Result<StreamPosition, StreamRefusal> {
+    ///
+    /// The accesses are derived here rather than declared beside the record,
+    /// and that is the point. A transaction whose `accesses` disagree with its
+    /// `streams` is representable the moment the two are supplied separately —
+    /// and the disagreement is silent, because nothing downstream reads the
+    /// records to check. Here the record *is* the declaration: the operation
+    /// states its own participation, `source` places it, and neither can be
+    /// supplied without the other.
+    ///
+    /// # Errors
+    ///
+    /// As before, plus [`StreamRefusal::Access`] where a participation cannot
+    /// be placed. The whole transaction refuses; see that variant.
+    pub fn record(
+        &mut self,
+        op: ResolvedOperation,
+        source: &mut impl AccessSource,
+    ) -> Result<StreamPosition, StreamRefusal> {
+        // Taken out and put back, so the walk costs no allocation after the
+        // first record of the first transaction. It also releases the borrow
+        // of `self` that `participations` takes on the arenas.
+        let mut parts = core::mem::take(&mut self.participation_scratch);
+        parts.clear();
+        op.participations(&self.arenas, &mut parts);
+        // Pushed straight onto the transaction's list and rolled back on any
+        // refusal, rather than gathered into a second vector: a record's
+        // accesses are at most a handful and a `Vec` per record would be an
+        // allocation per record on the hottest path this crate has.
+        let before = self.accesses.len();
+        let mut refused = None;
+        for participation in &parts {
+            match source.access(participation) {
+                Ok(access) => self.accesses.push(access),
+                Err(refusal) => {
+                    refused = Some(StreamRefusal::Access(refusal));
+                    break;
+                }
+            }
+        }
+        self.participation_scratch = parts;
+        match refused.map_or_else(|| self.place(op), Err) {
+            Ok(at) => Ok(at),
+            Err(refusal) => {
+                // Nothing half-applied: a record the cursor would not take
+                // leaves no accesses behind claiming it ran.
+                self.accesses.truncate(before);
+                Err(refusal)
+            }
+        }
+    }
+
+    /// The rail and cursor half of [`Self::record`].
+    fn place(&mut self, op: ResolvedOperation) -> Result<StreamPosition, StreamRefusal> {
         let rail = match rail_of(&op) {
             Some(rail) => rail,
             None => {
@@ -523,7 +582,7 @@ const fn class_admissible_on(class: OperationClass, kind: SegmentKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::{AccessKey, AccessMode, ResourceKey};
+    use crate::access::{AccessKey, AccessMode, ResourceKey, StubRegistry};
     use crate::identity::{ObjectListRef, SlotGeneration, StampSlot, StampValue};
     use crate::stream::ProtectionOptions;
     use crate::sync::{BarrierOp, BarrierTarget, ResourceSpan};
@@ -561,12 +620,18 @@ mod tests {
         let mut b = builder();
         b.begin_segment(SegmentKind::Blit.wire_type(), false)
             .expect("open");
-        let first = b.record(a_blit()).expect("record");
-        let second = b.record(a_blit()).expect("record");
+        let first = b
+            .record(a_blit(), &mut StubRegistry(ChannelId(1)))
+            .expect("record");
+        let second = b
+            .record(a_blit(), &mut StubRegistry(ChannelId(1)))
+            .expect("record");
         b.end_segment().expect("end");
         b.begin_segment(SegmentKind::Blit.wire_type(), false)
             .expect("open");
-        let third = b.record(a_blit()).expect("record");
+        let third = b
+            .record(a_blit(), &mut StubRegistry(ChannelId(1)))
+            .expect("record");
         b.end_segment().expect("end");
 
         let tx = b.finish().expect("frozen");
@@ -584,15 +649,19 @@ mod tests {
     #[test]
     fn the_stream_rules_are_the_cursors_and_are_not_restated() {
         let mut b = builder();
-        assert_eq!(b.record(a_blit()), Err(StreamRefusal::RecordOutsideEncoder));
+        assert_eq!(
+            b.record(a_blit(), &mut StubRegistry(ChannelId(1))),
+            Err(StreamRefusal::RecordOutsideEncoder)
+        );
 
         let mut b = builder();
         b.begin_segment(SegmentKind::Blit.wire_type(), false)
             .expect("open");
         assert_eq!(
-            b.record(ResolvedOperation::Render(RenderOp::SetPipeline {
-                pipeline: res(1)
-            })),
+            b.record(
+                ResolvedOperation::Render(RenderOp::SetPipeline { pipeline: res(1) }),
+                &mut StubRegistry(ChannelId(1))
+            ),
             Err(StreamRefusal::RailMismatch {
                 segment: SegmentKind::Blit,
                 record: reims_vgpu_protocol::closure::Rail::Render,
@@ -617,7 +686,8 @@ mod tests {
         for kind in [SegmentKind::Render, SegmentKind::Compute] {
             let mut b = builder();
             b.begin_segment(kind.wire_type(), false).expect("open");
-            b.record(a_barrier()).expect("a barrier exists on both");
+            b.record(a_barrier(), &mut StubRegistry(ChannelId(1)))
+                .expect("a barrier exists on both");
             b.end_segment().expect("end");
             assert_eq!(b.finish().expect("frozen").record_count(), 1);
         }
@@ -625,7 +695,7 @@ mod tests {
             let mut b = builder();
             b.begin_segment(kind.wire_type(), false).expect("open");
             assert_eq!(
-                b.record(a_barrier()),
+                b.record(a_barrier(), &mut StubRegistry(ChannelId(1))),
                 Err(StreamRefusal::RailMismatch {
                     segment: kind,
                     record: kind.rail(),
