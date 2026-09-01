@@ -458,6 +458,12 @@ unsafe fn judge(
         features = features.push_next(&mut dynamic_rendering);
     }
     unsafe { instance.get_physical_device_features2(physical, &mut features) };
+    // `VkPhysicalDeviceFeatures2::features` is the 1.0 boolean block, filled
+    // by the same call. Copied out here rather than read from a second
+    // `vkGetPhysicalDeviceFeatures`, so the whole capability answer comes from
+    // one query — and copied before the chain's borrows are released, which is
+    // the only order that reads it at all.
+    let core_features = features.features;
 
     let mut push = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
     if has(extension::PUSH_DESCRIPTOR) {
@@ -486,6 +492,8 @@ unsafe fn judge(
         timeline_semaphore: vulkan12.timeline_semaphore == vk::TRUE,
         synchronization2: synchronization2.synchronization2 == vk::TRUE,
         dynamic_rendering: dynamic_rendering.dynamic_rendering == vk::TRUE,
+        depth_clamp: core_features.depth_clamp == vk::TRUE,
+        fill_mode_non_solid: core_features.fill_mode_non_solid == vk::TRUE,
         mesh_shader: mesh.mesh_shader == vk::TRUE,
         descriptor_buffer: descriptor_buffer.descriptor_buffer == vk::TRUE,
         max_push_descriptors: push.max_push_descriptors,
@@ -519,6 +527,8 @@ mod tests {
             timeline_semaphore: true,
             synchronization2: false,
             dynamic_rendering: false,
+            depth_clamp: false,
+            fill_mode_non_solid: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,
@@ -738,6 +748,8 @@ mod tests {
             timeline_semaphore: true,
             synchronization2: false,
             dynamic_rendering: false,
+            depth_clamp: false,
+            fill_mode_non_solid: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,

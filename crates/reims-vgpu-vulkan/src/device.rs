@@ -57,9 +57,30 @@ pub struct Enabled {
     /// Always true. It is the support floor, and a device that lacked it never
     /// became a census.
     pub timeline_semaphore: bool,
+    /// The capability is on. *Which structure asks for it* is
+    /// [`Self::core_promotions`]: below 1.3 it is the extension's own feature
+    /// struct, and at 1.3 and above it is `VkPhysicalDeviceVulkan13Features`.
+    ///
+    /// A promoted feature is still a feature. It is not on because the device
+    /// supports the version — it is on because it was requested, and a device
+    /// created without requesting it answers `vkCmdPipelineBarrier2` with
+    /// undefined behaviour rather than with a refusal.
     pub synchronization2: bool,
+    pub dynamic_rendering: bool,
     pub mesh_shader: bool,
     pub descriptor_buffer: bool,
+    /// The 1.0 boolean block, requested through
+    /// `VkDeviceCreateInfo::pEnabledFeatures`.
+    pub depth_clamp: bool,
+    pub fill_mode_non_solid: bool,
+    /// Whether the promoted capabilities are asked for through
+    /// `VkPhysicalDeviceVulkan13Features` rather than each extension's own
+    /// structure.
+    ///
+    /// Not derivable from the extension list: a 1.3 device need not enumerate
+    /// `VK_KHR_synchronization2` at all, so an empty extension list there
+    /// means "core", and on a 1.2 device it means "absent".
+    pub core_promotions: bool,
 }
 
 impl Enabled {
@@ -69,13 +90,13 @@ impl Enabled {
         Self {
             extensions: census.extensions(),
             timeline_semaphore: true,
-            // `synchronization2` as a *feature* is only chained below 1.3; at
-            // 1.3 and above the capability is core and there is no feature
-            // struct to set. The census already collapsed those two routes into
-            // one answer, and the extension list says which route this is.
-            synchronization2: census.synchronization2() && census.extensions().synchronization2,
+            synchronization2: census.synchronization2(),
+            dynamic_rendering: census.passes().dynamic_rendering,
             mesh_shader: census.stages().mesh_shader,
             descriptor_buffer: census.descriptors().descriptor_buffer,
+            depth_clamp: census.raster().depth_clamp,
+            fill_mode_non_solid: census.raster().fill_mode_non_solid,
+            core_promotions: census.api().at_least(1, 3),
         }
     }
 }
@@ -165,18 +186,43 @@ impl DeviceEpoch {
         // census module gives: a feature struct for something the driver never
         // reported is a question it has no answer to.
         let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
+        // The promoted pair, asked for through the version's own structure.
+        // Chained only at 1.3 and above, where that structure is legal at all.
+        let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default()
+            .synchronization2(enabled.synchronization2)
+            .dynamic_rendering(enabled.dynamic_rendering);
         let mut synchronization2 =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        let mut dynamic_rendering =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
         let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
         let mut descriptor_buffer =
             vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
+        // The 1.0 block. Two states a guest sets need these, and a device
+        // created without them clips where the guest asked to clamp and fills
+        // where it asked for lines — see [`crate::raster`].
+        let core_features = vk::PhysicalDeviceFeatures::default()
+            .depth_clamp(enabled.depth_clamp)
+            .fill_mode_non_solid(enabled.fill_mode_non_solid);
 
         let mut create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&pointers)
+            .enabled_features(&core_features)
             .push_next(&mut vulkan12);
-        if enabled.synchronization2 {
-            create = create.push_next(&mut synchronization2);
+        if enabled.core_promotions {
+            create = create.push_next(&mut vulkan13);
+        } else {
+            // Below 1.3 each capability is asked for through its own
+            // extension's structure, and only where the extension is in the
+            // list above — a feature structure for an extension that was not
+            // enabled is a question the driver has no answer to.
+            if enabled.extensions.synchronization2 {
+                create = create.push_next(&mut synchronization2);
+            }
+            if enabled.extensions.dynamic_rendering {
+                create = create.push_next(&mut dynamic_rendering);
+            }
         }
         if enabled.mesh_shader {
             create = create.push_next(&mut mesh);
@@ -312,6 +358,8 @@ mod tests {
             timeline_semaphore: true,
             synchronization2: features.0,
             dynamic_rendering: false,
+            depth_clamp: false,
+            fill_mode_non_solid: false,
             mesh_shader: features.1,
             descriptor_buffer: features.2,
             max_push_descriptors: 32,
@@ -387,20 +435,31 @@ mod tests {
         assert!(enabled.mesh_shader && enabled.descriptor_buffer);
     }
 
-    /// A capability that arrived through core has no feature struct to set and
-    /// no name to request, and the enabled set says so.
+    /// A promoted capability is still requested; only the structure that asks
+    /// for it changes.
+    ///
+    /// This test previously asserted the opposite — that a core capability
+    /// needs neither a name nor a feature — and the belief cost a device whose
+    /// `synchronization2` was never enabled while `vkCmdPipelineBarrier2` was
+    /// being recorded into it. A promoted feature is not on because the device
+    /// supports the version; it is on because it was asked for.
     #[test]
-    fn a_core_capability_is_enabled_through_neither_a_name_nor_a_feature() {
+    fn a_promoted_capability_is_requested_through_the_version_and_not_the_name() {
         let promoted = census_of((1, 3), &[extension::SWAPCHAIN], (false, false, false));
         assert!(promoted.synchronization2(), "core at 1.3");
         let enabled = Enabled::for_census(&promoted);
+        assert!(enabled.synchronization2, "still requested");
         assert!(
-            !enabled.synchronization2,
-            "there is no feature struct to chain for a core capability"
+            enabled.core_promotions,
+            "through VkPhysicalDeviceVulkan13Features"
         );
-        assert!(!enabled.extensions.synchronization2);
+        assert!(
+            !enabled.extensions.synchronization2,
+            "and not by a name the device need not have enumerated"
+        );
 
-        // Through the extension below its promotion, both are set.
+        // Through the extension below its promotion, the name is requested and
+        // the version structure is not the route.
         let extended = census_of(
             (1, 2),
             &[extension::SWAPCHAIN, extension::SYNCHRONIZATION_2],
@@ -409,6 +468,51 @@ mod tests {
         let enabled = Enabled::for_census(&extended);
         assert!(enabled.synchronization2);
         assert!(enabled.extensions.synchronization2);
+        assert!(!enabled.core_promotions);
+
+        // A 1.2 device with neither the name nor the feature asks for nothing.
+        let bare = census_of((1, 2), &[extension::SWAPCHAIN], (false, false, false));
+        let enabled = Enabled::for_census(&bare);
+        assert!(!enabled.synchronization2);
+        assert!(!enabled.extensions.synchronization2);
+        assert!(!enabled.core_promotions);
+    }
+
+    #[test]
+    fn the_optional_raster_features_are_enabled_exactly_when_reported() {
+        let memory = mem::apple_m3_max();
+        let families = families();
+        for depth_clamp in [false, true] {
+            for fill_mode_non_solid in [false, true] {
+                let census = Census::take(Reported {
+                    depth_clamp,
+                    fill_mode_non_solid,
+                    ..Reported {
+                        api_version: vk::make_api_version(0, 1, 2, 0),
+                        extensions: &[extension::SWAPCHAIN],
+                        timeline_semaphore: true,
+                        synchronization2: false,
+                        dynamic_rendering: false,
+                        depth_clamp: false,
+                        fill_mode_non_solid: false,
+                        mesh_shader: false,
+                        descriptor_buffer: false,
+                        max_push_descriptors: 0,
+                        max_buffer_size: None,
+                        memory: &memory,
+                        queue_families: &families,
+                    }
+                })
+                .expect("admitted");
+                let enabled = Enabled::for_census(&census);
+                assert_eq!(enabled.depth_clamp, depth_clamp);
+                assert_eq!(enabled.fill_mode_non_solid, fill_mode_non_solid);
+                // And the census agrees, so nothing can be enabled that the
+                // raster planner would not see.
+                assert_eq!(census.raster().depth_clamp, depth_clamp);
+                assert_eq!(census.raster().fill_mode_non_solid, fill_mode_non_solid);
+            }
+        }
     }
 
     /// The identity is the session's, not this module's — which is the whole
@@ -495,6 +599,8 @@ mod tests {
             timeline_semaphore: true,
             synchronization2: false,
             dynamic_rendering: false,
+            depth_clamp: false,
+            fill_mode_non_solid: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,

@@ -44,6 +44,8 @@
 //!   is a performance bug and never a correctness one: topology selects a
 //!   preference order, the required flags are always the fallback, and nothing
 //!   may branch on topology in a way the guest can observe.
+//! - [`raster`] — the fixed-function state a guest sets, and the two pieces of
+//!   it that are host capabilities rather than mappings.
 //! - [`record`] — issuing the planned commands into a command buffer, and the
 //!   one choice it makes: which spelling of a barrier this host takes.
 //! - [`recording`] — everything one native recording owns, held as one value
@@ -99,6 +101,7 @@ pub mod pass;
 pub mod placement;
 pub mod pools;
 pub mod queues;
+pub mod raster;
 pub mod record;
 pub mod recording;
 pub mod resident;

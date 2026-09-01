@@ -125,6 +125,10 @@ pub struct Reported<'a> {
     pub synchronization2: bool,
     /// `VkPhysicalDeviceDynamicRenderingFeatures::dynamicRendering`.
     pub dynamic_rendering: bool,
+    /// `VkPhysicalDeviceFeatures::depthClamp`.
+    pub depth_clamp: bool,
+    /// `VkPhysicalDeviceFeatures::fillModeNonSolid`.
+    pub fill_mode_non_solid: bool,
     /// `VkPhysicalDeviceMeshShaderFeaturesEXT::meshShader`.
     pub mesh_shader: bool,
     /// `VkPhysicalDeviceDescriptorBufferFeaturesEXT::descriptorBuffer`.
@@ -211,6 +215,7 @@ pub struct DeviceExtensions {
     pub mesh_shader: bool,
     pub external_memory_host: bool,
     pub synchronization2: bool,
+    pub dynamic_rendering: bool,
 }
 
 impl DeviceExtensions {
@@ -225,6 +230,7 @@ impl DeviceExtensions {
             (self.mesh_shader, extension::MESH_SHADER),
             (self.external_memory_host, extension::EXTERNAL_MEMORY_HOST),
             (self.synchronization2, extension::SYNCHRONIZATION_2),
+            (self.dynamic_rendering, extension::DYNAMIC_RENDERING),
         ] {
             if wanted {
                 names.push(name);
@@ -263,6 +269,7 @@ pub struct Census {
     stages: StageSupport,
     descriptors: DescriptorCell,
     passes: crate::pass::PassCell,
+    raster: crate::raster::RasterCell,
     buffers: crate::buffer::BufferLimits,
     host_pointer_import: bool,
     synchronization2: bool,
@@ -327,6 +334,10 @@ impl Census {
                 dynamic_rendering: api.at_least(1, 3)
                     || (reported.has(extension::DYNAMIC_RENDERING) && reported.dynamic_rendering),
             },
+            raster: crate::raster::RasterCell {
+                depth_clamp: reported.depth_clamp,
+                fill_mode_non_solid: reported.fill_mode_non_solid,
+            },
             buffers: crate::buffer::BufferLimits {
                 max_buffer_size: reported.max_buffer_size,
             },
@@ -348,6 +359,9 @@ impl Census {
                 external_memory_host: reported.has(extension::EXTERNAL_MEMORY_HOST),
                 synchronization2: reported.has(extension::SYNCHRONIZATION_2)
                     && reported.synchronization2
+                    && !api.at_least(1, 3),
+                dynamic_rendering: reported.has(extension::DYNAMIC_RENDERING)
+                    && reported.dynamic_rendering
                     && !api.at_least(1, 3),
             },
         })
@@ -404,6 +418,13 @@ impl Census {
     #[must_use]
     pub const fn passes(&self) -> crate::pass::PassCell {
         self.passes
+    }
+
+    /// The optional features [`crate::raster`] needs for two of the states a
+    /// guest sets.
+    #[must_use]
+    pub const fn raster(&self) -> crate::raster::RasterCell {
+        self.raster
     }
 
     /// The bound [`crate::buffer::plan`] checks a length against.
@@ -523,6 +544,8 @@ mod tests {
             timeline_semaphore: true,
             synchronization2: false,
             dynamic_rendering: false,
+            depth_clamp: false,
+            fill_mode_non_solid: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,
