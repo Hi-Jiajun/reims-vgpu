@@ -103,6 +103,7 @@ pub mod memory;
 pub mod mipmap;
 pub mod pass;
 pub mod pipeline;
+pub mod pixel;
 pub mod placement;
 pub mod pools;
 pub mod queues;
