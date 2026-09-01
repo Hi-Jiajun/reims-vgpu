@@ -577,4 +577,209 @@ mod tests {
         }
         assert_eq!(forwards, backwards);
     }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// The byte window the sweep works in, and the version space it draws
+    /// from. Both small on purpose: a per-byte shadow has to be affordable, and
+    /// collisions — equal versions meeting, a write landing exactly on a span
+    /// boundary, three writers overlapping one byte — are the cases the
+    /// hand-written ones cannot arrange together.
+    const WINDOW: u64 = 40;
+    const VERSIONS: u64 = 5;
+
+    /// Every operation, driven, against a per-byte array of `Option<version>`
+    /// that knows nothing about spans.
+    ///
+    /// # What this adds to the cases above
+    ///
+    /// Two things neither a hand-written case nor
+    /// `the_map_is_the_pointwise_maximum_whatever_order_the_writes_arrive_in`
+    /// reaches.
+    ///
+    /// **`Applied` is a partition.** The module's whole argument for returning
+    /// two halves is that "this transaction's bytes never landed" must not be
+    /// invisible — for a GPU write that is a frame the guest will never see. A
+    /// caller can only rely on that if `taken` and `refused` together are
+    /// *exactly* the range and never share a byte. Nothing checked it, and a
+    /// gap between them is silent: the map would still be right, `taken` would
+    /// still be right, and the bytes that were beaten would simply not be
+    /// reported by either half.
+    ///
+    /// **The order-independence is checked over permutations rather than over
+    /// one schedule and its reverse.** Forwards-and-backwards agree on any
+    /// sequence whose overlaps happen to be nested; the shapes that separate a
+    /// pointwise maximum from an order-dependent one need a third order.
+    #[test]
+    fn every_apply_partitions_its_range_and_the_map_is_the_pointwise_maximum() {
+        let mut applies = 0usize;
+        let mut wholly_taken = 0usize;
+        let mut wholly_refused = 0usize;
+        let mut split = 0usize;
+        let mut equal_version_refusals = 0usize;
+
+        for seed in 0..192u64 {
+            let mut rng = Rng::new(seed);
+            let mut coverage = VersionCoverage::new();
+            let mut shadow: Vec<Option<ContentVersion>> = vec![None; WINDOW as usize];
+
+            let mut writes: Vec<(ByteRange, ContentVersion)> = Vec::new();
+            for _ in 0..24 {
+                let offset = rng.below(WINDOW);
+                let length = 1 + rng.below(WINDOW - offset);
+                let range = r(offset, length);
+                let version = v(rng.below(VERSIONS));
+                writes.push((range, version));
+
+                let applied = coverage.apply(range, version);
+                applies += 1;
+                invariants(&coverage);
+
+                // The partition, byte by byte, against the shadow's own answer
+                // about which bytes this write was allowed to take.
+                for byte in 0..WINDOW {
+                    let one = r(byte, 1);
+                    let inside = byte >= offset && byte < offset + length;
+                    let takes = inside && shadow[byte as usize].is_none_or(|held| held < version);
+                    assert_eq!(
+                        applied.taken.covers(one),
+                        takes,
+                        "seed {seed} byte {byte}: taken"
+                    );
+                    assert_eq!(
+                        applied.refused.covers(one),
+                        inside && !takes,
+                        "seed {seed} byte {byte}: refused"
+                    );
+                    if takes {
+                        shadow[byte as usize] = Some(version);
+                    }
+                }
+                assert_eq!(
+                    applied.taken.len() + applied.refused.len(),
+                    length,
+                    "seed {seed}: the two halves must be the whole range"
+                );
+                assert_eq!(applied.is_empty(), applied.taken.is_empty());
+                assert_eq!(applied.was_partly_stale(), !applied.refused.is_empty());
+
+                match (applied.taken.is_empty(), applied.refused.is_empty()) {
+                    (false, true) => wholly_taken += 1,
+                    (true, false) => wholly_refused += 1,
+                    (false, false) => split += 1,
+                    (true, true) => unreachable!("a non-empty range partitions into something"),
+                }
+                if (offset..offset + length)
+                    .any(|b| shadow[b as usize] == Some(version) && applied.refused.covers(r(b, 1)))
+                {
+                    equal_version_refusals += 1;
+                }
+
+                // Every query answers off the same shadow.
+                for byte in 0..WINDOW {
+                    let one = r(byte, 1);
+                    assert_eq!(
+                        coverage.newest_over(one),
+                        shadow[byte as usize],
+                        "seed {seed} byte {byte}: newest_over"
+                    );
+                    assert_eq!(
+                        coverage.uncovered(one).is_empty(),
+                        shadow[byte as usize].is_some(),
+                        "seed {seed} byte {byte}: uncovered"
+                    );
+                }
+                // And over the whole window at once, which is where a reader
+                // that clipped a span wrongly shows up.
+                let whole = r(0, WINDOW);
+                let mut walked = 0u64;
+                for span in coverage.over(whole) {
+                    for byte in span.range.offset..span.range.offset + span.range.length {
+                        assert_eq!(
+                            shadow[byte as usize],
+                            Some(span.version),
+                            "seed {seed} byte {byte}: over"
+                        );
+                        walked += 1;
+                    }
+                }
+                assert_eq!(
+                    walked,
+                    shadow.iter().filter(|s| s.is_some()).count() as u64,
+                    "seed {seed}: `over` must reach every covered byte exactly once"
+                );
+                assert_eq!(
+                    coverage.newest_over(whole),
+                    shadow.iter().copied().flatten().max(),
+                    "seed {seed}: the summary is the maximum over the range"
+                );
+            }
+
+            // The same writes in three more orders must produce the same map,
+            // value for value — which is the coalescing claim as well as the
+            // maximum one, since two maps that agree byte for byte are equal
+            // only if neither kept a split its history caused.
+            for shuffle in 0..3u64 {
+                let mut order: Vec<usize> = (0..writes.len()).collect();
+                let mut r2 = Rng::new(seed * 31 + shuffle + 1);
+                for i in (1..order.len()).rev() {
+                    order.swap(i, r2.below(i as u64 + 1) as usize);
+                }
+                let mut other = VersionCoverage::new();
+                for &i in &order {
+                    other.apply(writes[i].0, writes[i].1);
+                    invariants(&other);
+                }
+                assert_eq!(
+                    other, coverage,
+                    "seed {seed} shuffle {shuffle}: the map depends on the order \
+                     the writes arrived in"
+                );
+            }
+
+            coverage.clear();
+            invariants(&coverage);
+            assert!(coverage.is_empty());
+        }
+
+        // Non-vacuity: each of the three outcomes of an apply, and the equal-
+        // version refusal specifically — that is the arm which distinguishes
+        // "a second claim on a committed version" from a first landing, and a
+        // generator drawing versions from a wide enough space would never
+        // produce one.
+        assert!(applies > 4_000, "{applies}");
+        assert!(
+            wholly_taken > 500,
+            "writes that landed whole: {wholly_taken}"
+        );
+        assert!(
+            wholly_refused > 500,
+            "writes beaten everywhere: {wholly_refused}"
+        );
+        assert!(split > 500, "writes that landed in part: {split}");
+        assert!(
+            equal_version_refusals > 500,
+            "refusals of a version already committed: {equal_version_refusals}"
+        );
+    }
 }
