@@ -6,6 +6,7 @@
 //! remaining accepted opcodes are recognized and returned as typed kinds with
 //! raw length validation where the contract specifies fixed sizes.
 
+use reims_vgpu_protocol::residency::{RenderStages, ResourceUsage};
 use reims_vgpu_wire::ops::render as wire;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
@@ -687,6 +688,17 @@ pub struct Command {
     pub pipeline_ref: u32,
     pub first: u32,
     pub count: u32,
+    /// What a residency record declared, for [`Kind::UseResource`] and
+    /// [`Kind::UseHeap`] and nothing else.
+    ///
+    /// The three shapes disagree about which halves exist — the `stages:`-qualified
+    /// `useResource` carries both in 16 bits each, `useHeap` carries stages
+    /// alone, and the two inherited unqualified forms carry usage alone or
+    /// neither — so a missing half is [`ResourceUsage`]/[`RenderStages`] zero
+    /// and means "the selector had no such argument". The executor must not
+    /// read a zero here as the guest asking for nothing.
+    pub residency_usage: reims_vgpu_protocol::residency::ResourceUsage,
+    pub residency_stages: reims_vgpu_protocol::residency::RenderStages,
     pub buffer_ref: u32,
     pub buffer_offset: u64,
     /// Multi-entry buffer binds for slots `first..first+count`.
@@ -1435,22 +1447,30 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         wire::OPCODE_USE_RESOURCE => {
-            // Refs are not lifted (exec no-ops residency); count bounds the
-            // record via the wire layout (usage+stages pack to 4 bytes, refs
-            // at +8).
+            // Refs are not lifted: the rail resolves every binding it draws
+            // with, so a ref list here would be allocated per record and read
+            // by nobody. `usage` and `stages` are, because they are what says
+            // whether that reasoning holds — see
+            // `reims_vgpu_protocol::residency`. Count bounds the record via the
+            // wire layout (usage+stages pack to 4 bytes, refs at +8).
             let (head, refs) = wire::use_resource(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseResource;
             out.count = head.count.get();
+            out.residency_usage = ResourceUsage(u32::from(head.usage.get()));
+            out.residency_stages = RenderStages(u32::from(head.stages.get()));
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
             Ok(out)
         }
         wire::OPCODE_USE_HEAP => {
-            // Heap form: no usage word, stages u16, refs at +6 (align-1).
+            // Heap form: no usage word, so `residency_usage` stays zero and
+            // means "this selector has no usage argument" rather than "the
+            // guest declared none". Stages u16, refs at +6 (align-1).
             let (head, refs) = wire::use_heap(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseHeap;
             out.count = head.count.get();
+            out.residency_stages = RenderStages(u32::from(head.stages.get()));
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
@@ -1461,7 +1481,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         // as readily as the two above; without these arms they reached the
         // `OtherAccepted` catch-all and were reported as unimplemented opcodes,
         // which is a wrong answer twice over — they are implemented, by doing
-        // nothing, and `render_noop_residency_hint` was counting half its family.
+        // nothing, and the residency routes were counting half their family.
         //
         // Separate arms rather than a shared one because the heads differ: four
         // bytes here against the qualified pair's six and eight. Reading either
@@ -1472,6 +1492,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 wire::use_resources_no_stages(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseResource;
             out.count = head.count.get();
+            out.residency_usage = ResourceUsage(head.usage.get());
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }

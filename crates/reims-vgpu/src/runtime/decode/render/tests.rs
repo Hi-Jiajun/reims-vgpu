@@ -2439,14 +2439,14 @@ fn a_residency_record_is_bounded_by_its_own_count() {
 /// residency removed them from `Kind::OtherAccepted` — the one net that would
 /// have named them on the failure channel. Both halves of that have since
 /// changed. `runtime::exec` answers `UseResource`/`UseHeap` with
-/// `render_noop_residency_hint`, so the kind is a counter rather than a hole;
+/// a residency route, so the kind is a counter rather than a hole;
 /// and the numbers are not a guess but the two forms of residency a render
 /// encoder inherits from the encoder base class, which
 /// [`reims_vgpu_wire::ops::render::UseHeapsNoStages`] records.
 ///
 /// So the net they belong in is the counter, and leaving them in the catch-all
 /// reported an implemented command as unimplemented while
-/// `render_noop_residency_hint` counted half its family.
+/// the residency routes counted half their family.
 #[test]
 fn the_inherited_residency_opcodes_reach_the_residency_arm() {
     for (op, kind) in [

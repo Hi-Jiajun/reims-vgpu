@@ -3881,14 +3881,20 @@ fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
     use crate::runtime::drain::store_route_count;
 
     for (op, route, payload_len) in [
+        // A zero-filled `useResource` declares residency with no access at
+        // all, which is its own class: it is not the read case, and reporting
+        // it as one would let the reading that confirms the no-op absorb a
+        // shape the argument does not describe.
         (
             wire_render::OPCODE_USE_RESOURCE,
-            "render_noop_residency_hint",
+            "render_residency_empty",
             render::USE_RESOURCE_REFS + 4,
         ),
+        // `useHeap:` carries no usage argument, so its zero is a property of
+        // the selector rather than a guest declaration.
         (
             wire_render::OPCODE_USE_HEAP,
-            "render_noop_residency_hint",
+            "render_residency_heap",
             render::USE_HEAP_REFS + 4,
         ),
         (
@@ -5562,5 +5568,112 @@ fn a_ledger_row_the_rail_cannot_honour_reports_the_disagreement() {
         fields.contains(&("closure", "implemented".to_string())),
         "the line must carry what the ledger claimed, or the reader cannot tell \
          which of the two is wrong: {fields:?}"
+    );
+}
+
+/// A residency declaration that names a GPU **write** is not the record the
+/// no-op argument covers.
+///
+/// The whole family used to reach one counter, so a guest declaring that the
+/// GPU would write a resource through a path this rail never bound produced the
+/// same number as a guest declaring it would read one it already has. The first
+/// leaves the guest reading back content it believes was just produced; the
+/// second costs nothing. This pins that they are told apart, and that the write
+/// case additionally reaches the always-on channel with the declaration on it.
+#[test]
+fn a_residency_write_declaration_is_named_rather_than_counted_with_the_reads() {
+    use crate::runtime::decode::render;
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::residency::{RenderStages, ResourceUsage};
+
+    // `useResource:usage:stages:`: count at +0, usage and stages as two u16
+    // sharing the word at +4, refs from +8.
+    let record = |usage: u16, stages: u16| {
+        let total = reims_vgpu_wire::OP_HEADER_LEN + render::USE_RESOURCE_REFS + 4;
+        let mut v = vec![0u8; total];
+        st32(&mut v[0..], wire_render::OPCODE_USE_RESOURCE);
+        st32(&mut v[4..], total as u32);
+        st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], 1);
+        v[reims_vgpu_wire::OP_HEADER_LEN + 4..reims_vgpu_wire::OP_HEADER_LEN + 6]
+            .copy_from_slice(&usage.to_le_bytes());
+        v[reims_vgpu_wire::OP_HEADER_LEN + 6..reims_vgpu_wire::OP_HEADER_LEN + 8]
+            .copy_from_slice(&stages.to_le_bytes());
+        v
+    };
+
+    let decoded = render::decode(&record(
+        ResourceUsage::WRITE as u16,
+        RenderStages::FRAGMENT as u16,
+    ))
+    .expect("a well-formed useResource decodes");
+    assert_eq!(
+        decoded.residency_usage,
+        ResourceUsage(ResourceUsage::WRITE),
+        "the usage half must survive decode — it is what decides whether \
+         answering by doing nothing is sound"
+    );
+    assert_eq!(
+        decoded.residency_stages,
+        RenderStages(RenderStages::FRAGMENT)
+    );
+
+    let run = |usage: u16, stages: u16| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let command = record(usage, stages);
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_render::OPCODE_USE_RESOURCE,
+            &command,
+            &mut out,
+            &mut acc,
+        );
+    };
+
+    let before_read = store_route_count("render_residency_read");
+    run(ResourceUsage::READ as u16, RenderStages::VERTEX as u16);
+    assert_eq!(
+        store_route_count("render_residency_read") - before_read,
+        1,
+        "a read declaration is the case the no-op argument covers"
+    );
+
+    let cap = crate::observe::sink::FailCapture::start();
+    let before_write = store_route_count("render_residency_write");
+    run(ResourceUsage::WRITE as u16, RenderStages::FRAGMENT as u16);
+    assert_eq!(
+        store_route_count("render_residency_write") - before_write,
+        1,
+        "a write declaration must not be counted with the reads"
+    );
+    let line = cap.one("render_residency");
+    assert!(
+        line.contains("reason=render_residency_write_dropped"),
+        "a GPU write through a path this rail did not bind is lost guest \
+         content, not a hint: {line}"
+    );
+    assert!(
+        line.contains("usage=0x2") && line.contains("stages=0x2"),
+        "the line must carry the declaration, or it cannot be acted on: {line}"
+    );
+
+    // A usage bit the API does not declare is not narrowed into the bits it
+    // shares: `READ|0x8` must not read as the one case this rail is sure it
+    // owes nothing on.
+    let before_undeclared = store_route_count("render_residency_undeclared");
+    run((ResourceUsage::READ | 0x8) as u16, 0);
+    assert_eq!(
+        store_route_count("render_residency_undeclared") - before_undeclared,
+        1,
+        "an undeclared usage bit must not classify as a read"
+    );
+    assert_eq!(
+        store_route_count("render_residency_read") - before_read,
+        1,
+        "and it must not also count as one"
     );
 }

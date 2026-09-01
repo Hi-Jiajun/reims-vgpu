@@ -22,8 +22,12 @@
 //!   capability cell, contract-proven unsupported with its exact refusal, or
 //!   unresolved and therefore blocking. "The current workload does not use it"
 //!   and "the old backend drops it" are not outcomes and cannot be spelled here.
+//! - [`residency`] — what a `useResource`/`useHeap` declaration says, split so
+//!   that the half a per-draw binder owes nothing on cannot hide the half it
+//!   does.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod closure;
+pub mod residency;

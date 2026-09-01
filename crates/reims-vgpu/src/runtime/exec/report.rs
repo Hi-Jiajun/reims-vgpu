@@ -826,3 +826,113 @@ pub(super) fn note_info_record_unanswered(task_id: u32, opcode: u32, len: usize)
         .field("task", task_id)
         .fail_once(u64::from(opcode));
 }
+
+/// A residency declaration this rail answered by doing nothing, priced by what
+/// it declared.
+///
+/// # Why one counter was not enough
+///
+/// `render_noop_residency_hint` counted the whole family under one name, and
+/// the argument for the no-op only covers part of it. A resource declared
+/// **read** through an indirect path is one a per-draw binder already has; a
+/// resource declared **write** is one the guest expects the GPU to modify
+/// through a path this device did not bind, and dropping that leaves the guest
+/// reading back content it believes was just produced. Under one counter those
+/// are the same number, so the reading that would disprove the no-op looked
+/// exactly like the reading that confirms it.
+///
+/// So the class is the route, and [`reims_vgpu_protocol::residency`] owns the
+/// classification rather than this rail: which bits are a write is a decoded
+/// API fact, not an executor's opinion.
+///
+/// # What each reading means
+///
+/// * `..._read` — the argument holds. A healthy number, however large.
+/// * `..._empty` — residency declared with no access. Also fine, and separate
+///   because a guest that names resources without naming an access is doing
+///   something the read case does not describe.
+/// * `..._write` — the argument does **not** hold for these records, and the
+///   line beside the counter says which stages and how many resources.
+/// * `..._undeclared` — a usage value this project has no contract for. It is
+///   not narrowed into the bits it happens to share; a guest asking for
+///   something unknown is not asking for read.
+///
+/// The heap forms get their own route names because `useHeap:` carries no usage
+/// argument at all: its zero is a property of the selector, and folding it in
+/// with a guest-declared zero would report the two as one.
+pub(super) struct ResidencyWriteDeclared {
+    opcode: u32,
+    count: u32,
+    usage: reims_vgpu_protocol::residency::ResourceUsage,
+    stages: reims_vgpu_protocol::residency::RenderStages,
+}
+
+impl crate::observe::Decline for ResidencyWriteDeclared {
+    fn slug(&self) -> &'static str {
+        use reims_vgpu_protocol::residency::UsageClass;
+        match self.usage.classify() {
+            UsageClass::Undeclared => "render_residency_usage_undeclared",
+            _ => "render_residency_write_dropped",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("op", format!("{:#x}", self.opcode)),
+            ("count", self.count.to_string()),
+            ("usage", format!("{:#x}", self.usage.0)),
+            ("stages", format!("{:#x}", self.stages.0)),
+            (
+                "undeclared_usage",
+                format!("{:#x}", self.usage.undeclared_bits()),
+            ),
+        ]
+    }
+}
+
+/// Price and, where the no-op argument does not cover it, name one residency
+/// record.
+pub(super) fn note_residency_declaration(
+    task_id: u32,
+    is_heap: bool,
+    opcode: u32,
+    count: u32,
+    usage: reims_vgpu_protocol::residency::ResourceUsage,
+    stages: reims_vgpu_protocol::residency::RenderStages,
+) {
+    use reims_vgpu_protocol::residency::UsageClass;
+    let class = usage.classify();
+    crate::runtime::drain::note_store_route(match (is_heap, class) {
+        // `useHeap:`/`useHeaps:count:` carry no usage argument, so there is no
+        // class to report — the route says only that a heap was declared.
+        (true, _) => "render_residency_heap",
+        (false, UsageClass::Empty) => "render_residency_empty",
+        (false, UsageClass::ReadOnly) => "render_residency_read",
+        (false, UsageClass::Writes) => "render_residency_write",
+        (false, UsageClass::Undeclared) => "render_residency_undeclared",
+    });
+    // A stage this device has no encoder for, named separately: it is the same
+    // gap the tile records report one arm over, and counting it with the render
+    // stages would hide which of the two a reading came from.
+    if stages.names_unexecuted_stage() {
+        crate::runtime::drain::note_store_route("render_residency_unexecuted_stage");
+    }
+    if stages.undeclared_bits() != 0 {
+        crate::runtime::drain::note_store_route("render_residency_stages_undeclared");
+    }
+    if is_heap || matches!(class, UsageClass::Empty | UsageClass::ReadOnly) {
+        return;
+    }
+    // Latched on the declaration rather than on the task: the same guest asks
+    // for the same thing every frame, and a second *shape* of declaration is
+    // the event.
+    let decline = ResidencyWriteDeclared {
+        opcode,
+        count,
+        usage,
+        stages,
+    };
+    crate::observe::Emit::decline("render_residency", &decline)
+        .field("task", task_id)
+        .fail_once(u64::from(usage.0) << 32 | u64::from(stages.0));
+}

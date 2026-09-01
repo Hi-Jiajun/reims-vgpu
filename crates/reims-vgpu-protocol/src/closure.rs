@@ -662,7 +662,7 @@ pub const LEDGER: &[Op] = &[
         opcode: Some(0x001b),
         selector: "useHeap:stages:; useHeaps:count:stages:",
         closure: Closure::Unresolved {
-            question: "useHeap: the usage and stage fields are decoded and retained but execution treats residency as a no-op; the exact residency contract is a Seam 0 obligation",
+            question: "useHeap: stages are lifted and the record is priced as a heap declaration, but execution treats residency as a no-op. The selector carries no usage argument, so the read/write split that decides whether the no-op is sound cannot be read from it at all",
         },
     },
     Op {
@@ -992,7 +992,7 @@ pub const LEDGER: &[Op] = &[
         opcode: Some(0x0089),
         selector: "useResource:usage:stages:; useResources:count:usage:stages:",
         closure: Closure::Unresolved {
-            question: "useResource; as 0x1b",
+            question: "useResource: usage and stages are lifted and classified. A read declaration is the case a per-draw binder owes nothing on; a write declaration is content the GPU never produces, and it is now counted and named apart. The row closes when a driven boot shows which classes a guest issues",
         },
     },
     Op {
@@ -1708,7 +1708,7 @@ pub const LEDGER: &[Op] = &[
         opcode: Some(0x0086),
         selector: "useHeaps:count:",
         closure: Closure::Unresolved {
-            question: "unqualified useHeaps inherited from the serializer base class. residency: the usage and stage fields are decoded and retained but execution treats residency as a no-op; the exact residency contract is a Seam 0 obligation",
+            question: "unqualified useHeaps inherited from the serializer base class. It carries neither usage nor stages, so it is priced as a heap declaration and nothing about the access can be read from it",
         },
     },
     Op {
@@ -1716,7 +1716,7 @@ pub const LEDGER: &[Op] = &[
         opcode: Some(0x0087),
         selector: "useResources:count:usage:",
         closure: Closure::Unresolved {
-            question: "unqualified useResources inherited from the serializer base class. residency: the usage and stage fields are decoded and retained but execution treats residency as a no-op; the exact residency contract is a Seam 0 obligation",
+            question: "unqualified useResources inherited from the serializer base class. Usage is lifted and classified as on 0x89, widened to 32 bits by this form; there are no stages",
         },
     },
     Op {
@@ -1724,7 +1724,7 @@ pub const LEDGER: &[Op] = &[
         opcode: Some(0x0086),
         selector: "useHeaps:count:",
         closure: Closure::Unresolved {
-            question: "unqualified useHeaps inherited from the serializer base class. residency: the usage and stage fields are decoded and retained but execution treats residency as a no-op; the exact residency contract is a Seam 0 obligation",
+            question: "unqualified useHeaps inherited from the serializer base class. It carries neither usage nor stages, so it is priced as a heap declaration and nothing about the access can be read from it",
         },
     },
     Op {
@@ -1732,7 +1732,7 @@ pub const LEDGER: &[Op] = &[
         opcode: Some(0x0087),
         selector: "useResources:count:usage:",
         closure: Closure::Unresolved {
-            question: "unqualified useResources inherited from the serializer base class. residency: the usage and stage fields are decoded and retained but execution treats residency as a no-op; the exact residency contract is a Seam 0 obligation",
+            question: "unqualified useResources inherited from the serializer base class. Usage is lifted and classified as on 0x89, widened to 32 bits by this form; there are no stages",
         },
     },
     Op {

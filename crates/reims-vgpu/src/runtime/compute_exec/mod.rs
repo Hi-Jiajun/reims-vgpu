@@ -899,7 +899,12 @@ fn apply_record_inner<M: HostMemory + HostOps>(
             None
         }
         Kind::UseHeaps | Kind::UseResources => {
-            crate::runtime::drain::note_store_route("compute_noop_residency_hint");
+            note_residency_declaration(
+                cmd.kind == Kind::UseHeaps,
+                cmd.opcode,
+                cmd.count,
+                cmd.resource_usage,
+            );
             None
         }
         Kind::CompressedTextureFlush => {
@@ -3481,3 +3486,74 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
 
 #[cfg(test)]
 mod tests;
+
+/// A compute residency declaration whose usage the no-op argument does not
+/// cover.
+///
+/// The reasoning and the vocabulary are the render rail's — see
+/// `runtime::exec::report::ResidencyWriteDeclared`, which carries it — with one
+/// difference this rail owns. The compute encoder inherits only the
+/// **unqualified** residency selectors, so no record here carries a stage
+/// argument and there is no stage half to report; the usage half is the whole
+/// declaration, and it is the half that decides whether answering by doing
+/// nothing is sound.
+struct ComputeResidencyDeclared {
+    opcode: u32,
+    count: u32,
+    usage: reims_vgpu_protocol::residency::ResourceUsage,
+}
+
+impl crate::observe::Decline for ComputeResidencyDeclared {
+    fn slug(&self) -> &'static str {
+        use reims_vgpu_protocol::residency::UsageClass;
+        match self.usage.classify() {
+            UsageClass::Undeclared => "compute_residency_usage_undeclared",
+            _ => "compute_residency_write_dropped",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("op", format!("{:#x}", self.opcode)),
+            ("count", self.count.to_string()),
+            ("usage", format!("{:#x}", self.usage.0)),
+            (
+                "undeclared_usage",
+                format!("{:#x}", self.usage.undeclared_bits()),
+            ),
+        ]
+    }
+}
+
+/// Price one compute residency declaration by what it declared.
+fn note_residency_declaration(
+    is_heap: bool,
+    opcode: u32,
+    count: u32,
+    usage: reims_vgpu_protocol::residency::ResourceUsage,
+) {
+    use reims_vgpu_protocol::residency::UsageClass;
+    let class = usage.classify();
+    crate::runtime::drain::note_store_route(match (is_heap, class) {
+        // The heap form carries no usage argument, so there is no class to
+        // report — the route says only that a heap was declared.
+        (true, _) => "compute_residency_heap",
+        (false, UsageClass::Empty) => "compute_residency_empty",
+        (false, UsageClass::ReadOnly) => "compute_residency_read",
+        (false, UsageClass::Writes) => "compute_residency_write",
+        (false, UsageClass::Undeclared) => "compute_residency_undeclared",
+    });
+    if is_heap || matches!(class, UsageClass::Empty | UsageClass::ReadOnly) {
+        return;
+    }
+    // A dispatch writing through a path this rail did not bind loses content
+    // the guest expects to read back, which is not what a residency *hint*
+    // costs. Latched on the declaration: the same kernel asks for the same
+    // thing every frame, and a second shape is the event.
+    let decline = ComputeResidencyDeclared {
+        opcode,
+        count,
+        usage,
+    };
+    crate::observe::Emit::decline("compute_residency", &decline).fail_once(u64::from(usage.0));
+}

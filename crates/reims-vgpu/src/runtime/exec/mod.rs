@@ -2063,12 +2063,14 @@ fn handle_render_record<M: HostMemory + HostOps>(
         // the right one.
         //
         // The arguments are the compute rail's, which reached the same two
-        // conclusions first (`compute_noop_residency_hint`,
-        // `compute_noop_barrier`). Residency: `useResource:`/`useHeap:` are
-        // hints for a driver that pages resources, and this product resolves
-        // every binding per draw, so there is nothing for them to keep
-        // resident. Barriers: the render rail submits and waits at pass
-        // granularity, so a barrier inside the pass is implied by the boundary.
+        // conclusions first. Residency: `useResource:`/`useHeap:` are hints for
+        // a driver that pages resources, and this product resolves every
+        // binding per draw, so there is nothing for them to keep resident —
+        // for the half of the family that declares a *read*. The write half is
+        // not covered by that argument and is now told apart from it; see
+        // `report::note_residency_declaration`. Barriers: the render rail
+        // submits and waits at pass granularity, so a barrier inside the pass
+        // is implied by the boundary.
         //
         // These counters exist to price those arguments rather than to doubt
         // them. A large residency count is the cost of resolving per draw; a
@@ -2228,7 +2230,14 @@ fn handle_render_record<M: HostMemory + HostOps>(
             execute_indirect_draw(state, host, task_id, &cmd, acc);
         }
         RenderKind::UseResource | RenderKind::UseHeap => {
-            crate::runtime::drain::note_store_route("render_noop_residency_hint");
+            note_residency_declaration(
+                task_id,
+                cmd.kind == RenderKind::UseHeap,
+                cmd.opcode,
+                cmd.count,
+                cmd.residency_usage,
+                cmd.residency_stages,
+            );
         }
         RenderKind::Barrier => {
             crate::runtime::drain::note_store_route("render_noop_barrier");
@@ -4179,7 +4188,7 @@ use report::{
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
     note_empty_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
     note_info_record_unanswered, note_pass_array_length_unsupported, note_pass_extent_for_slot,
-    note_pass_raster_sample_count_unsupported, note_pass_target_extent,
+    note_pass_raster_sample_count_unsupported, note_pass_target_extent, note_residency_declaration,
     note_store_action_no_attachment, note_stream_draw_drops, note_unimplemented_render_opcode,
     note_unnamed_icb_execute,
 };
