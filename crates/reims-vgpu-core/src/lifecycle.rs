@@ -285,6 +285,41 @@ impl LifecycleOp {
         }
     }
 
+    /// The resources this operation names, in the order it names them.
+    ///
+    /// Empty is a claim about the *operation*, not about the transaction: a
+    /// task teardown names no resource and still tears down everything in the
+    /// task, and a map notice names an address interval. What it means is that
+    /// the operation itself makes no per-resource statement, so nothing here
+    /// constrains the transaction's access list.
+    ///
+    /// Non-empty is the opposite, and it is what
+    /// [`crate::transaction::LifecyclePayload`] holds the envelope to: these
+    /// resources *are* the operation's statement about what it touches, so an
+    /// envelope naming a different set is a hazard edge built against the wrong
+    /// memory.
+    #[must_use]
+    pub fn resources(&self) -> &[ResourceId] {
+        match self {
+            Self::Invalidate { resources, .. }
+            | Self::Synchronize { resources, .. }
+            | Self::SynchronizeAndDiscard { resources, .. }
+            | Self::Discard { resources, .. } => resources,
+            Self::DeleteResource { resource, .. } | Self::ReplacePhysical { resource, .. } => {
+                std::slice::from_ref(resource)
+            }
+            // A task's own lifetime, an address interval, a slot declaration
+            // and a backing retirement each name something that is not a
+            // resource id.
+            Self::DefineTask { .. }
+            | Self::DeleteTask { .. }
+            | Self::CreateResource { .. }
+            | Self::MapMemory { .. }
+            | Self::UnmapMemory { .. }
+            | Self::DeleteBacking { .. } => &[],
+        }
+    }
+
     #[must_use]
     pub const fn task(&self) -> TaskId {
         match self {

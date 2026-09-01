@@ -29,7 +29,7 @@
 use crate::access::{AccessIntent, AccessKey, AccessMode, ResourceKey};
 use crate::control::ControlOp;
 use crate::exec::ExecWork;
-use crate::identity::ChannelId;
+use crate::identity::{ChannelId, ResourceId};
 use crate::identity::{CompletionStamp, StampWait, TransactionIdentity};
 use crate::lifecycle::LifecycleOp;
 use crate::present::PresentPacket;
@@ -169,10 +169,7 @@ pub enum Payload {
     Exec(ExecWork),
     /// One lifetime operation, and the resources it touches as the namespace
     /// that owns them resolved.
-    ResourceLifecycle {
-        op: LifecycleOp,
-        accesses: Vec<AccessIntent>,
-    },
+    ResourceLifecycle(LifecyclePayload),
     /// A question, and the write its answer will make.
     Query(QueryPayload),
     /// What the guest asked to show, and the frame reading it.
@@ -186,6 +183,99 @@ pub enum Payload {
     /// packet that appeared to have one would be a decode error somewhere
     /// upstream. Held to by `control_transactions_touch_no_resource`.
     Control(ControlOp),
+}
+
+/// A lifetime operation and the accesses that resolve it.
+///
+/// **The two have to describe the same work, and until this type they did not
+/// have to.** `Payload`'s own doc says the payload owns what it touches so an
+/// envelope and its operation cannot disagree; a `Synchronize` naming three
+/// resources beside an access list naming two others was representable, and the
+/// hazard edges built from the list would order the operation against memory it
+/// does not use while leaving the memory it does use unordered.
+///
+/// [`LifecycleOp::resources`] is the operation's own statement. When it is
+/// non-empty, [`Self::new`] requires the accesses to name exactly that set —
+/// every one of them, and nothing else. When it is empty the operation makes no
+/// per-resource statement (a task teardown, a map notice) and the access list is
+/// the only one there is, so nothing here constrains it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LifecyclePayload {
+    op: LifecycleOp,
+    accesses: Vec<AccessIntent>,
+}
+
+/// Why an operation and the accesses offered for it do not describe the same
+/// work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessMismatch {
+    /// An access names a resource the operation does not. The edges it builds
+    /// order this operation against memory it never touches.
+    Unnamed { resource: ResourceId },
+    /// A resource the operation names has no access. Nothing orders the
+    /// operation against work still reading it, which for a delete or a discard
+    /// is a use-after-free.
+    Unaccessed { resource: ResourceId },
+}
+
+impl AccessMismatch {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Unnamed { .. } => "lifecycle_access_names_unnamed_resource",
+            Self::Unaccessed { .. } => "lifecycle_resource_has_no_access",
+        }
+    }
+}
+
+impl LifecyclePayload {
+    /// Build the payload, holding the accesses to the operation's own resource
+    /// list.
+    ///
+    /// `resolved` pairs each access with the resource it was resolved for,
+    /// because the two live in different name spaces: an operation names
+    /// [`ResourceId`]s and an access names a backing. Only the resolver knows
+    /// which is which, so it says so here rather than leaving the join to be
+    /// re-derived — or not made at all.
+    ///
+    /// # Errors
+    ///
+    /// [`AccessMismatch`] when the two sets differ in either direction.
+    pub fn new(
+        op: LifecycleOp,
+        resolved: Vec<(ResourceId, AccessIntent)>,
+    ) -> Result<Self, AccessMismatch> {
+        if !op.resources().is_empty() {
+            for (resource, _) in &resolved {
+                if !op.resources().contains(resource) {
+                    return Err(AccessMismatch::Unnamed {
+                        resource: *resource,
+                    });
+                }
+            }
+            for resource in op.resources() {
+                if !resolved.iter().any(|(named, _)| named == resource) {
+                    return Err(AccessMismatch::Unaccessed {
+                        resource: *resource,
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            op,
+            accesses: resolved.into_iter().map(|(_, access)| access).collect(),
+        })
+    }
+
+    #[must_use]
+    pub const fn op(&self) -> &LifecycleOp {
+        &self.op
+    }
+
+    #[must_use]
+    pub fn accesses(&self) -> &[AccessIntent] {
+        &self.accesses
+    }
 }
 
 /// A query and the one access it makes.
@@ -264,7 +354,7 @@ impl Payload {
     pub const fn class(&self) -> PayloadClass {
         match self {
             Self::Exec(_) => PayloadClass::Exec,
-            Self::ResourceLifecycle { .. } => PayloadClass::ResourceLifecycle,
+            Self::ResourceLifecycle(_) => PayloadClass::ResourceLifecycle,
             Self::Query(_) => PayloadClass::Query,
             Self::Present { .. } => PayloadClass::Present,
             Self::Control(_) => PayloadClass::Control,
@@ -281,7 +371,8 @@ impl Payload {
     pub fn accesses(&self) -> &[AccessIntent] {
         match self {
             Self::Exec(work) => &work.accesses,
-            Self::ResourceLifecycle { accesses, .. } | Self::Present { accesses, .. } => accesses,
+            Self::ResourceLifecycle(lifecycle) => lifecycle.accesses(),
+            Self::Present { accesses, .. } => accesses,
             Self::Query(query) => std::slice::from_ref(query.access()),
             Self::Control(_) => &[],
         }
@@ -354,6 +445,114 @@ impl DeviceTransaction {
 mod tests {
     use super::*;
     use reims_vgpu_protocol::packets::LEDGER;
+
+    fn resource(slot: u32) -> ResourceId {
+        ResourceId {
+            slot: crate::identity::ObjectListRef(slot),
+            generation: crate::identity::SlotGeneration(1),
+        }
+    }
+
+    fn whole(backing: u64) -> AccessIntent {
+        AccessIntent {
+            domain: ChannelId(1),
+            key: AccessKey::Whole(ResourceKey {
+                backing: crate::access::BackingId(backing),
+                heap: None,
+            }),
+            mode: AccessMode::ReadWrite,
+            api_stages: 0,
+            input_content_version: None,
+            output_content_version: None,
+        }
+    }
+
+    /// An operation that names resources and an envelope that names others
+    /// used to be representable, and the edges built from the envelope would
+    /// have ordered the operation against memory it does not touch.
+    #[test]
+    fn a_lifecycle_envelope_must_name_the_operations_own_resources() {
+        let op = crate::lifecycle::LifecycleOp::Synchronize {
+            task: crate::identity::TaskId(1),
+            resources: vec![resource(1), resource(2)],
+        };
+        assert!(LifecyclePayload::new(
+            op.clone(),
+            vec![(resource(1), whole(10)), (resource(2), whole(11))],
+        )
+        .is_ok());
+
+        // A third resource nobody synchronised.
+        assert_eq!(
+            LifecyclePayload::new(
+                op.clone(),
+                vec![
+                    (resource(1), whole(10)),
+                    (resource(2), whole(11)),
+                    (resource(3), whole(12)),
+                ],
+            ),
+            Err(AccessMismatch::Unnamed {
+                resource: resource(3)
+            })
+        );
+
+        // And the direction that is a use-after-free: a resource the operation
+        // acts on with nothing ordering it against work still reading it.
+        assert_eq!(
+            LifecyclePayload::new(op, vec![(resource(1), whole(10))]),
+            Err(AccessMismatch::Unaccessed {
+                resource: resource(2)
+            })
+        );
+    }
+
+    /// An operation that names no resource constrains nothing, because its
+    /// access list is the only statement there is.
+    ///
+    /// A task teardown retires everything in the task and names none of it; a
+    /// map notice names an address interval. Requiring an empty access list for
+    /// either would say the transaction touches nothing, which is the opposite
+    /// of true.
+    #[test]
+    fn an_operation_naming_no_resource_leaves_its_accesses_alone() {
+        for op in [
+            crate::lifecycle::LifecycleOp::DeleteTask {
+                task: crate::identity::TaskId(1),
+            },
+            crate::lifecycle::LifecycleOp::UnmapMemory {
+                task: crate::identity::TaskId(1),
+                span: crate::access::GuestSpan {
+                    base: 0x1000,
+                    length: 0x1000,
+                },
+            },
+        ] {
+            assert!(op.resources().is_empty(), "{:?}", op.kind());
+            let payload =
+                LifecyclePayload::new(op, vec![(resource(7), whole(10)), (resource(8), whole(11))])
+                    .expect("no per-resource statement to disagree with");
+            assert_eq!(payload.accesses().len(), 2);
+        }
+    }
+
+    /// Every kind's `resources()` is its own operation's list, and the two
+    /// single-resource kinds are not "no resources".
+    #[test]
+    fn a_single_resource_operation_names_that_resource() {
+        let one = crate::lifecycle::LifecycleOp::DeleteResource {
+            task: crate::identity::TaskId(1),
+            resource: resource(4),
+        };
+        assert_eq!(one.resources(), &[resource(4)]);
+        assert_eq!(
+            LifecyclePayload::new(one, Vec::new()),
+            Err(AccessMismatch::Unaccessed {
+                resource: resource(4)
+            }),
+            "a delete with nothing ordering it is the use-after-free case"
+        );
+    }
 
     /// A query's access is exactly the window its reply goes to.
     ///

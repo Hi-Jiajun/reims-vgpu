@@ -545,12 +545,15 @@ mod tests {
     fn empty_payload(channel: Channel, opcode: u16) -> Payload {
         match classify(channel, opcode) {
             Some(PayloadClass::Exec) => Payload::Exec(crate::exec::ExecWork::default()),
-            Some(PayloadClass::ResourceLifecycle) => Payload::ResourceLifecycle {
-                op: crate::lifecycle::LifecycleOp::DeleteTask {
-                    task: crate::identity::TaskId(1),
-                },
-                accesses: Vec::new(),
-            },
+            Some(PayloadClass::ResourceLifecycle) => Payload::ResourceLifecycle(
+                crate::transaction::LifecyclePayload::new(
+                    crate::lifecycle::LifecycleOp::DeleteTask {
+                        task: crate::identity::TaskId(1),
+                    },
+                    Vec::new(),
+                )
+                .expect("a task teardown names no resource"),
+            ),
             Some(PayloadClass::Query) => Payload::Query(crate::transaction::QueryPayload::new(
                 crate::query::QueryRequest {
                     kind: crate::query::QueryKind::of(channel, opcode).expect("a query"),
@@ -590,8 +593,28 @@ mod tests {
     fn touching(mut packet: Packet, accesses: Vec<AccessIntent>) -> Packet {
         match &mut packet.payload {
             Payload::Exec(work) => work.accesses = accesses,
-            Payload::ResourceLifecycle { accesses: a, .. }
-            | Payload::Present { accesses: a, .. } => *a = accesses,
+            Payload::Present { accesses: a, .. } => *a = accesses,
+            // The teardown `empty_payload` builds names no resource, so its
+            // access list is unconstrained — but it is still the payload's, and
+            // it is rebuilt rather than reached into.
+            Payload::ResourceLifecycle(lifecycle) => {
+                *lifecycle = crate::transaction::LifecyclePayload::new(
+                    lifecycle.op().clone(),
+                    accesses
+                        .into_iter()
+                        .map(|a| {
+                            (
+                                ResourceId {
+                                    slot: ObjectListRef(0),
+                                    generation: SlotGeneration(1),
+                                },
+                                a,
+                            )
+                        })
+                        .collect(),
+                )
+                .expect("the fixture's operation names no resource");
+            }
             // A query's access is its reply window and is not the test's to
             // choose — see `QueryPayload`.
             Payload::Query(query) => assert_eq!(

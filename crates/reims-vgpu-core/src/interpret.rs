@@ -477,13 +477,16 @@ mod tests {
             identity: crate::testing::identity(1, ingress),
             stamp_waits: Vec::new(),
             completion: None,
-            payload: crate::transaction::Payload::ResourceLifecycle {
-                op: crate::lifecycle::LifecycleOp::Synchronize {
-                    task: crate::identity::TaskId(1),
-                    resources: vec![res(1)],
-                },
-                accesses,
-            },
+            payload: crate::transaction::Payload::ResourceLifecycle(
+                crate::transaction::LifecyclePayload::new(
+                    crate::lifecycle::LifecycleOp::Synchronize {
+                        task: crate::identity::TaskId(1),
+                        resources: vec![res(1)],
+                    },
+                    accesses.into_iter().map(|a| (res(1), a)).collect(),
+                )
+                .expect("every access is for the one resource the op names"),
+            ),
         }
     }
 
