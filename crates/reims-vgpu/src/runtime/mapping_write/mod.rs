@@ -1265,13 +1265,15 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             let off = y * rgba_stride as usize;
             let src_row = &rgba[off..off + rgba_stride as usize];
             let dst_row = &mut cache[off..off + rgba_stride as usize];
-            for x in 0..mw as usize {
-                let i = x * 4;
-                dst_row[i] = src_row[i + 2];
-                dst_row[i + 1] = src_row[i + 1];
-                dst_row[i + 2] = src_row[i];
-                dst_row[i + 3] = src_row[i + 3];
-            }
+            // `Rgba8ToRow::Bgra8` *is* this swap. It was the third hand-inlined
+            // copy of it in this crate; the other two were the row loop's
+            // `rgba8_row_to_native` and the staged writers'. Named as the
+            // variant rather than parsed from an ordinal because the cache's
+            // layout is this device's own choice and not the guest's — see
+            // `cache_rows_are_native` below, which is the only place the two
+            // meet.
+            let swapped = pixel_format::Rgba8ToRow::Bgra8.convert(src_row, mw, dst_row);
+            debug_assert!(swapped, "the cache row is exactly mw BGRA8 texels");
         }
     }
     // Whether a cache row is byte for byte this mapping's native texel row, so
