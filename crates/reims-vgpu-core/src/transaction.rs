@@ -173,10 +173,7 @@ pub enum Payload {
     /// A question, and the write its answer will make.
     Query(QueryPayload),
     /// What the guest asked to show, and the frame reading it.
-    Present {
-        packet: PresentPacket,
-        accesses: Vec<AccessIntent>,
-    },
+    Present(PresentPayload),
     /// A control operation. **No access list, and that is a contract claim
     /// rather than an omission**: opening a channel, moving a cursor, acking a
     /// display and doing nothing all touch no guest resource, so a control
@@ -278,6 +275,105 @@ impl LifecyclePayload {
     }
 }
 
+/// A present and the reads it makes of what it shows.
+///
+/// Two claims the free `{ packet, accesses }` pair could not make.
+///
+/// **Every access is for the mapping the packet names.** A present shows one
+/// thing — the guest's display pipe serializes plane 0's surface into a
+/// fixed-size command and there is no plane list on the wire — so an access
+/// resolved for a different mapping is an envelope describing a frame the
+/// packet did not ask for. More than one access is still legitimate: a
+/// biplanar surface is two planes of one mapping.
+///
+/// **No access writes.** A present reads what the guest already produced; the
+/// writer is the EXEC the present waits for. Modelled as a writer it would
+/// reserve a content version, beat the real writer's, and publish bytes nothing
+/// produced.
+///
+/// The list may not be empty. A present that names nothing is ordered against
+/// nothing and shows whatever happens to be at the surface — the stale-frame
+/// class. A target that could not be resolved says so with
+/// [`AccessKey::DomainOnly`], which is the vocabulary for exactly that and
+/// which still buys submission-domain ordering.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PresentPayload {
+    packet: PresentPacket,
+    accesses: Vec<AccessIntent>,
+}
+
+/// Why a present's accesses do not describe the frame its packet asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentMismatch {
+    /// An access was resolved for a mapping this packet does not show.
+    NotTheTarget {
+        shown: crate::identity::MappingId,
+        named: crate::identity::MappingId,
+    },
+    /// An access writes. A present reads.
+    Writes { mode: AccessMode },
+    /// No access at all, so nothing orders the present against the work that
+    /// draws the frame.
+    NothingNamed,
+}
+
+impl PresentMismatch {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::NotTheTarget { .. } => "present_access_names_another_mapping",
+            Self::Writes { .. } => "present_access_writes",
+            Self::NothingNamed => "present_names_nothing",
+        }
+    }
+}
+
+impl PresentPayload {
+    /// Build the payload, holding the accesses to the packet's own target.
+    ///
+    /// `resolved` pairs each access with the mapping it was resolved for, for
+    /// [`LifecyclePayload::new`]'s reason: a packet names a mapping and an
+    /// access names a backing, and only the mapper knows which is which.
+    ///
+    /// # Errors
+    ///
+    /// [`PresentMismatch`] when an access names another mapping, writes, or
+    /// when there are none.
+    pub fn new(
+        packet: PresentPacket,
+        resolved: Vec<(crate::identity::MappingId, AccessIntent)>,
+    ) -> Result<Self, PresentMismatch> {
+        if resolved.is_empty() {
+            return Err(PresentMismatch::NothingNamed);
+        }
+        for (named, access) in &resolved {
+            if *named != packet.mapping {
+                return Err(PresentMismatch::NotTheTarget {
+                    shown: packet.mapping,
+                    named: *named,
+                });
+            }
+            if access.mode.writes() {
+                return Err(PresentMismatch::Writes { mode: access.mode });
+            }
+        }
+        Ok(Self {
+            packet,
+            accesses: resolved.into_iter().map(|(_, access)| access).collect(),
+        })
+    }
+
+    #[must_use]
+    pub const fn packet(&self) -> &PresentPacket {
+        &self.packet
+    }
+
+    #[must_use]
+    pub fn accesses(&self) -> &[AccessIntent] {
+        &self.accesses
+    }
+}
+
 /// A query and the one access it makes.
 ///
 /// **The access is not a field beside the request; it is derived from it.** A
@@ -356,7 +452,7 @@ impl Payload {
             Self::Exec(_) => PayloadClass::Exec,
             Self::ResourceLifecycle(_) => PayloadClass::ResourceLifecycle,
             Self::Query(_) => PayloadClass::Query,
-            Self::Present { .. } => PayloadClass::Present,
+            Self::Present(_) => PayloadClass::Present,
             Self::Control(_) => PayloadClass::Control,
         }
     }
@@ -372,7 +468,7 @@ impl Payload {
         match self {
             Self::Exec(work) => &work.accesses,
             Self::ResourceLifecycle(lifecycle) => lifecycle.accesses(),
-            Self::Present { accesses, .. } => accesses,
+            Self::Present(present) => present.accesses(),
             Self::Query(query) => std::slice::from_ref(query.access()),
             Self::Control(_) => &[],
         }
@@ -552,6 +648,86 @@ mod tests {
             }),
             "a delete with nothing ordering it is the use-after-free case"
         );
+    }
+
+    fn present_packet(mapping: u32) -> crate::present::PresentPacket {
+        crate::present::PresentPacket {
+            form: crate::present::PresentForm::SwapMapping,
+            mapping: crate::identity::MappingId(mapping),
+            task: None,
+        }
+    }
+
+    fn reads(backing: u64) -> AccessIntent {
+        AccessIntent {
+            domain: ChannelId(1),
+            key: AccessKey::Whole(ResourceKey {
+                backing: crate::access::BackingId(backing),
+                heap: None,
+            }),
+            mode: AccessMode::Read,
+            api_stages: 0,
+            input_content_version: None,
+            output_content_version: None,
+        }
+    }
+
+    /// A present shows one mapping, and every access it carries is for that
+    /// one. More than one is still legitimate — a biplanar surface is two
+    /// planes of one mapping.
+    #[test]
+    fn a_present_reads_the_mapping_it_shows_and_no_other() {
+        let packet = present_packet(7);
+        let two_planes = PresentPayload::new(
+            packet,
+            vec![(packet.mapping, reads(10)), (packet.mapping, reads(11))],
+        )
+        .expect("two planes of one surface");
+        assert_eq!(two_planes.accesses().len(), 2);
+
+        assert_eq!(
+            PresentPayload::new(packet, vec![(crate::identity::MappingId(8), reads(10))]),
+            Err(PresentMismatch::NotTheTarget {
+                shown: crate::identity::MappingId(7),
+                named: crate::identity::MappingId(8),
+            }),
+            "an envelope describing a frame the packet did not ask for"
+        );
+    }
+
+    /// A present reads. The writer is the EXEC it waits for, and a present
+    /// modelled as a writer reserves a version, beats the real writer's and
+    /// publishes bytes nothing produced.
+    #[test]
+    fn a_present_never_writes_what_it_shows() {
+        let packet = present_packet(7);
+        for mode in [
+            AccessMode::Write,
+            AccessMode::ReadWrite,
+            AccessMode::Unknown,
+        ] {
+            let mut access = reads(10);
+            access.mode = mode;
+            assert_eq!(
+                PresentPayload::new(packet, vec![(packet.mapping, access)]),
+                Err(PresentMismatch::Writes { mode }),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// A present that names nothing is ordered against nothing. An unresolved
+    /// target says so with `DomainOnly`, which still buys domain ordering.
+    #[test]
+    fn a_present_that_names_nothing_is_refused_rather_than_unordered() {
+        let packet = present_packet(7);
+        assert_eq!(
+            PresentPayload::new(packet, Vec::new()),
+            Err(PresentMismatch::NothingNamed)
+        );
+        let mut unresolved = reads(0);
+        unresolved.key = AccessKey::DomainOnly;
+        assert!(PresentPayload::new(packet, vec![(packet.mapping, unresolved)]).is_ok());
     }
 
     /// A query's access is exactly the window its reply goes to.

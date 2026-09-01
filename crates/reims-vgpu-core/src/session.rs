@@ -542,6 +542,19 @@ mod tests {
         }
     }
 
+    /// An access naming no memory: the vocabulary for a target that could not
+    /// be resolved.
+    fn domain_only(domain: ChannelId) -> AccessIntent {
+        AccessIntent {
+            domain,
+            key: crate::access::AccessKey::DomainOnly,
+            mode: crate::access::AccessMode::Read,
+            api_stages: 0,
+            input_content_version: None,
+            output_content_version: None,
+        }
+    }
+
     fn empty_payload(channel: Channel, opcode: u16) -> Payload {
         match classify(channel, opcode) {
             Some(PayloadClass::Exec) => Payload::Exec(crate::exec::ExecWork::default()),
@@ -569,11 +582,19 @@ mod tests {
                 ChannelId(0),
                 None,
             )),
-            Some(PayloadClass::Present) => Payload::Present {
-                packet: crate::present::resolve(channel, opcode, &0u32.to_le_bytes())
-                    .expect("a present with a trailer"),
-                accesses: Vec::new(),
-            },
+            Some(PayloadClass::Present) => {
+                let packet = crate::present::resolve(channel, opcode, &0u32.to_le_bytes())
+                    .expect("a present with a trailer");
+                // The target is unresolved in this fixture, and a present that
+                // named nothing at all would be refused — see `PresentPayload`.
+                Payload::Present(
+                    crate::transaction::PresentPayload::new(
+                        packet,
+                        vec![(packet.mapping, domain_only(ChannelId(0)))],
+                    )
+                    .expect("one read of the packet's own target"),
+                )
+            }
             // A packet the model refuses never reaches its payload, so the
             // class it would have had is not a thing this can answer. `Nop` is
             // the emptiest payload there is, and the refusal happens first.
@@ -593,7 +614,16 @@ mod tests {
     fn touching(mut packet: Packet, accesses: Vec<AccessIntent>) -> Packet {
         match &mut packet.payload {
             Payload::Exec(work) => work.accesses = accesses,
-            Payload::Present { accesses: a, .. } => *a = accesses,
+            // Its accesses must all be reads of the packet's own target, so
+            // they are rebuilt through the payload rather than assigned.
+            Payload::Present(present) => {
+                let packet = *present.packet();
+                *present = crate::transaction::PresentPayload::new(
+                    packet,
+                    accesses.into_iter().map(|a| (packet.mapping, a)).collect(),
+                )
+                .expect("reads of the packet's own target");
+            }
             // The teardown `empty_payload` builds names no resource, so its
             // access list is unconstrained — but it is still the payload's, and
             // it is rebuilt rather than reached into.
