@@ -108,6 +108,7 @@ pub mod queues;
 pub mod raster;
 pub mod record;
 pub mod recording;
+pub mod renderpass;
 pub mod resident;
 pub mod sampler;
 pub mod staging;

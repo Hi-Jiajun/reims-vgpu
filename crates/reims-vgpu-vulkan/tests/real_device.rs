@@ -21,6 +21,7 @@ use ash::vk;
 use reims_vgpu_core::blit::{BufferSpan, FillPattern};
 use reims_vgpu_core::identity::DeviceEpoch as EpochId;
 use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SessionGeneration, SlotGeneration};
+use reims_vgpu_core::pass::{LoadAction, PassDescriptor, RenderTargetExtent, StoreAction};
 use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM;
 use reims_vgpu_core::retire::{Lifetime, NativeRetirement};
 use reims_vgpu_core::texture_shape::{TextureKind, TextureShape, TextureUsage};
@@ -32,9 +33,11 @@ use reims_vgpu_vulkan::image;
 use reims_vgpu_vulkan::layout;
 use reims_vgpu_vulkan::memory::{select_memory_type, MappedMemoryKind, MemoryClass};
 use reims_vgpu_vulkan::mipmap;
+use reims_vgpu_vulkan::pass;
 use reims_vgpu_vulkan::placement::Route;
 use reims_vgpu_vulkan::pools::WorkerPool;
 use reims_vgpu_vulkan::record;
+use reims_vgpu_vulkan::renderpass;
 use reims_vgpu_vulkan::resident;
 use reims_vgpu_vulkan::staging;
 use reims_vgpu_vulkan::timeline::Timeline;
@@ -1194,5 +1197,172 @@ fn a_declined_vertex_format_has_a_substitute_or_no_sibling_at_all() {
             "{} is mandatory and this driver declined it",
             mandatory.name()
         );
+    }
+}
+
+/// Both rungs of the pass carrier, against a driver.
+///
+/// The unit tests build the create infos and read them back. That leaves the
+/// one thing they cannot say: whether a driver accepts them. So this creates a
+/// real image, binds it, makes a real attachment view, and then a real
+/// `VkRenderPass` and `VkFramebuffer` from one build — and asserts the
+/// pipeline structure the dynamic rung would use names the same format, since
+/// it is the same compatibility key.
+///
+/// A driver that refuses either object fails here and passes every unit test
+/// in the crate, which is the whole reason it exists.
+#[test]
+fn a_planned_pass_becomes_a_render_pass_and_a_framebuffer_this_driver_accepts() {
+    let Ok(host) = VulkanHost::open("reims-vgpu-vulkan pass integration") else {
+        println!("no real device: nothing to compose");
+        return;
+    };
+    let census = host.census();
+    let epoch = DeviceEpoch::create(
+        host.instance(),
+        host.physical_device(),
+        census,
+        EpochId::FIRST,
+    )
+    .expect("the driver refused a set its own census admitted");
+    let device = epoch.device().clone();
+
+    // One 64x32 colour target, the shape a pass attaches.
+    let texture = TextureShape {
+        kind: TextureKind::D2.ordinal(),
+        width: 64,
+        height: 32,
+        depth: 1,
+        mipmap_level_count: 1,
+        sample_count: 1,
+        array_length: 1,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        usage: TextureUsage::RENDER_TARGET,
+    }
+    .checked()
+    .expect("a declaration the guest API admits");
+
+    let planned = image::plan(
+        texture,
+        vk::Format::R8G8B8A8_UNORM,
+        Route::HostStaging {
+            working: MemoryClass::DeviceLocal,
+        },
+    )
+    .expect("a plannable texture");
+    let query = planned.query();
+    let reported = unsafe {
+        host.instance().get_physical_device_image_format_properties(
+            host.physical_device(),
+            query.format,
+            query.image_type,
+            query.tiling,
+            query.usage,
+            query.flags,
+        )
+    }
+    .expect("RGBA8 color-attachable is universal on Vulkan 1.2");
+    let admitted = planned
+        .admitted(reported)
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
+    let image = unsafe { device.create_image(&admitted.create_info(), None) }.expect("an image");
+
+    // A framebuffer names a bound image, so this one has to be backed.
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+    let properties = unsafe {
+        host.instance()
+            .get_physical_device_memory_properties(host.physical_device())
+    };
+    let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
+    let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance3);
+    unsafe {
+        host.instance()
+            .get_physical_device_properties2(host.physical_device(), &mut properties2);
+    }
+    let pick = select_memory_type(
+        &properties,
+        requirements.memory_type_bits,
+        &census.memory().topology.request(MemoryClass::DeviceLocal),
+        requirements.size,
+        maintenance3.max_memory_allocation_size,
+    )
+    .expect("a device-local type exists for a colour target");
+    let memory = unsafe {
+        device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(pick.index),
+            None,
+        )
+    }
+    .expect("the selected type allocates");
+    unsafe { device.bind_image_memory(image, memory, 0) }.expect("bind");
+
+    let expansion = view::attachments(texture, vk::Format::R8G8B8A8_UNORM);
+    let attachment = expansion.first().expect("one level, one layer");
+    let image_view = unsafe { device.create_image_view(&attachment.plan.create_info(image), None) }
+        .expect("an attachment view");
+
+    // The plan, from a descriptor the guest could have sent.
+    let mut descriptor = PassDescriptor::empty();
+    descriptor.extent = RenderTargetExtent {
+        width: 64,
+        height: 32,
+        array_length: 1,
+    };
+    descriptor.color[0].texture = Some(ResourceId {
+        slot: ObjectListRef(1),
+        generation: SlotGeneration(1),
+    });
+    descriptor.color[0].load = LoadAction::Clear;
+    descriptor.color[0].store = StoreAction::Store;
+    let pass_plan = pass::plan(&descriptor, |_| MTL_FORMAT_RGBA8_UNORM).expect("a legal pass");
+
+    let built = renderpass::build(
+        &pass_plan,
+        &[renderpass::Bound {
+            format: vk::Format::R8G8B8A8_UNORM,
+            samples: vk::SampleCountFlags::TYPE_1,
+            view: image_view,
+            resolve_view: None,
+        }],
+        None,
+    )
+    .expect("one colour attachment, one image");
+
+    let render_pass = built
+        .with_render_pass_create_info(|info| unsafe { device.create_render_pass(info, None) })
+        .expect("a render pass this driver accepts");
+    let framebuffer = built
+        .with_framebuffer_create_info(render_pass, |info| unsafe {
+            device.create_framebuffer(info, None)
+        })
+        .expect("a framebuffer this driver accepts");
+
+    // The dynamic rung's pipeline structure names the same format, whether or
+    // not this host is on that rung — it is the same compatibility key.
+    let compatibility = built.compatibility();
+    let rendering = compatibility.rendering_info();
+    assert_eq!(rendering.color_attachment_count, 1);
+    // SAFETY: the array is `compatibility.color`, which outlives `rendering`.
+    let formats = unsafe { std::slice::from_raw_parts(rendering.p_color_attachment_formats, 1) };
+    assert_eq!(formats[0], vk::Format::R8G8B8A8_UNORM);
+    assert_eq!(built.attachments()[0].format, vk::Format::R8G8B8A8_UNORM);
+    assert_eq!(built.attachments()[0].load_op, vk::AttachmentLoadOp::CLEAR);
+    println!(
+        "pass carrier={} attachments={}",
+        pass::select(census.passes(), pass::Narrowing::from_env())
+            .carrier
+            .name(),
+        built.attachments().len()
+    );
+
+    // SAFETY: nothing was submitted, so nothing names any of these.
+    unsafe {
+        device.destroy_framebuffer(framebuffer, None);
+        device.destroy_render_pass(render_pass, None);
+        device.destroy_image_view(image_view, None);
+        device.destroy_image(image, None);
+        device.free_memory(memory, None);
     }
 }
