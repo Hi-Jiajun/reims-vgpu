@@ -23,6 +23,24 @@
 //! whose producer is on a *different* queue may go at once, because that
 //! producer has its own path and the wait will be released from it.
 //!
+//! # Which waits reach this gate
+//!
+//! A wait the device satisfies on the CPU — held until the producer publishes,
+//! then released — never reaches here, because [`crate::ready`] already will not
+//! call the waiter ready until the producer has *completed*, which is strictly
+//! stronger than waiting for it to be submitted. The waits this gate is for are
+//! the ones forwarded to the device as timeline waits, where the waiter is
+//! submittable while its producer is still running and the GPU does the waiting.
+//! That is the arrangement the plan asks for — cross-queue dependencies become
+//! timeline waits — and it is precisely the arrangement in which submitting the
+//! waiter first can strand it.
+//!
+//! Which waits are forwarded is an executor decision and not this module's, and
+//! it is expressed by where the caller puts them: a CPU-held wait goes to
+//! [`crate::session::Packet::stamp_waits`], and a forwarded one goes to
+//! [`SubmitGate::admit`] as a producer. A wait passed to both is merely
+//! redundant, not wrong.
+//!
 //! # Holding is not blocking
 //!
 //! [`SubmitGate::admit`] returns an answer; it never waits. A held transaction
