@@ -42,6 +42,7 @@ pub mod ready;
 pub mod render;
 pub mod resolve;
 pub mod resource_state;
+pub mod schedule;
 pub mod session;
 pub mod stream;
 pub mod sync;
