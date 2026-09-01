@@ -235,6 +235,7 @@ pub(crate) fn registry(
         .apply(&LifecycleOp::DefineTask {
             task,
             kernel: false,
+            directory: crate::identity::DirectoryFrame(0x1000),
         })
         .expect("a fresh task");
     for &slot in slots {

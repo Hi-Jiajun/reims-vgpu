@@ -501,6 +501,7 @@ fn registry_holding(seen: &std::collections::BTreeSet<u32>) -> Lifecycle {
     // definition owes no transfer and frees no storage.
     let _ = model
         .apply(&LifecycleOp::DefineTask {
+            directory: reims_vgpu_core::identity::DirectoryFrame(0x1000),
             task: TASK,
             kernel: false,
         })

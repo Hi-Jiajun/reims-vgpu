@@ -164,6 +164,17 @@ pub struct MappingId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskId(pub u32);
 
+/// The guest page frame a task's page-table root sits at.
+///
+/// A task's address space *is* this number: two definitions of one task id with
+/// the same root are the same space re-declared, and two with different roots
+/// are different spaces under one name — which is why the model keeps it rather
+/// than only the id. It is a page frame and not an address; what the frame
+/// contains, and how a walk of it translates anything, belongs to the layer
+/// that can read guest pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DirectoryFrame(pub u32);
+
 /// A name in the kernel **object-list** ref space: what a task's object list is
 /// keyed by, and what a decoded command resolves its objects out of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

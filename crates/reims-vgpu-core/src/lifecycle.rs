@@ -57,7 +57,7 @@ use crate::access::{
 };
 use crate::content::{ContentLedger, Replica, Transfer};
 use crate::heap::{self, HeapPlacement, Heaps, Retirement};
-use crate::identity::{ChannelId, ObjectListRef, ResourceId, TaskId};
+use crate::identity::{ChannelId, DirectoryFrame, ObjectListRef, ResourceId, TaskId};
 use crate::namespace::{self, Namespace, Teardown};
 use crate::transaction::{classify, PayloadClass};
 use reims_vgpu_protocol::fifo;
@@ -200,6 +200,24 @@ pub enum LifecycleOp {
         /// zero. They are not the same registration and their teardowns do not
         /// cost the same.
         kernel: bool,
+        /// The page frame the task's page table is rooted at.
+        ///
+        /// **What makes a redefinition of a live task answerable.** A guest
+        /// does redefine one, and the question that decides what survives is
+        /// whether the root moved: a definition at the same root re-declares
+        /// the space it already had, and one at a different root means every
+        /// address this device resolved through the old table now translates
+        /// somewhere else — including the object list itself, which reads back
+        /// as zeros through the new one.
+        ///
+        /// The packet's fourth word, the address-space length, is **not** here.
+        /// No decision in this crate is a function of it — the model holds
+        /// nothing keyed by a guest address, which is the same reason
+        /// [`Self::MapMemory`] is an obligation rather than a table — and a
+        /// field nothing reads is one that quietly acquires a wrong meaning. It
+        /// stays on [`reims_vgpu_protocol::fifo::DefineTaskCommand`] for the
+        /// layer that walks the space.
+        directory: DirectoryFrame,
     },
     DeleteTask {
         task: TaskId,
@@ -375,6 +393,30 @@ pub struct Effects {
     /// Address intervals whose translations the guest has changed under this
     /// device.
     pub remapped: Vec<Remap>,
+    /// Task address spaces this transaction replaced under a live id.
+    pub redefined: Vec<Redefinition>,
+}
+
+/// A live task redefined: the whole address space replaced under one id.
+///
+/// An obligation of the same kind [`Remap`] is, and a wider one. A remap moves
+/// an interval; this replaces the table every interval was resolved through, so
+/// *every* resolution held for the task is answered by the wrong pages
+/// afterwards. The teardowns the redefinition performed travel in the same
+/// [`Effects`] — nothing is orphaned — and this is what says the survivors'
+/// cached addresses are not survivors.
+///
+/// `root_moved` is the distinction that decides how bad it is. A redefinition
+/// at the same root re-declares the space the task already had, and what the
+/// guest published into it is still there; one at a different root means the
+/// object list itself is now a different page, and everything published into
+/// the old one reads back as whatever the new pages hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redefinition {
+    pub task: TaskId,
+    pub previous: DirectoryFrame,
+    pub directory: DirectoryFrame,
+    pub root_moved: bool,
 }
 
 /// An interval of a task's address space whose translations have changed.
@@ -712,6 +754,7 @@ pub fn task_lifetime(kind: LifecycleKind, payload: &[u8]) -> Result<LifecycleOp,
             Ok(LifecycleOp::DefineTask {
                 task: TaskId(command.id.task_id),
                 kernel: command.id.kernel,
+                directory: DirectoryFrame(command.directory_pfn),
             })
         }
         LifecycleKind::DeleteTask => {
@@ -837,11 +880,7 @@ pub enum Refusal {
     NoSuchTask {
         task: TaskId,
     },
-    /// A live task cannot be redefined. Silently replacing would orphan every
-    /// object the previous definition owns.
-    TaskExists {
-        task: TaskId,
-    },
+
     Namespace {
         task: TaskId,
         refusal: namespace::Refusal,
@@ -863,7 +902,6 @@ impl Refusal {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::NoSuchTask { .. } => "lifecycle_no_such_task",
-            Self::TaskExists { .. } => "lifecycle_task_exists",
             Self::Namespace { .. } => "lifecycle_namespace",
             Self::Heap { .. } => "lifecycle_heap",
             Self::PlacedResourceHasNoPhysical { .. } => "lifecycle_placed_resource_has_no_physical",
@@ -947,11 +985,25 @@ impl Resident {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Task {
+    /// The page frame its page table is rooted at. See
+    /// [`crate::identity::DirectoryFrame`].
+    directory: DirectoryFrame,
     namespace: Namespace,
     heaps: Heaps,
     resident: HashMap<ResourceId, Resident>,
+}
+
+impl Task {
+    fn new(directory: DirectoryFrame) -> Self {
+        Self {
+            directory,
+            namespace: Namespace::new(),
+            heaps: Heaps::default(),
+            resident: HashMap::new(),
+        }
+    }
 }
 
 /// The resource-lifecycle owner for one session generation.
@@ -1182,7 +1234,9 @@ impl Lifecycle {
     /// name.
     pub fn apply(&mut self, op: &LifecycleOp) -> Result<Effects, Refusal> {
         match op {
-            LifecycleOp::DefineTask { task, .. } => self.define_task(*task),
+            LifecycleOp::DefineTask {
+                task, directory, ..
+            } => self.define_task(*task, *directory),
             LifecycleOp::DeleteTask { task } => self.delete_task(*task),
             LifecycleOp::CreateResource {
                 task,
@@ -1282,12 +1336,39 @@ impl Lifecycle {
         Ok(())
     }
 
-    fn define_task(&mut self, task: TaskId) -> Result<Effects, Refusal> {
-        if self.tasks.contains_key(&task) {
-            return Err(Refusal::TaskExists { task });
-        }
-        self.tasks.insert(task, Task::default());
-        Ok(Effects::default())
+    /// Install a task's address space, replacing one already under the id.
+    ///
+    /// **A live task is redefined, and refusing it loses the packet.** The
+    /// previous position here was that silently replacing would orphan every
+    /// object the old definition owns — which is true, and is an argument
+    /// against replacing *silently* rather than against replacing. The guest
+    /// does this: one macOS release never redefines a live task and a later one
+    /// does, so a model that refuses it refuses an ordinary packet on the
+    /// second.
+    ///
+    /// So the replacement goes through the same teardown a delete does, and
+    /// nothing is orphaned: every resource retires by name, every heap that
+    /// held the last allocation frees its storage, and all of it travels in the
+    /// returned effects. What the caller additionally gets is a
+    /// [`Redefinition`], because the objects are only half of it — every
+    /// address resolved through the old page table is answered by the wrong
+    /// pages now, and this crate holds no such resolution to invalidate.
+    fn define_task(&mut self, task: TaskId, directory: DirectoryFrame) -> Result<Effects, Refusal> {
+        let effects = match self.tasks.get(&task).map(|t| t.directory) {
+            Some(previous) => {
+                let mut effects = self.delete_task(task)?;
+                effects.redefined.push(Redefinition {
+                    task,
+                    previous,
+                    directory,
+                    root_moved: previous != directory,
+                });
+                effects
+            }
+            None => Effects::default(),
+        };
+        self.tasks.insert(task, Task::new(directory));
+        Ok(effects)
     }
 
     fn delete_task(&mut self, task: TaskId) -> Result<Effects, Refusal> {
@@ -1591,6 +1672,7 @@ mod tests {
             &LifecycleOp::DefineTask {
                 task: TASK,
                 kernel: false,
+                directory: DirectoryFrame(0x1000),
             },
         );
         apply_inert(
@@ -1870,6 +1952,7 @@ mod tests {
             &LifecycleOp::DefineTask {
                 task: TASK,
                 kernel: false,
+                directory: DirectoryFrame(0x1000),
             },
         );
         l.declare_heap(TASK, 3, BackingId(50), 4096).expect("heap");
@@ -1907,6 +1990,7 @@ mod tests {
             &LifecycleOp::DefineTask {
                 task: TASK,
                 kernel: false,
+                directory: DirectoryFrame(0x1000),
             },
         );
         l.declare_heap(TASK, 3, BackingId(50), 4096).expect("heap");
@@ -1948,6 +2032,7 @@ mod tests {
             &LifecycleOp::DefineTask {
                 task: TASK,
                 kernel: false,
+                directory: DirectoryFrame(0x1000),
             },
         );
         l.declare_heap(TASK, 3, BackingId(50), 4096).expect("heap");
@@ -1986,17 +2071,83 @@ mod tests {
         );
     }
 
+    /// A live task is redefined by the guest, and the model replaces it rather
+    /// than refusing the packet.
+    ///
+    /// Refusing was the previous answer, on the ground that replacing silently
+    /// would orphan the objects the old definition owns. It does — so the
+    /// replacement is the delete's own teardown path, and the orphans arrive as
+    /// effects instead of being invented away.
     #[test]
-    fn a_live_task_cannot_be_redefined() {
-        let (mut l, _) = with_one_resource(256);
-        assert_eq!(
-            l.apply(&LifecycleOp::DefineTask {
+    fn a_live_task_is_redefined_and_its_objects_retire_by_name() {
+        let (mut l, id) = with_one_resource(256);
+        let effects = l
+            .apply(&LifecycleOp::DefineTask {
                 task: TASK,
                 kernel: false,
-            }),
-            Err(Refusal::TaskExists { task: TASK }),
-            "silently replacing would orphan every object it owns"
+                directory: DirectoryFrame(0x2000),
+            })
+            .expect("a guest redefines a live task");
+        assert_eq!(
+            effects.redefined,
+            vec![Redefinition {
+                task: TASK,
+                previous: DirectoryFrame(0x1000),
+                directory: DirectoryFrame(0x2000),
+                root_moved: true,
+            }]
         );
+        assert!(
+            !effects.teardowns.is_empty(),
+            "the resource the old definition owned retired by name"
+        );
+        // The name is the previous space's and does not resolve in the new one.
+        assert_eq!(
+            l.resolve(TASK, id),
+            Err(Refusal::Namespace {
+                task: TASK,
+                refusal: namespace::Refusal::NotDeclared { slot: id.slot },
+            })
+        );
+    }
+
+    /// A redefinition at the same root is still a redefinition — the objects go
+    /// either way — and it says the root did not move, because what the guest
+    /// published into that page is still in it.
+    #[test]
+    fn a_redefinition_at_the_same_root_says_so() {
+        let (mut l, _) = with_one_resource(256);
+        let effects = l
+            .apply(&LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+                directory: DirectoryFrame(0x1000),
+            })
+            .expect("redefined");
+        assert_eq!(
+            effects.redefined,
+            vec![Redefinition {
+                task: TASK,
+                previous: DirectoryFrame(0x1000),
+                directory: DirectoryFrame(0x1000),
+                root_moved: false,
+            }]
+        );
+    }
+
+    /// A first definition replaces nothing and says nothing about a space that
+    /// was not there.
+    #[test]
+    fn a_first_definition_is_not_a_redefinition() {
+        let mut l = Lifecycle::new();
+        let effects = l
+            .apply(&LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+                directory: DirectoryFrame(0x1000),
+            })
+            .expect("a fresh task");
+        assert_eq!(effects, Effects::default());
     }
 
     /// The contract retires the backing *and* the resources that named it, so
@@ -2009,6 +2160,7 @@ mod tests {
             &LifecycleOp::DefineTask {
                 task: TASK,
                 kernel: false,
+                directory: DirectoryFrame(0x1000),
             },
         );
         for slot in 0..2 {
@@ -2103,11 +2255,16 @@ mod tests {
             .to_raw()
             .to_le_bytes(),
         );
+        // The page-table root, at its own offset. A definition that read it
+        // from anywhere else would name a page the guest did not.
+        define[fifo::DEFINE_TASK_DIRECTORY_PFN..fifo::DEFINE_TASK_DIRECTORY_PFN + 4]
+            .copy_from_slice(&0x1000u32.to_le_bytes());
         assert_eq!(
             task_lifetime(LifecycleKind::DefineTask, &define),
             Ok(LifecycleOp::DefineTask {
                 task: TaskId(1),
                 kernel: false,
+                directory: DirectoryFrame(0x1000),
             })
         );
         assert_eq!(
@@ -2131,6 +2288,7 @@ mod tests {
             Ok(LifecycleOp::DefineTask {
                 task: TaskId(0),
                 kernel: true,
+                directory: DirectoryFrame(0),
             })
         );
     }
@@ -2539,7 +2697,6 @@ mod tests {
     fn every_refusal_has_its_own_slug() {
         let all = [
             Refusal::NoSuchTask { task: TASK },
-            Refusal::TaskExists { task: TASK },
             Refusal::Namespace {
                 task: TASK,
                 refusal: namespace::Refusal::NotDeclared {
@@ -2568,6 +2725,7 @@ mod tests {
             &LifecycleOp::DefineTask {
                 task: TASK,
                 kernel: false,
+                directory: DirectoryFrame(0x1000),
             },
         );
         l.declare_heap(TASK, 3, BackingId(50), 4096).expect("heap");

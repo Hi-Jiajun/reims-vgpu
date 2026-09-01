@@ -661,6 +661,7 @@ mod tests {
             .apply(&crate::lifecycle::LifecycleOp::DefineTask {
                 task: crate::identity::TaskId(1),
                 kernel: false,
+                directory: crate::identity::DirectoryFrame(0x1000),
             })
             .expect("a fresh task");
         let _ = model
