@@ -5832,6 +5832,97 @@ fn a_view_mapping_that_offsets_a_view_is_named_apart_from_a_count_above_one() {
     assert_eq!(store_route_count(mapping) - b, 2);
 }
 
+/// All four residency forms reach the residency routes, including the two the
+/// render encoder inherits rather than declares.
+///
+/// `useHeaps:count:` and `useResources:count:usage:` are declared on the shared
+/// encoder base class, so they are absent from the serializer manifest while
+/// being callable on a render encoder — the worked example the closure ledger's
+/// `OFF_MANIFEST` names. The render rail once knew only the two
+/// `stages:`-qualified overrides, and an unqualified record reached no arm and
+/// was reported as `accepted_without_executor`: a residency declaration whose
+/// class nothing classified, sitting in a counter that says only "some opcode".
+///
+/// The decoder's own tests pin that all four decode. This is the other half:
+/// that the executor routes all four by *class* rather than dropping half the
+/// family into the unimplemented counter. Driven per opcode, because that is the
+/// axis the regression ran along.
+#[test]
+fn every_residency_form_reaches_a_residency_route_and_not_the_unimplemented_one() {
+    use crate::runtime::decode::render;
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::residency::ResourceUsage;
+
+    // Each form's refs start at its own offset — the heads are three different
+    // sizes — so the record is built from the decoder's own constants rather
+    // than from one literal that would be wrong for three of the four.
+    let record = |op: u32, refs_at: usize| {
+        let total = reims_vgpu_wire::OP_HEADER_LEN + refs_at + 4;
+        let mut v = vec![0u8; total];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total as u32);
+        st32(
+            &mut v[reims_vgpu_wire::OP_HEADER_LEN + render::RESIDENCY_COUNT..],
+            1,
+        );
+        v
+    };
+
+    let forms = [
+        (
+            wire_render::OPCODE_USE_RESOURCE,
+            render::USE_RESOURCE_REFS,
+            "render_residency_empty",
+        ),
+        (
+            wire_render::OPCODE_USE_HEAP,
+            render::USE_HEAP_REFS,
+            "render_residency_heap",
+        ),
+        (
+            wire_render::OPCODE_USE_RESOURCES_NO_STAGES,
+            render::USE_RESOURCES_NO_STAGES_REFS,
+            "render_residency_empty",
+        ),
+        (
+            wire_render::OPCODE_USE_HEAPS_NO_STAGES,
+            render::USE_HEAPS_NO_STAGES_REFS,
+            "render_residency_heap",
+        ),
+    ];
+
+    for (op, refs_at, route) in forms {
+        let command = record(op, refs_at);
+        let decoded = render::decode(&command).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
+        assert_eq!(
+            decoded.residency_usage,
+            ResourceUsage(0),
+            "op {op:#x}: the fixture declares no usage"
+        );
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let before = store_route_count(route);
+        let cap = crate::observe::sink::FailCapture::start();
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            store_route_count(route) - before,
+            1,
+            "op {op:#x} did not reach {route}"
+        );
+        assert!(
+            !cap.lines()
+                .iter()
+                .any(|l| l.contains("accepted_without_executor")),
+            "op {op:#x} was reported as an opcode with no arm rather than as a \
+             residency declaration: {:?}",
+            cap.lines()
+        );
+    }
+}
+
 /// A residency declaration that names a GPU **write** is not the record the
 /// no-op argument covers.
 ///
