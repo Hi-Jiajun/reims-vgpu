@@ -1,0 +1,29 @@
+//! Reims vGPU protocol: the first layer allowed to say what a wire tag *means*.
+//!
+//! # Why this is a crate
+//!
+//! `reims-vgpu-wire` answers one question and refuses the next one. It says
+//! which bytes a serializer record is made of, and it is deliberately unable to
+//! say what the device owes the guest in return — a view that knew that would be
+//! a view with a policy in it. Everything above wire has historically answered
+//! the second question wherever it happened to be standing: a decode arm, an
+//! executor match, a census route name, a comment. That is why the same
+//! operation could be a no-op in one rail's reading and a dropped command in
+//! another's, with nothing able to compare the two.
+//!
+//! This crate is the one place the second question is answered, and it depends
+//! only on wire so the compiler can keep it that way: no device state, no
+//! backend, no host OS, no allocation policy. `#![no_std]`.
+//!
+//! # The parts
+//!
+//! - [`closure`] — the refusal-closure ledger. For every decodable operation,
+//!   exactly one outcome: implemented, contract-proven no-op on a named
+//!   capability cell, contract-proven unsupported with its exact refusal, or
+//!   unresolved and therefore blocking. "The current workload does not use it"
+//!   and "the old backend drops it" are not outcomes and cannot be spelled here.
+
+#![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_op_in_unsafe_fn)]
+
+pub mod closure;

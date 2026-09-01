@@ -1187,6 +1187,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "reims-vgpu-protocol"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-wire",
+]
+
+[[package]]
 name = "reims-vgpu-wire"
 version = "0.1.0"
 dependencies = [

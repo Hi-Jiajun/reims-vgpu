@@ -1,0 +1,15 @@
+[package]
+name = "reims-vgpu-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "The first layer allowed to assign meaning to Apple paravirtualized GPU wire tags"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_protocol"
+
+# Wire only. This crate reads the byte-accurate views and the coverage manifest
+# and says what each decodable operation *means*; it must not reach the device,
+# a backend, or the host OS. `#![no_std]` keeps that structural.
+[dependencies]
+reims-vgpu-wire = { path = "../reims-vgpu-wire" }

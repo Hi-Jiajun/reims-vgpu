@@ -11,6 +11,7 @@ members = [
   "crates/reims-vgpu-env",
   "crates/reims-vgpu-observe",
   "crates/reims-vgpu-paging",
+  "crates/reims-vgpu-protocol",
   "crates/reims-vgpu-wire",
 ]
 exclude = [
