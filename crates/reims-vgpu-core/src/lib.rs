@@ -23,4 +23,5 @@
 #![forbid(unsafe_code)]
 
 pub mod identity;
+pub mod operation;
 pub mod transaction;
