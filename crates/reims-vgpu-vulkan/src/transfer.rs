@@ -65,9 +65,19 @@ pub enum Refusal {
     /// The guest's format has no block geometry this build knows, so no pitch
     /// conversion exists for it.
     UnknownFormatGeometry { format: u16 },
-    /// A fill whose offset or length is not four-byte aligned. See the module
-    /// doc.
-    UnalignedFill { offset: u64, length: u64 },
+    /// A fill whose offset or length is not four-byte aligned, and whose
+    /// pattern is four bytes wide.
+    ///
+    /// The byte-wide pattern has a ragged form — see [`plan_fill`] — because
+    /// every byte of the range takes the same value and the phase of the
+    /// pattern therefore does not exist. A four-byte pattern has a phase, and
+    /// which byte of it lands on a range that does not start at a multiple of
+    /// four is not a term this wire has established. Refused rather than
+    /// guessed: a wrong phase writes the right number of bytes in the wrong
+    /// order, everywhere, and nothing downstream can see it.
+    RaggedPatternFill { offset: u64, length: u64 },
+    /// The scratch memory a ragged fill needs was not available.
+    NoStaging { refusal: crate::staging::Refusal },
     /// A fill or copy of no bytes.
     EmptyRange,
     /// A dimension larger than the 32-bit fields a native copy carries.
@@ -92,7 +102,8 @@ impl Refusal {
             Self::RowPitchNotWholeBlocks { .. } => "vk_transfer_row_pitch_not_whole_blocks",
             Self::ImagePitchNotWholeRows { .. } => "vk_transfer_image_pitch_not_whole_rows",
             Self::UnknownFormatGeometry { .. } => "vk_transfer_unknown_format_geometry",
-            Self::UnalignedFill { .. } => "vk_transfer_unaligned_fill",
+            Self::RaggedPatternFill { .. } => "vk_transfer_ragged_pattern_fill",
+            Self::NoStaging { .. } => "vk_transfer_no_staging",
             Self::EmptyRange => "vk_transfer_empty_range",
             Self::ExtentTooLarge { .. } => "vk_transfer_extent_too_large",
             Self::NotACopy { .. } => "vk_transfer_not_a_copy",
@@ -123,9 +134,10 @@ impl std::fmt::Display for Refusal {
             Self::UnknownFormatGeometry { format } => {
                 write!(f, "{} format={format}", self.slug())
             }
-            Self::UnalignedFill { offset, length } => {
+            Self::RaggedPatternFill { offset, length } => {
                 write!(f, "{} offset={offset} length={length}", self.slug())
             }
+            Self::NoStaging { refusal } => write!(f, "{} {refusal}", self.slug()),
             Self::EmptyRange => f.write_str(self.slug()),
             Self::ExtentTooLarge { axis, value } => {
                 write!(f, "{} axis={axis} value={value}", self.slug())
@@ -162,12 +174,6 @@ pub enum Command {
         source: vk::Image,
         dest: vk::Image,
         regions: Vec<vk::ImageCopy>,
-    },
-    FillBuffer {
-        dest: vk::Buffer,
-        offset: u64,
-        size: u64,
-        data: u32,
     },
 }
 
@@ -417,23 +423,10 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                 regions,
             })
         }
-        BlitOp::FillBuffer { dest, pattern } => {
-            if dest.length == 0 {
-                return Err(Refusal::EmptyRange);
-            }
-            if !dest.offset.is_multiple_of(4) || !dest.length.is_multiple_of(4) {
-                return Err(Refusal::UnalignedFill {
-                    offset: dest.offset,
-                    length: dest.length,
-                });
-            }
-            Ok(Command::FillBuffer {
-                dest: resolved(residency.buffer(dest.buffer))?.buffer,
-                offset: dest.offset,
-                size: dest.length,
-                data: fill_word(pattern),
-            })
-        }
+        // A fill is not a copy, and a ragged one is not even one command. See
+        // [`plan_fill`], which is the only thing that can answer it, because
+        // it needs the scratch memory this signature has no access to.
+        BlitOp::FillBuffer { .. } => Err(Refusal::NotACopy { op: "fill_buffer" }),
         // A filtered reduction with a barrier between every pair of levels,
         // not a copy: see [`crate::mipmap`]. Refused here rather than absorbed
         // into one of the copies above, because a mipmap generation recorded
@@ -447,6 +440,150 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
             })
         }
     }
+}
+
+/// The interior of a fill, as `vkCmdFillBuffer` takes it.
+///
+/// Its own type rather than a [`Command`], so a [`FillPlan`] stays comparable:
+/// a plan whose parts cannot be compared is one whose split cannot be asserted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillRange {
+    pub offset: u64,
+    pub size: u64,
+    pub data: u32,
+}
+
+/// The bytes a ragged fill's edge needs, and where they go.
+///
+/// The caller writes `byte` into every one of `length` bytes at the window,
+/// flushes if the mapping is not coherent, and copies the window into the
+/// destination buffer at `dest_offset`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StagedEdge {
+    pub window: crate::staging::Window,
+    pub byte: u8,
+    pub dest_offset: u64,
+    pub length: u64,
+}
+
+/// A fill, split into the part a native fill command can do and the edges it
+/// cannot.
+///
+/// `head` and `tail` are at most three bytes each, so the scratch this costs
+/// is six bytes whatever the size of the fill — the middle is still one
+/// `vkCmdFillBuffer` over everything else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a fill plan whose edges are not written leaves the range partly unfilled"]
+pub struct FillPlan {
+    pub dest: vk::Buffer,
+    /// The unaligned bytes before the first four-byte boundary in the range.
+    pub head: Option<StagedEdge>,
+    /// The four-byte-aligned interior. `None` only for a range too short to
+    /// contain one.
+    pub middle: Option<FillRange>,
+    /// The unaligned bytes after the last four-byte boundary in the range.
+    pub tail: Option<StagedEdge>,
+}
+
+/// Plan a buffer fill, using scratch memory for the edges a native fill cannot
+/// reach.
+///
+/// `vkCmdFillBuffer` requires a four-byte-aligned offset and size, and
+/// `fillBuffer:range:` does not. Refusing the whole fill for that would lose a
+/// legal guest command; rounding out would write bytes outside the range the
+/// guest named, and rounding in would leave bytes inside it unwritten. So the
+/// range is split: the interior is one fill command, and the at-most-three
+/// bytes at each end are staged and copied. A copy has no alignment rule at
+/// all, which is exactly why the edges go through one.
+///
+/// # Errors
+///
+/// [`Refusal`]. Scratch is taken in one allocation covering both edges, so a
+/// refusal leaves the arena as it was rather than stranding a head window
+/// whose tail could not be found.
+pub fn plan_fill(
+    span: reims_vgpu_core::blit::BufferSpan,
+    pattern: reims_vgpu_core::blit::FillPattern,
+    residency: &Residency,
+    arena: &mut crate::staging::Arena,
+) -> Result<FillPlan, Refusal> {
+    use reims_vgpu_core::blit::FillPattern;
+
+    if span.length == 0 {
+        return Err(Refusal::EmptyRange);
+    }
+    let dest = resolved(residency.buffer(span.buffer))?.buffer;
+
+    // The bytes before the first four-byte boundary inside the range, and
+    // after the last one. Both are zero for an aligned range, which is the
+    // common case and costs no scratch at all.
+    let head_length = (4 - span.offset % 4) % 4;
+    let head_length = head_length.min(span.length);
+    let remaining = span.length - head_length;
+    let middle_length = remaining & !3;
+    let tail_length = remaining & 3;
+
+    if head_length == 0 && tail_length == 0 {
+        return Ok(FillPlan {
+            dest,
+            head: None,
+            middle: Some(FillRange {
+                offset: span.offset,
+                size: span.length,
+                data: fill_word(pattern),
+            }),
+            tail: None,
+        });
+    }
+
+    // A byte pattern has no phase: every byte of the range takes the value, so
+    // splitting the range changes nothing. A four-byte pattern does have one,
+    // and which of its bytes lands on an unaligned start is not established.
+    let FillPattern::Byte(byte) = pattern else {
+        return Err(Refusal::RaggedPatternFill {
+            offset: span.offset,
+            length: span.length,
+        });
+    };
+
+    // One allocation for both edges, so there is one failure point and no
+    // stranded window on it.
+    let scratch = arena
+        .allocate(head_length + tail_length, 1)
+        .map_err(|refusal| Refusal::NoStaging { refusal })?;
+
+    let head = (head_length > 0).then_some(StagedEdge {
+        window: crate::staging::Window {
+            chunk: scratch.chunk,
+            offset: scratch.offset,
+            size: head_length,
+        },
+        byte,
+        dest_offset: span.offset,
+        length: head_length,
+    });
+    let tail = (tail_length > 0).then_some(StagedEdge {
+        window: crate::staging::Window {
+            chunk: scratch.chunk,
+            offset: scratch.offset + head_length,
+            size: tail_length,
+        },
+        byte,
+        dest_offset: span.offset + head_length + middle_length,
+        length: tail_length,
+    });
+    let middle = (middle_length > 0).then_some(FillRange {
+        offset: span.offset + head_length,
+        size: middle_length,
+        data: fill_word(pattern),
+    });
+
+    Ok(FillPlan {
+        dest,
+        head,
+        middle,
+        tail,
+    })
 }
 
 /// One `VkBufferImageCopy`, whichever direction it goes.
@@ -991,54 +1128,195 @@ mod tests {
         assert_eq!(fill_word(FillPattern::Pattern4(0x1234_5678)), 0x1234_5678);
     }
 
+    fn arena() -> crate::staging::Arena {
+        crate::staging::Arena::adopt(
+            256,
+            64,
+            vec![vk::Buffer::from_raw(0xFF)],
+            vec![vk::DeviceMemory::from_raw(0xFF)],
+            vec![std::ptr::null_mut()],
+        )
+    }
+
+    fn span(offset: u64, length: u64) -> BufferSpan {
+        BufferSpan {
+            buffer: id(BUFFER_A),
+            offset,
+            length,
+        }
+    }
+
     #[test]
-    fn an_aligned_fill_becomes_one_command_and_a_ragged_one_refuses() {
+    fn a_fill_is_not_a_copy_and_the_copy_planner_says_so() {
         let residency = populated();
-        let planned = plan(
-            &BlitOp::FillBuffer {
-                dest: BufferSpan {
-                    buffer: id(BUFFER_A),
-                    offset: 64,
-                    length: 256,
+        assert_eq!(
+            plan(
+                &BlitOp::FillBuffer {
+                    dest: span(0, 16),
+                    pattern: FillPattern::Byte(0),
                 },
-                pattern: FillPattern::Byte(0xFF),
-            },
+                &residency,
+            )
+            .err(),
+            Some(Refusal::NotACopy { op: "fill_buffer" })
+        );
+    }
+
+    #[test]
+    fn an_aligned_fill_is_one_command_and_costs_no_scratch() {
+        let residency = populated();
+        let mut arena = arena();
+        let planned = plan_fill(
+            span(64, 256),
+            FillPattern::Byte(0xFF),
             &residency,
+            &mut arena,
         )
         .expect("plannable");
-        let Command::FillBuffer {
-            dest,
-            offset,
-            size,
-            data,
-        } = planned
-        else {
-            panic!("a fill");
-        };
-        assert_eq!(dest.as_raw(), 0xB1);
-        assert_eq!(offset, 64);
-        assert_eq!(size, 256);
-        assert_eq!(data, 0xFFFF_FFFF);
+        assert_eq!(planned.dest.as_raw(), 0xB1);
+        assert_eq!(planned.head, None);
+        assert_eq!(planned.tail, None);
+        assert_eq!(
+            planned.middle,
+            Some(FillRange {
+                offset: 64,
+                size: 256,
+                data: 0xFFFF_FFFF,
+            })
+        );
+        // The common case must not touch the arena at all.
+        assert_eq!(arena.census().allocated, 0);
+    }
 
-        // Neither rounded out — which writes outside the range the guest named
-        // — nor rounded in, which leaves bytes inside it unwritten.
-        for (offset, length) in [(65u64, 256u64), (64, 255), (1, 1)] {
-            assert_eq!(
-                plan(
-                    &BlitOp::FillBuffer {
-                        dest: BufferSpan {
-                            buffer: id(BUFFER_A),
-                            offset,
-                            length,
-                        },
-                        pattern: FillPattern::Byte(0),
-                    },
-                    &residency,
-                )
-                .err(),
-                Some(Refusal::UnalignedFill { offset, length })
-            );
-        }
+    #[test]
+    fn a_ragged_fill_stages_both_edges_and_fills_the_interior() {
+        let residency = populated();
+        let mut arena = arena();
+        // 65..=263: one byte before the boundary at 68, one after the last at
+        // 260.
+        let planned = plan_fill(
+            span(65, 198),
+            FillPattern::Byte(0xAB),
+            &residency,
+            &mut arena,
+        )
+        .expect("plannable");
+
+        let head = planned.head.expect("a head");
+        let tail = planned.tail.expect("a tail");
+        let middle = planned.middle.expect("an interior");
+
+        // Exactly the guest's range, once: no byte outside it and none inside
+        // it left out.
+        assert_eq!(head.dest_offset, 65);
+        assert_eq!(head.length, 3);
+        assert_eq!(middle.offset, 68);
+        assert_eq!(middle.size, 192);
+        assert_eq!(tail.dest_offset, 260);
+        assert_eq!(tail.length, 3);
+        assert_eq!(head.dest_offset + head.length, middle.offset);
+        assert_eq!(middle.offset + middle.size, tail.dest_offset);
+        assert_eq!(tail.dest_offset + tail.length, 65 + 198);
+
+        assert_eq!(head.byte, 0xAB);
+        assert_eq!(tail.byte, 0xAB);
+        assert_eq!(middle.data, 0xABAB_ABAB);
+
+        // Six bytes of scratch whatever the size of the fill, in one
+        // allocation so there is one failure point.
+        assert_eq!(arena.census().allocated, 1);
+        assert_eq!(head.window.chunk, tail.window.chunk);
+        assert_eq!(head.window.end(), tail.window.offset);
+        assert_eq!(head.window.size + tail.window.size, 6);
+    }
+
+    #[test]
+    fn a_fill_too_short_to_reach_a_boundary_is_all_edge() {
+        let residency = populated();
+        let mut arena = arena();
+        let planned =
+            plan_fill(span(1, 2), FillPattern::Byte(7), &residency, &mut arena).expect("plannable");
+        let head = planned.head.expect("a head");
+        assert_eq!(head.dest_offset, 1);
+        assert_eq!(head.length, 2);
+        assert_eq!(planned.middle, None);
+        assert_eq!(planned.tail, None);
+    }
+
+    #[test]
+    fn a_ragged_four_byte_pattern_refuses_because_its_phase_is_not_established() {
+        let residency = populated();
+        let mut arena = arena();
+        assert_eq!(
+            plan_fill(
+                span(1, 16),
+                FillPattern::Pattern4(0x1234_5678),
+                &residency,
+                &mut arena,
+            )
+            .err(),
+            Some(Refusal::RaggedPatternFill {
+                offset: 1,
+                length: 16,
+            })
+        );
+        // Refused before anything was taken.
+        assert_eq!(arena.census().allocated, 0);
+        // And the aligned form of the same pattern is fine, which is what
+        // makes this a phase question and not a pattern one.
+        assert!(plan_fill(
+            span(4, 16),
+            FillPattern::Pattern4(0x1234_5678),
+            &residency,
+            &mut arena,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_fill_of_no_bytes_and_one_naming_nothing_refuse_before_the_arena() {
+        let residency = populated();
+        let mut arena = arena();
+        assert_eq!(
+            plan_fill(span(0, 0), FillPattern::Byte(0), &residency, &mut arena).err(),
+            Some(Refusal::EmptyRange)
+        );
+        assert_eq!(
+            plan_fill(
+                BufferSpan {
+                    buffer: id(99),
+                    offset: 1,
+                    length: 8,
+                },
+                FillPattern::Byte(0),
+                &residency,
+                &mut arena,
+            )
+            .err(),
+            Some(Refusal::Unresolved {
+                miss: Miss::Unknown {
+                    slot: ObjectListRef(99)
+                }
+            })
+        );
+        assert_eq!(arena.census().allocated, 0);
+    }
+
+    #[test]
+    fn a_ragged_fill_with_no_scratch_left_refuses_with_the_arenas_own_reason() {
+        let residency = populated();
+        let mut arena = arena();
+        let _ = arena.allocate(256, 1).expect("the whole chunk");
+        arena.submitted(TimelinePoint(1));
+        let refusal = plan_fill(span(1, 16), FillPattern::Byte(0), &residency, &mut arena)
+            .expect_err("nothing left to stage in");
+        assert!(matches!(
+            refusal,
+            Refusal::NoStaging {
+                refusal: crate::staging::Refusal::Exhausted { .. }
+            }
+        ));
+        assert!(refusal.to_string().contains("vk_staging_exhausted"));
     }
 
     #[test]
@@ -1173,9 +1451,12 @@ mod tests {
                 bytes_per_row: 2,
             },
             Refusal::UnknownFormatGeometry { format: 1 },
-            Refusal::UnalignedFill {
+            Refusal::RaggedPatternFill {
                 offset: 1,
                 length: 1,
+            },
+            Refusal::NoStaging {
+                refusal: crate::staging::Refusal::BadAlignment { alignment: 3 },
             },
             Refusal::EmptyRange,
             Refusal::ExtentTooLarge {

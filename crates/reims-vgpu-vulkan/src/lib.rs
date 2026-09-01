@@ -61,6 +61,8 @@
 //!   is allowed to compile each, and why none of them is ever evicted.
 //! - [`resident`] — which native object a guest resource name resolves to,
 //!   and what becomes of the previous one when the guest reuses the name.
+//! - [`staging`] — host-visible scratch memory, sub-allocated linearly and
+//!   returned only by the timeline.
 //! - [`submission`] — what happens to a timeline point between reserving it
 //!   and the GPU reaching it, and why a refused one is signalled rather than
 //!   forgotten.
@@ -94,6 +96,7 @@ pub mod pools;
 pub mod queues;
 pub mod recording;
 pub mod resident;
+pub mod staging;
 pub mod submission;
 pub mod timeline;
 pub mod transfer;

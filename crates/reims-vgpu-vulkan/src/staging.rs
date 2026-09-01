@@ -1,0 +1,672 @@
+//! Host-visible scratch memory, sub-allocated linearly and recycled against
+//! the timeline.
+//!
+//! # Why a chunk is reset whole and never freed piecemeal
+//!
+//! Every staging allocation has the same lifetime: it is written by the CPU,
+//! read by one submission, and dead the moment that submission's timeline
+//! point is reached. A general allocator with a free list would be paying for
+//! fragmentation, coalescing and a per-allocation header to express a lifetime
+//! that is already known, and it would still have to consult the timeline
+//! before reusing anything.
+//!
+//! So a chunk is a bump pointer, and the only free operation is resetting a
+//! whole chunk once the GPU is past every submission that named it. The cost
+//! is that a chunk stays occupied by its longest-lived allocation; the benefit
+//! is that allocation is one add and a bound check on the hottest upload path
+//! in the device.
+//!
+//! # In flight is not free, and it is not a wait either
+//!
+//! A chunk a submission may still be reading is not writable, exactly as a
+//! command buffer is not re-recordable and a descriptor set is not rewritable
+//! — see [`crate::pools`] and [`crate::descriptor`]. Exhaustion refuses rather
+//! than blocking or resetting the oldest chunk: blocking inside an upload path
+//! makes one worker's depth every worker's latency, and resetting the oldest
+//! is a use-after-submit with extra steps.
+//!
+//! # A flush range is rounded outward, and that is why it is computed here
+//!
+//! `vkFlushMappedMemoryRanges` requires offsets and sizes that are multiples
+//! of `nonCoherentAtomSize` (except a size reaching the end of the
+//! allocation). A caller flushing exactly its own sub-allocation would be
+//! passing an unaligned range on every host whose atom is larger than the
+//! alignment it asked for. Rounding *outward* is safe — a flush makes more
+//! writes visible than asked, never fewer — and rounding inward silently drops
+//! the edge bytes of every upload. [`Arena::flush_range`] does the rounding so
+//! no call site has to know the rule.
+//!
+//! # Bookkeeping without handles
+//!
+//! [`Chunk`] holds offsets and a timeline point and no Vulkan object, so every
+//! rule above is tested on a machine with no GPU. [`Arena`] is the chunks plus
+//! the handles they name.
+
+use ash::vk;
+use reims_vgpu_core::identity::TimelinePoint;
+
+/// What one chunk is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkState {
+    /// Not yet named by any submission. May be written and sub-allocated from.
+    Open,
+    /// Named by a submission and readable by the GPU until this point.
+    Submitted(TimelinePoint),
+}
+
+/// A window of one chunk, handed to one caller.
+///
+/// Carries the chunk it came from so a flush can be computed and so a caller
+/// cannot pair an offset from one chunk with the buffer of another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a staging window that is not written and copied is capacity spent on nothing"]
+pub struct Window {
+    pub chunk: usize,
+    /// Byte offset within the chunk's buffer and its mapping.
+    pub offset: u64,
+    pub size: u64,
+}
+
+impl Window {
+    /// The end of the window, which is where the next allocation may start.
+    #[must_use]
+    pub const fn end(self) -> u64 {
+        self.offset + self.size
+    }
+}
+
+/// Why an allocation could not be made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Larger than a chunk, so no arrangement of chunks would fit it. The
+    /// caller allocates a dedicated buffer; this is not a capacity problem
+    /// that retrying solves.
+    TooLarge { requested: u64, chunk: u64 },
+    /// No chunk has room and none is free. Poll the timeline, recycle, retry
+    /// or park — see the module doc.
+    Exhausted { chunks: usize, in_flight: usize },
+    /// An alignment that is not a power of two. Every Vulkan alignment is, and
+    /// a caller passing zero or three has computed one rather than read it.
+    BadAlignment { alignment: u64 },
+}
+
+impl Refusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::TooLarge { .. } => "vk_staging_larger_than_chunk",
+            Self::Exhausted { .. } => "vk_staging_exhausted",
+            Self::BadAlignment { .. } => "vk_staging_bad_alignment",
+        }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { requested, chunk } => {
+                write!(f, "{} requested={requested} chunk={chunk}", self.slug())
+            }
+            Self::Exhausted { chunks, in_flight } => {
+                write!(f, "{} chunks={chunks} in_flight={in_flight}", self.slug())
+            }
+            Self::BadAlignment { alignment } => {
+                write!(f, "{} alignment={alignment}", self.slug())
+            }
+        }
+    }
+}
+
+/// How the arena has been used.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Census {
+    pub allocated: usize,
+    /// Allocations that fitted the chunk already open.
+    pub in_place: usize,
+    /// Allocations that had to move to another chunk. A number that tracks
+    /// `allocated` means the chunk size is too small for the frame.
+    pub rolled: usize,
+    pub recycled: usize,
+    pub refused: usize,
+    /// Bytes lost to alignment padding, which is what says whether the
+    /// alignment a caller asks for is costing anything.
+    pub padding: u64,
+}
+
+/// One chunk's bookkeeping. No Vulkan object: this is the part that can be
+/// wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunk {
+    size: u64,
+    used: u64,
+    state: ChunkState,
+}
+
+impl Chunk {
+    #[must_use]
+    pub const fn state(&self) -> ChunkState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn used(&self) -> u64 {
+        self.used
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// The chunks, and the handles they name.
+///
+/// One arena per worker, for the reason a command pool is per worker: the
+/// mapping is written by the CPU with no synchronization of its own.
+#[derive(Debug)]
+pub struct Arena {
+    chunks: Vec<Chunk>,
+    buffers: Vec<vk::Buffer>,
+    memory: Vec<vk::DeviceMemory>,
+    mapped: Vec<*mut u8>,
+    /// The chunk allocations are being taken from. Moves only when one cannot
+    /// fit, so a frame's uploads stay in one chunk and one flush covers them.
+    open: usize,
+    atom: u64,
+    census: Census,
+}
+
+// SAFETY: the mapped pointers are the only non-`Send` field, and an `Arena` is
+// owned by exactly one worker for the same reason a `VkCommandPool` is — see
+// the module doc. Moving that ownership between threads is what `Send` says,
+// and it is sound here because nothing else holds a pointer into a chunk: a
+// [`Window`] is an offset, not a reference.
+unsafe impl Send for Arena {}
+
+impl Arena {
+    /// Adopt `chunks` buffers of `size` bytes, each already allocated, bound
+    /// and mapped.
+    ///
+    /// `atom` is `VkPhysicalDeviceLimits::nonCoherentAtomSize`, which
+    /// [`Self::flush_range`] rounds to. Pass it even on a coherent allocation:
+    /// the arena does not decide whether a flush is needed, only what range
+    /// one would cover.
+    ///
+    /// # Panics
+    ///
+    /// If the three arrays disagree in length, if any is empty, if `size` is
+    /// zero, or if `atom` is not a power of two. Each is a caller that built
+    /// the arena from mismatched pieces, and every one of them produces a
+    /// pointer into the wrong allocation later.
+    #[must_use]
+    pub fn adopt(
+        size: u64,
+        atom: u64,
+        buffers: Vec<vk::Buffer>,
+        memory: Vec<vk::DeviceMemory>,
+        mapped: Vec<*mut u8>,
+    ) -> Self {
+        assert!(
+            !buffers.is_empty(),
+            "an arena with no chunks stages nothing"
+        );
+        assert!(
+            buffers.len() == memory.len() && memory.len() == mapped.len(),
+            "a chunk is a buffer, its memory and its mapping together"
+        );
+        assert!(size > 0, "a chunk of no bytes holds nothing");
+        assert!(
+            atom.is_power_of_two(),
+            "nonCoherentAtomSize is a power of two"
+        );
+        let chunks = vec![
+            Chunk {
+                size,
+                used: 0,
+                state: ChunkState::Open,
+            };
+            buffers.len()
+        ];
+        Self {
+            chunks,
+            buffers,
+            memory,
+            mapped,
+            open: 0,
+            atom,
+            census: Census::default(),
+        }
+    }
+
+    #[must_use]
+    pub const fn census(&self) -> Census {
+        self.census
+    }
+
+    #[must_use]
+    pub fn chunks(&self) -> &[Chunk] {
+        &self.chunks
+    }
+
+    #[must_use]
+    pub const fn open(&self) -> usize {
+        self.open
+    }
+
+    /// The buffer a window's bytes are copied from.
+    #[must_use]
+    pub fn buffer(&self, window: Window) -> vk::Buffer {
+        self.buffers[window.chunk]
+    }
+
+    #[must_use]
+    pub fn memory(&self, window: Window) -> vk::DeviceMemory {
+        self.memory[window.chunk]
+    }
+
+    /// A pointer to the window's first byte.
+    ///
+    /// # Safety
+    ///
+    /// The caller may write `window.size` bytes there, and only while it holds
+    /// the window. The chunk is not readable by the GPU until
+    /// [`Self::submitted`], which is what makes the write safe rather than
+    /// this function.
+    #[must_use]
+    pub unsafe fn write_at(&self, window: Window) -> *mut u8 {
+        // SAFETY: the window came from this arena, so its chunk index is in
+        // range and `offset + size` is within that chunk's mapping.
+        unsafe { self.mapped[window.chunk].add(window.offset as usize) }
+    }
+
+    /// How many chunks a submission may still be reading.
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|c| matches!(c.state, ChunkState::Submitted(_)))
+            .count()
+    }
+
+    /// Take `size` bytes aligned to `alignment`.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal`]. Nothing is taken on any of the three.
+    pub fn allocate(&mut self, size: u64, alignment: u64) -> Result<Window, Refusal> {
+        if !alignment.is_power_of_two() {
+            self.census.refused += 1;
+            return Err(Refusal::BadAlignment { alignment });
+        }
+        let chunk_size = self.chunks[0].size;
+        if size > chunk_size {
+            self.census.refused += 1;
+            return Err(Refusal::TooLarge {
+                requested: size,
+                chunk: chunk_size,
+            });
+        }
+
+        if let Some(window) = self.take_from(self.open, size, alignment) {
+            self.census.allocated += 1;
+            self.census.in_place += 1;
+            return Ok(window);
+        }
+        // The open chunk is full. Roll to an open one with room — not to a
+        // submitted one, however old: the timeline is the only thing that
+        // frees a chunk.
+        for index in 0..self.chunks.len() {
+            if index == self.open {
+                continue;
+            }
+            if self.chunks[index].state != ChunkState::Open {
+                continue;
+            }
+            if let Some(window) = self.take_from(index, size, alignment) {
+                self.open = index;
+                self.census.allocated += 1;
+                self.census.rolled += 1;
+                return Ok(window);
+            }
+        }
+        self.census.refused += 1;
+        Err(Refusal::Exhausted {
+            chunks: self.chunks.len(),
+            in_flight: self.in_flight(),
+        })
+    }
+
+    fn take_from(&mut self, index: usize, size: u64, alignment: u64) -> Option<Window> {
+        let chunk = self.chunks.get_mut(index)?;
+        if chunk.state != ChunkState::Open {
+            return None;
+        }
+        let start = chunk.used.next_multiple_of(alignment);
+        let end = start.checked_add(size)?;
+        if end > chunk.size {
+            return None;
+        }
+        self.census.padding += start - chunk.used;
+        chunk.used = end;
+        Some(Window {
+            chunk: index,
+            offset: start,
+            size,
+        })
+    }
+
+    /// Every chunk with anything in it is now named by a submission that will
+    /// signal `at`.
+    ///
+    /// Chunks with nothing in them stay open: a submission that staged nothing
+    /// must not cost the arena its capacity. A chunk already submitted has its
+    /// point moved forward rather than kept, for the reason
+    /// [`crate::descriptor::SetRing::submitted`] does: two submissions may
+    /// read one chunk, and the later one is what frees it.
+    pub fn submitted(&mut self, at: TimelinePoint) {
+        for chunk in &mut self.chunks {
+            if chunk.used == 0 {
+                continue;
+            }
+            chunk.state = match chunk.state {
+                ChunkState::Submitted(previous) if previous.0 > at.0 => {
+                    ChunkState::Submitted(previous)
+                }
+                _ => ChunkState::Submitted(at),
+            };
+        }
+    }
+
+    /// Reset every chunk the timeline has passed. Returns how many.
+    ///
+    /// The one place capacity comes back, and it consults the timeline rather
+    /// than an age or a count.
+    pub fn recycle(&mut self, reached: TimelinePoint) -> usize {
+        let mut freed = 0;
+        for chunk in &mut self.chunks {
+            if let ChunkState::Submitted(at) = chunk.state {
+                if reached.0 >= at.0 {
+                    chunk.state = ChunkState::Open;
+                    chunk.used = 0;
+                    freed += 1;
+                }
+            }
+        }
+        self.census.recycled += freed;
+        freed
+    }
+
+    /// The `(offset, size)` to flush or invalidate for a window.
+    ///
+    /// Rounded outward to `nonCoherentAtomSize` and clamped to the chunk, so
+    /// the range is always one Vulkan accepts. A caller passing its own
+    /// offsets would be passing an unaligned range on every host whose atom is
+    /// larger than the alignment it asked for, and rounding inward instead
+    /// would silently drop the edge bytes of every upload.
+    #[must_use]
+    pub fn flush_range(&self, window: Window) -> (u64, u64) {
+        let start = window.offset & !(self.atom - 1);
+        let end = window.end().next_multiple_of(self.atom);
+        let end = end.min(self.chunks[window.chunk].size);
+        (start, end - start)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ash::vk::Handle;
+    use std::collections::BTreeSet;
+    use std::ptr;
+
+    const CHUNK: u64 = 1024;
+
+    fn arena(chunks: usize, atom: u64) -> Arena {
+        Arena::adopt(
+            CHUNK,
+            atom,
+            (0..chunks)
+                .map(|i| vk::Buffer::from_raw(i as u64 + 1))
+                .collect(),
+            (0..chunks)
+                .map(|i| vk::DeviceMemory::from_raw(i as u64 + 1))
+                .collect(),
+            vec![ptr::null_mut(); chunks],
+        )
+    }
+
+    fn at(n: u64) -> TimelinePoint {
+        TimelinePoint(n)
+    }
+
+    #[test]
+    fn allocations_bump_within_one_chunk_and_stay_there() {
+        let mut arena = arena(2, 64);
+        let first = arena.allocate(100, 4).expect("room");
+        let second = arena.allocate(100, 4).expect("room");
+        assert_eq!(first.chunk, 0);
+        assert_eq!(second.chunk, 0);
+        assert_eq!(first.offset, 0);
+        assert_eq!(second.offset, 100);
+        assert_eq!(arena.census().in_place, 2);
+        assert_eq!(arena.census().rolled, 0);
+        // The second chunk is untouched: rolling early would halve the useful
+        // capacity of every frame.
+        assert_eq!(arena.chunks()[1].used(), 0);
+    }
+
+    #[test]
+    fn an_allocation_is_aligned_and_the_padding_is_counted() {
+        let mut arena = arena(1, 64);
+        let first = arena.allocate(10, 4).expect("room");
+        assert_eq!(first.offset, 0);
+        let second = arena.allocate(10, 256).expect("room");
+        assert_eq!(second.offset, 256);
+        // 246 bytes of padding, which is what says whether a caller's
+        // alignment is costing anything.
+        assert_eq!(arena.census().padding, 246);
+    }
+
+    #[test]
+    fn an_alignment_that_is_not_a_power_of_two_is_refused() {
+        let mut arena = arena(1, 64);
+        for alignment in [0u64, 3, 6, 100] {
+            assert_eq!(
+                arena.allocate(4, alignment),
+                Err(Refusal::BadAlignment { alignment })
+            );
+        }
+        assert_eq!(arena.chunks()[0].used(), 0);
+    }
+
+    #[test]
+    fn a_full_chunk_rolls_to_the_next_open_one_rather_than_refusing() {
+        let mut arena = arena(2, 64);
+        let _ = arena.allocate(1000, 4).expect("room");
+        let rolled = arena.allocate(100, 4).expect("the other chunk");
+        assert_eq!(rolled.chunk, 1);
+        assert_eq!(rolled.offset, 0);
+        assert_eq!(arena.open(), 1);
+        assert_eq!(arena.census().rolled, 1);
+        // And it stays on the new chunk rather than going back to look.
+        assert_eq!(arena.allocate(4, 4).expect("room").chunk, 1);
+    }
+
+    #[test]
+    fn a_request_larger_than_a_chunk_refuses_as_that_and_not_as_exhaustion() {
+        let mut arena = arena(4, 64);
+        // Four chunks with everything free, so this is not a capacity problem
+        // and retrying would never help. The caller allocates a dedicated
+        // buffer instead, and the refusal is what tells it so.
+        assert_eq!(
+            arena.allocate(CHUNK + 1, 4),
+            Err(Refusal::TooLarge {
+                requested: CHUNK + 1,
+                chunk: CHUNK,
+            })
+        );
+    }
+
+    #[test]
+    fn exhaustion_refuses_rather_than_resetting_the_oldest_chunk() {
+        let mut arena = arena(2, 64);
+        let _ = arena.allocate(CHUNK, 4).expect("room");
+        arena.submitted(at(5));
+        let _ = arena.allocate(CHUNK, 4).expect("the second chunk");
+        arena.submitted(at(9));
+
+        assert_eq!(
+            arena.allocate(4, 4),
+            Err(Refusal::Exhausted {
+                chunks: 2,
+                in_flight: 2,
+            })
+        );
+        // Neither chunk was reset. The GPU may be reading both.
+        assert_eq!(arena.in_flight(), 2);
+        assert_eq!(arena.census().refused, 1);
+    }
+
+    #[test]
+    fn only_the_timeline_returns_a_chunk_and_it_returns_the_whole_chunk() {
+        let mut arena = arena(2, 64);
+        let _ = arena.allocate(600, 4).expect("room");
+        let _ = arena.allocate(300, 4).expect("room");
+        arena.submitted(at(5));
+        assert_eq!(arena.recycle(at(4)), 0);
+        assert_eq!(arena.in_flight(), 1);
+
+        assert_eq!(arena.recycle(at(5)), 1);
+        assert_eq!(arena.chunks()[0].state(), ChunkState::Open);
+        // The whole chunk, not the last allocation: two allocations went in
+        // and one reset takes both back.
+        assert_eq!(arena.chunks()[0].used(), 0);
+        assert_eq!(arena.allocate(CHUNK, 4).expect("room").offset, 0);
+    }
+
+    #[test]
+    fn a_chunk_named_twice_is_freed_by_the_later_submission() {
+        let mut arena = arena(1, 64);
+        let _ = arena.allocate(4, 4).expect("room");
+        arena.submitted(at(9));
+        arena.submitted(at(3));
+        // Keeping the earlier point would free the chunk while the second
+        // submission is still reading it.
+        assert_eq!(arena.chunks()[0].state(), ChunkState::Submitted(at(9)));
+        assert_eq!(arena.recycle(at(3)), 0);
+        assert_eq!(arena.recycle(at(9)), 1);
+    }
+
+    #[test]
+    fn a_submission_that_staged_nothing_costs_no_capacity() {
+        let mut arena = arena(2, 64);
+        let _ = arena.allocate(4, 4).expect("room");
+        arena.submitted(at(7));
+        // The second chunk was never written, so it must not be waiting on a
+        // point that has nothing to do with it.
+        assert_eq!(arena.chunks()[1].state(), ChunkState::Open);
+        assert_eq!(arena.in_flight(), 1);
+        assert_eq!(arena.allocate(CHUNK, 4).expect("the open chunk").chunk, 1);
+    }
+
+    #[test]
+    fn a_flush_range_is_rounded_outward_to_the_atom() {
+        let arena = arena(1, 64);
+        let window = Window {
+            chunk: 0,
+            offset: 100,
+            size: 10,
+        };
+        // 100..110 becomes 64..128: outward, because a flush that made fewer
+        // writes visible than asked would drop the edge bytes of the upload.
+        assert_eq!(arena.flush_range(window), (64, 64));
+
+        let aligned = Window {
+            chunk: 0,
+            offset: 128,
+            size: 128,
+        };
+        assert_eq!(arena.flush_range(aligned), (128, 128));
+    }
+
+    #[test]
+    fn a_flush_at_the_end_of_a_chunk_is_clamped_to_it() {
+        let arena = arena(1, 64);
+        let tail = Window {
+            chunk: 0,
+            offset: CHUNK - 10,
+            size: 10,
+        };
+        let (offset, size) = arena.flush_range(tail);
+        // Rounding the end up would run past the allocation, which Vulkan only
+        // permits when the size reaches the end — so it is clamped there.
+        assert_eq!(offset + size, CHUNK);
+        assert_eq!(offset, CHUNK - 64);
+    }
+
+    #[test]
+    fn an_atom_of_one_leaves_every_range_exactly_as_asked() {
+        let arena = arena(1, 1);
+        let window = Window {
+            chunk: 0,
+            offset: 7,
+            size: 5,
+        };
+        assert_eq!(arena.flush_range(window), (7, 5));
+    }
+
+    #[test]
+    fn a_window_names_the_buffer_of_its_own_chunk() {
+        let mut arena = arena(2, 64);
+        let _ = arena.allocate(CHUNK, 4).expect("room");
+        let second = arena.allocate(4, 4).expect("the other chunk");
+        assert_eq!(second.chunk, 1);
+        assert_eq!(arena.buffer(second).as_raw(), 2);
+        assert_eq!(arena.memory(second).as_raw(), 2);
+    }
+
+    #[test]
+    fn every_refusal_names_itself() {
+        let refusals = [
+            Refusal::TooLarge {
+                requested: 2,
+                chunk: 1,
+            },
+            Refusal::Exhausted {
+                chunks: 1,
+                in_flight: 1,
+            },
+            Refusal::BadAlignment { alignment: 3 },
+        ];
+        let slugs: BTreeSet<&str> = refusals.iter().map(|r| r.slug()).collect();
+        assert_eq!(slugs.len(), refusals.len());
+        for refusal in refusals {
+            assert!(refusal.to_string().starts_with(refusal.slug()));
+            assert!(refusal.slug().starts_with("vk_staging_"));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "an arena with no chunks stages nothing")]
+    fn an_arena_with_no_chunks_is_refused() {
+        let _ = Arena::adopt(CHUNK, 64, Vec::new(), Vec::new(), Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "a chunk is a buffer, its memory and its mapping together")]
+    fn an_arena_built_from_mismatched_pieces_is_refused() {
+        let _ = Arena::adopt(
+            CHUNK,
+            64,
+            vec![vk::Buffer::null(), vk::Buffer::null()],
+            vec![vk::DeviceMemory::null()],
+            vec![ptr::null_mut()],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "nonCoherentAtomSize is a power of two")]
+    fn an_atom_that_is_not_a_power_of_two_is_refused() {
+        let _ = arena(1, 96);
+    }
+}
