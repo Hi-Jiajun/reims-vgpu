@@ -579,6 +579,12 @@ pub enum Divergence {
         serial: Vec<(IngressOrdinal, Refusal)>,
         parallel: Vec<(IngressOrdinal, Refusal)>,
     },
+    /// A channel showed a different sequence of frames.
+    Presentation {
+        domain: ChannelId,
+        serial: Vec<crate::identity::MappingId>,
+        parallel: Vec<crate::identity::MappingId>,
+    },
     /// A transaction's lifetime operation was declined in one run and not the
     /// other. Its stamp is owed either way — see
     /// [`crate::interpret::Observation::OperationDeclined`] — so this is a
@@ -622,6 +628,7 @@ impl Divergence {
             Self::PublicationOrder { .. } => "diverge_publication_order",
             Self::Refusals { .. } => "diverge_refusals",
             Self::Declined { .. } => "diverge_declined",
+            Self::Presentation { .. } => "diverge_presentation",
             Self::SplitPublication { .. } => "diverge_split_publication",
             Self::StampBeforeVersions { .. } => "diverge_stamp_before_versions",
             Self::ContentBeaten { .. } => "diverge_content_beaten",
@@ -746,6 +753,20 @@ pub fn equivalent(serial: &Run, parallel: &Run) -> Result<(), Divergence> {
         });
     }
 
+    for domain in left.presented.keys().chain(right.presented.keys()) {
+        let (a, b) = (
+            left.presented.get(domain).cloned().unwrap_or_default(),
+            right.presented.get(domain).cloned().unwrap_or_default(),
+        );
+        if a != b {
+            return Err(Divergence::Presentation {
+                domain: *domain,
+                serial: a,
+                parallel: b,
+            });
+        }
+    }
+
     let mut domains = serial.domains();
     domains.extend(parallel.domains());
     domains.sort_unstable();
@@ -787,7 +808,8 @@ fn monotone(run: &Run) -> Result<(), Divergence> {
             | Observation::VersionBeaten { .. }
             | Observation::FenceUpdated { .. }
             | Observation::Refused { .. }
-            | Observation::OperationDeclined { .. } => {}
+            | Observation::OperationDeclined { .. }
+            | Observation::FramePresented { .. } => {}
         }
     }
     Ok(())
@@ -844,6 +866,10 @@ struct Summary {
     fences: BTreeMap<ResourceId, usize>,
     refusals: Vec<(IngressOrdinal, Refusal)>,
     declined: Vec<(IngressOrdinal, crate::lifecycle::Refusal)>,
+    /// Per domain, the frames handed to the display in order. Two channels'
+    /// presents have no ordering obligation to each other, so this is not one
+    /// interleaved sequence.
+    presented: BTreeMap<ChannelId, Vec<crate::identity::MappingId>>,
 }
 
 impl Summary {
@@ -896,6 +922,9 @@ impl Summary {
                 // do not mean the same thing.
                 Observation::OperationDeclined { ingress, reason } => {
                     out.declined.push((ingress, reason));
+                }
+                Observation::FramePresented { domain, mapping } => {
+                    out.presented.entry(domain).or_default().push(mapping);
                 }
             }
         }

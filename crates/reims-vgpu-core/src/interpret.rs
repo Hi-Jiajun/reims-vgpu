@@ -88,6 +88,27 @@ pub enum Observation {
         ingress: IngressOrdinal,
         reason: Refusal,
     },
+    /// A frame was handed to the display.
+    ///
+    /// **The one observation a guest does not read back**, and it is here
+    /// because leaving it out makes two schedules that show *different frames*
+    /// compare equal. A present's accesses are reads, reads publish no version,
+    /// and a present writes no completion word beyond the envelope's — so
+    /// without this the trace of a run that showed mapping A is byte-identical
+    /// to one that showed mapping B, and showing the wrong frame is the one
+    /// failure this device exists to avoid.
+    ///
+    /// Ordered per domain rather than globally: two channels' presents have no
+    /// ordering obligation to each other, and comparing one interleaved
+    /// sequence would report a divergence where the contract allows both.
+    ///
+    /// Recorded even for [`crate::identity::MappingId`] zero, which the guest
+    /// sends to mean *nothing to show*: a run that showed nothing and a run
+    /// that showed a frame are not the same run.
+    FramePresented {
+        domain: crate::identity::ChannelId,
+        mapping: crate::identity::MappingId,
+    },
     /// A transaction ran and its lifetime operation did not happen.
     ///
     /// **Not [`Self::Refused`], and the difference is the completion word.** A
@@ -291,6 +312,17 @@ impl Interpreter {
             for record in exec.records() {
                 self.apply_record(&record.op);
             }
+        }
+
+        // What the guest asked to show becomes visible when the transaction's
+        // work completes, like the content versions below and unlike the
+        // completion word — a guest that polls the word and then reads the
+        // surface must not see the flag without the frame.
+        if let crate::transaction::Payload::Present(present) = &tx.payload {
+            self.trace.push(Observation::FramePresented {
+                domain: tx.identity.domain,
+                mapping: present.packet().mapping,
+            });
         }
 
         // A lifetime operation acts on the model, and a model that declines it
@@ -544,6 +576,64 @@ mod tests {
                 kind: crate::control::ControlKind::Nop,
             }),
         }
+    }
+
+    /// A present of `mapping`: one read of the surface it shows.
+    fn present(ingress: u64, mapping: u32) -> DeviceTransaction {
+        let packet = crate::present::PresentPacket {
+            form: crate::present::PresentForm::SwapMapping,
+            mapping: crate::identity::MappingId(mapping),
+            task: None,
+        };
+        let read = AccessIntent {
+            domain: ChannelId(1),
+            key: AccessKey::Whole(ResourceKey {
+                backing: BackingId(u64::from(mapping)),
+                heap: None,
+            }),
+            mode: AccessMode::Read,
+            api_stages: 0,
+            input_content_version: None,
+            output_content_version: None,
+        };
+        DeviceTransaction {
+            identity: crate::testing::identity(1, ingress),
+            stamp_waits: Vec::new(),
+            completion: None,
+            payload: crate::transaction::Payload::Present(
+                crate::transaction::PresentPayload::new(packet, vec![(packet.mapping, read)])
+                    .expect("one read of the packet's own target"),
+            ),
+        }
+    }
+
+    /// Two runs that show different frames must not compare equal.
+    ///
+    /// Everything else about them is identical: a present's accesses are reads,
+    /// reads publish no version, and neither carries a completion word. Without
+    /// [`Observation::FramePresented`] the two traces are byte-identical, and
+    /// showing the wrong frame is the one failure this device exists to avoid.
+    #[test]
+    fn a_run_that_showed_a_different_frame_is_a_different_run() {
+        let trace_of = |mapping: u32| {
+            let mut interp = Interpreter::new();
+            assert_eq!(interp.run(&present(1, mapping)), Outcome::Ran);
+            interp.trace().to_vec()
+        };
+        let seven = trace_of(7);
+        assert_eq!(
+            seven,
+            vec![Observation::FramePresented {
+                domain: crate::testing::identity(1, 1).domain,
+                mapping: crate::identity::MappingId(7),
+            }]
+        );
+        assert_ne!(seven, trace_of(8));
+        assert_ne!(
+            seven,
+            trace_of(0),
+            "nothing to show is not the same as showing something"
+        );
     }
 
     /// A lifecycle packet that synchronises a resource: no records, and an
