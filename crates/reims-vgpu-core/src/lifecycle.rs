@@ -1059,7 +1059,10 @@ impl Lifecycle {
     ///
     /// # Errors
     ///
-    /// If the task does not exist, or a live heap already has the number.
+    /// If the task does not exist, a live heap already has the number, or any
+    /// heap of this task already holds the storage — see
+    /// [`crate::heap::Refusal::StorageInUse`], which forwards through
+    /// [`Refusal::Heap`].
     pub fn declare_heap(
         &mut self,
         task: TaskId,

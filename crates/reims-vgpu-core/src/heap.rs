@@ -92,6 +92,24 @@ pub enum Refusal {
     /// was already removed, or it was minted by a heap whose number has since
     /// been reused for different storage.
     StaleStorage { backing: BackingId },
+    /// A live heap, or storage still retiring behind a deleted one, already
+    /// holds this backing.
+    ///
+    /// Storage is what identifies a heap once its number is gone — a retiring
+    /// heap is reachable only through the placements handed out over it, and
+    /// those name the backing. Two heaps over one backing therefore have one
+    /// retirement between them: the second delete replaces the first's set of
+    /// live allocations, and the last removal of *that* set reports the storage
+    /// free while the first heap's resources are still in it. That is the exact
+    /// failure this module's deletion rule exists to prevent, so it is refused
+    /// at the point the second heap is created rather than diagnosed later.
+    ///
+    /// It would also make the aliasing answer wrong in the other direction:
+    /// a placement is a coordinate in its heap's backing, so two placements at
+    /// one offset in two heaps over one backing *are* the same bytes, while
+    /// [`HeapId::same_heap`] says they are in different heaps and their accesses
+    /// never meet.
+    StorageInUse { backing: BackingId },
 }
 
 impl Refusal {
@@ -105,6 +123,7 @@ impl Refusal {
             Self::AlreadyPlaced { .. } => "heap_already_placed",
             Self::NotPlaced { .. } => "heap_not_placed",
             Self::StaleStorage { .. } => "heap_stale_storage",
+            Self::StorageInUse { .. } => "heap_storage_in_use",
         }
     }
 }
@@ -225,10 +244,17 @@ impl Heaps {
     ///
     /// # Errors
     ///
-    /// If a live heap already has this number.
+    /// If a live heap already has this number, or any heap — live or retiring
+    /// behind a delete — already holds this storage.
     pub fn create(&mut self, heap: u64, backing: BackingId, length: u64) -> Result<(), Refusal> {
         if self.heaps.contains_key(&heap) {
             return Err(Refusal::HeapExists { heap });
+        }
+        // Storage is the key a retirement is held under, and the identity a
+        // placement carries once the number is gone, so one backing may belong
+        // to at most one heap at a time. See [`Refusal::StorageInUse`].
+        if self.holds_storage(backing) {
+            return Err(Refusal::StorageInUse { backing });
         }
         self.heaps.insert(
             heap,
@@ -743,6 +769,72 @@ mod tests {
         );
     }
 
+    /// One backing belongs to at most one heap, and the second heap over it is
+    /// refused rather than admitted.
+    ///
+    /// Admitted, it produced the failure the deletion rule exists to prevent.
+    /// Two heaps over backing `B`, one resource placed in each, both deleted:
+    /// the second delete's `retiring.insert(B, ...)` replaced the first's set
+    /// of live allocations, so removing the *second* heap's resource emptied
+    /// what was left and reported `StorageFree` while the first heap's resource
+    /// was still in that storage — and the first resource's own removal then
+    /// refused as `StaleStorage`, which is the model saying the memory a live
+    /// placement names is gone.
+    ///
+    /// Refused at creation rather than diagnosed at deletion, because by the
+    /// time the second delete runs there is nothing left to refuse: both heaps
+    /// were legal, both placements were legal, and the retirement map has one
+    /// key for two sets.
+    #[test]
+    fn two_heaps_cannot_be_created_over_one_piece_of_storage() {
+        let mut h = Heaps::new();
+        let b = BackingId(9);
+        h.create(1, b, 100)
+            .expect("the first heap over this storage");
+        assert_eq!(
+            h.create(2, b, 100),
+            Err(Refusal::StorageInUse { backing: b }),
+            "a second heap over one backing gives the two one retirement"
+        );
+        // A different backing under a different number is unaffected.
+        h.create(2, BackingId(10), 100).expect("its own storage");
+
+        // And the storage is free again once the first heap is gone, so the
+        // refusal is about overlap in time and not a permanent claim on a
+        // number.
+        assert!(matches!(
+            h.delete(1).expect("live"),
+            Retirement::StorageFree { backing } if backing == b
+        ));
+        h.create(3, b, 100).expect("the storage was handed back");
+    }
+
+    /// The refusal outlives the delete for as long as the storage does: a heap
+    /// retiring behind its allocations still holds its backing, and a new heap
+    /// over it would inherit the retirement it cannot see.
+    #[test]
+    fn storage_outliving_its_heap_number_is_still_in_use() {
+        let mut h = Heaps::new();
+        let b = BackingId(9);
+        h.create(1, b, 100).expect("live");
+        let p = h.place(1, res(10), 0, 10).expect("placed");
+        assert!(matches!(
+            h.delete(1).expect("live"),
+            Retirement::Held { .. }
+        ));
+        assert_eq!(
+            h.create(2, b, 100),
+            Err(Refusal::StorageInUse { backing: b }),
+            "the number is free and the storage is not"
+        );
+        assert!(matches!(
+            h.remove(p, res(10)).expect("placed"),
+            Retirement::StorageFree { backing } if backing == b
+        ));
+        h.create(2, b, 100)
+            .expect("the last allocation handed it back");
+    }
+
     #[test]
     fn every_refusal_has_its_own_slug() {
         let all = [
@@ -762,6 +854,9 @@ mod tests {
             Refusal::AlreadyPlaced { resource: res(1) },
             Refusal::NotPlaced { resource: res(1) },
             Refusal::StaleStorage {
+                backing: BackingId(1),
+            },
+            Refusal::StorageInUse {
                 backing: BackingId(1),
             },
         ];
