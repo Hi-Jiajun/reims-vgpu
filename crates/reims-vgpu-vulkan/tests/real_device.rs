@@ -18,6 +18,7 @@
 //! distinguishable from a passing one in the output.
 
 use ash::vk;
+use reims_vgpu_core::identity::DeviceEpoch as EpochId;
 use reims_vgpu_vulkan::device::DeviceEpoch;
 use reims_vgpu_vulkan::host::VulkanHost;
 use reims_vgpu_vulkan::memory::{select_memory_type, MappedMemoryKind, MemoryClass};
@@ -41,8 +42,13 @@ fn a_filled_buffer_reads_back_after_the_timeline_this_rail_reserved() {
     println!("composing on: {}", host.report_line());
 
     let census = host.census();
-    let mut epoch = DeviceEpoch::create(host.instance(), host.physical_device(), census)
-        .expect("the driver refused a set its own census admitted");
+    let mut epoch = DeviceEpoch::create(
+        host.instance(),
+        host.physical_device(),
+        census,
+        EpochId::FIRST,
+    )
+    .expect("the driver refused a set its own census admitted");
 
     // One owner for one `VkQueue`, taken from this epoch's ledger.
     let family = census.queues().universal().index;

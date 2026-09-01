@@ -16,6 +16,12 @@
 //! be touched. Collapsing them makes a guest reset destroy live GPU work, or a
 //! device loss leave semantic state claiming to own dead handles.
 //!
+//! That identity is [`reims_vgpu_core::identity::DeviceEpoch`] and is *given*
+//! to [`DeviceEpoch::create`] rather than minted here. The session owns which
+//! incarnation this is — it is the value [`reims_vgpu_core::retire`] compares a
+//! queued destruction against — and a rail that numbered its own would be a
+//! second answer to the one question a stale lease asks.
+//!
 //! # The enabled set is derived from the census and from nothing else
 //!
 //! [`Enabled::for_census`] is the one place a feature or extension is asked
@@ -38,37 +44,8 @@
 use crate::census::{Census, DeviceExtensions};
 use crate::queues::QueuePlan;
 use ash::vk;
+use reims_vgpu_core::identity::DeviceEpoch as EpochId;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Which incarnation of the device a handle belongs to.
-///
-/// Monotone and never reused within a process, so a stale lease naming an
-/// earlier epoch is recognisably stale rather than accidentally valid against a
-/// recreated device that happens to sit at the same address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EpochId(u64);
-
-impl EpochId {
-    fn next() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        // Relaxed: the only requirement is uniqueness, and every ordering
-        // relationship an epoch takes part in is carried by the owner that
-        // hands it out rather than by this counter.
-        Self(NEXT.fetch_add(1, Ordering::Relaxed))
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for EpochId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "epoch{}", self.0)
-    }
-}
 
 /// What device creation turns on.
 ///
@@ -151,6 +128,9 @@ pub struct DeviceEpoch {
 impl DeviceEpoch {
     /// Create the device from a host's catalog.
     ///
+    /// `epoch` is the incarnation identity the session assigned; see the module
+    /// doc for why it is not minted here.
+    ///
     /// One queue is requested from the chosen family. More would be a
     /// concurrency decision, and the architecture puts that behind measurement
     /// rather than behind "the family reported a count".
@@ -163,6 +143,7 @@ impl DeviceEpoch {
         instance: &ash::Instance,
         physical: vk::PhysicalDevice,
         census: Census,
+        epoch: EpochId,
     ) -> Result<Self, DeviceFailure> {
         let enabled = Enabled::for_census(&census);
         let family = census.queues().universal().index;
@@ -220,7 +201,7 @@ impl DeviceEpoch {
         }
 
         Ok(Self {
-            id: EpochId::next(),
+            id: epoch,
             device,
             census,
             enabled,
@@ -428,13 +409,14 @@ mod tests {
         assert!(enabled.extensions.synchronization2);
     }
 
+    /// The identity is the session's, not this module's — which is the whole
+    /// point: it is the value a queued destruction is compared against.
     #[test]
-    fn an_epoch_id_is_unique_and_names_itself() {
-        let a = EpochId::next();
-        let b = EpochId::next();
+    fn the_epoch_identity_is_the_one_the_session_assigned() {
+        let a = EpochId::FIRST;
+        let b = a.next();
         assert_ne!(a, b);
-        assert!(b > a, "an id has to say which incarnation is later");
-        assert!(a.to_string().starts_with("epoch"));
+        assert!(b > a, "an identity has to say which incarnation is later");
     }
 
     #[test]
@@ -460,16 +442,27 @@ mod tests {
             return;
         };
         let census = host.census();
-        let epoch = DeviceEpoch::create(host.instance(), host.physical_device(), census)
-            .expect("the driver refused a set its own census admitted");
+        let epoch = DeviceEpoch::create(
+            host.instance(),
+            host.physical_device(),
+            census,
+            EpochId::FIRST,
+        )
+        .expect("the driver refused a set its own census admitted");
 
-        println!("real device: {} {:?}", epoch.id(), epoch.enabled());
+        println!("real device: {:?} {:?}", epoch.id(), epoch.enabled());
         assert_eq!(epoch.census(), census, "one snapshot, not a second reading");
         assert!(epoch.enabled().timeline_semaphore);
 
-        // A second epoch on the same device is a distinct incarnation.
-        let second = DeviceEpoch::create(host.instance(), host.physical_device(), census)
-            .expect("a second device");
+        // A second incarnation on the same device carries the identity the
+        // session gave it, so a lease from the first is recognisably stale.
+        let second = DeviceEpoch::create(
+            host.instance(),
+            host.physical_device(),
+            census,
+            EpochId::FIRST.next(),
+        )
+        .expect("a second device");
         assert_ne!(epoch.id(), second.id());
 
         // The queue ledger is this epoch's, and hands each queue out once.
