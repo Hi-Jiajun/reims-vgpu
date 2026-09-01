@@ -1810,12 +1810,20 @@ pub fn write_stamp<H: HostMemory + HostOps>(
 /// answering too little is a zero it also acts on.
 fn reply_device_info<H: HostMemory + HostOps>(
     host: &mut H,
-    key_table_len: u32,
-    count: u32,
-    reply_pfn: u32,
+    request: &crate::protocol::fifo::DeviceInfoRequest,
     page_shift: u32,
     version: u32,
 ) -> Result<(), MemError> {
+    // The two bounds are the request's, derived once by the form that knows
+    // which of them it carries. The two arms that reach here used to spell the
+    // ceiling-less reading twice — `unwrap_or(u32::MAX)` at one, a bare
+    // `u32::MAX` at the other — for a field only one of the forms has.
+    let bounds = request.reply_bounds();
+    let ReplyBounds {
+        key_table_len,
+        count,
+    } = bounds;
+    let reply_pfn = request.reply_pfn;
     if reply_pfn == 0 {
         return Ok(());
     }
@@ -1841,10 +1849,6 @@ fn reply_device_info<H: HostMemory + HostOps>(
     // reduction of what the device can do — a key the guest discards on arrival
     // buys nothing, and the slot it occupies is one fewer for a key the guest
     // *does* have an arm for, on a reply that is only ever asked for once.
-    let bounds = ReplyBounds {
-        key_table_len,
-        count,
-    };
     let caps: Vec<(u32, u32)> = served
         .iter()
         .copied()
@@ -2125,10 +2129,7 @@ fn reply_compute_info<H: HostMemory + HostOps>(
     // so that is the buffer, and the encoder's own capacity rule turns the
     // guest's count into the terminator decision it already owns.
     let mut reply = [0u8; (COMPUTE_INFO_ANSWERS + 1) * info_reply::PAIR_LEN];
-    let bounds = ReplyBounds {
-        key_table_len,
-        count,
-    };
+    let bounds = request.reply_bounds();
     let written = info_reply::encode(bounds, &served, &mut reply);
     let wrote = written.pairs;
     // An answer this device has and the guest's own count could not carry. It
@@ -2271,49 +2272,23 @@ fn process_root_packet<H: HostMemory + HostOps>(
     packet: &Packet,
 ) {
     match packet.opcode {
-        ROOT_OP_DEVICE_INFO_TAHOE => {
-            // The offsets are the form's, and the form's are
-            // `reims_vgpu_protocol::fifo`'s. The two requests differ by one
-            // prepended word, so reading either at the other's offsets would
-            // take the count for a page frame and write the reply wherever
-            // that landed.
-            match decode_device_info(DeviceInfoForm::WithKeyLimit, &packet.payload) {
+        // The two device-info opcodes, one arm. They differ only in which form
+        // their payload is — the newer one prepends a parse ceiling — and
+        // reading either at the other's offsets would take the count for a page
+        // frame and write the reply wherever that landed. Which form an opcode
+        // carries was the one thing the two arms did not share, so it is now
+        // the only thing that differs between them.
+        ROOT_OP_DEVICE_INFO_TAHOE | ROOT_OP_DEVICE_INFO_MONTEREY => {
+            let (form, slug) = if packet.opcode == ROOT_OP_DEVICE_INFO_TAHOE {
+                (DeviceInfoForm::WithKeyLimit, "device_info_tahoe")
+            } else {
+                (DeviceInfoForm::WithoutKeyLimit, "device_info_monterey")
+            };
+            match decode_device_info(form, &packet.payload) {
                 Ok(request) => {
-                    let _ = reply_device_info(
-                        host,
-                        request.key_table_len.unwrap_or(u32::MAX),
-                        request.pair_capacity,
-                        request.reply_pfn,
-                        state.page_shift,
-                        state.gfx.version,
-                    );
+                    let _ = reply_device_info(host, &request, state.page_shift, state.gfx.version);
                 }
-                Err(short) => {
-                    note_short_payload("device_info_tahoe", None, &short);
-                }
-            }
-        }
-        ROOT_OP_DEVICE_INFO_MONTEREY => {
-            match decode_device_info(DeviceInfoForm::WithoutKeyLimit, &packet.payload) {
-                Ok(request) => {
-                    let count = request.pair_capacity;
-                    let pfn = request.reply_pfn;
-                    // This record carries no parse ceiling — see
-                    // `DEVICE_INFO_MONTEREY_COUNT` — so the reply names every key the
-                    // table holds and the count alone bounds it, which is what this
-                    // arm has always done.
-                    let _ = reply_device_info(
-                        host,
-                        u32::MAX,
-                        count,
-                        pfn,
-                        state.page_shift,
-                        state.gfx.version,
-                    );
-                }
-                Err(short) => {
-                    note_short_payload("device_info_monterey", None, &short);
-                }
+                Err(short) => note_short_payload(slug, None, &short),
             }
         }
         ROOT_OP_DEFINE_FIFO => {

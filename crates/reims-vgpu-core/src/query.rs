@@ -40,6 +40,8 @@
 use crate::access::{BackingId, ByteRange};
 use crate::identity::CompletionStamp;
 use crate::transaction::{classify, PayloadClass};
+use reims_vgpu_protocol::fifo::{self, DeviceInfoForm};
+use reims_vgpu_protocol::info_reply::ReplyBounds;
 use reims_vgpu_protocol::packets::Channel;
 
 /// Which question a query packet asks.
@@ -60,6 +62,25 @@ pub enum QueryKind {
 }
 
 impl QueryKind {
+    /// Which of the device-info request layouts this question's packet carries,
+    /// or `None` for the questions that are not device-info.
+    ///
+    /// The two device-info opcodes differ only in that the newer one prepends a
+    /// parse ceiling, so every offset after it moves by four. The choice of
+    /// form is therefore an opcode question and nothing else, and it was made
+    /// at the packet arms — one arm naming one form, another naming the other,
+    /// with nothing able to compare them. Reading either request at the other's
+    /// offsets takes the pair count for a page frame and writes the reply to
+    /// whatever page that named.
+    #[must_use]
+    pub const fn device_info_form(self) -> Option<DeviceInfoForm> {
+        match self {
+            Self::DeviceInfoLegacy => Some(DeviceInfoForm::WithoutKeyLimit),
+            Self::DeviceInfo => Some(DeviceInfoForm::WithKeyLimit),
+            Self::ComputeInfo | Self::HeapTextureSizeAndAlign => None,
+        }
+    }
+
     /// The question a packet asks, or `None` if it is not a query packet.
     #[must_use]
     pub fn of(channel: Channel, opcode: u16) -> Option<Self> {
@@ -97,6 +118,24 @@ pub struct ReplyDestination {
     pub bytes: ByteRange,
 }
 
+/// What shape of answer a question expects, with the bounds its request
+/// carried.
+///
+/// The bounds are part of the request and not of the destination. A destination
+/// says how many bytes fit; these say how many pairs the guest will consume and
+/// which keys its own parser reaches, and a reply is correct only under all
+/// three. Carrying the pair here rather than beside it is what stops an
+/// evaluator from being handed a window and left to guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyShape {
+    /// A run of `(key, value)` pairs, laid out by
+    /// [`reims_vgpu_protocol::info_reply`].
+    KeyValue(ReplyBounds),
+    /// A record of a fixed size the request does not bound. The destination's
+    /// own length is the only bound, which is why none is repeated here.
+    Fixed,
+}
+
 /// The question a query packet asks, and where its answer goes.
 ///
 /// The two travel together because neither is a query on its own: a kind with
@@ -110,6 +149,78 @@ pub struct ReplyDestination {
 pub struct QueryRequest {
     pub kind: QueryKind,
     pub destination: ReplyDestination,
+    pub reply: ReplyShape,
+}
+
+/// A query packet's request words, as its own layout carries them.
+///
+/// One variant per layout rather than per question, because the two device-info
+/// opcodes share a decoder and differ by a form. Which form is
+/// [`QueryKind::device_info_form`]'s answer, and [`resolve`] checks that the
+/// words it was handed came from the layout the kind names — a check no caller
+/// can make for itself, since the two forms decode to the same Rust type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestWords {
+    DeviceInfo(fifo::DeviceInfoRequest),
+    ComputeInfo(fifo::ComputeInfoRequest),
+    /// The heap-texture query, whose request is a serialized texture descriptor
+    /// and whose reply is a fixed record. Nothing about it bounds the reply, so
+    /// there are no words to carry here.
+    HeapTexture,
+}
+
+/// Why a request's words are not the ones its question asks with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveRefusal {
+    /// The words came from a different layout than the kind names.
+    ///
+    /// The dangerous case is the two device-info forms, which decode to one
+    /// Rust type: a `DeviceInfoRequest` read at the other form's offsets is a
+    /// well-typed value whose count is a page frame.
+    WrongLayout { kind: QueryKind },
+}
+
+impl ResolveRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::WrongLayout { .. } => "query_request_wrong_layout",
+        }
+    }
+}
+
+/// Join a question, the words its request carried and the destination its reply
+/// goes to into one request.
+///
+/// **The destination is resolved and this function does not resolve it.** The
+/// address a request names is translated by whoever owns translation; a
+/// destination arriving here as an address would be one this crate could not
+/// bound. What this owns is the pairing: which bounds belong to which question,
+/// and that the words came from the layout the question uses.
+///
+/// # Errors
+///
+/// [`ResolveRefusal::WrongLayout`] when the words are not the kind's own.
+pub fn resolve(
+    kind: QueryKind,
+    words: RequestWords,
+    destination: ReplyDestination,
+) -> Result<QueryRequest, ResolveRefusal> {
+    let reply = match (kind, words) {
+        (_, RequestWords::DeviceInfo(request)) if kind.device_info_form() == Some(request.form) => {
+            ReplyShape::KeyValue(request.reply_bounds())
+        }
+        (QueryKind::ComputeInfo, RequestWords::ComputeInfo(request)) => {
+            ReplyShape::KeyValue(request.reply_bounds())
+        }
+        (QueryKind::HeapTextureSizeAndAlign, RequestWords::HeapTexture) => ReplyShape::Fixed,
+        _ => return Err(ResolveRefusal::WrongLayout { kind }),
+    };
+    Ok(QueryRequest {
+        kind,
+        destination,
+        reply,
+    })
 }
 
 /// The exact window the answer occupies.
@@ -318,6 +429,10 @@ mod tests {
             QueryRequest {
                 kind: QueryKind::ComputeInfo,
                 destination: destination(length),
+                reply: ReplyShape::KeyValue(ReplyBounds {
+                    key_table_len: 5,
+                    count: 512,
+                }),
             },
             Some(stamp()),
         )
@@ -346,6 +461,120 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), 4, "four questions, and no fifth kind");
+    }
+
+    fn device_info_words(form: DeviceInfoForm) -> fifo::DeviceInfoRequest {
+        let mut bytes = [0u8; 12];
+        let bytes = &mut bytes[..form.request_len()];
+        if let Some(at) = form.key_table_len_offset() {
+            bytes[at..at + 4].copy_from_slice(&18u32.to_le_bytes());
+        }
+        let at = form.pair_capacity_offset();
+        bytes[at..at + 4].copy_from_slice(&512u32.to_le_bytes());
+        let at = form.reply_pfn_offset();
+        bytes[at..at + 4].copy_from_slice(&0x40u32.to_le_bytes());
+        fifo::decode_device_info(form, bytes).expect("built at the form's own length")
+    }
+
+    /// Each question is resolved with the layout its own opcode carries, and
+    /// the bounds that reach the request are the ones the words held.
+    #[test]
+    fn a_question_is_joined_to_the_words_its_own_layout_carries() {
+        let words = device_info_words(DeviceInfoForm::WithKeyLimit);
+        let resolved = resolve(
+            QueryKind::DeviceInfo,
+            RequestWords::DeviceInfo(words),
+            destination(4096),
+        )
+        .expect("the newer opcode's form");
+        assert_eq!(
+            resolved.reply,
+            ReplyShape::KeyValue(ReplyBounds {
+                key_table_len: 18,
+                count: 512,
+            })
+        );
+
+        // The older form carries no ceiling, and "the count alone bounds it" is
+        // one derivation rather than a `u32::MAX` written at each caller.
+        let legacy = resolve(
+            QueryKind::DeviceInfoLegacy,
+            RequestWords::DeviceInfo(device_info_words(DeviceInfoForm::WithoutKeyLimit)),
+            destination(4096),
+        )
+        .expect("the older opcode's form");
+        assert_eq!(
+            legacy.reply,
+            ReplyShape::KeyValue(ReplyBounds {
+                key_table_len: u32::MAX,
+                count: 512,
+            })
+        );
+    }
+
+    /// Both device-info forms decode to one Rust type, so handing a question
+    /// the other form's words type-checks. It is refused here.
+    ///
+    /// This is the whole reason the join exists. The two forms' pair counts sit
+    /// four bytes apart, so the wrong form's request is a well-typed value
+    /// whose count is a page frame — and the reply would be written to whatever
+    /// page that named.
+    #[test]
+    fn a_question_refuses_the_other_forms_words() {
+        for (kind, wrong) in [
+            (QueryKind::DeviceInfo, DeviceInfoForm::WithoutKeyLimit),
+            (QueryKind::DeviceInfoLegacy, DeviceInfoForm::WithKeyLimit),
+        ] {
+            assert_eq!(
+                resolve(
+                    kind,
+                    RequestWords::DeviceInfo(device_info_words(wrong)),
+                    destination(4096)
+                ),
+                Err(ResolveRefusal::WrongLayout { kind })
+            );
+        }
+    }
+
+    /// A question resolves from exactly one variant of the request words, and
+    /// every question has one.
+    #[test]
+    fn every_question_resolves_from_exactly_one_layout() {
+        let every: [RequestWords; 4] = [
+            RequestWords::DeviceInfo(device_info_words(DeviceInfoForm::WithoutKeyLimit)),
+            RequestWords::DeviceInfo(device_info_words(DeviceInfoForm::WithKeyLimit)),
+            RequestWords::ComputeInfo(
+                fifo::decode_compute_info(&[0u8; fifo::COMPUTE_INFO_REQUEST_LEN])
+                    .expect("a full-length request"),
+            ),
+            RequestWords::HeapTexture,
+        ];
+        for kind in [
+            QueryKind::DeviceInfoLegacy,
+            QueryKind::DeviceInfo,
+            QueryKind::ComputeInfo,
+            QueryKind::HeapTextureSizeAndAlign,
+        ] {
+            let accepted = every
+                .iter()
+                .filter(|words| resolve(kind, **words, destination(64)).is_ok())
+                .count();
+            assert_eq!(accepted, 1, "{} accepts {accepted} layouts", kind.name());
+        }
+    }
+
+    /// The heap-texture query's reply is a fixed record its request does not
+    /// bound, and saying so is not the same as saying its bounds are zero.
+    #[test]
+    fn the_heap_texture_query_carries_no_reply_bounds() {
+        let resolved = resolve(
+            QueryKind::HeapTextureSizeAndAlign,
+            RequestWords::HeapTexture,
+            destination(16),
+        )
+        .expect("its own layout");
+        assert_eq!(resolved.reply, ReplyShape::Fixed);
+        assert_eq!(resolved.destination.bytes.length, 16);
     }
 
     #[test]
@@ -396,6 +625,7 @@ mod tests {
             QueryRequest {
                 kind: QueryKind::DeviceInfo,
                 destination: destination(64),
+                reply: ReplyShape::Fixed,
             },
             None,
         )

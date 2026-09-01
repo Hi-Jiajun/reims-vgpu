@@ -1851,10 +1851,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            task_lifetime(
-                LifecycleKind::DefineTask,
-                &vec![0u8; fifo::DEFINE_TASK_LEN - 1]
-            ),
+            task_lifetime(LifecycleKind::DefineTask, &[0u8; fifo::DEFINE_TASK_LEN - 1]),
             Err(ResolveRefusal::ShortNotice(fifo::ShortPayload {
                 plen: fifo::DEFINE_TASK_LEN - 1,
                 need: fifo::DEFINE_TASK_LEN,

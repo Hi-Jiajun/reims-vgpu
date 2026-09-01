@@ -330,6 +330,26 @@ pub struct DeviceInfoRequest {
     pub reply_pfn: u32,
 }
 
+impl DeviceInfoRequest {
+    /// The two bounds a reply to this request must respect.
+    ///
+    /// A form carrying no parse ceiling is bounded by its pair count alone, and
+    /// that reading belongs here rather than at each caller: it was
+    /// `key_table_len.unwrap_or(u32::MAX)` at one arm and a bare `u32::MAX` at
+    /// the other, which are two spellings of one decision about a field only
+    /// one of the two forms has.
+    #[must_use]
+    pub const fn reply_bounds(self) -> crate::info_reply::ReplyBounds {
+        crate::info_reply::ReplyBounds {
+            key_table_len: match self.key_table_len {
+                Some(len) => len,
+                None => u32::MAX,
+            },
+            count: self.pair_capacity,
+        }
+    }
+}
+
 /// Decode a device-info request.
 ///
 /// # Errors
@@ -376,6 +396,18 @@ pub struct ComputeInfoRequest {
     pub pair_capacity: u32,
     /// Where the reply goes: a full guest address, not a page frame.
     pub reply_gva: u64,
+}
+
+impl ComputeInfoRequest {
+    /// The two bounds a reply to this request must respect. Both are always
+    /// present here — this form has no ceiling-less variant.
+    #[must_use]
+    pub const fn reply_bounds(self) -> crate::info_reply::ReplyBounds {
+        crate::info_reply::ReplyBounds {
+            key_table_len: self.key_table_len,
+            count: self.pair_capacity,
+        }
+    }
 }
 
 /// Bytes a compute-info request carries.

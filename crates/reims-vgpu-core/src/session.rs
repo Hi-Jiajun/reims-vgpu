@@ -561,6 +561,7 @@ mod tests {
                             length: 64,
                         },
                     },
+                    reply: crate::query::ReplyShape::Fixed,
                 },
                 accesses: Vec::new(),
             },
