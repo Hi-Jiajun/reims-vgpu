@@ -35,12 +35,13 @@
 //! Recorded per record where the two disagree. Nothing here changes that
 //! module; the divergences are findings.
 
-use crate::le::{F32le, U16le, U32le, U64le};
+use crate::le::{U16le, U32le, U64le};
 use crate::op::Op;
 use crate::view::{view, Wire, WireError};
 
 pub use crate::ops::render::{
     BindHeader, BufferBind, BufferOffset, BufferOffsetStride, BufferStrideBind, RefBind,
+    SamplerLodBind,
 };
 
 // --- 0xc8 / 0xca the direct dispatches -------------------------------------
@@ -235,27 +236,21 @@ pub fn ref_binds<'a>(op: &Op<'a>) -> Result<(&'a BindHeader, &'a [RefBind]), Wir
 
 pub const OPCODE_SET_SAMPLER_LOD: u32 = 0xcd;
 
-/// One sampler slot with its own level-of-detail clamps.
+/// The compute stage's sampler binds with level-of-detail clamps.
+///
+/// The entry is the render stage's [`crate::ops::render::SamplerLodBind`],
+/// re-exported at the top of this module with the other bind entries rather
+/// than declared again: same three fields, same twelve-byte stride, and two
+/// identical declarations are two things that can drift.
 ///
 /// **The clamps are per entry, not per record.** With `count == 1` a pair of
 /// floats after the ref could be either; `compute_set_sampler_states_lod` binds
-/// two slots with four distinct clamps (0.25/0.75 and 0.125/0.875) and the
-/// record is 40 bytes, which is the header plus two twelve-byte entries. That
-/// is the case the singular one cannot supply.
+/// two slots with four distinct clamps (0.25/0.75 and 0.125/0.875) in a 40-byte
+/// record, which is the head plus two twelve-byte entries. That is the case the
+/// singular form cannot supply.
 ///
 /// The clamps are 32-bit floats where every viewport depth bound in this
 /// protocol is 64-bit. Both widths are carried and they are not interchangeable.
-#[repr(C)]
-#[derive(Debug, PartialEq, Eq)]
-pub struct SamplerLodBind {
-    pub sampler_ref: U32le,
-    pub lod_min_clamp: F32le,
-    pub lod_max_clamp: F32le,
-}
-
-// SAFETY: three align-1 all-bytes-valid `le` scalars.
-unsafe impl Wire for SamplerLodBind {}
-
 pub fn sampler_lod_binds<'a>(
     op: &Op<'a>,
 ) -> Result<(&'a BindHeader, &'a [SamplerLodBind]), WireError> {

@@ -32,6 +32,22 @@ pub mod sync;
 
 use crate::closure::Rail;
 
+/// The framed record every decoder here reads, and the element types the
+/// records borrow arrays of.
+///
+/// Re-exported rather than left for a caller to reach past this crate for. A
+/// layer above this one — the model — has to name a decoded record's entries to
+/// resolve them, and the rule it works under is that everything it needs from
+/// the wire comes through the layer that assigned the meaning. An element type
+/// is a layout with no meaning of its own; which table it fills and what a slot
+/// means is decided by the record carrying it, and that decision is made here.
+pub use reims_vgpu_wire::op::Op;
+pub use reims_vgpu_wire::ops::render::{
+    BufferBind, BufferStrideBind, RefBind, SamplerLodBind, ScissorRect, Viewport,
+};
+
+pub use reims_vgpu_wire::ops::render_pass::RenderPassBody;
+
 /// Why a record could not be lifted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeRefusal {
