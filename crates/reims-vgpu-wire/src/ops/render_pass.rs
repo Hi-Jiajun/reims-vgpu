@@ -116,7 +116,7 @@ pub const RENDER_PASS_COLOR_ATTACHMENTS: usize = 8;
 /// three rather than leaving two arms right and one wrong — which is the state
 /// `reims-vgpu` was in.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct AttachmentPrefix {
     /// Serializer ref of the attached texture; 0 when the slot is unattached.
     ///
@@ -159,7 +159,7 @@ unsafe impl Wire for AttachmentPrefix {}
 
 /// One colour attachment slot. 60 bytes.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ColorAttachmentBody {
     pub prefix: AttachmentPrefix,
     /// `MTLClearColor`'s four components, each an IEEE-754 double. Observed:
@@ -188,7 +188,7 @@ impl ColorAttachmentBody {
 
 /// The depth attachment slot. 40 bytes.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DepthAttachmentBody {
     pub prefix: AttachmentPrefix,
     /// `clearDepth` as an IEEE-754 double. Observed: 1.0 (the value
@@ -215,7 +215,7 @@ impl DepthAttachmentBody {
 
 /// The stencil attachment slot. 36 bytes.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct StencilAttachmentBody {
     pub prefix: AttachmentPrefix,
     /// `clearStencil`, a full 32 bits. Observed: `0x5a` and `0xa5`.
@@ -232,8 +232,15 @@ pub struct StencilAttachmentBody {
 unsafe impl Wire for StencilAttachmentBody {}
 
 /// Payload of a render-pass record.
+///
+/// Comparable, along with the attachment bodies it contains. Equality here is
+/// byte equality over a descriptor a caller holds by reference — it asserts
+/// nothing about what any field *means*, which is what the rule against
+/// comparing bodies with `unidentified_` fields is about. What it buys is that
+/// a reader can ask whether two passes were described the same way without
+/// copying 592 bytes to find out.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RenderPassBody {
     pub depth: DepthAttachmentBody,
     pub stencil: StencilAttachmentBody,

@@ -461,7 +461,7 @@ pub const SET_SCISSOR_TOTAL_LEN: u32 = 40;
 /// `MTLScissorRect` — four `NSUInteger`, so four 64-bit fields.
 /// Fixture `render_set_scissor` (1, 2, 300, 400).
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ScissorRect {
     pub x: U64le,
     pub y: U64le,
@@ -488,7 +488,7 @@ pub const SET_VIEWPORT_TOTAL_LEN: u32 = 56;
 /// Note the width contrast with [`BlendColor`], which is 32-bit: this protocol
 /// carries both float widths and they are not interchangeable.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Viewport {
     pub origin_x: F64le,
     pub origin_y: F64le,
@@ -762,16 +762,18 @@ unsafe impl Wire for BindHeader {}
 /// `render_set_fragment_sampler` (the stub sampler's 6363). The two families
 /// differ only in opcode, which is also how the stage is decided — no wire
 /// field names it.
-/// # Why the bind entry types are comparable
+/// # Why the array-element types are comparable
 ///
-/// [`RefBind`], [`BufferBind`], [`BufferStrideBind`] and
-/// [`crate::ops::compute::SamplerLodBind`] derive equality where most bodies
-/// here do not. They are the types a caller borrows a *counted array* of, and
-/// comparing two such windows is comparing what the guest wrote — there is
-/// nothing in a run of `le` scalars for equality to get wrong, and the float
-/// clamps compare bitwise, which is what `le` already does. The bodies that
-/// stay incomparable are the ones with an `unidentified_` field, where equality
-/// would quietly assert something about bytes nobody has derived.
+/// [`RefBind`], [`BufferBind`], [`BufferStrideBind`],
+/// [`crate::ops::compute::SamplerLodBind`], [`Viewport`] and [`ScissorRect`]
+/// derive equality where most bodies here do not. They are the types a caller
+/// borrows a *counted array* of, and comparing two such windows is comparing
+/// what the guest wrote — there is nothing in a run of `le` scalars for
+/// equality to get wrong, and the floats compare bitwise, which is what `le`
+/// already does and what a state table needs (a NaN depth bound has to stay
+/// equal to itself). The bodies that stay incomparable are the ones with an
+/// `unidentified_` field, where equality would quietly assert something about
+/// bytes nobody has derived.
 #[repr(C)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct RefBind {
@@ -842,7 +844,7 @@ pub const OPCODE_SET_FRAGMENT_SAMPLER_LOD: u32 = 0x71;
 /// it fails an assertion rather than emitting anything — so there is no
 /// four-float form of this entry. See the manifest.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SamplerLodBind {
     pub sampler_ref: U32le,
     pub lod_min_clamp: F32le,

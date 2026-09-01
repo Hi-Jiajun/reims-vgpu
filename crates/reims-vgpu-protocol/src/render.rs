@@ -99,6 +99,51 @@ impl DrawShape {
     }
 }
 
+/// The width of one index.
+///
+/// Two values, and they are the whole of `MTLIndexType`. A third ordinal is not
+/// an index width this device can guess at: the two sizes differ by a factor of
+/// two, so reading the wrong one either overruns the buffer or reads half the
+/// indices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IndexType {
+    Uint16,
+    Uint32,
+}
+
+impl IndexType {
+    /// Parse the record's ordinal.
+    #[must_use]
+    pub const fn parse(raw: u16) -> Option<IndexType> {
+        match raw {
+            0 => Some(IndexType::Uint16),
+            1 => Some(IndexType::Uint32),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        match self {
+            Self::Uint16 => 2,
+            Self::Uint32 => 4,
+        }
+    }
+}
+
+/// Which attachment a store-action override names.
+///
+/// Derived from the opcode: three opcodes carry a store action, and only the
+/// colour one carries a slot index — its two siblings name the depth and the
+/// stencil attachment by being themselves. A target read from a field would
+/// need a field the depth and stencil records do not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StoreActionTarget {
+    Color(u32),
+    Depth,
+    Stencil,
+}
+
 /// The render-encoder record an opcode names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RenderKind {

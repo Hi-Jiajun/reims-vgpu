@@ -41,39 +41,9 @@
 use crate::access::{AccessMode, ByteRange};
 use crate::bind::{BindSpan, IndirectSource};
 use crate::identity::ResourceId;
-pub use reims_vgpu_protocol::render::{DrawShape, RenderKind, ShaderStage};
-
-/// The width of one index.
-///
-/// Two values, and they are the whole of `MTLIndexType`. A third ordinal is not
-/// an index width this device can guess at: the two sizes differ by a factor of
-/// two, so reading the wrong one either overruns the buffer or reads half the
-/// indices.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum IndexType {
-    Uint16,
-    Uint32,
-}
-
-impl IndexType {
-    /// Parse the record's ordinal.
-    #[must_use]
-    pub const fn parse(raw: u16) -> Option<IndexType> {
-        match raw {
-            0 => Some(IndexType::Uint16),
-            1 => Some(IndexType::Uint32),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn bytes(self) -> u64 {
-        match self {
-            Self::Uint16 => 2,
-            Self::Uint32 => 4,
-        }
-    }
-}
+pub use reims_vgpu_protocol::render::{
+    DrawShape, IndexType, RenderKind, ShaderStage, StoreActionTarget,
+};
 
 /// The `MTLPrimitiveType` ordinal, carried verbatim.
 ///
@@ -270,14 +240,6 @@ impl FloatBits {
     }
 }
 
-/// Which attachment a store-action override names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum StoreActionTarget {
-    Color(u32),
-    Depth,
-    Stencil,
-}
-
 /// A window of the transaction's viewport or scissor arena.
 pub type StateSpan = BindSpan;
 
@@ -356,9 +318,17 @@ pub enum RenderOp {
         front: u32,
         back: u32,
     },
+    /// A store-action override on one attachment.
+    ///
+    /// The ordinal is carried at `u64` because that is the width the wire uses
+    /// for the depth and stencil forms; the colour form is 32 bits. Neither is
+    /// narrowed and neither is parsed, for the reason [`PrimitiveType`] gives:
+    /// which store actions a host can perform is the executor's question, and
+    /// folding an unknown ordinal onto a known one stores the wrong thing
+    /// rather than refusing.
     SetStoreAction {
         target: StoreActionTarget,
-        action: u16,
+        action: u64,
     },
     /// The occlusion-query mode, and the offset into the pass's visibility
     /// buffer.
@@ -609,6 +579,23 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), DrawShape::ALL.len());
+    }
+
+    /// A store-action ordinal wider than sixteen bits survives. The depth and
+    /// stencil records carry theirs at 64 bits, so narrowing the payload would
+    /// have folded a value the wire kept — the same shape of loss as the base
+    /// vertex above, on a different field.
+    #[test]
+    fn a_store_action_wider_than_sixteen_bits_is_carried_whole() {
+        let op = RenderOp::SetStoreAction {
+            target: StoreActionTarget::Depth,
+            action: 0x1_0000,
+        };
+        let RenderOp::SetStoreAction { action, .. } = op else {
+            panic!("store action");
+        };
+        assert_eq!(action, 0x1_0000);
+        assert!(action > u64::from(u16::MAX));
     }
 
     /// A base vertex the compact encoding could not have held survives the
