@@ -16,6 +16,23 @@
 //! *absence* of stages stays `None`, because a selector without the argument
 //! and a guest passing zero are different facts.
 //!
+//! # The layout is derived and the contract is not, so `decode` refuses
+//!
+//! All six rows are `Unresolved` in the ledger. What each *record says* is
+//! settled — the layouts below are pinned by fixtures — but what the device
+//! owes a guest that sends one is not, and the questions on those rows say a
+//! driven boot is what closes them.
+//!
+//! So the two questions are two functions. [`lift`] answers "what did the guest
+//! write", which is true whatever the ledger says. [`decode`] answers "may the
+//! model represent this", consults the ledger, and today refuses every one of
+//! the six. When a row closes, that call starts returning the record `lift`
+//! already produces, and nothing about the layout has to be revisited.
+//!
+//! Splitting them is what keeps a derived layout from being lost to an open
+//! contract, and an open contract from being closed by the existence of a
+//! decoder.
+//!
 //! # A heap is not a resource
 //!
 //! Two of the four name heaps and two name resources, and the record set is the
@@ -80,8 +97,29 @@ pub fn is_residency(rail: Rail, opcode: u32) -> bool {
     }
 }
 
-/// Lift a residency declaration out of its bytes.
+/// Lift a residency declaration, if the ledger has settled what it means.
+///
+/// Every row is unresolved today, so this refuses everything and the refusal
+/// says the contract is open rather than the opcode unknown. It is the entry
+/// point the model uses; [`lift`] is the one that answers the layout question
+/// regardless.
 pub fn decode<'a>(rail: Rail, op: &Op<'a>) -> Result<ResidencyRecord<'a>, DecodeRefusal> {
+    let opcode = op.opcode();
+    match crate::closure::find(rail, opcode).map(|row| row.closure) {
+        Some(
+            crate::closure::Closure::Implemented { .. }
+            | crate::closure::Closure::ProvenNoOp { .. },
+        ) => lift(rail, op),
+        _ => Err(no_record(rail, opcode)),
+    }
+}
+
+/// Lift a residency declaration out of its bytes, whatever the ledger says.
+///
+/// The layout question, answered on its own. A caller here is asking what the
+/// guest wrote — a census, a divergence instrument, a test that pins the
+/// record — and not asking permission to execute it.
+pub fn lift<'a>(rail: Rail, op: &Op<'a>) -> Result<ResidencyRecord<'a>, DecodeRefusal> {
     let opcode = op.opcode();
     if !is_residency(rail, opcode) {
         return Err(no_record(rail, opcode));
@@ -163,8 +201,8 @@ mod tests {
         out
     }
 
-    fn lift(rail: Rail, bytes: &[u8]) -> Result<ResidencyRecord<'_>, DecodeRefusal> {
-        decode(rail, &op(bytes, 0).expect("framed"))
+    fn read(rail: Rail, bytes: &[u8]) -> Result<ResidencyRecord<'_>, DecodeRefusal> {
+        super::lift(rail, &op(bytes, 0).expect("framed"))
     }
 
     /// The heap record's refs begin at `+6`, not `+8`. The serializer sizes the
@@ -181,7 +219,7 @@ mod tests {
         // The two bytes the serializer sizes for and never writes.
         payload.extend_from_slice(&[0xaa, 0xaa]);
         let bytes = record(wire::OPCODE_USE_HEAP, &payload);
-        let lifted = lift(Rail::Render, &bytes).expect("lifted");
+        let lifted = read(Rail::Render, &bytes).expect("lifted");
         assert_eq!(lifted.subject, ResidencySubject::Heaps);
         assert_eq!(lifted.refs.len(), 2);
         assert_eq!(lifted.refs[0].object_ref.get(), 6565);
@@ -200,7 +238,7 @@ mod tests {
         qualified.extend_from_slice(&2u16.to_le_bytes());
         qualified.extend_from_slice(&5151u32.to_le_bytes());
         let bytes = record(wire::OPCODE_USE_RESOURCE, &qualified);
-        let lifted = lift(Rail::Render, &bytes).expect("lifted");
+        let lifted = read(Rail::Render, &bytes).expect("lifted");
         assert_eq!(lifted.usage, Some(ResourceUsage(ResourceUsage::WRITE)));
         assert_eq!(lifted.stages, Some(RenderStages(2)));
 
@@ -208,7 +246,7 @@ mod tests {
         unqualified.extend_from_slice(&ResourceUsage::WRITE.to_le_bytes());
         unqualified.extend_from_slice(&5151u32.to_le_bytes());
         let bytes = record(wire::OPCODE_USE_RESOURCES_NO_STAGES, &unqualified);
-        let lifted = lift(Rail::Render, &bytes).expect("lifted");
+        let lifted = read(Rail::Render, &bytes).expect("lifted");
         assert_eq!(lifted.usage, Some(ResourceUsage(ResourceUsage::WRITE)));
         assert_eq!(lifted.stages, None);
     }
@@ -222,14 +260,14 @@ mod tests {
         let mut payload = 1u32.to_le_bytes().to_vec();
         payload.extend_from_slice(&6565u32.to_le_bytes());
         let bytes = record(wire::OPCODE_USE_HEAPS_NO_STAGES, &payload);
-        let heaps = lift(Rail::Render, &bytes).expect("lifted");
+        let heaps = read(Rail::Render, &bytes).expect("lifted");
         assert_eq!(heaps.subject, ResidencySubject::Heaps);
 
         let mut resources = 1u32.to_le_bytes().to_vec();
         resources.extend_from_slice(&0u32.to_le_bytes());
         resources.extend_from_slice(&6565u32.to_le_bytes());
         let bytes = record(wire::OPCODE_USE_RESOURCES_NO_STAGES, &resources);
-        let lifted = lift(Rail::Render, &bytes).expect("lifted");
+        let lifted = read(Rail::Render, &bytes).expect("lifted");
         assert_eq!(lifted.subject, ResidencySubject::Resources);
     }
 
@@ -240,13 +278,13 @@ mod tests {
     fn the_inherited_pair_reaches_both_encoders_and_the_declared_pair_does_not() {
         let mut payload = 1u32.to_le_bytes().to_vec();
         payload.extend_from_slice(&6565u32.to_le_bytes());
-        assert!(lift(
+        assert!(read(
             Rail::Compute,
             &record(wire::OPCODE_USE_HEAPS_NO_STAGES, &payload)
         )
         .is_ok());
-        assert!(lift(Rail::Compute, &record(wire::OPCODE_USE_HEAP, &payload)).is_err());
-        assert!(lift(Rail::Blit, &record(wire::OPCODE_USE_HEAP, &payload)).is_err());
+        assert!(read(Rail::Compute, &record(wire::OPCODE_USE_HEAP, &payload)).is_err());
+        assert!(read(Rail::Blit, &record(wire::OPCODE_USE_HEAP, &payload)).is_err());
     }
 
     /// A count larger than the record it sits in is reported with both numbers.
@@ -255,7 +293,7 @@ mod tests {
         let mut payload = 200u32.to_le_bytes().to_vec();
         payload.extend_from_slice(&5151u32.to_le_bytes());
         assert_eq!(
-            lift(
+            read(
                 Rail::Render,
                 &record(wire::OPCODE_USE_HEAPS_NO_STAGES, &payload)
             ),
@@ -268,10 +306,39 @@ mod tests {
         );
     }
 
-    /// Every residency opcode in the ledger lifts a record, on every rail the
-    /// ledger gives it a row on.
+    /// The model's entry point refuses every one of the six, and says the
+    /// contract is open rather than the opcode unknown. The layout is derived;
+    /// what the device owes a guest that sends one is not, and a decoder that
+    /// answered the second question because it could answer the first is the
+    /// guess the ledger exists to prevent.
     #[test]
-    fn every_ledger_residency_row_lifts_a_record() {
+    fn the_gated_entry_point_refuses_every_row_while_the_rows_are_open() {
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0u8; 16]);
+        let mut seen = 0usize;
+        for rail in [Rail::Render, Rail::Compute] {
+            for opcode in 0u32..0x200 {
+                if !is_residency(rail, opcode) {
+                    continue;
+                }
+                seen += 1;
+                let bytes = record(opcode, &payload);
+                assert_eq!(
+                    decode(rail, &op(&bytes, 0).expect("framed")),
+                    Err(DecodeRefusal::Unjudged { rail, opcode }),
+                    "{rail:?} {opcode:#x}"
+                );
+                // And the layout question still has its answer.
+                assert!(read(rail, &bytes).is_ok(), "{rail:?} {opcode:#x}");
+            }
+        }
+        assert_eq!(seen, 6);
+    }
+
+    /// Every residency opcode the record set names lifts a record, on every
+    /// rail that carries it. This is the layout question and it is closed.
+    #[test]
+    fn every_residency_opcode_lifts_a_record() {
         let mut payload = 1u32.to_le_bytes().to_vec();
         payload.extend_from_slice(&[0u8; 16]);
         let mut seen = 0usize;
@@ -282,7 +349,7 @@ mod tests {
                 }
                 seen += 1;
                 assert!(
-                    lift(rail, &record(opcode, &payload)).is_ok(),
+                    read(rail, &record(opcode, &payload)).is_ok(),
                     "{rail:?} {opcode:#x}"
                 );
             }

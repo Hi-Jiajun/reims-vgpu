@@ -39,6 +39,7 @@ use crate::identity::{
     ChannelId, ChannelSequence, CompletionStamp, IngressOrdinal, ResourceId, SessionGeneration,
     StampWait,
 };
+use crate::operation::OperationClass;
 use crate::pass::PassDescriptor;
 use crate::render::{RenderOp, ScissorRect, Viewport};
 use crate::resource_state::ResourceStateOp;
@@ -59,6 +60,29 @@ pub enum ResolvedOperation {
     Barrier(BarrierOp),
     ResourceState(ResourceStateOp),
     IndirectCommand(IcbOp),
+}
+
+impl ResolvedOperation {
+    /// The vocabulary class this operation belongs to.
+    ///
+    /// An exhaustive match, and that is the point: rail and segment
+    /// admissibility are both answered from the class, so a variant added
+    /// without a class here does not compile rather than quietly inheriting
+    /// whatever the last arm said.
+    #[must_use]
+    pub const fn class(&self) -> OperationClass {
+        match self {
+            Self::EncoderBoundary(_) => OperationClass::EncoderBoundary,
+            Self::Render(_) => OperationClass::Render,
+            Self::Compute(_) => OperationClass::Compute,
+            Self::Blit(_) => OperationClass::Blit,
+            Self::Event(_) => OperationClass::Event,
+            Self::Fence(_) => OperationClass::Fence,
+            Self::Barrier(_) => OperationClass::Barrier,
+            Self::ResourceState(_) => OperationClass::ResourceState,
+            Self::IndirectCommand(_) => OperationClass::IndirectCommand,
+        }
+    }
 }
 
 /// One record, and where it sits.
@@ -352,16 +376,18 @@ impl ExecBuilder {
 /// that from meaning "any encoder at all".
 fn rail_of(op: &ResolvedOperation) -> Option<reims_vgpu_protocol::closure::Rail> {
     use reims_vgpu_protocol::closure::Rail;
-    Some(match op {
-        ResolvedOperation::Render(_) => Rail::Render,
-        ResolvedOperation::Compute(_) => Rail::Compute,
-        ResolvedOperation::Blit(_) => Rail::Blit,
-        ResolvedOperation::Event(_) => Rail::Event,
-        ResolvedOperation::EncoderBoundary(_)
-        | ResolvedOperation::Fence(_)
-        | ResolvedOperation::Barrier(_)
-        | ResolvedOperation::ResourceState(_)
-        | ResolvedOperation::IndirectCommand(_) => return None,
+    Some(match op.class() {
+        OperationClass::Render => Rail::Render,
+        OperationClass::Compute => Rail::Compute,
+        OperationClass::Blit => Rail::Blit,
+        OperationClass::Event => Rail::Event,
+        OperationClass::InfoQuery => Rail::Info,
+        OperationClass::EncoderBoundary
+        | OperationClass::Fence
+        | OperationClass::Barrier
+        | OperationClass::ResourceState
+        | OperationClass::IndirectCommand
+        | OperationClass::CompletionEffect => return None,
     })
 }
 
@@ -377,22 +403,43 @@ fn rail_of(op: &ResolvedOperation) -> Option<reims_vgpu_protocol::closure::Rail>
 /// arrangement the payload vocabularies use: the table is what runs, and the
 /// test is what says the table still describes the contract.
 fn admissible_on(op: &ResolvedOperation, kind: SegmentKind) -> bool {
-    match op {
+    class_admissible_on(op.class(), kind)
+}
+
+/// Whether a class of record may appear inside a `kind` segment.
+///
+/// Keyed on the class rather than on the payload variant, because that is what
+/// the ledger is keyed on. A payload added to an existing class inherits its
+/// class's answer instead of needing one written for it, and a class added
+/// without an answer does not compile.
+///
+/// The sets are narrower than "more than one" and the narrowness is the point:
+/// a fence exists on the render and blit encoders and **not** on the compute
+/// one, because the compute pair is unresolved; a barrier exists on render and
+/// compute and not on blit; residency's rows are all unresolved, so the
+/// resource-state class reaches only the encoders whose *content* records are
+/// judged. Admitting a class on every encoder that is not its own would let a
+/// compute fence through the one door the ledger closed.
+///
+/// Hard-coded and then checked against the ledger, which is the same
+/// arrangement the payload vocabularies use: the table is what runs, and the
+/// test is what says the table still describes the contract.
+const fn class_admissible_on(class: OperationClass, kind: SegmentKind) -> bool {
+    match class {
         // A boundary is the segment. Every encoder has one.
-        ResolvedOperation::EncoderBoundary(_) => true,
-        ResolvedOperation::Fence(_) => matches!(kind, SegmentKind::Render | SegmentKind::Blit),
-        ResolvedOperation::Barrier(_) => matches!(kind, SegmentKind::Render | SegmentKind::Compute),
-        ResolvedOperation::ResourceState(_) => {
-            matches!(kind, SegmentKind::Blit | SegmentKind::Compute)
-        }
-        ResolvedOperation::IndirectCommand(_) => {
-            matches!(kind, SegmentKind::Render | SegmentKind::Blit)
-        }
-        // The single-rail classes never reach here.
-        ResolvedOperation::Render(_)
-        | ResolvedOperation::Compute(_)
-        | ResolvedOperation::Blit(_)
-        | ResolvedOperation::Event(_) => false,
+        OperationClass::EncoderBoundary => true,
+        OperationClass::Fence => matches!(kind, SegmentKind::Render | SegmentKind::Blit),
+        OperationClass::Barrier => matches!(kind, SegmentKind::Render | SegmentKind::Compute),
+        OperationClass::ResourceState => matches!(kind, SegmentKind::Blit | SegmentKind::Compute),
+        OperationClass::IndirectCommand => matches!(kind, SegmentKind::Render | SegmentKind::Blit),
+        // The single-rail classes never reach here, and the two classes with no
+        // stream records at all reach nothing.
+        OperationClass::Render
+        | OperationClass::Compute
+        | OperationClass::Blit
+        | OperationClass::Event
+        | OperationClass::InfoQuery
+        | OperationClass::CompletionEffect => false,
     }
 }
 
@@ -513,43 +560,21 @@ mod tests {
 
     /// The admissibility table is the ledger's, and this is what says so.
     ///
-    /// For every multi-rail class, the segments it is admitted on are exactly
-    /// the rails the ledger has judged an operation of that class on. The
-    /// compute fence pair is the case that makes this worth checking: it is
-    /// unresolved, so the compute encoder must not admit a fence even though
-    /// the selector exists.
+    /// Driven over **every** class rather than over a written list of probes.
+    /// For each one, the segments it is admitted on are exactly the rails the
+    /// ledger has judged an operation of that class on. A class whose rows are
+    /// all unresolved is admitted nowhere, which is residency's case today and
+    /// the compute fence pair's — the selector exists and the door is closed.
+    ///
+    /// The probe list this replaced could not see a class it did not name, and
+    /// a payload added under an existing class inherits that class's answer
+    /// now rather than needing an entry nobody remembers to add.
     #[test]
     fn the_admissibility_table_matches_the_ledger() {
-        use crate::operation::{classify, OperationClass, OperationHome};
+        use crate::operation::{classify, OperationHome};
         use reims_vgpu_protocol::closure::LEDGER;
 
-        let probes: [(ResolvedOperation, OperationClass); 4] = [
-            (
-                ResolvedOperation::Fence(FenceOp {
-                    kind: crate::sync::FenceKind::Update,
-                    fence: res(1),
-                    stages: None,
-                }),
-                OperationClass::Fence,
-            ),
-            (a_barrier(), OperationClass::Barrier),
-            (
-                ResolvedOperation::ResourceState(ResourceStateOp {
-                    directive: crate::resource_state::ContentDirective::Synchronize,
-                    target: crate::resource_state::ResourceStateTarget::Encoder,
-                }),
-                OperationClass::ResourceState,
-            ),
-            (
-                ResolvedOperation::IndirectCommand(IcbOp::ExecuteRange {
-                    icb: res(1),
-                    commands: crate::icb::CommandRange::default(),
-                }),
-                OperationClass::IndirectCommand,
-            ),
-        ];
-
-        for (op, class) in probes {
+        for &class in OperationClass::ALL {
             for &kind in SegmentKind::ALL {
                 let ledger_has_one = LEDGER.iter().any(|o| {
                     o.rail == kind.rail()
@@ -559,12 +584,59 @@ mod tests {
                             reims_vgpu_protocol::closure::Closure::Refused { .. }
                         )
                 });
+                // A single-rail class is admitted by its own rail rather than
+                // by this table, and the boundary is the segment itself.
+                let single_rail = matches!(
+                    class,
+                    OperationClass::Render
+                        | OperationClass::Compute
+                        | OperationClass::Blit
+                        | OperationClass::Event
+                        | OperationClass::InfoQuery
+                );
+                if single_rail || matches!(class, OperationClass::EncoderBoundary) {
+                    continue;
+                }
                 assert_eq!(
-                    admissible_on(&op, kind),
+                    class_admissible_on(class, kind),
                     ledger_has_one,
                     "{class:?} on {kind:?}"
                 );
             }
+        }
+    }
+
+    /// Every payload variant reports the class its records are judged under,
+    /// and a class this table admits somewhere has a payload that can reach it.
+    #[test]
+    fn every_multi_rail_class_that_is_admitted_somewhere_has_a_payload() {
+        let samples = [
+            ResolvedOperation::Fence(FenceOp {
+                kind: crate::sync::FenceKind::Update,
+                fence: res(1),
+                stages: None,
+            }),
+            a_barrier(),
+            ResolvedOperation::ResourceState(ResourceStateOp {
+                directive: crate::resource_state::ContentDirective::Synchronize,
+                target: crate::resource_state::ResourceStateTarget::Encoder,
+            }),
+            ResolvedOperation::IndirectCommand(IcbOp::ExecuteRange {
+                icb: res(1),
+                commands: crate::icb::CommandRange::default(),
+            }),
+        ];
+        for &class in OperationClass::ALL {
+            let admitted = SegmentKind::ALL
+                .iter()
+                .any(|&kind| class_admissible_on(class, kind));
+            if !admitted || matches!(class, OperationClass::EncoderBoundary) {
+                continue;
+            }
+            assert!(
+                samples.iter().any(|op| op.class() == class),
+                "{class:?} is admitted and has no payload to admit"
+            );
         }
     }
 

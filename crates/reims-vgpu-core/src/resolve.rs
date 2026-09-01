@@ -60,7 +60,6 @@ use reims_vgpu_protocol::decode::render::{
     DrawRecord, IndexRef as RecordIndexRef, IndirectRef as RenderIndirect,
     Instancing as RecordInstancing, RenderRecord,
 };
-use reims_vgpu_protocol::decode::residency::ResidencyRecord;
 use reims_vgpu_protocol::decode::resource_state::{RecordTarget, ResourceStateRecord};
 use reims_vgpu_protocol::decode::sync::{BarrierRecord, EventRecord, FenceRecord, SyncRecord};
 use reims_vgpu_protocol::decode::{
@@ -427,19 +426,6 @@ pub enum SyncResolved {
     Fence(FenceOp),
     Event(EventOp),
     Barrier(BarrierOp),
-}
-
-/// Resolve a residency declaration into the participations it asserts.
-///
-/// The window is the declared list; the usage and stages ride on the record.
-/// Heaps and resources both land in the same arena because both are resolved
-/// objects — what they *mean* is the record's `subject`, which the caller keeps.
-pub fn residency(
-    record: &ResidencyRecord<'_>,
-    resolver: &impl RefResolver,
-    arenas: &mut ExecArenas,
-) -> Result<ResourceSpan, ResolveRefusal> {
-    append_refs(arenas, resolver, record.refs)
 }
 
 /// The ref a bind entry uses to mean "nothing".
