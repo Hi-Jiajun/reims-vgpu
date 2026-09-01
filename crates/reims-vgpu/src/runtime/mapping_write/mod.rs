@@ -11,9 +11,7 @@
 //! on success.
 
 use crate::contract::iosurface_pages::{packed_span_estimate, sample_window_from_device_desc};
-use crate::contract::pixel_format::{
-    self, convert_rgba8_to_row, RowToRgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
-};
+use crate::contract::pixel_format::{self, RowToRgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
 use crate::model::{scanout_extent_ok, DeviceState, MappingEntry, MAX_SCANOUT_DIM};
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
@@ -846,6 +844,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // safe — a short source row would otherwise leave the previous row's bytes
     // in its tail.
     let direct_rows = rgba.is_none() && tight == (mw as usize) * (RGBA8_BPP as usize);
+    // Parsed once for both staged arms below. `Option` rather than an early
+    // refusal because `direct_rows` converts nothing, so a format with no arm is
+    // not that path's problem. See `pixel_format::Rgba8ToRow`.
+    let store_rail = pixel_format::Rgba8ToRow::for_format(format);
 
     use crate::runtime::drain::{
         note_surface_write_path, note_surface_write_phase, SurfaceWritePhase,
@@ -877,7 +879,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             } else {
                 if let Some(ref mut rgba_row) = rgba {
                     if !RowToRgba8::Bgra8.convert(src_row, mw, rgba_row)
-                        || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
+                        || !store_rail.is_some_and(|rail| rail.convert(rgba_row, mw, &mut row))
                     {
                         return refuse(
                             mapping_id,
@@ -959,7 +961,8 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                     } else {
                         if let Some(ref mut rgba_row) = rgba {
                             if !RowToRgba8::Bgra8.convert(src_row, mw, rgba_row)
-                                || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
+                                || !store_rail
+                                    .is_some_and(|rail| rail.convert(rgba_row, mw, &mut row))
                             {
                                 return refuse(
                                     mapping_id,
@@ -1281,11 +1284,20 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
         MTL_FORMAT_BGRA8_UNORM | pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
     ) && tight == rgba_stride as usize;
 
+    // Parsed once above `surface_changed_rows_us`, which this loop is: it runs
+    // `mh` times a flush and used to re-answer "is this BGRA8" per row and then
+    // the format ordinal per texel. `Rgba8ToRow::Bgra8` *is* the hand-rolled
+    // BGRA arm this replaced, vectorised. `Option` rather than an early refusal
+    // because `cache_rows_are_native` converts nothing, so a format with no arm
+    // is not that path's problem.
+    let store_rail = pixel_format::Rgba8ToRow::for_format(format);
     let span_rows = crate::runtime::chain_phase::CostSpan::new("surface_changed_rows_us");
     for y in 0..mh as usize {
         let src_off = y * rgba_stride as usize;
         let src_row = &rgba[src_off..src_off + rgba_stride as usize];
-        if !cache_rows_are_native && !rgba8_row_to_native(format, src_row, mw, &mut native) {
+        if !cache_rows_are_native
+            && !store_rail.is_some_and(|rail| rail.convert(src_row, mw, &mut native))
+        {
             return refuse(
                 mapping_id,
                 SurfaceWriteRefusal::RowConvert {
@@ -1303,7 +1315,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
         };
         let seed_row = if let Some(seed) = seed_rgba {
             let s = &seed[src_off..src_off + rgba_stride as usize];
-            if !rgba8_row_to_native(format, s, mw, &mut seed_native) {
+            if !store_rail.is_some_and(|rail| rail.convert(s, mw, &mut seed_native)) {
                 return refuse(
                     mapping_id,
                     SurfaceWriteRefusal::SeedRowConvert {
@@ -1407,23 +1419,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // worst on every bind.
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
-}
-
-fn rgba8_row_to_native(format: u16, rgba_row: &[u8], width: u32, native: &mut [u8]) -> bool {
-    if format == MTL_FORMAT_BGRA8_UNORM || format == pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB {
-        if rgba_row.len() < native.len() || native.len() < (width as usize) * 4 {
-            return false;
-        }
-        for i in 0..(width as usize) {
-            let o = i * 4;
-            native[o] = rgba_row[o + 2];
-            native[o + 1] = rgba_row[o + 1];
-            native[o + 2] = rgba_row[o];
-            native[o + 3] = rgba_row[o + 3];
-        }
-        return true;
-    }
-    convert_rgba8_to_row(format, rgba_row, width, native)
 }
 
 /// Write rows already encoded as a mapper-ref-texture mapping's native pixel format.

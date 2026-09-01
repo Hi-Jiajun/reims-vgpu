@@ -2989,19 +2989,30 @@ pub fn narrows_to_unorm8(format: u16) -> bool {
 /// release build, M3 Max:
 ///
 /// ```text
-///            before     after
-/// BGRA8     586 MB/s   56 GB/s
-/// RGBA8    1290 MB/s   91 GB/s
-/// R8        407 MB/s   24 GB/s
-/// RGBA16F  5311 MB/s    7 GB/s
+///          before    after
+/// BGRA8    1.5 GB/s  56 GB/s
+/// RGBA8    1.7 GB/s  86 GB/s
+/// R8       0.4 GB/s  24 GB/s
+/// RGBA16F  5.3 GB/s   7 GB/s
 /// ```
 ///
 /// Read as ratios, not as rates: the row is 8 KB and stays in L1, so those are
 /// what the conversion costs once the bytes are in front of it and not what a
-/// texture streamed from guest pages will reach. The ratio is the claim, and
-/// `RGBA16Float` is the control — it already had a hoisted arm, it gains only
-/// the vectorisation, and it moves 1.3x while the arms that were re-deciding
-/// the ordinal per texel move 60-96x.
+/// texture streamed from guest pages will reach. `RGBA16Float` is the control —
+/// it already had a hoisted arm, it gains only the vectorisation, and it moves
+/// 1.3x while the arms that were re-deciding the ordinal per texel move 38-59x.
+///
+/// # Do not take these on a busy machine
+///
+/// Three runs each, idle machine, before-tree in a separate worktree so the two
+/// are the same benchmark. That is not ceremony. A first attempt read the
+/// after-tree while a workspace test run was still finishing and reported BGRA8
+/// at 8.8 GB/s instead of 54 — self-consistent, repeatable within that run, and
+/// wrong by 6x in the direction that makes a later reader believe their change
+/// regressed something. The same attempt made the before-tree's BGRA8 read
+/// 586 MB/s rather than 1.5 GB/s. Both columns move under load and they do not
+/// move together, which is `chain_phase`'s and `sampled_phase`'s warning about
+/// contention inverting a ranking, one level down.
 ///
 /// That loop is this device's sampled-texture rail: a driven macos-13 Metal
 /// boot moved 2.15 MB a draw through it at 150 MB/s end to end, which was
@@ -3179,60 +3190,174 @@ pub fn convert_row_to_rgba8(format: u16, src: &[u8], pixels: u32, dst_rgba: &mut
     RowToRgba8::for_format(format).is_some_and(|rail| rail.convert(src, pixels, dst_rgba))
 }
 
+/// One guest pixel format, parsed into the conversion from a row of RGBA8 to a
+/// **row** of its texels.
+///
+/// The inverse of [`RowToRgba8`] and the same argument: the ordinal used to be
+/// re-matched per texel, inside [`rgba8_to_texel`], behind a per-texel
+/// `bytes_per_pixel` call and a four-byte temporary.
+///
+/// # Where this direction is paid
+///
+/// Every Store that lands a rendered frame in the guest's own pages. The GVA
+/// arm of `runtime::render_writeback` reads the resident back across a blocking
+/// fence and then writes it out a row at a time through here; that arm is 59 %
+/// of render Stores on a driven desktop-compositing boot. `mapping_write`'s
+/// `surface_changed_rows_us` loop, the scanout capture's BGRA re-encode and the
+/// mipmap generator take it too.
+///
+/// Measured the way [`RowToRgba8`]'s doc records, and with the same warning
+/// attached — a 2048-texel row, 4096 rows, L1-resident, release, M3 Max, three
+/// runs on a quiet machine:
+///
+/// ```text
+///          before    after
+/// BGRA8    1.6 GB/s  54 GB/s
+/// RGBA8    1.8 GB/s  85 GB/s
+/// R8       1.8 GB/s  53 GB/s
+/// BGR10A2  1.4 GB/s  13 GB/s
+/// RGBA16F  4.1 GB/s   4 GB/s
+/// ```
+///
+/// `RGBA16Float` is the control again: it already had a hoisted arm and does not
+/// move. The rates are per byte of **RGBA8 in**, so the arms are comparable to
+/// each other across differing texel widths.
+///
+/// # Why the arm set differs from [`RowToRgba8`]'s
+///
+/// The two directions are governed separately and deliberately. `R16Float` has
+/// an arm here and none there, so a renderable single-channel float target can
+/// be stored while a sampled bind of one keeps its native rail instead of being
+/// quantised to 256 levels on the way in — [`TexelLayout::has_cpu_loader_arm`]
+/// is what states that. `A8` and `RG8` go the other way. Neither set is
+/// derivable from the other, which is why each is held to *its own* per-texel
+/// function by a test rather than to the other direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rgba8ToRow {
+    /// Four bytes already in R,G,B,A order — the row is a `copy_from_slice`.
+    Rgba8,
+    /// Four bytes in B,G,R,A order — the row is a four-byte shuffle.
+    Bgra8,
+    /// One byte of red. Green, blue and alpha have no destination.
+    R8,
+    /// One `float16` red channel; the other three have no destination.
+    R16Float,
+    /// Two `float16` channels from R,G; blue and alpha have no destination.
+    Rg16Float,
+    /// Four `float16` channels.
+    Rgba16Float,
+    /// Ten bits per colour channel and two of alpha in one packed word.
+    Bgr10A2,
+}
+
+impl Rgba8ToRow {
+    /// The conversion `format` names, or `None` when this rail has no arm for
+    /// it.
+    pub fn for_format(format: u16) -> Option<Self> {
+        Some(match format {
+            MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => Self::Rgba8,
+            MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => Self::Bgra8,
+            MTL_FORMAT_R8_UNORM => Self::R8,
+            MTL_FORMAT_R16_FLOAT => Self::R16Float,
+            MTL_FORMAT_RG16_FLOAT => Self::Rg16Float,
+            MTL_FORMAT_RGBA16_FLOAT => Self::Rgba16Float,
+            MTL_FORMAT_BGR10A2_UNORM => Self::Bgr10A2,
+            _ => return None,
+        })
+    }
+
+    /// Bytes one destination texel occupies.
+    pub fn destination_bytes_per_pixel(self) -> u32 {
+        match self {
+            Self::R8 => 1,
+            Self::R16Float => RG8_BPP,
+            Self::Rgba8 | Self::Bgra8 | Self::Rg16Float | Self::Bgr10A2 => RGBA8_BPP,
+            Self::Rgba16Float => RGBA16F_BPP,
+        }
+    }
+
+    /// Convert `pixels` RGBA8 texels of `src_rgba` into `dst`.
+    ///
+    /// `false` only when a slice is too short for the extent asked for; the
+    /// format question was settled at construction.
+    pub fn convert(self, src_rgba: &[u8], pixels: u32, dst: &mut [u8]) -> bool {
+        let bpp = self.destination_bytes_per_pixel();
+        let Some(src_len) = (pixels as u64).checked_mul(RGBA8_BPP as u64) else {
+            return false;
+        };
+        let Some(dst_len) = (pixels as u64).checked_mul(bpp as u64) else {
+            return false;
+        };
+        let (Ok(src_len), Ok(dst_len)) = (usize::try_from(src_len), usize::try_from(dst_len))
+        else {
+            return false;
+        };
+        let (Some(src), Some(dst)) = (src_rgba.get(..src_len), dst.get_mut(..dst_len)) else {
+            return false;
+        };
+        // Chunked for [`RowToRgba8::convert`]'s reason: the counts are already
+        // equal, so the bounds checks fall out and the shuffles vectorise.
+        match self {
+            Self::Rgba8 => dst.copy_from_slice(src),
+            Self::Bgra8 => {
+                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                    d[0] = s[COMPONENT_B];
+                    d[1] = s[COMPONENT_G];
+                    d[2] = s[COMPONENT_R];
+                    d[3] = s[COMPONENT_A];
+                }
+            }
+            Self::R8 => {
+                for (s, d) in src.chunks_exact(4).zip(dst.iter_mut()) {
+                    *d = s[COMPONENT_R];
+                }
+            }
+            Self::R16Float => {
+                let lut = unorm8_to_f16_lut();
+                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(2)) {
+                    st16(d, lut[s[COMPONENT_R] as usize]);
+                }
+            }
+            Self::Rg16Float => {
+                let lut = unorm8_to_f16_lut();
+                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                    st16(&mut d[0..2], lut[s[COMPONENT_R] as usize]);
+                    st16(&mut d[2..4], lut[s[COMPONENT_G] as usize]);
+                }
+            }
+            Self::Rgba16Float => {
+                let lut = unorm8_to_f16_lut();
+                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(8)) {
+                    st16(&mut d[0..2], lut[s[COMPONENT_R] as usize]);
+                    st16(&mut d[2..4], lut[s[COMPONENT_G] as usize]);
+                    st16(&mut d[4..6], lut[s[COMPONENT_B] as usize]);
+                    st16(&mut d[6..8], lut[s[COMPONENT_A] as usize]);
+                }
+            }
+            Self::Bgr10A2 => {
+                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                    let mut texel = [0u8; 4];
+                    texel.copy_from_slice(s);
+                    d.copy_from_slice(&rgba8_to_bgr10a2_word(texel).to_le_bytes());
+                }
+            }
+        }
+        true
+    }
+}
+
+/// One row of RGBA8 as `format`'s texels.
+///
+/// The per-row entry point. A caller with a height loop should hold an
+/// [`Rgba8ToRow`] across it instead, for the reason that type's doc records.
+///
+/// A zero-pixel row succeeds before the format is consulted, matching
+/// [`convert_row_to_rgba8`].
 pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut [u8]) -> bool {
     if pixels == 0 {
         return true;
     }
-    let Some(bpp) = bytes_per_pixel(format) else {
-        return false;
-    };
-    let src_len = match (pixels as u64).checked_mul(RGBA8_BPP as u64) {
-        Some(v) => v as usize,
-        None => return false,
-    };
-    let dst_len = match (pixels as u64).checked_mul(bpp as u64) {
-        Some(v) => v as usize,
-        None => return false,
-    };
-    if src_rgba.len() < src_len || dst.len() < dst_len {
-        return false;
-    }
-
-    if format == MTL_FORMAT_RGBA16_FLOAT {
-        let lut = unorm8_to_f16_lut();
-        for i in 0..pixels {
-            let sp = (i as usize) * RGBA8_BPP as usize;
-            let dp = (i as usize) * RGBA16F_BPP as usize;
-            st16(
-                &mut dst[dp..dp + 2],
-                lut[src_rgba[sp + COMPONENT_R] as usize],
-            );
-            st16(
-                &mut dst[dp + 2..dp + 4],
-                lut[src_rgba[sp + COMPONENT_G] as usize],
-            );
-            st16(
-                &mut dst[dp + 4..dp + 6],
-                lut[src_rgba[sp + COMPONENT_B] as usize],
-            );
-            st16(
-                &mut dst[dp + 6..dp + 8],
-                lut[src_rgba[sp + COMPONENT_A] as usize],
-            );
-        }
-        return true;
-    }
-
-    for i in 0..pixels {
-        let sp = (i as usize) * RGBA8_BPP as usize;
-        let dp = (i as usize) * bpp as usize;
-        let mut rgba = [0u8; 4];
-        rgba.copy_from_slice(&src_rgba[sp..sp + 4]);
-        if !rgba8_to_texel(format, rgba, &mut dst[dp..dp + bpp as usize]) {
-            return false;
-        }
-    }
-    true
+    Rgba8ToRow::for_format(format).is_some_and(|rail| rail.convert(src_rgba, pixels, dst))
 }
 
 #[cfg(test)]
@@ -5338,6 +5463,152 @@ mod row_to_rgba8_tests {
             let mut a = vec![0u8; 64 * 4];
             let mut b = vec![0u8; 64 * 4];
             assert!(convert_row_to_rgba8(format, &src, 64, &mut a));
+            assert!(rail.convert(&src, 64, &mut b));
+            assert_eq!(a, b, "{format:#x} ({rail:?})");
+        }
+    }
+}
+
+#[cfg(test)]
+mod rgba8_to_row_tests {
+    use super::*;
+
+    fn every_named_format() -> impl Iterator<Item = u16> {
+        0u16..=0xffff
+    }
+
+    /// The row rail and the texel rail answer for exactly the same formats.
+    ///
+    /// # Why
+    ///
+    /// Held to [`rgba8_to_texel`] and **not** to [`RowToRgba8`]: the two
+    /// directions have deliberately different arm sets, and a test that
+    /// compared them would fail on `R16Float`, `A8`, `RG8` and `BGR10A2` for
+    /// reasons the code intends. See [`Rgba8ToRow`]'s doc.
+    #[test]
+    fn the_row_rail_and_the_texel_rail_answer_for_the_same_formats() {
+        for format in every_named_format() {
+            let mut cell = [0u8; RGBA32_BPP as usize];
+            let texel = rgba8_to_texel(format, [0, 0, 0, 0], &mut cell);
+            let row = Rgba8ToRow::for_format(format).is_some();
+            assert_eq!(
+                texel, row,
+                "{format:#x}: texel arm {texel}, row arm {row} — the two CPU \
+                 store rails disagree about this format"
+            );
+        }
+    }
+
+    /// The variant's own width is the contract's width for the ordinal it was
+    /// parsed from.
+    #[test]
+    fn the_row_rail_agrees_with_bytes_per_pixel() {
+        for format in every_named_format() {
+            let Some(rail) = Rgba8ToRow::for_format(format) else {
+                continue;
+            };
+            assert_eq!(
+                Some(rail.destination_bytes_per_pixel()),
+                bytes_per_pixel(format),
+                "{format:#x} ({rail:?})"
+            );
+        }
+    }
+
+    /// A converted row is texel-for-texel what the per-texel rail produces.
+    ///
+    /// # Why
+    ///
+    /// This direction lands in the **guest's own pages**: a transposed index in
+    /// one of these arms is a wrong frame the guest reads back and keeps. Every
+    /// byte value appears in every source lane so a swapped pair cannot hide
+    /// behind a symmetric pattern.
+    #[test]
+    fn a_converted_row_matches_the_texel_rail_texel_for_texel() {
+        const PIXELS: u32 = 257;
+        for format in every_named_format() {
+            let Some(rail) = Rgba8ToRow::for_format(format) else {
+                continue;
+            };
+            let bpp = rail.destination_bytes_per_pixel() as usize;
+            let src: Vec<u8> = (0..PIXELS as usize * RGBA8_BPP as usize)
+                .map(|i| (i.wrapping_mul(37).wrapping_add(i / 5)) as u8)
+                .collect();
+            let mut row = vec![0u8; PIXELS as usize * bpp];
+            assert!(rail.convert(&src, PIXELS, &mut row), "{format:#x}");
+            for i in 0..PIXELS as usize {
+                let mut expect = vec![0u8; bpp];
+                let mut rgba = [0u8; 4];
+                rgba.copy_from_slice(&src[i * 4..i * 4 + 4]);
+                assert!(
+                    rgba8_to_texel(format, rgba, &mut expect),
+                    "the texel rail answers wherever the row rail does"
+                );
+                assert_eq!(
+                    &row[i * bpp..(i + 1) * bpp],
+                    &expect[..],
+                    "{format:#x} ({rail:?}) texel {i}"
+                );
+            }
+        }
+    }
+
+    /// A short source or destination refuses rather than converting a partial
+    /// row, and refuses having written nothing.
+    #[test]
+    fn a_short_slice_refuses_and_writes_nothing() {
+        let rail = Rgba8ToRow::for_format(MTL_FORMAT_BGRA8_UNORM).expect("BGRA8 has an arm");
+        let src = [1u8; 16];
+        let mut dst = [0u8; 16];
+        assert!(!rail.convert(&src[..15], 4, &mut dst), "short source");
+        assert!(dst.iter().all(|&b| b == 0), "nothing written: {dst:?}");
+        assert!(!rail.convert(&src, 4, &mut dst[..15]), "short destination");
+        assert!(dst.iter().all(|&b| b == 0), "nothing written: {dst:?}");
+        assert!(rail.convert(&src, 4, &mut dst), "the exact extent converts");
+    }
+
+    /// A destination longer than the extent keeps its tail.
+    ///
+    /// # Why
+    ///
+    /// Callers hand in the remainder of a whole guest row, padding included. An
+    /// arm writing past `pixels` would overwrite bytes the guest owns and this
+    /// device was never asked to touch, and the `Rgba8` arm's whole-slice
+    /// `copy_from_slice` is exactly the shape that would.
+    #[test]
+    fn a_long_destination_keeps_its_tail() {
+        for format in [MTL_FORMAT_RGBA8_UNORM, MTL_FORMAT_BGRA8_UNORM] {
+            let rail = Rgba8ToRow::for_format(format).expect("has an arm");
+            let src = [7u8; 8];
+            let mut dst = [0xabu8; 16];
+            assert!(rail.convert(&src, 2, &mut dst), "{format:#x}");
+            assert!(
+                dst[8..].iter().all(|&b| b == 0xab),
+                "{format:#x}: tail overwritten: {dst:?}"
+            );
+        }
+    }
+
+    /// A zero-pixel row succeeds for a format with no arm, matching the other
+    /// direction.
+    #[test]
+    fn a_zero_pixel_row_succeeds_before_the_format_is_consulted() {
+        assert!(convert_rgba8_to_row(0xffff, &[], 0, &mut []));
+        assert!(!convert_rgba8_to_row(0xffff, &[0; 4], 1, &mut [0; 8]));
+    }
+
+    /// The free function and the parsed type produce the same bytes.
+    #[test]
+    fn the_free_function_is_the_parsed_type() {
+        for format in every_named_format() {
+            let Some(rail) = Rgba8ToRow::for_format(format) else {
+                continue;
+            };
+            let bpp = rail.destination_bytes_per_pixel() as usize;
+            let src: Vec<u8> = (0..64 * 4).map(|i| (i * 7 + 11) as u8).collect();
+            let mut a = vec![0u8; 64 * bpp];
+            let mut b = vec![0u8; 64 * bpp];
+            assert!(convert_rgba8_to_row(format, &src, 64, &mut a));
             assert!(rail.convert(&src, 64, &mut b));
             assert_eq!(a, b, "{format:#x} ({rail:?})");
         }

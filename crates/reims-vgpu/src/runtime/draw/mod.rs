@@ -2805,6 +2805,11 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
         FrameRows::Rgba8(_) => vec![0u8; tight as usize],
         FrameRows::Native(_) => Vec::new(),
     };
+    // One parse for both arms below — the mapped-span walk and the fragmented
+    // per-row one convert the same frame at the same format. A `Native` frame
+    // converts nothing, so an unsupported format is not its problem and the
+    // parse stays lazy. See `pixel_format::Rgba8ToRow`.
+    let row_rail = pixel_format::Rgba8ToRow::for_format(format);
     // Guest writes resolve through a fresh PT walk at write time — never a
     // cached view (stale-view heap-corruption class; see
     // `gva_view::write_span_within`) —
@@ -2819,12 +2824,9 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
             let at = y * src_stride;
             let out_row: &[u8] = match frame {
                 FrameRows::Rgba8(rgba) => {
-                    if !pixel_format::convert_rgba8_to_row(
-                        format,
-                        &rgba[at..at + src_stride],
-                        width,
-                        &mut row,
-                    ) {
+                    if !row_rail
+                        .is_some_and(|r| r.convert(&rgba[at..at + src_stride], width, &mut row))
+                    {
                         res = Err(MemError::BadArgs);
                         break;
                     }
@@ -2865,12 +2867,8 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
         let at = y * src_stride;
         let out_row: &[u8] = match frame {
             FrameRows::Rgba8(rgba) => {
-                if !pixel_format::convert_rgba8_to_row(
-                    format,
-                    &rgba[at..at + src_stride],
-                    width,
-                    &mut row,
-                ) {
+                if !row_rail.is_some_and(|r| r.convert(&rgba[at..at + src_stride], width, &mut row))
+                {
                     return Err(MemError::BadArgs);
                 }
                 &row
@@ -2967,6 +2965,11 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
     if rgba.len() < need {
         return false;
     }
+    // One parse for both arms below, as in the whole-frame writer above: this
+    // rect lands in the guest's pages at one format however the span maps.
+    let Some(row_rail) = pixel_format::Rgba8ToRow::for_format(format) else {
+        return false;
+    };
     let x_bytes = (origin_x as u64).saturating_mul(bpp as u64);
     let mut row = vec![0u8; tight_rect as usize];
     let mut src_rgba = vec![0u8; (rect_w as usize) * (RGBA8_BPP as usize)];
@@ -2984,7 +2987,7 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
             let src_full = &rgba[y * rgba_row + (origin_x as usize) * 4
                 ..y * rgba_row + (origin_x as usize) * 4 + (rect_w as usize) * 4];
             src_rgba.copy_from_slice(src_full);
-            if !pixel_format::convert_rgba8_to_row(format, &src_rgba, rect_w, &mut row) {
+            if !row_rail.convert(&src_rgba, rect_w, &mut row) {
                 ok = false;
                 break;
             }
@@ -3008,7 +3011,7 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
         let src_full = &rgba[y * rgba_row + (origin_x as usize) * 4
             ..y * rgba_row + (origin_x as usize) * 4 + (rect_w as usize) * 4];
         src_rgba.copy_from_slice(src_full);
-        if !pixel_format::convert_rgba8_to_row(format, &src_rgba, rect_w, &mut row) {
+        if !row_rail.convert(&src_rgba, rect_w, &mut row) {
             return false;
         }
         let row_gva = gva

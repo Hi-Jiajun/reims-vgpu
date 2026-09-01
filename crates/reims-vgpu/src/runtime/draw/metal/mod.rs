@@ -2060,6 +2060,9 @@ fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
         return false;
     }
     let tight = (rect_w as usize).saturating_mul(bpp as usize);
+    let Some(store_rail) = pixel_format::Rgba8ToRow::for_format(format) else {
+        return false;
+    };
     let mut raw = vec![0u8; tight.saturating_mul(rect_h as usize)];
     let mut guest_row = vec![0u8; tight];
     for dy in 0..rect_h as usize {
@@ -2067,7 +2070,7 @@ fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
         let src = &rgba[y * rgba_row + (origin_x as usize) * 4
             ..y * rgba_row + (origin_x as usize) * 4 + (rect_w as usize) * 4];
         // Guest store is native format; convert from tight RGBA8 (same as full write_gva path).
-        if !pixel_format::convert_rgba8_to_row(format, src, rect_w, &mut guest_row) {
+        if !store_rail.convert(src, rect_w, &mut guest_row) {
             return false;
         }
         raw[dy * tight..dy * tight + tight].copy_from_slice(&guest_row);

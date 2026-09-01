@@ -2149,8 +2149,8 @@ fn rgba8_image_changed_writes_only_diff_spans() {
 /// Every writer in this file is asserted, including the ones that already
 /// published or forgot, because the value of the rule is that it has no
 /// exceptions to remember.
-/// The fast arm's premise: for a BGRA8 mapping, this writer's native row *is*
-/// the host cache's row, byte for byte.
+/// The `cache_rows_are_native` shortcut's premise: for a BGRA8 mapping, this
+/// writer's native row *is* the host cache's row, byte for byte.
 ///
 /// `write_rgba8_image_changed` used to convert the frame twice — once per row
 /// into the mapping's native texels for the guest write, and once whole-frame
@@ -2160,9 +2160,15 @@ fn rgba8_image_changed_writes_only_diff_spans() {
 /// asserted directly rather than left to the reader of two loops in different
 /// parts of the file.
 ///
-/// The sRGB spelling is included because it is the other format the fast arm
+/// The sRGB spelling is included because it is the other format the shortcut
 /// admits, and a transfer function applied on one side and not the other would
 /// be invisible in any test that used only one of them.
+///
+/// The store rail is asked by ordinal rather than named as `Rgba8ToRow::Bgra8`
+/// on purpose: the shortcut's condition is a `matches!` on those two ordinals,
+/// so what has to hold is that *the ordinals the shortcut admits* reach the
+/// swapping arm. Naming the variant would assert the swap and skip the mapping,
+/// which is the half that can drift.
 #[test]
 fn a_bgra8_native_row_is_the_host_cache_row() {
     const W: u32 = 4;
@@ -2183,15 +2189,17 @@ fn a_bgra8_native_row_is_the_host_cache_row() {
         crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
     ] {
         let mut native = vec![0u8; (W * 4) as usize];
-        assert!(super::rgba8_row_to_native(format, &rgba, W, &mut native));
+        let rail = crate::contract::pixel_format::Rgba8ToRow::for_format(format)
+            .expect("both BGRA8 spellings have a store arm");
+        assert!(rail.convert(&rgba, W, &mut native));
         assert_eq!(
             native, cache_row,
-            "format {format:#x} takes the fast arm, so its native row must be the cache row"
+            "format {format:#x} takes the shortcut, so its native row must be the cache row"
         );
         assert_eq!(
             crate::contract::pixel_format::tight_row_bytes(W, format),
             Some(W * 4),
-            "the fast arm also requires the tight row to be the whole of the cache row"
+            "the shortcut also requires the tight row to be the whole of the cache row"
         );
     }
 }

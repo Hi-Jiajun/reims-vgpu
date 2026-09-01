@@ -30,8 +30,8 @@ pub mod vulkan;
 
 use crate::backend::Backend as _;
 use crate::contract::pixel_format::{
-    self, convert_rgba8_to_row, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
-    MTL_FORMAT_RGBA8_UNORM, RGBA8_BPP,
+    self, Rgba8ToRow, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM,
+    RGBA8_BPP,
 };
 use crate::model::{scanout_extent_ok, DeviceState, EFI_BOOT_HEIGHT, EFI_BOOT_WIDTH};
 use crate::runtime::host::HostMemory;
@@ -1090,7 +1090,7 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
             if !converted {
                 return fail(CaptureDecline::ConvertToRgba { format });
             }
-            if !convert_rgba8_to_row(MTL_FORMAT_BGRA8_UNORM, rgba, mw, dst_row) {
+            if !Rgba8ToRow::Bgra8.convert(rgba, mw, dst_row) {
                 return fail(CaptureDecline::ConvertFromRgba);
             }
         } else {

@@ -419,12 +419,13 @@ fn generate_via_box_filter(
         let need = (tight as usize)
             .checked_mul(dh as usize)
             .ok_or(MipmapStatus::Capacity)?;
+        let store_rail =
+            pixel_format::Rgba8ToRow::for_format(fmt).ok_or(MipmapStatus::UnsupportedFormat)?;
         let mut native = vec![0u8; need];
         for y in 0..dh {
             let src_off = (y as usize) * (dw as usize) * 4;
             let dst_off = (y as usize) * (tight as usize);
-            if !pixel_format::convert_rgba8_to_row(
-                fmt,
+            if !store_rail.convert(
                 &next_rgba[src_off..],
                 dw,
                 &mut native[dst_off..dst_off + tight as usize],
