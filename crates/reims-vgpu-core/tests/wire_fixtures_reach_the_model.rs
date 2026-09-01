@@ -395,7 +395,7 @@ fn signature(verdict: Verdict) -> String {
 fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written() {
     use reims_vgpu_core::exec::ExecBuilder;
     use reims_vgpu_core::identity::{ChannelSequence, IngressOrdinal, SessionGeneration};
-    use reims_vgpu_protocol::segment::SegmentKind;
+    use reims_vgpu_protocol::segment::{SegmentKind, SegmentLifetime};
 
     let mut placed = 0usize;
     let mut accesses = 0usize;
@@ -433,7 +433,7 @@ fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written()
         let mut model = registry_holding(&resolver.seen());
         let mut place = || -> Result<(), String> {
             builder
-                .begin_segment(kind.wire_type(), false)
+                .begin_segment(kind.wire_type(), SegmentLifetime::SELF_CONTAINED)
                 .map_err(|r| format!("begin: {}", r.reason()))?;
             builder
                 .record(op, &mut model.task_access(TASK, DOMAIN))
@@ -655,14 +655,6 @@ fn a_record_never_participates_in_a_resource_it_did_not_name() {
 /// hands the resolver an arena it then discards.
 ///
 /// # The classes whose only captured header asks to continue something
-///
-/// `beginSegment:1` writes the continuation bit, and that is what the render,
-/// compute and info cases were driven with — the oracle picked an argument
-/// before the bit's meaning was recovered. Those headers are not valid stream
-/// prefixes, and the model refuses a spanning encoder on purpose, so they are
-/// required to *refuse* here rather than being dropped from the sweep. Clearing
-/// the bit to walk them anyway would be synthesizing the field whose meaning is
-/// the thing at issue.
 #[test]
 fn apples_own_segment_header_frames_apples_own_records() {
     use reims_vgpu_core::exec::ExecBuilder;
@@ -735,8 +727,8 @@ fn apples_own_segment_header_frames_apples_own_records() {
         if continues {
             assert_eq!(
                 outcome.err().map(|r| r.reason()),
-                Some("walk_encoder_spans_segments"),
-                "{}: a header asking to continue an encoder was walked anyway",
+                Some("stream_continuation_without_encoder"),
+                "{}: a header claiming to continue an encoder found one to continue",
                 kind.name()
             );
             refused_spanning += 1;
@@ -790,7 +782,7 @@ fn apples_own_segment_header_frames_apples_own_records() {
     assert!(walked > 0, "no captured segment header reached the walk");
     assert!(
         refused_spanning > 0,
-        "no captured header exercised the spanning-encoder refusal"
+        "no captured header exercised the unoffered-continuation refusal"
     );
     assert!(
         accesses > 0,

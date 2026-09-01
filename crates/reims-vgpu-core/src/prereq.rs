@@ -395,7 +395,7 @@ mod tests {
         ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SessionGeneration,
         SlotGeneration, StampWait,
     };
-    use crate::stream::SegmentKind;
+    use crate::stream::{SegmentKind, SegmentLifetime};
     use crate::sync::EventOp;
 
     fn res(slot: u32) -> ResourceId {
@@ -424,8 +424,11 @@ mod tests {
             });
         }
         if !signals.is_empty() {
-            b.begin_segment(SegmentKind::Event.wire_type(), false)
-                .expect("segment opens");
+            b.begin_segment(
+                SegmentKind::Event.wire_type(),
+                SegmentLifetime::SELF_CONTAINED,
+            )
+            .expect("segment opens");
             for &(event, value) in signals {
                 b.record(
                     ResolvedOperation::Event(EventOp {

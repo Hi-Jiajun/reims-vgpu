@@ -46,7 +46,8 @@ use crate::pass::PassDescriptor;
 use crate::render::{RenderOp, ScissorRect, Viewport};
 use crate::resource_state::ResourceStateOp;
 use crate::stream::{
-    EncoderBoundary, SegmentBegin, SegmentKind, StreamCursor, StreamPosition, StreamRefusal,
+    EncoderBoundary, SegmentBegin, SegmentEnd, SegmentKind, SegmentLifetime, SegmentOpening,
+    StreamCursor, StreamPosition, StreamRefusal,
 };
 use crate::sync::{BarrierOp, EventOp, FenceOp};
 
@@ -356,9 +357,13 @@ impl ExecBuilder {
     }
 
     /// Open an encoder, named by the type byte in its segment header.
-    pub fn begin_segment(&mut self, wire_type: u8, flag: bool) -> Result<(), StreamRefusal> {
-        let (_, begin) = self.cursor.begin(wire_type, flag)?;
-        self.opened(begin);
+    pub fn begin_segment(
+        &mut self,
+        wire_type: u8,
+        lifetime: SegmentLifetime,
+    ) -> Result<(), StreamRefusal> {
+        let opening = self.cursor.begin(wire_type, lifetime)?;
+        self.opened(opening);
         Ok(())
     }
 
@@ -370,19 +375,24 @@ impl ExecBuilder {
     /// "resolve twice" shape the replacement exists to remove.
     pub fn begin_encoder(
         &mut self,
-        kind: reims_vgpu_protocol::segment::SegmentKind,
-        flag: bool,
+        kind: SegmentKind,
+        lifetime: SegmentLifetime,
     ) -> Result<(), StreamRefusal> {
-        let (_, begin) = self.cursor.begin_kind(kind, flag)?;
-        self.opened(begin);
+        let opening = self.cursor.begin_kind(kind, lifetime)?;
+        self.opened(opening);
         Ok(())
     }
 
-    fn opened(&mut self, begin: crate::stream::SegmentBegin) {
-        self.open = Some(ResolvedStream {
-            begin,
-            records: Vec::new(),
-        });
+    /// A segment opened. Only a *new* encoder makes a new [`ResolvedStream`];
+    /// a continuation keeps writing into the one already open, which is what
+    /// makes an encoder spanning segments one encoder here rather than two.
+    fn opened(&mut self, opening: SegmentOpening) {
+        if let SegmentOpening::Opened(_, begin) = opening {
+            self.open = Some(ResolvedStream {
+                begin,
+                records: Vec::new(),
+            });
+        }
     }
 
     /// Record one resolved operation inside the open encoder, and declare
@@ -472,12 +482,18 @@ impl ExecBuilder {
         Ok(at)
     }
 
-    /// Close the open encoder.
-    pub fn end_segment(&mut self) -> Result<EncoderBoundary, StreamRefusal> {
-        let boundary = self.cursor.end()?;
-        self.streams
-            .push(self.open.take().expect("an encoder was open"));
-        Ok(boundary)
+    /// End the open segment, and the encoder inside it if it ends here.
+    ///
+    /// A held encoder's [`ResolvedStream`] is not filed: it is still being
+    /// written to, and filing it would put a half-recorded encoder into the
+    /// transaction with its remaining records landing nowhere.
+    pub fn end_segment(&mut self) -> Result<SegmentEnd, StreamRefusal> {
+        let end = self.cursor.end()?;
+        if matches!(end, SegmentEnd::EncoderEnded(_)) {
+            self.streams
+                .push(self.open.take().expect("an encoder was open"));
+        }
+        Ok(end)
     }
 
     pub fn declare_access(&mut self, access: AccessIntent) {
@@ -638,8 +654,11 @@ mod tests {
     #[test]
     fn a_finished_transaction_carries_its_records_in_order() {
         let mut b = builder();
-        b.begin_segment(SegmentKind::Blit.wire_type(), false)
-            .expect("open");
+        b.begin_segment(
+            SegmentKind::Blit.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
         let first = b
             .record(a_blit(), &mut StubRegistry(ChannelId(1)))
             .expect("record");
@@ -647,8 +666,11 @@ mod tests {
             .record(a_blit(), &mut StubRegistry(ChannelId(1)))
             .expect("record");
         b.end_segment().expect("end");
-        b.begin_segment(SegmentKind::Blit.wire_type(), false)
-            .expect("open");
+        b.begin_segment(
+            SegmentKind::Blit.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
         let third = b
             .record(a_blit(), &mut StubRegistry(ChannelId(1)))
             .expect("record");
@@ -675,8 +697,11 @@ mod tests {
         );
 
         let mut b = builder();
-        b.begin_segment(SegmentKind::Blit.wire_type(), false)
-            .expect("open");
+        b.begin_segment(
+            SegmentKind::Blit.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
         assert_eq!(
             b.record(
                 ResolvedOperation::Render(RenderOp::SetPipeline { pipeline: res(1) }),
@@ -689,8 +714,11 @@ mod tests {
         );
 
         let mut b = builder();
-        b.begin_segment(SegmentKind::Compute.wire_type(), false)
-            .expect("open");
+        b.begin_segment(
+            SegmentKind::Compute.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
         assert_eq!(
             b.finish().err(),
             Some(StreamRefusal::EncoderNeverEnded(SegmentKind::Compute))
@@ -705,7 +733,8 @@ mod tests {
     fn a_multi_rail_record_is_admitted_only_by_an_encoder_that_carries_it() {
         for kind in [SegmentKind::Render, SegmentKind::Compute] {
             let mut b = builder();
-            b.begin_segment(kind.wire_type(), false).expect("open");
+            b.begin_segment(kind.wire_type(), SegmentLifetime::SELF_CONTAINED)
+                .expect("open");
             b.record(a_barrier(), &mut StubRegistry(ChannelId(1)))
                 .expect("a barrier exists on both");
             b.end_segment().expect("end");
@@ -713,7 +742,8 @@ mod tests {
         }
         for kind in [SegmentKind::Blit, SegmentKind::Event, SegmentKind::Info] {
             let mut b = builder();
-            b.begin_segment(kind.wire_type(), false).expect("open");
+            b.begin_segment(kind.wire_type(), SegmentLifetime::SELF_CONTAINED)
+                .expect("open");
             assert_eq!(
                 b.record(a_barrier(), &mut StubRegistry(ChannelId(1))),
                 Err(StreamRefusal::RailMismatch {

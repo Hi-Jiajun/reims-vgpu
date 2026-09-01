@@ -10,7 +10,7 @@ use crate::access::{AccessIntent, AccessKey, AccessMode, ByteRange, ResourceKey,
 use crate::exec::{ExecBuilder, ResolvedOperation};
 use crate::identity::{ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration};
 use crate::prereq::Diagnosis;
-use crate::stream::SegmentKind;
+use crate::stream::{SegmentKind, SegmentLifetime};
 use crate::sync::{EventKind, EventOp, FenceKind, FenceOp};
 
 fn res(slot: u32) -> ResourceId {
@@ -161,8 +161,11 @@ fn mixed(seed: u64, count: u64) -> Vec<ExecTransaction> {
                     .map(|(_, v)| *v)
                     .max()
                     .unwrap_or(0);
-                b.begin_segment(SegmentKind::Event.wire_type(), false)
-                    .expect("event encoder opens");
+                b.begin_segment(
+                    SegmentKind::Event.wire_type(),
+                    SegmentLifetime::SELF_CONTAINED,
+                )
+                .expect("event encoder opens");
                 b.record(
                     ResolvedOperation::Event(EventOp {
                         kind: EventKind::Signal,
@@ -176,8 +179,11 @@ fn mixed(seed: u64, count: u64) -> Vec<ExecTransaction> {
                 signalled.push((event, at + 1));
             }
             1 => {
-                b.begin_segment(SegmentKind::Blit.wire_type(), false)
-                    .expect("blit encoder opens");
+                b.begin_segment(
+                    SegmentKind::Blit.wire_type(),
+                    SegmentLifetime::SELF_CONTAINED,
+                )
+                .expect("blit encoder opens");
                 b.record(
                     ResolvedOperation::Fence(FenceOp {
                         kind: FenceKind::Update,
@@ -591,8 +597,11 @@ fn the_equivalence_relation_rejects_a_transaction_that_did_not_run() {
 #[test]
 fn the_equivalence_relation_rejects_a_missing_fence_update() {
     let mut b = builder(1, 1);
-    b.begin_segment(SegmentKind::Blit.wire_type(), false)
-        .expect("blit encoder opens");
+    b.begin_segment(
+        SegmentKind::Blit.wire_type(),
+        SegmentLifetime::SELF_CONTAINED,
+    )
+    .expect("blit encoder opens");
     b.record(
         ResolvedOperation::Fence(FenceOp {
             kind: FenceKind::Update,
@@ -617,8 +626,11 @@ fn the_equivalence_relation_rejects_a_missing_fence_update() {
 #[test]
 fn the_equivalence_relation_rejects_an_event_that_came_to_rest_elsewhere() {
     let mut b = builder(1, 1);
-    b.begin_segment(SegmentKind::Event.wire_type(), false)
-        .expect("event encoder opens");
+    b.begin_segment(
+        SegmentKind::Event.wire_type(),
+        SegmentLifetime::SELF_CONTAINED,
+    )
+    .expect("event encoder opens");
     b.record(
         ResolvedOperation::Event(EventOp {
             kind: EventKind::Signal,

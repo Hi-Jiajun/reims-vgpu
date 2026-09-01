@@ -432,7 +432,7 @@ mod tests {
     use crate::identity::{
         ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration, StampWait,
     };
-    use crate::stream::SegmentKind;
+    use crate::stream::{SegmentKind, SegmentLifetime};
     use crate::sync::EventOp;
 
     fn res(slot: u32) -> ResourceId {
@@ -597,8 +597,11 @@ mod tests {
     #[test]
     fn only_an_advancing_signal_reaches_the_trace() {
         let mut b = builder(1);
-        b.begin_segment(SegmentKind::Event.wire_type(), false)
-            .expect("open");
+        b.begin_segment(
+            SegmentKind::Event.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
         b.record(signal(res(4), 5), &mut StubRegistry(ChannelId(1)))
             .expect("record");
         b.record(signal(res(4), 3), &mut StubRegistry(ChannelId(1)))
@@ -632,7 +635,10 @@ mod tests {
     fn an_event_wait_is_met_at_or_past_its_value() {
         let mut producer = builder(1);
         producer
-            .begin_segment(SegmentKind::Event.wire_type(), false)
+            .begin_segment(
+                SegmentKind::Event.wire_type(),
+                SegmentLifetime::SELF_CONTAINED,
+            )
             .expect("open");
         producer
             .record(signal(res(4), 5), &mut StubRegistry(ChannelId(1)))
@@ -818,8 +824,11 @@ mod tests {
     fn the_trace_is_a_function_of_the_transactions_alone() {
         let make = || {
             let mut b = builder(1);
-            b.begin_segment(SegmentKind::Event.wire_type(), false)
-                .expect("open");
+            b.begin_segment(
+                SegmentKind::Event.wire_type(),
+                SegmentLifetime::SELF_CONTAINED,
+            )
+            .expect("open");
             b.record(signal(res(4), 2), &mut StubRegistry(ChannelId(1)))
                 .expect("record");
             b.end_segment().expect("end");

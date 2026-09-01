@@ -236,6 +236,40 @@ pub enum SegmentBody<'a> {
     ProtectionEnvelope { options: u64 },
 }
 
+/// Whether a segment's encoder reaches past the segment, in either direction.
+///
+/// One value rather than two bools passed side by side, because a continuation
+/// *is* the pair: the serializer writes the `beginSegment:` `BOOL` at `+5` of
+/// the header it opens and then reaches back to mark `+6` of the **preceding**
+/// header, so the edge is recorded from both ends and one non-zero byte cannot
+/// be read for its direction. A seam that took the two halves separately could
+/// carry one and drop the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SegmentLifetime {
+    /// Whether this segment's records continue the encoder the previous
+    /// segment left open.
+    ///
+    /// The `BOOL` first argument of `-beginSegment:protectionOptions:`, at `+5`
+    /// of the header that call opens. Read as set or clear rather than kept as
+    /// a byte: the wire carries a `BOOL`, and a guest that writes `2` means by
+    /// it what one that writes `1` means.
+    pub continues_previous: bool,
+    /// Whether the encoder outlives this segment, so the next one may continue
+    /// it.
+    ///
+    /// The other half of the same edge. The serializer does not write this into
+    /// the header it is opening; it marks `+6` of the preceding one.
+    pub continues_into_next: bool,
+}
+
+impl SegmentLifetime {
+    /// Neither end of a continuation is declared: one segment, one encoder.
+    pub const SELF_CONTAINED: Self = Self {
+        continues_previous: false,
+        continues_into_next: false,
+    };
+}
+
 /// One segment of a command stream, located and parsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FramedSegment<'a> {
@@ -246,24 +280,8 @@ pub struct FramedSegment<'a> {
     /// Byte offset of [`SegmentBody::Encoder::commands`] within the stream, so
     /// a per-record offset taken inside the window can be made absolute.
     pub commands_offset: u32,
-    /// Whether this segment's records continue the encoder the previous
-    /// segment left open.
-    ///
-    /// The `BOOL` first argument of `-beginSegment:protectionOptions:`, which
-    /// the serializer writes at `+5` of the header that call opens. Read as set
-    /// or clear rather than kept as a byte: the wire carries a `BOOL`, and a
-    /// guest that writes `2` means by it what one that writes `1` means.
-    pub continues_previous: bool,
-    /// Whether the encoder outlives this segment, so the next one may continue
-    /// it.
-    ///
-    /// The other half of the same edge, and the reason both halves are
-    /// surfaced. The serializer does not write this into the header it is
-    /// opening: it reaches *back* and marks `+6` of the **preceding** header,
-    /// so a continuation is relational state between two headers and one
-    /// non-zero byte cannot be read for its direction. The oracle's
-    /// continuation case drives both ends together for that reason.
-    pub continues_into_next: bool,
+    /// Whether this segment's encoder reaches past it, in either direction.
+    pub lifetime: SegmentLifetime,
     pub body: SegmentBody<'a>,
 }
 
@@ -354,8 +372,10 @@ impl<'a> SegmentStream<'a> {
                 wire_type: header.segment_type,
             });
         };
-        let continues_previous = header.begin_flag != 0;
-        let continues_into_next = header.unidentified_u8 != 0;
+        let lifetime = SegmentLifetime {
+            continues_previous: header.begin_flag != 0,
+            continues_into_next: header.unidentified_u8 != 0,
+        };
         let commands_offset = self.cursor + SEGMENT_HEADER_LEN;
         let window = &self.bytes[commands_offset..self.cursor + length_usize];
         let body = match role {
@@ -383,8 +403,7 @@ impl<'a> SegmentStream<'a> {
             index: self.index,
             offset: at,
             commands_offset: commands_offset as u32,
-            continues_previous,
-            continues_into_next,
+            lifetime,
             body,
         };
         self.cursor += length_usize;
@@ -655,8 +674,13 @@ mod tests {
                     .next()
                     .expect("a segment")
                     .expect("well framed");
-                assert_eq!(segment.continues_previous, previous);
-                assert_eq!(segment.continues_into_next, next);
+                assert_eq!(
+                    segment.lifetime,
+                    SegmentLifetime {
+                        continues_previous: previous,
+                        continues_into_next: next,
+                    }
+                );
                 assert_eq!(
                     segment.body,
                     SegmentBody::Encoder {
@@ -679,8 +703,8 @@ mod tests {
             .next()
             .expect("a segment")
             .expect("well framed");
-        assert!(segment.continues_previous);
-        assert!(segment.continues_into_next);
+        assert!(segment.lifetime.continues_previous);
+        assert!(segment.lifetime.continues_into_next);
     }
 
     /// Every malformed framing is a named refusal, and the walk stops there

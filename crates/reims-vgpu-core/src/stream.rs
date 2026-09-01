@@ -39,7 +39,7 @@
 //! missing one.
 
 use reims_vgpu_protocol::closure::Rail;
-pub use reims_vgpu_protocol::segment::{segment_role, SegmentKind, SegmentRole};
+pub use reims_vgpu_protocol::segment::{segment_role, SegmentKind, SegmentLifetime, SegmentRole};
 
 /// The protection-options value a guest attached to the segment that follows.
 ///
@@ -61,11 +61,13 @@ impl ProtectionOptions {
 }
 
 /// The resolved form of an encoder opening.
+///
+/// The header's `continues_previous` bit is not here, and cannot be: a
+/// `SegmentBegin` exists exactly when a *new* encoder opens, which is exactly
+/// when that bit is clear. Carrying it would be carrying a constant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SegmentBegin {
     pub kind: SegmentKind,
-    /// The `BOOL` first argument of the begin call, verbatim.
-    pub flag: bool,
     /// The value from a preceding protection envelope, if one armed this
     /// segment.
     pub protection: Option<ProtectionOptions>,
@@ -91,6 +93,9 @@ pub enum EncoderBoundary {
     /// length at `-endEncoding` and says nothing about how many records it
     /// covered. A count the model derived is checkable against a re-walk;
     /// a length copied from the header is not.
+    ///
+    /// It counts the *encoder*, not the segment. An encoder that spanned three
+    /// segments reports all of its records once, here, at the end of the third.
     End { records: u32 },
 }
 
@@ -151,8 +156,28 @@ impl StreamOrder {
 pub enum StreamRefusal {
     /// A segment type with no established contract.
     UnknownSegmentType(u8),
-    /// A begin arrived while an encoder was still open.
+    /// A begin arrived while an encoder was still open, and did not claim to
+    /// continue it.
+    ///
+    /// Either the previous segment declared the encoder outlives it and this
+    /// one did not take the offer, or the two disagree outright. Both are half
+    /// an edge, and an encoder abandoned mid-stream is records with no
+    /// `-endEncoding` behind them.
     EncoderStillOpen(SegmentKind),
+    /// A segment claimed to continue an encoder, and none was open.
+    ContinuationWithoutEncoder(SegmentKind),
+    /// A segment claimed to continue an encoder of a different family.
+    ContinuationKindMismatch {
+        open: SegmentKind,
+        claimed: SegmentKind,
+    },
+    /// A segment claimed to continue an encoder the previous segment did not
+    /// offer.
+    ///
+    /// The contract records a continuation from both ends. One end alone is a
+    /// stream whose two headers disagree about whether an encoder survived,
+    /// and picking either reading attributes records to a pass on a guess.
+    ContinuationNotOffered(SegmentKind),
     /// A record arrived outside any encoder.
     RecordOutsideEncoder,
     /// A record decoded on one rail was found inside another rail's segment.
@@ -180,6 +205,9 @@ impl StreamRefusal {
         match self {
             Self::UnknownSegmentType(_) => "stream_segment_type_unknown",
             Self::EncoderStillOpen(_) => "stream_encoder_begin_while_open",
+            Self::ContinuationWithoutEncoder(_) => "stream_continuation_without_encoder",
+            Self::ContinuationKindMismatch { .. } => "stream_continuation_kind_mismatch",
+            Self::ContinuationNotOffered(_) => "stream_continuation_not_offered",
             Self::RecordOutsideEncoder => "stream_record_outside_encoder",
             Self::RailMismatch { .. } => "stream_record_rail_mismatch",
             Self::EndWithoutBegin => "stream_encoder_end_without_begin",
@@ -191,10 +219,52 @@ impl StreamRefusal {
     }
 }
 
+/// What opening a segment did.
+///
+/// Two answers rather than one, because a continuation opens no encoder: there
+/// is no new [`SegmentBegin`] to make, and making one anyway would give the
+/// same encoder two openings and two protection states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SegmentOpening {
+    /// A new encoder opened at this position.
+    Opened(StreamPosition, SegmentBegin),
+    /// This segment's records join the encoder already open.
+    Continued(StreamPosition),
+}
+
+/// What ending a segment did to the encoder inside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SegmentEnd {
+    /// The encoder ended with the segment.
+    EncoderEnded(EncoderBoundary),
+    /// The segment ended and its encoder did not, having recorded this many
+    /// records so far. The next segment may continue it — and must, or the
+    /// encoder is abandoned.
+    EncoderHeld { records: u32 },
+}
+
 /// Where an encoder is in its life.
+///
+/// Three states rather than two, because "inside a segment" and "alive between
+/// segments" admit different things and collapsing them would let a record
+/// land where no segment is open, or let a continuation be claimed without a
+/// segment boundary in between.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    Open { kind: SegmentKind, records: u32 },
+    /// Inside a segment, taking records.
+    Open {
+        kind: SegmentKind,
+        records: u32,
+        /// Whether *this* segment declared the encoder outlives it. Per
+        /// segment, not per encoder: an encoder spanning three segments
+        /// re-declares it on each of the first two.
+        outlives_segment: bool,
+    },
+    /// Between segments, with the encoder alive and waiting to be continued.
+    Held {
+        kind: SegmentKind,
+        records: u32,
+    },
     Closed,
 }
 
@@ -237,7 +307,7 @@ impl StreamCursor {
         if self.pending_protection.is_some() {
             return Err(StreamRefusal::ProtectionEnvelopeUnclaimed);
         }
-        if let Phase::Open { kind, .. } = self.phase {
+        if let Phase::Open { kind, .. } | Phase::Held { kind, .. } = self.phase {
             return Err(StreamRefusal::EncoderStillOpen(kind));
         }
         self.pending_protection = Some(options);
@@ -254,8 +324,8 @@ impl StreamCursor {
     pub fn begin(
         &mut self,
         wire_type: u8,
-        flag: bool,
-    ) -> Result<(StreamPosition, SegmentBegin), StreamRefusal> {
+        lifetime: SegmentLifetime,
+    ) -> Result<SegmentOpening, StreamRefusal> {
         let kind = match segment_role(wire_type) {
             Some(SegmentRole::Encoder(kind)) => kind,
             // The envelope has its own entry point; arriving here means the
@@ -264,29 +334,70 @@ impl StreamCursor {
                 return Err(StreamRefusal::UnknownSegmentType(wire_type))
             }
         };
-        self.begin_kind(kind, flag)
+        self.begin_kind(kind, lifetime)
     }
 
     /// A segment header opened an encoder whose kind is already established.
+    ///
+    /// # Both ends of a continuation, or neither
+    ///
+    /// A continuation is one edge written from two places: this header's `+5`
+    /// says it continues what came before, and the *previous* header's `+6`,
+    /// which the serializer went back and marked, says the encoder survived to
+    /// be continued. This checks both. A stream where only one is set has two
+    /// headers disagreeing about whether an encoder is still alive, and reading
+    /// either one alone attributes records to a pass on a guess.
     pub fn begin_kind(
         &mut self,
         kind: SegmentKind,
-        flag: bool,
-    ) -> Result<(StreamPosition, SegmentBegin), StreamRefusal> {
-        if let Phase::Open { kind, .. } = self.phase {
-            return Err(StreamRefusal::EncoderStillOpen(kind));
-        }
+        lifetime: SegmentLifetime,
+    ) -> Result<SegmentOpening, StreamRefusal> {
         let at = StreamPosition {
             segment: self.segment,
-            record: 0,
+            record: self.record,
         };
-        self.phase = Phase::Open { kind, records: 0 };
-        self.record = 0;
-        Ok((
+        if lifetime.continues_previous {
+            match self.phase {
+                Phase::Held {
+                    kind: open,
+                    records,
+                } => {
+                    if open != kind {
+                        return Err(StreamRefusal::ContinuationKindMismatch {
+                            open,
+                            claimed: kind,
+                        });
+                    }
+                    // Re-declared per segment: the offer this one makes says
+                    // nothing about whether the encoder survives *it*.
+                    self.phase = Phase::Open {
+                        kind,
+                        records,
+                        outlives_segment: lifetime.continues_into_next,
+                    };
+                    return Ok(SegmentOpening::Continued(at));
+                }
+                // A segment is still open, so no boundary has been crossed and
+                // there is nothing to continue across one.
+                Phase::Open { .. } => return Err(StreamRefusal::ContinuationNotOffered(kind)),
+                Phase::Closed => return Err(StreamRefusal::ContinuationWithoutEncoder(kind)),
+            }
+        }
+        match self.phase {
+            Phase::Open { kind, .. } | Phase::Held { kind, .. } => {
+                return Err(StreamRefusal::EncoderStillOpen(kind))
+            }
+            Phase::Closed => {}
+        }
+        self.phase = Phase::Open {
+            kind,
+            records: 0,
+            outlives_segment: lifetime.continues_into_next,
+        };
+        Ok(SegmentOpening::Opened(
             at,
             SegmentBegin {
                 kind,
-                flag,
                 protection: self.pending_protection.take(),
             },
         ))
@@ -297,7 +408,7 @@ impl StreamCursor {
     /// Returns the record's position, which is what an [`crate::access`] intent
     /// and a hazard edge are keyed by.
     pub fn record(&mut self, rail: Rail) -> Result<StreamPosition, StreamRefusal> {
-        let Phase::Open { kind, records } = &mut self.phase else {
+        let Phase::Open { kind, records, .. } = &mut self.phase else {
             return Err(StreamRefusal::RecordOutsideEncoder);
         };
         if kind.rail() != rail {
@@ -315,20 +426,37 @@ impl StreamCursor {
         Ok(at)
     }
 
-    /// The open encoder ended.
-    pub fn end(&mut self) -> Result<EncoderBoundary, StreamRefusal> {
-        let Phase::Open { records, .. } = self.phase else {
+    /// The segment's records are over.
+    ///
+    /// The encoder ends here unless the header declared it outlives the
+    /// segment, in which case it stays open for the next one to continue.
+    /// Either way this is a segment boundary, so the position counter advances
+    /// and the per-segment record counter restarts — an encoder spanning three
+    /// segments still gives its records three distinct segment indices, because
+    /// where a record was written is not the same question as which encoder ran
+    /// it.
+    pub fn end(&mut self) -> Result<SegmentEnd, StreamRefusal> {
+        let Phase::Open {
+            kind,
+            records,
+            outlives_segment,
+        } = self.phase
+        else {
             return Err(StreamRefusal::EndWithoutBegin);
         };
-        self.phase = Phase::Closed;
         self.segment += 1;
         self.record = 0;
-        Ok(EncoderBoundary::End { records })
+        if outlives_segment {
+            self.phase = Phase::Held { kind, records };
+            return Ok(SegmentEnd::EncoderHeld { records });
+        }
+        self.phase = Phase::Closed;
+        Ok(SegmentEnd::EncoderEnded(EncoderBoundary::End { records }))
     }
 
     /// The stream is over. Anything still open or still armed is a refusal.
     pub fn finish(self) -> Result<u32, StreamRefusal> {
-        if let Phase::Open { kind, .. } = self.phase {
+        if let Phase::Open { kind, .. } | Phase::Held { kind, .. } = self.phase {
             return Err(StreamRefusal::EncoderNeverEnded(kind));
         }
         if self.pending_protection.is_some() {
@@ -342,7 +470,9 @@ impl StreamCursor {
     pub const fn open_encoder(&self) -> Option<SegmentKind> {
         match self.phase {
             Phase::Open { kind, .. } => Some(kind),
-            Phase::Closed => None,
+            // An encoder held between segments takes no records, so there is no
+            // encoder for one to be admitted by.
+            Phase::Held { .. } | Phase::Closed => None,
         }
     }
 }
@@ -351,13 +481,35 @@ impl StreamCursor {
 mod tests {
     use super::*;
 
+    /// One segment, one encoder: the shape every stream this guest has been
+    /// measured emitting uses.
+    const SELF: SegmentLifetime = SegmentLifetime::SELF_CONTAINED;
+
+    /// The encoder outlives this segment.
+    const HOLDS: SegmentLifetime = SegmentLifetime {
+        continues_previous: false,
+        continues_into_next: true,
+    };
+
+    /// This segment continues the encoder above and ends it.
+    const TAKES: SegmentLifetime = SegmentLifetime {
+        continues_previous: true,
+        continues_into_next: false,
+    };
+
+    /// This segment continues the encoder above and passes it on.
+    const RELAYS: SegmentLifetime = SegmentLifetime {
+        continues_previous: true,
+        continues_into_next: true,
+    };
+
     /// Each kind admits its own rail's records and no other's.
     #[test]
     fn a_segment_admits_exactly_its_own_rail() {
         for &kind in SegmentKind::ALL {
             for &other in SegmentKind::ALL {
                 let mut c = StreamCursor::new();
-                c.begin(kind.wire_type(), false).expect("opens");
+                c.begin(kind.wire_type(), SELF).expect("opens");
                 let got = c.record(other.rail());
                 if kind == other {
                     assert!(got.is_ok());
@@ -377,14 +529,24 @@ mod tests {
     #[test]
     fn records_are_positioned_in_wire_order_across_segments() {
         let mut c = StreamCursor::new();
-        c.begin(SegmentKind::Render.wire_type(), true)
+        c.begin(SegmentKind::Render.wire_type(), SELF)
             .expect("open");
         let a = c.record(Rail::Render).expect("rec");
         let b = c.record(Rail::Render).expect("rec");
-        assert_eq!(c.end(), Ok(EncoderBoundary::End { records: 2 }));
-        c.begin(SegmentKind::Blit.wire_type(), false).expect("open");
+        assert_eq!(
+            c.end(),
+            Ok(SegmentEnd::EncoderEnded(EncoderBoundary::End {
+                records: 2
+            }))
+        );
+        c.begin(SegmentKind::Blit.wire_type(), SELF).expect("open");
         let d = c.record(Rail::Blit).expect("rec");
-        assert_eq!(c.end(), Ok(EncoderBoundary::End { records: 1 }));
+        assert_eq!(
+            c.end(),
+            Ok(SegmentEnd::EncoderEnded(EncoderBoundary::End {
+                records: 1
+            }))
+        );
         assert_eq!(c.finish(), Ok(2));
 
         assert!(a < b && b < d);
@@ -405,12 +567,12 @@ mod tests {
             Err(StreamRefusal::RecordOutsideEncoder)
         );
         assert_eq!(c.end(), Err(StreamRefusal::EndWithoutBegin));
-        assert_eq!(c.begin(9, false), Err(StreamRefusal::UnknownSegmentType(9)));
+        assert_eq!(c.begin(9, SELF), Err(StreamRefusal::UnknownSegmentType(9)));
 
-        c.begin(SegmentKind::Render.wire_type(), false)
+        c.begin(SegmentKind::Render.wire_type(), SELF)
             .expect("open");
         assert_eq!(
-            c.begin(SegmentKind::Compute.wire_type(), false),
+            c.begin(SegmentKind::Compute.wire_type(), SELF),
             Err(StreamRefusal::EncoderStillOpen(SegmentKind::Render))
         );
         assert_eq!(
@@ -425,13 +587,21 @@ mod tests {
         let mut c = StreamCursor::new();
         c.protection_envelope(ProtectionOptions(0x44))
             .expect("armed");
-        let (_, begin) = c.begin(SegmentKind::Blit.wire_type(), false).expect("open");
+        let SegmentOpening::Opened(_, begin) =
+            c.begin(SegmentKind::Blit.wire_type(), SELF).expect("open")
+        else {
+            panic!("a fresh encoder opens")
+        };
         assert_eq!(begin.protection, Some(ProtectionOptions(0x44)));
         assert!(begin.demands_protection());
         c.end().expect("end");
 
         // Not the one after that.
-        let (_, next) = c.begin(SegmentKind::Blit.wire_type(), false).expect("open");
+        let SegmentOpening::Opened(_, next) =
+            c.begin(SegmentKind::Blit.wire_type(), SELF).expect("open")
+        else {
+            panic!("a fresh encoder opens")
+        };
         assert_eq!(next.protection, None);
         assert!(!next.demands_protection());
     }
@@ -454,11 +624,157 @@ mod tests {
     #[test]
     fn an_envelope_may_not_arrive_inside_an_encoder() {
         let mut c = StreamCursor::new();
-        c.begin(SegmentKind::Compute.wire_type(), false)
+        c.begin(SegmentKind::Compute.wire_type(), SELF)
             .expect("open");
         assert_eq!(
             c.protection_envelope(ProtectionOptions(1)),
             Err(StreamRefusal::EncoderStillOpen(SegmentKind::Compute))
+        );
+    }
+
+    /// An encoder split across segments is one encoder, and its record count is
+    /// the encoder's rather than the last segment's.
+    #[test]
+    fn an_encoder_may_span_segments_when_both_headers_say_so() {
+        let mut c = StreamCursor::new();
+        let opening = c.begin(SegmentKind::Blit.wire_type(), HOLDS).expect("open");
+        assert!(matches!(opening, SegmentOpening::Opened(..)));
+        let a = c.record(Rail::Blit).expect("rec");
+        assert_eq!(c.end(), Ok(SegmentEnd::EncoderHeld { records: 1 }));
+
+        // No second opening: the encoder is the one already running.
+        let opening = c
+            .begin(SegmentKind::Blit.wire_type(), RELAYS)
+            .expect("continue");
+        let SegmentOpening::Continued(_) = opening else {
+            panic!("a continuation opens no encoder")
+        };
+        let b = c.record(Rail::Blit).expect("rec");
+        assert_eq!(c.end(), Ok(SegmentEnd::EncoderHeld { records: 2 }));
+
+        c.begin(SegmentKind::Blit.wire_type(), TAKES)
+            .expect("continue");
+        let d = c.record(Rail::Blit).expect("rec");
+        assert_eq!(
+            c.end(),
+            Ok(SegmentEnd::EncoderEnded(EncoderBoundary::End {
+                records: 3
+            })),
+            "the count is the encoder's, not the last segment's"
+        );
+        assert_eq!(c.finish(), Ok(3));
+
+        // Where a record was written is still answered per segment.
+        assert_eq!([a.segment, b.segment, d.segment], [0, 1, 2]);
+        assert!(a < b && b < d);
+    }
+
+    /// A continuation is one edge recorded from both headers, so half of one is
+    /// a refusal from either side. Reading either half alone attributes records
+    /// to a pass on a guess.
+    #[test]
+    fn half_a_continuation_edge_is_refused_from_either_side() {
+        // Claimed with nothing open.
+        let mut c = StreamCursor::new();
+        assert_eq!(
+            c.begin(SegmentKind::Blit.wire_type(), TAKES),
+            Err(StreamRefusal::ContinuationWithoutEncoder(SegmentKind::Blit))
+        );
+
+        // Claimed against an encoder that never offered it.
+        let mut c = StreamCursor::new();
+        c.begin(SegmentKind::Blit.wire_type(), SELF).expect("open");
+        c.end().expect("end");
+        assert_eq!(
+            c.begin(SegmentKind::Blit.wire_type(), TAKES),
+            Err(StreamRefusal::ContinuationWithoutEncoder(SegmentKind::Blit))
+        );
+
+        // Offered, then claimed by another family.
+        let mut c = StreamCursor::new();
+        c.begin(SegmentKind::Blit.wire_type(), HOLDS).expect("open");
+        c.end().expect("held");
+        assert_eq!(
+            c.begin(SegmentKind::Compute.wire_type(), TAKES),
+            Err(StreamRefusal::ContinuationKindMismatch {
+                open: SegmentKind::Blit,
+                claimed: SegmentKind::Compute,
+            })
+        );
+
+        // Offered and not taken: the encoder is abandoned.
+        let mut c = StreamCursor::new();
+        c.begin(SegmentKind::Blit.wire_type(), HOLDS).expect("open");
+        c.end().expect("held");
+        assert_eq!(
+            c.begin(SegmentKind::Blit.wire_type(), SELF),
+            Err(StreamRefusal::EncoderStillOpen(SegmentKind::Blit))
+        );
+
+        // Claimed without a segment boundary in between: a begin arriving
+        // inside a segment that is still open has nothing to continue *across*.
+        let mut c = StreamCursor::new();
+        c.begin(SegmentKind::Blit.wire_type(), HOLDS).expect("open");
+        assert_eq!(
+            c.begin(SegmentKind::Blit.wire_type(), TAKES),
+            Err(StreamRefusal::ContinuationNotOffered(SegmentKind::Blit))
+        );
+
+        // A held encoder takes no records: it is alive, and no segment is open
+        // for one to be written into.
+        let mut c = StreamCursor::new();
+        c.begin(SegmentKind::Blit.wire_type(), HOLDS).expect("open");
+        c.end().expect("held");
+        assert_eq!(
+            c.record(Rail::Blit),
+            Err(StreamRefusal::RecordOutsideEncoder)
+        );
+        assert_eq!(c.end(), Err(StreamRefusal::EndWithoutBegin));
+
+        // Held open to the end of the stream.
+        let mut c = StreamCursor::new();
+        c.begin(SegmentKind::Blit.wire_type(), HOLDS).expect("open");
+        c.end().expect("held");
+        assert_eq!(
+            c.finish(),
+            Err(StreamRefusal::EncoderNeverEnded(SegmentKind::Blit))
+        );
+    }
+
+    /// `continues_into_next` is re-read on every segment of a spanning encoder.
+    ///
+    /// A cursor that recorded it once, at the opening, would let a relayed
+    /// encoder be continued forever — or refuse the segment that legitimately
+    /// ends it.
+    #[test]
+    fn the_offer_is_re_declared_by_each_segment_of_a_spanning_encoder() {
+        let mut c = StreamCursor::new();
+        c.begin(SegmentKind::Blit.wire_type(), HOLDS).expect("open");
+        c.end().expect("held");
+        // This one takes the offer and makes none.
+        c.begin(SegmentKind::Blit.wire_type(), TAKES)
+            .expect("continue");
+        assert_eq!(
+            c.end(),
+            Ok(SegmentEnd::EncoderEnded(EncoderBoundary::End {
+                records: 0
+            }))
+        );
+        assert_eq!(
+            c.begin(SegmentKind::Blit.wire_type(), TAKES),
+            Err(StreamRefusal::ContinuationWithoutEncoder(SegmentKind::Blit))
+        );
+    }
+
+    /// A protection envelope cannot arm a segment that opens no encoder.
+    #[test]
+    fn an_envelope_may_not_arm_a_continuation() {
+        let mut c = StreamCursor::new();
+        c.begin(SegmentKind::Blit.wire_type(), HOLDS).expect("open");
+        c.end().expect("held");
+        assert_eq!(
+            c.protection_envelope(ProtectionOptions(1)),
+            Err(StreamRefusal::EncoderStillOpen(SegmentKind::Blit))
         );
     }
 
@@ -477,6 +793,12 @@ mod tests {
             StreamRefusal::EndWithoutBegin,
             StreamRefusal::ProtectionEnvelopeUnclaimed,
             StreamRefusal::EncoderNeverEnded(SegmentKind::Render),
+            StreamRefusal::ContinuationWithoutEncoder(SegmentKind::Render),
+            StreamRefusal::ContinuationKindMismatch {
+                open: SegmentKind::Render,
+                claimed: SegmentKind::Blit,
+            },
+            StreamRefusal::ContinuationNotOffered(SegmentKind::Render),
         ];
         let mut seen: Vec<&str> = all.iter().map(|r| r.reason()).collect();
         seen.sort_unstable();

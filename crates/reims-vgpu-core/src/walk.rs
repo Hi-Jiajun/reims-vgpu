@@ -42,25 +42,22 @@
 //! unresolved row, so a stream refusing here while rows remain open is the
 //! ledger's prediction rather than a surprise.
 //!
-//! # What it refuses that the contract permits
+//! # An encoder is not a segment
 //!
-//! A segment header carries two encoder-lifetime bits and the contract behind
-//! them is established, not guessed: the `beginSegment:` `BOOL` lands at `+5`
-//! of the header it opens, and the serializer then reaches *back* into the
+//! A guest may split one encoder across several segments, and the contract for
+//! it is established rather than guessed: the `beginSegment:` `BOOL` lands at
+//! `+5` of the header it opens, and the serializer then reaches *back* into the
 //! preceding header to mark `+6`. The two are one edge recorded from both ends
 //! — "this segment continues the encoder above" and "that encoder continues
-//! below" — which is why one non-zero byte cannot be read for the direction.
-//! The oracle drives both ends in a single case for exactly that reason.
+//! below" — which is why one non-zero byte cannot be read for the direction,
+//! and why [`reims_vgpu_protocol::segment::SegmentLifetime`] is one value
+//! rather than two bools a seam could split.
 //!
-//! So a guest may ask for one encoder to span several segments, and
-//! [`crate::stream::StreamCursor`] cannot represent it: an encoder opens and
-//! closes inside one segment. [`WalkRefusal::EncoderSpansSegments`] is that
-//! limit of the model, stated rather than ignored. Silently opening a fresh
-//! encoder instead would attribute the second segment's records to a pass the
-//! guest never opened, which is a wrong frame rather than a missing one — and
-//! the legacy walker's own census of a driven boot found the bits clear on all
-//! 94 860 segments, so refusing costs this guest nothing while the model
-//! catches up.
+//! This module does nothing with it beyond passing it whole.
+//! [`crate::stream::StreamCursor`] holds the encoder, so it is the cursor that
+//! decides whether a segment's end ends anything, and the walker's loop is the
+//! same either way. That is the point of the split: a walker that knew when an
+//! encoder survives would be a second copy of the encoder state machine.
 
 use crate::exec::{ExecBuilder, ExecTransaction};
 use crate::resolve::{self, RefResolver, ResolveRefusal};
@@ -108,10 +105,6 @@ pub enum WalkRefusal {
         at: StreamSite,
         refusal: StreamRefusal,
     },
-    /// A segment asked for its encoder to span a segment boundary.
-    ///
-    /// A limit of the model, not of the contract. See the module documentation.
-    EncoderSpansSegments { at: StreamSite },
     /// The stream ended with an encoder or a protection envelope unfinished.
     Unfinished { refusal: StreamRefusal },
 }
@@ -129,7 +122,6 @@ impl WalkRefusal {
             Self::RecordFraming { .. } => "walk_record_framing_refused",
             Self::Resolve { refusal, .. } => refusal.reason(),
             Self::Place { refusal, .. } | Self::Unfinished { refusal } => refusal.reason(),
-            Self::EncoderSpansSegments { .. } => "walk_encoder_spans_segments",
         }
     }
 
@@ -141,10 +133,9 @@ impl WalkRefusal {
     #[must_use]
     pub const fn site(self) -> Option<StreamSite> {
         match self {
-            Self::RecordFraming { at }
-            | Self::Resolve { at, .. }
-            | Self::Place { at, .. }
-            | Self::EncoderSpansSegments { at } => Some(at),
+            Self::RecordFraming { at } | Self::Resolve { at, .. } | Self::Place { at, .. } => {
+                Some(at)
+            }
             Self::Framing(_) | Self::Unfinished { .. } => None,
         }
     }
@@ -202,11 +193,8 @@ fn segment(
         }
         SegmentBody::Encoder { kind, commands } => (kind, commands),
     };
-    if framed.continues_previous || framed.continues_into_next {
-        return Err(WalkRefusal::EncoderSpansSegments { at });
-    }
     builder
-        .begin_encoder(kind, framed.continues_previous)
+        .begin_encoder(kind, framed.lifetime)
         .map_err(|refusal| WalkRefusal::Place { at, refusal })?;
     let mut records = OpStream::new(commands);
     loop {
@@ -246,7 +234,9 @@ mod tests {
         ChannelId, ChannelSequence, IngressOrdinal, ObjectListRef, ResourceId, SessionGeneration,
         SlotGeneration,
     };
-    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_TYPE_PROTECTION_OPTIONS};
+    use reims_vgpu_protocol::segment::{
+        SegmentKind, SegmentLifetime, SEGMENT_TYPE_PROTECTION_OPTIONS,
+    };
     use reims_vgpu_wire::ops::blit::OPCODE_GENERATE_MIPMAPS;
     use reims_vgpu_wire::ops::render::OPCODE_SET_LINE_WIDTH;
     use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
@@ -293,14 +283,49 @@ mod tests {
         record(OPCODE_GENERATE_MIPMAPS, &texture.to_le_bytes())
     }
 
+    /// The encoder outlives this segment.
+    const HOLDS: SegmentLifetime = SegmentLifetime {
+        continues_previous: false,
+        continues_into_next: true,
+    };
+
+    /// This segment continues the encoder above and ends it.
+    const TAKES: SegmentLifetime = SegmentLifetime {
+        continues_previous: true,
+        continues_into_next: false,
+    };
+
+    /// This segment continues the encoder above and passes it on.
+    const RELAYS: SegmentLifetime = SegmentLifetime {
+        continues_previous: true,
+        continues_into_next: true,
+    };
+
+    /// A compute-encoder scope barrier: a four-byte payload of which the
+    /// serializer writes the first two.
+    fn barrier() -> Vec<u8> {
+        record(
+            reims_vgpu_wire::ops::compute::OPCODE_MEMORY_BARRIER_SCOPE,
+            &[1, 0, 0xaa, 0xaa],
+        )
+    }
+
     /// One segment, with the length `-endEncoding` fills in.
     fn segment_bytes(wire_type: u8, records: &[Vec<u8>]) -> Vec<u8> {
+        segment_bytes_with(wire_type, SegmentLifetime::SELF_CONTAINED, records)
+    }
+
+    fn segment_bytes_with(
+        wire_type: u8,
+        lifetime: SegmentLifetime,
+        records: &[Vec<u8>],
+    ) -> Vec<u8> {
         let body: usize = records.iter().map(Vec::len).sum();
         let mut out = Vec::new();
         out.extend_from_slice(&((SEGMENT_HEADER_LEN + body) as u32).to_le_bytes());
         out.push(wire_type);
-        out.push(0);
-        out.push(0);
+        out.push(u8::from(lifetime.continues_previous));
+        out.push(u8::from(lifetime.continues_into_next));
         // The byte the serializer never writes.
         out.push(0xaa);
         for r in records {
@@ -494,26 +519,144 @@ mod tests {
         );
     }
 
-    /// An encoder the guest asks to span two segments is refused, because the
-    /// model cannot represent one. Opening a fresh encoder instead would
-    /// attribute the second segment's records to a pass the guest never opened.
+    /// An encoder the guest splits across two segments is one encoder.
+    ///
+    /// The records of both segments land in one `ResolvedStream`, with one
+    /// opening and one protection state, and the segment indices still say
+    /// where each record was written. Opening a fresh encoder for the second
+    /// segment instead would attribute its records to a pass the guest never
+    /// opened.
     #[test]
-    fn an_encoder_that_spans_segments_is_refused_rather_than_reopened() {
-        for (previous, next) in [(1u8, 0u8), (0, 1), (1, 1)] {
-            let mut first = segment_bytes(SegmentKind::Blit.wire_type(), &[generate_mipmaps(1)]);
-            first[5] = previous;
-            first[6] = next;
-            assert_eq!(
-                exec(&first, &Everything, &mut StubRegistry(DOMAIN), builder()),
-                Err(WalkRefusal::EncoderSpansSegments {
-                    at: StreamSite {
-                        segment: 0,
-                        offset: 0,
-                    },
-                }),
-                "{previous}/{next}"
-            );
-        }
+    fn an_encoder_split_across_segments_is_one_encoder() {
+        let mut bytes = segment_bytes_with(
+            SegmentKind::Blit.wire_type(),
+            HOLDS,
+            &[generate_mipmaps(1), generate_mipmaps(2)],
+        );
+        bytes.extend_from_slice(&segment_bytes_with(
+            SegmentKind::Blit.wire_type(),
+            TAKES,
+            std::slice::from_ref(&generate_mipmaps(3)),
+        ));
+
+        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
+            .expect("both ends of the continuation are declared");
+        assert_eq!(tx.streams.len(), 1, "one encoder, not two");
+        assert_eq!(tx.record_count(), 3);
+        // Where a record was written and which encoder ran it are different
+        // questions, and the positions still answer the first.
+        let positions: Vec<_> = tx.records().map(|r| r.at).collect();
+        assert_eq!(
+            positions.iter().map(|p| p.segment).collect::<Vec<_>>(),
+            [0, 0, 1]
+        );
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(tx.accesses.len(), 3);
+    }
+
+    /// An encoder may be relayed through as many segments as the guest writes.
+    #[test]
+    fn an_encoder_may_be_relayed_through_several_segments() {
+        let mut bytes = segment_bytes_with(
+            SegmentKind::Compute.wire_type(),
+            HOLDS,
+            std::slice::from_ref(&barrier()),
+        );
+        bytes.extend_from_slice(&segment_bytes_with(
+            SegmentKind::Compute.wire_type(),
+            RELAYS,
+            std::slice::from_ref(&barrier()),
+        ));
+        bytes.extend_from_slice(&segment_bytes_with(
+            SegmentKind::Compute.wire_type(),
+            TAKES,
+            std::slice::from_ref(&barrier()),
+        ));
+
+        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
+            .expect("a relayed encoder");
+        assert_eq!(tx.streams.len(), 1);
+        assert_eq!(tx.record_count(), 3);
+        assert_eq!(
+            tx.records().map(|r| r.at.segment).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+    }
+
+    /// Half an edge is a refusal, in either direction.
+    ///
+    /// The contract records a continuation from both headers. A stream where
+    /// only one end declares it has two headers disagreeing about whether an
+    /// encoder is still alive, and picking either reading attributes records to
+    /// a pass on a guess.
+    #[test]
+    fn half_a_continuation_edge_is_refused_from_either_side() {
+        let record = generate_mipmaps(1);
+        let blit = SegmentKind::Blit.wire_type();
+
+        // Offered and not taken: the second segment opens on top of an encoder
+        // that is still alive.
+        let mut offered = segment_bytes_with(blit, HOLDS, std::slice::from_ref(&record));
+        offered.extend_from_slice(&segment_bytes_with(
+            blit,
+            SegmentLifetime::SELF_CONTAINED,
+            std::slice::from_ref(&record),
+        ));
+        assert_eq!(
+            exec(&offered, &Everything, &mut StubRegistry(DOMAIN), builder())
+                .expect_err("an encoder was abandoned")
+                .reason(),
+            "stream_encoder_begin_while_open"
+        );
+
+        // Taken and never offered.
+        let mut taken = segment_bytes_with(
+            blit,
+            SegmentLifetime::SELF_CONTAINED,
+            std::slice::from_ref(&record),
+        );
+        taken.extend_from_slice(&segment_bytes_with(
+            blit,
+            TAKES,
+            std::slice::from_ref(&record),
+        ));
+        assert_eq!(
+            exec(&taken, &Everything, &mut StubRegistry(DOMAIN), builder())
+                .expect_err("nothing offered a continuation")
+                .reason(),
+            "stream_continuation_without_encoder"
+        );
+
+        // Offered by one family and claimed by another.
+        let mut crossed = segment_bytes_with(blit, HOLDS, std::slice::from_ref(&record));
+        crossed.extend_from_slice(&segment_bytes_with(
+            SegmentKind::Compute.wire_type(),
+            TAKES,
+            std::slice::from_ref(&barrier()),
+        ));
+        assert_eq!(
+            exec(&crossed, &Everything, &mut StubRegistry(DOMAIN), builder())
+                .expect_err("a compute segment cannot continue a blit encoder")
+                .reason(),
+            "stream_continuation_kind_mismatch"
+        );
+    }
+
+    /// An encoder held open at the end of a stream is records with no
+    /// `-endEncoding` behind them.
+    #[test]
+    fn an_encoder_held_open_at_the_end_of_a_stream_is_refused() {
+        let bytes = segment_bytes_with(
+            SegmentKind::Blit.wire_type(),
+            HOLDS,
+            std::slice::from_ref(&generate_mipmaps(1)),
+        );
+        assert_eq!(
+            exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder()),
+            Err(WalkRefusal::Unfinished {
+                refusal: StreamRefusal::EncoderNeverEnded(SegmentKind::Blit),
+            })
+        );
     }
 
     /// An empty stream is an empty transaction, not a refusal. A guest may
@@ -564,10 +707,9 @@ mod tests {
             segment: 0,
             offset: 0,
         };
-        let own = [
+        assert_eq!(
             WalkRefusal::RecordFraming { at: site }.reason(),
-            WalkRefusal::EncoderSpansSegments { at: site }.reason(),
-        ];
-        assert_ne!(own[0], own[1]);
+            "walk_record_framing_refused"
+        );
     }
 }
