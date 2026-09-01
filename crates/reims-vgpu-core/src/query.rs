@@ -194,6 +194,72 @@ pub enum RequestWords {
     HeapTexture,
 }
 
+/// Read a query packet's request words at the layout its question uses.
+///
+/// **The join between "which question is this packet" and "what does its
+/// request say".** [`QueryKind::device_info_form`] answered the first half and
+/// [`reims_vgpu_protocol::fifo`] holds the three decoders for the second, and
+/// nothing carried one to the other — so the form was picked at each call site
+/// that wanted a device-info request, one arm naming one form and another
+/// naming the other, with nothing able to compare them. The two forms decode to
+/// **one Rust type**, so reading either at the other's offsets is a well-typed
+/// value whose pair count is a page frame and whose reply goes to whatever page
+/// that named. Asking the kind is what makes that unrepresentable.
+///
+/// The heap-texture request's descriptor is not read here. Its words carry
+/// nothing that bounds the reply — see [`RequestWords::HeapTexture`] — and
+/// turning the embedded record into fields is the reader's, not this crate's.
+/// The framing is still checked, because a request whose record does not frame
+/// is not a request.
+///
+/// # Errors
+///
+/// [`WordsRefusal`] when the payload cannot hold the layout the question uses.
+pub fn request_words(kind: QueryKind, payload: &[u8]) -> Result<RequestWords, WordsRefusal> {
+    if let Some(form) = kind.device_info_form() {
+        return fifo::decode_device_info(form, payload)
+            .map(RequestWords::DeviceInfo)
+            .map_err(WordsRefusal::Short);
+    }
+    match kind {
+        QueryKind::ComputeInfo => fifo::decode_compute_info(payload)
+            .map(RequestWords::ComputeInfo)
+            .map_err(WordsRefusal::Short),
+        QueryKind::HeapTextureSizeAndAlign => fifo::decode_heap_texture_query(payload)
+            .map(|_| RequestWords::HeapTexture)
+            .map_err(WordsRefusal::HeapTexture),
+        // `device_info_form` answered `Some` for both of these, so the branch
+        // above returned. Matching them rather than wildcarding is what makes a
+        // fifth question a compile error here.
+        QueryKind::DeviceInfo | QueryKind::DeviceInfoLegacy => {
+            unreachable!("a device-info kind names a form")
+        }
+    }
+}
+
+/// Why a query packet's bytes are not its request.
+///
+/// Forwards each decoder's own refusal rather than flattening them: the
+/// heap-texture request has four ways to be malformed and the other two have
+/// one, and a caller reporting "short" for a record of the wrong selector would
+/// send a reader looking for a truncation that is not there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordsRefusal {
+    Short(fifo::ShortPayload),
+    HeapTexture(fifo::HeapTextureRefusal),
+}
+
+impl WordsRefusal {
+    /// The name this reaches a failure channel under: the forwarded owner's.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Short(_) => fifo::ShortPayload::SLUG,
+            Self::HeapTexture(refusal) => refusal.slug(),
+        }
+    }
+}
+
 /// Why a request's words are not the ones its question asks with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolveRefusal {
@@ -590,6 +656,105 @@ mod tests {
                 .count();
             assert_eq!(accepted, 1, "{} accepts {accepted} layouts", kind.name());
         }
+    }
+
+    /// The two device-info opcodes read their own layout and not each other's.
+    ///
+    /// The hazard is that they decode to one Rust type: the newer form
+    /// prepends a parse ceiling, so every field after it moves by four, and
+    /// reading either at the other's offsets is a *well-typed* value. Here the
+    /// legacy form's pair capacity is the newer one's ceiling and its reply
+    /// frame is the newer one's capacity — so a call site that picked the form
+    /// itself and picked wrong would write the reply to page 512.
+    #[test]
+    fn each_device_info_question_reads_its_own_form() {
+        let mut bytes = Vec::new();
+        for word in [18u32, 512, 0xF00D, 0xDEAD] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        assert_eq!(
+            request_words(QueryKind::DeviceInfo, &bytes),
+            Ok(RequestWords::DeviceInfo(fifo::DeviceInfoRequest {
+                form: fifo::DeviceInfoForm::WithKeyLimit,
+                key_table_len: Some(18),
+                pair_capacity: 512,
+                reply_pfn: 0xF00D,
+            }))
+        );
+        assert_eq!(
+            request_words(QueryKind::DeviceInfoLegacy, &bytes),
+            Ok(RequestWords::DeviceInfo(fifo::DeviceInfoRequest {
+                form: fifo::DeviceInfoForm::WithoutKeyLimit,
+                key_table_len: None,
+                pair_capacity: 18,
+                reply_pfn: 512,
+            }))
+        );
+        // And what each kind reads is what `resolve` will accept: the pairing
+        // check and the decode now come from one answer rather than two.
+        for kind in [QueryKind::DeviceInfo, QueryKind::DeviceInfoLegacy] {
+            let words = request_words(kind, &bytes).expect("its own form");
+            assert!(resolve(kind, words, destination(4096)).is_ok(), "{kind:?}");
+            let other = if kind == QueryKind::DeviceInfo {
+                QueryKind::DeviceInfoLegacy
+            } else {
+                QueryKind::DeviceInfo
+            };
+            assert_eq!(
+                resolve(other, words, destination(4096)),
+                Err(ResolveRefusal::WrongLayout { kind: other }),
+                "the other question's words are refused, not read"
+            );
+        }
+    }
+
+    /// The other two questions read their own layouts, and a payload too short
+    /// for one is refused with that decoder's own reason.
+    #[test]
+    fn the_other_two_questions_forward_their_decoders_refusals() {
+        let compute = vec![0u8; fifo::COMPUTE_INFO_REQUEST_LEN];
+        assert!(matches!(
+            request_words(QueryKind::ComputeInfo, &compute),
+            Ok(RequestWords::ComputeInfo(_))
+        ));
+        assert_eq!(
+            request_words(QueryKind::ComputeInfo, &compute[..1]),
+            Err(WordsRefusal::Short(fifo::ShortPayload {
+                plen: 1,
+                need: fifo::COMPUTE_INFO_REQUEST_LEN,
+            }))
+        );
+
+        // The heap-texture request is framed but not read: its words bound
+        // nothing, and a record of another selector is still not a request.
+        let mut heap = vec![0u8; fifo::HEAP_TEXTURE_REQUEST_HEADER_LEN];
+        heap[fifo::HEAP_TEXTURE_REPLY_GVA] = 1;
+        heap[fifo::HEAP_TEXTURE_REPLY_LENGTH] = fifo::HEAP_TEXTURE_REPLY_LEN as u8;
+        heap[fifo::HEAP_TEXTURE_SERIALIZER_LENGTH] = fifo::HEAP_TEXTURE_SERIALIZED_LEN as u8;
+        heap.resize(
+            fifo::HEAP_TEXTURE_REQUEST_HEADER_LEN + fifo::HEAP_TEXTURE_SERIALIZED_LEN,
+            0,
+        );
+        let record = fifo::HEAP_TEXTURE_REQUEST_HEADER_LEN;
+        heap[record] = fifo::HEAP_TEXTURE_SERIALIZED_TAG as u8;
+        heap[record + 4] = fifo::HEAP_TEXTURE_SERIALIZED_LEN as u8;
+        assert_eq!(
+            request_words(QueryKind::HeapTextureSizeAndAlign, &heap),
+            Ok(RequestWords::HeapTexture)
+        );
+        heap[record] = 0x99;
+        assert_eq!(
+            request_words(QueryKind::HeapTextureSizeAndAlign, &heap),
+            Err(WordsRefusal::HeapTexture(
+                fifo::HeapTextureRefusal::SerializerTag { found: 0x99 }
+            ))
+        );
+        assert_eq!(
+            request_words(QueryKind::HeapTextureSizeAndAlign, &heap)
+                .unwrap_err()
+                .slug(),
+            "heap_query_unknown_serializer_tag"
+        );
     }
 
     /// The heap-texture query's reply is a fixed record its request does not
