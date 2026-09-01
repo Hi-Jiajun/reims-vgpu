@@ -36,6 +36,7 @@ use crate::access::{
 use crate::bind::{BufferBinding, ObjectBinding};
 use crate::blit::BlitOp;
 use crate::compute::ComputeOp;
+use crate::encoder::{ComputeEncoderState, RenderEncoderState};
 use crate::icb::IcbOp;
 use crate::identity::{
     ChannelId, ChannelSequence, IngressOrdinal, ResourceId, SessionGeneration, TransactionIdentity,
@@ -439,9 +440,95 @@ pub struct ExecBuilder {
     pipeline_leases: Vec<ResourceId>,
     prerequisites: Vec<Prerequisite>,
     arenas: ExecArenas,
+    /// The open encoder's binding tables. See [`EncoderBindings`].
+    bindings: EncoderBindings,
     /// Scratch [`Self::record`] gathers each operation's participations into,
     /// so the walk costs no allocation after the first record.
     participation_scratch: Vec<Participation>,
+}
+
+/// The binding state of whichever encoder is open.
+///
+/// **What makes a draw's footprint the draw's, and not just its index
+/// buffer's.** A bind record touches no memory and a draw's own fields name
+/// only what they carry, so the memory a draw reads through its bound slots is
+/// a fact of the *encoder* — accumulated across the records before it and read
+/// back at the draw. Without this the tables in [`crate::encoder`] had no
+/// writer and no reader, and a transaction that wrote a buffer and then drew
+/// with it bound compiled no edge between the two.
+///
+/// One encoder's worth, not one per stream: the cursor keeps exactly one
+/// encoder open, a continuation keeps writing into it, and a new encoder starts
+/// with everything unbound — which is Metal's rule and not a simplification.
+/// The blit and event encoders bind nothing, so they hold no tables rather than
+/// empty ones.
+#[derive(Debug)]
+enum EncoderBindings {
+    Render(Box<RenderEncoderState>),
+    Compute(Box<ComputeEncoderState>),
+    /// An encoder with no binding tables, or no encoder at all.
+    None,
+}
+
+impl EncoderBindings {
+    /// Start a freshly opened encoder of this kind with nothing bound.
+    ///
+    /// Reuses the tables in place where the kind is the one already held,
+    /// which is the common case — a packet is many encoders of a few kinds —
+    /// so the argument-table capacity is reserved once per builder rather than
+    /// once per encoder.
+    fn open(&mut self, kind: SegmentKind) {
+        match (kind, &mut *self) {
+            (SegmentKind::Render, Self::Render(state)) => state.clear(),
+            (SegmentKind::Compute, Self::Compute(state)) => state.clear(),
+            (SegmentKind::Render, _) => *self = Self::Render(Box::default()),
+            (SegmentKind::Compute, _) => *self = Self::Compute(Box::default()),
+            (SegmentKind::Blit | SegmentKind::Event | SegmentKind::Info, _) => *self = Self::None,
+        }
+    }
+
+    /// What this record reads through the bound slots, appended to `out`.
+    ///
+    /// Only a draw and a dispatch read the tables; every other record either
+    /// writes a slot or carries state.
+    ///
+    /// Every bound slot participates as [`crate::access::AccessMode::Unknown`]
+    /// until a pipeline publishes what its shader does with each one. That is
+    /// [`crate::pipeline::BindingUsage`], and the layer that can produce it is
+    /// the executor that compiled the shader — so the narrowing arrives with
+    /// the pipeline, not from here.
+    fn footprint_into(&self, op: &ResolvedOperation, out: &mut Vec<Participation>) {
+        match (self, op) {
+            (Self::Render(state), ResolvedOperation::Render(RenderOp::Draw(_))) => {
+                state.footprint_into(None, None, out);
+            }
+            (Self::Compute(state), ResolvedOperation::Compute(ComputeOp::Dispatch(_))) => {
+                state.footprint_into(None, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply one accepted record to the open encoder's tables.
+    ///
+    /// A record the cursor refused never reaches here, so a refusal leaves no
+    /// binding behind claiming it ran — the same rule [`ExecBuilder::record`]
+    /// applies to the accesses.
+    ///
+    /// A record whose rail disagrees with the tables it stands in is not
+    /// applied. That pairing is the cursor's refusal to make, and by the time
+    /// this runs it has already made it.
+    fn apply(&mut self, op: &ResolvedOperation, arenas: &ExecArenas) {
+        match (self, op) {
+            (Self::Render(state), ResolvedOperation::Render(op)) => {
+                state.apply(op, &arenas.buffer_bindings, &arenas.object_bindings);
+            }
+            (Self::Compute(state), ResolvedOperation::Compute(op)) => {
+                state.apply(op, &arenas.buffer_bindings, &arenas.object_bindings);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Default for ExecBuilder {
@@ -464,6 +551,7 @@ impl ExecBuilder {
             pipeline_leases: Vec::new(),
             prerequisites: Vec::new(),
             arenas: ExecArenas::default(),
+            bindings: EncoderBindings::None,
             participation_scratch: Vec::new(),
         }
     }
@@ -514,6 +602,9 @@ impl ExecBuilder {
     /// makes an encoder spanning segments one encoder here rather than two.
     fn opened(&mut self, opening: SegmentOpening) {
         if let SegmentOpening::Opened(_, begin) = opening {
+            // A new encoder starts with everything unbound; a continuation
+            // keeps the tables it has been filling.
+            self.bindings.open(begin.kind);
             self.open = Some(ResolvedStream {
                 begin,
                 records: Vec::new(),
@@ -551,6 +642,11 @@ impl ExecBuilder {
         let mut parts = core::mem::take(&mut self.participation_scratch);
         parts.clear();
         op.participations(&self.arenas, &mut parts);
+        // What the record reads through the encoder's bound slots. Derived
+        // here, beside the record's own participations, for the same reason
+        // those are derived rather than declared: a footprint supplied
+        // separately can disagree with the records that produced it.
+        self.bindings.footprint_into(&op, &mut parts);
         // Pushed straight onto the transaction's list and rolled back on any
         // refusal, rather than gathered into a second vector: a record's
         // accesses are at most a handful and a `Vec` per record would be an
@@ -576,6 +672,7 @@ impl ExecBuilder {
                 if let Some(pipeline) = lease {
                     self.lease_pipeline(pipeline);
                 }
+                self.bindings.apply(&op, &self.arenas);
                 Ok(at)
             }
             Err(refusal) => {
@@ -769,6 +866,7 @@ const fn class_admissible_on(class: OperationClass, kind: SegmentKind) -> bool {
 mod tests {
     use super::*;
     use crate::access::{AccessKey, AccessMode, ResourceKey, StubRegistry};
+    use crate::bind::BindSpan;
     use crate::identity::{ObjectListRef, SlotGeneration};
     use crate::stream::ProtectionOptions;
     use crate::sync::{BarrierOp, BarrierTarget, ResourceSpan};
@@ -786,6 +884,271 @@ mod tests {
 
     fn a_blit() -> ResolvedOperation {
         ResolvedOperation::Blit(BlitOp::GenerateMipmaps { texture: res(1) })
+    }
+
+    /// A draw that reads one index buffer of its own, so a test can tell the
+    /// record's own footprint from the encoder's.
+    fn a_draw() -> ResolvedOperation {
+        ResolvedOperation::Render(RenderOp::Draw(crate::render::DrawOp::Indexed {
+            primitive: crate::render::PrimitiveType(0),
+            index: crate::render::IndexSource {
+                buffer: res(5),
+                offset: 0,
+                index_type: crate::render::IndexType::Uint16,
+            },
+            index_count: 3,
+            instances: crate::render::Instancing::default(),
+            base_vertex: 0,
+        }))
+    }
+
+    /// Which backing an access names, for the tests that care only about that.
+    fn backing(key: AccessKey) -> Option<BackingId> {
+        match key {
+            AccessKey::Range(r, _) | AccessKey::Subresource(r, _) | AccessKey::Whole(r) => {
+                Some(r.backing)
+            }
+            AccessKey::Heap(_) | AccessKey::DomainOnly => None,
+        }
+    }
+
+    /// File buffer bindings in the transaction's arena and name the window,
+    /// the way a resolver would.
+    fn bind_arena(b: &mut ExecBuilder, buffers: &[ResourceId]) -> BindSpan {
+        let start = b.arenas.buffer_bindings.len() as u32;
+        for &buffer in buffers {
+            b.arenas.buffer_bindings.push(BufferBinding {
+                buffer: Some(buffer),
+                offset: 0,
+                stride: None,
+            });
+        }
+        BindSpan {
+            start,
+            len: buffers.len() as u32,
+        }
+    }
+
+    /// A draw declares what it reads through the encoder's bound slots, not
+    /// only what its own fields name.
+    ///
+    /// The binding tables had a writer and a reader in [`crate::encoder`] and
+    /// neither was reachable, so a buffer bound at slot 0 and read by the next
+    /// draw produced no access — and a transaction that wrote it earlier
+    /// compiled no edge to the draw that reads it.
+    #[test]
+    fn a_draw_reads_the_slots_the_binds_before_it_filled() {
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        let entries = bind_arena(&mut b, &[res(7), res(8)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
+                first: 0,
+                entries,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        assert!(
+            b.accesses.is_empty(),
+            "a bind writes a slot and touches no memory"
+        );
+
+        b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+            .expect("draw");
+        let read: Vec<_> = b.accesses.iter().filter_map(|a| backing(a.key)).collect();
+        assert!(
+            read.contains(&BackingId(7)) && read.contains(&BackingId(8)),
+            "a draw reads both bound buffers, got {read:?}"
+        );
+        // Unknown until a pipeline says otherwise, and unknown conflicts with
+        // a reader — which is the point of declaring it at all.
+        assert!(b
+            .accesses
+            .iter()
+            .filter(|a| backing(a.key) != Some(BackingId(5)))
+            .all(|a| a.mode == AccessMode::Unknown));
+    }
+
+    /// A record that binds nothing leaves the tables alone, so a draw with no
+    /// binds before it declares only its own fields.
+    #[test]
+    fn a_draw_with_nothing_bound_reads_only_what_it_names() {
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+            .expect("draw");
+        let read: Vec<_> = b.accesses.iter().filter_map(|a| backing(a.key)).collect();
+        assert_eq!(
+            read,
+            vec![BackingId(5)],
+            "the index buffer, and nothing else"
+        );
+    }
+
+    /// A new encoder starts with everything unbound. Metal's rule, and a table
+    /// that survived would make the next draw name a resource nothing bound.
+    #[test]
+    fn a_new_encoder_inherits_no_bindings_from_the_one_before_it() {
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        let entries = bind_arena(&mut b, &[res(7)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
+                first: 0,
+                entries,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        b.end_segment().expect("end");
+
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+            .expect("draw");
+        let read: Vec<_> = b.accesses.iter().filter_map(|a| backing(a.key)).collect();
+        assert_eq!(read, vec![BackingId(5)]);
+    }
+
+    /// An encoder that spans two segments keeps its tables. The bind and the
+    /// draw are in different segments and the same encoder, which is exactly
+    /// the case a per-segment table would lose.
+    #[test]
+    fn a_continued_encoder_keeps_the_slots_the_first_segment_bound() {
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime {
+                continues_previous: false,
+                continues_into_next: true,
+            },
+        )
+        .expect("open");
+        let entries = bind_arena(&mut b, &[res(7)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
+                first: 0,
+                entries,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        b.end_segment().expect("held");
+
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime {
+                continues_previous: true,
+                continues_into_next: false,
+            },
+        )
+        .expect("continue");
+        b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+            .expect("draw");
+        let read: Vec<_> = b.accesses.iter().filter_map(|a| backing(a.key)).collect();
+        assert!(read.contains(&BackingId(7)), "got {read:?}");
+    }
+
+    /// A dispatch reads the compute encoder's tables the same way, and a
+    /// compute bind never reaches a render table.
+    #[test]
+    fn a_dispatch_reads_the_compute_encoders_slots() {
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Compute.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        let entries = bind_arena(&mut b, &[res(9)]);
+        b.record(
+            ResolvedOperation::Compute(ComputeOp::BindBuffers { first: 0, entries }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        b.record(
+            ResolvedOperation::Compute(ComputeOp::Dispatch(
+                crate::compute::DispatchOp::Threadgroups {
+                    groups: crate::compute::ComputeExtent {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    threads_per_group: crate::compute::ComputeExtent {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                },
+            )),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("dispatch");
+        let read: Vec<_> = b.accesses.iter().filter_map(|a| backing(a.key)).collect();
+        assert_eq!(read, vec![BackingId(9)]);
+    }
+
+    /// Unbinding a slot removes it from the next draw's footprint. The guest
+    /// unbinds by naming no object, and a slot that kept the old resource would
+    /// order every later draw against memory nothing reads.
+    #[test]
+    fn an_unbound_slot_leaves_the_next_draws_footprint() {
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        let entries = bind_arena(&mut b, &[res(7)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
+                first: 0,
+                entries,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        let cleared = {
+            let start = b.arenas.buffer_bindings.len() as u32;
+            b.arenas.buffer_bindings.push(BufferBinding {
+                buffer: None,
+                offset: 0,
+                stride: None,
+            });
+            BindSpan { start, len: 1 }
+        };
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
+                first: 0,
+                entries: cleared,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("unbind");
+        b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+            .expect("draw");
+        let read: Vec<_> = b.accesses.iter().filter_map(|a| backing(a.key)).collect();
+        assert_eq!(read, vec![BackingId(5)]);
     }
 
     fn a_barrier() -> ResolvedOperation {

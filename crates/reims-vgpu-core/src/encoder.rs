@@ -34,9 +34,11 @@
 //! can be counted is a number that can be driven down.
 
 use crate::access::{AccessMode, Participation, ParticipationExtent};
-use crate::bind::{BufferBinding, ObjectBinding};
+use crate::bind::{BindSpan, BufferBinding, ObjectBinding};
+use crate::compute::ComputeOp;
 use crate::identity::ResourceId;
 use crate::pipeline::BindingUsage;
+use crate::render::RenderOp;
 use reims_vgpu_protocol::render::ShaderStage;
 
 /// The argument-table sizes Apple's serializer truncates a plural bind at.
@@ -130,6 +132,18 @@ impl Default for StageTables {
 }
 
 impl StageTables {
+    /// Unbind everything, keeping the storage.
+    ///
+    /// A new encoder starts with nothing bound, and it starts often — so this
+    /// is a clear rather than a fresh set of tables: the argument-table
+    /// capacity is reserved once per builder and reused by every encoder after
+    /// the first.
+    pub fn clear(&mut self) {
+        self.buffers.clear();
+        self.textures.clear();
+        self.samplers.clear();
+    }
+
     /// Append what this stage's bound slots contribute.
     ///
     /// Written into a caller's buffer rather than returned, because this runs
@@ -190,6 +204,46 @@ fn slot_mode(
 /// A bound slot declares no stage of its own; the stages are the pipeline's.
 const NO_STAGES: u32 = 0;
 
+/// Bind `entries` at consecutive slots from `first`.
+///
+/// The record's count is the guest's and the slot numbers follow from it, so a
+/// plural bind is one loop here rather than a slot number recomputed at every
+/// call site. A count that would reach past `u32` cannot exist: the entries
+/// came out of a transaction arena whose window is already a `u32` pair.
+fn bind_span<T: Copy>(table: &mut SlotTable<T>, first: u32, entries: &[T]) {
+    for (offset, entry) in entries.iter().enumerate() {
+        let Ok(offset) = u32::try_from(offset) else {
+            return;
+        };
+        let Some(slot) = first.checked_add(offset) else {
+            return;
+        };
+        table.set(slot, Some(*entry));
+    }
+}
+
+/// Move an already-bound buffer's offset, and optionally its stride.
+///
+/// A slot holding nothing stays holding nothing. The record names no buffer —
+/// it moves whatever the slot holds — so an unbound slot has nothing to move,
+/// and inventing a binding here would make a resource out of a record that
+/// named none.
+fn rebind_offset(
+    table: &mut SlotTable<BufferBinding>,
+    index: u32,
+    offset: u64,
+    stride: Option<u64>,
+) {
+    let Some(mut binding) = table.get(index) else {
+        return;
+    };
+    binding.offset = offset;
+    if stride.is_some() {
+        binding.stride = stride;
+    }
+    table.set(index, Some(binding));
+}
+
 /// The compute encoder's state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ComputeEncoderState {
@@ -198,10 +252,67 @@ pub struct ComputeEncoderState {
 }
 
 impl ComputeEncoderState {
+    /// Return to what a freshly opened encoder holds, keeping the storage.
+    pub fn clear(&mut self) {
+        self.tables.clear();
+        self.pipeline = None;
+    }
+
     /// What a dispatch reads through the bound slots.
     pub fn footprint_into(&self, usage: Option<&BindingUsage>, out: &mut Vec<Participation>) {
         self.tables.footprint_into(usage, out);
     }
+
+    /// Apply one record to the encoder's state.
+    ///
+    /// The entries are the transaction's arenas, because a bind record names a
+    /// window of one rather than carrying its entries. Exhaustive over
+    /// [`ComputeOp`] for the reason every other match on the vocabulary is: a
+    /// record that changes what a slot holds and is not applied here makes the
+    /// next dispatch's footprint name the *previous* resource, which is a
+    /// missing hazard edge rather than a wrong log line.
+    pub fn apply(&mut self, op: &ComputeOp, buffers: &[BufferBinding], objects: &[ObjectBinding]) {
+        match *op {
+            ComputeOp::BindBuffers { first, entries }
+            | ComputeOp::BindBuffersWithStride { first, entries } => {
+                bind_span(&mut self.tables.buffers, first, span(buffers, entries));
+            }
+            ComputeOp::BindTextures { first, entries } => {
+                bind_span(&mut self.tables.textures, first, span(objects, entries));
+            }
+            ComputeOp::BindSamplers { first, entries }
+            | ComputeOp::BindSamplersWithLod { first, entries } => {
+                bind_span(&mut self.tables.samplers, first, span(objects, entries));
+            }
+            ComputeOp::RebindBufferOffset {
+                index,
+                offset,
+                stride,
+            } => rebind_offset(&mut self.tables.buffers, index, offset, stride),
+            ComputeOp::SetPipeline { pipeline } => self.pipeline = Some(pipeline),
+            // State a dispatch carries rather than state a slot holds, and a
+            // dispatch reads the tables without changing them.
+            ComputeOp::SetStageInRegion { .. }
+            | ComputeOp::SetStageInRegionIndirect { .. }
+            | ComputeOp::SetThreadgroupMemory { .. }
+            | ComputeOp::SetImageblockSize { .. }
+            | ComputeOp::WriteDescriptor { .. }
+            | ComputeOp::Dispatch(_) => {}
+        }
+    }
+}
+
+/// The entries a bind record's window names.
+///
+/// Out of range is empty rather than a panic: the arena and the window are
+/// built together by [`crate::exec::ExecBuilder`], so a mismatch is a bug in
+/// this crate, and taking a whole packet down over it would lose work the guest
+/// is waiting on. An empty span binds nothing, which is the same answer the
+/// footprint would give for slots that were never written.
+fn span<T>(arena: &[T], window: BindSpan) -> &[T] {
+    let start = window.start as usize;
+    let end = start.saturating_add(window.len as usize);
+    arena.get(start..end).unwrap_or(&[])
 }
 
 /// The render encoder's state.
@@ -229,6 +340,15 @@ pub struct VisibilityState {
 }
 
 impl RenderEncoderState {
+    /// Return to what a freshly opened encoder holds, keeping the storage.
+    pub fn clear(&mut self) {
+        self.vertex.clear();
+        self.fragment.clear();
+        self.pipeline = None;
+        self.depth_stencil = None;
+        self.visibility = None;
+    }
+
     #[must_use]
     pub fn stage(&self, stage: ShaderStage) -> &StageTables {
         match stage {
@@ -257,6 +377,82 @@ impl RenderEncoderState {
     ) {
         self.vertex.footprint_into(vertex_usage, out);
         self.fragment.footprint_into(fragment_usage, out);
+    }
+
+    /// Apply one record to the encoder's state.
+    ///
+    /// Exhaustive over [`RenderOp`], for the reason
+    /// [`ComputeEncoderState::apply`] gives. The stage is the record's own:
+    /// `BindBuffersWithStride` has no fragment form because the API has no
+    /// fragment attribute stride, and reading a stage off anything but the
+    /// record would put a vertex bind in the fragment table.
+    pub fn apply(&mut self, op: &RenderOp, buffers: &[BufferBinding], objects: &[ObjectBinding]) {
+        match *op {
+            RenderOp::BindBuffers {
+                stage,
+                first,
+                entries,
+            } => bind_span(
+                &mut self.stage_mut(stage).buffers,
+                first,
+                span(buffers, entries),
+            ),
+            RenderOp::BindBuffersWithStride { first, entries } => bind_span(
+                &mut self.stage_mut(ShaderStage::Vertex).buffers,
+                first,
+                span(buffers, entries),
+            ),
+            RenderOp::BindTextures {
+                stage,
+                first,
+                entries,
+            } => bind_span(
+                &mut self.stage_mut(stage).textures,
+                first,
+                span(objects, entries),
+            ),
+            RenderOp::BindSamplers {
+                stage,
+                first,
+                entries,
+            }
+            | RenderOp::BindSamplersWithLod {
+                stage,
+                first,
+                entries,
+            } => bind_span(
+                &mut self.stage_mut(stage).samplers,
+                first,
+                span(objects, entries),
+            ),
+            RenderOp::RebindBufferOffset {
+                stage,
+                index,
+                offset,
+                stride,
+            } => rebind_offset(&mut self.stage_mut(stage).buffers, index, offset, stride),
+            RenderOp::SetPipeline { pipeline } => self.pipeline = Some(pipeline),
+            RenderOp::SetDepthStencilState { state } => self.depth_stencil = Some(state),
+            RenderOp::SetVisibilityResultMode { mode, offset } => {
+                self.visibility = Some(VisibilityState { mode, offset });
+            }
+            // Fixed-function state and the pass descriptor. None of it changes
+            // what a slot holds, and a draw reads the tables without changing
+            // them.
+            RenderOp::Draw(_)
+            | RenderOp::WriteDescriptor { .. }
+            | RenderOp::SetViewports(_)
+            | RenderOp::SetScissorRects(_)
+            | RenderOp::SetCullMode(_)
+            | RenderOp::SetFrontFacingWinding(_)
+            | RenderOp::SetDepthClipMode(_)
+            | RenderOp::SetTriangleFillMode(_)
+            | RenderOp::SetDepthBias { .. }
+            | RenderOp::SetLineWidth(_)
+            | RenderOp::SetBlendColor { .. }
+            | RenderOp::SetStencilReference { .. }
+            | RenderOp::SetStoreAction { .. } => {}
+        }
     }
 }
 
@@ -401,6 +597,171 @@ mod tests {
         assert_eq!(out[0].mode, AccessMode::Read);
         assert_eq!(out[1].mode, AccessMode::Write);
         assert_eq!(out[0].resource, out[1].resource);
+    }
+
+    /// A plural bind fills consecutive slots from `first`, which is the only
+    /// thing the record says about where its entries land.
+    #[test]
+    fn a_plural_bind_fills_consecutive_slots_from_first() {
+        let mut state = ComputeEncoderState::default();
+        let arena = [buffer(1), buffer(2), buffer(3)];
+        state.apply(
+            &ComputeOp::BindBuffers {
+                first: 4,
+                entries: BindSpan { start: 0, len: 3 },
+            },
+            &arena,
+            &[],
+        );
+        assert_eq!(state.tables.buffers.get(4), Some(buffer(1)));
+        assert_eq!(state.tables.buffers.get(6), Some(buffer(3)));
+        assert_eq!(state.tables.buffers.get(3), None);
+    }
+
+    /// A window naming entries the arena does not have binds nothing. The two
+    /// are built together, so a mismatch is a bug in this crate — and losing a
+    /// whole packet over it would lose work the guest is waiting on.
+    #[test]
+    fn a_window_past_the_arena_binds_nothing() {
+        let mut state = ComputeEncoderState::default();
+        state.apply(
+            &ComputeOp::BindBuffers {
+                first: 0,
+                entries: BindSpan { start: 2, len: 3 },
+            },
+            &[buffer(1)],
+            &[],
+        );
+        assert_eq!(state.tables.buffers.bound().count(), 0);
+    }
+
+    /// A rebind moves the offset of whatever the slot holds. It names no
+    /// buffer, so the slot keeps the one bound before it.
+    #[test]
+    fn a_rebind_moves_the_offset_and_keeps_the_buffer() {
+        let mut state = ComputeEncoderState::default();
+        state.apply(
+            &ComputeOp::BindBuffers {
+                first: 2,
+                entries: BindSpan { start: 0, len: 1 },
+            },
+            &[buffer(1)],
+            &[],
+        );
+        state.apply(
+            &ComputeOp::RebindBufferOffset {
+                index: 2,
+                offset: 0x900,
+                stride: None,
+            },
+            &[],
+            &[],
+        );
+        let bound = state.tables.buffers.get(2).expect("still bound");
+        assert_eq!(bound.buffer, Some(res(1)));
+        assert_eq!(bound.offset, 0x900);
+        assert_eq!(
+            bound.stride, None,
+            "the plain form carries no stride and clears none"
+        );
+    }
+
+    /// The strided form sets one; the plain form after it leaves it alone.
+    /// `setBufferOffset:atIndex:` moves the offset and says nothing about the
+    /// attribute stride, so a slot that lost its stride there would feed the
+    /// next draw a vertex layout the guest never changed.
+    #[test]
+    fn a_plain_rebind_does_not_clear_a_stride_the_strided_form_set() {
+        let mut state = ComputeEncoderState::default();
+        state.apply(
+            &ComputeOp::BindBuffers {
+                first: 0,
+                entries: BindSpan { start: 0, len: 1 },
+            },
+            &[buffer(1)],
+            &[],
+        );
+        state.apply(
+            &ComputeOp::RebindBufferOffset {
+                index: 0,
+                offset: 0x10,
+                stride: Some(32),
+            },
+            &[],
+            &[],
+        );
+        state.apply(
+            &ComputeOp::RebindBufferOffset {
+                index: 0,
+                offset: 0x20,
+                stride: None,
+            },
+            &[],
+            &[],
+        );
+        let bound = state.tables.buffers.get(0).expect("bound");
+        assert_eq!((bound.offset, bound.stride), (0x20, Some(32)));
+    }
+
+    /// A rebind of a slot holding nothing binds nothing. The record names no
+    /// buffer, so there is none to invent.
+    #[test]
+    fn a_rebind_of_an_unbound_slot_binds_nothing() {
+        let mut state = ComputeEncoderState::default();
+        state.apply(
+            &ComputeOp::RebindBufferOffset {
+                index: 0,
+                offset: 0x40,
+                stride: None,
+            },
+            &[],
+            &[],
+        );
+        assert_eq!(state.tables.buffers.get(0), None);
+    }
+
+    /// The vertex-stride bind has no fragment form, so it lands in the vertex
+    /// table however the record reached the encoder.
+    #[test]
+    fn the_stride_bind_is_the_vertex_stages() {
+        let mut state = RenderEncoderState::default();
+        state.apply(
+            &RenderOp::BindBuffersWithStride {
+                first: 0,
+                entries: BindSpan { start: 0, len: 1 },
+            },
+            &[buffer(1)],
+            &[],
+        );
+        assert_eq!(
+            state.stage(ShaderStage::Vertex).buffers.get(0),
+            Some(buffer(1))
+        );
+        assert_eq!(state.stage(ShaderStage::Fragment).buffers.get(0), None);
+    }
+
+    /// A sampler bind lands in the sampler table, never the texture one: the
+    /// two carry the same entry layout and only the record says which is which.
+    #[test]
+    fn a_sampler_bind_never_reaches_the_texture_table() {
+        let mut state = RenderEncoderState::default();
+        state.apply(
+            &RenderOp::BindSamplers {
+                stage: ShaderStage::Fragment,
+                first: 0,
+                entries: BindSpan { start: 0, len: 1 },
+            },
+            &[],
+            &[texture(3)],
+        );
+        assert_eq!(
+            state.stage(ShaderStage::Fragment).samplers.get(0),
+            Some(texture(3))
+        );
+        assert_eq!(state.stage(ShaderStage::Fragment).textures.get(0), None);
+        let mut out = Vec::new();
+        state.footprint_into(None, None, &mut out);
+        assert!(out.is_empty(), "samplers bind no memory");
     }
 
     /// The footprint is written into the caller's buffer, so a draw loop
