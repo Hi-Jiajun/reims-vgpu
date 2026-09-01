@@ -2,7 +2,7 @@
 //!
 //! # Why these survive into the model at all
 //!
-//! All eight are proven no-ops in the ledger, and the cells say why: "guest
+//! All nine are proven no-ops in the ledger, and the cells say why: "guest
 //! pages are written directly; there is no host-private texture layout", "guest
 //! pages are the single copy of resource content". Both sentences describe the
 //! *placement* the current executor chose. Neither is a property of the guest's
@@ -19,14 +19,14 @@
 //! So these are operations, and the same reasoning `crate::sync` applies to
 //! barriers applies here: a host fact belongs to the host.
 //!
-//! # Only one of the four has a definable effect
+//! # Only one of the five has a definable effect
 //!
 //! [`ContentDirective::Synchronize`] means the guest's own pages must be
 //! current for the named content. That is a statement about
 //! [`crate::content::Replica`] and it is checkable, so
 //! [`ResourceStateOp::publication_requirement`] returns it.
 //!
-//! The other three do not get invented effects. `optimizeContentsFor…` is a
+//! The other four do not get invented effects. `optimizeContentsFor…` is a
 //! preference about a representation the model does not describe;
 //! `invalidateCompressedTexture:` says a compression metadata this model has no
 //! concept of is stale. Mapping either onto a replica discard would be a guess
@@ -37,7 +37,7 @@
 use crate::access::SubresourceRange;
 use crate::content::Replica;
 use crate::identity::ResourceId;
-pub use reims_vgpu_protocol::resource_state::{ContentDirective, ContentGranularity};
+pub use reims_vgpu_protocol::resource_state::{ContentDirective, ContentTarget};
 
 /// A texture subresource named by a `slice:level:` record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -60,26 +60,55 @@ impl SliceLevel {
     }
 }
 
+/// What a content-representation operation is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceStateTarget {
+    /// A resource, and the subresource within it the record named.
+    ///
+    /// `subresource: None` is "the record carried a ref alone", not "slice 0,
+    /// level 0". A whole-texture synchronise covers every level, and collapsing
+    /// it to the top one would publish a fraction of what the guest asked for.
+    Resource {
+        resource: ResourceId,
+        subresource: Option<SliceLevel>,
+    },
+    /// The encoder that issued it, because the record named nothing.
+    ///
+    /// A variant rather than a resource with a reserved id: "the record named
+    /// nothing" and "the record named resource zero" have to stay different, or
+    /// the flush orders against an unrelated object.
+    Encoder,
+}
+
 /// One content-representation operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceStateOp {
     pub directive: ContentDirective,
-    pub resource: ResourceId,
-    /// The subresource the record named, or `None` for the whole-resource form.
-    ///
-    /// `None` is "the record carried a ref alone", not "slice 0, level 0". A
-    /// whole-texture synchronise covers every level, and collapsing it to the
-    /// top one would publish a fraction of what the guest asked for.
-    pub subresource: Option<SliceLevel>,
+    pub target: ResourceStateTarget,
 }
 
 impl ResourceStateOp {
-    /// The granularity the record was sent at.
+    /// The target shape the record was sent at.
     #[must_use]
-    pub const fn granularity(&self) -> ContentGranularity {
-        match self.subresource {
-            Some(_) => ContentGranularity::SliceLevel,
-            None => ContentGranularity::WholeResource,
+    pub const fn target_kind(&self) -> ContentTarget {
+        match self.target {
+            ResourceStateTarget::Resource {
+                subresource: Some(_),
+                ..
+            } => ContentTarget::SliceLevel,
+            ResourceStateTarget::Resource {
+                subresource: None, ..
+            } => ContentTarget::WholeResource,
+            ResourceStateTarget::Encoder => ContentTarget::Encoder,
+        }
+    }
+
+    /// The resource this operation is about, if it is about one.
+    #[must_use]
+    pub const fn resource(&self) -> Option<ResourceId> {
+        match self.target {
+            ResourceStateTarget::Resource { resource, .. } => Some(resource),
+            ResourceStateTarget::Encoder => None,
         }
     }
 
@@ -87,7 +116,7 @@ impl ResourceStateOp {
     ///
     /// `Some(GuestPages)` for a synchronise and nothing for the rest. This is
     /// the model's whole semantic contribution here, and it is deliberately
-    /// small: three of the four directives have no effect this layer can state
+    /// small: four of the five directives have no effect this layer can state
     /// without inventing one.
     #[must_use]
     pub const fn publication_requirement(&self) -> Option<Replica> {
@@ -95,7 +124,8 @@ impl ResourceStateOp {
             ContentDirective::Synchronize => Some(Replica::GuestPages),
             ContentDirective::OptimizeForCpu
             | ContentDirective::OptimizeForGpu
-            | ContentDirective::InvalidateCompressed => None,
+            | ContentDirective::InvalidateCompressed
+            | ContentDirective::FlushCompressedReinterpretation => None,
         }
     }
 
@@ -103,7 +133,7 @@ impl ResourceStateOp {
     /// *once it has stated where the content is*.
     ///
     /// Never answered here — the method returns what the model knows, which is
-    /// that a synchronise depends on placement and the other three depend on a
+    /// that a synchronise depends on placement and the other four depend on a
     /// representation. It exists so a caller asking "can I skip this" has to
     /// pass through a name that says the answer is not the model's.
     #[must_use]
@@ -117,7 +147,7 @@ mod tests {
     use super::*;
     use crate::identity::{ObjectListRef, SlotGeneration};
     use crate::operation::{classify, OperationClass, OperationHome};
-    use reims_vgpu_protocol::closure::{Rail, LEDGER};
+    use reims_vgpu_protocol::closure::LEDGER;
     use reims_vgpu_protocol::resource_state::content_request;
 
     fn res(slot: u32) -> ResourceId {
@@ -130,8 +160,10 @@ mod tests {
     fn op(directive: ContentDirective, subresource: Option<SliceLevel>) -> ResourceStateOp {
         ResourceStateOp {
             directive,
-            resource: res(1),
-            subresource,
+            target: ResourceStateTarget::Resource {
+                resource: res(1),
+                subresource,
+            },
         }
     }
 
@@ -147,13 +179,20 @@ mod tests {
     fn the_content_requests_are_exactly_the_judged_resource_state_operations() {
         for op in LEDGER {
             let Some(opcode) = op.opcode else { continue };
-            let classified = classify(op)
-                == Some(OperationHome::Stream(OperationClass::ResourceState))
-                && op.rail == Rail::Blit;
-            assert_eq!(
-                content_request(opcode).is_some() && op.rail == Rail::Blit,
-                classified,
-                "{:?} {opcode:#x} disagrees about being a content request",
+            let classified =
+                classify(op) == Some(OperationHome::Stream(OperationClass::ResourceState));
+            let judged_request = content_request(op.rail, opcode).is_some();
+            // Every content request is a classified resource-state operation.
+            assert!(
+                !judged_request || classified,
+                "{:?} {opcode:#x} is a content request that is not classified as one",
+                op.rail
+            );
+            // And every classified one that is *not* a request is a residency
+            // record, which is unresolved and so cannot be classified at all.
+            assert!(
+                !classified || judged_request,
+                "{:?} {opcode:#x} is a resource-state operation with no payload",
                 op.rail
             );
         }
@@ -167,7 +206,7 @@ mod tests {
         let mut residency = 0;
         for op in LEDGER {
             let Some(opcode) = op.opcode else { continue };
-            if op.rail == Rail::Blit || content_request(opcode).is_some() {
+            if content_request(op.rail, opcode).is_some() {
                 continue;
             }
             if !op.selector.starts_with("use") {
@@ -193,8 +232,8 @@ mod tests {
             Some(SliceLevel { slice: 0, level: 0 }),
         );
         assert_ne!(whole, top);
-        assert_eq!(whole.granularity(), ContentGranularity::WholeResource);
-        assert_eq!(top.granularity(), ContentGranularity::SliceLevel);
+        assert_eq!(whole.target_kind(), ContentTarget::WholeResource);
+        assert_eq!(top.target_kind(), ContentTarget::SliceLevel);
     }
 
     /// Synchronise publishes to the guest's pages; nothing else claims an
@@ -209,11 +248,28 @@ mod tests {
             ContentDirective::OptimizeForCpu,
             ContentDirective::OptimizeForGpu,
             ContentDirective::InvalidateCompressed,
+            ContentDirective::FlushCompressedReinterpretation,
         ] {
             assert_eq!(op(directive, None).publication_requirement(), None);
             assert!(!op(directive, None).depends_on_placement());
         }
         assert!(op(ContentDirective::Synchronize, None).depends_on_placement());
+    }
+
+    /// The encoder-scoped flush is about no resource, and that is readable
+    /// from the operation rather than by inspecting a sentinel.
+    #[test]
+    fn the_encoder_scoped_flush_names_no_resource() {
+        let flush = ResourceStateOp {
+            directive: ContentDirective::FlushCompressedReinterpretation,
+            target: ResourceStateTarget::Encoder,
+        };
+        assert_eq!(flush.resource(), None);
+        assert_eq!(flush.target_kind(), ContentTarget::Encoder);
+        assert_eq!(
+            op(ContentDirective::Synchronize, None).resource(),
+            Some(res(1))
+        );
     }
 
     /// A slice/level record names exactly one subresource, so two synchronises
