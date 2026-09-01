@@ -25,11 +25,12 @@
 use crate::access::AccessIntent;
 use crate::depend::DependencyGraph;
 use crate::identity::{
-    ChannelId, ChannelSequence, CompletionStamp, IngressOrdinal, SessionGeneration, SessionId,
-    StampWait,
+    ChannelId, ChannelSequence, CompletionStamp, DeviceEpoch, IngressOrdinal, SessionGeneration,
+    SessionId, StampWait,
 };
 use crate::publish::{Publisher, Release, RetireRefusal};
 use crate::ready::Scheduler;
+use crate::retire::Lifetime;
 use crate::transaction::{classify, DeviceTransaction, PayloadClass};
 use reims_vgpu_protocol::packets::{find, Channel};
 use std::collections::BTreeMap;
@@ -46,6 +47,13 @@ pub enum Refusal {
     /// A command with no established contract. Admitting it would promise
     /// ordering and completion for work the model cannot describe.
     UnestablishedContract { channel: Channel, opcode: u16 },
+    /// The host device incarnation ended and no replacement exists yet.
+    /// Admitting would promise ordering and completion on a device that is not
+    /// there. Not a guest error and not a semantic one, which is why it is
+    /// neither of the other two.
+    DeviceLost { epoch: DeviceEpoch },
+    /// A replacement device was asked for while the current one is live.
+    DeviceNotLost { epoch: DeviceEpoch },
     /// The packet arrived after the semantic lifetime it names was closed.
     /// Not an error in the guest: a reset races in-flight submissions, and the
     /// contract is that the closed generation stops accepting rather than that
@@ -61,9 +69,23 @@ impl Refusal {
         match self {
             Self::UnknownCommand { .. } => "ingress_unknown_command",
             Self::UnestablishedContract { .. } => "ingress_unestablished_contract",
+            Self::DeviceLost { .. } => "ingress_device_lost",
+            Self::DeviceNotLost { .. } => "ingress_device_not_lost",
             Self::GenerationClosed { .. } => "ingress_generation_closed",
         }
     }
+}
+
+/// Whether this session has a host device incarnation to execute on.
+///
+/// Separate from the epoch identity: the identity says *which* incarnation,
+/// this says whether there is one. A session between a loss and its
+/// replacement has an epoch that names something dead, and admitting work
+/// against it would be promising execution on a device that does not exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceState {
+    Live,
+    Lost,
 }
 
 /// A packet as ingress receives it, before it is a transaction.
@@ -97,6 +119,8 @@ pub struct Admitted {
 pub struct SessionModel {
     id: SessionId,
     generation: SessionGeneration,
+    epoch: DeviceEpoch,
+    device: DeviceState,
     next_ingress: IngressOrdinal,
     channel_sequence: BTreeMap<ChannelId, ChannelSequence>,
     graph: DependencyGraph,
@@ -114,6 +138,8 @@ impl SessionModel {
         Self {
             id,
             generation: SessionGeneration::FIRST,
+            epoch: DeviceEpoch::FIRST,
+            device: DeviceState::Live,
             next_ingress: IngressOrdinal::default().next(),
             channel_sequence: BTreeMap::new(),
             graph: DependencyGraph::new(),
@@ -139,6 +165,18 @@ impl SessionModel {
         self.refusals
     }
 
+    /// The host device incarnation this session's native objects belong to.
+    #[must_use]
+    pub const fn epoch(&self) -> DeviceEpoch {
+        self.epoch
+    }
+
+    /// The pair every lease this session issues carries.
+    #[must_use]
+    pub const fn lifetime(&self) -> Lifetime {
+        Lifetime::new(self.generation, self.epoch)
+    }
+
     /// Close this semantic lifetime and open the next.
     ///
     /// New resolution stops; accepted work is not invalidated. The ordering
@@ -146,9 +184,56 @@ impl SessionModel {
     /// generation still has to complete, still publishes its stamp, and still
     /// releases whatever waited on it. Dropping it here would be a reset that
     /// can lose a completion the host is still going to deliver.
+    ///
+    /// The device epoch does not move. A guest reset says nothing about the
+    /// host device, which may be perfectly healthy — recreating it here would
+    /// throw away work the host is still executing in order to answer a
+    /// question the guest did not ask.
     pub fn reset(&mut self) -> SessionGeneration {
         self.generation = self.generation.next();
         self.generation
+    }
+
+    /// Whether this session has a host device at all.
+    #[must_use]
+    pub const fn device_state(&self) -> DeviceState {
+        self.device
+    }
+
+    /// End the host device incarnation.
+    ///
+    /// Every lease from this epoch becomes unusable at once: no timeline will
+    /// advance to release it, because the thing that would advance it is what
+    /// was lost. The semantic generation does not move — the guest has not
+    /// reset, still names what it named, and is owed a typed terminal fact
+    /// rather than a silent new lifetime.
+    ///
+    /// This does **not** open a replacement. Losing a device and having one
+    /// again are two events, and folding them into one call would mean work
+    /// submitted in between is admitted into an incarnation that does not
+    /// exist. Until [`SessionModel::recreate_device`] runs, admission refuses.
+    ///
+    /// Returns the epoch that died, which is the identity the retirement queue
+    /// has to be told about.
+    pub fn device_lost(&mut self) -> DeviceEpoch {
+        self.device = DeviceState::Lost;
+        self.epoch
+    }
+
+    /// Open the next host device incarnation after a loss.
+    ///
+    /// # Errors
+    ///
+    /// If the device was never lost. A replacement created while the current
+    /// incarnation is live would orphan every lease against a device that is
+    /// still perfectly able to execute them.
+    pub fn recreate_device(&mut self) -> Result<DeviceEpoch, Refusal> {
+        if self.device == DeviceState::Live {
+            return Err(Refusal::DeviceNotLost { epoch: self.epoch });
+        }
+        self.epoch = self.epoch.next();
+        self.device = DeviceState::Live;
+        Ok(self.epoch)
     }
 
     /// Turn a packet into a transaction, or refuse it.
@@ -159,6 +244,10 @@ impl SessionModel {
     /// no ordinal is consumed and no sequence advances — so a refused packet
     /// leaves no gap in either order for a reader to explain.
     pub fn admit(&mut self, packet: &Packet) -> Result<Admitted, Refusal> {
+        if self.device == DeviceState::Lost {
+            self.refusals += 1;
+            return Err(Refusal::DeviceLost { epoch: self.epoch });
+        }
         let Some(judged) = find(packet.channel, packet.opcode) else {
             self.refusals += 1;
             return Err(Refusal::UnknownCommand {
@@ -310,6 +399,7 @@ mod tests {
     use super::*;
     use crate::access::{AccessKey, AccessMode, BackingId, ResourceKey};
     use crate::identity::{StampSlot, StampValue};
+    use crate::retire::Validity;
 
     fn packet(opcode: u16) -> Packet {
         Packet {
@@ -526,6 +616,107 @@ mod tests {
         // continuing the lifetime that just ended.
         let next = s.admit(&packet(0x37)).expect("accepted");
         assert_eq!(next.transaction.channel_sequence, ChannelSequence(1));
+    }
+
+    /// The two transitions are independent, which is the whole reason they are
+    /// two identities.
+    #[test]
+    fn a_guest_reset_and_a_device_loss_move_different_lifetimes() {
+        let mut s = SessionModel::new(SessionId(1));
+        let start = s.lifetime();
+
+        s.reset();
+        assert_eq!(
+            s.epoch(),
+            start.epoch,
+            "a guest reset says nothing about the host device, which may be \
+             perfectly healthy"
+        );
+        assert_ne!(s.generation(), start.session);
+        assert_eq!(s.device_state(), DeviceState::Live);
+
+        let after_reset = s.lifetime();
+        let died = s.device_lost();
+        assert_eq!(died, after_reset.epoch, "the epoch that died is named");
+        assert_eq!(
+            s.generation(),
+            after_reset.session,
+            "the guest has not reset; it still names what it named"
+        );
+        assert_eq!(s.device_state(), DeviceState::Lost);
+
+        let replacement = s.recreate_device().expect("lost, so replaceable");
+        assert_ne!(replacement, died);
+        assert_eq!(s.generation(), after_reset.session);
+    }
+
+    /// Work submitted between a loss and its replacement has nothing to run on
+    /// and must be told so, not admitted into an incarnation that is gone.
+    #[test]
+    fn a_lost_device_refuses_admission_until_it_is_replaced() {
+        let mut s = SessionModel::new(SessionId(1));
+        let epoch = s.device_lost();
+        assert_eq!(
+            s.admit(&packet(0x37)),
+            Err(Refusal::DeviceLost { epoch }),
+            "ordering and completion cannot be promised on a device that is \
+             not there"
+        );
+        assert_eq!(s.refusals(), 1);
+        s.recreate_device().expect("lost");
+        assert!(s.admit(&packet(0x37)).is_ok());
+    }
+
+    #[test]
+    fn a_live_device_cannot_be_replaced() {
+        let mut s = SessionModel::new(SessionId(1));
+        assert_eq!(
+            s.recreate_device(),
+            Err(Refusal::DeviceNotLost { epoch: s.epoch() }),
+            "a replacement made while the device is live would orphan every \
+             lease against a device still able to execute them"
+        );
+    }
+
+    /// A lease issued before either transition is judged on both, separately.
+    #[test]
+    fn a_lease_from_before_both_transitions_is_judged_on_both() {
+        let mut s = SessionModel::new(SessionId(1));
+        let lease = s.lifetime();
+        assert_eq!(lease.against(s.generation(), s.epoch()), Validity::Live);
+
+        s.reset();
+        let after = lease.against(s.generation(), s.epoch());
+        assert!(!after.admits_new_work(), "the guest may not name it");
+        assert!(
+            after.handles_usable(),
+            "and the submission the host is still executing must finish"
+        );
+
+        s.device_lost();
+        s.recreate_device().expect("lost");
+        assert_eq!(lease.against(s.generation(), s.epoch()), Validity::Gone);
+    }
+
+    /// Two attached devices are two values with nothing between them. The test
+    /// exists so that adding a process-global anywhere in this plane fails
+    /// here rather than in a guest.
+    #[test]
+    fn one_sessions_reset_or_loss_cannot_reach_another_session() {
+        let mut a = SessionModel::new(SessionId(1));
+        let mut b = SessionModel::new(SessionId(2));
+        let untouched = b.lifetime();
+        let admitted = b.admit(&packet(0x37)).expect("accepted");
+
+        a.reset();
+        a.device_lost();
+        a.recreate_device().expect("lost");
+
+        assert_eq!(b.lifetime(), untouched);
+        assert_eq!(b.device_state(), DeviceState::Live);
+        assert_eq!(untouched.against(b.generation(), b.epoch()), Validity::Live);
+        assert!(b.admit(&packet(0x37)).is_ok());
+        assert!(!b.complete(admitted.transaction.ingress).is_empty());
     }
 
     /// A reset opens a new lifetime and does not throw away work that has not

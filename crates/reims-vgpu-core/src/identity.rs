@@ -72,6 +72,76 @@ impl SessionGeneration {
     }
 }
 
+/// The host device incarnation: the lifetime whose objects are invalidated
+/// together when the host device is lost or deliberately recreated.
+///
+/// A **separate** lifetime from [`SessionGeneration`], and the separation is
+/// the point. A guest reset closes the semantic lifetime and says nothing about
+/// the host device, which may be perfectly healthy and must not be torn down
+/// for it. Host device loss ends every handle at once and says nothing about
+/// what the guest still names. Every native object lease carries both: the
+/// generation decides whether the guest may still name it, the epoch decides
+/// whether its handles may still be touched. Collapsing them into one counter
+/// makes a reset destroy a working device or a device loss leave dead handles
+/// reachable under a live name, and those are the two failures this device
+/// cannot have.
+///
+/// What an epoch *contains* is an executor's business and is not nameable from
+/// here. What it *is* — a lifetime that ends all at once — is the contract, and
+/// that is what this is.
+///
+/// Non-zero for the same reason [`SessionGeneration`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeviceEpoch(NonZeroU64);
+
+impl DeviceEpoch {
+    /// The incarnation an attach creates.
+    pub const FIRST: DeviceEpoch = DeviceEpoch(NonZeroU64::MIN);
+
+    /// The incarnation created after this one is lost.
+    ///
+    /// Saturating for the same reason [`SessionGeneration::next`] is: a wrapped
+    /// epoch would make a lease from a dead device compare equal to a live one,
+    /// and that failure is a use-after-free wearing a valid name.
+    #[must_use]
+    pub const fn next(self) -> DeviceEpoch {
+        match NonZeroU64::new(self.0.get().saturating_add(1)) {
+            Some(n) => DeviceEpoch(n),
+            // Unreachable: a saturating add on a non-zero value is non-zero.
+            None => DeviceEpoch::FIRST,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// A point on a host completion timeline.
+///
+/// Not a [`StampValue`]. The guest's completion word is a 32-bit value that
+/// wraps and is compared in a wrapping order; a host timeline is a 64-bit
+/// monotone counter that does not wrap in any run this device will see. They
+/// are different contracts with different comparison rules, so a single type
+/// for both would mean one of the two comparisons is silently wrong — and the
+/// wrong one is whichever the reader was not thinking about.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TimelinePoint(pub u64);
+
+impl TimelinePoint {
+    /// Whether a timeline that has reached `self` has passed `other`.
+    #[must_use]
+    pub const fn reached(self, other: TimelinePoint) -> bool {
+        self.0 >= other.0
+    }
+
+    #[must_use]
+    pub const fn next(self) -> TimelinePoint {
+        TimelinePoint(self.0.wrapping_add(1))
+    }
+}
+
 /// A guest task ordinal, as it arrives on the wire.
 ///
 /// Task 0 is the kernel task and is a legal value, so this is not `NonZero`.
