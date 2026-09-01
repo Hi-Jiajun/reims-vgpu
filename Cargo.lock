@@ -1148,6 +1148,7 @@ dependencies = [
  "raw-window-handle",
  "reims-vgpu-config",
  "reims-vgpu-contract",
+ "reims-vgpu-memory",
  "reims-vgpu-observe",
  "reims-vgpu-paging",
  "reims-vgpu-protocol",
@@ -1181,6 +1182,15 @@ dependencies = [
  "reims-vgpu-protocol",
  "reims-vgpu-wire",
  "serde_json",
+]
+
+[[package]]
+name = "reims-vgpu-memory"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-contract",
+ "reims-vgpu-observe",
+ "reims-vgpu-paging",
 ]
 
 [[package]]

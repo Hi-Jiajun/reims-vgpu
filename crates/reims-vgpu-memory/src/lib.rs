@@ -22,8 +22,8 @@
 //!
 //! `AGENTS.md` bans source-grep scanners, and the test that used to hold the old
 //! ban was one. Its replacement is rule 1 of the "Before A Broad Sweep" ladder —
-//! *make the invariant unrepresentable*. [`GuestSlice`](crate::runtime::guest_ram::GuestSlice) has exactly one
-//! constructor, [`GuestRamImport::slice`](crate::runtime::guest_ram::GuestRamImport::slice), which bounds-checks with checked
+//! *make the invariant unrepresentable*. [`GuestSlice`] has exactly one
+//! constructor, [`GuestRamImport::slice`], which bounds-checks with checked
 //! arithmetic against the import's own length. There is no second way to build
 //! one, no public field that hands back a raw pointer or an absolute offset a
 //! call site could re-add to something, and no `From` conversion. A new import
@@ -32,7 +32,7 @@
 //!
 //! The absolute position of a slice inside its import is obtainable only by
 //! presenting the slice back to the import that made it
-//! ([`GuestRamImport::resolve`](crate::runtime::guest_ram::GuestRamImport::resolve)), which is also where the cross-import check
+//! ([`GuestRamImport::resolve`]), which is also where the cross-import check
 //! lives. That is the same rule as the C shim boundary in `AGENTS.md`: export
 //! what the backend binds, not the inputs it binds from.
 //!
@@ -57,7 +57,7 @@
 //!
 //! GPA → HVA is linear *within* a RAMBlock, so one import covers every guest
 //! page in it and a resource becomes an `(offset, len)` pair rather than a page
-//! list somebody has to export. That is what makes [`GuestRamImport::slice`](crate::runtime::guest_ram::GuestRamImport::slice)
+//! list somebody has to export. That is what makes [`GuestRamImport::slice`]
 //! free — no ioctl, no allocation, no cache, no kernel reference per page — and
 //! it is why a scattered surface is not un-importable: it is N slices over one
 //! import.
@@ -69,8 +69,8 @@
 //! the alias is optional; a driver may refuse it and the existing gather remains
 //! the correctness path. It is never attempted per draw.
 
-use crate::contract::checked::align_up_u64;
-use crate::observe::{Decline, Emit};
+use reims_vgpu_contract::checked::align_up_u64;
+use reims_vgpu_observe::{Decline, Emit};
 
 /// Exact physical footprint retained with one imported guest allocation.
 ///
@@ -92,7 +92,7 @@ pub struct GuestPageFootprint {
 }
 
 impl GuestPageFootprint {
-    pub(crate) fn new(pages: std::sync::Arc<[u64]>, page_size: u64) -> Option<Self> {
+    pub fn new(pages: std::sync::Arc<[u64]>, page_size: u64) -> Option<Self> {
         if pages.is_empty() || !page_size.is_power_of_two() {
             return None;
         }
@@ -126,8 +126,7 @@ impl GuestPageFootprint {
     /// can describe a later allocation. Resource-owned clones retain the same
     /// `Arc`, so pointer identity gives the outstanding-write ledger an O(1)
     /// deduplication key without inventing a second allocation id.
-    #[cfg(feature = "backend-vulkan")]
-    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+    pub fn same_allocation(&self, other: &Self) -> bool {
         self.page_size == other.page_size && std::sync::Arc::ptr_eq(&self.pages, &other.pages)
     }
 
@@ -146,8 +145,7 @@ impl GuestPageFootprint {
     /// page — which is what the outstanding-write ledger does — the scan was
     /// O(pages x runs) and measured 5.2 ms per ask on a driven Maps leg, 42 asks
     /// a second. It is now a binary search.
-    #[cfg(feature = "backend-vulkan")]
-    pub(crate) fn contains_page(&self, gpa: u64) -> bool {
+    pub fn contains_page(&self, gpa: u64) -> bool {
         self.ascending.binary_search(&gpa).is_ok()
     }
 
@@ -160,12 +158,11 @@ impl GuestPageFootprint {
     /// binary search per page. A span test can only ever answer "cannot
     /// overlap"; an overlap of spans still has to be settled by
     /// [`Self::contains_page`], so this narrows work and never a verdict.
-    #[cfg(feature = "backend-vulkan")]
-    pub(crate) fn page_span(&self) -> Option<(u64, u64)> {
+    pub fn page_span(&self) -> Option<(u64, u64)> {
         Some((*self.ascending.first()?, *self.ascending.last()?))
     }
 
-    pub(crate) fn pages_arc(&self) -> std::sync::Arc<[u64]> {
+    pub fn pages_arc(&self) -> std::sync::Arc<[u64]> {
         std::sync::Arc::clone(&self.pages)
     }
 
@@ -198,7 +195,7 @@ impl GuestPageFootprint {
 /// One RAMBlock as the host shim describes it: where it starts in guest physical
 /// address space, where QEMU mapped it, and how long it is.
 ///
-/// This is the shape [`crate::runtime::HostOps::guest_ram_regions`] hands back,
+/// This is the shape `HostOps::guest_ram_regions` hands back,
 /// and it is deliberately not `map_pages` with a different return type.
 /// `map_pages` answers "give me a view of these specific pages" and may build a
 /// transient one the caller must release; this answers "where does guest RAM
@@ -393,7 +390,7 @@ impl Decline for GuestRamError {
     }
 }
 
-crate::observe::decline_display!(GuestRamError);
+reims_vgpu_observe::decline_display!(GuestRamError);
 
 /// The greppable event class every refusal in this module carries.
 const EVENT: &str = "guest_ram";
@@ -564,7 +561,7 @@ impl GuestRamImport {
 
     /// End this allocation identity. Existing backend children may finish,
     /// but no new child or import may be created from it afterward.
-    pub(crate) fn retire(&self) {
+    pub fn retire(&self) {
         self.retired
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -773,7 +770,7 @@ impl GuestSlice {
 ///
 /// The granularity is measured from the GPU — `minImportedHostPointerAlignment`
 /// on Vulkan, the host page size on the Metal-direct arm — and it is needed by
-/// [`crate::runtime::guest_ram_map`], which runs on the runtime side and holds
+/// `reims_vgpu::runtime::guest_ram_map`, which runs on the runtime side and holds
 /// no device context. The alternative is threading a number from the backend
 /// through every decode path that might name guest memory, which is how a site
 /// ends up with a default nobody measured.
@@ -856,7 +853,7 @@ pub fn forget_import_limits() {
 /// Distinct from [`import_budget`], which bounds the *sum* of every live import
 /// against the roomiest heap. This bounds one `vkAllocateMemory`, and a RAMBlock
 /// longer than it is imported in several — see
-/// [`crate::backend::vulkan::caps::host_pointer::IMPORT_SPAN_CEILING`] for the
+/// `reims_vgpu`'s host-pointer capability ceiling for the
 /// driver defect that makes a single large import unsafe.
 pub fn import_span_max() -> Option<u64> {
     match IMPORT_SPAN_MAX.load(std::sync::atomic::Ordering::Relaxed) {
@@ -952,8 +949,7 @@ impl GuestRef {
     /// reference has completed. Keeping the address derivation here preserves
     /// the module's central invariant: callers never receive a raw host pointer
     /// or reconstruct `host_base + offset` themselves.
-    #[cfg(feature = "backend-vulkan")]
-    pub(crate) fn store_u32_release(&self, value: u32) -> bool {
+    pub fn store_u32_release(&self, value: u32) -> bool {
         if self.requested() < std::mem::size_of::<u32>() as u64 {
             return false;
         }
@@ -1159,7 +1155,6 @@ mod tests {
     /// coped with that by construction — it never assumed an order — so the
     /// sorted membership index beside it has to be built from a copy rather
     /// than by asserting the list is already sorted.
-    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn membership_holds_when_allocation_order_descends() {
         let pages: std::sync::Arc<[u64]> = [0x9000, 0x3000, 0x8000, 0x1000, 0x2000].into();
@@ -1182,7 +1177,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_page_footprint_answers_membership_without_filling_scatter_gaps() {
         let pages: std::sync::Arc<[u64]> = [0x1000, 0x2000, 0x9000, 0xa000].into();
@@ -1311,7 +1305,7 @@ mod tests {
     /// the floor, which is the silent-failure class `AGENTS.md` forbids.
     #[test]
     fn the_refusal_reaches_the_always_on_log_with_a_named_reason() {
-        let capture = crate::observe::FailCapture::start();
+        let capture = reims_vgpu_observe::FailCapture::start();
         let import = import(0x1000, 1);
         let _ = import.slice(0xfff, 2);
         let line = capture.one(EVENT);
@@ -1501,7 +1495,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_guest_reference_stores_only_inside_its_checked_word() {
         let mut words = [0u32; 4];

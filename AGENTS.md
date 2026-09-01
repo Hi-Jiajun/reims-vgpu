@@ -33,6 +33,7 @@ Persist only the resulting field, layout, lifetime, ordering, or calling-convent
 - `crates/reims-vgpu-contract`: backend-neutral layouts, formats, geometry, page arithmetic, and
   contract refusals.
 - `crates/reims-vgpu-wire`: derived wire views; its nested instructions also apply.
+- `crates/reims-vgpu-memory`: the guest-RAM bound — imports, checked slices, page footprints.
 - `crates/reims-vgpu-config`: the single parse and declaration point for operator switches. An
   override may only narrow what the device does; it may never widen it.
 - `crates/reims-vgpu-observe`: typed observations and refusals. It describes decisions but does not
@@ -44,7 +45,7 @@ Product logic belongs in Rust. C and Objective-C connect QEMU to Rust and must n
 policy from multiple Rust queries. Shared C/Rust constants need a `qemu::abi::header_define` test.
 No panic may cross an FFI boundary.
 
-Guest RAM bounds and provenance belong to `runtime/guest_ram.rs`; extend `GuestRamImport` or
+Guest RAM bounds and provenance belong to `crates/reims-vgpu-memory`; extend `GuestRamImport` or
 `GuestSlice` instead of exposing raw pointers and offsets. Resource state that represents guest
 work follows the contract-owned guest lifetime. Do not silently evict it with arbitrary cache
 bounds; refuse excess work explicitly when the contract provides no lawful loss.

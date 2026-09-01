@@ -53,7 +53,14 @@ pub mod gpa_map;
 pub mod gpu_hang_trail;
 /// The bound on every GPU reference to guest RAM — one import per RAMBlock,
 /// and the only type that can name a byte inside one.
-pub mod guest_ram;
+///
+/// Re-exported from `reims_vgpu_memory` under the path every caller already
+/// writes (`crate::runtime::guest_ram::…`) so moving the module out did not
+/// move a call site. The crate boundary is what makes the bound structural:
+/// nothing there can see a resource table, a Vulkan handle or a QEMU
+/// structure, so there is no second way to answer "how big is this" and no
+/// place for a raw pointer and an offset to escape together.
+pub use reims_vgpu_memory as guest_ram;
 /// This process's imports of guest RAM, and the one place a guest physical
 /// address becomes a bindable reference.
 pub mod guest_ram_map;

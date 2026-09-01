@@ -63,6 +63,7 @@ reims-vgpu-paging = { path = "../reims-vgpu-paging" }
 # Operator switches: one parser, four results, and the rule that a switch may
 # only ever narrow what this device does. No dependencies of its own.
 reims-vgpu-config = { path = "../reims-vgpu-config" }
+reims-vgpu-memory = { path = "../reims-vgpu-memory" }
 # The backend-neutral protocol vocabulary: layouts, formats, geometry, page
 # arithmetic. A crate so that nothing in it can name a Vulkan handle, a Metal
 # object, or this device's state.
