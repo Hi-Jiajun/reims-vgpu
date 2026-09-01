@@ -3630,12 +3630,7 @@ unsafe fn plan_guest_copy(
             // The relation itself is the caller's to check, because it is the
             // caller that knows what the destination was built from and can name
             // the refusal — see `GuestWriteDecline::WindowTooSmall`.
-            let scratch = pools.acquire_guest_gather(
-                ctx,
-                dst.window_bytes(),
-                ash::vk::BufferUsageFlags::empty(),
-                counters,
-            )?;
+            let scratch = pools.acquire_guest_gather(ctx, dst.window_bytes(), counters)?;
             // The dispatch first, falling back to the regions it replaces —
             // which is the only ordering that keeps the transfer form reachable
             // on every host and for every run shape it still has to serve.
@@ -4314,14 +4309,7 @@ unsafe fn stage_run_tables(
     // kilobytes, which is why this is cheaper than the per-table slots it
     // replaces even with the extra copy.
     let (packed, places) = pack_run_tables(tables, ctx.storage_buffer_offset_align);
-    let slot = unsafe {
-        pools.acquire_staging(
-            ctx,
-            packed.len() as u64,
-            ash::vk::BufferUsageFlags::empty(),
-            counters,
-        )
-    }?;
+    let slot = unsafe { pools.acquire_staging(ctx, packed.len() as u64, counters) }?;
     unsafe { pools.write_staging(ctx, &slot, &packed) }?;
     Ok((slot, places))
 }

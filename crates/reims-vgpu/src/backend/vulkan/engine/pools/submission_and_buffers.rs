@@ -42,6 +42,41 @@ pub(crate) struct ReadbackLease {
 /// states count as off, and `Unrecognized` must not — a mistyped value would
 /// otherwise narrow this device silently, which is the opposite of what a
 /// mistyped switch should do.
+/// Every operation class a pooled buffer slot can be bound as.
+///
+/// One constant rather than a set each acquire assembles from a caller's
+/// argument, because **these slots are recycled by size bucket and not by
+/// usage.** A slot handed back to the free list is handed out again to whoever
+/// asks for that bucket next, so it has to be legal for whatever that caller
+/// binds it as — and a slot created with a narrower set is one that works until
+/// the bucket happens to be reused for something else, which is a fault
+/// arbitrarily far from the creation that decided it.
+///
+/// That is not hypothetical here. `acquire_guest_gather` used to OR
+/// `TRANSFER_SRC` in by hand with a comment recording exactly this bug: the
+/// sampled rail gathers into a slot and then copies it into an image, so a slot
+/// first created for a vertex window was an invalid copy source the second time
+/// it came out of the free list. Naming the set once is what stops the next one.
+///
+/// Both pools take the same set. A draw deduplicates its binds by content — the
+/// same window bound as a vertex stream and as a storage buffer resolves to one
+/// buffer — so a staging slot and a gather slot are interchangeable by
+/// construction and a difference between their usages would be a crossover that
+/// misses.
+///
+/// It is deliberately *not* `reims_vgpu_vulkan::buffer::EVERY_CLASS`, which is
+/// wider: that constant answers what a **guest** buffer must admit, and a guest
+/// buffer is created once for a lifetime the guest owns. These are host-visible
+/// pool slots, and widening a pool slot's usage is a change to what memory the
+/// driver will place it in — a measurement nobody has taken.
+const POOL_SLOT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
+        | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
+        | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
+        | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw(),
+);
+
 const fn identity_lookup_on(switch: crate::config::Switch) -> bool {
     !matches!(switch, crate::config::Switch::Off)
 }
@@ -3008,12 +3043,13 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
         size: u64,
-        usage: vk::BufferUsageFlags,
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
         let need = size.max(4);
         let bucket = Self::bucket(need);
-        // Prefer exact-usage free slots in this bucket; usage is OR'd broadly so reuse is fine.
+        // Free slots in this bucket, whatever the caller is about to bind them
+        // as: every slot carries [`POOL_SLOT_USAGE`], so there is no usage for
+        // this list to be keyed by.
         if let Some(list) = self.staging_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
                 self.note_staging_hit();
@@ -3028,14 +3064,7 @@ impl ResourcePools {
             .create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(bucket)
-                    .usage(
-                        usage
-                            | vk::BufferUsageFlags::TRANSFER_SRC
-                            | vk::BufferUsageFlags::TRANSFER_DST
-                            | vk::BufferUsageFlags::VERTEX_BUFFER
-                            | vk::BufferUsageFlags::INDEX_BUFFER
-                            | vk::BufferUsageFlags::STORAGE_BUFFER,
-                    )
+                    .usage(POOL_SLOT_USAGE)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )
@@ -3135,7 +3164,6 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
         size: u64,
-        usage: vk::BufferUsageFlags,
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
         let bucket = Self::bucket(size.max(4));
@@ -3147,20 +3175,7 @@ impl ResourcePools {
             .create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(bucket)
-                    .usage(
-                        usage
-                            | vk::BufferUsageFlags::TRANSFER_DST
-                            // TRANSFER_SRC unconditionally, because these slots
-                            // are recycled by size bucket and not by usage: the
-                            // sampled rail gathers into one and then copies it
-                            // into an image, so a slot first created for a
-                            // vertex window would be an invalid copy source the
-                            // second time it came out of `gather_free`.
-                            | vk::BufferUsageFlags::TRANSFER_SRC
-                            | vk::BufferUsageFlags::VERTEX_BUFFER
-                            | vk::BufferUsageFlags::INDEX_BUFFER
-                            | vk::BufferUsageFlags::STORAGE_BUFFER,
-                    )
+                    .usage(POOL_SLOT_USAGE)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )

@@ -670,7 +670,6 @@ fn used_binding_absent_from_layout(
 
 #[derive(Clone, Copy)]
 struct StageBufferUse {
-    usage: vk::BufferUsageFlags,
     snapshot_volatile: bool,
     gather_role: BufferGatherRole,
 }
@@ -684,7 +683,6 @@ unsafe fn stage_buffer_content(
     gathers: &mut Vec<PendingGuestGather>,
 ) -> Result<BoundBuffer, DrawError> {
     let StageBufferUse {
-        usage,
         snapshot_volatile,
         gather_role,
     } = use_;
@@ -712,7 +710,7 @@ unsafe fn stage_buffer_content(
         BufferContent::Bytes(b) => {
             let slot = {
                 let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                pools.acquire_staging(ctx, b.len() as u64, usage, counters)?
+                pools.acquire_staging(ctx, b.len() as u64, counters)?
             };
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, b.len() as u64);
             pools.write_staging(ctx, &slot, b)?;
@@ -734,7 +732,7 @@ unsafe fn stage_buffer_content(
                 counters.note_buffer_guest_import(src.total_len, gather_role);
                 bound
             } else if let Some((bound, pending)) =
-                unsafe { gather_guest_buffer_window(ctx, pools, counters, src, usage)? }
+                unsafe { gather_guest_buffer_window(ctx, pools, counters, src)? }
             {
                 // The copies read guest RAM when the CB executes, exactly as a
                 // direct bind does, so this owes the same quiesce.
@@ -763,7 +761,7 @@ unsafe fn stage_buffer_content(
                 // deferred-submit hot path, ~4.8 binds/draw under compositing).
                 let slot = {
                     let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                    pools.acquire_staging(ctx, src.total_len, usage, counters)?
+                    pools.acquire_staging(ctx, src.total_len, counters)?
                 };
                 let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
                 pools.write_staging_from_runs(
@@ -901,7 +899,6 @@ unsafe fn gather_guest_buffer_window(
     pools: &mut ResourcePools,
     counters: &EngineCounters,
     src: &super::types::GuestRunSource,
-    usage: vk::BufferUsageFlags,
 ) -> Result<Option<(BoundBuffer, PendingGuestGather)>, DrawError> {
     if !ctx.caps.host_pointer.is_available() {
         return Ok(None);
@@ -948,7 +945,7 @@ unsafe fn gather_guest_buffer_window(
         .fail_once(src.total_len);
         return Ok(None);
     }
-    let slot = pools.acquire_guest_gather(ctx, src.total_len, usage, counters)?;
+    let slot = pools.acquire_guest_gather(ctx, src.total_len, counters)?;
     Ok(Some((
         BoundBuffer::from(slot),
         PendingGuestGather {
@@ -1345,14 +1342,7 @@ unsafe fn import_sampled_guest_window(
         .fail_once(src.total_len);
         return Ok(None);
     }
-    let slot = unsafe {
-        pools.acquire_guest_gather(
-            ctx,
-            src.total_len,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            counters,
-        )?
-    };
+    let slot = unsafe { pools.acquire_guest_gather(ctx, src.total_len, counters)? };
     gathers.push(PendingGuestGather {
         dst: slot.buffer,
         sources,
@@ -3404,12 +3394,7 @@ pub(crate) unsafe fn execute_draw_inner(
             };
             let slot = {
                 let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                pools.acquire_staging(
-                    ctx,
-                    shifted.len() as u64,
-                    vk::BufferUsageFlags::VERTEX_BUFFER,
-                    counters,
-                )?
+                pools.acquire_staging(ctx, shifted.len() as u64, counters)?
             };
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, shifted.len() as u64);
             pools.write_staging(ctx, &slot, &shifted)?;
@@ -3422,7 +3407,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 counters,
                 &resource.content,
                 StageBufferUse {
-                    usage: vk::BufferUsageFlags::VERTEX_BUFFER,
                     snapshot_volatile: batch_eligible,
                     gather_role: gather_roles
                         .role(CbBind::key_of(&resource.content))
@@ -3445,7 +3429,6 @@ pub(crate) unsafe fn execute_draw_inner(
             counters,
             &indexed.content,
             StageBufferUse {
-                usage: vk::BufferUsageFlags::INDEX_BUFFER,
                 snapshot_volatile: batch_eligible,
                 gather_role: gather_roles
                     .role(CbBind::key_of(&indexed.content))
@@ -3457,8 +3440,9 @@ pub(crate) unsafe fn execute_draw_inner(
     };
 
     // Storage buffers (deduplicated by content with the vertex streams: a
-    // stage-in buffer doubling as a storage bind reuses the same slot —
-    // staging slots always carry the full usage superset).
+    // stage-in buffer doubling as a storage bind reuses the same slot — every
+    // pooled slot carries `POOL_SLOT_USAGE`, so there is no usage for that
+    // reuse to be wrong about).
     phase.enter(super::draw_phase::Phase::StageStorage);
     let mut storage_slots = Vec::new();
     for resource in &req.storage_buffers {
@@ -3468,7 +3452,6 @@ pub(crate) unsafe fn execute_draw_inner(
             counters,
             &resource.content,
             StageBufferUse {
-                usage: vk::BufferUsageFlags::STORAGE_BUFFER,
                 snapshot_volatile: batch_eligible,
                 gather_role: gather_roles
                     .role(CbBind::key_of(&resource.content))
@@ -3528,12 +3511,7 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         let slot = {
             let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-            pools.acquire_staging(
-                ctx,
-                wide.len() as u64,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                counters,
-            )?
+            pools.acquire_staging(ctx, wide.len() as u64, counters)?
         };
         {
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, wide.len() as u64);
@@ -3544,12 +3522,7 @@ pub(crate) unsafe fn execute_draw_inner(
     } else if let Some(rgba8) = seed_bytes {
         let slot = {
             let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-            pools.acquire_staging(
-                ctx,
-                rgba8.len() as u64,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                counters,
-            )?
+            pools.acquire_staging(ctx, rgba8.len() as u64, counters)?
         };
         // Vulkan buffer→image copies do not perform format conversion, so the
         // staged bytes must already be in the attachment's physical order —
@@ -3804,12 +3777,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 None => {
                     let slot = {
                         let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                        pools.acquire_staging(
-                            ctx,
-                            seed.source.total_len,
-                            vk::BufferUsageFlags::TRANSFER_SRC,
-                            counters,
-                        )?
+                        pools.acquire_staging(ctx, seed.source.total_len, counters)?
                     };
                     {
                         let _s = stage_phase::Span::moving(
@@ -3906,12 +3874,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     continue;
                 }
                 let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
-                let st = pools.acquire_staging(
-                    ctx,
-                    bytes.len() as u64,
-                    vk::BufferUsageFlags::TRANSFER_SRC,
-                    counters,
-                )?;
+                let st = pools.acquire_staging(ctx, bytes.len() as u64, counters)?;
                 pools.write_staging(ctx, &st, bytes)?;
                 counters.note_sampled_reupload(bytes.len() as u64, resource.byte_origin);
                 sampled.push(PreparedSampled::Upload {
@@ -4179,12 +4142,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         imported
                     }
                     None => {
-                        let scratch = pools.acquire_staging(
-                            ctx,
-                            src.total_len,
-                            vk::BufferUsageFlags::TRANSFER_SRC,
-                            counters,
-                        )?;
+                        let scratch = pools.acquire_staging(ctx, src.total_len, counters)?;
                         pools.write_staging_from_runs(
                             ctx,
                             &scratch,

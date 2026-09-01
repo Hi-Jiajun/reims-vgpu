@@ -3833,7 +3833,6 @@ pub(super) unsafe fn invalidate_slot_for_read(
 mod staging_mapping_tests {
     use super::{readback_leases_outstanding, return_readback_lease, DeviceContext, ResourcePools};
     use crate::backend::vulkan::engine::counters::EngineCounters;
-    use ash::vk;
 
     /// A staging slot carries its own host mapping, and keeps it across recycle.
     ///
@@ -3857,9 +3856,8 @@ mod staging_mapping_tests {
         };
         let counters = EngineCounters::default();
         let mut pools = ResourcePools::new();
-        let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
 
-        let first = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }
+        let first = unsafe { pools.acquire_staging(&ctx, 4096, &counters) }
             .expect("a 4 KiB staging slot must be available");
         assert_ne!(first.mapped, 0, "a fresh staging slot must be mapped");
 
@@ -3870,7 +3868,7 @@ mod staging_mapping_tests {
         assert_eq!(seen, &payload[..], "the mapping does not observe the write");
 
         pools.recycle_staging();
-        let again = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }
+        let again = unsafe { pools.acquire_staging(&ctx, 4096, &counters) }
             .expect("the recycled slot must come back");
         assert_eq!(again.buffer, first.buffer, "expected the recycled slot");
         assert_eq!(
@@ -3909,7 +3907,6 @@ mod staging_mapping_tests {
         };
         let counters = EngineCounters::default();
         let mut pools = ResourcePools::new();
-        let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
 
         // Two passes over eleven distinct buckets from 64 B to 64 KiB. The
         // second pass re-requests each bucket while the first pass's slot is
@@ -3919,8 +3916,7 @@ mod staging_mapping_tests {
         for _ in 0..2 {
             let mut size = 64u64;
             while size <= 64 << 10 {
-                unsafe { pools.acquire_staging(&ctx, size, usage, &counters) }
-                    .expect("staging slot");
+                unsafe { pools.acquire_staging(&ctx, size, &counters) }.expect("staging slot");
                 acquires += 1;
                 size <<= 1;
             }
@@ -3966,10 +3962,9 @@ mod staging_mapping_tests {
         };
         let counters = EngineCounters::default();
         let mut pools = ResourcePools::new();
-        let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
 
-        let a = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }.expect("slot a");
-        let b = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }.expect("slot b");
+        let a = unsafe { pools.acquire_staging(&ctx, 4096, &counters) }.expect("slot a");
+        let b = unsafe { pools.acquire_staging(&ctx, 4096, &counters) }.expect("slot b");
         assert_ne!(a.buffer, b.buffer, "two live acquires must be two buffers");
 
         let pa: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
