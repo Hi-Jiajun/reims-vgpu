@@ -114,6 +114,7 @@ pub mod resident;
 pub mod sampler;
 pub mod staging;
 pub mod submission;
+pub mod swapchain;
 pub mod timeline;
 pub mod topology;
 pub mod transfer;

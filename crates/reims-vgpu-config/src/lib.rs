@@ -225,6 +225,20 @@ pub const PUSH_DESCRIPTORS: &str = "REIMS_VGPU_PUSH_DESCRIPTORS";
 /// one host.
 pub const DYNAMIC_RENDERING: &str = "REIMS_VGPU_DYNAMIC_RENDERING";
 
+/// `on` takes the bottom rung of the present-mode ladder whatever the surface
+/// offers, so a frame queues behind the pending one instead of replacing it.
+///
+/// Narrowing-only in the direction that matters: `FIFO` is the mode every
+/// surface is required to support, so this can only ever move *down* the
+/// ladder from `MAILBOX`. There is deliberately no switch that reaches
+/// `IMMEDIATE` — it tears, nothing in the guest's presentation contract asks
+/// for a torn frame, and a switch that traded correctness for latency would be
+/// widening what the device does rather than narrowing it.
+///
+/// It exists because the two rungs are the only way to tell a latency problem
+/// in this device from one in the compositor's scheduling on a single host.
+pub const SWAPCHAIN_FIFO: &str = "REIMS_VGPU_SWAPCHAIN_FIFO";
+
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 
