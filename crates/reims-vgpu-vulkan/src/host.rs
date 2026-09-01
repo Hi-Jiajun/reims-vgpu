@@ -444,6 +444,7 @@ unsafe fn judge(
     let mut descriptor_buffer = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
     let mut synchronization2 = vk::PhysicalDeviceSynchronization2Features::default();
     let mut dynamic_rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+    let mut extended_dynamic_state = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
     let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan12);
     if has(extension::MESH_SHADER) {
         features = features.push_next(&mut mesh);
@@ -456,6 +457,9 @@ unsafe fn judge(
     }
     if has(extension::DYNAMIC_RENDERING) {
         features = features.push_next(&mut dynamic_rendering);
+    }
+    if has(extension::EXTENDED_DYNAMIC_STATE) {
+        features = features.push_next(&mut extended_dynamic_state);
     }
     unsafe { instance.get_physical_device_features2(physical, &mut features) };
     // `VkPhysicalDeviceFeatures2::features` is the 1.0 boolean block, filled
@@ -483,6 +487,18 @@ unsafe fn judge(
         maintenance4.max_buffer_size
     });
 
+    // A *property*, and one with no core promotion: a device that does not
+    // enumerate `VK_EXT_extended_dynamic_state3` has not said it is
+    // unrestricted, and asking anyway would read an unfilled structure. `None`
+    // is therefore "was not asked" rather than "answered no".
+    let dynamic_primitive_topology_unrestricted =
+        has(extension::EXTENDED_DYNAMIC_STATE_3).then(|| {
+            let mut state3 = vk::PhysicalDeviceExtendedDynamicState3PropertiesEXT::default();
+            let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut state3);
+            unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+            state3.dynamic_primitive_topology_unrestricted == vk::TRUE
+        });
+
     let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
     let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
 
@@ -495,6 +511,8 @@ unsafe fn judge(
         depth_clamp: core_features.depth_clamp == vk::TRUE,
         fill_mode_non_solid: core_features.fill_mode_non_solid == vk::TRUE,
         sampler_anisotropy: core_features.sampler_anisotropy == vk::TRUE,
+        extended_dynamic_state: extended_dynamic_state.extended_dynamic_state == vk::TRUE,
+        dynamic_primitive_topology_unrestricted,
         dual_src_blend: core_features.dual_src_blend == vk::TRUE,
         independent_blend: core_features.independent_blend == vk::TRUE,
         max_sampler_anisotropy: properties.limits.max_sampler_anisotropy,
@@ -536,6 +554,8 @@ mod tests {
             fill_mode_non_solid: false,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
+            extended_dynamic_state: false,
+            dynamic_primitive_topology_unrestricted: None,
             dual_src_blend: false,
             independent_blend: false,
             sampler_mirror_clamp_to_edge: false,
@@ -762,6 +782,8 @@ mod tests {
             fill_mode_non_solid: false,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
+            extended_dynamic_state: false,
+            dynamic_primitive_topology_unrestricted: None,
             dual_src_blend: false,
             independent_blend: false,
             sampler_mirror_clamp_to_edge: false,

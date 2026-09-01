@@ -101,6 +101,13 @@ pub use reims_vgpu_protocol::depth_stencil;
 /// not, and that question belongs to the executor that queried a device.
 pub use reims_vgpu_protocol::blend;
 
+/// The primitive a draw assembles, re-exported from the protocol layer.
+///
+/// Semantic on either rail, and the class grouping with it — where a rail's
+/// pipeline may move without being rebuilt is an executor question, but which
+/// types share a class is not.
+pub use reims_vgpu_protocol::topology;
+
 pub mod stream;
 pub mod submit;
 pub mod sync;

@@ -26,7 +26,18 @@
 /// bit for one would be a number chosen to match a capture rather than a
 /// contract. Each backend's translator carries the test that holds this constant
 /// to the arms that actually exist.
-pub const EXECUTABLE_PRIMITIVE_TYPES: u32 = 0b1_1111;
+/// Derived from [`crate::topology::PrimitiveType::ALL`] rather than written
+/// as a literal. The advertisement and the set of types a rail can translate
+/// are one fact, and a literal cannot notice when that set changes.
+pub const EXECUTABLE_PRIMITIVE_TYPES: u32 = {
+    let mut mask = 0u32;
+    let mut i = 0;
+    while i < crate::topology::PrimitiveType::ALL.len() {
+        mask |= 1 << crate::topology::PrimitiveType::ALL[i].ordinal();
+        i += 1;
+    }
+    mask
+};
 
 /// Whether `mtl` is a primitive type this device advertises and can execute.
 #[inline]

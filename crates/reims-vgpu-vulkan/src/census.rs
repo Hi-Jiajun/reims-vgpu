@@ -103,6 +103,17 @@ pub mod extension {
     /// Carries `maxBufferSize`, which 1.3 promoted to core.
     pub const MAINTENANCE_4: &str = "VK_KHR_maintenance4";
     pub const DYNAMIC_RENDERING: &str = "VK_KHR_dynamic_rendering";
+    /// Carries `vkCmdSetPrimitiveTopology`, which 1.3 promoted to core.
+    pub const EXTENDED_DYNAMIC_STATE: &str = "VK_EXT_extended_dynamic_state";
+    /// Carries `dynamicPrimitiveTopologyUnrestricted`, which is a *property*
+    /// and has no core promotion — a 1.4 device that does not enumerate this
+    /// extension has not said it is unrestricted.
+    ///
+    /// Deliberately absent from [`DeviceExtensions`]: a physical-device
+    /// property is readable from a *supported* extension and nothing here
+    /// calls a command this one adds, so requesting it at device creation
+    /// would be asking for something this rail does not use.
+    pub const EXTENDED_DYNAMIC_STATE_3: &str = "VK_EXT_extended_dynamic_state3";
 }
 
 /// What the driver said, as the caller read it off the device.
@@ -137,6 +148,16 @@ pub struct Reported<'a> {
     /// *meaningful* where `sampler_anisotropy` is set, and the cell it lands
     /// in says so.
     pub max_sampler_anisotropy: f32,
+    /// `VkPhysicalDeviceExtendedDynamicStateFeaturesEXT::extendedDynamicState`.
+    pub extended_dynamic_state: bool,
+    /// `VkPhysicalDeviceExtendedDynamicState3PropertiesEXT::dynamicPrimitiveTopologyUnrestricted`,
+    /// when this device reported one.
+    ///
+    /// `None` and `Some(false)` mean the same thing to a decision and are
+    /// still different facts: the first is a device that was never asked, and
+    /// substituting one for the other here would make the census say a driver
+    /// answered when it did not.
+    pub dynamic_primitive_topology_unrestricted: Option<bool>,
     /// `VkPhysicalDeviceFeatures::dualSrcBlend`.
     pub dual_src_blend: bool,
     /// `VkPhysicalDeviceFeatures::independentBlend`.
@@ -234,6 +255,7 @@ pub struct DeviceExtensions {
     pub external_memory_host: bool,
     pub synchronization2: bool,
     pub dynamic_rendering: bool,
+    pub extended_dynamic_state: bool,
 }
 
 impl DeviceExtensions {
@@ -249,6 +271,10 @@ impl DeviceExtensions {
             (self.external_memory_host, extension::EXTERNAL_MEMORY_HOST),
             (self.synchronization2, extension::SYNCHRONIZATION_2),
             (self.dynamic_rendering, extension::DYNAMIC_RENDERING),
+            (
+                self.extended_dynamic_state,
+                extension::EXTENDED_DYNAMIC_STATE,
+            ),
         ] {
             if wanted {
                 names.push(name);
@@ -294,6 +320,7 @@ pub struct Census {
     buffers: crate::buffer::BufferLimits,
     samplers: crate::sampler::SamplerCell,
     blend: crate::blend::BlendCell,
+    topology: crate::topology::TopologyCell,
     host_pointer_import: bool,
     synchronization2: bool,
     can_present: bool,
@@ -364,6 +391,20 @@ impl Census {
             buffers: crate::buffer::BufferLimits {
                 max_buffer_size: reported.max_buffer_size,
             },
+            topology: crate::topology::TopologyCell {
+                // Core from 1.3, and both halves below it — for the reason
+                // `synchronization2` needs both.
+                dynamic: api.at_least(1, 3)
+                    || (reported.has(extension::EXTENDED_DYNAMIC_STATE)
+                        && reported.extended_dynamic_state),
+                // Never promoted, so the property is only ever what the
+                // extension reported. A device that was not asked is
+                // restricted, which is the conservative rung.
+                unrestricted: reported.has(extension::EXTENDED_DYNAMIC_STATE_3)
+                    && reported
+                        .dynamic_primitive_topology_unrestricted
+                        .unwrap_or(false),
+            },
             blend: crate::blend::BlendCell {
                 dual_source: reported.dual_src_blend,
                 independent: reported.independent_blend,
@@ -398,6 +439,9 @@ impl Census {
                     && !api.at_least(1, 3),
                 dynamic_rendering: reported.has(extension::DYNAMIC_RENDERING)
                     && reported.dynamic_rendering
+                    && !api.at_least(1, 3),
+                extended_dynamic_state: reported.has(extension::EXTENDED_DYNAMIC_STATE)
+                    && reported.extended_dynamic_state
                     && !api.at_least(1, 3),
             },
         })
@@ -469,6 +513,13 @@ impl Census {
         self.buffers
     }
 
+    /// The cell [`crate::topology::key`] reads to decide what a built
+    /// pipeline can serve.
+    #[must_use]
+    pub const fn topology(&self) -> crate::topology::TopologyCell {
+        self.topology
+    }
+
     /// The cell [`crate::blend::plan`] checks a dual-source factor against,
     /// and [`crate::blend::independent`] a whole attachment list.
     #[must_use]
@@ -520,7 +571,8 @@ impl Census {
         format!(
             "vk_census api={} topology={} signal={} import={} sync2={} mesh={} push={} \
              push_max={} desc_buffer={} desc_qualified={} queue_family={} compute={} \
-             mirror_clamp={} aniso={} aniso_max={} dual_src={} independent_blend={}",
+             mirror_clamp={} aniso={} aniso_max={} dual_src={} independent_blend={} \
+             dyn_topology={} topology_unrestricted={}",
             self.api,
             self.memory.topology.slug(),
             self.memory.signal.slug(),
@@ -538,6 +590,8 @@ impl Census {
             self.samplers.max_anisotropy,
             self.blend.dual_source,
             self.blend.independent,
+            self.topology.dynamic,
+            self.topology.unrestricted,
         )
     }
 }
@@ -604,6 +658,8 @@ mod tests {
             fill_mode_non_solid: false,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
+            extended_dynamic_state: false,
+            dynamic_primitive_topology_unrestricted: None,
             dual_src_blend: false,
             independent_blend: false,
             sampler_mirror_clamp_to_edge: false,
@@ -857,6 +913,8 @@ mod tests {
             "aniso_max=16",
             "dual_src=false",
             "independent_blend=false",
+            "dyn_topology=false",
+            "topology_unrestricted=false",
         ] {
             assert!(line.contains(fact), "{fact} missing from {line}");
         }
@@ -997,6 +1055,91 @@ mod tests {
             Err(Refusal::NoIndependentBlend { .. })
         ));
         assert!(independent(&[planned, opaque], rich.blend()).is_ok());
+    }
+
+    /// The three rungs of the topology cell, and the two facts that make them.
+    ///
+    /// The property has no core promotion, so a 1.4 device that never
+    /// enumerated `VK_EXT_extended_dynamic_state3` is restricted — which is
+    /// the case a version check would have got wrong.
+    #[test]
+    fn the_topology_cell_has_three_rungs_and_the_property_never_arrives_by_version() {
+        use crate::topology::{key, TopologyKey};
+        use reims_vgpu_core::topology::{PrimitiveType, TopologyClass};
+
+        let memory = mem::intel_igpu();
+        let families = integrated_families();
+
+        // 1.2 with neither: one pipeline per primitive type.
+        let bare =
+            Census::take(reported(packed(1, 2), BASELINE, &memory, &families)).expect("admitted");
+        assert!(!bare.topology().dynamic);
+        assert!(!bare.topology().unrestricted);
+        assert_eq!(
+            key(PrimitiveType::LineStrip, bare.topology()),
+            TopologyKey::Exact(PrimitiveType::LineStrip)
+        );
+
+        // 1.2 with the extension and its feature: dynamic within a class.
+        let classed = &[extension::SWAPCHAIN, extension::EXTENDED_DYNAMIC_STATE];
+        let mut r = reported(packed(1, 2), classed, &memory, &families);
+        r.extended_dynamic_state = true;
+        let classed = Census::take(r).expect("admitted");
+        assert!(classed.topology().dynamic);
+        assert!(!classed.topology().unrestricted);
+        assert_eq!(
+            key(PrimitiveType::LineStrip, classed.topology()),
+            TopologyKey::Class(TopologyClass::Line)
+        );
+        // The extension is asked for by name, because 1.2 is below the
+        // promotion.
+        assert!(classed.extensions().extended_dynamic_state);
+
+        // The extension without its feature is not a capability.
+        let mut r = reported(
+            packed(1, 2),
+            &[extension::SWAPCHAIN, extension::EXTENDED_DYNAMIC_STATE],
+            &memory,
+            &families,
+        );
+        r.extended_dynamic_state = false;
+        assert!(!Census::take(r).expect("admitted").topology().dynamic);
+
+        // 1.3 has it in core and never asks for the name.
+        let promoted =
+            Census::take(reported(packed(1, 3), BASELINE, &memory, &families)).expect("admitted");
+        assert!(promoted.topology().dynamic);
+        assert!(!promoted.extensions().extended_dynamic_state);
+
+        // A 1.4 device that never enumerated the property extension is still
+        // restricted, and one that enumerated it and answered yes is not.
+        let mut r = reported(packed(1, 4), BASELINE, &memory, &families);
+        r.dynamic_primitive_topology_unrestricted = Some(true);
+        let lying = Census::take(r).expect("admitted");
+        assert!(
+            !lying.topology().unrestricted,
+            "a property from an extension this device did not enumerate is not an answer"
+        );
+
+        let named = &[extension::SWAPCHAIN, extension::EXTENDED_DYNAMIC_STATE_3];
+        let mut r = reported(packed(1, 4), named, &memory, &families);
+        r.dynamic_primitive_topology_unrestricted = Some(true);
+        let free = Census::take(r).expect("admitted");
+        assert!(free.topology().dynamic);
+        assert!(free.topology().unrestricted);
+        assert_eq!(key(PrimitiveType::Point, free.topology()), TopologyKey::Any);
+        // And the extension is never requested, because only its property was
+        // read.
+        assert!(!free
+            .extensions()
+            .names()
+            .contains(&extension::EXTENDED_DYNAMIC_STATE_3));
+
+        // Enumerated but answered no is the restricted rung, and is a
+        // different fact from never having been asked.
+        let mut r = reported(packed(1, 4), named, &memory, &families);
+        r.dynamic_primitive_topology_unrestricted = Some(false);
+        assert!(!Census::take(r).expect("admitted").topology().unrestricted);
     }
 
     /// The rule a device creation gets refused for breaking: a capability that

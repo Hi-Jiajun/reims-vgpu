@@ -60,6 +60,8 @@
 //!   of its two faces the record actually wrote.
 //! - [`sampler`] — `MTLSamplerDescriptor`'s ordinals, and the combinations
 //!   the guest API itself does not admit.
+//! - [`topology`] — `MTLPrimitiveType` and the three classes its five
+//!   values fall into.
 //! - [`texture_shape`] — what a texture declaration is: its type ordinal, the
 //!   dimensions that type uses, and the field pairs the guest API does not
 //!   admit.
@@ -128,5 +130,6 @@ pub mod segment;
 pub mod storage_mode;
 pub mod sync;
 pub mod texture_shape;
+pub mod topology;
 pub mod vertex_step;
 pub mod visibility;

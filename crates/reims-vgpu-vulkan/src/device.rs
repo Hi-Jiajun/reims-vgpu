@@ -67,6 +67,15 @@ pub struct Enabled {
     /// undefined behaviour rather than with a refusal.
     pub synchronization2: bool,
     pub dynamic_rendering: bool,
+    /// `vkCmdSetPrimitiveTopology`, which decides whether one pipeline can
+    /// serve more than one primitive type — see [`crate::topology`].
+    ///
+    /// The one promoted capability here that is *not* a feature at its core
+    /// version: 1.3 made these commands mandatory and
+    /// `VkPhysicalDeviceVulkan13Features` has no field for them. So unlike
+    /// `synchronization2` beside it, there is nothing to request at 1.3 and
+    /// above, and below it the extension's own structure is the only asker.
+    pub extended_dynamic_state: bool,
     pub mesh_shader: bool,
     pub descriptor_buffer: bool,
     /// The 1.0 boolean block, requested through
@@ -108,6 +117,7 @@ impl Enabled {
             timeline_semaphore: true,
             synchronization2: census.synchronization2(),
             dynamic_rendering: census.passes().dynamic_rendering,
+            extended_dynamic_state: census.topology().dynamic,
             mesh_shader: census.stages().mesh_shader,
             descriptor_buffer: census.descriptors().descriptor_buffer,
             depth_clamp: census.raster().depth_clamp,
@@ -217,6 +227,9 @@ impl DeviceEpoch {
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
         let mut dynamic_rendering =
             vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let mut extended_dynamic_state =
+            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
+                .extended_dynamic_state(true);
         let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
         let mut descriptor_buffer =
             vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
@@ -247,6 +260,9 @@ impl DeviceEpoch {
             }
             if enabled.extensions.dynamic_rendering {
                 create = create.push_next(&mut dynamic_rendering);
+            }
+            if enabled.extensions.extended_dynamic_state {
+                create = create.push_next(&mut extended_dynamic_state);
             }
         }
         if enabled.mesh_shader {
@@ -387,6 +403,8 @@ mod tests {
             fill_mode_non_solid: false,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
+            extended_dynamic_state: false,
+            dynamic_primitive_topology_unrestricted: None,
             dual_src_blend: false,
             independent_blend: false,
             sampler_mirror_clamp_to_edge: false,
@@ -527,6 +545,8 @@ mod tests {
                         fill_mode_non_solid: false,
                         sampler_anisotropy: false,
                         max_sampler_anisotropy: 1.0,
+                        extended_dynamic_state: false,
+                        dynamic_primitive_topology_unrestricted: None,
                         dual_src_blend: false,
                         independent_blend: false,
                         sampler_mirror_clamp_to_edge: false,
@@ -574,6 +594,8 @@ mod tests {
                         fill_mode_non_solid: false,
                         sampler_anisotropy: false,
                         max_sampler_anisotropy: 16.0,
+                        extended_dynamic_state: false,
+                        dynamic_primitive_topology_unrestricted: None,
                         dual_src_blend: false,
                         independent_blend: false,
                         sampler_mirror_clamp_to_edge: false,
@@ -617,6 +639,8 @@ mod tests {
                         fill_mode_non_solid: false,
                         sampler_anisotropy: false,
                         max_sampler_anisotropy: 16.0,
+                        extended_dynamic_state: false,
+                        dynamic_primitive_topology_unrestricted: None,
                         dual_src_blend: false,
                         independent_blend: false,
                         sampler_mirror_clamp_to_edge: false,
@@ -726,6 +750,8 @@ mod tests {
             fill_mode_non_solid: false,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
+            extended_dynamic_state: false,
+            dynamic_primitive_topology_unrestricted: None,
             dual_src_blend: false,
             independent_blend: false,
             sampler_mirror_clamp_to_edge: false,
