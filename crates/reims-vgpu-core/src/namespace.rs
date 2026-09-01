@@ -596,7 +596,13 @@ mod tests {
         let first = ns.declare(slot(1), backing(10)).expect("free slot");
         assert_eq!(ns.resource(1), Some(first));
 
-        ns.delete(first).expect("declared");
+        assert_eq!(
+            ns.delete(first).expect("declared"),
+            Teardown::Now {
+                backing: backing(10)
+            },
+            "nothing was acquired, so nothing is owed"
+        );
         assert_eq!(
             ns.resource(1),
             None,

@@ -2129,7 +2129,13 @@ mod tests {
         // The generation is the object's own, not a number this test chose: a
         // second declaration in the same slot is a different name, and work
         // still carrying the first one no longer resolves to it.
-        names.delete(id).expect("declared");
+        assert_eq!(
+            names.delete(id).expect("declared"),
+            crate::namespace::Teardown::Now {
+                backing: crate::access::BackingId(10)
+            },
+            "nothing here acquired the lease, so the backing is owed to nobody"
+        );
         assert_eq!(
             operation(
                 LifecycleKind::DeleteResource,
