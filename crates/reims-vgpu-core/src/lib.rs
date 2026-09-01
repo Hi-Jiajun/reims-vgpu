@@ -59,6 +59,26 @@ pub mod session;
 /// the executor that consumes it sees this crate rather than the protocol one.
 pub use reims_vgpu_protocol::storage_mode;
 
+/// The three-dimensional extent and mip arithmetic of the guest API,
+/// re-exported from the protocol layer.
+pub use reims_vgpu_protocol::extent;
+
+/// The guest's pixel-format ordinals and what each one is made of,
+/// re-exported from the protocol layer.
+///
+/// Semantic, not native: which aspects a format has and how wide its texels
+/// are decide what a transfer moves and which attachment slot an image can
+/// take, on either rail. The executor that turns one of these into a native
+/// format sees this crate rather than the protocol one.
+pub use reims_vgpu_protocol::pixel_format;
+
+/// What a texture declaration is, re-exported from the protocol layer.
+///
+/// A checked shape is a semantic input to allocation, view expansion and
+/// transfer arithmetic alike, so the model carries it — and the executor that
+/// turns one into a native image sees this crate rather than the protocol one.
+pub use reims_vgpu_protocol::texture_shape;
+
 pub mod stream;
 pub mod submit;
 pub mod sync;

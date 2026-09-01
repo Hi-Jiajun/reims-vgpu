@@ -33,6 +33,8 @@
 //!   failed frame leaves with a signal outstanding on them.
 //! - [`host`] — the instance, the physical device this rail bound, and the
 //!   only Vulkan state the architecture allows to be process-global.
+//! - [`image`] — what a checked texture declaration becomes here, and the
+//!   device query that has to admit it before anything is allocated.
 //! - [`layout`] — which layout each image subresource is in, and the explicit
 //!   transitions and ownership moves that get it to the next one.
 //! - [`memory`] — how host and device memory relate on the bound physical
@@ -72,6 +74,7 @@ pub mod descriptor;
 pub mod device;
 pub mod frames;
 pub mod host;
+pub mod image;
 pub mod layout;
 pub mod memory;
 pub mod placement;

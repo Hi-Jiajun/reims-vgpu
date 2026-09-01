@@ -19,9 +19,13 @@
 
 use ash::vk;
 use reims_vgpu_core::identity::DeviceEpoch as EpochId;
+use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+use reims_vgpu_core::texture_shape::{TextureKind, TextureShape, TextureUsage};
 use reims_vgpu_vulkan::device::DeviceEpoch;
 use reims_vgpu_vulkan::host::VulkanHost;
+use reims_vgpu_vulkan::image;
 use reims_vgpu_vulkan::memory::{select_memory_type, MappedMemoryKind, MemoryClass};
+use reims_vgpu_vulkan::placement::Route;
 use reims_vgpu_vulkan::pools::WorkerPool;
 use reims_vgpu_vulkan::timeline::Timeline;
 
@@ -258,5 +262,161 @@ fn a_filled_buffer_reads_back_after_the_timeline_this_rail_reserved() {
     epoch.queues().release(owner);
     // `epoch`'s own `Drop` idles and destroys the device. `device` is a clone
     // of its loader table and owns nothing, so it needs no teardown of its own.
+    drop(epoch);
+}
+
+/// The image half: a decoded texture declaration reaching a real `VkImage`
+/// through the query that admitted it.
+///
+/// The plan is pure and the admission is pure, so both are unit-tested here
+/// with invented `VkImageFormatProperties`. What no unit test can check is
+/// whether the tuple this rail builds is one a driver answers at all — a
+/// usage bit a format does not support turns
+/// `vkGetPhysicalDeviceImageFormatProperties` into
+/// `ERROR_FORMAT_NOT_SUPPORTED`, and every downstream number this rail then
+/// validates against would be zero.
+///
+/// So this asks the driver about exactly the tuple the plan names, admits the
+/// plan against exactly that answer, and creates the image from exactly the
+/// admitted plan. A refusal anywhere is this rail's, with both numbers in it.
+#[test]
+fn a_decoded_texture_becomes_an_image_the_driver_admitted() {
+    let Ok(host) = VulkanHost::open("reims-vgpu-vulkan image integration") else {
+        println!("no real device: nothing to allocate");
+        return;
+    };
+    let census = host.census();
+    let epoch = DeviceEpoch::create(
+        host.instance(),
+        host.physical_device(),
+        census,
+        EpochId::FIRST,
+    )
+    .expect("the driver refused a set its own census admitted");
+    let device = epoch.device().clone();
+
+    // A cube array with a mip chain: the shape whose layer count is the one a
+    // caller deriving it itself gets wrong, and whose mip count a device is
+    // entitled to cap below the pyramid.
+    let declaration = TextureShape {
+        kind: TextureKind::CubeArray.ordinal(),
+        width: 64,
+        height: 64,
+        depth: 1,
+        mipmap_level_count: 7,
+        sample_count: 1,
+        array_length: 2,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        usage: TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
+    };
+    let texture = declaration
+        .checked()
+        .expect("a declaration the guest API admits");
+    assert_eq!(texture.layers(), 12);
+
+    let plan = image::plan(
+        texture,
+        vk::Format::R8G8B8A8_UNORM,
+        Route::HostStaging {
+            working: MemoryClass::DeviceLocal,
+        },
+    )
+    .expect("a plannable texture");
+    let query = plan.query();
+
+    // The one thing that needs a device: what this exact combination's limits
+    // are. Not the general `maxImageDimension2D`, which is the ceiling over
+    // every usage and would admit tuples this one does not.
+    let reported = unsafe {
+        host.instance().get_physical_device_image_format_properties(
+            host.physical_device(),
+            query.format,
+            query.image_type,
+            query.tiling,
+            query.usage,
+            query.flags,
+        )
+    }
+    .expect("RGBA8 sampled and color-attachable is universal on Vulkan 1.2");
+    println!(
+        "image tuple extent={}x{}x{} mips={} layers={} samples=0x{:x}",
+        reported.max_extent.width,
+        reported.max_extent.height,
+        reported.max_extent.depth,
+        reported.max_mip_levels,
+        reported.max_array_layers,
+        reported.sample_counts.as_raw(),
+    );
+
+    let admitted = plan
+        .admitted(reported)
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
+    let info = admitted.create_info();
+    assert_eq!(info.array_layers, 12);
+    assert_eq!(info.mip_levels, 7);
+    assert!(info.flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE));
+
+    let image = unsafe { device.create_image(&info, None) }
+        .expect("the driver takes what its own reported properties admitted");
+
+    // And it is allocatable: an image plan that cannot be backed is a plan
+    // that passed every check and produces nothing.
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+    let properties = unsafe {
+        host.instance()
+            .get_physical_device_memory_properties(host.physical_device())
+    };
+    let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
+    let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance3);
+    unsafe {
+        host.instance()
+            .get_physical_device_properties2(host.physical_device(), &mut properties2);
+    }
+    let pick = select_memory_type(
+        &properties,
+        requirements.memory_type_bits,
+        &census.memory().topology.request(MemoryClass::DeviceLocal),
+        requirements.size,
+        maintenance3.max_memory_allocation_size,
+    )
+    .expect("a device-local type exists for a sampled colour image");
+    let memory = unsafe {
+        device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(pick.index),
+            None,
+        )
+    }
+    .expect("the selected type allocates");
+    unsafe { device.bind_image_memory(image, memory, 0) }.expect("bind");
+    println!(
+        "image bytes={} type={} for {} subresources",
+        requirements.size,
+        pick.index,
+        texture.subresources()
+    );
+
+    // A device that caps this tuple below the declaration refuses with both
+    // numbers rather than clamping. Asked here against the driver's own answer
+    // narrowed by one, so the assertion is about this rail's comparison and not
+    // about any particular host's limits.
+    let one_layer_short = vk::ImageFormatProperties {
+        max_array_layers: 11,
+        ..reported
+    };
+    assert_eq!(
+        plan.admitted(one_layer_short),
+        Err(image::Refusal::LayersBeyondDevice {
+            declared: 12,
+            max: 11,
+        })
+    );
+
+    unsafe {
+        device.device_wait_idle().expect("idle before teardown");
+        device.destroy_image(image, None);
+        device.free_memory(memory, None);
+    }
     drop(epoch);
 }
