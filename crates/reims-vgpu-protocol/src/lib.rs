@@ -28,6 +28,8 @@
 //!   than its closure.
 //! - [`extent`] — the guest API's three-dimensional extent, its mip-level
 //!   dimensions, and the byte arithmetic of a tightly-packed image.
+//! - [`sync`] — which opcode is a fence, an event or a barrier, on which rail,
+//!   and what a barrier's scope word names.
 //! - [`segment`] — what a segment-type byte means: which encoder wrote it, and
 //!   which rail its records are read on.
 //! - [`residency`] — what a `useResource`/`useHeap` declaration says, split so
@@ -48,3 +50,4 @@ pub mod extent;
 pub mod packets;
 pub mod residency;
 pub mod segment;
+pub mod sync;

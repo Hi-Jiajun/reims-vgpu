@@ -12,7 +12,7 @@
 //! # Sorted and disjoint is an invariant, not a convention
 //!
 //! Every operation restores it before returning, and the tests assert it after
-//! each one. An overlapping pair here would make [`RangeSet::subtract`] leave
+//! each one. An overlapping pair here would make [`RangeSet::remove`] leave
 //! bytes behind, which reads as a transfer that copied everything it was asked
 //! to and quietly did not.
 
