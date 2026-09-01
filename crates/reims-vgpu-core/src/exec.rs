@@ -30,7 +30,7 @@
 //! about: `operation::tests::every_class_has_a_payload_or_a_reason_to_be_empty`
 //! fails the moment either count moves off zero.
 
-use crate::access::{AccessIntent, BackingId, ContentVersion};
+use crate::access::{AccessIntent, AccessKey, BackingId, ContentVersion};
 use crate::bind::{BufferBinding, ObjectBinding};
 use crate::blit::BlitOp;
 use crate::compute::ComputeOp;
@@ -106,15 +106,23 @@ impl ResolvedStream {
     }
 }
 
-/// A content version this transaction will produce.
+/// A content version this transaction makes current, and exactly the memory it
+/// covers.
 ///
-/// Reserved at planning and committed at completion, which is the whole reason
-/// it is a pair: a reader planned against `to` waits for the work, and a reader
-/// that only needs `from` does not.
+/// **Derived from the accesses, never stated beside them.** A version claim
+/// *is* a write access's claim to produce the next content of the memory it
+/// names, so the two cannot be separate lists without being able to disagree
+/// about the region — and that disagreement is not hypothetical. A reservation
+/// that named a whole backing while its access named a range let two writers of
+/// disjoint ranges both claim to produce one backing's next version, with
+/// nothing ordering them and no legal answer to which version the backing ended
+/// at. Region coverage is the access's own key, and the same `may_alias` that
+/// decides hazards decides whether two claims collide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VersionReservation {
+pub struct VersionPublication {
     pub backing: BackingId,
-    pub from: ContentVersion,
+    /// Exactly the memory the producing access named.
+    pub region: AccessKey,
     pub to: ContentVersion,
 }
 
@@ -139,14 +147,15 @@ pub enum Prerequisite {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PublicationContract {
     /// The stamp the guest polls, if this packet carries one.
-    pub stamp: Option<CompletionStamp>,
-    /// The content versions that become current.
     ///
-    /// Published *after* the work completes and never before, which is the rule
-    /// the plan states as "results visible before the completion word": the
-    /// version and the stamp become visible together, and a reader that saw the
-    /// stamp without the version would read stale content with a fresh flag.
-    pub versions: Vec<VersionReservation>,
+    /// The content versions this transaction makes current are *not* here.
+    /// They are [`ExecTransaction::published_versions`], derived from the
+    /// accesses, for the reason [`VersionPublication`] gives. What this
+    /// contract still states is the order: versions become visible when the
+    /// work completes and the stamp only when ordered guest publication
+    /// releases it, so a reader that saw the stamp cannot fail to see the
+    /// bytes.
+    pub stamp: Option<CompletionStamp>,
 }
 
 /// The variable-length parts of a packet's records.
@@ -189,6 +198,28 @@ impl ExecTransaction {
     /// Every record, in execution order.
     pub fn records(&self) -> impl Iterator<Item = &StreamRecord> {
         self.streams.iter().flat_map(|s| s.records.iter())
+    }
+
+    /// The content versions this transaction makes current.
+    ///
+    /// One per access that declared an output version and names memory. A heap
+    /// declaration or a domain-only access produces none: neither names bytes,
+    /// so neither can claim to have produced any.
+    pub fn published_versions(&self) -> impl Iterator<Item = VersionPublication> + '_ {
+        self.accesses.iter().filter_map(|access| {
+            let to = access.output_content_version?;
+            let backing = match access.key {
+                AccessKey::Range(r, _) | AccessKey::Subresource(r, _) | AccessKey::Whole(r) => {
+                    r.backing
+                }
+                AccessKey::Heap(_) | AccessKey::DomainOnly => return None,
+            };
+            Some(VersionPublication {
+                backing,
+                region: access.key,
+                to,
+            })
+        })
     }
 
     /// How many records this packet carries.
@@ -336,10 +367,6 @@ impl ExecBuilder {
 
     pub fn publish_stamp(&mut self, stamp: CompletionStamp) {
         self.publication.stamp = Some(stamp);
-    }
-
-    pub fn reserve_version(&mut self, reservation: VersionReservation) {
-        self.publication.versions.push(reservation);
     }
 
     /// Freeze the transaction.
@@ -705,23 +732,67 @@ mod tests {
         assert!(tx.accesses.is_empty());
     }
 
-    /// The publication contract carries the versions and the stamp together,
-    /// which is what lets them become visible together.
+    /// A version claim is the write access's claim, so it is read off the
+    /// access and cannot name different memory than the write did.
     #[test]
-    fn publication_carries_the_versions_beside_the_stamp() {
+    fn a_published_version_covers_exactly_the_region_its_access_named() {
+        let region = AccessKey::Range(
+            crate::access::ResourceKey {
+                backing: BackingId(9),
+                heap: None,
+            },
+            crate::access::ByteRange {
+                offset: 64,
+                length: 128,
+            },
+        );
         let mut b = builder();
         b.publish_stamp(CompletionStamp {
             slot: StampSlot(1),
             value: StampValue(5),
         });
-        b.reserve_version(VersionReservation {
-            backing: BackingId(9),
-            from: ContentVersion(1),
-            to: ContentVersion(2),
+        b.declare_access(AccessIntent {
+            domain: ChannelId(1),
+            key: region,
+            mode: crate::access::AccessMode::Write,
+            api_stages: 0,
+            input_content_version: None,
+            output_content_version: Some(ContentVersion(2)),
         });
         let tx = b.finish().expect("frozen");
         assert!(tx.publication.stamp.is_some());
-        assert_eq!(tx.publication.versions.len(), 1);
-        assert_eq!(tx.publication.versions[0].to, ContentVersion(2));
+        assert_eq!(
+            tx.published_versions().collect::<Vec<_>>(),
+            vec![VersionPublication {
+                backing: BackingId(9),
+                region,
+                to: ContentVersion(2),
+            }]
+        );
+    }
+
+    /// A heap declaration and a domain-only access name no bytes, so neither
+    /// can claim to have produced any.
+    #[test]
+    fn an_access_that_names_no_memory_publishes_no_version() {
+        let mut b = builder();
+        for key in [
+            AccessKey::Heap(crate::access::HeapId {
+                id: 1,
+                membership_generation: 0,
+            }),
+            AccessKey::DomainOnly,
+        ] {
+            b.declare_access(AccessIntent {
+                domain: ChannelId(1),
+                key,
+                mode: crate::access::AccessMode::Write,
+                api_stages: 0,
+                input_content_version: None,
+                output_content_version: Some(ContentVersion(2)),
+            });
+        }
+        let tx = b.finish().expect("frozen");
+        assert_eq!(tx.published_versions().count(), 0);
     }
 }

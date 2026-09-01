@@ -61,7 +61,7 @@ pub struct HeapId {
 }
 
 /// A half-open byte range within one backing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ByteRange {
     pub offset: u64,
     pub length: u64,
@@ -87,7 +87,7 @@ impl ByteRange {
 ///
 /// Plane is exact rather than a range: a plane is a separate memory layout, not
 /// a coordinate within one, so "planes 0..2" is two accesses and not one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubresourceRange {
     pub base_level: u32,
     pub level_count: u32,
@@ -131,14 +131,14 @@ const fn span_overlaps(a_base: u32, a_count: u32, b_base: u32, b_count: u32) -> 
 /// and not its members: without it, a heap declaration and a resource access
 /// have nothing to compare and the coarser rung would silently order against
 /// nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceKey {
     pub backing: BackingId,
     pub heap: Option<HeapId>,
 }
 
 /// How precisely an access is known.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AccessKey {
     /// The command named an exact byte range.
     Range(ResourceKey, ByteRange),

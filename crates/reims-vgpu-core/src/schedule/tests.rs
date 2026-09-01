@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::access::{AccessIntent, AccessKey, AccessMode, ByteRange, ResourceKey};
-use crate::exec::{ExecBuilder, ResolvedOperation, VersionReservation};
+use crate::exec::{ExecBuilder, ResolvedOperation};
 use crate::identity::{ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration};
 use crate::prereq::Diagnosis;
 use crate::stream::SegmentKind;
@@ -46,6 +46,14 @@ fn whole(domain: u32, backing: u64, mode: AccessMode) -> AccessIntent {
     }
 }
 
+/// A whole-backing write that also claims the region's next content version.
+fn produces(domain: u32, backing: u64, to: u64) -> AccessIntent {
+    AccessIntent {
+        output_content_version: Some(ContentVersion(to)),
+        ..whole(domain, backing, AccessMode::Write)
+    }
+}
+
 fn ranged(domain: u32, backing: u64, offset: u64) -> AccessIntent {
     AccessIntent {
         domain: ChannelId(domain),
@@ -71,12 +79,7 @@ fn chain(length: u64) -> Vec<ExecTransaction> {
     (1..=length)
         .map(|n| {
             let mut b = builder(1, n);
-            b.declare_access(whole(1, 1, AccessMode::Write));
-            b.reserve_version(VersionReservation {
-                backing: BackingId(1),
-                from: ContentVersion(n - 1),
-                to: ContentVersion(n),
-            });
+            b.declare_access(produces(1, 1, n));
             b.publish_stamp(CompletionStamp {
                 slot: StampSlot(1),
                 value: StampValue(u32::try_from(n).expect("small")),
@@ -92,12 +95,7 @@ fn independent(count: u64) -> Vec<ExecTransaction> {
     (1..=count)
         .map(|n| {
             let mut b = builder(1, n);
-            b.declare_access(whole(1, n, AccessMode::Write));
-            b.reserve_version(VersionReservation {
-                backing: BackingId(n),
-                from: ContentVersion(0),
-                to: ContentVersion(1),
-            });
+            b.declare_access(produces(1, n, 1));
             b.finish().expect("frozen")
         })
         .collect()
@@ -131,18 +129,12 @@ fn mixed(seed: u64, count: u64) -> Vec<ExecTransaction> {
             let backing = (u64::from(domain) * 4) + (rng.next() % 4);
             b.declare_access(ranged(domain, backing, rng.next() % 4 * 64));
         }
-        // One write, sometimes, and a version reservation with it.
+        // One write, sometimes, claiming the region's next content version.
         if !rng.next().is_multiple_of(3) {
             let backing = (u64::from(domain) * 4) + (rng.next() % 4);
-            b.declare_access(whole(domain, backing, AccessMode::Write));
             let slot = usize::try_from(backing).expect("small") % version.len();
-            let from = version[slot];
-            version[slot] = from + 1;
-            b.reserve_version(VersionReservation {
-                backing: BackingId(backing),
-                from: ContentVersion(from),
-                to: ContentVersion(from + 1),
-            });
+            version[slot] += 1;
+            b.declare_access(produces(domain, backing, version[slot]));
         }
         // A wait for a point some earlier transaction has already signalled.
         if !signalled.is_empty() && rng.next().is_multiple_of(3) {
@@ -450,25 +442,43 @@ fn a_second_generation_in_one_batch_is_refused() {
     );
 }
 
-/// The gap this comparison names rather than tolerates: a version reservation
-/// covers a whole backing while an access may cover a range, so two writers of
-/// disjoint ranges both claim to produce the backing's next version and
-/// nothing orders them.
+/// Two writers of disjoint ranges of one backing are not a race. This is the
+/// case that used to be one, because a version claim named a whole backing
+/// while the access naming the bytes named a range; now the claim *is* the
+/// access's region and the two histories are independent.
 #[test]
-fn two_unordered_publishers_of_one_backing_have_no_legal_version_order() {
+fn two_publishers_of_disjoint_regions_of_one_backing_are_independent() {
     let batch: Vec<_> = [(1u64, 0u64), (2, 512)]
         .into_iter()
         .map(|(n, offset)| {
             let mut b = builder(1, n);
             b.declare_access(AccessIntent {
                 mode: AccessMode::Write,
+                output_content_version: Some(ContentVersion(1)),
                 ..ranged(1, 1, offset)
             });
-            b.reserve_version(VersionReservation {
-                backing: BackingId(1),
-                from: ContentVersion(0),
-                to: ContentVersion(1),
-            });
+            b.finish().expect("frozen")
+        })
+        .collect();
+    eligible(&batch).expect("disjoint regions have no shared history");
+    let reference = serial(&batch);
+    for seed in 0..16u64 {
+        equivalent(&reference, &parallel(&batch, seed))
+            .unwrap_or_else(|d| panic!("seed {seed} diverged: {d:?}"));
+    }
+}
+
+/// What is left of the race, and it is real: two channels writing memory they
+/// share. `requires_edge` orders nothing across domains — correctly, because
+/// the guest supplied no ordering — so that region's version sequence has two
+/// legal answers and this comparison declines to pick one.
+#[test]
+fn two_channels_writing_shared_memory_have_no_legal_version_order() {
+    let batch: Vec<_> = [1u64, 2]
+        .into_iter()
+        .map(|n| {
+            let mut b = builder(u32::try_from(n).expect("small"), n);
+            b.declare_access(produces(u32::try_from(n).expect("small"), 1, 1));
             b.finish().expect("frozen")
         })
         .collect();

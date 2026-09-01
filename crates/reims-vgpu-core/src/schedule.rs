@@ -27,11 +27,13 @@
 //!
 //! # What may differ, and why
 //!
-//! A backing's content versions are compared **in order**. Two transactions
-//! that both make a backing's content current are ordered by their hazard edge,
-//! so their versions have one legal sequence and a device that produced the
-//! other sequence would be showing the guest stale bytes under a fresh
-//! version.
+//! A **region's** content versions are compared in order. Two transactions
+//! that make aliasing memory current are ordered by their hazard edge, so that
+//! region's versions have one legal sequence and a device that produced the
+//! other sequence would be showing the guest stale bytes under a fresh version.
+//! Two transactions writing *disjoint* regions of one backing are ordered by
+//! nothing and need not be: their histories are separate, which is why the
+//! region is part of the observation rather than folded into the backing.
 //!
 //! A **channel's releases** are compared in order. Work may finish in any order
 //! the dependency graph permits, but each channel tells the guest about it in
@@ -63,9 +65,9 @@
 //! than letting a generator quietly produce batches the comparison cannot
 //! speak about.
 
-use crate::access::{BackingId, ContentVersion};
+use crate::access::{AccessKey, BackingId, ContentVersion};
 use crate::depend::{Census, DependencyGraph};
-use crate::exec::{ExecTransaction, Prerequisite};
+use crate::exec::{ExecTransaction, Prerequisite, VersionPublication};
 use crate::identity::{
     ChannelId, ChannelSequence, IngressOrdinal, ResourceId, SessionGeneration, StampSlot,
     StampValue, StampWait,
@@ -105,14 +107,14 @@ pub enum Ineligible {
     /// fence, which is order-sensitive state neither graph carries; a batch
     /// that uses one is outside what this comparison can speak about.
     FencePrerequisite { waiter: IngressOrdinal },
-    /// Two packets make the same backing's content current without a hazard
-    /// edge between them, so their version sequence has no single legal order.
+    /// Two packets make aliasing memory current without a hazard edge between
+    /// them, so that region's version sequence has no single legal order.
     ///
-    /// This is a real gap and it is named rather than tolerated: a version
-    /// reservation names a whole backing while an access may name a range, so
-    /// two disjoint-range writers can both claim to produce the backing's next
-    /// version. Region-level version coverage is what closes it, and until
-    /// then such a batch is not one this comparison can judge.
+    /// Version claims are derived from write accesses and aliasing writes in
+    /// one domain always produce an edge, so what is left is two *channels*
+    /// writing memory they share. The guest supplied no ordering between them
+    /// and neither does this device; such a batch is not one this comparison
+    /// can judge, and saying so is better than picking a winner.
     UnorderedVersionRace {
         backing: BackingId,
         first: IngressOrdinal,
@@ -220,18 +222,21 @@ fn earliest_producers(waits: &WaitGraph) -> Vec<(IngressOrdinal, WaitPoint, Ingr
 }
 
 /// The one eligibility question that needs the hazard compiler to answer it.
+///
+/// Two version claims over memory that may alias must be hazard-ordered, or
+/// their region's history has two legal sequences and no reason to prefer
+/// either. Since versions are derived from write accesses, two aliasing claims
+/// in one domain always *are* ordered — [`crate::access::requires_edge`] says
+/// so — which leaves exactly one shape this can still catch: two channels
+/// writing memory they share. That is real, it has no ordering the guest
+/// supplied, and it is named rather than assumed away.
 fn version_races(batch: &[ExecTransaction]) -> Result<(), Ineligible> {
     let mut graph = DependencyGraph::new();
-    let mut publishers: HashMap<BackingId, Vec<IngressOrdinal>> = HashMap::new();
+    let mut publishers: Vec<(IngressOrdinal, VersionPublication)> = Vec::new();
     let mut ordered: HashMap<IngressOrdinal, Vec<IngressOrdinal>> = HashMap::new();
     for tx in batch {
         ordered.insert(tx.ingress, graph.admit(tx.ingress, &tx.accesses));
-        for reservation in &tx.publication.versions {
-            publishers
-                .entry(reservation.backing)
-                .or_default()
-                .push(tx.ingress);
-        }
+        publishers.extend(tx.published_versions().map(|p| (tx.ingress, p)));
     }
     // Reachability over hazard edges, which point backwards, so one pass in
     // ingress order settles it.
@@ -247,17 +252,16 @@ fn version_races(batch: &[ExecTransaction]) -> Result<(), Ineligible> {
         }
         reaches.insert(tx.ingress, set);
     }
-    let mut backings: Vec<_> = publishers.keys().copied().collect();
-    backings.sort_unstable();
-    for backing in backings {
-        let list = &publishers[&backing];
-        for pair in list.windows(2) {
-            let (first, second) = (pair[0], pair[1]);
-            if !reaches[&second].contains(&first) {
+    for (at, (second, later)) in publishers.iter().enumerate() {
+        for (first, earlier) in &publishers[..at] {
+            if first == second || !earlier.region.may_alias(later.region) {
+                continue;
+            }
+            if !reaches[second].contains(first) {
                 return Err(Ineligible::UnorderedVersionRace {
-                    backing,
-                    first,
-                    second,
+                    backing: later.backing,
+                    first: *first,
+                    second: *second,
                 });
             }
         }
@@ -520,6 +524,7 @@ pub enum Divergence {
     /// different set of them was published.
     ContentHistory {
         backing: BackingId,
+        region: AccessKey,
         serial: Vec<ContentVersion>,
         parallel: Vec<ContentVersion>,
     },
@@ -603,22 +608,24 @@ pub fn equivalent(serial: &Run, parallel: &Run) -> Result<(), Divergence> {
 
     let left = Summary::of(&serial.trace);
     let right = Summary::of(&parallel.trace);
-    for (backing, versions) in &left.content {
-        let theirs = right.content.get(backing).cloned().unwrap_or_default();
+    for (key, versions) in &left.content {
+        let theirs = right.content.get(key).cloned().unwrap_or_default();
         if *versions != theirs {
             return Err(Divergence::ContentHistory {
-                backing: *backing,
+                backing: key.0,
+                region: key.1,
                 serial: versions.clone(),
                 parallel: theirs,
             });
         }
     }
-    for backing in right.content.keys() {
-        if !left.content.contains_key(backing) {
+    for key in right.content.keys() {
+        if !left.content.contains_key(key) {
             return Err(Divergence::ContentHistory {
-                backing: *backing,
+                backing: key.0,
+                region: key.1,
                 serial: Vec::new(),
-                parallel: right.content[backing].clone(),
+                parallel: right.content[key].clone(),
             });
         }
     }
@@ -755,7 +762,9 @@ fn atomic_publication(run: &Run) -> Result<(), Divergence> {
 /// What a trace came to, per observable location.
 #[derive(Debug, Default)]
 struct Summary {
-    content: BTreeMap<BackingId, Vec<ContentVersion>>,
+    /// Per (backing, region), because two disjoint regions of one backing
+    /// are two independent histories.
+    content: BTreeMap<(BackingId, AccessKey), Vec<ContentVersion>>,
     stamps: BTreeMap<StampSlot, StampValue>,
     events: BTreeMap<ResourceId, u64>,
     fences: BTreeMap<ResourceId, usize>,
@@ -767,8 +776,15 @@ impl Summary {
         let mut out = Self::default();
         for observation in trace {
             match *observation {
-                Observation::VersionPublished { backing, version } => {
-                    out.content.entry(backing).or_default().push(version);
+                Observation::VersionPublished {
+                    backing,
+                    region,
+                    version,
+                } => {
+                    out.content
+                        .entry((backing, region))
+                        .or_default()
+                        .push(version);
                 }
                 // Where the point came to rest, which on a monotone location
                 // is the furthest value published into it and not the last

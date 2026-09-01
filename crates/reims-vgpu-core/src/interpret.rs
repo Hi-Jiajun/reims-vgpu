@@ -51,9 +51,15 @@ use std::collections::HashMap;
 /// Something a guest could observe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Observation {
-    /// A backing's content reached a version.
+    /// A region of a backing's content reached a version.
+    ///
+    /// The region is part of the observation, not decoration. A guest that
+    /// wrote two disjoint ranges of one buffer observes two independent
+    /// histories, and folding them into one per-backing history would make two
+    /// legal orders read as a disagreement.
     VersionPublished {
         backing: crate::access::BackingId,
+        region: AccessKey,
         version: ContentVersion,
     },
     /// A completion stamp reached a value.
@@ -238,30 +244,18 @@ impl Interpreter {
             self.apply_record(&record.op);
         }
 
-        // Writes land before anything is published, which is what makes the
-        // publication order below meaningful.
-        for access in &tx.accesses {
-            if access.output_content_version.is_none() {
-                continue;
+        // The bytes land, and then the version that says they are current
+        // becomes visible. Both come from the same list — the accesses — so a
+        // version cannot be published for memory nothing wrote.
+        for published in tx.published_versions() {
+            if let Some(bytes) = written_bytes(published.region) {
+                self.content
+                    .write(published.backing, bytes, Replica::DeviceOwned);
             }
-            let Some(bytes) = written_bytes(access.key) else {
-                continue;
-            };
-            let backing = match access.key {
-                AccessKey::Range(r, _) | AccessKey::Subresource(r, _) | AccessKey::Whole(r) => {
-                    r.backing
-                }
-                AccessKey::Heap(_) | AccessKey::DomainOnly => continue,
-            };
-            self.content.write(backing, bytes, Replica::DeviceOwned);
-        }
-
-        // Versions first, then the stamp. See the module documentation: the
-        // opposite order is the bug this trace has to be able to fail on.
-        for reservation in &tx.publication.versions {
             self.trace.push(Observation::VersionPublished {
-                backing: reservation.backing,
-                version: reservation.to,
+                backing: published.backing,
+                region: published.region,
+                version: published.to,
             });
         }
         self.ran += 1;
@@ -379,7 +373,7 @@ fn written_bytes(key: AccessKey) -> Option<crate::access::ByteRange> {
 mod tests {
     use super::*;
     use crate::access::{AccessIntent, AccessMode, BackingId, ByteRange, ResourceKey};
-    use crate::exec::{ExecBuilder, VersionReservation};
+    use crate::exec::ExecBuilder;
     use crate::identity::{
         ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration, StampWait,
     };
@@ -481,11 +475,11 @@ mod tests {
     #[test]
     fn a_transaction_publishes_its_versions_before_its_stamp() {
         let mut b = builder(1);
-        b.reserve_version(VersionReservation {
-            backing: BackingId(7),
-            from: ContentVersion(1),
-            to: ContentVersion(2),
-        });
+        let access = AccessIntent {
+            output_content_version: Some(ContentVersion(2)),
+            ..write_access(7, 0, 64)
+        };
+        b.declare_access(access);
         b.publish_stamp(CompletionStamp {
             slot: StampSlot(3),
             value: StampValue(9),
@@ -499,6 +493,7 @@ mod tests {
             &[
                 Observation::VersionPublished {
                     backing: BackingId(7),
+                    region: access.key,
                     version: ContentVersion(2)
                 },
                 Observation::StampPublished {
