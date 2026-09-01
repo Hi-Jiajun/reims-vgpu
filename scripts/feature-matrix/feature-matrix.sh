@@ -335,7 +335,7 @@ count_cell "support crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
 # checked with --all-targets so its tests compile, and counted so a cfg or a
 # module move cannot empty it quietly.
 run_cell "replacement crates / $HOST_TRIPLE" "" "" "$WORKSPACE_DIR" \
-  "-p reims-vgpu-protocol -p reims-vgpu-core"
+  "-p reims-vgpu-protocol -p reims-vgpu-core -p reims-vgpu-testkit -p reims-vgpu-vulkan"
 
 # The decline vocabulary without the sink. `reims-vgpu-observe` is `no_std` plus
 # `alloc` with its `std` feature off, so a layer below the device can name its
@@ -354,7 +354,7 @@ run_cell "observe / no_std vocabulary" "" "--no-default-features" \
 run_cell "protocol / no_std library" "" "" "$WORKSPACE_DIR" \
   "-p reims-vgpu-protocol" "--lib"
 count_cell "replacement crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
-  "-p reims-vgpu-protocol -p reims-vgpu-core"
+  "-p reims-vgpu-protocol -p reims-vgpu-core -p reims-vgpu-testkit -p reims-vgpu-vulkan"
 if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then
   run_cell "vulkan,host-window / $CROSS_TARGET" "$CROSS_TARGET" "$FEATURES_VULKAN"
   if [ "$COUNT_TESTS" -eq 1 ]; then

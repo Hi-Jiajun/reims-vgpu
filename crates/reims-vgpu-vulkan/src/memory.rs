@@ -277,7 +277,7 @@ pub unsafe fn max_allocation_size(instance: &ash::Instance, pd: vk::PhysicalDevi
     let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut v11);
     unsafe { instance.get_physical_device_properties2(pd, &mut props) };
     if v11.max_memory_allocation_size == 0 {
-        crate::observe::fail(
+        reims_vgpu_observe::fail(
             "vk_max_allocation_unreported reason=vk_max_allocation_unreported (the device \
              reported maxMemoryAllocationSize=0; allocations are bounded by their heap alone)",
         );
@@ -513,12 +513,17 @@ impl MappedMemoryKind {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+pub mod fixtures {
     //! Synthetic `VkPhysicalDeviceMemoryProperties` for every device family in
     //! the support matrix, so both memory rows are covered by unit tests on any
     //! machine. The Apple layout is transcribed from a live `vulkaninfo` on the
     //! M3 Max dev host; the rest follow each driver's documented layout.
+    //!
+    //! Public, rather than behind a `testing` feature, because the consumer that
+    //! needs them is in another crate: a feature would either pull this rail
+    //! into a Metal-only test build or fork the fixtures, and a forked fixture
+    //! is a second answer to "what does an AMD APU's memory look like". They are
+    //! const data; a build that does not name them does not carry them.
     use ash::vk;
 
     const GIB: u64 = 1 << 30;
