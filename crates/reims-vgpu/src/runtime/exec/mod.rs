@@ -660,9 +660,10 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // authoritative bytes afterwards. `need` above already proved the table fits,
     // so a refusal here means the header and the decoder disagree about the
     // layout — which is a fail line, never a silent empty table.
-    let resource_descs = decode_exec_resource_table(payload).unwrap_or_else(|| {
+    let resource_descs = decode_exec_resource_table(payload).unwrap_or_else(|refusal| {
         crate::observe::fail(format!(
-            "exec_res_table decode_fail task={task_id} res={resource_count} plen={}",
+            "exec_res_table {} task={task_id} res={resource_count} plen={}",
+            refusal.slug(),
             payload.len()
         ));
         Vec::new()

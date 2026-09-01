@@ -991,8 +991,13 @@ impl InvalidateValidityOps {
         }
     }
 
-    #[cfg(test)]
-    pub fn to_le_dword(self) -> u32 {
+    /// The four bytes back as the guest's dword.
+    ///
+    /// The inverse of [`Self::from_le_dword`], and not test-only: a refusal
+    /// about a quad has to be able to say which quad arrived, and the records
+    /// this comes off do not all keep the raw word beside it.
+    #[must_use]
+    pub const fn to_le_dword(self) -> u32 {
         u32::from_le_bytes([
             self.clear_host_valid,
             self.set_host_valid,
@@ -1158,24 +1163,71 @@ impl ExecResourceDesc {
     }
 }
 
+/// The `EXEC_INDIRECT2` header: whose task the submission is, and how many
+/// records follow it in each of the two tables.
+///
+/// A type rather than three loose `ld32`s at every reader, because the three
+/// are read together and a reader that took the counts without the task would
+/// have a table of object refs and no namespace to resolve them in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecIndirectHeader {
+    pub task_id: u32,
+    pub resource_count: u32,
+    pub cmdbuf_count: u32,
+}
+
+/// Decode the `EXEC_INDIRECT2` header.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the three words. The counts
+/// are the guest's and are *not* checked against the payload here — that is
+/// each table decoder's own bound, because the two tables have different record
+/// lengths and a reader of one has no business being refused by the other's
+/// length.
+pub fn decode_exec_header(payload: &[u8]) -> Result<ExecIndirectHeader, ShortPayload> {
+    let need = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+    if payload.len() < need {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need,
+        });
+    }
+    Ok(ExecIndirectHeader {
+        task_id: ld32(&payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..]),
+        resource_count: ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]),
+        cmdbuf_count: ld32(&payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..]),
+    })
+}
+
 /// Decode the `EXEC_INDIRECT2` resource table: `resource_count` records of
 /// [`CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN`] bytes, starting right after the
 /// header.
 ///
-/// `None` when the payload is shorter than the count it declares — the same
-/// refusal shape as the other list decoders here, so a malformed or truncated
-/// submission is a caller-visible failure rather than a partial table. The
-/// bound is checked before the allocation, so a hostile `resource_count`
-/// cannot reserve memory the payload does not back.
-pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc>> {
-    if payload.len() < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
-        return None;
-    }
-    let count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
-    let table_len = (count as u64).checked_mul(CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as u64)?;
-    let need = (CHILD_EXEC_INDIRECT_HEADER_LEN as u64).checked_add(table_len)?;
-    if need > payload.len() as u64 {
-        return None;
+/// The same refusal the other list decoders here give, so a malformed or
+/// truncated submission is a caller-visible failure with a reason rather than a
+/// partial table. The bound is checked before the allocation, so a hostile
+/// `resource_count` cannot reserve memory the payload does not back.
+///
+/// # Errors
+///
+/// [`ResourceListDecodeError::ShortHeader`] where the header is not there, and
+/// [`ResourceListDecodeError::Truncated`] where the declared table is not.
+pub fn decode_exec_resource_table(
+    payload: &[u8],
+) -> Result<Vec<ExecResourceDesc>, ResourceListDecodeError> {
+    let plen = payload.len();
+    let count = decode_exec_header(payload)
+        .map_err(|_| ResourceListDecodeError::ShortHeader { plen })?
+        .resource_count;
+    // Saturating rather than checked: a count that overflows the multiply is a
+    // count no payload can back, which is the same answer `need > plen` gives —
+    // and it is the answer with the guest's own numbers in it.
+    let need = (CHILD_EXEC_INDIRECT_HEADER_LEN as u64).saturating_add(
+        (count as u64).saturating_mul(CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as u64),
+    );
+    if need > plen as u64 {
+        return Err(ResourceListDecodeError::Truncated { count, plen, need });
     }
     let mut descs = Vec::with_capacity(count as usize);
     let mut off = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
@@ -1192,7 +1244,7 @@ pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc
         });
         off += CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
     }
-    Some(descs)
+    Ok(descs)
 }
 
 /// Decode `CmdDefineFifo` / `CmdFreeFifo`: the channel id at word zero.
@@ -1280,6 +1332,48 @@ pub fn decode_synchronize_resources(
 mod tests {
     use super::*;
     use crate::endian::st32;
+
+    /// The header's three words, and a payload one byte short of them refuses
+    /// rather than reading a count out of whatever follows.
+    #[test]
+    fn an_exec_header_is_three_words_and_a_short_one_refuses() {
+        let mut payload = vec![0u8; CHILD_EXEC_INDIRECT_HEADER_LEN as usize];
+        st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 7);
+        st32(
+            &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            2,
+        );
+        st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 5);
+        assert_eq!(
+            decode_exec_header(&payload),
+            Ok(ExecIndirectHeader {
+                task_id: 7,
+                resource_count: 2,
+                cmdbuf_count: 5,
+            })
+        );
+        assert_eq!(
+            decode_exec_header(&payload[..payload.len() - 1]),
+            Err(ShortPayload {
+                plen: CHILD_EXEC_INDIRECT_HEADER_LEN as usize - 1,
+                need: CHILD_EXEC_INDIRECT_HEADER_LEN as usize,
+            })
+        );
+    }
+
+    /// The four bytes after an EXEC resource record's object ref are the same
+    /// validity quad a standalone invalidate carries, read at this table's own
+    /// 24-byte stride.
+    #[test]
+    fn an_exec_resource_record_carries_the_same_validity_quad() {
+        let payload = exec_payload_with_table(&[(11, 0x0100_0001, [0u8; 16])]);
+        let table = decode_exec_resource_table(&payload).expect("one record, and it is there");
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0].object_id, 11);
+        assert!(table[0].ops.is_guest_write());
+        assert_eq!(table[0].ops.to_le_dword(), 0x0100_0001);
+        assert_eq!(table[0].tail_nonzero_bytes(), 0);
+    }
 
     /// The guest-write transition is one exact quad, not "some bits set".
     ///
@@ -1597,17 +1691,17 @@ mod tests {
     fn decode_exec_resource_table_rejects_count_the_payload_cannot_back() {
         let mut p = exec_payload_with_table(&[(1, 0, [0u8; 16])]);
         st32(&mut p[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..], 2);
-        assert!(decode_exec_resource_table(&p).is_none());
+        assert!(decode_exec_resource_table(&p).is_err());
         st32(
             &mut p[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
             u32::MAX,
         );
-        assert!(decode_exec_resource_table(&p).is_none());
+        assert!(decode_exec_resource_table(&p).is_err());
     }
 
     #[test]
     fn decode_exec_resource_table_rejects_short_header() {
-        assert!(decode_exec_resource_table(&[0u8; 4]).is_none());
+        assert!(decode_exec_resource_table(&[0u8; 4]).is_err());
     }
 
     #[test]
@@ -1903,7 +1997,7 @@ mod tests {
                 }
                 Err(_) => {}
             }
-            if let Some(descs) = decode_exec_resource_table(&payload) {
+            if let Ok(descs) = decode_exec_resource_table(&payload) {
                 let count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
                 assert_eq!(descs.len() as u64, u64::from(count));
                 assert!(

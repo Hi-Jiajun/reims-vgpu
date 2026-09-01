@@ -570,6 +570,67 @@ pub fn resource_list(
     })
 }
 
+/// The content-authority moves an EXEC packet declares in its own resource
+/// table.
+///
+/// **A GPU-work packet carries a lifecycle statement, and it is the same
+/// statement.** `EXEC_INDIRECT2` writes one 24-byte record per live object-list
+/// entry, and the four bytes after each object ref are byte-identical to a
+/// `CmdInvalidateResources` record's validity quad. The guest says "I CPU-wrote
+/// this resource" here, with the submission that reads it, exactly as often as
+/// it says it in a standalone packet — and if the two produced different
+/// operations there would be two content-authority models, one of which is
+/// reached only by whichever packet the guest happened to use.
+///
+/// So this returns the same [`LifecycleOp::Invalidate`], and the caller applies
+/// it before the transaction's work reads anything. The task is the header's,
+/// not a caller's guess: a table of object refs with someone else's namespace
+/// resolves to someone else's resources.
+///
+/// **A zero quad is the normal record here and it is not a refusal.** Unlike a
+/// standalone invalidate, whose whole purpose is to move authority, this table
+/// lists every resource the submission touches — and most of them were not
+/// CPU-written. A record asking for nothing contributes nothing, so an EXEC
+/// that wrote none produces an operation over no resources.
+///
+/// # Errors
+///
+/// [`ResolveRefusal::ShortNotice`] for a payload too short for the header,
+/// [`ResolveRefusal::Payload`] where the declared table is not there,
+/// [`ResolveRefusal::UnestablishedValidityOps`] for a quad that is neither the
+/// guest-write move nor nothing, and [`ResolveRefusal::UnknownRef`] for a ref
+/// naming nothing live.
+pub fn exec_resource_table(
+    payload: &[u8],
+    resolver: &impl crate::resolve::RefResolver,
+) -> Result<LifecycleOp, ResolveRefusal> {
+    let header = fifo::decode_exec_header(payload).map_err(ResolveRefusal::ShortNotice)?;
+    let table = fifo::decode_exec_resource_table(payload).map_err(ResolveRefusal::Payload)?;
+    let mut resources = Vec::new();
+    for record in &table {
+        if record.ops == fifo::InvalidateValidityOps::default() {
+            continue;
+        }
+        if !record.ops.is_guest_write() {
+            return Err(ResolveRefusal::UnestablishedValidityOps {
+                object_ref: record.object_id,
+                ops: record.ops.to_le_dword(),
+            });
+        }
+        resources.push(
+            resolver
+                .resource(record.object_id)
+                .ok_or(ResolveRefusal::UnknownRef {
+                    object_ref: record.object_id,
+                })?,
+        );
+    }
+    Ok(LifecycleOp::Invalidate {
+        task: TaskId(header.task_id),
+        resources,
+    })
+}
+
 /// Turn any lifecycle packet's payload into the operation it names.
 ///
 /// **The one place a kind picks its join.** The five joins below each refuse
@@ -2716,6 +2777,140 @@ mod tests {
                 kind.name()
             );
         }
+    }
+
+    /// An `EXEC_INDIRECT2` payload: the three header words, then one 24-byte
+    /// record per `(object_ref, quad)`.
+    fn exec_bytes(task: u32, records: &[(u32, u32)]) -> Vec<u8> {
+        use reims_vgpu_protocol::fifo::{
+            CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN, CHILD_EXEC_RESOURCE_TAIL_LEN,
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&task.to_le_bytes());
+        out.extend_from_slice(&u32::try_from(records.len()).expect("small").to_le_bytes());
+        // The command-buffer count. Not this function's table, and stated so a
+        // record is never read out of a word that was meant to be a count.
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for (object_ref, ops) in records {
+            out.extend_from_slice(&object_ref.to_le_bytes());
+            out.extend_from_slice(&ops.to_le_bytes());
+            out.resize(out.len() + CHILD_EXEC_RESOURCE_TAIL_LEN as usize, 0);
+        }
+        assert_eq!(
+            out.len(),
+            12 + records.len() * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+        );
+        out
+    }
+
+    /// An EXEC packet's own resource table carries the same guest-write
+    /// statement a standalone invalidate does, and it becomes the same
+    /// operation.
+    ///
+    /// Two content-authority models — one for each packet the guest could have
+    /// used to say the same thing — is the shape this avoids.
+    #[test]
+    fn an_exec_tables_guest_write_becomes_the_same_invalidate() {
+        let bytes = exec_bytes(1, &[(11, PAGEON_DWORD), (12, PAGEON_DWORD)]);
+        assert_eq!(
+            exec_resource_table(&bytes, &Everything),
+            Ok(LifecycleOp::Invalidate {
+                task: TaskId(1),
+                resources: vec![name(11), name(12)],
+            })
+        );
+    }
+
+    /// A record asking for no move is the normal record in this table: it lists
+    /// every resource the submission touches, and most were not CPU-written.
+    ///
+    /// Refusing them, or treating them as guest writes, are both wrong in the
+    /// same direction — one loses every EXEC, the other declares a device
+    /// replica stale on every submission and charges the rebuild to the next
+    /// reader.
+    #[test]
+    fn an_exec_record_asking_for_nothing_moves_nothing() {
+        let bytes = exec_bytes(1, &[(11, 0), (12, PAGEON_DWORD), (13, 0)]);
+        assert_eq!(
+            exec_resource_table(&bytes, &Everything),
+            Ok(LifecycleOp::Invalidate {
+                task: TaskId(1),
+                resources: vec![name(12)],
+            })
+        );
+        // A table of nothing but used resources declares no move at all.
+        let quiet = exec_bytes(1, &[(11, 0)]);
+        assert_eq!(
+            exec_resource_table(&quiet, &Everything),
+            Ok(LifecycleOp::Invalidate {
+                task: TaskId(1),
+                resources: Vec::new(),
+            })
+        );
+    }
+
+    /// The same unestablished quad refuses here as in the standalone packet.
+    #[test]
+    fn an_exec_record_asking_for_an_unestablished_move_refuses() {
+        let bytes = exec_bytes(1, &[(11, 0x0100_0101)]);
+        assert_eq!(
+            exec_resource_table(&bytes, &Everything),
+            Err(ResolveRefusal::UnestablishedValidityOps {
+                object_ref: 11,
+                ops: 0x0100_0101,
+            })
+        );
+    }
+
+    /// The task is the header's. A table of refs resolved in another task's
+    /// namespace names another task's resources.
+    #[test]
+    fn an_exec_tables_task_is_the_headers() {
+        let bytes = exec_bytes(9, &[]);
+        assert_eq!(
+            exec_resource_table(&bytes, &Everything).map(|op| op.task()),
+            Ok(TaskId(9))
+        );
+    }
+
+    /// A payload too short for the header refuses on the header, and one whose
+    /// declared table is not there refuses on the table.
+    #[test]
+    fn an_exec_payload_that_disagrees_with_itself_refuses_by_name() {
+        assert!(matches!(
+            exec_resource_table(&[0u8; 4], &Everything),
+            Err(ResolveRefusal::ShortNotice(_))
+        ));
+        let mut bytes = exec_bytes(1, &[(11, PAGEON_DWORD)]);
+        bytes.truncate(bytes.len() - 1);
+        assert!(matches!(
+            exec_resource_table(&bytes, &Everything),
+            Err(ResolveRefusal::Payload(_))
+        ));
+    }
+
+    /// The operation the table produces is one `Lifecycle` applies: the guest's
+    /// pages become the current content of exactly the resource the record
+    /// named.
+    #[test]
+    fn an_exec_tables_invalidate_applies_like_any_other() {
+        let (mut l, id) = with_one_resource(256);
+        let backing = BackingId(10);
+        l.record_write(TASK, id, 0, 256, Replica::DeviceOwned)
+            .expect("inside the resource");
+        assert!(l
+            .content()
+            .is_fresh(backing, range(0, 256), Replica::DeviceOwned));
+
+        let bytes = exec_bytes(TASK.0, &[(0, PAGEON_DWORD)]);
+        let op = exec_resource_table(&bytes, &Everything).expect("well formed");
+        assert_eq!(l.apply(&op).expect("resolves"), Effects::default());
+        assert!(l
+            .content()
+            .is_fresh(backing, range(0, 256), Replica::GuestPages));
+        assert!(!l
+            .content()
+            .is_fresh(backing, range(0, 1), Replica::DeviceOwned));
     }
 
     /// A record asking for a transition this device has not established refuses
