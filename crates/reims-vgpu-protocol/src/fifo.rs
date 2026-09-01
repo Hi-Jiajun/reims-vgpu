@@ -36,6 +36,14 @@ pub const CHILD_SYNCHRONIZE_RECORD_LEN: u32 = 4;
 pub const CHILD_REPLACE_PHYSICAL_TASK_ID: u32 = 0x00;
 pub const CHILD_REPLACE_PHYSICAL_OBJECT_ID: u32 = 0x04;
 pub const CHILD_REPLACE_PHYSICAL_LEN: u32 = 8;
+/// `CmdDefineFifo` / `CmdFreeFifo`: the channel id, and nothing else.
+///
+/// One word, and it is the whole payload either command needs. Named rather
+/// than written as a literal `4` at each site that bounds it, because the two
+/// arms that read it and the two that length-check it were four separate
+/// spellings of one number.
+pub const CHANNEL_LIFETIME_CHANNEL_ID: u32 = 0x00;
+pub const CHANNEL_LIFETIME_LEN: u32 = 4;
 /// Hardcoded pageon second dword from `pageBacking` (LE bytes `01 00 00 01`).
 ///
 /// Not a free-form bitfield. PVG host `invalidateResources:` treats the four
@@ -68,9 +76,18 @@ pub struct ShortPayload {
     pub need: usize,
 }
 
+impl ShortPayload {
+    /// The slug this refusal reports under.
+    ///
+    /// A constant as well as a [`reims_vgpu_observe::Decline`] method, for the
+    /// same reason [`ResourceListDecodeError::slug`] is inherent: a layer that
+    /// may not depend on `observe` still has to name the refusal it forwards.
+    pub const SLUG: &'static str = "fifo_payload_short";
+}
+
 impl reims_vgpu_observe::Decline for ShortPayload {
     fn slug(&self) -> &'static str {
-        "fifo_payload_short"
+        Self::SLUG
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
@@ -442,6 +459,26 @@ pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc
         off += CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
     }
     Some(descs)
+}
+
+/// Decode `CmdDefineFifo` / `CmdFreeFifo`: the channel id at word zero.
+///
+/// The two commands share a payload because they are the two ends of one
+/// lifetime, so they share a decoder. Which of them a packet is stays the
+/// caller's — a decoder does not know its own opcode.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the one word.
+pub fn decode_channel_lifetime(payload: &[u8]) -> Result<u32, ShortPayload> {
+    let need = CHANNEL_LIFETIME_LEN as usize;
+    if payload.len() < need {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need,
+        });
+    }
+    Ok(ld32(&payload[CHANNEL_LIFETIME_CHANNEL_ID as usize..]))
 }
 
 /// Decode CmdReplacePhysical (`0x3c`): `{task_id, object_id}`, 8 bytes.

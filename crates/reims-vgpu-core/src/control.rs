@@ -179,6 +179,69 @@ impl ControlOp {
     }
 }
 
+/// Why a control packet's bytes did not become an operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveRefusal {
+    /// The packet is not a control packet at all.
+    NotControl { channel: Channel, opcode: u16 },
+    /// A channel-lifetime command whose payload cannot hold its one word.
+    Payload(reims_vgpu_protocol::fifo::ShortPayload),
+}
+
+impl ResolveRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::NotControl { .. } => "control_not_a_control_packet",
+            Self::Payload(_) => reims_vgpu_protocol::fifo::ShortPayload::SLUG,
+        }
+    }
+}
+
+/// Turn one control packet into the operation it names.
+///
+/// **The join between the ledger's twenty-three control rows and the three-arm
+/// vocabulary that describes them.** [`ControlKind::of`] said which command a
+/// packet is and [`ControlOp`] said what the model does about it, and nothing
+/// carried a packet from one to the other — so `Payload::Control` could be
+/// described and could not be built from a guest's bytes.
+///
+/// Only one of the twenty-three reads a payload word: a channel definition or
+/// free names the domain it opens or ends. The rest carry nothing this crate
+/// reads — a cursor's pixels and a display's shared-state page belong to the
+/// layer that has a display, and the retired slots and `CmdNOP` carry nothing
+/// at all — so their operations are the kind and no more. That is not a
+/// shortcut: it is what [`ControlOp::Display`] and [`ControlOp::Inert`] already
+/// say, and this function is where the claim becomes checkable against every
+/// row the ledger judged.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a packet that is not control, or a channel-lifetime
+/// command too short to name a domain.
+pub fn resolve(channel: Channel, opcode: u16, payload: &[u8]) -> Result<ControlOp, ResolveRefusal> {
+    let Some(kind) = ControlKind::of(channel, opcode) else {
+        return Err(ResolveRefusal::NotControl { channel, opcode });
+    };
+    // Everything but the two channel-lifetime commands: the kind is the whole
+    // operation. Both questions are asked of `ControlKind` rather than
+    // restated here, so a row that stops being a channel command or stops
+    // being a no-op changes one answer and not two.
+    let Some(transition) = kind.channel_transition() else {
+        return Ok(if kind.payload_is_inert() {
+            ControlOp::Inert { kind }
+        } else {
+            ControlOp::Display { kind }
+        });
+    };
+    let domain = reims_vgpu_protocol::fifo::decode_channel_lifetime(payload)
+        .map_err(ResolveRefusal::Payload)?;
+    Ok(ControlOp::Channel {
+        transition,
+        domain: ChannelId(domain),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +364,102 @@ mod tests {
         let count = names.len();
         names.dedup();
         assert_eq!(names.len(), count);
+    }
+
+    /// The claim `resolve` exists to make checkable: every control row the
+    /// ledger judged becomes an operation from bytes, and the operation is the
+    /// command the row names.
+    ///
+    /// Before it, `ControlKind::of` said which command a packet is and
+    /// `ControlOp` said what the model does about it, with nothing carrying a
+    /// packet from one to the other.
+    #[test]
+    fn every_control_packet_resolves_from_bytes_to_its_own_operation() {
+        let channel_id = 5u32;
+        let payload = channel_id.to_le_bytes();
+        let mut channels = 0;
+        let mut inert = 0;
+        let mut display = 0;
+        for p in LEDGER {
+            let Some(kind) = ControlKind::of(p.channel, p.opcode) else {
+                assert_eq!(
+                    resolve(p.channel, p.opcode, &payload),
+                    Err(ResolveRefusal::NotControl {
+                        channel: p.channel,
+                        opcode: p.opcode
+                    }),
+                    "{} {:#04x} is not control and must not resolve to one",
+                    p.channel.name(),
+                    p.opcode
+                );
+                continue;
+            };
+            let op = resolve(p.channel, p.opcode, &payload).expect("a control packet");
+            assert_eq!(
+                op.kind(),
+                kind,
+                "{} {:#04x} resolved to a different command",
+                p.channel.name(),
+                p.opcode
+            );
+            match op {
+                ControlOp::Channel { domain, .. } => {
+                    assert_eq!(domain, ChannelId(channel_id), "the domain is word zero");
+                    channels += 1;
+                }
+                ControlOp::Inert { .. } => inert += 1,
+                ControlOp::Display { .. } => display += 1,
+            }
+        }
+        assert_eq!(
+            (channels, inert, display),
+            (2, 16, 5),
+            "two channel-lifetime commands, sixteen inert payloads (the fifteen \
+             retired slots and CmdNOP) and five display commands"
+        );
+    }
+
+    /// A channel definition names its domain, and a free ends the same one.
+    /// They share a payload because they are the two ends of one lifetime.
+    #[test]
+    fn a_channel_command_names_the_domain_it_opens_or_ends() {
+        let payload = 9u32.to_le_bytes();
+        assert_eq!(
+            resolve(Channel::Root, 0x30, &payload),
+            Ok(ControlOp::Channel {
+                transition: ChannelTransition::Open,
+                domain: ChannelId(9),
+            })
+        );
+        assert_eq!(
+            resolve(Channel::Root, 0x31, &payload),
+            Ok(ControlOp::Channel {
+                transition: ChannelTransition::Free,
+                domain: ChannelId(9),
+            })
+        );
+    }
+
+    /// A channel command with nothing to read names no domain, and is refused
+    /// rather than opening channel zero.
+    #[test]
+    fn a_channel_command_too_short_to_name_a_domain_is_refused() {
+        for opcode in [0x30u16, 0x31] {
+            for plen in 0..4usize {
+                let refusal = resolve(Channel::Root, opcode, &vec![0u8; plen][..])
+                    .expect_err("no domain to name");
+                assert_eq!(
+                    refusal,
+                    ResolveRefusal::Payload(reims_vgpu_protocol::fifo::ShortPayload {
+                        plen,
+                        need: 4
+                    }),
+                    "{opcode:#04x} at {plen}"
+                );
+                assert_eq!(refusal.slug(), "fifo_payload_short");
+            }
+        }
+        // And the commands that read no payload do not care.
+        assert!(resolve(Channel::Child, 0x1e, &[]).is_ok());
     }
 }

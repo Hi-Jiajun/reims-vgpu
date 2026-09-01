@@ -2302,8 +2302,15 @@ fn process_root_packet<H: HostMemory + HostOps>(
             }
         }
         ROOT_OP_DEFINE_FIFO => {
-            if !packet_short("define_fifo", None, packet.payload.len(), 4) {
-                let ch = ld32(&packet.payload[0..]);
+            if !packet_short(
+                "define_fifo",
+                None,
+                packet.payload.len(),
+                crate::protocol::fifo::CHANNEL_LIFETIME_LEN as usize,
+            ) {
+                let ch = ld32(
+                    &packet.payload[crate::protocol::fifo::CHANNEL_LIFETIME_CHANNEL_ID as usize..],
+                );
                 if is_child_channel(ch) {
                     let bit = 1u32 << ch;
                     state.active_child_mask |= bit;
@@ -2316,8 +2323,15 @@ fn process_root_packet<H: HostMemory + HostOps>(
             }
         }
         ROOT_OP_FREE_FIFO => {
-            if !packet_short("free_fifo", None, packet.payload.len(), 4) {
-                let ch = ld32(&packet.payload[0..]);
+            if !packet_short(
+                "free_fifo",
+                None,
+                packet.payload.len(),
+                crate::protocol::fifo::CHANNEL_LIFETIME_LEN as usize,
+            ) {
+                let ch = ld32(
+                    &packet.payload[crate::protocol::fifo::CHANNEL_LIFETIME_CHANNEL_ID as usize..],
+                );
                 if is_child_channel(ch) {
                     let bit = 1u32 << ch;
                     state.active_child_mask &= !bit;
