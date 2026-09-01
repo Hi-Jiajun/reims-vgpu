@@ -1095,6 +1095,12 @@ fn bind_sampled_images(
             )
         };
 
+        // Every sampled bind is a fresh `MTLTexture` and a full upload, per
+        // draw — the same shape the colour target had before
+        // [`crate::backend::metal::resident`], and charged apart from the rest
+        // of `metal_encode_us` for the same reason: the fix for byte movement
+        // is not the fix for encoder overhead.
+        let span_alloc = crate::runtime::chain_phase::CostSpan::new("metal_sampled_tex_alloc_us");
         let descriptor = TextureDescriptor::new();
         descriptor.set_texture_type(MTLTextureType::D2);
         descriptor.set_pixel_format(pixel_format);
@@ -1119,7 +1125,12 @@ fn bind_sampled_images(
                 depth: 1,
             },
         };
-        texture.replace_region(region, 0, bytes as *const _, bytes_per_row);
+        drop(span_alloc);
+        {
+            let _span_upload =
+                crate::runtime::chain_phase::CostSpan::new("metal_sampled_tex_upload_us");
+            texture.replace_region(region, 0, bytes as *const _, bytes_per_row);
+        }
         if fragment_stage {
             encoder.set_fragment_texture(texture_index as u64, Some(&texture));
         } else {

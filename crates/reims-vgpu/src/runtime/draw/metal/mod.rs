@@ -477,8 +477,14 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // Archive apple-pv-gpu-exec: a bound texture that does not resolve gates the
     // draw (never samples black/garbage). Same for vertex-stage textures.
     chain_phase::enter(chain_phase::Phase::Sampled);
+    // `sampled_us` is this rail's largest bar and, unlike the Vulkan rail's, has
+    // never been divided — `runtime::sampled_phase` splits the other rail's.
+    // Two spans and two magnitudes, because a bar this size has two candidate
+    // shapes and they have opposite fixes: many small binds (per-bind overhead)
+    // and few large ones (byte movement).
     let mut vtx_tex_items: Vec<TexItem> = Vec::new();
     let mut frag_tex_items: Vec<TexItem> = Vec::new();
+    let span_sampled = chain_phase::CostSpan::new("metal_sampled_load_us");
     for t in req.vertex_textures.iter() {
         if t.texture_ref == 0 {
             continue;
@@ -494,6 +500,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 None,
             );
         };
+        crate::runtime::drain::note_store_route("metal_sampled_binds");
+        crate::runtime::drain::note_store_route_n("metal_sampled_bytes", rgba.len() as u64);
         vtx_tex_items.push(TexItem {
             index: t.index,
             w,
@@ -516,6 +524,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 None,
             );
         };
+        crate::runtime::drain::note_store_route("metal_sampled_binds");
+        crate::runtime::drain::note_store_route_n("metal_sampled_bytes", rgba.len() as u64);
         frag_tex_items.push(TexItem {
             index: t.index,
             w,
@@ -523,6 +533,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             rgba,
         });
     }
+    drop(span_sampled);
     let vtx_imgs: Vec<ReimsVgpuSampledImage> = vtx_tex_items
         .iter()
         .map(|it| {
@@ -563,6 +574,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // Samplers: serializer-object subtype 0x03 when present. A nonzero ref is an explicit
     // guest bind; if it cannot be resolved, keep the correct fallback but make
     // the degradation visible with the exact resolver reason.
+    let span_samplers = chain_phase::CostSpan::new("metal_sampled_smp_us");
     let mut vtx_samps: Vec<ReimsVgpuSampler> = Vec::new();
     let mut frag_samps: Vec<ReimsVgpuSampler> = Vec::new();
     for s in req.vertex_samplers.iter() {
@@ -597,6 +609,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             frag_samps.push(with_bind_lod_clamp(sampler, s.lod_clamp));
         }
     }
+    drop(span_samplers);
 
     // Both lists were built exactly one entry long from an `Option`, while the
     // backend ABI beneath them has always taken a slice and `apply_viewports`
