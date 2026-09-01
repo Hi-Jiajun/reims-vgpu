@@ -48,9 +48,18 @@
 //! Nothing here calls `vkCreateRenderPass` or `vkCmdBeginRendering`. Each
 //! build owns the arrays its create info points at and hands out a borrowed
 //! info, so the structure a driver would receive is inspectable with no GPU.
+//!
+//! [`Cache`] keeps that property. It memoizes handles the caller creates and
+//! hands back the ones the caller must destroy; it never touches a device
+//! itself. So the whole cache — including the reverse index that decides
+//! *which* framebuffers a dead image view invalidates — is testable without a
+//! GPU, and the one thing that would not be is the `vkDestroy` call the caller
+//! makes on what it gives back.
 
 use crate::pass::{ClearColor, Ops, PassPlan};
 use ash::vk;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
 /// What two passes must agree on for a pipeline built against one to run in
 /// the other.
@@ -640,6 +649,230 @@ impl Build {
     }
 }
 
+/// What a [`Cache`] has done, for the report line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheCensus {
+    pub render_pass_hits: u64,
+    pub render_pass_misses: u64,
+    pub framebuffer_hits: u64,
+    pub framebuffer_misses: u64,
+    /// Framebuffers dropped because an image view they named went away. Not
+    /// evictions: see [`Cache`].
+    pub framebuffers_invalidated: u64,
+    /// Live now, which is what the two counters above cannot say.
+    pub render_passes: usize,
+    pub framebuffers: usize,
+}
+
+/// Everything one device epoch's [`Cache`] was holding when it ended.
+///
+/// Two vectors and not one, because the two are destroyed by different
+/// functions and a caller that confused them would be calling
+/// `vkDestroyRenderPass` on a framebuffer.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Retired {
+    pub render_passes: Vec<vk::RenderPass>,
+    pub framebuffers: Vec<vk::Framebuffer>,
+}
+
+impl Retired {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.render_passes.is_empty() && self.framebuffers.is_empty()
+    }
+}
+
+/// The `VkRenderPass` and `VkFramebuffer` objects one device epoch has built.
+///
+/// # Two keys, two granularities, on purpose
+///
+/// Render passes are keyed on [`Signature`] and framebuffers on
+/// [`FramebufferKey`], for the reason the module doc gives. Neither is
+/// [`Compatibility`], which is the *pipeline* cache's key — a pass that clears
+/// and a pass that loads are two objects here and one class there, and
+/// collapsing either direction would either recompile every pipeline when a
+/// guest changes a load action or begin a pass with the wrong operations.
+///
+/// # Nothing is evicted, and invalidation is not eviction
+///
+/// There is no capacity bound and no LRU, for the reason
+/// [`crate::variant`] gives: a cached object the guest can still reach is
+/// state that represents guest work, and a bound here would silently rebuild
+/// under load.
+///
+/// [`Cache::forget_view`] is not an exception to that. A framebuffer names
+/// image views by handle, so when the guest releases the texture behind one,
+/// every framebuffer naming it is *already* invalid — keeping it would hand a
+/// later pass a framebuffer over freed memory. That is a lifetime the guest
+/// ended, not a bound this cache chose, and it is why the reverse index below
+/// exists at all: without it the only way to find those framebuffers would be
+/// to walk every key, and the only way to be safe without walking would be to
+/// keep none.
+///
+/// # It creates nothing and destroys nothing
+///
+/// Every entry point takes a closure for the miss and returns handles for the
+/// caller to destroy. A cache that called `vkDestroyFramebuffer` itself would
+/// be destroying objects a recorded command buffer may still name; the caller
+/// has the completion fact and queues them through
+/// [`reims_vgpu_core::retire::NativeRetirement`], which is the type that owns
+/// when a native object may die.
+#[derive(Debug, Default)]
+pub struct Cache {
+    passes: HashMap<Signature, vk::RenderPass>,
+    framebuffers: HashMap<FramebufferKey, vk::Framebuffer>,
+    /// Which framebuffer keys name each image view.
+    ///
+    /// A `HashSet` and not a `Vec` because a framebuffer may name one view in
+    /// two slots — a colour attachment and its own resolve target cannot be
+    /// the same view, but a depth attachment read by two subpass-less passes
+    /// at the same level can be, and a duplicate would hand the same
+    /// framebuffer back twice for one destroy.
+    by_view: HashMap<vk::ImageView, HashSet<FramebufferKey>>,
+    census: CacheCensus,
+}
+
+impl Cache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What this cache has done and is holding.
+    #[must_use]
+    pub fn census(&self) -> CacheCensus {
+        CacheCensus {
+            render_passes: self.passes.len(),
+            framebuffers: self.framebuffers.len(),
+            ..self.census
+        }
+    }
+
+    /// The `VkRenderPass` for `signature`, creating it on a miss.
+    ///
+    /// `create` runs at most once per signature per epoch. A creation that
+    /// fails is not cached: the driver may have refused for a reason that does
+    /// not recur, and a cached failure would turn one refusal into a permanent
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `create` returns, unchanged and unrecorded.
+    pub fn render_pass<E>(
+        &mut self,
+        signature: &Signature,
+        create: impl FnOnce() -> Result<vk::RenderPass, E>,
+    ) -> Result<vk::RenderPass, E> {
+        if let Some(&pass) = self.passes.get(signature) {
+            self.census.render_pass_hits += 1;
+            return Ok(pass);
+        }
+        let pass = create()?;
+        self.census.render_pass_misses += 1;
+        self.passes.insert(signature.clone(), pass);
+        Ok(pass)
+    }
+
+    /// The `VkFramebuffer` for `key`, creating it on a miss.
+    ///
+    /// Every view in the key is indexed, so [`Self::forget_view`] finds this
+    /// framebuffer through any one of them.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `create` returns, unchanged and unindexed — a framebuffer that
+    /// was never created must not be reachable from a view.
+    pub fn framebuffer<E>(
+        &mut self,
+        key: &FramebufferKey,
+        create: impl FnOnce() -> Result<vk::Framebuffer, E>,
+    ) -> Result<vk::Framebuffer, E> {
+        if let Some(&framebuffer) = self.framebuffers.get(key) {
+            self.census.framebuffer_hits += 1;
+            return Ok(framebuffer);
+        }
+        let framebuffer = create()?;
+        self.census.framebuffer_misses += 1;
+        self.framebuffers.insert(key.clone(), framebuffer);
+        for &view in &key.views {
+            self.by_view.entry(view).or_default().insert(key.clone());
+        }
+        Ok(framebuffer)
+    }
+
+    /// Drop every framebuffer naming `view`, and hand back the handles.
+    ///
+    /// Called when the image behind `view` stops being the one the guest
+    /// named — a resource replacement, a reallocation, or a release. The
+    /// returned handles are still live and are the caller's to retire.
+    ///
+    /// Idempotent: a view nothing names returns nothing, and a second call
+    /// returns nothing because the first removed the index entry.
+    #[must_use]
+    pub fn forget_view(&mut self, view: vk::ImageView) -> Vec<vk::Framebuffer> {
+        let Some(keys) = self.by_view.remove(&view) else {
+            return Vec::new();
+        };
+        let mut dropped = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(framebuffer) = self.framebuffers.remove(&key) else {
+                // Unreachable while the two maps agree: the sibling cleanup
+                // below is what keeps a key from surviving in the index after
+                // its framebuffer is gone, and `retire` clears both. Skipping
+                // rather than unwrapping because the failure this would be is
+                // a drifted index, and handing back a handle that is not in
+                // the framebuffer map is a second destroy of one already
+                // returned.
+                continue;
+            };
+            // The framebuffer's *other* views must stop naming it, or the
+            // index grows for the life of the epoch and a later forget hands
+            // back a handle this call already returned.
+            for &other in &key.views {
+                if other == view {
+                    continue;
+                }
+                if let Entry::Occupied(mut entry) = self.by_view.entry(other) {
+                    entry.get_mut().remove(&key);
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
+                }
+            }
+            dropped.push(framebuffer);
+        }
+        self.census.framebuffers_invalidated += dropped.len() as u64;
+        dropped
+    }
+
+    /// Everything this cache holds, at the end of the device epoch.
+    ///
+    /// Leaves the cache empty, so a caller that retires and keeps using it is
+    /// building against the next epoch rather than handing out handles from
+    /// the one that ended.
+    #[must_use]
+    pub fn retire(&mut self) -> Retired {
+        self.by_view.clear();
+        Retired {
+            render_passes: self.passes.drain().map(|(_, pass)| pass).collect(),
+            framebuffers: self
+                .framebuffers
+                .drain()
+                .map(|(_, framebuffer)| framebuffer)
+                .collect(),
+        }
+    }
+
+    /// How many views the reverse index is tracking.
+    ///
+    /// A cache whose framebuffers have all been forgotten tracks none, and
+    /// that is the assertion that catches an index leak.
+    #[must_use]
+    pub fn indexed_views(&self) -> usize {
+        self.by_view.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,5 +1309,381 @@ mod tests {
         .map(|r| r.slug())
         .collect();
         assert_eq!(slugs.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use ash::vk::Handle;
+
+    fn compatibility(color: &[vk::Format]) -> Compatibility {
+        Compatibility {
+            color: color.to_vec(),
+            depth_stencil: None,
+            depth: false,
+            stencil: false,
+            samples: vk::SampleCountFlags::TYPE_1,
+        }
+    }
+
+    fn ops(load: vk::AttachmentLoadOp) -> AttachmentOps {
+        AttachmentOps {
+            load,
+            store: vk::AttachmentStoreOp::STORE,
+            stencil_load: vk::AttachmentLoadOp::DONT_CARE,
+            stencil_store: vk::AttachmentStoreOp::DONT_CARE,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            final_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        }
+    }
+
+    fn signature(load: vk::AttachmentLoadOp) -> Signature {
+        Signature {
+            compatibility: compatibility(&[vk::Format::B8G8R8A8_UNORM]),
+            color: vec![ops(load)],
+            depth_stencil: None,
+            resolve: vec![false],
+        }
+    }
+
+    fn framebuffer_key(pass: u64, views: &[u64]) -> FramebufferKey {
+        FramebufferKey {
+            render_pass: vk::RenderPass::from_raw(pass),
+            views: views.iter().map(|&v| vk::ImageView::from_raw(v)).collect(),
+            width: 64,
+            height: 32,
+            layers: 1,
+        }
+    }
+
+    /// A counter that stands in for the driver, so a second creation is
+    /// visible rather than merely wasteful.
+    #[derive(Default)]
+    struct Creations(std::cell::Cell<u64>);
+
+    impl Creations {
+        fn pass(&self, raw: u64) -> Result<vk::RenderPass, ()> {
+            self.0.set(self.0.get() + 1);
+            Ok(vk::RenderPass::from_raw(raw))
+        }
+
+        fn framebuffer(&self, raw: u64) -> Result<vk::Framebuffer, ()> {
+            self.0.set(self.0.get() + 1);
+            Ok(vk::Framebuffer::from_raw(raw))
+        }
+    }
+
+    /// A repeated signature is one object, and the driver is asked once.
+    #[test]
+    fn a_repeated_signature_is_one_render_pass() {
+        let mut cache = Cache::new();
+        let made = Creations::default();
+        let first = cache.render_pass(&signature(vk::AttachmentLoadOp::CLEAR), || made.pass(1));
+        let second = cache.render_pass(&signature(vk::AttachmentLoadOp::CLEAR), || made.pass(2));
+        assert_eq!(first, Ok(vk::RenderPass::from_raw(1)));
+        assert_eq!(second, Ok(vk::RenderPass::from_raw(1)));
+        assert_eq!(made.0.get(), 1, "the driver was asked twice");
+        assert_eq!(cache.census().render_pass_hits, 1);
+        assert_eq!(cache.census().render_pass_misses, 1);
+        assert_eq!(cache.census().render_passes, 1);
+    }
+
+    /// A load action makes a different render pass and the *same* pipeline
+    /// class. That is the whole reason there are two keys: a cache keyed on
+    /// compatibility would begin the second pass with the first's operations,
+    /// and a pipeline cache keyed on the signature would recompile every
+    /// pipeline in the frame the first time a guest loaded instead of cleared.
+    #[test]
+    fn a_load_action_is_a_different_pass_and_the_same_compatibility() {
+        let mut cache = Cache::new();
+        let made = Creations::default();
+        let clear = signature(vk::AttachmentLoadOp::CLEAR);
+        let load = signature(vk::AttachmentLoadOp::LOAD);
+        assert_ne!(clear, load);
+        assert_eq!(clear.compatibility, load.compatibility);
+
+        let a = cache.render_pass(&clear, || made.pass(1)).expect("created");
+        let b = cache.render_pass(&load, || made.pass(2)).expect("created");
+        assert_ne!(a, b);
+        assert_eq!(made.0.get(), 2);
+        assert_eq!(cache.census().render_passes, 2);
+    }
+
+    /// A failed creation is not cached. A driver that refused once for a
+    /// reason that does not recur would otherwise refuse for the epoch.
+    #[test]
+    fn a_refused_creation_is_not_remembered_as_a_refusal() {
+        let mut cache = Cache::new();
+        let signature = signature(vk::AttachmentLoadOp::CLEAR);
+        assert_eq!(
+            cache.render_pass(&signature, || Err::<vk::RenderPass, _>("refused")),
+            Err("refused")
+        );
+        assert_eq!(cache.census().render_passes, 0);
+        assert_eq!(cache.census().render_pass_misses, 0);
+        assert_eq!(
+            cache.render_pass(&signature, || Ok::<_, &str>(vk::RenderPass::from_raw(1))),
+            Ok(vk::RenderPass::from_raw(1))
+        );
+
+        // Same for a framebuffer, and the failed one leaves no view behind.
+        let key = framebuffer_key(1, &[10, 11]);
+        assert!(cache
+            .framebuffer(&key, || Err::<vk::Framebuffer, _>("refused"))
+            .is_err());
+        assert_eq!(
+            cache.indexed_views(),
+            0,
+            "a view names a framebuffer that does not exist"
+        );
+    }
+
+    /// Every view of a framebuffer finds it, not only the first.
+    #[test]
+    fn a_framebuffer_is_reachable_through_each_view_it_names() {
+        for through in 0..3u64 {
+            let mut cache = Cache::new();
+            let made = Creations::default();
+            let key = framebuffer_key(1, &[10, 11, 12]);
+            cache
+                .framebuffer(&key, || made.framebuffer(100))
+                .expect("created");
+            assert_eq!(cache.indexed_views(), 3);
+            let dropped = cache.forget_view(vk::ImageView::from_raw(10 + through));
+            assert_eq!(
+                dropped,
+                vec![vk::Framebuffer::from_raw(100)],
+                "not found through view {through}"
+            );
+            // And the index no longer holds any of the three, so a later
+            // forget cannot hand the same handle back a second time.
+            assert_eq!(cache.indexed_views(), 0);
+            for other in 0..3u64 {
+                assert!(cache
+                    .forget_view(vk::ImageView::from_raw(10 + other))
+                    .is_empty());
+            }
+            assert_eq!(cache.census().framebuffers_invalidated, 1);
+            assert_eq!(cache.census().framebuffers, 0);
+        }
+    }
+
+    /// One view shared by several framebuffers invalidates all of them, and
+    /// leaves the ones that do not name it alone.
+    #[test]
+    fn a_shared_view_invalidates_exactly_the_framebuffers_that_name_it() {
+        let mut cache = Cache::new();
+        let made = Creations::default();
+        // Three attachments to the same depth view at different colour views,
+        // and one that shares nothing.
+        for (raw, views) in [
+            (100, vec![10, 99]),
+            (101, vec![11, 99]),
+            (102, vec![12, 99]),
+            (103, vec![13, 98]),
+        ] {
+            cache
+                .framebuffer(&framebuffer_key(1, &views), || made.framebuffer(raw))
+                .expect("created");
+        }
+        assert_eq!(cache.census().framebuffers, 4);
+
+        let mut dropped = cache.forget_view(vk::ImageView::from_raw(99));
+        dropped.sort_by_key(|f| f.as_raw());
+        assert_eq!(
+            dropped,
+            vec![
+                vk::Framebuffer::from_raw(100),
+                vk::Framebuffer::from_raw(101),
+                vk::Framebuffer::from_raw(102),
+            ]
+        );
+        assert_eq!(cache.census().framebuffers, 1, "the unrelated one survived");
+        // Its own views are still indexed and nothing else is.
+        assert_eq!(cache.indexed_views(), 2);
+        assert_eq!(
+            cache.forget_view(vk::ImageView::from_raw(98)),
+            vec![vk::Framebuffer::from_raw(103)]
+        );
+        assert_eq!(cache.indexed_views(), 0);
+    }
+
+    /// A view named twice by one framebuffer hands the handle back once.
+    /// Destroying it twice is a driver crash.
+    #[test]
+    fn a_view_a_framebuffer_names_twice_is_returned_once() {
+        let mut cache = Cache::new();
+        let made = Creations::default();
+        let key = framebuffer_key(1, &[10, 10]);
+        cache
+            .framebuffer(&key, || made.framebuffer(100))
+            .expect("created");
+        assert_eq!(cache.indexed_views(), 1, "one view, named twice");
+        assert_eq!(
+            cache.forget_view(vk::ImageView::from_raw(10)),
+            vec![vk::Framebuffer::from_raw(100)]
+        );
+        assert_eq!(cache.indexed_views(), 0);
+    }
+
+    /// After a forget, the same key misses again rather than returning the
+    /// handle the caller was told to destroy.
+    #[test]
+    fn a_forgotten_framebuffer_is_rebuilt_and_not_handed_back() {
+        let mut cache = Cache::new();
+        let made = Creations::default();
+        let key = framebuffer_key(1, &[10]);
+        cache
+            .framebuffer(&key, || made.framebuffer(100))
+            .expect("created");
+        assert_eq!(
+            cache.forget_view(vk::ImageView::from_raw(10)),
+            vec![vk::Framebuffer::from_raw(100)]
+        );
+        let rebuilt = cache
+            .framebuffer(&key, || made.framebuffer(200))
+            .expect("created");
+        assert_eq!(rebuilt, vk::Framebuffer::from_raw(200));
+        assert_eq!(made.0.get(), 2);
+        assert_eq!(cache.census().framebuffer_hits, 0);
+        assert_eq!(cache.census().framebuffer_misses, 2);
+        // The rebuild is indexed too, or the second one leaks.
+        assert_eq!(cache.indexed_views(), 1);
+    }
+
+    /// The extent is part of the key: the same views at two sizes are two
+    /// framebuffers.
+    #[test]
+    fn a_framebuffer_key_separates_extents_over_the_same_views() {
+        let mut cache = Cache::new();
+        let made = Creations::default();
+        let small = framebuffer_key(1, &[10]);
+        let large = FramebufferKey {
+            width: 128,
+            ..small.clone()
+        };
+        cache
+            .framebuffer(&small, || made.framebuffer(100))
+            .expect("created");
+        cache
+            .framebuffer(&large, || made.framebuffer(101))
+            .expect("created");
+        assert_eq!(cache.census().framebuffers, 2);
+        // Both reachable through the one view they share.
+        let mut dropped = cache.forget_view(vk::ImageView::from_raw(10));
+        dropped.sort_by_key(|f| f.as_raw());
+        assert_eq!(
+            dropped,
+            vec![
+                vk::Framebuffer::from_raw(100),
+                vk::Framebuffer::from_raw(101)
+            ]
+        );
+    }
+
+    /// Retirement hands back everything exactly once and leaves nothing
+    /// reachable, including the reverse index.
+    #[test]
+    fn retiring_an_epoch_hands_back_everything_once_and_leaves_no_index() {
+        let mut cache = Cache::new();
+        let made = Creations::default();
+        cache
+            .render_pass(&signature(vk::AttachmentLoadOp::CLEAR), || made.pass(1))
+            .expect("created");
+        cache
+            .render_pass(&signature(vk::AttachmentLoadOp::LOAD), || made.pass(2))
+            .expect("created");
+        for (raw, views) in [(100, vec![10, 11]), (101, vec![12])] {
+            cache
+                .framebuffer(&framebuffer_key(1, &views), || made.framebuffer(raw))
+                .expect("created");
+        }
+
+        let retired = cache.retire();
+        assert_eq!(retired.render_passes.len(), 2);
+        assert_eq!(retired.framebuffers.len(), 2);
+        assert!(!retired.is_empty());
+        assert_eq!(cache.census().render_passes, 0);
+        assert_eq!(cache.census().framebuffers, 0);
+        assert_eq!(cache.indexed_views(), 0, "the index outlived the epoch");
+        // Nothing is handed back twice, which would be two destroys.
+        assert!(cache.retire().is_empty());
+        assert!(cache.forget_view(vk::ImageView::from_raw(10)).is_empty());
+    }
+
+    /// A view nothing names forgets nothing, whatever else is cached.
+    #[test]
+    fn forgetting_an_unnamed_view_drops_nothing() {
+        let mut cache = Cache::new();
+        let made = Creations::default();
+        cache
+            .framebuffer(&framebuffer_key(1, &[10]), || made.framebuffer(100))
+            .expect("created");
+        assert!(cache.forget_view(vk::ImageView::from_raw(77)).is_empty());
+        assert_eq!(cache.census().framebuffers, 1);
+        assert_eq!(cache.census().framebuffers_invalidated, 0);
+    }
+
+    /// A build's own key finds the object the build made, so the cache and the
+    /// builder cannot disagree about what identifies a pass.
+    #[test]
+    fn a_builds_signature_and_framebuffer_key_are_the_cache_keys() {
+        use crate::pass::plan;
+        use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
+        use reims_vgpu_core::pass::{LoadAction, PassDescriptor, RenderTargetExtent, StoreAction};
+
+        let mut descriptor = PassDescriptor::empty();
+        descriptor.extent = RenderTargetExtent {
+            width: 64,
+            height: 32,
+            array_length: 1,
+        };
+        descriptor.color[0].texture = Some(ResourceId {
+            slot: ObjectListRef(1),
+            generation: SlotGeneration(1),
+        });
+        descriptor.color[0].load = LoadAction::Clear;
+        descriptor.color[0].store = StoreAction::Store;
+        let plan = plan(&descriptor, |_| {
+            reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        })
+        .expect("a legal pass");
+        let built = build(
+            &plan,
+            &[Bound {
+                format: vk::Format::B8G8R8A8_UNORM,
+                samples: vk::SampleCountFlags::TYPE_1,
+                view: vk::ImageView::from_raw(10),
+                resolve_view: None,
+            }],
+            None,
+        )
+        .expect("one colour attachment");
+
+        let mut cache = Cache::new();
+        let made = Creations::default();
+        let pass = cache
+            .render_pass(built.signature(), || made.pass(1))
+            .expect("created");
+        // The second lookup of the same build is a hit, which is the property
+        // that makes a per-frame pass cost one creation rather than one per
+        // frame.
+        assert_eq!(
+            cache.render_pass(built.signature(), || made.pass(2)),
+            Ok(pass)
+        );
+        assert_eq!(made.0.get(), 1);
+
+        let key = built.framebuffer_key(pass);
+        cache
+            .framebuffer(&key, || made.framebuffer(100))
+            .expect("created");
+        // And the view the build named is the one the guest's texture death
+        // will invalidate it through.
+        assert_eq!(
+            cache.forget_view(vk::ImageView::from_raw(10)),
+            vec![vk::Framebuffer::from_raw(100)]
+        );
     }
 }
