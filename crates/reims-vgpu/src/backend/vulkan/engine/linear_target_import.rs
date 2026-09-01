@@ -42,7 +42,7 @@ fn subresource_aspect(mode: LayoutMode) -> vk::ImageAspectFlags {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WindowRefusal {
-    /// [`crate::env::SHARED_TARGET`] is `off`, so this host takes the arm a
+    /// [`crate::config::SHARED_TARGET`] is `off`, so this host takes the arm a
     /// discrete one has no choice about. First, because it is a policy answer
     /// and every check below it is a measurement of the host.
     DisabledByEnv,
@@ -319,7 +319,7 @@ pub(super) struct ImportedTarget {
 }
 
 /// Whether the primary colour attachment may be the guest's own pages.
-/// **Default on**; [`crate::env::SHARED_TARGET`]`=off` is the ablation arm.
+/// **Default on**; [`crate::config::SHARED_TARGET`]`=off` is the ablation arm.
 ///
 /// Read once. A target created under one answer outlives the draw that created
 /// it and is recycled by geometry and format alone, so an answer that changed
@@ -327,14 +327,14 @@ pub(super) struct ImportedTarget {
 /// apart.
 fn shared_target_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| shared_target_from(crate::env::read(crate::env::SHARED_TARGET).0))
+    *ON.get_or_init(|| shared_target_from(crate::config::read(crate::config::SHARED_TARGET).0))
 }
 
 /// The rail's answer for one parsed spelling, split out of the `OnceLock` above
 /// so both arms are reachable from a test — a latched answer can be asked only
 /// once per process, which is exactly one arm.
-fn shared_target_from(switch: crate::env::Switch) -> bool {
-    !matches!(switch, crate::env::Switch::Off)
+fn shared_target_from(switch: crate::config::Switch) -> bool {
+    !matches!(switch, crate::config::Switch::Off)
 }
 
 /// Create a linear image whose storage is the guest surface allocation itself.
@@ -884,7 +884,7 @@ mod tests {
     /// regression rather than as an operator mistake.
     #[test]
     fn only_off_takes_this_host_to_the_copying_rail() {
-        use crate::env::Switch;
+        use crate::config::Switch;
         assert!(shared_target_from(Switch::Unset));
         assert!(shared_target_from(Switch::On));
         assert!(shared_target_from(Switch::Unrecognized));

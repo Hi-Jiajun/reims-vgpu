@@ -10837,7 +10837,7 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
     //
     // The eager arm has always done this — `write_bgra8_from_resident_gpu` calls
     // `invalidate_storage_residency_window` over the same extent — so without it
-    // here the two arms of `env::LAZY_WRITEBACK` disagree about what the GPU
+    // here the two arms of `config::LAZY_WRITEBACK` disagree about what the GPU
     // observes, which is the one thing that switch's doc promises they never do.
     // Nothing else drops an entry from that map and no guest-write witness feeds
     // it, so a stale claim is held until the window is written some other way.

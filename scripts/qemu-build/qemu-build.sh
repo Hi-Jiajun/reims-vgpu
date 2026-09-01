@@ -29,7 +29,7 @@
 # binary that comparison costs a rebuild — which changes the binary, the caches
 # and the boot alongside the thing being measured. Note this is still not a
 # runtime *sniff*: the set of rails is baked, and the variable can only narrow
-# it (see crates/reims-vgpu-env, REIMS_VGPU_RAIL).
+# it (see crates/reims-vgpu-config, REIMS_VGPU_RAIL).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

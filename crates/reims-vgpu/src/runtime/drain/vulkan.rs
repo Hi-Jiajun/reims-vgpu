@@ -74,7 +74,7 @@ fn stamp_word_order_on_fifo<H: HostMemory + HostOps>(
     index: u32,
     value: u32,
 ) -> StampOrder {
-    if crate::env::switch(crate::env::GPU_STAMP) == crate::env::Switch::Off {
+    if crate::config::switch(crate::config::GPU_STAMP) == crate::config::Switch::Off {
         return StampOrder::Declined;
     }
     // A CPU-only packet normally has nothing queued behind it. It must still

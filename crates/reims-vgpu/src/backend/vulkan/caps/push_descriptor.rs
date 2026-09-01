@@ -51,7 +51,7 @@ pub unsafe fn query(
     pd: vk::PhysicalDevice,
     has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
 ) -> PushDescriptorCaps {
-    if crate::env::switch(crate::env::PUSH_DESCRIPTORS) == crate::env::Switch::Off {
+    if crate::config::switch(crate::config::PUSH_DESCRIPTORS) == crate::config::Switch::Off {
         return PushDescriptorCaps::default();
     }
     if !has_extension(ash::khr::push_descriptor::NAME) {

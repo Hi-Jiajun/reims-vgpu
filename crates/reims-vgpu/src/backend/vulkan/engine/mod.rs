@@ -3970,7 +3970,7 @@ enum ScatterForm {
     ///
     /// The only form on a host without the guest-RAM import, the form for a run
     /// the dispatch cannot express, and the A/B baseline. See
-    /// [`crate::env::COMPUTE_SCATTER`].
+    /// [`crate::config::COMPUTE_SCATTER`].
     Regions(Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>),
     /// One compute dispatch per destination buffer, over a run table.
     ///
@@ -4033,8 +4033,8 @@ fn scatter_split_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
-            crate::env::read(crate::env::SCATTER_SPLIT).0,
-            crate::env::Switch::On
+            crate::config::read(crate::config::SCATTER_SPLIT).0,
+            crate::config::Switch::On
         )
     })
 }
@@ -4108,13 +4108,13 @@ unsafe fn plan_guest_linear_copies(
     Ok(grouped)
 }
 
-/// Whether the compute scatter is on. See [`crate::env::COMPUTE_SCATTER`].
+/// Whether the compute scatter is on. See [`crate::config::COMPUTE_SCATTER`].
 fn compute_scatter_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            crate::env::read(crate::env::COMPUTE_SCATTER).0,
-            crate::env::Switch::Off
+            crate::config::read(crate::config::COMPUTE_SCATTER).0,
+            crate::config::Switch::Off
         )
     })
 }

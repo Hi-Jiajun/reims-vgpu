@@ -32,7 +32,7 @@
 //! blocks inside it, so the work that matters is the last handful and not the
 //! last thousand.
 //!
-//! It is deliberately *not* gated behind [`crate::env::DRAW_LOG`]. That switch
+//! It is deliberately *not* gated behind [`crate::config::DRAW_LOG`]. That switch
 //! turns on a per-draw log flood, which is itself a drain cost heavy enough to
 //! change what it measures; this writes seven integers into a fixed array and
 //! prints nothing until something has already gone wrong.

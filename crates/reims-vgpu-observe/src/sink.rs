@@ -62,7 +62,8 @@ pub fn enabled() -> bool {
         // here would recurse into the sink that is being asked whether it is
         // enabled. Such a value reads as off, which is what every
         // non-affirmative value already did.
-        let on = reims_vgpu_env::switch(reims_vgpu_env::DRAW_LOG) == reims_vgpu_env::Switch::On;
+        let on =
+            reims_vgpu_config::switch(reims_vgpu_config::DRAW_LOG) == reims_vgpu_config::Switch::On;
         ENABLED.store(on, Ordering::Relaxed);
     }
     ENABLED.load(Ordering::Relaxed)

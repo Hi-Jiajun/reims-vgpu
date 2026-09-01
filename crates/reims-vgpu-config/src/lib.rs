@@ -1,4 +1,14 @@
-//! Every environment variable this device reads, and the one way they parse.
+//! Operator configuration: every switch this device reads, and the one way they
+//! parse.
+//!
+//! # Configuration, not "the environment"
+//!
+//! The environment is how a switch reaches this process today; it is not what a
+//! switch *is*. What the crate owns is the declaration, the parse and the rule
+//! — a name, a total type for its value, membership in [`ALL`], and the
+//! guarantee below about what an override may do. A second delivery mechanism,
+//! if one ever arrives, is a second reader in front of the same declarations
+//! rather than a second place the set is written down.
 //!
 //! # Why they all live here
 //!

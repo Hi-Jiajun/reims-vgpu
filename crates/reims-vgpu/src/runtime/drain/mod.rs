@@ -4731,9 +4731,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
 
     // Every packet below stamps `stamp_index`, which was read once above, so the
     // whole drain owes one slot one value. See [`PendingStamp`] for why that is
-    // collapsed rather than written per packet, and `env::STAMP_COALESCE` for
+    // collapsed rather than written per packet, and `config::STAMP_COALESCE` for
     // the switch that restores the per-packet arm.
-    let coalesce = crate::env::switch(crate::env::STAMP_COALESCE) != crate::env::Switch::Off;
+    let coalesce =
+        crate::config::switch(crate::config::STAMP_COALESCE) != crate::config::Switch::Off;
     let mut pending = PendingStamp::default();
     // The slot the latch is about, resolved the same way `write_stamp` resolves
     // it, so a wait naming that slot is compared against the same index the

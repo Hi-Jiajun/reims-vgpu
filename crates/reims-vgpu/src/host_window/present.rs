@@ -154,17 +154,17 @@ pub enum WindowMode {
 }
 
 impl WindowMode {
-    /// What [`crate::env::FULLSCREEN`] asks for.
+    /// What [`crate::config::FULLSCREEN`] asks for.
     ///
-    /// The parse is [`crate::env`]'s; what is decided here is what each of its
+    /// The parse is [`crate::config`]'s; what is decided here is what each of its
     /// four answers means for a window. `Unrecognized` is the one worth naming:
     /// an operator who wrote `REIMS_VGPU_FULLSCREEN=yes-please` gets a sized
     /// window, and without a line saying the value was rejected they read that
     /// as the switch not working.
     pub fn requested() -> Self {
-        match crate::env::read(crate::env::FULLSCREEN) {
-            (crate::env::Switch::On, _) => Self::Borderless,
-            (crate::env::Switch::Unrecognized, value) => {
+        match crate::config::read(crate::config::FULLSCREEN) {
+            (crate::config::Switch::On, _) => Self::Borderless,
+            (crate::config::Switch::Unrecognized, value) => {
                 crate::observe::Emit::decline(
                     "host_window_init",
                     &WindowError::FullscreenValue(value.unwrap_or_default()),
@@ -505,7 +505,7 @@ pub enum WindowError {
     /// Presenter attach: the running rail refused to build a presenter for this
     /// surface. The refusal that ends the window, on every platform and rail.
     AttachPresenter(String),
-    /// [`crate::env::FULLSCREEN`] was set to something that is neither an on nor
+    /// [`crate::config::FULLSCREEN`] was set to something that is neither an on nor
     /// an off spelling. The window opens sized; the value is quoted so the
     /// operator can see what the parse rejected. The one variant here that does
     /// not end anything.
@@ -1965,12 +1965,12 @@ mod tests {
             // in this process, and it is removed before the guard drops.
             unsafe {
                 match value {
-                    Some(v) => std::env::set_var(crate::env::FULLSCREEN, v),
-                    None => std::env::remove_var(crate::env::FULLSCREEN),
+                    Some(v) => std::env::set_var(crate::config::FULLSCREEN, v),
+                    None => std::env::remove_var(crate::config::FULLSCREEN),
                 }
             }
             let out = WindowMode::requested();
-            unsafe { std::env::remove_var(crate::env::FULLSCREEN) };
+            unsafe { std::env::remove_var(crate::config::FULLSCREEN) };
             out
         };
         for on in ["1", "on", "true", "yes", "ON", " on "] {

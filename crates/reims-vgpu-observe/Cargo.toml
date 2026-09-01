@@ -21,4 +21,4 @@ testing = []
 # dependency, and both are named by the protocol layer below the device, so
 # anything added here would be added to that layer too.
 [dependencies]
-reims-vgpu-env = { path = "../reims-vgpu-env" }
+reims-vgpu-config = { path = "../reims-vgpu-config" }

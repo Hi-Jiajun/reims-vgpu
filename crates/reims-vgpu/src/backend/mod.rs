@@ -1910,7 +1910,7 @@ impl Rail {
         }
     }
 
-    /// Every rail this crate can name, which is what [`crate::env::RAIL`] is
+    /// Every rail this crate can name, which is what [`crate::config::RAIL`] is
     /// parsed against.
     ///
     /// Deliberately *not* narrowed to the rails a build compiled: an operator
@@ -1952,7 +1952,7 @@ pub enum Compiled {
     Both,
 }
 
-/// What the operator asked for through [`crate::env::RAIL`].
+/// What the operator asked for through [`crate::config::RAIL`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RailRequest {
     /// Nothing set; the device takes its own default.
@@ -2104,18 +2104,18 @@ pub fn selected() -> SelectedBackend {
     *SELECTED.get_or_init(select)
 }
 
-/// What [`crate::env::RAIL`] says, in this module's vocabulary.
+/// What [`crate::config::RAIL`] says, in this module's vocabulary.
 fn requested_rail() -> RailRequest {
-    match crate::env::choice(crate::env::RAIL, &Rail::NAMES) {
-        crate::env::Choice::Unset => RailRequest::Unset,
-        crate::env::Choice::Named(name) => match Rail::from_name(name) {
+    match crate::config::choice(crate::config::RAIL, &Rail::NAMES) {
+        crate::config::Choice::Unset => RailRequest::Unset,
+        crate::config::Choice::Named(name) => match Rail::from_name(name) {
             Some(rail) => RailRequest::Named(rail),
             // Unreachable while `Rail::NAMES` is what was parsed against, and
             // spelled as a value rather than as a panic because nothing here
             // may panic across the QEMU boundary.
             None => RailRequest::Unrecognized(name.to_owned()),
         },
-        crate::env::Choice::Refused(raw) => RailRequest::Unrecognized(raw),
+        crate::config::Choice::Refused(raw) => RailRequest::Unrecognized(raw),
     }
 }
 

@@ -681,12 +681,12 @@ pub fn lazy_writeback_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::LAZY_WRITEBACK);
+        let (state, value) = crate::config::read(crate::config::LAZY_WRITEBACK);
         // Only an explicit `off` narrows to the eager Store. Unset, `on` and an
         // unrecognized value are all the shipping rail, which is what makes
         // `Switch::Unrecognized` — an operator's typo — fail toward the measured
         // default rather than silently selecting the arm it is 45 % slower on.
-        let on = !matches!(state, crate::env::Switch::Off);
+        let on = !matches!(state, crate::config::Switch::Off);
         crate::observe::off(format!(
             "lazy_writeback on={on} switch={state:?} value={}",
             value.unwrap_or_else(|| "<unset>".into())

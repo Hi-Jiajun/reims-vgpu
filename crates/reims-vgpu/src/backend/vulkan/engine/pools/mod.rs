@@ -554,7 +554,7 @@ pub(crate) struct ResourcePools {
     /// ring flushes it first ([`Self::batch_flush`]).
     open_batch: Option<OpenBatch>,
     /// How many draws one command buffer may carry: the topology policy from
-    /// [`batch_default_draws`] unless [`crate::env::BATCH_DRAWS`] narrowed it.
+    /// [`batch_default_draws`] unless [`crate::config::BATCH_DRAWS`] narrowed it.
     ///
     /// A field rather than a read inside [`Self::batch_fit`], because that
     /// function's doc promises it is pure and testable without a device and a
@@ -655,7 +655,7 @@ pub(crate) struct ResourcePools {
 /// and produces a batch that admits draws of the wrong shape.
 ///
 /// Derived `PartialEq` is the *narrowed* join test — the arm
-/// [`crate::env::BATCH_MIXED_TARGETS`]`=off` selects — so the fields it turns on
+/// [`crate::config::BATCH_MIXED_TARGETS`]`=off` selects — so the fields it turns on
 /// cannot drift from the fields the batch carries: adding one here makes it
 /// decide joins without a second edit. The default arm does not compare it at
 /// all; see [`BatchFit`].
@@ -683,7 +683,7 @@ pub(crate) enum BatchFit {
     /// A batch is recording and already holds `BATCH_MAX_DRAWS` draws.
     Full,
     /// A batch is recording on a different [`BatchTarget`], and
-    /// [`crate::env::BATCH_MIXED_TARGETS`] is off.
+    /// [`crate::config::BATCH_MIXED_TARGETS`] is off.
     OtherTarget,
     /// Room in the recording batch: its command buffer and the fence its flush
     /// will submit with.
@@ -2681,8 +2681,8 @@ fn slab_retain_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::SLAB_RETAIN);
-        let on = !matches!(state, crate::env::Switch::Off);
+        let (state, value) = crate::config::read(crate::config::SLAB_RETAIN);
+        let on = !matches!(state, crate::config::Switch::Off);
         crate::observe::off(format!(
             "slab_retain on={on} switch={state:?} value={}",
             value.unwrap_or_else(|| "<unset>".into())
@@ -2920,7 +2920,7 @@ const fn batch_default_draws(
 /// The topology default is not a bound on GPU *time*, and the host kernel
 /// imposes one of those whether or not this device has an opinion: i915 resets
 /// a context that holds its engine past `preempt_timeout_ms`. So the cap is
-/// narrowable from the environment — see [`crate::env::BATCH_DRAWS`] for why
+/// narrowable from the environment — see [`crate::config::BATCH_DRAWS`] for why
 /// that is the lever and what a cap of one buys as an instrument.
 ///
 /// Called only while an uninitialized pool is being attached to its device.
@@ -2928,13 +2928,13 @@ const fn batch_default_draws(
 /// topology is re-read on the draw path.
 fn batch_max_draws(topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology) -> u64 {
     let default = batch_default_draws(topology);
-    let cap = match crate::env::count(crate::env::BATCH_DRAWS, default) {
-        crate::env::Count::Narrowed(n) => n,
-        crate::env::Count::Unset => default,
+    let cap = match crate::config::count(crate::config::BATCH_DRAWS, default) {
+        crate::config::Count::Narrowed(n) => n,
+        crate::config::Count::Unset => default,
         // Fail-visible: a bound the operator asked for and did not get is a
         // silent difference between what a bisect thinks it measured and
         // what ran, which is the one thing an arm must never be.
-        crate::env::Count::Refused(raw) => {
+        crate::config::Count::Refused(raw) => {
             crate::observe::fail(format!(
                 "batch_draws_refused value={raw} ceiling={default} \
                      (a count from 1 to the ceiling narrows the cap; anything \
@@ -4236,7 +4236,7 @@ mod idle_slab_trim_tests {
     /// Fails without the gate: the trim ran on every fired pass, so this would
     /// read `Some(0)` for both arguments.
     ///
-    /// It cannot reach the `off` arm of [`crate::env::SLAB_RETAIN`], which
+    /// It cannot reach the `off` arm of [`crate::config::SLAB_RETAIN`], which
     /// reads the environment through a `OnceLock` shared with every other test
     /// in this binary. That arm is the A/B's, verified on a boot.
     #[test]

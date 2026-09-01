@@ -33,7 +33,8 @@ Persist only the resulting field, layout, lifetime, ordering, or calling-convent
 - `crates/reims-vgpu-contract`: backend-neutral layouts, formats, geometry, page arithmetic, and
   contract refusals.
 - `crates/reims-vgpu-wire`: derived wire views; its nested instructions also apply.
-- `crates/reims-vgpu-env`: the single parse and declaration point for environment switches.
+- `crates/reims-vgpu-config`: the single parse and declaration point for operator switches. An
+  override may only narrow what the device does; it may never widen it.
 - `crates/reims-vgpu-observe`: typed observations and refusals. It describes decisions but does not
   select behavior.
 - `conformance`: native-oracle and guest-visible compatibility cases.
@@ -54,7 +55,7 @@ after the guest may release or reuse resources. Submission is not completion.
 
 Unknown, dropped, rejected, degraded, or unsupported guest work must produce a typed reason on the
 always-on failure channel. Expected not-ready control flow stays quiet. Read environment variables
-only through the environment owner.
+only through the configuration owner.
 
 ## Supported pathways
 

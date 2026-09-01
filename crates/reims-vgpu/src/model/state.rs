@@ -2643,7 +2643,7 @@ pub struct DeviceState {
     /// since the Store that produced it. See
     /// [`crate::runtime::writeback_debt`], which owns every transition.
     ///
-    /// Empty unless [`crate::env::LAZY_WRITEBACK`] is on, and empty on the
+    /// Empty unless [`crate::config::LAZY_WRITEBACK`] is on, and empty on the
     /// `backend-metal` arm, which arms nothing.
     pub pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks,
     /// GVA render target → a hash of the guest physical pages its engine
