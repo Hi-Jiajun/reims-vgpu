@@ -36,8 +36,9 @@
 //!   dimensions, and the byte arithmetic of a tightly-packed image.
 //! - [`sync`] — which opcode is a fence, an event or a barrier, on which rail,
 //!   and what a barrier's scope word names.
-//! - [`segment`] — what a segment-type byte means: which encoder wrote it, and
-//!   which rail its records are read on.
+//! - [`segment`] — what a segment-type byte means: which encoder wrote it and
+//!   which rail its records are read on, and how a command stream divides into
+//!   the segments carrying them.
 //! - [`resource_state`] — what the content-representation records ask for:
 //!   which directive, at which granularity.
 //! - [`info_reply`] — the key/value table an info query is answered with, and
