@@ -35,9 +35,10 @@ use crate::blit::{
     TextureSpan,
 };
 use crate::compute::{ComputeExtent, ComputeOp, ComputeOrigin, DispatchOp};
-use crate::exec::ExecArenas;
+use crate::exec::{ExecArenas, ResolvedOperation};
 use crate::icb::{CommandRange, IcbOp};
 use crate::identity::ResourceId;
+use crate::operation::{classify, OperationClass, OperationHome};
 use crate::pass::{
     Attachment, AttachmentSlot, LoadAction, PassDescriptor, RenderTargetExtent, StoreAction,
     VisibilityResultBuffer,
@@ -48,6 +49,7 @@ use crate::render::{
 };
 use crate::resource_state::{ResourceStateOp, ResourceStateTarget, SliceLevel};
 use crate::sync::{BarrierOp, BarrierTarget, EventOp, FenceOp, ResourceSpan};
+use reims_vgpu_protocol::closure::{self, Rail};
 use reims_vgpu_protocol::decode::blit::{
     BlitRecord, FillPattern as RecordFill, Origin as RecordOrigin, Size as RecordSize,
     TextureEndpoint,
@@ -62,6 +64,7 @@ use reims_vgpu_protocol::decode::render::{
 };
 use reims_vgpu_protocol::decode::resource_state::{RecordTarget, ResourceStateRecord};
 use reims_vgpu_protocol::decode::sync::{BarrierRecord, EventRecord, FenceRecord, SyncRecord};
+use reims_vgpu_protocol::decode::{self, Op};
 use reims_vgpu_protocol::decode::{
     AttachmentPrefix, BufferBind, BufferStrideBind, DecodeRefusal, RefBind, RenderPassBody,
     SamplerLodBind, ScissorRect as WireScissorRect, Viewport as WireViewport,
@@ -988,6 +991,73 @@ pub fn draw(record: &DrawRecord, resolver: &impl RefResolver) -> Result<DrawOp, 
     })
 }
 
+/// Decode and resolve one record, choosing the decoder from the ledger.
+///
+/// # The ledger picks the decoder, so an unjudged opcode never reaches one
+///
+/// The class an opcode belongs to is the ledger's answer, and asking it first
+/// means the dispatch and the admission are the same step. An opcode with no
+/// row, a row the ledger has not settled, and a row it settled as a refusal all
+/// stop here with their own reason — none of them reaches a decoder that might
+/// have lifted a record the model has no use for.
+///
+/// That is also why there is no `rail`-free form: three encoders number their
+/// records independently, and the same opcode is a different record on each.
+///
+/// # An encoder boundary is not a record
+///
+/// Segment framing is the stream's own vocabulary and it reaches
+/// [`crate::exec::ExecBuilder::begin_segment`] rather than this. A boundary
+/// arriving here is a caller mistake rather than a guest one, and it refuses
+/// with a reason that says so instead of being decoded as whatever record its
+/// opcode field happens to hold.
+pub fn operation(
+    rail: Rail,
+    op: &Op<'_>,
+    resolver: &impl RefResolver,
+    arenas: &mut ExecArenas,
+) -> Result<ResolvedOperation, ResolveRefusal> {
+    let opcode = op.opcode();
+    let unjudged = || ResolveRefusal::Decode(decode::no_record(rail, opcode));
+    let Some(row) = closure::find(rail, opcode) else {
+        return Err(unjudged());
+    };
+    let Some(OperationHome::Stream(class)) = classify(row) else {
+        return Err(unjudged());
+    };
+    Ok(match class {
+        OperationClass::Render => {
+            ResolvedOperation::Render(render(&decode::render::decode(op)?, resolver, arenas)?)
+        }
+        OperationClass::Compute => {
+            ResolvedOperation::Compute(compute(&decode::compute::decode(op)?, resolver, arenas)?)
+        }
+        OperationClass::Blit => {
+            ResolvedOperation::Blit(blit(&decode::blit::decode(op)?, resolver)?)
+        }
+        OperationClass::Event | OperationClass::Fence | OperationClass::Barrier => {
+            match sync(&decode::sync::decode(rail, op)?, resolver, arenas)? {
+                SyncResolved::Fence(o) => ResolvedOperation::Fence(o),
+                SyncResolved::Event(o) => ResolvedOperation::Event(o),
+                SyncResolved::Barrier(o) => ResolvedOperation::Barrier(o),
+            }
+        }
+        OperationClass::ResourceState => ResolvedOperation::ResourceState(resource_state(
+            &decode::resource_state::decode(rail, op)?,
+            resolver,
+        )?),
+        OperationClass::IndirectCommand => {
+            ResolvedOperation::IndirectCommand(icb(&decode::icb::decode(rail, op)?, resolver)?)
+        }
+        // A boundary is the segment, an info query has a reply destination
+        // rather than an encoder, and the completion class has no record at all.
+        // None of the three is a stream record to decode here.
+        OperationClass::EncoderBoundary
+        | OperationClass::InfoQuery
+        | OperationClass::CompletionEffect => return Err(unjudged()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1663,6 +1733,172 @@ mod tests {
             RenderOp::WriteDescriptor {
                 descriptor: PassDescriptorSlot(1)
             }
+        );
+    }
+
+    /// Frame a record the way the serializer frames one.
+    fn framed(opcode: u32, payload: &[u8]) -> Vec<u8> {
+        let total = (reims_vgpu_protocol::decode::OP_HEADER_LEN + payload.len()) as u32;
+        let mut out = Vec::with_capacity(total as usize);
+        out.extend_from_slice(&opcode.to_le_bytes());
+        out.extend_from_slice(&total.to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A resolver that answers every ref, so a record's failure to resolve is
+    /// never about a missing object.
+    struct Everything;
+
+    impl RefResolver for Everything {
+        fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+            Some(ResourceId {
+                slot: ObjectListRef(object_ref),
+                generation: SlotGeneration(7),
+            })
+        }
+    }
+
+    /// **Every judged stream operation in the ledger resolves**, and lands in
+    /// the class the ledger put it in.
+    ///
+    /// This is the property the whole decode-and-resolve path exists to have:
+    /// the model can represent everything the ledger says the device does.
+    /// Driven off the ledger rather than a written list, so an operation judged
+    /// without a path here fails on the row that judged it.
+    ///
+    /// The payload is zero-filled and long enough for the widest body. That
+    /// makes every count zero and every ordinal the API's first value, which is
+    /// exactly what this test wants: it is asking whether a path exists, not
+    /// what a particular guest sent. The per-rail tests are where the fields
+    /// are pinned.
+    #[test]
+    fn every_judged_stream_operation_resolves_into_its_own_class() {
+        use reims_vgpu_protocol::closure::LEDGER;
+
+        let payload = [0u8; 1024];
+        let mut seen = 0usize;
+        let mut refused = 0usize;
+        for row in LEDGER {
+            let Some(opcode) = row.opcode else {
+                continue;
+            };
+            let Some(OperationHome::Stream(class)) = classify(row) else {
+                continue;
+            };
+            // The three classes with no stream record to decode. Their absence
+            // is asserted below rather than skipped silently.
+            if matches!(
+                class,
+                OperationClass::EncoderBoundary
+                    | OperationClass::InfoQuery
+                    | OperationClass::CompletionEffect
+            ) {
+                continue;
+            }
+            // One record's length is exact rather than a minimum: the
+            // compressed-reinterpretation flush's selector takes no argument,
+            // so a payload means the bytes are not that record. Every other
+            // body is a fixed shape a longer buffer merely contains.
+            let body: &[u8] = if opcode
+                == reims_vgpu_protocol::resource_state::OPCODE_COMPRESSED_REINTERPRETATION_FLUSH
+                && row.rail == Rail::Compute
+            {
+                &[]
+            } else {
+                &payload
+            };
+            let bytes = framed(opcode, body);
+            let view = reims_vgpu_protocol::decode::op(&bytes, 0).expect("framed");
+            let mut arenas = ExecArenas::default();
+            // A row the ledger settled as a refusal is judged and still must
+            // not become an operation. It refuses by that name, which is what
+            // keeps a closed decision from reading as an open one.
+            if matches!(
+                row.closure,
+                reims_vgpu_protocol::closure::Closure::Refused { .. }
+            ) {
+                assert_eq!(
+                    operation(row.rail, &view, &Everything, &mut arenas),
+                    Err(ResolveRefusal::Decode(DecodeRefusal::RefusedByContract {
+                        rail: row.rail,
+                        opcode,
+                    })),
+                    "{:?} {opcode:#x}",
+                    row.rail
+                );
+                refused += 1;
+                continue;
+            }
+            seen += 1;
+            let resolved = operation(row.rail, &view, &Everything, &mut arenas)
+                .unwrap_or_else(|e| panic!("{:?} {opcode:#x} did not resolve: {e:?}", row.rail));
+            assert_eq!(
+                resolved.class(),
+                class,
+                "{:?} {opcode:#x} landed in the wrong class",
+                row.rail
+            );
+        }
+        // The census the vocabulary prints is 101 stream operations. Six of
+        // them carry no opcode at all — the four `beginSegment:` boundaries,
+        // and the blit `withCommand:` selectors that write their command
+        // argument into the record's opcode field, so they *are* whichever
+        // opcode they emitted. Neither shape is dispatched by opcode, so
+        // neither reaches this path, and 95 is what remains.
+        //
+        // Two of those 95 are settled refusals, counted apart rather than
+        // folded into either total: a refusal that reads as an unwritten path
+        // would send someone to write it.
+        assert_eq!(seen + refused, 95);
+        assert_eq!(refused, 2);
+    }
+
+    /// An opcode the ledger has never heard of stops at the dispatcher, and an
+    /// unresolved one stops there too — neither reaches a decoder that might
+    /// have lifted a record the model has no use for.
+    #[test]
+    fn an_unjudged_opcode_never_reaches_a_decoder() {
+        let bytes = framed(0x7fff, &[0u8; 32]);
+        let view = reims_vgpu_protocol::decode::op(&bytes, 0).expect("framed");
+        let mut arenas = ExecArenas::default();
+        assert_eq!(
+            operation(Rail::Render, &view, &Everything, &mut arenas),
+            Err(ResolveRefusal::Decode(DecodeRefusal::UnknownOpcode {
+                rail: Rail::Render,
+                opcode: 0x7fff,
+            }))
+        );
+
+        // A residency opcode: the layout is derived and the row is not settled.
+        let bytes = framed(0x86, &[0u8; 32]);
+        let view = reims_vgpu_protocol::decode::op(&bytes, 0).expect("framed");
+        assert_eq!(
+            operation(Rail::Render, &view, &Everything, &mut arenas),
+            Err(ResolveRefusal::Decode(DecodeRefusal::Unjudged {
+                rail: Rail::Render,
+                opcode: 0x86,
+            }))
+        );
+    }
+
+    /// A ledger row settled as a refusal keeps its own reason through the
+    /// dispatcher. It is not an open question and must not be reported as one.
+    #[test]
+    fn a_refused_row_keeps_its_reason_through_the_dispatcher() {
+        let mut payload = 7u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&5u64.to_le_bytes());
+        payload.extend_from_slice(&42u32.to_le_bytes());
+        let opcode = reims_vgpu_protocol::sync::OPCODE_WAIT_EVENT_TIMEOUT;
+        let bytes = framed(opcode, &payload);
+        let view = reims_vgpu_protocol::decode::op(&bytes, 0).expect("framed");
+        let mut arenas = ExecArenas::default();
+        assert_eq!(
+            operation(Rail::Event, &view, &Everything, &mut arenas),
+            Err(ResolveRefusal::Decode(DecodeRefusal::RefusedByContract {
+                rail: Rail::Event,
+                opcode,
+            }))
         );
     }
 

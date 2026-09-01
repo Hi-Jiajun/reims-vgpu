@@ -41,7 +41,7 @@ use crate::closure::Rail;
 /// the wire comes through the layer that assigned the meaning. An element type
 /// is a layout with no meaning of its own; which table it fills and what a slot
 /// means is decided by the record carrying it, and that decision is made here.
-pub use reims_vgpu_wire::op::Op;
+pub use reims_vgpu_wire::op::{op, Op, OP_HEADER_LEN};
 pub use reims_vgpu_wire::ops::render::{
     BufferBind, BufferStrideBind, RefBind, SamplerLodBind, ScissorRect, Viewport,
 };
@@ -175,7 +175,7 @@ impl DecodeRefusal {
 /// deliberate refusal back on the work queue every time someone read the logs,
 /// and it would let a genuinely open contract hide behind "we meant to do
 /// that".
-pub(crate) fn no_record(rail: Rail, opcode: u32) -> DecodeRefusal {
+pub fn no_record(rail: Rail, opcode: u32) -> DecodeRefusal {
     match crate::closure::find(rail, opcode).map(|row| row.closure) {
         Some(crate::closure::Closure::Refused { .. }) => {
             DecodeRefusal::RefusedByContract { rail, opcode }
