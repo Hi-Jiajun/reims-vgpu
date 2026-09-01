@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod access;
+pub mod bind;
 pub mod blit;
 pub mod compute;
 pub mod content;
@@ -33,6 +34,7 @@ pub mod pass;
 pub mod pipeline;
 pub mod range_set;
 pub mod ready;
+pub mod render;
 pub mod resource_state;
 pub mod session;
 pub mod stream;
