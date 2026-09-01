@@ -45,15 +45,23 @@ use crate::pass::PassDescriptor;
 use crate::render::{RenderOp, ScissorRect, Viewport};
 use crate::resource_state::ResourceStateOp;
 use crate::stream::{
-    EncoderBoundary, SegmentBegin, SegmentEnd, SegmentKind, SegmentLifetime, SegmentOpening,
-    StreamCursor, StreamPosition, StreamRefusal,
+    SegmentBegin, SegmentEnd, SegmentKind, SegmentLifetime, SegmentOpening, StreamCursor,
+    StreamPosition, StreamRefusal,
 };
 use crate::sync::{BarrierOp, EventOp, FenceOp};
 
 /// One resolved operation, in the class the vocabulary put it in.
+///
+/// Eight variants for eleven [`OperationClass`]es, and the three missing ones
+/// are missing because they are not records inside an encoder. A boundary *is*
+/// the encoder — [`ExecBuilder::begin_encoder`] and [`ExecBuilder::end_segment`]
+/// are how one enters a transaction, and [`ResolvedStream::begin`] is where its
+/// opening is kept — so a boundary payload here would be a second
+/// representation of the same fact, one that could be recorded at a position
+/// *inside* the encoder it opens. An info query answers into a reply buffer
+/// rather than an encoder, and the completion class has no record at all.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ResolvedOperation {
-    EncoderBoundary(EncoderBoundary),
     Render(RenderOp),
     Compute(ComputeOp),
     Blit(BlitOp),
@@ -74,7 +82,6 @@ impl ResolvedOperation {
     #[must_use]
     pub const fn class(&self) -> OperationClass {
         match self {
-            Self::EncoderBoundary(_) => OperationClass::EncoderBoundary,
             Self::Render(_) => OperationClass::Render,
             Self::Compute(_) => OperationClass::Compute,
             Self::Blit(_) => OperationClass::Blit,
@@ -110,7 +117,6 @@ impl ResolvedOperation {
             | Self::Compute(ComputeOp::SetPipeline { pipeline }) => Some(*pipeline),
             Self::Render(_)
             | Self::Compute(_)
-            | Self::EncoderBoundary(_)
             | Self::Blit(_)
             | Self::Event(_)
             | Self::Fence(_)
@@ -151,7 +157,6 @@ impl ResolvedOperation {
     /// hottest path this crate has.
     pub fn participations(&self, arenas: &ExecArenas, out: &mut Vec<Participation>) {
         match self {
-            Self::EncoderBoundary(op) => out.extend(op.participations()),
             Self::Render(op) => {
                 out.extend(op.participations());
                 if let RenderOp::WriteDescriptor { descriptor } = op {
@@ -619,7 +624,7 @@ impl ExecBuilder {
     /// transaction with its remaining records landing nowhere.
     pub fn end_segment(&mut self) -> Result<SegmentEnd, StreamRefusal> {
         let end = self.cursor.end()?;
-        if matches!(end, SegmentEnd::EncoderEnded(_)) {
+        if matches!(end, SegmentEnd::EncoderEnded { .. }) {
             self.streams
                 .push(self.open.take().expect("an encoder was open"));
         }
@@ -696,6 +701,8 @@ fn rail_of(op: &ResolvedOperation) -> Option<reims_vgpu_protocol::closure::Rail>
         OperationClass::Blit => Rail::Blit,
         OperationClass::Event => Rail::Event,
         OperationClass::InfoQuery => Rail::Info,
+        // A boundary is the segment rather than a record inside one, so no
+        // payload of this class exists to reach here.
         OperationClass::EncoderBoundary
         | OperationClass::Fence
         | OperationClass::Barrier
@@ -740,15 +747,16 @@ fn admissible_on(op: &ResolvedOperation, kind: SegmentKind) -> bool {
 /// test is what says the table still describes the contract.
 const fn class_admissible_on(class: OperationClass, kind: SegmentKind) -> bool {
     match class {
-        // A boundary is the segment. Every encoder has one.
-        OperationClass::EncoderBoundary => true,
         OperationClass::Fence => matches!(kind, SegmentKind::Render | SegmentKind::Blit),
         OperationClass::Barrier => matches!(kind, SegmentKind::Render | SegmentKind::Compute),
         OperationClass::ResourceState => matches!(kind, SegmentKind::Blit | SegmentKind::Compute),
         OperationClass::IndirectCommand => matches!(kind, SegmentKind::Render | SegmentKind::Blit),
-        // The single-rail classes never reach here, and the two classes with no
-        // stream records at all reach nothing.
-        OperationClass::Render
+        // The single-rail classes never reach here, and the three classes with
+        // no stream records at all reach nothing. A boundary is the segment
+        // rather than a record inside one: which encoders it may open is
+        // [`StreamCursor`]'s answer, not this table's.
+        OperationClass::EncoderBoundary
+        | OperationClass::Render
         | OperationClass::Compute
         | OperationClass::Blit
         | OperationClass::Event
@@ -941,7 +949,9 @@ mod tests {
                         )
                 });
                 // A single-rail class is admitted by its own rail rather than
-                // by this table, and the boundary is the segment itself.
+                // by this table, and the boundary is the segment itself: the
+                // ledger has boundary rows on every rail and none of them is a
+                // record this table can admit.
                 let single_rail = matches!(
                     class,
                     OperationClass::Render
@@ -986,7 +996,7 @@ mod tests {
             let admitted = SegmentKind::ALL
                 .iter()
                 .any(|&kind| class_admissible_on(class, kind));
-            if !admitted || matches!(class, OperationClass::EncoderBoundary) {
+            if !admitted {
                 continue;
             }
             assert!(
@@ -1259,13 +1269,6 @@ mod tests {
             &arenas
         )
         .is_empty());
-        // A boundary names nothing.
-        assert!(ask(
-            ResolvedOperation::EncoderBoundary(EncoderBoundary::End { records: 0 }),
-            &arenas
-        )
-        .is_empty());
-
         // A transfer names its operand.
         let blit = ask(a_blit(), &arenas);
         assert_eq!(blit.len(), 1);

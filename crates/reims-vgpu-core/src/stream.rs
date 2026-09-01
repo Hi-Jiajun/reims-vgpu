@@ -2,13 +2,19 @@
 //!
 //! # The boundary is the first payload type, because everything else sits in it
 //!
-//! [`crate::operation`] names eleven classes of resolved operation. Ten of them
-//! are records; the eleventh — `EncoderBoundary` — is the thing that says which
-//! encoder those records belong to and in what order they run. It has to be
-//! first: a `Render` payload with no encoder is a draw with no pass, and a
-//! vocabulary that resolves draws before it resolves the encoder they sit in
-//! would have to discover the encoder later, from position, which is exactly
+//! [`crate::operation`] names eleven classes of resolved operation. Eight of
+//! them are records inside an encoder; the boundary class is the thing that
+//! says which encoder those records belong to and in what order they run. It
+//! has to be first: a `Render` payload with no encoder is a draw with no pass,
+//! and a vocabulary that resolves draws before it resolves the encoder they sit
+//! in would have to discover the encoder later, from position, which is exactly
 //! the "resolve twice" shape the replacement exists to remove.
+//!
+//! Being first is also why it has no payload type. A boundary opens or closes
+//! an encoder, and this module's state machine is where that happens — so the
+//! opening lives on [`crate::exec::ResolvedStream`] and the close is a
+//! [`SegmentEnd`], not a [`crate::exec::ResolvedOperation`] a caller could
+//! record at a position *inside* the encoder it opens.
 //!
 //! # A segment type is parsed once, and not here
 //!
@@ -79,36 +85,6 @@ impl SegmentBegin {
     #[must_use]
     pub fn demands_protection(&self) -> bool {
         self.protection.is_some_and(|p| !p.is_none())
-    }
-}
-
-/// The `EncoderBoundary` class's payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum EncoderBoundary {
-    /// An encoder opened.
-    Begin(SegmentBegin),
-    /// An encoder ended, having recorded this many records.
-    ///
-    /// The count is the model's, not the wire's: the wire fills in a byte
-    /// length at `-endEncoding` and says nothing about how many records it
-    /// covered. A count the model derived is checkable against a re-walk;
-    /// a length copied from the header is not.
-    ///
-    /// It counts the *encoder*, not the segment. An encoder that spanned three
-    /// segments reports all of its records once, here, at the end of the third.
-    End { records: u32 },
-}
-
-impl EncoderBoundary {
-    /// The memory this record names: none.
-    ///
-    /// A boundary opens or closes an encoder. It is here, answering the same
-    /// question every other operation class answers, so that "touches nothing"
-    /// is a claim this type makes rather than a case the aggregation in
-    /// [`crate::exec::ResolvedOperation::participations`] has to know to skip.
-    #[must_use]
-    pub const fn participations(&self) -> crate::access::Participations {
-        crate::access::Participations::NONE
     }
 }
 
@@ -235,8 +211,16 @@ pub enum SegmentOpening {
 /// What ending a segment did to the encoder inside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SegmentEnd {
-    /// The encoder ended with the segment.
-    EncoderEnded(EncoderBoundary),
+    /// The encoder ended with the segment, having recorded this many records.
+    ///
+    /// The count is the model's, not the wire's: the wire fills in a byte
+    /// length at `-endEncoding` and says nothing about how many records it
+    /// covered. A count the model derived is checkable against a re-walk;
+    /// a length copied from the header is not.
+    ///
+    /// It counts the *encoder*, not the segment. An encoder that spanned three
+    /// segments reports all of its records once, here, at the end of the third.
+    EncoderEnded { records: u32 },
     /// The segment ended and its encoder did not, having recorded this many
     /// records so far. The next segment may continue it — and must, or the
     /// encoder is abandoned.
@@ -451,7 +435,7 @@ impl StreamCursor {
             return Ok(SegmentEnd::EncoderHeld { records });
         }
         self.phase = Phase::Closed;
-        Ok(SegmentEnd::EncoderEnded(EncoderBoundary::End { records }))
+        Ok(SegmentEnd::EncoderEnded { records })
     }
 
     /// The stream is over. Anything still open or still armed is a refusal.
@@ -533,20 +517,10 @@ mod tests {
             .expect("open");
         let a = c.record(Rail::Render).expect("rec");
         let b = c.record(Rail::Render).expect("rec");
-        assert_eq!(
-            c.end(),
-            Ok(SegmentEnd::EncoderEnded(EncoderBoundary::End {
-                records: 2
-            }))
-        );
+        assert_eq!(c.end(), Ok(SegmentEnd::EncoderEnded { records: 2 }));
         c.begin(SegmentKind::Blit.wire_type(), SELF).expect("open");
         let d = c.record(Rail::Blit).expect("rec");
-        assert_eq!(
-            c.end(),
-            Ok(SegmentEnd::EncoderEnded(EncoderBoundary::End {
-                records: 1
-            }))
-        );
+        assert_eq!(c.end(), Ok(SegmentEnd::EncoderEnded { records: 1 }));
         assert_eq!(c.finish(), Ok(2));
 
         assert!(a < b && b < d);
@@ -657,9 +631,7 @@ mod tests {
         let d = c.record(Rail::Blit).expect("rec");
         assert_eq!(
             c.end(),
-            Ok(SegmentEnd::EncoderEnded(EncoderBoundary::End {
-                records: 3
-            })),
+            Ok(SegmentEnd::EncoderEnded { records: 3 }),
             "the count is the encoder's, not the last segment's"
         );
         assert_eq!(c.finish(), Ok(3));
@@ -754,12 +726,7 @@ mod tests {
         // This one takes the offer and makes none.
         c.begin(SegmentKind::Blit.wire_type(), TAKES)
             .expect("continue");
-        assert_eq!(
-            c.end(),
-            Ok(SegmentEnd::EncoderEnded(EncoderBoundary::End {
-                records: 0
-            }))
-        );
+        assert_eq!(c.end(), Ok(SegmentEnd::EncoderEnded { records: 0 }));
         assert_eq!(
             c.begin(SegmentKind::Blit.wire_type(), TAKES),
             Err(StreamRefusal::ContinuationWithoutEncoder(SegmentKind::Blit))

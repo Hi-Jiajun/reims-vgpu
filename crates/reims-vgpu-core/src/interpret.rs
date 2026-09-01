@@ -592,8 +592,7 @@ impl Interpreter {
             // A barrier orders nothing in a schedule that is already serial, a
             // content directive is answered by whatever placement an executor
             // chose, and a draw's memory effect is its declared participation.
-            ResolvedOperation::EncoderBoundary(_)
-            | ResolvedOperation::Render(_)
+            ResolvedOperation::Render(_)
             | ResolvedOperation::Compute(_)
             | ResolvedOperation::Blit(_)
             | ResolvedOperation::Barrier(_)
