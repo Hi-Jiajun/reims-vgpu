@@ -1352,6 +1352,53 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
     })
 }
 
+/// Which of `VkClearColorValue`'s three members a format's clear value is.
+///
+/// The guest always sends four `double`s: `MTLClearColor` has no other form,
+/// and Metal itself interprets them by the attachment's format. Vulkan does
+/// not — a clear colour written into the float member of the union for an
+/// integer attachment is read as a bit pattern, and the attachment clears to
+/// garbage that no later stage can attribute.
+///
+/// The integer formats are enumerated and everything else is
+/// [`ClearClass::Float`], because that is the shape of the rule: unorm, snorm,
+/// srgb and float texels all take a float clear, so the list is of the
+/// exception rather than of the majority.
+#[must_use]
+pub const fn clear_class(format: u16) -> ClearClass {
+    match format {
+        MTL_FORMAT_RG16_SINT | MTL_FORMAT_R32_SINT | MTL_FORMAT_RGBA8_SINT => ClearClass::Sint,
+        MTL_FORMAT_R8_UINT
+        | MTL_FORMAT_RG8_UINT
+        | MTL_FORMAT_RG16_UINT
+        | MTL_FORMAT_R32_UINT
+        | MTL_FORMAT_RGBA8_UINT
+        | MTL_FORMAT_RGB10A2_UINT
+        | MTL_FORMAT_RGBA16_UINT
+        | MTL_FORMAT_RGBA32_UINT => ClearClass::Uint,
+        _ => ClearClass::Float,
+    }
+}
+
+/// How a clear colour's four components are to be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ClearClass {
+    Float,
+    Uint,
+    Sint,
+}
+
+impl ClearClass {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Float => "float",
+            Self::Uint => "uint",
+            Self::Sint => "sint",
+        }
+    }
+}
+
 /// Whether `format` has a depth plane (for `MTLBlitOptionDepthFromDepthStencil`).
 pub fn format_has_depth_aspect(format: u16) -> bool {
     matches!(
@@ -5646,5 +5693,47 @@ mod compile_time_tables {
                 "{value} -> half {half:#06x} -> back"
             );
         }
+    }
+
+    #[test]
+    fn only_the_integer_formats_take_an_integer_clear() {
+        use super::{clear_class, ClearClass};
+        for format in [
+            MTL_FORMAT_R8_UINT,
+            MTL_FORMAT_RG8_UINT,
+            MTL_FORMAT_RG16_UINT,
+            MTL_FORMAT_R32_UINT,
+            MTL_FORMAT_RGBA8_UINT,
+            MTL_FORMAT_RGB10A2_UINT,
+            MTL_FORMAT_RGBA16_UINT,
+            MTL_FORMAT_RGBA32_UINT,
+        ] {
+            assert_eq!(clear_class(format), ClearClass::Uint, "{format:#x}");
+        }
+        for format in [
+            MTL_FORMAT_RG16_SINT,
+            MTL_FORMAT_R32_SINT,
+            MTL_FORMAT_RGBA8_SINT,
+        ] {
+            assert_eq!(clear_class(format), ClearClass::Sint, "{format:#x}");
+        }
+        // Unorm, srgb, float and depth all take a float clear, which is why
+        // the enumeration above is of the exception.
+        for format in [
+            MTL_FORMAT_RGBA8_UNORM,
+            MTL_FORMAT_BGRA8_UNORM,
+            MTL_FORMAT_RGBA16_FLOAT,
+            MTL_FORMAT_RGBA32_FLOAT,
+            MTL_FORMAT_DEPTH32_FLOAT,
+            MTL_FORMAT_RG16_UNORM,
+        ] {
+            assert_eq!(clear_class(format), ClearClass::Float, "{format:#x}");
+        }
+        // A signed integer format must not be answered as unsigned: the union
+        // member differs and the clear would be read as a bit pattern.
+        assert_ne!(
+            clear_class(MTL_FORMAT_RGBA8_SINT),
+            clear_class(MTL_FORMAT_RGBA8_UINT)
+        );
     }
 }

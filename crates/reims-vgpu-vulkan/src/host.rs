@@ -443,6 +443,7 @@ unsafe fn judge(
     let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
     let mut descriptor_buffer = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
     let mut synchronization2 = vk::PhysicalDeviceSynchronization2Features::default();
+    let mut dynamic_rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default();
     let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan12);
     if has(extension::MESH_SHADER) {
         features = features.push_next(&mut mesh);
@@ -452,6 +453,9 @@ unsafe fn judge(
     }
     if has(extension::SYNCHRONIZATION_2) {
         features = features.push_next(&mut synchronization2);
+    }
+    if has(extension::DYNAMIC_RENDERING) {
+        features = features.push_next(&mut dynamic_rendering);
     }
     unsafe { instance.get_physical_device_features2(physical, &mut features) };
 
@@ -481,6 +485,7 @@ unsafe fn judge(
         extensions: &names,
         timeline_semaphore: vulkan12.timeline_semaphore == vk::TRUE,
         synchronization2: synchronization2.synchronization2 == vk::TRUE,
+        dynamic_rendering: dynamic_rendering.dynamic_rendering == vk::TRUE,
         mesh_shader: mesh.mesh_shader == vk::TRUE,
         descriptor_buffer: descriptor_buffer.descriptor_buffer == vk::TRUE,
         max_push_descriptors: push.max_push_descriptors,
@@ -513,6 +518,7 @@ mod tests {
             extensions: &[extension::SWAPCHAIN],
             timeline_semaphore: true,
             synchronization2: false,
+            dynamic_rendering: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,
@@ -731,6 +737,7 @@ mod tests {
             extensions: &[extension::SWAPCHAIN],
             timeline_semaphore: true,
             synchronization2: false,
+            dynamic_rendering: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,

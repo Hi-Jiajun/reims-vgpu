@@ -213,6 +213,18 @@ pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 /// differs (command-buffer state versus an allocated set).
 pub const PUSH_DESCRIPTORS: &str = "REIMS_VGPU_PUSH_DESCRIPTORS";
 
+/// `off` keeps a render pass on the `VkRenderPass`/`VkFramebuffer` path even
+/// where the device has dynamic rendering.
+///
+/// Narrowing-only, like [`PUSH_DESCRIPTORS`]: it cannot enable dynamic
+/// rendering on a device without it, because the rung below is Vulkan 1.0 and
+/// there is nothing above the one it names. The two arms describe the same
+/// attachments, their operations and their clear values; what differs is
+/// whether a render-pass object and a framebuffer exist at all — which is the
+/// only way to attribute a wrong frame to one carrier rather than the other on
+/// one host.
+pub const DYNAMIC_RENDERING: &str = "REIMS_VGPU_DYNAMIC_RENDERING";
+
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 

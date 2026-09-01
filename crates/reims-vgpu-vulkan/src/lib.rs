@@ -54,6 +54,8 @@
 //!   the guest's stages this host has no equivalent for.
 //! - [`mipmap`] — the blit ladder that fills a texture's mip chain, and the
 //!   layout each rung has to be in before the next one reads it.
+//! - [`pass`] — what a render-pass descriptor becomes here: its attachments,
+//!   their operations, and the clear values read the way the format says.
 //! - [`placement`] — where a resource's bytes live, decided in one order from
 //!   the guest's declaration and this host's measured capabilities.
 //! - [`pools`] — one command pool per worker, and the rule that a command
@@ -93,6 +95,7 @@ pub mod image;
 pub mod layout;
 pub mod memory;
 pub mod mipmap;
+pub mod pass;
 pub mod placement;
 pub mod pools;
 pub mod queues;

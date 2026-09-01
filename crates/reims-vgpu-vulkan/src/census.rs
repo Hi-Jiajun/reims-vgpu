@@ -102,6 +102,7 @@ pub mod extension {
     pub const SWAPCHAIN: &str = "VK_KHR_swapchain";
     /// Carries `maxBufferSize`, which 1.3 promoted to core.
     pub const MAINTENANCE_4: &str = "VK_KHR_maintenance4";
+    pub const DYNAMIC_RENDERING: &str = "VK_KHR_dynamic_rendering";
 }
 
 /// What the driver said, as the caller read it off the device.
@@ -122,6 +123,8 @@ pub struct Reported<'a> {
     pub timeline_semaphore: bool,
     /// `VkPhysicalDeviceSynchronization2Features::synchronization2`.
     pub synchronization2: bool,
+    /// `VkPhysicalDeviceDynamicRenderingFeatures::dynamicRendering`.
+    pub dynamic_rendering: bool,
     /// `VkPhysicalDeviceMeshShaderFeaturesEXT::meshShader`.
     pub mesh_shader: bool,
     /// `VkPhysicalDeviceDescriptorBufferFeaturesEXT::descriptorBuffer`.
@@ -259,6 +262,7 @@ pub struct Census {
     queues: QueueChoice,
     stages: StageSupport,
     descriptors: DescriptorCell,
+    passes: crate::pass::PassCell,
     buffers: crate::buffer::BufferLimits,
     host_pointer_import: bool,
     synchronization2: bool,
@@ -316,6 +320,12 @@ impl Census {
                 descriptor_buffer,
                 // Never reported by a driver. See [`DescriptorBufferProbe`].
                 descriptor_buffer_qualified: false,
+            },
+            // Core from 1.3, and both halves below it — for the reason
+            // `synchronization2` needs both.
+            passes: crate::pass::PassCell {
+                dynamic_rendering: api.at_least(1, 3)
+                    || (reported.has(extension::DYNAMIC_RENDERING) && reported.dynamic_rendering),
             },
             buffers: crate::buffer::BufferLimits {
                 max_buffer_size: reported.max_buffer_size,
@@ -388,6 +398,12 @@ impl Census {
     #[must_use]
     pub const fn descriptors(&self) -> DescriptorCell {
         self.descriptors
+    }
+
+    /// The cell [`crate::pass::select`] chooses a carrier from.
+    #[must_use]
+    pub const fn passes(&self) -> crate::pass::PassCell {
+        self.passes
     }
 
     /// The bound [`crate::buffer::plan`] checks a length against.
@@ -506,6 +522,7 @@ mod tests {
             extensions,
             timeline_semaphore: true,
             synchronization2: false,
+            dynamic_rendering: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,
@@ -853,5 +870,29 @@ mod tests {
         })
         .expect("the baseline");
         assert_eq!(stated.buffers().max_buffer_size, Some(1 << 30));
+    }
+
+    #[test]
+    fn dynamic_rendering_needs_both_halves_below_the_version_that_promoted_it() {
+        let memory = mem::nvidia_discrete();
+        let families = discrete_families();
+        let with = |api: (u32, u32), extensions: &[&str], feature: bool| {
+            Census::take(Reported {
+                dynamic_rendering: feature,
+                ..reported(packed(api.0, api.1), extensions, &memory, &families)
+            })
+            .expect("the baseline")
+            .passes()
+            .dynamic_rendering
+        };
+
+        // 1.3 promoted it, so the extension name is never the question there.
+        assert!(with((1, 3), BASELINE, false));
+        // Below it, the extension alone is not enough and the feature alone is
+        // not either.
+        let named = &[extension::SWAPCHAIN, extension::DYNAMIC_RENDERING];
+        assert!(!with((1, 2), named, false));
+        assert!(!with((1, 2), BASELINE, true));
+        assert!(with((1, 2), named, true));
     }
 }
