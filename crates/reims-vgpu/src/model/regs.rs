@@ -546,13 +546,11 @@ pub const CHILD_OP_DISCARD_RESOURCES: u16 = 0x3f;
 /// command.
 pub const CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN: u16 = 0x40;
 
-/// `CmdDisplayTransaction2_DEPRECATED` (op 6) trailer `[pipe][surface][task]`:
-/// surface id offset. `CmdDisplaySwapMapping` (op 8) is a different command with
-/// a different payload — see `DISPLAY_SWAP_MAPPING`, which is not this offset.
-pub const DISPLAY_TRANSACTION2_SURFACE_ID: usize = 0x04;
-/// `CmdDisplayTransaction3` (op 7) trailer is `[pipe][task][surface][gamma…]`,
-/// so its surface and task words are swapped relative to op 6's.
-pub const DISPLAY_TRANSACTION3_SURFACE_ID: usize = 0x08;
+// The three present commands' trailer offsets and widths live in
+// `reims_vgpu_protocol::present`, which is the layer allowed to say what a wire
+// tag means. They were here, in `drain`'s `display_txn_trailer_slots` and in
+// `drain`'s tests, and the tests read the same table the decoder did — so the
+// one thing a wrong offset would break was the one thing nothing checked.
 
 /// Every child-channel command this device names, with the name a log line and
 /// a ledger row spell it by.
@@ -675,8 +673,9 @@ pub const CHILD_REG_HEAD: u64 = 0x04;
 ///
 /// `drain::child` takes head, tail, stamp index and base PFN out of this block
 /// every doorbell; this word sits between head and stamp index and no product
-/// path touches it. It stays named for the reason [`DISPLAY_SWAP_DISPLAY`]
-/// does — a guest field with no name is the one nobody notices being ignored —
+/// path touches it. It stays named for the reason a present's display index is
+/// decoded rather than skipped — a guest field with no name is the one nobody
+/// notices being ignored —
 /// and because deleting it leaves the block map skipping `0x08` with nothing
 /// saying what lives there, which is how a later offset gets read from the
 /// wrong word.
@@ -743,15 +742,12 @@ pub const SET_OBJECT_LIST_PFN: usize = 0x04;
 pub const SET_OBJECT_LIST_COUNT: usize = 0x08;
 pub const SET_OBJECT_LIST_LEN: usize = 12;
 
-// `CmdDisplaySwapMapping`'s trailer is `[display][_][mapping]`. Only the
-// mapping is read; the display index has no reader here, and it stays named
-// because a decoded guest field with no name is the one nobody notices being
-// ignored. Whether ignoring it is correct is not established — it needs the
-// display count this device advertises, which no boot on this rig has
-// measured. Its own length lives at `display_txn_trailer_len`.
-#[allow(dead_code)] // named on purpose and read by nothing — see above.
-pub const DISPLAY_SWAP_DISPLAY: usize = 0x00;
-pub const DISPLAY_SWAP_MAPPING: usize = 0x08;
+// `CmdDisplaySwapMapping`'s trailer offsets moved to
+// `reims_vgpu_protocol::present` with the other two forms' — see the note above
+// `DISPLAY_SHARED_*`. Its display index is decoded there rather than named and
+// ignored here: whether ignoring it is correct is still not established, and it
+// needs the display count this device advertises, which no boot on this rig has
+// measured.
 
 pub const CHILD_SHARED_STATE_INDEX: usize = 0x00;
 pub const CHILD_SHARED_STATE_PFN: usize = 0x04;

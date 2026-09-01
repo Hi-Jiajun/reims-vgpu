@@ -45,6 +45,8 @@
 //!   the three separate bounds on how much of it may be written.
 //! - [`storage_mode`] — which storage mode a resource declares, and the one
 //!   thing this wire's use of it does not license.
+//! - [`present`] — which of the three present commands a packet is, and where
+//!   its trailer keeps the target it names.
 //! - [`render`] — which render-encoder record an opcode names, the eight draw
 //!   shapes behind its fourteen draw opcodes, and the stage no wire field
 //!   carries.
@@ -125,6 +127,7 @@ pub mod mipmap;
 pub mod packets;
 pub mod pass_action;
 pub mod pixel_format;
+pub mod present;
 pub mod render;
 pub mod residency;
 pub mod resource_state;

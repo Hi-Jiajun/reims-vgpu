@@ -119,18 +119,30 @@ use crate::runtime::host::{FakeHost, HostActionKind};
 /// A display-present packet naming `mapping`.
 ///
 /// The surface id goes at the offset the emitting command's trailer puts it,
-/// read from `display_txn_trailer_slots` — the same table the decoder uses, so a
-/// test cannot pin an offset the product code does not read. The payload is the
+/// read from `reims_vgpu_protocol::present` — the same table the decoder uses,
+/// so a test cannot pin an offset the product code does not read. The payload is the
 /// command's own trailer length and nothing else, which is what the guest sends:
 /// `kb/pvg-display-contract.md` §8.1 measured every op6 payload as trailer-only.
 ///
 /// Every present test built this same eight-field `Packet` by hand; only the
 /// opcode and the named mapping ever differed. A test that varies the payload
 /// length on purpose builds its own rather than calling this.
+/// The overlong alarm, driven the way the present arm drives it: decode the
+/// trailer first, then hand the decode to the alarm. The alarm no longer works
+/// out the trailer width itself — `reims_vgpu_protocol::present` owns that — so
+/// a test that skipped the decode would be testing a call production cannot
+/// make.
+fn note(state: &mut DeviceState, channel_id: u32, packet: &Packet) {
+    let form = PresentForm::of(WireChannel::Child, packet.opcode).expect("a present opcode");
+    let decoded = present_trailer(form, &packet.payload).expect("long enough for its trailer");
+    note_display_txn_payload(state, channel_id, packet, &decoded);
+}
+
 fn present_packet(opcode: u16, mapping: u32) -> Packet {
-    let len = display_txn_trailer_len(opcode);
+    let form = PresentForm::of(WireChannel::Child, opcode).expect("a present opcode");
+    let len = form.trailer_len();
     let mut payload = vec![0u8; len];
-    let off = display_txn_trailer_slots(opcode).0 * 4;
+    let off = form.target_offset();
     payload[off..off + 4].copy_from_slice(&mapping.to_le_bytes());
     Packet {
         opcode,
@@ -1353,9 +1365,9 @@ fn child_drain_yields_after_present_for_display_consumer() {
     assert!(state.map_surface(4));
     assert!(state.set_mapping_geom(4, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
-    let mut payload = vec![0u8; display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION2)];
-    payload[DISPLAY_TRANSACTION2_SURFACE_ID..DISPLAY_TRANSACTION2_SURFACE_ID + 4]
-        .copy_from_slice(&4u32.to_le_bytes());
+    let form = PresentForm::Transaction2;
+    let mut payload = vec![0u8; form.trailer_len()];
+    payload[form.target_offset()..form.target_offset() + 4].copy_from_slice(&4u32.to_le_bytes());
     let first = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 21, &payload);
     let second = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 22, &payload);
     let mut ring = first.clone();
@@ -4094,9 +4106,9 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // Every command at exactly its declared trailer is conformant and silent.
     let quiet = store_route_count("display_txn_payload_overlong");
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x0c));
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION3, 0x24));
-    note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 0x0c));
+    note(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x0c));
+    note(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION3, 0x24));
+    note(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 0x0c));
     assert_eq!(
         store_route_count("display_txn_payload_overlong"),
         quiet,
@@ -4106,7 +4118,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // A payload past the trailer is the one thing that falsifies the decode.
     for _ in 0..8 {
-        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 64));
+        note(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 64));
     }
     assert_eq!(
         store_route_count("display_txn_payload_overlong"),
@@ -4121,7 +4133,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // The gamma variant's trailer is larger, so 0x24 is conformant there while
     // the same length would be overlong for op6 - the sizes are per command.
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x24));
+    note(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x24));
     assert_eq!(
         state.display.txn_payload_samples.len(),
         2,
@@ -4158,7 +4170,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     let mut body = vec![0u8; 12];
     body.extend((0..28u8).map(|i| 0xa0 + i));
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, body));
+    note(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, body));
     let lines = cap.lines();
     let line = lines
         .iter()
@@ -4191,7 +4203,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     // op6 does serialize a transaction, so the plane-list reading is its own
     // and must survive. Same alarm, different explanation.
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(
+    note(
         &mut state,
         5,
         &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]),
@@ -4210,7 +4222,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     // The dump is bounded: the length is guest-controlled, so a pathological
     // payload must not turn one latched line into an unbounded one.
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(
+    note(
         &mut state,
         5,
         &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![0u8; 4096]),
@@ -4229,95 +4241,6 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
         "a guest-sized payload must not produce a guest-sized log line: {}",
         line.len()
     );
-}
-
-/// The gamma command swaps the surface id and the task field relative to the
-/// plain one.
-///
-/// Both words are u32s in adjacent slots, so reading them at the wrong offsets
-/// still yields plausible-looking values — the probe would key its budget on the
-/// surface id and re-arm every frame, and the emitted `task=` would be a surface
-/// id. Nothing downstream would report an error.
-#[test]
-fn display_txn_trailer_slots_follow_the_emitting_command() {
-    // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
-    assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_DISPLAY_TRANSACTION2),
-        (1, Some(2))
-    );
-    // command 7: [pipe][task][surface][gamma…] — the two are swapped.
-    assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_DISPLAY_TRANSACTION3),
-        (2, Some(1))
-    );
-    // command 8 `CmdDisplaySwapMapping` is not a transaction at all: it names
-    // one mapping, at DISPLAY_SWAP_MAPPING (0x08) = slot 2, and carries no task
-    // word. Borrowing op6's (1, 2) here would make the census report the
-    // unidentified middle word as the surface and the mapping as a task.
-    assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_DISPLAY_SWAP),
-        (DISPLAY_SWAP_MAPPING / 4, None)
-    );
-    // The present path reads the same field the census does, for every command.
-    for (op, off) in [
-        (
-            CHILD_OP_DISPLAY_TRANSACTION2,
-            DISPLAY_TRANSACTION2_SURFACE_ID,
-        ),
-        (
-            CHILD_OP_DISPLAY_TRANSACTION3,
-            DISPLAY_TRANSACTION3_SURFACE_ID,
-        ),
-        (CHILD_OP_DISPLAY_SWAP, DISPLAY_SWAP_MAPPING),
-    ] {
-        let mut p = vec![0u8; display_txn_trailer_len(op)];
-        p[off..off + 4].copy_from_slice(&0x5eu32.to_le_bytes());
-        assert_eq!(present_surface_id(op, &p), Some(0x5e), "op {op:#x}");
-        // One byte short of the command's own trailer is not a present.
-        assert_eq!(
-            present_surface_id(op, &p[..p.len() - 1]),
-            None,
-            "op {op:#x}"
-        );
-    }
-
-    // The swap is between two adjacent u32s, so reading either at the other's
-    // offset yields a plausible value and nothing downstream would complain.
-    // Pin both directions on a payload where the two differ.
-    let mut gamma = Vec::new();
-    gamma.extend_from_slice(&7u32.to_le_bytes()); // pipe
-    gamma.extend_from_slice(&9u32.to_le_bytes()); // task
-    gamma.extend_from_slice(&0x2au32.to_le_bytes()); // surface
-    gamma.resize(0x24, 0);
-    assert_eq!(
-        present_surface_id(CHILD_OP_DISPLAY_TRANSACTION3, &gamma),
-        Some(0x2a),
-        "gamma's surface is the third word; the second is its task"
-    );
-
-    let mut plain = Vec::new();
-    plain.extend_from_slice(&7u32.to_le_bytes()); // pipe
-    plain.extend_from_slice(&0x2au32.to_le_bytes()); // surface
-    plain.extend_from_slice(&9u32.to_le_bytes()); // task
-    plain.resize(0x0c, 0);
-    assert_eq!(
-        present_surface_id(CHILD_OP_DISPLAY_TRANSACTION2, &plain),
-        Some(0x2a),
-        "the plain command's surface is the second word; the third is its task"
-    );
-}
-
-/// The trailer the guest appends after serializing the transaction's resource
-/// list is 0x24 bytes for the gamma command and 0x0c for the plain one.
-///
-/// The probe reports the trailer read from *both* ends of the payload, and the
-/// tail reading is only meaningful at the right width — get this wrong and a
-/// payload that does carry an inline plane list would still look trailer-only.
-#[test]
-fn display_txn_trailer_width_matches_the_emitting_command() {
-    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION2), 0x0c);
-    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION3), 0x24);
-    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_SWAP), 0x0c);
 }
 
 /// A present a resident carried is not a black present.

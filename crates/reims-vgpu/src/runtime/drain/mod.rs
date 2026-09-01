@@ -12,6 +12,10 @@ use crate::protocol::iosurface_pages::{
     MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP, MAPPER_REQUEST_MAPPING_ID, MAPPER_REQUEST_TYPE,
     MAPPER_REQUEST_UNMAP,
 };
+use crate::protocol::packets::Channel as WireChannel;
+use crate::protocol::present::{
+    self, trailer as present_trailer, PresentForm, Trailer as PresentTrailer,
+};
 use crate::runtime::decode::fifo::{
     display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
     DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
@@ -579,63 +583,6 @@ fn define_task_length(payload: &[u8]) -> u64 {
     ld64(&payload[DEFINE_TASK_LENGTH..])
 }
 
-/// Trailer size `submitTransaction` appends after serializing the transaction's
-/// resource list: `[pipe][task][surface][gamma…]` for the gamma command,
-/// `[pipe][surface][task]` otherwise.
-fn display_txn_trailer_len(opcode: u16) -> usize {
-    if opcode == CHILD_OP_DISPLAY_TRANSACTION3 {
-        0x24
-    } else {
-        0x0c
-    }
-}
-
-/// Word slots of the surface id and the task field within the trailer, keyed on
-/// the command that emitted it.
-///
-/// These are three different FIFO commands, not one shape with variations, so
-/// nothing here may be assumed from one opcode to another:
-///
-/// - op6 `CmdDisplayTransaction2_DEPRECATED` — `[pipe][surface][task]`.
-/// - op7 `CmdDisplayTransaction3` — `[pipe][task][surface][gamma…]`; the first
-///   two words are swapped relative to op6, and the gamma table follows. The two
-///   are separate commands with separate handlers, not one command with a
-///   variant flag, which is why the trailer differs at all.
-/// - op8 `CmdDisplaySwapMapping` — `[display][_][mapping]`. This one names a
-///   single mapping instead of serializing a transaction, so its surface word
-///   is `DISPLAY_SWAP_MAPPING` (0x08), *not* op6's 0x04, and it has no known
-///   task field at all. Reading it at op6's slot would return the unidentified
-///   word between the display index and the mapping.
-///
-/// Slots are `regs.rs`'s `PRESENT_*` / `DISPLAY_SWAP_*` byte offsets divided by
-/// four; this is the only place either reading of those offsets is spelled out,
-/// so the present path and the payload census cannot decode the field
-/// differently.
-fn display_txn_trailer_slots(opcode: u16) -> (usize, Option<usize>) {
-    match opcode {
-        CHILD_OP_DISPLAY_TRANSACTION3 => (DISPLAY_TRANSACTION3_SURFACE_ID / 4, Some(1)),
-        CHILD_OP_DISPLAY_SWAP => (DISPLAY_SWAP_MAPPING / 4, None),
-        _ => (DISPLAY_TRANSACTION2_SURFACE_ID / 4, Some(2)),
-    }
-}
-
-/// The surface id a display-present payload names, read from offset zero.
-///
-/// The slot is the one `display_txn_trailer_slots` gives for the emitting
-/// command, so this head-relative reading and the tail-relative reading the
-/// census takes cannot drift apart.
-///
-/// `None` is a payload too short to hold the command's own trailer. That loses
-/// the present outright, so callers must name it rather than presenting mapping
-/// zero and completing the packet in silence.
-fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
-    let trailer = display_txn_trailer_len(opcode);
-    (payload.len() >= trailer).then(|| {
-        let off = display_txn_trailer_slots(opcode).0 * 4;
-        ld32(&payload[off..])
-    })
-}
-
 /// Alarm for a display-transaction payload longer than its command declares.
 ///
 /// # The wire shape, and why there is nothing left to sample here
@@ -752,12 +699,17 @@ fn note_resource_list_decode_fail(
         .fail_once(u64::from(opcode));
 }
 
-fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &Packet) {
+fn note_display_txn_payload(
+    state: &mut DeviceState,
+    channel_id: u32,
+    packet: &Packet,
+    decoded: &PresentTrailer,
+) {
     let plen = packet.payload.len();
-    let trailer = display_txn_trailer_len(packet.opcode);
-    if plen <= trailer {
+    if decoded.undecoded_tail == 0 {
         return;
     }
+    let trailer = decoded.form.trailer_len();
     crate::runtime::drain::note_store_route("display_txn_payload_overlong");
     // Latched per (opcode, length): a guest that grew this command grew it for
     // every frame, and the thousandth line says nothing the first did not.
@@ -4171,16 +4123,25 @@ fn process_child_packet<H: HostMemory + HostOps>(
         opcode @ (CHILD_OP_DISPLAY_SWAP
         | CHILD_OP_DISPLAY_TRANSACTION2
         | CHILD_OP_DISPLAY_TRANSACTION3) => {
-            note_display_txn_payload(state, channel_id, packet);
-            let Some(mapping) = present_surface_id(opcode, &packet.payload) else {
-                crate::observe::fail(format!(
-                    "packet_short reason=display_present_short ch={channel_id} op={opcode:#x} \
-                     plen={} need={}",
-                    packet.payload.len(),
-                    display_txn_trailer_len(opcode)
-                ));
-                return ChildPacketDisposition::Complete;
+            // Which of the three, and therefore where every word is, is
+            // `reims_vgpu_protocol::present`'s: three commands with three
+            // trailers, and one place that says so.
+            let form = PresentForm::of(WireChannel::Child, opcode)
+                .expect("the three present opcodes are this arm's own pattern");
+            let decoded = match present_trailer(form, &packet.payload) {
+                Ok(decoded) => decoded,
+                Err(refusal) => {
+                    let present::Refusal::Short { have, need } = refusal;
+                    crate::observe::fail(format!(
+                        "packet_short reason={} ch={channel_id} op={opcode:#x} plen={have} \
+                         need={need}",
+                        refusal.slug()
+                    ));
+                    return ChildPacketDisposition::Complete;
+                }
             };
+            let mapping = decoded.target;
+            note_display_txn_payload(state, channel_id, packet, &decoded);
             // Per-present decode census (~30k/session under animation); the
             // present rate lives in the present_proxy summary, so gate the
             // per-packet line behind REIMS_VGPU_DRAW_LOG. `pipe` is the display
@@ -4188,14 +4149,13 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // both. `task` is op6/7's task field, which is the submitting task's
             // and not a completion stamp; the packet's own stamp lives in the
             // FIFO header. op8 has no such word, and prints `-`.
-            let (_, task_slot) = display_txn_trailer_slots(opcode);
-            let task = task_slot
-                .map(|slot| format!("{:#x}", ld32(&packet.payload[slot * 4..])))
-                .unwrap_or_else(|| "-".to_string());
+            let task = decoded
+                .task
+                .map_or_else(|| "-".to_string(), |task| format!("{task:#x}"));
             crate::observe::line(format!(
                 "present_txn op={opcode:#x} ch={channel_id} pipe={} sid={mapping} task={task} \
                  plen={} unpainted={} prior_present_mapping={}",
-                ld32(&packet.payload[0..]),
+                decoded.pipe,
                 packet.payload.len(),
                 state.present.unpainted_presents,
                 state.present.present_mapping
