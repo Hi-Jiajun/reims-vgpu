@@ -64,10 +64,10 @@ pub(crate) use facade_decline::EngineFacadeDecline;
 pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
-    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue,
-    ColorWriteMask, ComputeBufferResource, ComputeDispatch, ComputeDispatchPayload,
-    ComputeDispatchRegion, ComputeImageDestination, ComputeImageResult, ComputeOutput,
-    ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+    BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue, ColorWriteMask,
+    ComputeBufferResource, ComputeDispatch, ComputeDispatchPayload, ComputeDispatchRegion,
+    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeRequest,
+    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
     DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
     GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,

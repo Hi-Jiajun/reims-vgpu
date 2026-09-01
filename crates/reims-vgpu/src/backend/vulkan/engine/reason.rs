@@ -135,24 +135,32 @@ pub enum DrawReason {
     /// Delegates for the same reason as the variant above; the rail that owns
     /// the capability is the one that names the refusal.
     SamplerDevice(reims_vgpu_vulkan::sampler::Refusal),
-    /// The guest pipeline names one of `MTLBlendFactor`'s four dual-source
-    /// factors (`Source1Color` .. `OneMinusSource1Alpha`, 15-18) and this device
-    /// does not advertise `VkPhysicalDeviceFeatures::dualSrcBlend`.
+    /// A colour attachment's blend declaration is not one the guest API
+    /// admits — a factor, an operation or a mask ordinal outside its enum.
     ///
-    /// These reached no arm at all until the translation table was extended —
-    /// `translate::blend::factor` stopped at 14 and its test asserted 15 was
-    /// past the end of `MTLBlendFactor`, which runs to 18. So a guest asking
-    /// for dual-source blending was refused as an unknown factor on every host,
-    /// including the ones that support it. Now it translates, and only a host
-    /// that genuinely cannot run it declines — here, by name.
-    DualSourceBlendUnsupported,
+    /// Delegates its slug for the same reason as [`Self::SamplerDeclaration`]:
+    /// the protocol layer already named the field that broke.
+    ///
+    /// This used to be reported per attachment at translation time, where an
+    /// unrecognised ordinal made the *slot* unblended and left the pipeline to
+    /// build. It refuses the pipeline now, because the alternative is a
+    /// compositing draw silently becoming a raw store.
+    BlendDeclaration(reims_vgpu_core::blend::BlendRefusal),
+    /// The declaration is admissible and *this device* cannot serve it: one of
+    /// `MTLBlendFactor`'s four dual-source factors without
+    /// `VkPhysicalDeviceFeatures::dualSrcBlend`, or attachments that blend
+    /// differently without `independentBlend`.
+    ///
+    /// Delegates for the same reason as [`Self::SamplerDevice`]; the rail that
+    /// owns the capability is the one that names the refusal.
+    BlendDevice(reims_vgpu_vulkan::blend::Refusal),
     /// The guest asked for `MTLTriangleFillModeLines` and this device does not
     /// advertise `VkPhysicalDeviceFeatures::fillModeNonSolid`, so no pipeline
     /// on it can name `VK_POLYGON_MODE_LINE`.
     ///
     /// The alternative is rasterizing the wireframe filled, which is a whole
     /// pass of wrong pixels the guest is never told about. Same reading as
-    /// [`Self::DualSourceBlendUnsupported`]: optional core feature, asked for
+    /// [`Self::BlendDevice`]: optional core feature, asked for
     /// at device creation, declined by name where the host says no.
     FillModeNonSolidUnsupported,
     /// The guest asked for `MTLDepthClipModeClamp` and this device does not
@@ -341,7 +349,8 @@ impl crate::observe::Decline for DrawReason {
             }
             Self::SamplerDeclaration(refusal) => Decline::slug(refusal),
             Self::SamplerDevice(refusal) => refusal.slug(),
-            Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
+            Self::BlendDeclaration(refusal) => Decline::slug(refusal),
+            Self::BlendDevice(refusal) => refusal.slug(),
             Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
             Self::DepthClampUnsupported => "depth_clamp_unsupported",
             // Deliberately delegates: the translation layer already named the
@@ -488,6 +497,15 @@ impl std::fmt::Display for DrawReason {
                 " binding={binding} first_type={first_type} first_count={first_count} \
                  second_type={second_type} second_count={second_count}"
             ),
+            Self::BlendDeclaration(refusal) => {
+                for (name, value) in Decline::fields(refusal) {
+                    write!(f, " {name}={value}")?;
+                }
+                Ok(())
+            }
+            // The rail's own refusal already spells its slug and its fields;
+            // printing it whole keeps one event to one reading.
+            Self::BlendDevice(refusal) => write!(f, " {refusal}"),
             _ => Ok(()),
         }
     }
@@ -698,7 +716,14 @@ mod tests {
         DrawReason::SwapchainLacksTransferDst,
         DrawReason::SwapchainNoSurfaceFormat,
         DrawReason::SwapchainNoCompositeAlpha,
-        DrawReason::DualSourceBlendUnsupported,
+        DrawReason::BlendDeclaration(reims_vgpu_core::blend::BlendRefusal::UnknownOrdinal {
+            field: "src_rgb",
+            ordinal: 0,
+        }),
+        DrawReason::BlendDevice(reims_vgpu_vulkan::blend::Refusal::NoDualSource {
+            factor: reims_vgpu_core::blend::BlendFactor::Source1Color,
+        }),
+        DrawReason::BlendDevice(reims_vgpu_vulkan::blend::Refusal::NoIndependentBlend { slots: 2 }),
         DrawReason::FillModeNonSolidUnsupported,
         DrawReason::DepthClampUnsupported,
     ];

@@ -47,7 +47,6 @@
 //! * Never gate on a driver name, a vendor id, or an API version — that is
 //!   [`super::caps`]'s job and it has its own rules.
 
-pub mod blend;
 pub mod pixel;
 pub mod raster;
 pub mod reason;

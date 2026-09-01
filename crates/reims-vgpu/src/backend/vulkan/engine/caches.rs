@@ -1430,6 +1430,35 @@ fn depth_stencil_state(
     .expect("every ordinal in a pipeline key was parsed from an enum on the way in")
 }
 
+/// One colour attachment's blend terms, in the vocabulary of the layer that
+/// owns what they mean.
+///
+/// `None` is `blendingEnabled` clear, which is the whole of what the flag
+/// means: with it clear Metal evaluates no equation, so the six ordinals it
+/// left behind are not parsed and cannot refuse anything. The mask is outside
+/// that, because `MTLColorWriteMask` applies whether or not the slot blends.
+///
+/// Unlike [`depth_stencil_state`] this one can genuinely fail. The ordinals
+/// travel from the guest unparsed, so a value outside `MTLBlendFactor` or
+/// `MTLBlendOperation` arrives here rather than at the decoder — see
+/// [`super::types::BlendStateResource`] for why that is the arrangement.
+fn color_attachment_state(
+    blend: Option<BlendKey>,
+    mask: ColorWriteMask,
+) -> Result<reims_vgpu_core::blend::ColorAttachmentState, reims_vgpu_core::blend::BlendRefusal> {
+    reims_vgpu_core::blend::ColorAttachmentShape {
+        blending_enabled: blend.is_some(),
+        src_rgb: blend.map_or(0, |b| b.src_rgb),
+        dst_rgb: blend.map_or(0, |b| b.dst_rgb),
+        op_rgb: blend.map_or(0, |b| b.op_rgb),
+        src_alpha: blend.map_or(0, |b| b.src_alpha),
+        dst_alpha: blend.map_or(0, |b| b.dst_alpha),
+        op_alpha: blend.map_or(0, |b| b.op_alpha),
+        write_mask: mask,
+    }
+    .checked()
+}
+
 impl ObjectCaches {
     pub(crate) fn new() -> Self {
         Self {
@@ -2155,27 +2184,51 @@ impl ObjectCaches {
         }
         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
 
-        // `MTLBlendFactor` 15-18 are the dual-source factors; Vulkan spells them
-        // `SRC1_*` and gates them behind `VkPhysicalDeviceFeatures::dualSrcBlend`.
-        // Same shape as the sampler's mirror-clamp check: capability question,
-        // typed decline, cached negatively so a replay returns this exact reason.
+        // Every colour attachment, parsed once and planned once.
         //
-        // Every attachment is checked, not just slot 0 — the secondaries carry
-        // their own decoded blend, and a pipeline is invalid if *any* attachment
-        // names a `SRC1_*` factor without the feature.
-        if !ctx.features.dual_src_blend {
-            let uses_dual_source = std::iter::once(&key.blend)
-                .chain(key.secondary_blend.iter())
-                .flatten()
-                .any(|b| {
-                    [b.src_color, b.dst_color, b.src_alpha, b.dst_alpha]
-                        .iter()
-                        .any(|f| f.is_dual_source())
-                });
-            if uses_dual_source {
-                let reason = super::reason::DrawReason::DualSourceBlendUnsupported;
+        // Built here rather than beside the create-info below because both
+        // things that can go wrong are refusals of the whole pipeline, and a
+        // refusal belongs with the other capability checks in this run: typed
+        // decline, cached negatively so a replay returns this exact reason.
+        //
+        // Every attachment participates, not just slot 0. The secondaries
+        // carry their own decoded blend, and both questions are asked of the
+        // set: a pipeline is invalid if *any* attachment names a `SRC1_*`
+        // factor without `dualSrcBlend`, and invalid if they *disagree*
+        // without `independentBlend` — which no single attachment can be
+        // blamed for, which is why the second check takes the list.
+        let blend_cell = reims_vgpu_vulkan::blend::BlendCell {
+            dual_source: ctx.features.dual_src_blend,
+            independent: ctx.features.independent_blend,
+        };
+        let mut blend_plans = Vec::with_capacity(1 + key.pass.secondary_count());
+        {
+            let refuse = |reason: super::reason::DrawReason| {
                 crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
-                let err = DrawError::Unsupported(reason);
+                DrawError::Unsupported(reason)
+            };
+            for slot in 0..=key.pass.secondary_count() {
+                let blend = if slot == 0 {
+                    key.blend
+                } else {
+                    key.secondary_blend[slot - 1]
+                };
+                let attempt = color_attachment_state(blend, key.color_write_mask[slot])
+                    .map_err(|r| refuse(super::reason::DrawReason::BlendDeclaration(r)))
+                    .and_then(|state| {
+                        reims_vgpu_vulkan::blend::plan(&state, blend_cell)
+                            .map_err(|r| refuse(super::reason::DrawReason::BlendDevice(r)))
+                    });
+                match attempt {
+                    Ok(plan) => blend_plans.push(plan),
+                    Err(err) => {
+                        self.pipelines.insert_negative(key.clone(), err.clone());
+                        return Err(err);
+                    }
+                }
+            }
+            if let Err(r) = reims_vgpu_vulkan::blend::independent(&blend_plans, blend_cell) {
+                let err = refuse(super::reason::DrawReason::BlendDevice(r));
                 self.pipelines.insert_negative(key.clone(), err.clone());
                 return Err(err);
             }
@@ -2408,32 +2461,10 @@ impl ObjectCaches {
         // both arms because `MTLColorWriteMask` is independent of
         // `blendingEnabled` — an unblended masked attachment still leaves its
         // unwritten channels alone. Metal's bits are alpha-first and Vulkan's
-        // are red-first, so the exchange goes through `vk_color_write_mask`
-        // rather than a cast.
-        let attachment_blend = |blend: Option<BlendKey>, mask: ColorWriteMask| {
-            let write = translate::blend::vk_color_write_mask(mask);
-            match blend {
-                Some(b) => vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(write)
-                    .blend_enable(true)
-                    .src_color_blend_factor(b.src_color.vk())
-                    .dst_color_blend_factor(b.dst_color.vk())
-                    .color_blend_op(b.color_op.vk())
-                    .src_alpha_blend_factor(b.src_alpha.vk())
-                    .dst_alpha_blend_factor(b.dst_alpha.vk())
-                    .alpha_blend_op(b.alpha_op.vk()),
-                None => vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(write)
-                    .blend_enable(false),
-            }
-        };
-        let mut blend_att = vec![attachment_blend(key.blend, key.color_write_mask[0])];
-        for slot in 0..key.pass.secondary_count() {
-            blend_att.push(attachment_blend(
-                key.secondary_blend[slot],
-                key.color_write_mask[slot + 1],
-            ));
-        }
+        // are red-first, so the exchange is a reordering rather than a cast;
+        // `reims_vgpu_vulkan::blend` performs it, above.
+        let blend_att: Vec<vk::PipelineColorBlendAttachmentState> =
+            blend_plans.iter().map(|p| p.native()).collect();
         let blend_constants = key
             .blend
             .map(|b| b.constants.map(f32::from_bits))
@@ -3049,6 +3080,91 @@ mod object_cache_tests {
         // -01075, U and V.
         assert_eq!(plan.address[0], ash::vk::SamplerAddressMode::CLAMP_TO_EDGE);
         assert_eq!(plan.address[1], ash::vk::SamplerAddressMode::CLAMP_TO_EDGE);
+    }
+
+    /// The six blend ordinals reach the six fields of their own names.
+    ///
+    /// They are interchangeable `u32`s three-for-three, so a swap between the
+    /// RGB and alpha halves produces a perfectly valid blend that composites
+    /// the wrong channel set — no refusal, no log line. A test on either side
+    /// of this projection alone cannot see it: the key would still hold what it
+    /// was given and the shape would still parse. Distinct values in all six
+    /// positions is the only arrangement that can.
+    #[test]
+    fn the_six_blend_ordinals_do_not_cross_on_the_way_to_the_owning_layer() {
+        use reims_vgpu_core::blend::{
+            BlendFactor, BlendOperation, MTL_BLEND_FACTOR_DESTINATION_ALPHA, MTL_BLEND_FACTOR_ONE,
+            MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA, MTL_BLEND_FACTOR_SOURCE_ALPHA,
+            MTL_BLEND_OPERATION_MAX, MTL_BLEND_OPERATION_REVERSE_SUBTRACT,
+        };
+        let key = BlendKey {
+            src_rgb: MTL_BLEND_FACTOR_SOURCE_ALPHA,
+            dst_rgb: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+            op_rgb: MTL_BLEND_OPERATION_REVERSE_SUBTRACT,
+            src_alpha: MTL_BLEND_FACTOR_ONE,
+            dst_alpha: MTL_BLEND_FACTOR_DESTINATION_ALPHA,
+            op_alpha: MTL_BLEND_OPERATION_MAX,
+            constants: [0; 4],
+        };
+        let blend = color_attachment_state(Some(key), ColorWriteMask::ALL)
+            .expect("every ordinal is one the guest API declares")
+            .blend()
+            .expect("the key carried a blend");
+        assert_eq!(blend.src_color, BlendFactor::SourceAlpha);
+        assert_eq!(blend.dst_color, BlendFactor::OneMinusSourceAlpha);
+        assert_eq!(blend.color_operation, BlendOperation::ReverseSubtract);
+        assert_eq!(blend.src_alpha, BlendFactor::One);
+        assert_eq!(blend.dst_alpha, BlendFactor::DestinationAlpha);
+        assert_eq!(blend.alpha_operation, BlendOperation::Max);
+    }
+
+    /// `blendingEnabled` clear is the absence of a blend, and the mask is not
+    /// part of it.
+    ///
+    /// Both halves matter. Parsing the six ordinals behind a clear flag would
+    /// refuse a pipeline over a value that can never reach a pixel; dropping
+    /// the mask with them would make an unblended attachment that writes only
+    /// alpha write everything, which is a colour channel the guest asked to
+    /// keep.
+    #[test]
+    fn an_unblended_attachment_keeps_its_mask_and_parses_no_equation() {
+        let masked = color_attachment_state(
+            None,
+            ColorWriteMask::new(reims_vgpu_core::blend::MTL_COLOR_WRITE_MASK_ALPHA)
+                .expect("in range"),
+        )
+        .expect("nothing to parse");
+        assert!(masked.blend().is_none());
+        assert!(!masked.write_mask().red());
+        assert!(masked.write_mask().alpha());
+    }
+
+    /// An ordinal the guest API does not declare refuses the pipeline by name.
+    ///
+    /// It used to make the *slot* unblended and let the pipeline build, which
+    /// is a compositing attachment silently becoming a raw store.
+    #[test]
+    fn an_ordinal_outside_the_guest_api_refuses_rather_than_unblending() {
+        let refusal = color_attachment_state(
+            Some(BlendKey {
+                src_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ONE,
+                dst_rgb: 99,
+                op_rgb: 0,
+                src_alpha: 1,
+                dst_alpha: 0,
+                op_alpha: 0,
+                constants: [0; 4],
+            }),
+            ColorWriteMask::ALL,
+        )
+        .expect_err("99 is not an MTLBlendFactor");
+        assert_eq!(
+            refusal,
+            reims_vgpu_core::blend::BlendRefusal::UnknownOrdinal {
+                field: "dst_rgb",
+                ordinal: 99,
+            }
+        );
     }
 
     /// Every state a pipeline key can hold is one the owning layer admits.

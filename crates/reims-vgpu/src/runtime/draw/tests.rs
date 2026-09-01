@@ -6,8 +6,6 @@ use super::*;
 // won rather than against the rail the test names.
 #[cfg(feature = "backend-vulkan")]
 use super::vulkan::*;
-#[cfg(feature = "backend-vulkan")]
-use crate::backend::vulkan::translate;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
@@ -2757,40 +2755,6 @@ fn a8_sample_preserves_alpha_coverage() {
     );
 }
 
-/// Metal blend factors/ops must map into engine blend types (Linux path was silent-None).
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn blend_state_maps_src_alpha_one_minus() {
-    let b = translate::blend::state(
-        &crate::runtime::decode::resource::PipelineColorAttachment {
-            src_rgb: 4,   // SrcAlpha
-            dst_rgb: 5,   // OneMinusSrcAlpha
-            op_rgb: 0,    // Add
-            src_alpha: 1, // One
-            dst_alpha: 5, // OneMinusSrcAlpha
-            op_alpha: 0,  // Add
-            ..Default::default()
-        },
-        [0.0; 4],
-    )
-    .expect("map");
-    assert_eq!(
-        b.src_color,
-        crate::backend::vulkan::engine::BlendFactor::SrcAlpha
-    );
-    assert_eq!(
-        b.dst_color,
-        crate::backend::vulkan::engine::BlendFactor::OneMinusSrcAlpha
-    );
-    assert_eq!(b.color_op, crate::backend::vulkan::engine::BlendOp::Add);
-    assert_eq!(
-        b.src_alpha,
-        crate::backend::vulkan::engine::BlendFactor::One
-    );
-    assert!(translate::blend::factor(99).is_err());
-    assert!(translate::blend::operation(9).is_err());
-}
-
 /// qemu-shim: guest Load with unresolvable mapper-ref-texture pages still encodes
 /// (archive NULL seed / Metal Clear invent) — does not drop the pass.
 #[test]
@@ -5357,12 +5321,20 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         "slot 1 declares blending_enabled — before this fix every secondary \
              was forced unblended",
     );
-    use crate::backend::vulkan::engine::{BlendFactor, BlendOp};
-    assert_eq!(blend.src_color, BlendFactor::One, "slot 1's own src factor");
-    assert_eq!(blend.dst_color, BlendFactor::One, "slot 1's own dst factor");
-    assert_eq!(blend.color_op, BlendOp::Add);
+    use reims_vgpu_core::blend::{
+        MTL_BLEND_FACTOR_ONE, MTL_BLEND_FACTOR_SOURCE_ALPHA, MTL_BLEND_OPERATION_ADD,
+    };
+    assert_eq!(
+        blend.src_rgb, MTL_BLEND_FACTOR_ONE,
+        "slot 1's own src factor"
+    );
+    assert_eq!(
+        blend.dst_rgb, MTL_BLEND_FACTOR_ONE,
+        "slot 1's own dst factor"
+    );
+    assert_eq!(blend.op_rgb, MTL_BLEND_OPERATION_ADD);
     // The tell that it is not slot 0's: slot 0 asked for SrcAlpha/OneMinusSrcAlpha.
-    assert_ne!(blend.src_color, BlendFactor::SrcAlpha);
+    assert_ne!(blend.src_rgb, MTL_BLEND_FACTOR_SOURCE_ALPHA);
 
     // A slot the pipeline does not blend stays unblended rather than
     // inheriting slot 0's — there is no `or_else(first())` fallback here.

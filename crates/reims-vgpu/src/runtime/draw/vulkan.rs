@@ -10,7 +10,9 @@
 
 use super::*;
 
-use crate::backend::vulkan::engine::{resource_lease, DrawError, DrawPreparationDecline};
+use crate::backend::vulkan::engine::{
+    resource_lease, BlendStateResource, DrawError, DrawPreparationDecline,
+};
 use crate::backend::vulkan::translate;
 use crate::backend::PlaneDrawReader;
 use crate::runtime::census::srgb_census;
@@ -6750,26 +6752,24 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             .find(|a| a.slot == c.slot)
             .map(|a| a.write_mask)
             .unwrap_or_default();
+        // The six ordinals travel to the engine as the guest wrote them. An
+        // out-of-contract factor or op used to make *this slot* unblended with
+        // a decline of its own, which is a compositing attachment quietly
+        // becoming a raw store; the pipeline refuses it now, once, where the
+        // same declaration is also weighed against what the device can blend.
         let blend = pipeline
             .color_attachments
             .iter()
             .find(|a| a.slot == c.slot)
             .filter(|a| a.blending_enabled)
-            .and_then(|a| {
-                match translate::blend::state(a, blend_constants) {
-                    Ok(state) => Some(state),
-                    // An out-of-contract blend factor or op on a secondary
-                    // slot: the attachment still renders, unblended, and the
-                    // decline says which value refused rather than the slot
-                    // quietly becoming a raw store the way every slot used to.
-                    Err(reason) => {
-                        crate::observe::fail(format!(
-                            "secondary_blend_unmapped {reason} slot={} {}x{}",
-                            c.slot, c.width, c.height
-                        ));
-                        None
-                    }
-                }
+            .map(|a| BlendStateResource {
+                src_rgb: a.src_rgb,
+                dst_rgb: a.dst_rgb,
+                op_rgb: a.op_rgb,
+                src_alpha: a.src_alpha,
+                dst_alpha: a.dst_alpha,
+                op_alpha: a.op_alpha,
+                constants: blend_constants,
             });
         out.push(SecondaryColorTarget {
             identity,
@@ -8991,18 +8991,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.color_write_mask = pd.color0.write_mask;
         if pd.color0.blending_enabled {
-            let constants = req.blend_color.unwrap_or([0.0; 4]);
-            match translate::blend::state(&pd.color0, constants) {
-                Ok(b) => {
-                    resources.blend = Some(b);
-                }
-                Err(e) => {
-                    crate::observe::fail(format!(
-                        "m2v_blend_map_fail pipe={} {e}",
-                        req.pipeline_ref
-                    ));
-                }
-            }
+            resources.blend = Some(BlendStateResource {
+                src_rgb: pd.color0.src_rgb,
+                dst_rgb: pd.color0.dst_rgb,
+                op_rgb: pd.color0.op_rgb,
+                src_alpha: pd.color0.src_alpha,
+                dst_alpha: pd.color0.dst_alpha,
+                op_alpha: pd.color0.op_alpha,
+                constants: req.blend_color.unwrap_or([0.0; 4]),
+            });
         }
 
         // The engine ignores this when the draw is indexed (the index count

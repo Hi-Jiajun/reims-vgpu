@@ -1359,85 +1359,44 @@ pub(crate) struct SamplerStateKey {
     pub unnormalized_coordinates: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum BlendFactor {
-    Zero,
-    One,
-    SrcColor,
-    OneMinusSrcColor,
-    SrcAlpha,
-    OneMinusSrcAlpha,
-    DstColor,
-    OneMinusDstColor,
-    DstAlpha,
-    OneMinusDstAlpha,
-    SrcAlphaSaturated,
-    ConstantColor,
-    OneMinusConstantColor,
-    ConstantAlpha,
-    OneMinusConstantAlpha,
-    /// `MTLBlendFactorSource1Color` and its three siblings — the dual-source
-    /// factors, which read the fragment shader's *second* colour output.
-    ///
-    /// Separated from the fifteen above by [`BlendFactor::is_dual_source`]
-    /// because Vulkan gates exactly these four behind the `dualSrcBlend` device
-    /// feature, and a pipeline naming one without it is invalid.
-    Src1Color,
-    OneMinusSrc1Color,
-    Src1Alpha,
-    OneMinusSrc1Alpha,
-}
-
-impl BlendFactor {
-    pub(crate) fn vk(self) -> vk::BlendFactor {
-        translate::blend::vk_factor(self)
-    }
-
-    /// Whether this factor reads the second fragment output, and so needs
-    /// `VkPhysicalDeviceFeatures::dualSrcBlend`.
-    pub(crate) fn is_dual_source(self) -> bool {
-        matches!(
-            self,
-            Self::Src1Color | Self::OneMinusSrc1Color | Self::Src1Alpha | Self::OneMinusSrc1Alpha
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum BlendOp {
-    Add,
-    Subtract,
-    ReverseSubtract,
-    Min,
-    Max,
-}
-
-impl BlendOp {
-    pub(crate) fn vk(self) -> vk::BlendOp {
-        translate::blend::vk_operation(self)
-    }
-}
-
+/// One colour attachment's blend declaration, as the six `MTLBlendFactor` and
+/// `MTLBlendOperation` ordinals the guest serialized plus the encoder's blend
+/// colour.
+///
+/// The ordinals travel **unparsed**. Which nineteen values are factors, which
+/// five are operations, and which four of the factors need the second fragment
+/// output are all statements about `MTLRenderPipeline.h`, and this crate is
+/// not where that is decided: `reims_vgpu_core::blend::ColorAttachmentShape`
+/// owns the parse and `reims_vgpu_vulkan::blend` owns the spelling. Carrying a
+/// pair of local enums between the two would be a third table that has to
+/// agree with both, and the way it disagreed last time was by stopping at
+/// `MTLBlendFactorOneMinusBlendAlpha = 14` while Apple's enum ran to 18.
+///
+/// A consequence worth stating: an ordinal outside the guest API no longer
+/// refuses the *slot* at translation time, it refuses the *pipeline* at build
+/// time, which is where the same declaration is also weighed against what this
+/// device can blend. There is one answer per pipeline rather than one per
+/// attachment reached by two different paths.
 #[derive(Clone, Copy, Debug)]
 pub struct BlendStateResource {
-    pub src_color: BlendFactor,
-    pub dst_color: BlendFactor,
-    pub color_op: BlendOp,
-    pub src_alpha: BlendFactor,
-    pub dst_alpha: BlendFactor,
-    pub alpha_op: BlendOp,
+    pub src_rgb: u32,
+    pub dst_rgb: u32,
+    pub op_rgb: u32,
+    pub src_alpha: u32,
+    pub dst_alpha: u32,
+    pub op_alpha: u32,
     pub constants: [f32; 4],
 }
 
 impl BlendStateResource {
     pub(crate) fn key(&self) -> BlendKey {
         BlendKey {
-            src_color: self.src_color,
-            dst_color: self.dst_color,
-            color_op: self.color_op,
+            src_rgb: self.src_rgb,
+            dst_rgb: self.dst_rgb,
+            op_rgb: self.op_rgb,
             src_alpha: self.src_alpha,
             dst_alpha: self.dst_alpha,
-            alpha_op: self.alpha_op,
+            op_alpha: self.op_alpha,
             constants: self.constants.map(|c| c.to_bits()),
         }
     }
@@ -1445,12 +1404,12 @@ impl BlendStateResource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct BlendKey {
-    pub src_color: BlendFactor,
-    pub dst_color: BlendFactor,
-    pub color_op: BlendOp,
-    pub src_alpha: BlendFactor,
-    pub dst_alpha: BlendFactor,
-    pub alpha_op: BlendOp,
+    pub src_rgb: u32,
+    pub dst_rgb: u32,
+    pub op_rgb: u32,
+    pub src_alpha: u32,
+    pub dst_alpha: u32,
+    pub op_alpha: u32,
     pub constants: [u32; 4],
 }
 

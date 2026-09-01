@@ -10,12 +10,16 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState,
-    DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
-    SampledImageResource, SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource,
-    SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
-    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
-    ViewportResource, VisibilityResultMode, MAX_DEVICE_RECREATES,
+    self, BlendStateResource, BufferContent, CullMode, DepthState, DrawRequest, IndexType,
+    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
+    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
+    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
+    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
+    VisibilityResultMode, MAX_DEVICE_RECREATES,
+};
+use reims_vgpu_core::blend::{
+    MTL_BLEND_FACTOR_ONE, MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA, MTL_BLEND_FACTOR_SOURCE_ALPHA,
+    MTL_BLEND_OPERATION_ADD,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -973,12 +977,12 @@ fn blend_src_alpha_known_color() {
     let mut req = engine_req(&v, &f, 8, 8);
     req.target_rgba8 = Some(std::sync::Arc::new([0, 0, 0, 255].repeat(8 * 8)));
     req.blend = Some(BlendStateResource {
-        src_color: BlendFactor::SrcAlpha,
-        dst_color: BlendFactor::OneMinusSrcAlpha,
-        color_op: BlendOp::Add,
-        src_alpha: BlendFactor::One,
-        dst_alpha: BlendFactor::OneMinusSrcAlpha,
-        alpha_op: BlendOp::Add,
+        src_rgb: MTL_BLEND_FACTOR_SOURCE_ALPHA,
+        dst_rgb: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+        op_rgb: MTL_BLEND_OPERATION_ADD,
+        src_alpha: MTL_BLEND_FACTOR_ONE,
+        dst_alpha: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+        op_alpha: MTL_BLEND_OPERATION_ADD,
         constants: [0.0; 4],
     });
     if let Some(px) = draw_or_skip("blend_src_alpha", &req) {
@@ -2822,12 +2826,12 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
     let mut gpu = engine_req(&v, &f, w, h);
     gpu.target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
     gpu.blend = Some(BlendStateResource {
-        src_color: BlendFactor::One,
-        dst_color: BlendFactor::OneMinusSrcAlpha,
-        color_op: BlendOp::Add,
-        src_alpha: BlendFactor::One,
-        dst_alpha: BlendFactor::OneMinusSrcAlpha,
-        alpha_op: BlendOp::Add,
+        src_rgb: MTL_BLEND_FACTOR_ONE,
+        dst_rgb: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+        op_rgb: MTL_BLEND_OPERATION_ADD,
+        src_alpha: MTL_BLEND_FACTOR_ONE,
+        dst_alpha: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+        op_alpha: MTL_BLEND_OPERATION_ADD,
         constants: [0.0; 4],
     });
     let gpu_px = match engine::execute_draw_request(&gpu) {

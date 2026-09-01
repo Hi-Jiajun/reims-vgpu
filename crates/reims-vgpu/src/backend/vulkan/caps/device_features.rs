@@ -329,6 +329,24 @@ pub struct DeviceFeatures {
     /// an extension, but not mandatory either — so it is asked rather than
     /// assumed, and the pipeline path declines by name where it is absent.
     pub dual_src_blend: bool,
+    /// `VkPhysicalDeviceFeatures::independentBlend` — whether the colour
+    /// attachments of one pipeline may declare *different* blend states.
+    ///
+    /// Metal places no such restriction: every
+    /// `MTLRenderPipelineColorAttachmentDescriptor` carries its own six
+    /// factors, its own two operations and its own write mask, and a guest MRT
+    /// pipeline routinely blends one slot and replaces another. Vulkan without
+    /// this feature requires every element of
+    /// `VkPipelineColorBlendStateCreateInfo::pAttachments` to be identical, so
+    /// a pipeline the guest may lawfully declare is one this device may be
+    /// unable to build.
+    ///
+    /// Asked and enabled rather than assumed, for the same reason as
+    /// [`Self::dual_src_blend`]: building a pipeline whose attachments
+    /// disagree without it is invalid use, not a slower path. Where it is
+    /// absent the pipeline path declines by name — see
+    /// `reims_vgpu_vulkan::blend::independent`.
+    pub independent_blend: bool,
     /// `VkPhysicalDeviceFeatures::fillModeNonSolid` — whether a pipeline may
     /// name `VK_POLYGON_MODE_LINE` or `_POINT`.
     ///
@@ -449,6 +467,7 @@ impl DeviceFeatures {
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
             .shader_storage_image_read_without_format(self.storage_image_read_without_format)
             .dual_src_blend(self.dual_src_blend)
+            .independent_blend(self.independent_blend)
             .fill_mode_non_solid(self.fill_mode_non_solid)
             .texture_compression_bc(self.texture_compression_bc)
             .depth_clamp(self.depth_clamp)
@@ -578,6 +597,7 @@ impl DeviceFeatures {
             attachment_feedback_loop_layout,
             image_drm_format_modifier,
             dual_src_blend,
+            independent_blend,
             fill_mode_non_solid,
             depth_clamp,
             multi_viewport,
@@ -625,7 +645,8 @@ impl DeviceFeatures {
              timeline_semaphore={timeline_semaphore} \
              descriptor_binding_partially_bound={descriptor_binding_partially_bound} \
              mirror_clamp_to_edge={mirror_clamp_to_edge:?} \
-             dual_src_blend={dual_src_blend} fill_mode_non_solid={fill_mode_non_solid} \
+             dual_src_blend={dual_src_blend} independent_blend={independent_blend} \
+             fill_mode_non_solid={fill_mode_non_solid} \
              depth_clamp={depth_clamp} multi_viewport={multi_viewport} max_viewports={max_viewports} \
              occlusion_query_precise={occlusion_query_precise}",
             missing(sampled_linear_filter),
@@ -796,6 +817,7 @@ pub unsafe fn query(
         image_drm_format_modifier,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
+        independent_blend: supported.independent_blend == vk::TRUE,
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
         texture_compression_bc: supported.texture_compression_bc == vk::TRUE,
         depth_clamp: supported.depth_clamp == vk::TRUE,
@@ -901,6 +923,7 @@ mod tests {
             attachment_feedback_loop_layout: true,
             image_drm_format_modifier: true,
             dual_src_blend: true,
+            independent_blend: true,
             fill_mode_non_solid: true,
             depth_clamp: true,
             multi_viewport: true,
@@ -930,6 +953,27 @@ mod tests {
         // The default is "not supported", so a `DeviceFeatures` built without a
         // query never claims a capability it has not checked for.
         assert!(!DeviceFeatures::default().dual_src_blend);
+    }
+
+    /// `independentBlend` under the same rule, and it is the one feature here
+    /// whose absence is reachable from an ordinary guest pipeline rather than
+    /// from an unusual one: any MRT pipeline that blends one slot and replaces
+    /// another declares attachments that disagree.
+    #[test]
+    fn independent_blend_is_enabled_only_where_the_device_advertises_it() {
+        assert_eq!(
+            all_supported().enabled_features().independent_blend,
+            vk::TRUE
+        );
+        let without = DeviceFeatures {
+            independent_blend: false,
+            attachment_feedback_loop_layout: false,
+            image_drm_format_modifier: false,
+            ..all_supported()
+        };
+        assert_eq!(without.enabled_features().independent_blend, vk::FALSE);
+        assert!(without.required_extensions().is_empty());
+        assert!(!DeviceFeatures::default().independent_blend);
     }
 
     /// The two rasterization features the guest's `setTriangleFillMode:` and

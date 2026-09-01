@@ -797,41 +797,14 @@ impl VertexAttribute {
 
 /// `MTLColorWriteMask` for one attachment, in Metal's own bit order.
 ///
-/// A newtype rather than a bare `u32` for one reason: the value that means
-/// "write every channel" is `0xf`, and the value a derived `Default` would
-/// produce is `0` — which means *write nothing*. `PipelineColorAttachment` is
-/// built with `..Default::default()` in the decoder and defaulted outright at
-/// several call sites, so a bare field would make an omitted mask a black
-/// attachment. Here the omission is unwritable: `Default` is `all`, which is
-/// also what an entry that does not carry tag `0x09` means on the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ColorWriteMask {
-    /// Private so the only ways to obtain one are [`ColorWriteMask::new`],
-    /// which range-checks, and `Default`, which is `all`. A `pub` field would
-    /// also make this a decode field needing its own coverage disposition,
-    /// when the disposition that matters is `PipelineColorAttachment`'s.
-    bits: u32,
-}
-
-impl Default for ColorWriteMask {
-    fn default() -> Self {
-        Self {
-            bits: MTL_COLOR_WRITE_MASK_ALL,
-        }
-    }
-}
-
-impl ColorWriteMask {
-    /// `None` for a value outside `MTLColorWriteMask`'s four bits — see
-    /// [`ColorWriteMaskOutOfRange`], which is what the decoder reports for it.
-    pub fn new(bits: u32) -> Option<Self> {
-        (bits <= MTL_COLOR_WRITE_MASK_ALL).then_some(Self { bits })
-    }
-
-    pub fn bits(self) -> u32 {
-        self.bits
-    }
-}
+/// The type is [`reims_vgpu_protocol::blend::ColorWriteMask`], re-exported so
+/// the decoder and the layer that assigns the mask its meaning range-check one
+/// value once. It used to be declared here as well, which made "which four
+/// bits are a mask" a fact stated twice — and the value that means "write
+/// every channel" is `0xf` while the value a derived `Default` would produce
+/// is `0`, so the two statements disagreeing would make an omitted mask a
+/// black attachment on one side and an opaque one on the other.
+pub use reims_vgpu_protocol::blend::ColorWriteMask;
 
 /// One pipeline color-attachment entry (format + blend) from the serializer-object color section.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1346,16 +1319,13 @@ pub const BLEND_OP_ADD: u32 = 0;
 // run alpha-first from the low end, which is the reverse of the RGBA reading
 // order the name suggests — `Red` is `1 << 3`, not `1 << 0`.
 //
-// This is an SDK mirror, so the table is the whole enum and stays `pub` even
-// where a member has no reader. `_NONE` has one on the Vulkan arm only, and
-// gating it on that arm would make the mirror's completeness depend on which
-// backend is compiled — which is the property a mirror exists to not have.
-pub const MTL_COLOR_WRITE_MASK_NONE: u32 = 0;
-pub const MTL_COLOR_WRITE_MASK_ALPHA: u32 = 1 << 0;
-pub const MTL_COLOR_WRITE_MASK_BLUE: u32 = 1 << 1;
-pub const MTL_COLOR_WRITE_MASK_GREEN: u32 = 1 << 2;
-pub const MTL_COLOR_WRITE_MASK_RED: u32 = 1 << 3;
-pub const MTL_COLOR_WRITE_MASK_ALL: u32 = 0xf;
+// The mirror lives beside [`ColorWriteMask`] in the protocol crate and is
+// re-exported whole, so the constants and the newtype that range-checks
+// against them cannot drift apart.
+pub use reims_vgpu_protocol::blend::{
+    MTL_COLOR_WRITE_MASK_ALL, MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE,
+    MTL_COLOR_WRITE_MASK_GREEN, MTL_COLOR_WRITE_MASK_NONE, MTL_COLOR_WRITE_MASK_RED,
+};
 
 /// Where the sampler-creation record (serializer-object subtype 0x03) puts each field, for
 /// the synthetic buffers the tests below assemble.
