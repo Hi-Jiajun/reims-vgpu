@@ -27,6 +27,8 @@
 //!   it, and it holds no device name for one to branch on.
 //! - [`descriptor`] — which mechanism carries a draw's descriptors on this
 //!   host, and what one emission is therefore allowed to write.
+//! - [`host`] — the instance, the physical device this rail bound, and the
+//!   only Vulkan state the architecture allows to be process-global.
 //! - [`layout`] — which layout each image subresource is in, and the explicit
 //!   transitions and ownership moves that get it to the next one.
 //! - [`memory`] — how host and device memory relate on the bound physical
@@ -56,6 +58,7 @@ pub mod barrier;
 pub mod bindings;
 pub mod census;
 pub mod descriptor;
+pub mod host;
 pub mod layout;
 pub mod memory;
 pub mod placement;
