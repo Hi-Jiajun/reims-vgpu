@@ -266,7 +266,7 @@ impl Interpreter {
             // reservation happened when the transaction was planned, and a
             // completion that took a fresh number here would beat every writer
             // that reserved after it and lose to none.
-            let beaten = written_bytes(published.region).map(|bytes| {
+            let beaten = written_bytes(&self.content, published.region).map(|bytes| {
                 self.content.materialize(
                     published.backing,
                     bytes,
@@ -395,18 +395,30 @@ impl Interpreter {
 
 /// The byte range a write access covers, when it names one.
 ///
-/// A subresource write names image coordinates rather than bytes, and this
-/// crate cannot relate the two — that needs the image's layout, which is an
-/// executor's. So a subresource write moves no bytes in the ledger and its
-/// effect is the version alone. Saying that here, once, is better than a caller
-/// inventing a range from a subresource.
-fn written_bytes(key: AccessKey) -> Option<crate::access::ByteRange> {
+/// Three answers, and the two `None`s are not the same fact.
+///
+/// A `Range` names its bytes. `Whole` names the backing, and the backing's
+/// bytes are the extent its declaration gave it — so this asks the ledger
+/// rather than returning nothing. It used to return nothing, and a
+/// whole-backing write therefore published a version over no bytes: nothing
+/// was covered, so a later *older* write was not beaten by it, and the replica
+/// that produced the content did not become fresh for it — which makes the
+/// next read from that replica owe a transfer that copies stale bytes over
+/// what the device just wrote.
+///
+/// A subresource write is the genuine `None`: it names image coordinates
+/// rather than bytes, and relating the two needs the image's layout, which is
+/// an executor's and not this crate's. Its effect is the version alone. So is
+/// a heap declaration's and an unparticipating access's, neither of which
+/// names memory at all.
+fn written_bytes(
+    content: &crate::content::ContentLedger,
+    key: AccessKey,
+) -> Option<crate::access::ByteRange> {
     match key {
         AccessKey::Range(_, range) => Some(range),
-        AccessKey::Subresource(..)
-        | AccessKey::Whole(_)
-        | AccessKey::Heap(_)
-        | AccessKey::DomainOnly => None,
+        AccessKey::Whole(resource) => content.extent(resource.backing),
+        AccessKey::Subresource(..) | AccessKey::Heap(_) | AccessKey::DomainOnly => None,
     }
 }
 
@@ -643,11 +655,16 @@ mod tests {
         );
     }
 
-    /// A byte-ranged write reaches the content ledger; a subresource write
-    /// moves no bytes there, because relating image coordinates to bytes needs
-    /// a layout this crate cannot see.
+    /// A byte-ranged write reaches the content ledger, and each other access
+    /// shape names its own bytes or says why it cannot.
+    ///
+    /// The whole backing is the extent its declaration gave it; a backing no
+    /// declaration reached names nothing, because the model does not know how
+    /// big it is; and a subresource names nothing because relating image
+    /// coordinates to bytes needs a layout this crate cannot see. Three
+    /// answers, and the two silences are different facts.
     #[test]
-    fn a_ranged_write_advances_content_and_a_subresource_write_does_not() {
+    fn a_ranged_write_advances_content_and_each_shape_names_its_own_bytes() {
         let mut b = builder(1);
         b.declare_access(write_access(9, 0, 0x40));
         let tx = b.finish().expect("frozen");
@@ -679,11 +696,51 @@ mod tests {
             Replica::GuestPages
         ));
 
+        // A whole-backing write names the extent the declaration gave it.
+        // Above it named nothing, so a whole-backing write covered no bytes and
+        // published a version over memory it never claimed.
+        let whole = AccessKey::Whole(ResourceKey {
+            backing: BackingId(9),
+            heap: None,
+        });
         assert_eq!(
-            written_bytes(AccessKey::Whole(ResourceKey {
-                backing: BackingId(9),
-                heap: None
-            })),
+            written_bytes(&interp.content, whole),
+            Some(ByteRange {
+                offset: 0,
+                length: 0x100
+            })
+        );
+        // And a backing no declaration reached still names nothing: the model
+        // does not know how big it is, and a guessed size would claim memory
+        // the guest never gave it.
+        assert_eq!(
+            written_bytes(
+                &interp.content,
+                AccessKey::Whole(ResourceKey {
+                    backing: BackingId(404),
+                    heap: None
+                })
+            ),
+            None
+        );
+        // A subresource is the genuine unknown: its bytes need a layout.
+        assert_eq!(
+            written_bytes(
+                &interp.content,
+                AccessKey::Subresource(
+                    ResourceKey {
+                        backing: BackingId(9),
+                        heap: None
+                    },
+                    crate::access::SubresourceRange {
+                        base_level: 0,
+                        level_count: 1,
+                        base_slice: 0,
+                        slice_count: 1,
+                        plane: 0,
+                    }
+                )
+            ),
             None
         );
     }
@@ -930,5 +987,63 @@ mod tests {
             ],
             "half landed, so it is both beaten and published"
         );
+    }
+
+    /// A whole-backing write makes the writing replica fresh for the whole
+    /// backing, so a later read from it owes no transfer.
+    ///
+    /// The failure this replaces: a `Whole` access named no bytes, so the
+    /// device's write covered nothing and the guest stayed fresh for
+    /// everything. The next read from device storage then owed a copy *from*
+    /// the guest — stale bytes, over content the device had just produced,
+    /// with a version published saying the device's content was current.
+    #[test]
+    fn a_whole_backing_write_makes_its_replica_fresh_for_the_whole_backing() {
+        let extent = ByteRange {
+            offset: 0,
+            length: 0x100,
+        };
+        let mut interp = Interpreter::new();
+        interp
+            .content_mut()
+            .declare(BackingId(9), extent, Replica::GuestPages);
+
+        let mut b = builder(1);
+        b.declare_access(AccessIntent {
+            key: AccessKey::Whole(ResourceKey {
+                backing: BackingId(9),
+                heap: None,
+            }),
+            output_content_version: Some(ContentVersion(5)),
+            ..write_access(9, 0, 0x100)
+        });
+        assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+
+        let content = interp.content_mut();
+        assert!(content.is_fresh(BackingId(9), extent, Replica::DeviceOwned));
+        assert!(!content.is_fresh(BackingId(9), extent, Replica::GuestPages));
+        assert!(
+            content
+                .transfer_for_read(BackingId(9), extent, Replica::DeviceOwned)
+                .is_none(),
+            "the device produced these bytes; nothing may be copied over them"
+        );
+        assert_eq!(
+            content.version_of(BackingId(9), extent),
+            Some(ContentVersion(5))
+        );
+
+        // And it beats an older write that overlaps it, which a version over
+        // no bytes could not have done.
+        let mut b = builder(2);
+        b.declare_access(AccessIntent {
+            output_content_version: Some(ContentVersion(2)),
+            ..write_access(9, 0, 0x40)
+        });
+        assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+        assert!(interp
+            .trace()
+            .iter()
+            .any(|o| matches!(o, Observation::VersionBeaten { landed: 0, .. })));
     }
 }

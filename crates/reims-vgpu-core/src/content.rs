@@ -81,6 +81,13 @@ struct Entry {
     /// Which version is current in each part of the backing. See
     /// [`crate::coverage`] for why this is not one number.
     canonical: VersionCoverage,
+    /// The extent the declaration named, which is the whole backing.
+    ///
+    /// `None` for a backing that reached this ledger through a write rather
+    /// than a declaration — a test, or a replay that starts mid-stream. It is
+    /// what turns "the whole backing" into bytes, and where it is absent that
+    /// translation is refused rather than guessed at some default size.
+    extent: Option<ByteRange>,
     fresh: HashMap<Replica, RangeSet>,
 }
 
@@ -142,6 +149,23 @@ impl ContentLedger {
         self.backings
             .get(&backing)
             .and_then(|e| e.canonical.newest_over(range))
+    }
+
+    /// The bytes a record naming "the whole backing" is naming.
+    ///
+    /// The extent its declaration gave it, and `None` for a backing no
+    /// declaration reached. A caller with a whole-backing write must ask this
+    /// rather than inventing a range: a write recorded against no bytes
+    /// publishes a version over nothing, so a later *older* write is not
+    /// beaten by it and a replica that produced the content does not become
+    /// fresh for it — which is a transfer that copies stale bytes over what
+    /// the device just wrote.
+    ///
+    /// Not answerable for a subresource, and that is a different fact: image
+    /// coordinates need a layout, which is an executor's and not this crate's.
+    #[must_use]
+    pub fn extent(&self, backing: BackingId) -> Option<ByteRange> {
+        self.backings.get(&backing).and_then(|e| e.extent)
     }
 
     /// Take the next version a write of this backing may produce.
@@ -213,6 +237,7 @@ impl ContentLedger {
     pub fn declare(&mut self, backing: BackingId, extent: ByteRange, authority: Replica) {
         let version = self.reserve(backing);
         let e = self.backings.entry(backing).or_default();
+        e.extent = Some(extent);
         e.canonical.clear();
         e.fresh.clear();
         e.fresh.insert(authority, RangeSet::from_range(extent));
