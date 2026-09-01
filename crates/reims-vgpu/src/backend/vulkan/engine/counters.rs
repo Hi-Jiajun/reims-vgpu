@@ -620,6 +620,11 @@ engine_counters! {
         /// bakes all four — where it reads zero because nothing was ever
         /// asked, not because nothing was held.
         dynstate_raster_held,
+        /// The primitive topology a draw did not re-record. Out of every draw
+        /// on a host that made it dynamic; on a host that bakes it this counts
+        /// every draw after the first of each command buffer, because nothing
+        /// is asked and nothing changes.
+        dynstate_topology_held,
         /// Vertex-buffer binding slots requested by draws. This must equal
         /// `vertex_buffer_bind_emitted`; compare either with
         /// `vertex_buffer_bind_calls` to measure contiguous bulk encoding.

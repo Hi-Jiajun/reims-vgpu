@@ -547,7 +547,7 @@ pub(crate) struct DeviceContext {
     pub push_descriptor: Option<ash::khr::push_descriptor::Device>,
     /// `VK_EXT_extended_dynamic_state` entry points — `vkCmdSetCullModeEXT`
     /// and `vkCmdSetFrontFaceEXT` — present only where
-    /// [`crate::backend::vulkan::caps::DeviceFeatures::dynamic_cull_and_winding`]
+    /// [`crate::backend::vulkan::caps::DeviceFeatures::extended_dynamic_state`]
     /// admitted them and the extension was therefore enabled.
     ///
     /// `None` is not a degraded rung: the pipeline bakes those two members
@@ -1109,7 +1109,7 @@ impl DeviceContext {
         if features.attachment_feedback_loop_layout {
             dci = dci.push_next(&mut en_attachment_feedback);
         }
-        if features.dynamic_cull_and_winding {
+        if features.extended_dynamic_state {
             dci = dci.push_next(&mut en_extended_dynamic_state);
         }
         if features.wants_extended_dynamic_state3() {
@@ -1218,7 +1218,7 @@ impl DeviceContext {
             .is_available()
             .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
         let extended_dynamic_state = features
-            .dynamic_cull_and_winding
+            .extended_dynamic_state
             .then(|| ash::ext::extended_dynamic_state::Device::new(&instance, &device));
         let extended_dynamic_state3 = features
             .wants_extended_dynamic_state3()

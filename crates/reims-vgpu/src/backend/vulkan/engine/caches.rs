@@ -13,8 +13,7 @@ use super::counters::{CreateSite, EngineCounters};
 use super::digest::Digest128;
 use super::pools::{DeferredHandle, ResourcePools};
 use super::types::{
-    BlendKey, ColorWriteMask, DrawError, PrimitiveTopology, SamplerStateKey, VertexAttributeFormat,
-    VertexStepFunction,
+    BlendKey, ColorWriteMask, DrawError, SamplerStateKey, VertexAttributeFormat, VertexStepFunction,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -575,7 +574,21 @@ pub(crate) struct PipelineKey {
     pub vert: Digest128,
     pub frag: Digest128,
     pub attrs: Vec<AttrKey>,
-    pub topology: PrimitiveTopology,
+    /// What this pipeline is identified by as far as the primitive type is
+    /// concerned — the guest's exact type on a host that bakes it, its
+    /// topology class where `vkCmdSetPrimitiveTopology` may move within a
+    /// class, and one key for everything where the device also reports
+    /// `dynamicPrimitiveTopologyUnrestricted`.
+    ///
+    /// Not the guest's type, for the reason [`Self::raster`] is not the
+    /// guest's ordinals: on a dynamic host a triangle list and a triangle
+    /// strip are one pipeline, and a key holding the type could not say so.
+    /// `reims_vgpu_vulkan::topology::key` is the only place that decides which
+    /// of the three rungs this device is on, and
+    /// `TopologyKey::input_assembly` derives the declared topology back out of
+    /// the key — never out of the guest's type — so two draws sharing a key
+    /// cannot describe two different pipelines.
+    pub topology: reims_vgpu_vulkan::topology::TopologyKey,
     pub blend: Option<BlendKey>,
     /// Per-slot blend for secondary colour attachments, parallel to
     /// `pass.secondary[..pass.secondary_count]`. Entries past the count are
@@ -2457,17 +2470,13 @@ impl ObjectCaches {
         if !vertex_binding_divisors.is_empty() {
             vtx_input = vtx_input.push_next(&mut vertex_divisor_state);
         }
-        // The rungs above the baseline are not wired: this cache still keys a
-        // pipeline on the exact primitive type, so the topology is declared
-        // rather than set per draw and `TopologyCell` is the floor every host
-        // meets. Naming the cell rather than omitting it is what will make
-        // turning a rung on a change to one value.
-        const TOPOLOGY: reims_vgpu_vulkan::topology::TopologyCell =
-            reims_vgpu_vulkan::topology::TopologyCell {
-                dynamic: false,
-                unrestricted: false,
-            };
-        let input_asm = reims_vgpu_vulkan::topology::plan(key.topology.0, TOPOLOGY).native();
+        // Derived from the key, never from the guest's primitive type: the
+        // key is what two draws share, so the declared topology has to be a
+        // function of it or one cache entry would describe two pipelines. On
+        // the baseline rung the key *is* the guest's type and this is the
+        // topology it always was.
+        let input_asm_plan = key.topology.input_assembly();
+        let input_asm = input_asm_plan.native();
         // Dynamic viewport/scissor so L5 key need not include extent (flip flag is static).
         // Stencil reference is dynamic (Metal's `SetStencilReferenceValue` is a
         // command distinct from the state object) so distinct references reuse
@@ -2498,6 +2507,12 @@ impl ObjectCaches {
         // `key.raster` are two readings of one `RasterDynamic`, and a second
         // derivation could disagree with it.
         dynamic_states.extend(key.raster.dynamic.states());
+        // `PRIMITIVE_TOPOLOGY` where the input assembly above declared a
+        // stand-in for a class rather than the guest's own type. Taken from
+        // the same plan that chose the stand-in: a pipeline that declares one
+        // without declaring the state rasterizes the stand-in, and on a host
+        // with no validation layers nothing says so.
+        dynamic_states.extend_from_slice(input_asm_plan.states());
         if key.stencil.is_some() {
             dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
         }

@@ -1870,6 +1870,7 @@ impl ResourcePools {
         self.cb_graphics.blend_constants = None;
         self.cb_graphics.depth_bias_set = false;
         self.cb_graphics.raster = None;
+        self.cb_graphics.topology = None;
         self.cb_graphics.push_layout = None;
         self.cb_graphics.push_bindings.clear();
     }
@@ -2533,6 +2534,44 @@ impl ResourcePools {
             if let Some(clamp) = values.depth_clamp_enable {
                 unsafe { eds3.cmd_set_depth_clamp_enable(cb, clamp) };
             }
+        }
+    }
+
+    /// Record `vkCmdSetPrimitiveTopology` unless this command buffer already
+    /// carries exactly this topology.
+    ///
+    /// `wanted` is `Some` exactly when the pipeline about to be bound declares
+    /// `PRIMITIVE_TOPOLOGY` dynamic, which is the same condition
+    /// `reims_vgpu_vulkan::topology::key` used to collapse a list and its strip
+    /// onto one cache entry. A pipeline that declares the state and never
+    /// receives it draws undefined; a host that bakes the topology asks
+    /// nothing here and pays one comparison.
+    ///
+    /// The entry point comes from the `VK_EXT_extended_dynamic_state` loader,
+    /// which is `Some` on exactly the devices whose feature bit put a `Some`
+    /// in `wanted` — so an entry point the device never enabled cannot be
+    /// reached from here.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_topology(
+        &mut self,
+        ctx: &super::super::context::DeviceContext,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        wanted: Option<vk::PrimitiveTopology>,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.topology == Some(wanted) {
+            counters
+                .dynstate_topology_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.topology = Some(wanted);
+        if let (Some(eds), Some(topology)) = (ctx.extended_dynamic_state.as_ref(), wanted) {
+            unsafe { eds.cmd_set_primitive_topology(cb, topology) };
         }
     }
 

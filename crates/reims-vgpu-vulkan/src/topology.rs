@@ -113,6 +113,23 @@ pub struct InputAssemblyPlan {
 }
 
 impl InputAssemblyPlan {
+    /// The dynamic states a pipeline built from this plan must declare.
+    ///
+    /// Read off the plan rather than off the cell, for the reason
+    /// `raster::RasterizationState::dynamic` is read off the pipeline key: the
+    /// state list and the stand-in topology it explains are two readings of
+    /// one decision, and a second derivation could disagree. A pipeline that
+    /// declares a stand-in without declaring the state draws that stand-in —
+    /// silently, on a host with no validation layers.
+    #[must_use]
+    pub const fn states(self) -> &'static [vk::DynamicState] {
+        if self.dynamic {
+            &[vk::DynamicState::PRIMITIVE_TOPOLOGY]
+        } else {
+            &[]
+        }
+    }
+
     pub const fn native(self) -> vk::PipelineInputAssemblyStateCreateInfo<'static> {
         vk::PipelineInputAssemblyStateCreateInfo {
             s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -125,16 +142,58 @@ impl InputAssemblyPlan {
     }
 }
 
-/// Plan the input assembly for a draw of `guest`.
+impl TopologyKey {
+    /// The input assembly a pipeline under this key is built with.
+    ///
+    /// Derived from the key rather than from the guest's own primitive type,
+    /// and that is the whole reason this is a method on the key: two draws
+    /// that share a key must produce a byte-identical pipeline, so the
+    /// declared topology has to be a function of what they share. A `Class`
+    /// pipeline built from a triangle strip and one built from a triangle list
+    /// would otherwise declare different topologies while claiming to be the
+    /// same cache entry.
+    ///
+    /// `Class` declares [`TopologyClass::list`] — the class's one non-strip
+    /// member, which exists for exactly this. `Any` declares a triangle list;
+    /// under `dynamicPrimitiveTopologyUnrestricted` the declared topology
+    /// constrains nothing, so the only thing that matters is that every `Any`
+    /// pipeline picks the same one.
+    #[must_use]
+    pub const fn input_assembly(self) -> InputAssemblyPlan {
+        InputAssemblyPlan {
+            topology: topology(self.declares()),
+            primitive_restart_enable: false,
+            dynamic: !matches!(self, Self::Exact(_)),
+        }
+    }
+
+    /// The primitive type a pipeline under this key declares.
+    ///
+    /// Always a type this key itself serves — see
+    /// [`Self::input_assembly`] — so on the restricted rung the declared
+    /// topology is always in the class the encoder may move within.
+    #[must_use]
+    pub const fn declares(self) -> PrimitiveType {
+        match self {
+            Self::Exact(guest) => guest,
+            Self::Class(class) => class.list(),
+            Self::Any => PrimitiveType::Triangle,
+        }
+    }
+}
+
+/// The topology the encoder sets before a draw of `guest`, or `None` where
+/// this host baked it into the pipeline instead.
 ///
-/// Total: every primitive type the guest API admits has a plan here. The
-/// ordinal that could have failed was closed one layer down.
+/// `Some` exactly when [`TopologyKey::input_assembly`] reported `dynamic`, so
+/// a caller that sets every `Some` has reproduced the guest's draw and a
+/// caller that sets none of them is a host that bakes the topology.
 #[must_use]
-pub const fn plan(guest: PrimitiveType, cell: TopologyCell) -> InputAssemblyPlan {
-    InputAssemblyPlan {
-        topology: topology(guest),
-        primitive_restart_enable: false,
-        dynamic: cell.dynamic,
+pub const fn dynamic(guest: PrimitiveType, cell: TopologyCell) -> Option<vk::PrimitiveTopology> {
+    if cell.dynamic {
+        Some(topology(guest))
+    } else {
+        None
     }
 }
 
@@ -149,7 +208,7 @@ pub fn serves(built: PrimitiveType, wanted: PrimitiveType, cell: TopologyCell) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const STATIC: TopologyCell = TopologyCell {
         dynamic: false,
@@ -200,7 +259,7 @@ mod tests {
     fn no_plan_enables_primitive_restart_including_the_strips() {
         for guest in PrimitiveType::ALL {
             for cell in [STATIC, CLASSED, FREE] {
-                let plan = plan(guest, cell);
+                let plan = key(guest, cell).input_assembly();
                 assert!(!plan.primitive_restart_enable);
                 assert_eq!(plan.native().primitive_restart_enable, vk::FALSE);
             }
@@ -254,7 +313,7 @@ mod tests {
         ));
         assert!(!serves(PrimitiveType::Point, PrimitiveType::Line, CLASSED));
         for guest in PrimitiveType::ALL {
-            assert!(plan(guest, CLASSED).dynamic);
+            assert!(key(guest, CLASSED).input_assembly().dynamic);
         }
     }
 
@@ -289,17 +348,71 @@ mod tests {
             PrimitiveType::LineStrip,
             confused
         ));
-        assert!(!plan(PrimitiveType::Line, confused).dynamic);
+        assert!(!key(PrimitiveType::Line, confused).input_assembly().dynamic);
+        assert_eq!(dynamic(PrimitiveType::Line, confused), None);
+        assert!(key(PrimitiveType::Line, confused)
+            .input_assembly()
+            .states()
+            .is_empty());
     }
 
     #[test]
     fn the_native_state_carries_the_plan() {
-        let native = plan(PrimitiveType::TriangleStrip, CLASSED).native();
+        let native = TopologyKey::Exact(PrimitiveType::TriangleStrip)
+            .input_assembly()
+            .native();
         assert_eq!(native.topology, vk::PrimitiveTopology::TRIANGLE_STRIP);
         assert_eq!(native.primitive_restart_enable, vk::FALSE);
         assert_eq!(
             native.s_type,
             vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
         );
+    }
+
+    /// The claim a cache rests on: every guest type that shares a key builds
+    /// the *same* pipeline. If the declared topology were read from the guest
+    /// instead of from the key, a triangle list and a triangle strip would be
+    /// one cache entry describing two different pipelines — the first one
+    /// created would silently serve the other.
+    #[test]
+    fn one_key_declares_one_input_assembly_whatever_guest_type_reached_it() {
+        for cell in [STATIC, CLASSED, FREE] {
+            let mut per_key: BTreeMap<TopologyKey, InputAssemblyPlan> = BTreeMap::new();
+            for guest in PrimitiveType::ALL {
+                let k = key(guest, cell);
+                let asm = k.input_assembly();
+                if let Some(seen) = per_key.get(&k) {
+                    assert_eq!(*seen, asm, "{k:?} declares two different pipelines");
+                } else {
+                    per_key.insert(k, asm);
+                }
+                // And the declared topology is one the key admits, so a draw
+                // whose dynamic topology is set can lawfully reach it.
+                assert_eq!(key(k.declares(), cell), k);
+            }
+        }
+    }
+
+    /// A member is dynamic in exactly one of the two halves: the encoder is
+    /// given the guest's own type precisely where the pipeline declared a
+    /// stand-in, and given nothing where the pipeline declared the guest's.
+    #[test]
+    fn the_guests_type_is_in_exactly_one_half() {
+        for cell in [STATIC, CLASSED, FREE] {
+            for guest in PrimitiveType::ALL {
+                let asm = key(guest, cell).input_assembly();
+                let dyn_value = dynamic(guest, cell);
+                assert_eq!(dyn_value.is_some(), asm.dynamic);
+                assert_eq!(
+                    asm.states().contains(&vk::DynamicState::PRIMITIVE_TOPOLOGY),
+                    asm.dynamic
+                );
+                if let Some(set) = dyn_value {
+                    assert_eq!(set, topology(guest));
+                } else {
+                    assert_eq!(asm.topology, topology(guest));
+                }
+            }
+        }
     }
 }

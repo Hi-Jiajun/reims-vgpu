@@ -3200,7 +3200,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let raster_cell = reims_vgpu_vulkan::raster::RasterCell {
         depth_clamp: ctx.features.depth_clamp,
         fill_mode_non_solid: ctx.features.fill_mode_non_solid,
-        dynamic_cull_and_winding: ctx.features.dynamic_cull_and_winding,
+        dynamic_cull_and_winding: ctx.features.extended_dynamic_state,
         dynamic_polygon_mode: ctx.features.dynamic_polygon_mode,
         dynamic_depth_clamp: ctx.features.dynamic_depth_clamp,
     };
@@ -3212,12 +3212,24 @@ pub(crate) unsafe fn execute_draw_inner(
             return Err(DrawError::Unsupported(reason));
         }
     };
+    // The primitive type, under the same split. `extendedDynamicState` is the
+    // same feature bit the cull mode and winding above ride on — it reaches
+    // `vkCmdSetPrimitiveTopology` too — and the unrestricted property says
+    // whether a draw may then move across topology classes rather than only
+    // between a list and its strip.
+    let topology_cell = reims_vgpu_vulkan::topology::TopologyCell {
+        dynamic: ctx.features.extended_dynamic_state,
+        unrestricted: ctx.features.dynamic_primitive_topology_unrestricted,
+    };
+    let topology_key = reims_vgpu_vulkan::topology::key(req.primitive_topology.0, topology_cell);
+    let topology_dynamic =
+        reims_vgpu_vulkan::topology::dynamic(req.primitive_topology.0, topology_cell);
     let pipeline_key =
         PipelineKey {
             vert: vert_digest,
             frag: frag_digest,
             attrs: attr_keys,
-            topology: req.primitive_topology,
+            topology: topology_key,
             blend: req.blend.map(|b| b.key()),
             secondary_blend: {
                 let mut per_slot = [None; MAX_SECONDARY_ATTACH];
@@ -5232,6 +5244,11 @@ pub(crate) unsafe fn execute_draw_inner(
     // state dynamic and never receives it draws undefined, so the same `Plan`
     // that decided which members are dynamic is the one that supplies them.
     unsafe { pools.set_dynamic_raster(ctx, cb, counters, raster_plan.dynamic) };
+    // The primitive type, `Some` exactly where the pipeline above declared a
+    // stand-in for its class. The pipeline that will be bound declares
+    // `PRIMITIVE_TOPOLOGY` dynamic under the same condition, so this is asked
+    // whenever that is true and never otherwise.
+    unsafe { pools.set_dynamic_topology(ctx, cb, counters, topology_dynamic) };
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
     // dynamic state; front/back set together because Metal's split refs are one

@@ -53,6 +53,22 @@ impl TopologyClass {
             Self::Triangle => "triangle",
         }
     }
+
+    /// The one member of this class that is not a strip.
+    ///
+    /// Every class has exactly one, which is what makes this total and what
+    /// makes it the class's canonical member: a layer that must name *some*
+    /// primitive type standing for the whole class — a pipeline declaring a
+    /// topology it may then be told to change within the class, say — names
+    /// this one and cannot pick differently from one call to the next.
+    #[must_use]
+    pub const fn list(self) -> PrimitiveType {
+        match self {
+            Self::Point => PrimitiveType::Point,
+            Self::Line => PrimitiveType::Line,
+            Self::Triangle => PrimitiveType::Triangle,
+        }
+    }
 }
 
 impl PrimitiveType {
@@ -121,6 +137,23 @@ impl PrimitiveType {
 mod tests {
     use super::*;
     use alloc::collections::BTreeSet;
+
+    /// Every class's canonical member is in that class, is not a strip, and is
+    /// the only member of the class that is not — so the choice is forced
+    /// rather than picked.
+    #[test]
+    fn each_class_has_exactly_one_non_strip_member_and_that_is_its_list() {
+        for class in TopologyClass::ALL {
+            let list = class.list();
+            assert_eq!(list.class(), class);
+            assert!(!list.is_strip());
+            let non_strips: alloc::vec::Vec<PrimitiveType> = PrimitiveType::ALL
+                .into_iter()
+                .filter(|p| p.class() == class && !p.is_strip())
+                .collect();
+            assert_eq!(non_strips.as_slice(), &[list]);
+        }
+    }
 
     #[test]
     fn the_set_is_closed_at_five_and_round_trips() {

@@ -221,6 +221,86 @@ fn plain_triangle_known_color() {
 /// zero leaves three standard 4x sample locations inside and one outside, so
 /// the resolved red channel must lie strictly between clear black and the
 /// fragment's red value. A one-sample redirect can only produce an endpoint.
+/// The five Metal primitive types collapse onto exactly the number of
+/// pipelines this host's topology rung admits — five, three, or one.
+///
+/// `reims_vgpu_vulkan::topology::key` has three rungs and this is the only
+/// place they are measured against a real driver. Which one this host is on is
+/// not asserted, because it is a property of the driver; what is asserted is
+/// that the count is *one of the three* and that the collapse is the right
+/// shape for it. A key that forgot the class rule would collapse a line onto a
+/// triangle and land on one; a key that never consulted the cell would stay at
+/// five on a host that reports `extendedDynamicState`; a key that used the
+/// guest's type where it meant the class would produce four.
+///
+/// Every draw is also checked to have run, so a rung that collapses is not one
+/// that stopped drawing.
+#[test]
+fn the_primitive_types_collapse_onto_one_of_the_three_topology_rungs() {
+    use reims_vgpu_core::topology::PrimitiveType;
+
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 16, 16);
+
+    // A first draw to build everything that is not the pipeline — shader
+    // modules, layout, render pass, the target — so the deltas below are the
+    // pipeline and nothing else.
+    if draw_or_skip("topology_warm", &req).is_none() {
+        return;
+    }
+
+    let mut created = Vec::new();
+    for guest in PrimitiveType::ALL {
+        req.primitive_topology = PrimitiveTopology(guest);
+        engine::reset_draw_counters();
+        let before = engine::counter_snapshot();
+        draw_or_skip("topology_rung", &req).expect("a GPU was already found");
+        let d = engine::counter_snapshot().delta_since(&before);
+        if d.creates > 0 {
+            created.push(guest);
+        }
+    }
+
+    // The warm draw above was a triangle list, so it already built whatever
+    // pipeline that type needs. What is counted here is therefore what the
+    // *other* four types cost on top of it, which is what distinguishes the
+    // rungs.
+    let names: Vec<&str> = created.iter().map(|p| p.name()).collect();
+    match created.len() {
+        // The baseline: no dynamic topology, a pipeline per type, so the four
+        // that are not a triangle list each build their own.
+        4 => assert_eq!(
+            created,
+            vec![
+                PrimitiveType::Point,
+                PrimitiveType::Line,
+                PrimitiveType::LineStrip,
+                PrimitiveType::TriangleStrip
+            ],
+            "{names:?}"
+        ),
+        // `extendedDynamicState` and nothing more: one pipeline per class. The
+        // triangle class is already built, so the point and line classes are
+        // what is left — and the strips join the pipelines their lists made.
+        2 => assert_eq!(
+            created,
+            vec![PrimitiveType::Point, PrimitiveType::Line],
+            "a classed host builds one pipeline per class and no more: {names:?}"
+        ),
+        // `dynamicPrimitiveTopologyUnrestricted` as well: the warm draw's
+        // pipeline serves every type, so nothing else is built at all.
+        0 => {}
+        n => panic!("{n} further pipelines is not a rung `topology::key` can produce: {names:?}"),
+    }
+
+    // And the triangle list still covers the target, so nothing above was
+    // achieved by declining to draw.
+    req.primitive_topology = PrimitiveTopology(PrimitiveType::Triangle);
+    let px = draw_or_skip("topology_triangle", &req).expect("a GPU was already found");
+    assert_fullscreen_fragment_color("topology_triangle", &px, 16, 16);
+}
+
 #[test]
 fn multisample_resolve_preserves_subpixel_coverage() {
     let _g = engine_test_session();

@@ -866,6 +866,14 @@ pub(crate) struct CbGraphicsState {
     /// all four members the recorded value is all-`None` and this holds from
     /// the second draw onwards, which costs four comparisons and no calls.
     raster: Option<reims_vgpu_vulkan::raster::DynamicRaster>,
+    /// The primitive topology last handed to `vkCmdSetPrimitiveTopology`.
+    ///
+    /// `Some(None)` is a host that bakes the topology and recorded nothing;
+    /// `None` is a command buffer no draw has reached yet. Two states rather
+    /// than one because "nothing was asked" and "nothing has happened" are
+    /// different, and collapsing them would re-record on the first draw of
+    /// every command buffer on a baking host.
+    topology: Option<Option<vk::PrimitiveTopology>>,
     /// The four floats last handed to `vkCmdSetBlendConstants`, by bit pattern.
     ///
     /// Compared as bits rather than as floats so the cache is a plain equality

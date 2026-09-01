@@ -356,21 +356,27 @@ pub struct DeviceFeatures {
     /// pipeline invalid. Same shape as [`Self::dual_src_blend`] — optional
     /// core, asked rather than assumed, declined by name where absent.
     pub fill_mode_non_solid: bool,
-    /// `VK_EXT_extended_dynamic_state`'s `extendedDynamicState` — whether
-    /// `vkCmdSetCullMode` and `vkCmdSetFrontFace` exist.
+    /// `VK_EXT_extended_dynamic_state`'s `extendedDynamicState`.
     ///
-    /// One field for two commands because it is one feature bit, and two
-    /// fields that could only ever be set alike would be two spellings of one
-    /// fact. Metal's `setCullMode:` and `setFrontFacingWinding:` are encoder
-    /// state the guest changes between draws; without this they are
-    /// `VkPipelineRasterizationStateCreateInfo` members, so a guest that
-    /// toggles culling around a draw compiles a second pipeline for it.
+    /// **The feature bit, not what any one layer does with it.** It reaches
+    /// `vkCmdSetCullMode`, `vkCmdSetFrontFace` and `vkCmdSetPrimitiveTopology`
+    /// alike, and those are two different subsystems: the cull mode and
+    /// winding are `reims_vgpu_vulkan::raster`'s, the primitive topology is
+    /// `reims_vgpu_vulkan::topology`'s. Each projects this one bit into its own
+    /// cell at the draw seam; a field per command would be three spellings of
+    /// one fact, and a field named after one of the three would make the other
+    /// two read like they were borrowing it.
+    ///
+    /// All three are Metal encoder state the guest changes between draws.
+    /// Without this they are pipeline-creation members, so a guest that toggles
+    /// culling around a draw — or draws lines and then triangles from one
+    /// render pipeline state — compiles a second pipeline for it.
     ///
     /// Reached through the extension rather than 1.3 core, per
     /// [`super::api_floor`]: a capability promoted into 1.3 is taken by its
     /// `EXT` name and gated on runtime presence, so the 1.2 baseline stays the
     /// path that is actually exercised.
-    pub dynamic_cull_and_winding: bool,
+    pub extended_dynamic_state: bool,
     /// `VK_EXT_extended_dynamic_state3`'s `extendedDynamicState3PolygonMode` —
     /// whether `vkCmdSetPolygonModeEXT` exists. Metal's
     /// `setTriangleFillMode:`.
@@ -390,6 +396,24 @@ pub struct DeviceFeatures {
     /// `reims_vgpu_vulkan::raster::plan` refuses `MTLDepthClipModeClamp`
     /// without it on the dynamic path too.
     pub dynamic_depth_clamp: bool,
+    /// `VkPhysicalDeviceExtendedDynamicState3PropertiesEXT::dynamicPrimitiveTopologyUnrestricted`.
+    ///
+    /// A **property**, not a feature: a device reports whether
+    /// `vkCmdSetPrimitiveTopology` may move across topology classes, rather
+    /// than being asked to lift the restriction. So it needs no enable and
+    /// adds no extension string — only `VK_EXT_extended_dynamic_state3` being
+    /// *advertised*, which is what makes the property answerable at all.
+    ///
+    /// Meaningless without [`Self::extended_dynamic_state`], which is the
+    /// feature that makes the topology dynamic in the first place;
+    /// `reims_vgpu_vulkan::topology::key` is where the two combine into the
+    /// three rungs a pipeline may be cached under, and a device that was not
+    /// asked reads `false`, which is the conservative rung.
+    ///
+    /// Getting this wrong is not a validation failure on a device that happens
+    /// to allow a cross-class change — it just runs — which is exactly why it
+    /// is asked structurally.
+    pub dynamic_primitive_topology_unrestricted: bool,
     /// `VkPhysicalDeviceFeatures::textureCompressionBC` — whether this device
     /// can sample the BC (DXT / S3TC) block-compressed families.
     ///
@@ -578,7 +602,7 @@ impl DeviceFeatures {
         &self,
     ) -> vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'static> {
         vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
-            .extended_dynamic_state(self.dynamic_cull_and_winding)
+            .extended_dynamic_state(self.extended_dynamic_state)
     }
 
     /// The `VK_EXT_extended_dynamic_state3` feature struct to chain. Two
@@ -659,9 +683,10 @@ impl DeviceFeatures {
             dual_src_blend,
             independent_blend,
             fill_mode_non_solid,
-            dynamic_cull_and_winding,
+            extended_dynamic_state,
             dynamic_polygon_mode,
             dynamic_depth_clamp,
+            dynamic_primitive_topology_unrestricted,
             depth_clamp,
             multi_viewport,
             max_viewports,
@@ -710,9 +735,10 @@ impl DeviceFeatures {
              mirror_clamp_to_edge={mirror_clamp_to_edge:?} \
              dual_src_blend={dual_src_blend} independent_blend={independent_blend} \
              fill_mode_non_solid={fill_mode_non_solid} \
-             dyn_cull_winding={dynamic_cull_and_winding} \
+             extended_dynamic_state={extended_dynamic_state} \
              dyn_polygon_mode={dynamic_polygon_mode} \
              dyn_depth_clamp={dynamic_depth_clamp} \
+             dyn_topology_unrestricted={dynamic_primitive_topology_unrestricted} \
              depth_clamp={depth_clamp} multi_viewport={multi_viewport} max_viewports={max_viewports} \
              occlusion_query_precise={occlusion_query_precise}",
             missing(sampled_linear_filter),
@@ -736,7 +762,7 @@ impl DeviceFeatures {
         if self.image_drm_format_modifier {
             out.push(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr());
         }
-        if self.dynamic_cull_and_winding {
+        if self.extended_dynamic_state {
             out.push(vk::EXT_EXTENDED_DYNAMIC_STATE_NAME.as_ptr());
         }
         // One string for both members, and named only when at least one of
@@ -890,7 +916,7 @@ pub unsafe fn query(
     // advertised it. Both are asked by their `EXT` name rather than through
     // 1.3 core — see [`super::api_floor`] — so the 1.2 baseline is the path
     // that runs.
-    let dynamic_cull_and_winding = if has_extension(vk::EXT_EXTENDED_DYNAMIC_STATE_NAME) {
+    let extended_dynamic_state = if has_extension(vk::EXT_EXTENDED_DYNAMIC_STATE_NAME) {
         let mut eds = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
         let mut chained = vk::PhysicalDeviceFeatures2::default().push_next(&mut eds);
         unsafe { instance.get_physical_device_features2(pd, &mut chained) };
@@ -910,6 +936,21 @@ pub unsafe fn query(
         } else {
             (false, false)
         };
+    // A property rather than a feature, so it is read from `Properties2` and
+    // never enabled. Advertised is all it takes to be answerable — the
+    // extension does not have to be *enabled* for the device to have told the
+    // truth about how its `vkCmdSetPrimitiveTopology` behaves. A device that
+    // does not carry the extension is left restricted, which is the rung every
+    // host meets.
+    let dynamic_primitive_topology_unrestricted =
+        if has_extension(vk::EXT_EXTENDED_DYNAMIC_STATE3_NAME) {
+            let mut eds3 = vk::PhysicalDeviceExtendedDynamicState3PropertiesEXT::default();
+            let mut chained = vk::PhysicalDeviceProperties2::default().push_next(&mut eds3);
+            unsafe { instance.get_physical_device_properties2(pd, &mut chained) };
+            eds3.dynamic_primitive_topology_unrestricted == vk::TRUE
+        } else {
+            false
+        };
 
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
@@ -920,9 +961,10 @@ pub unsafe fn query(
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
         independent_blend: supported.independent_blend == vk::TRUE,
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
-        dynamic_cull_and_winding,
+        extended_dynamic_state,
         dynamic_polygon_mode,
         dynamic_depth_clamp,
+        dynamic_primitive_topology_unrestricted,
         texture_compression_bc: supported.texture_compression_bc == vk::TRUE,
         depth_clamp: supported.depth_clamp == vk::TRUE,
         multi_viewport: supported.multi_viewport == vk::TRUE,
@@ -990,9 +1032,10 @@ mod tests {
     fn all_supported() -> DeviceFeatures {
         DeviceFeatures {
             occlusion_query_precise: true,
-            dynamic_cull_and_winding: true,
+            extended_dynamic_state: true,
             dynamic_polygon_mode: true,
             dynamic_depth_clamp: true,
+            dynamic_primitive_topology_unrestricted: true,
             robust_buffer_access: true,
             texture_compression_bc: true,
             sampler_anisotropy: true,
@@ -1124,7 +1167,7 @@ mod tests {
             (false, false, true),
         ] {
             let caps = DeviceFeatures {
-                dynamic_cull_and_winding: cull,
+                extended_dynamic_state: cull,
                 dynamic_polygon_mode: polygon,
                 dynamic_depth_clamp: clamp,
                 ..all_supported()
@@ -1145,16 +1188,34 @@ mod tests {
             );
         }
 
+        // The unrestricted topology *property* is not a feature: it names no
+        // extension and enables nothing, however it reads. A device is asked
+        // whether its `vkCmdSetPrimitiveTopology` may cross a topology class;
+        // it is never asked to make it so.
+        for unrestricted in [false, true] {
+            let caps = DeviceFeatures {
+                extended_dynamic_state: false,
+                dynamic_polygon_mode: false,
+                dynamic_depth_clamp: false,
+                dynamic_primitive_topology_unrestricted: unrestricted,
+                ..all_supported()
+            };
+            assert!(!caps.required_extensions().contains(&eds));
+            assert!(!caps.required_extensions().contains(&eds3));
+            assert!(!caps.wants_extended_dynamic_state3());
+        }
+
         // Never claimed without a query, like every other capability here. A
         // device that was not asked bakes all four members, which is what
         // every host below these extensions has always done.
         let none = DeviceFeatures::default();
-        assert!(!none.dynamic_cull_and_winding);
+        assert!(!none.extended_dynamic_state);
         assert!(!none.dynamic_polygon_mode);
         assert!(!none.dynamic_depth_clamp);
         assert!(!none.wants_extended_dynamic_state3());
         assert!(!none.required_extensions().contains(&eds));
         assert!(!none.required_extensions().contains(&eds3));
+        assert!(!none.dynamic_primitive_topology_unrestricted);
     }
 
     /// The two rasterization features the guest's `setTriangleFillMode:` and
