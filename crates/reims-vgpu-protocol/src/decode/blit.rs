@@ -14,7 +14,7 @@
 //! the views are what the fixtures pin, and an offset written here would be a
 //! second reading of the same bytes with nothing comparing the two.
 
-use super::{short, DecodeRefusal};
+use super::{no_record, short, DecodeRefusal};
 use crate::blit::BlitKind;
 use crate::closure::Rail;
 use reims_vgpu_wire::op::Op;
@@ -149,7 +149,7 @@ impl BlitRecord {
 pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
     let opcode = op.opcode();
     let Some(kind) = BlitKind::of_opcode(opcode) else {
-        return Err(unmapped(opcode));
+        return Err(no_record(Rail::Blit, opcode));
     };
     let have = op.payload.len();
     let fail = |need: usize| short(Rail::Blit, opcode, have, need);
@@ -298,28 +298,6 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
             }
         }
     })
-}
-
-/// The refusal for an opcode with no transfer kind.
-///
-/// Two answers, and the difference is what a reader needs: an opcode the ledger
-/// has a row for is *unjudged* — its contract is open and the row says what is
-/// missing — while one it has never seen is a stream that has gone wrong.
-fn unmapped(opcode: u32) -> DecodeRefusal {
-    let known = crate::closure::LEDGER
-        .iter()
-        .any(|o| o.rail == Rail::Blit && o.opcode == Some(opcode));
-    if known {
-        DecodeRefusal::Unjudged {
-            rail: Rail::Blit,
-            opcode,
-        }
-    } else {
-        DecodeRefusal::UnknownOpcode {
-            rail: Rail::Blit,
-            opcode,
-        }
-    }
 }
 
 #[cfg(test)]

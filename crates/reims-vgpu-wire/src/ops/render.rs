@@ -762,8 +762,12 @@ unsafe impl Wire for BindHeader {}
 /// `render_set_fragment_sampler` (the stub sampler's 6363). The two families
 /// differ only in opcode, which is also how the stage is decided — no wire
 /// field names it.
+/// Comparable, unlike most bodies here: a caller that borrows a counted array
+/// of these out of one record and compares it with another's is comparing what
+/// the guest wrote, and there is nothing in a single `le` scalar for equality
+/// to get wrong.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RefBind {
     pub object_ref: U32le,
 }

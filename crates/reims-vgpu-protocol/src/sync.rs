@@ -21,14 +21,19 @@ use reims_vgpu_wire::ops::{blit as wire_blit, compute as wire_compute, render as
 
 /// The event-encoder opcodes.
 ///
-/// The event encoder is the one segment family the wire crate has no fixtures
-/// for, so these are named here — at the layer that assigns meaning — rather
-/// than there, where a value no capture wrote has no place. The window is
-/// contiguous and the device's own event decoder frames it as one.
-pub const OPCODE_WAIT_EVENT: u32 = 0x190;
-pub const OPCODE_SIGNAL_EVENT: u32 = 0x191;
-/// The bounded wait, which is refused rather than executed: see the ledger.
-pub const OPCODE_WAIT_EVENT_TIMEOUT: u32 = 0x192;
+/// Re-exported rather than restated. The event encoder is the one segment
+/// family no fixture pins, so its records sit in the wire crate's unverified
+/// tier — but they are still a byte layout with opcodes attached, and a byte
+/// layout is that crate's whether or not an oracle backs it. Naming the numbers
+/// twice would let the view and the meaning drift apart, which for
+/// [`OPCODE_WAIT_EVENT_TIMEOUT`] would mean a refusal aimed at an opcode the
+/// device no longer reads there.
+///
+/// What stays here is the meaning: which of the three is a signal, which is a
+/// wait, and which is refused.
+pub use reims_vgpu_wire::ops::event::{
+    OPCODE_SIGNAL_EVENT, OPCODE_WAIT_EVENT, OPCODE_WAIT_EVENT_TIMEOUT,
+};
 
 /// Which side of a fence a record is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

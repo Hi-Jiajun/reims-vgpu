@@ -23,6 +23,7 @@
 //! is a failure nobody can act on.
 
 pub mod blit;
+pub mod sync;
 
 use crate::closure::Rail;
 
@@ -46,6 +47,14 @@ pub enum DecodeRefusal {
     /// The opcode is real and its contract is not established, so the model
     /// must not represent it.
     Unjudged { rail: Rail, opcode: u32 },
+    /// The opcode's contract is established and the device refuses it.
+    ///
+    /// Distinct from [`Self::Unjudged`], which says nothing is known. This one
+    /// says the row is settled and the settlement is a refusal, so a record
+    /// that decoded perfectly must still not become an operation. Reporting the
+    /// two the same way would make a deliberate refusal look like an open
+    /// question and put it back on the work queue.
+    RefusedByContract { rail: Rail, opcode: u32 },
     /// A counted array does not fit the record that declares it.
     ///
     /// The count is the guest's, so this is an ordinary hostile-input case and
@@ -68,6 +77,7 @@ impl DecodeRefusal {
             Self::Short { .. } => "decode_record_short",
             Self::UnknownOpcode { .. } => "decode_opcode_unknown",
             Self::Unjudged { .. } => "decode_opcode_unjudged",
+            Self::RefusedByContract { .. } => "decode_opcode_refused_by_contract",
             Self::CountOverruns { .. } => "decode_count_overruns_record",
         }
     }
@@ -78,6 +88,7 @@ impl DecodeRefusal {
             Self::Short { rail, .. }
             | Self::UnknownOpcode { rail, .. }
             | Self::Unjudged { rail, .. }
+            | Self::RefusedByContract { rail, .. }
             | Self::CountOverruns { rail, .. } => rail,
         }
     }
@@ -88,8 +99,32 @@ impl DecodeRefusal {
             Self::Short { opcode, .. }
             | Self::UnknownOpcode { opcode, .. }
             | Self::Unjudged { opcode, .. }
+            | Self::RefusedByContract { opcode, .. }
             | Self::CountOverruns { opcode, .. } => opcode,
         }
+    }
+}
+
+/// The refusal for an opcode this rail lifts no record for.
+///
+/// Three answers, and the difference is what a reader needs. An opcode the
+/// ledger settled as [`crate::closure::Closure::Refused`] is refused *by
+/// contract*: nothing is missing and nothing is to be built. One the ledger has
+/// a row for but has not settled is unjudged, and the row says what is not yet
+/// known. One with no row at all is a stream that has gone wrong, or a
+/// serializer this device has never seen.
+///
+/// Collapsing the first two is the mistake worth naming: it would put a
+/// deliberate refusal back on the work queue every time someone read the logs,
+/// and it would let a genuinely open contract hide behind "we meant to do
+/// that".
+pub(crate) fn no_record(rail: Rail, opcode: u32) -> DecodeRefusal {
+    match crate::closure::find(rail, opcode).map(|row| row.closure) {
+        Some(crate::closure::Closure::Refused { .. }) => {
+            DecodeRefusal::RefusedByContract { rail, opcode }
+        }
+        Some(_) => DecodeRefusal::Unjudged { rail, opcode },
+        None => DecodeRefusal::UnknownOpcode { rail, opcode },
     }
 }
 
@@ -126,6 +161,10 @@ mod tests {
                 opcode: 1,
             },
             DecodeRefusal::Unjudged {
+                rail: Rail::Blit,
+                opcode: 1,
+            },
+            DecodeRefusal::RefusedByContract {
                 rail: Rail::Blit,
                 opcode: 1,
             },
