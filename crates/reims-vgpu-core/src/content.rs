@@ -26,6 +26,7 @@
 //! would make the same guest stream mean different things on two hosts.
 
 use crate::access::{BackingId, ByteRange, ContentVersion};
+use crate::coverage::{Applied, VersionCoverage};
 use crate::range_set::RangeSet;
 use std::collections::HashMap;
 
@@ -72,7 +73,14 @@ pub struct Transfer {
 /// What has happened to one backing's content.
 #[derive(Clone, Debug, Default)]
 struct Entry {
-    version: ContentVersion,
+    /// The next version a write of this backing may reserve. Monotone, and one
+    /// counter for the whole backing even though the coverage is per region:
+    /// two writers of disjoint ranges must not be handed the same number, or
+    /// their completions cannot be told apart.
+    next_version: ContentVersion,
+    /// Which version is current in each part of the backing. See
+    /// [`crate::coverage`] for why this is not one number.
+    canonical: VersionCoverage,
     fresh: HashMap<Replica, RangeSet>,
 }
 
@@ -108,12 +116,91 @@ impl ContentLedger {
         self.census
     }
 
-    /// The backing's current content version.
+    /// The highest version current anywhere in the backing.
+    ///
+    /// `None` for a backing nothing has written. Distinct from version zero,
+    /// which is a version a write can produce — see
+    /// [`VersionCoverage::newest_over`].
+    ///
+    /// A summary, and only ever that. Two writers of disjoint ranges are both
+    /// current and this reports one of their versions, so a caller deciding
+    /// whether *its own* bytes are current must ask
+    /// [`Self::version_of`] about the range it names.
     #[must_use]
-    pub fn version(&self, backing: BackingId) -> ContentVersion {
+    pub fn newest_version(&self, backing: BackingId) -> Option<ContentVersion> {
+        self.backings.get(&backing).and_then(|e| {
+            e.canonical.newest_over(ByteRange {
+                offset: 0,
+                length: u64::MAX,
+            })
+        })
+    }
+
+    /// The highest version current over `range`.
+    #[must_use]
+    pub fn version_of(&self, backing: BackingId, range: ByteRange) -> Option<ContentVersion> {
         self.backings
             .get(&backing)
-            .map_or(ContentVersion::default(), |e| e.version)
+            .and_then(|e| e.canonical.newest_over(range))
+    }
+
+    /// Take the next version a write of this backing may produce.
+    ///
+    /// The planning half of the reservation rule: a version is reserved when
+    /// the write is planned and becomes current only when
+    /// [`Self::materialize`] records the completion, so a reader planned
+    /// against it waits for the work rather than for the plan.
+    ///
+    /// Advances the counter whatever happens next. A reservation that is never
+    /// materialized — a transaction the device refuses after planning it —
+    /// leaves a gap in the numbering and nothing else, which is the cheap
+    /// answer; reusing the number would let a later write pass for the
+    /// abandoned one.
+    pub fn reserve(&mut self, backing: BackingId) -> ContentVersion {
+        let e = self.backings.entry(backing).or_default();
+        let reserved = e.next_version;
+        e.next_version = reserved.next();
+        reserved
+    }
+
+    /// Record that a write of `bytes` at `version` has completed in `replica`.
+    ///
+    /// Coverage is taken only where nothing at least as new already holds the
+    /// bytes, and **freshness follows the coverage**: a replica becomes fresh
+    /// for exactly the bytes whose version it won, and the other replica loses
+    /// exactly those. A completion that lost the race leaves both replicas as
+    /// they were, which is the point — the winner's bytes are the current
+    /// content and the loser's must not be readable from anywhere.
+    ///
+    /// Returns what landed and what was beaten. A caller that ignores the
+    /// second half has a transaction whose bytes never became visible and no
+    /// record saying so.
+    pub fn materialize(
+        &mut self,
+        backing: BackingId,
+        bytes: ByteRange,
+        version: ContentVersion,
+        replica: Replica,
+    ) -> Applied {
+        let e = self.backings.entry(backing).or_default();
+        // Keep the counter ahead of anything committed, so a backing whose
+        // versions were assigned elsewhere — a replayed transaction, a test —
+        // cannot later reserve a number already in the coverage.
+        if version >= e.next_version {
+            e.next_version = version.next();
+        }
+        let applied = e.canonical.apply(bytes, version);
+        for taken in applied.taken.ranges() {
+            for r in Replica::BOTH {
+                let set = e.fresh.entry(r).or_default();
+                if r == replica {
+                    set.insert(*taken);
+                } else {
+                    set.remove(*taken);
+                }
+            }
+        }
+        applied
     }
 
     /// Declare that a backing's content originates in one replica and is
@@ -124,10 +211,17 @@ impl ContentLedger {
     /// Calling it on a live backing resets the authority, which is what a
     /// replace-physical does and what nothing else may do.
     pub fn declare(&mut self, backing: BackingId, extent: ByteRange, authority: Replica) {
+        let version = self.reserve(backing);
         let e = self.backings.entry(backing).or_default();
-        e.version = e.version.next();
+        e.canonical.clear();
         e.fresh.clear();
         e.fresh.insert(authority, RangeSet::from_range(extent));
+        // The coverage is rebuilt rather than applied over the old one: a
+        // declaration is not a write that has to beat what was there, it is a
+        // statement that what was there is gone. `apply` on a cleared map takes
+        // everything, which is the same answer written the way the invariant
+        // wants it.
+        e.canonical.apply(extent, version);
     }
 
     /// Record a write of `bytes` performed in `replica`.
@@ -138,16 +232,11 @@ impl ContentLedger {
     /// what makes a read from *here* owe nothing.
     pub fn write(&mut self, backing: BackingId, bytes: ByteRange, replica: Replica) {
         self.census.writes += 1;
-        let e = self.backings.entry(backing).or_default();
-        e.version = e.version.next();
-        for r in Replica::BOTH {
-            let set = e.fresh.entry(r).or_default();
-            if r == replica {
-                set.insert(bytes);
-            } else {
-                set.remove(bytes);
-            }
-        }
+        let version = self.reserve(backing);
+        // A CPU write is planned and completed at once, so its reservation can
+        // never lose: nothing else could have taken a higher version in
+        // between. `materialize` still decides, rather than this asserting it.
+        self.materialize(backing, bytes, version, replica);
     }
 
     /// The transfer a read of `bytes` from `replica` needs, if any.
@@ -300,7 +389,9 @@ mod tests {
         c.declare(B, r(0, 256), Replica::GuestPages);
         assert!(c.is_fresh(B, r(0, 256), Replica::GuestPages));
         assert!(!c.is_fresh(B, r(0, 1), Replica::DeviceOwned));
-        assert_eq!(c.version(B), ContentVersion(1));
+        // A declaration reserves and commits one version over the extent.
+        assert_eq!(c.newest_version(B), Some(ContentVersion(0)));
+        assert_eq!(c.version_of(B, r(0, 256)), Some(ContentVersion(0)));
     }
 
     /// The first failure this module exists to prevent: a copy without a
@@ -332,9 +423,15 @@ mod tests {
             .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
             .unwrap();
         c.record_transfer(&t);
-        let before = c.version(B);
+        let before = c.version_of(B, r(0, 16)).expect("declared");
         c.write(B, r(0, 16), Replica::GuestPages);
-        assert!(c.version(B) > before, "a write is a version transition");
+        assert!(
+            c.version_of(B, r(0, 16)).expect("written") > before,
+            "a write is a version transition"
+        );
+        // And only over the bytes it named: the rest of the backing is still
+        // at the version the declaration gave it.
+        assert_eq!(c.version_of(B, r(16, 240)), Some(before));
         let again = c
             .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
             .expect("the first sixteen bytes moved under it");
@@ -408,9 +505,9 @@ mod tests {
             .transfer_for_read(B, r(0, 256), Replica::DeviceOwned)
             .unwrap();
         c.record_transfer(&t);
-        let version = c.version(B);
+        let version = c.version_of(B, r(0, 256));
         c.discard(B, r(0, 256), Replica::DeviceOwned);
-        assert_eq!(c.version(B), version, "nothing was written");
+        assert_eq!(c.version_of(B, r(0, 256)), version, "nothing was written");
         assert!(c.is_fresh(B, r(0, 256), Replica::GuestPages));
         assert!(c
             .transfer_for_read(B, r(0, 256), Replica::DeviceOwned)
@@ -430,10 +527,11 @@ mod tests {
         c.declare(B, r(0, 256), Replica::GuestPages);
         assert!(!c.is_fresh(B, r(0, 1), Replica::DeviceOwned));
         assert_eq!(
-            c.version(B),
-            ContentVersion(2),
-            "two declarations; the transfer between them was not a version \
-             transition, which is the whole reason it could not repeat"
+            c.version_of(B, r(0, 256)),
+            Some(ContentVersion(1)),
+            "two declarations, so the second reserved the version after the \
+             first; the transfer between them was not a version transition, \
+             which is the whole reason it could not repeat"
         );
     }
 
@@ -445,7 +543,7 @@ mod tests {
         assert!(c
             .transfer_for_read(B, r(0, 256), Replica::DeviceOwned)
             .is_none());
-        assert_eq!(c.version(B), ContentVersion::default());
+        assert_eq!(c.newest_version(B), None);
     }
     /// Two resources placed in one heap share a backing, so a discard has to
     /// be about bytes. A whole-backing discard would throw away a neighbour's

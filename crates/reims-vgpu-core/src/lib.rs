@@ -28,6 +28,7 @@ pub mod blit;
 pub mod compute;
 pub mod content;
 pub mod control;
+pub mod coverage;
 pub mod depend;
 pub mod encoder;
 pub mod exec;

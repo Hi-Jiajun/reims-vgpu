@@ -570,6 +570,20 @@ pub enum Divergence {
     /// A transaction published its completion stamp before its content
     /// versions.
     StampBeforeVersions { ordinal: IngressOrdinal },
+    /// A published version was beaten by newer content in one run and not the
+    /// other, or lost a different amount of it.
+    ///
+    /// Guest-visible, which is why it is a divergence and not a note: the
+    /// bytes of a beaten write are never readable. A schedule where one write
+    /// lands and another where it is overwritten are two different pictures on
+    /// the screen — and if a hazard edge orders the two writers, neither
+    /// schedule may produce it.
+    ContentBeaten {
+        backing: BackingId,
+        region: AccessKey,
+        serial: Vec<(ContentVersion, u64)>,
+        parallel: Vec<(ContentVersion, u64)>,
+    },
 }
 
 impl Divergence {
@@ -586,6 +600,7 @@ impl Divergence {
             Self::Refusals { .. } => "diverge_refusals",
             Self::SplitPublication { .. } => "diverge_split_publication",
             Self::StampBeforeVersions { .. } => "diverge_stamp_before_versions",
+            Self::ContentBeaten { .. } => "diverge_content_beaten",
         }
     }
 }
@@ -631,6 +646,20 @@ pub fn equivalent(serial: &Run, parallel: &Run) -> Result<(), Divergence> {
                 region: key.1,
                 serial: Vec::new(),
                 parallel: right.content[key].clone(),
+            });
+        }
+    }
+    for key in left.beaten.keys().chain(right.beaten.keys()) {
+        let (a, b) = (
+            left.beaten.get(key).cloned().unwrap_or_default(),
+            right.beaten.get(key).cloned().unwrap_or_default(),
+        );
+        if a != b {
+            return Err(Divergence::ContentBeaten {
+                backing: key.0,
+                region: key.1,
+                serial: a,
+                parallel: b,
             });
         }
     }
@@ -721,6 +750,7 @@ fn monotone(run: &Run) -> Result<(), Divergence> {
                 events.insert(event, to);
             }
             Observation::VersionPublished { .. }
+            | Observation::VersionBeaten { .. }
             | Observation::FenceUpdated { .. }
             | Observation::Refused { .. } => {}
         }
@@ -770,6 +800,10 @@ struct Summary {
     /// Per (backing, region), because two disjoint regions of one backing
     /// are two independent histories.
     content: BTreeMap<(BackingId, AccessKey), Vec<ContentVersion>>,
+    /// Per (backing, region), each write that newer content beat and how many
+    /// bytes of it survived. Part of the outcome because a beaten write is a
+    /// picture the guest never sees.
+    beaten: BTreeMap<(BackingId, AccessKey), Vec<(ContentVersion, u64)>>,
     stamps: BTreeMap<StampSlot, StampValue>,
     events: BTreeMap<ResourceId, u64>,
     fences: BTreeMap<ResourceId, usize>,
@@ -807,6 +841,17 @@ impl Summary {
                 }
                 Observation::FenceUpdated { fence } => {
                     *out.fences.entry(fence).or_insert(0) += 1;
+                }
+                Observation::VersionBeaten {
+                    backing,
+                    region,
+                    version,
+                    landed,
+                } => {
+                    out.beaten
+                        .entry((backing, region))
+                        .or_default()
+                        .push((version, landed));
                 }
                 Observation::Refused { ingress, reason } => out.refusals.push((ingress, reason)),
             }

@@ -943,7 +943,7 @@ mod tests {
         assert!(l
             .content()
             .is_fresh(backing, range(0, 256), Replica::DeviceOwned));
-        let version_before = l.content().version(backing);
+        let version_before = l.content().version_of(backing, range(0, 256));
         apply_inert(
             &mut l,
             &LifecycleOp::Invalidate {
@@ -952,7 +952,7 @@ mod tests {
             },
         );
         assert!(
-            l.content().version(backing) != version_before,
+            l.content().version_of(backing, range(0, 256)) != version_before,
             "the content changed under us, so the version moved"
         );
         assert!(l
@@ -1099,7 +1099,7 @@ mod tests {
     fn a_list_with_one_stale_name_changes_nothing() {
         let (mut l, id) = with_one_resource(256);
         let backing = BackingId(10);
-        let version = l.content().version(backing);
+        let version = l.content().version_of(backing, range(0, 256));
         let stale = ResourceId {
             slot: ObjectListRef(9),
             generation: SlotGeneration::default().next(),
@@ -1120,7 +1120,7 @@ mod tests {
             }
         );
         assert_eq!(
-            l.content().version(backing),
+            l.content().version_of(backing, range(0, 256)),
             version,
             "the first resource was not invalidated on the way to the refusal"
         );

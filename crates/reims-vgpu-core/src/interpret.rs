@@ -68,6 +68,20 @@ pub enum Observation {
     EventAdvanced { event: ResourceId, to: u64 },
     /// A fence was updated by the encoder that owns it.
     FenceUpdated { fence: ResourceId },
+    /// A published version reached memory something newer already held, so
+    /// none of it — or only part of it — became current.
+    ///
+    /// A completion, not a refusal: the transaction ran and its work happened.
+    /// What did not happen is the bytes becoming readable, because a newer
+    /// write owns them. That is a lawful outcome of two writers racing and it
+    /// is exactly the outcome that must not be silent — see
+    /// [`crate::coverage`]. `landed` is what did become current, in bytes.
+    VersionBeaten {
+        backing: crate::access::BackingId,
+        region: AccessKey,
+        version: ContentVersion,
+        landed: u64,
+    },
     /// A transaction could not run, with the reason.
     Refused {
         ingress: IngressOrdinal,
@@ -248,9 +262,36 @@ impl Interpreter {
         // becomes visible. Both come from the same list — the accesses — so a
         // version cannot be published for memory nothing wrote.
         for published in tx.published_versions() {
-            if let Some(bytes) = written_bytes(published.region) {
-                self.content
-                    .write(published.backing, bytes, Replica::DeviceOwned);
+            // The version the access reserved, not one this ledger mints: the
+            // reservation happened when the transaction was planned, and a
+            // completion that took a fresh number here would beat every writer
+            // that reserved after it and lose to none.
+            let beaten = written_bytes(published.region).map(|bytes| {
+                self.content.materialize(
+                    published.backing,
+                    bytes,
+                    published.to,
+                    Replica::DeviceOwned,
+                )
+            });
+            match beaten {
+                Some(applied) if applied.was_partly_stale() => {
+                    self.trace.push(Observation::VersionBeaten {
+                        backing: published.backing,
+                        region: published.region,
+                        version: published.to,
+                        landed: applied.taken.len(),
+                    });
+                    if applied.is_empty() {
+                        // Nothing became current, so nothing was published.
+                        continue;
+                    }
+                }
+                // A subresource or whole-backing write names no bytes this
+                // crate can place — see `written_bytes` — so its effect is the
+                // version alone and there is nothing for a newer write to have
+                // beaten it over.
+                _ => {}
             }
             self.trace.push(Observation::VersionPublished {
                 backing: published.backing,
@@ -729,5 +770,165 @@ mod tests {
         a.run(&tx);
         b.run(&make());
         assert_eq!(a.trace(), b.trace());
+    }
+
+    /// Two transactions writing disjoint ranges of one backing are both
+    /// current, whichever order they complete in.
+    ///
+    /// The failure a per-backing version cannot avoid: the later reservation is
+    /// the higher number, so under one version per backing the earlier writer's
+    /// completion arrives holding a version the backing has already passed.
+    /// Here they never meet, because they cover different bytes — and the
+    /// interpreter is the reference every parallel schedule is checked against,
+    /// so getting this wrong here would make the whole equivalence proof agree
+    /// about the wrong answer.
+    #[test]
+    fn two_writers_of_disjoint_ranges_are_both_current_in_either_order() {
+        for late_first in [false, true] {
+            let mut interp = Interpreter::new();
+            interp.content_mut().declare(
+                BackingId(7),
+                ByteRange {
+                    offset: 0,
+                    length: 128,
+                },
+                Replica::GuestPages,
+            );
+            let front = AccessIntent {
+                output_content_version: Some(ContentVersion(5)),
+                ..write_access(7, 0, 64)
+            };
+            let back = AccessIntent {
+                output_content_version: Some(ContentVersion(6)),
+                ..write_access(7, 64, 64)
+            };
+            let order = if late_first {
+                [back, front]
+            } else {
+                [front, back]
+            };
+            for (n, access) in order.into_iter().enumerate() {
+                let mut b = builder(n as u64 + 1);
+                b.declare_access(access);
+                assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+            }
+            assert!(
+                !interp
+                    .trace()
+                    .iter()
+                    .any(|o| matches!(o, Observation::VersionBeaten { .. })),
+                "disjoint writers must not beat each other ({late_first})"
+            );
+            let content = interp.content_mut();
+            assert_eq!(
+                content.version_of(
+                    BackingId(7),
+                    ByteRange {
+                        offset: 0,
+                        length: 64
+                    }
+                ),
+                Some(ContentVersion(5))
+            );
+            assert_eq!(
+                content.version_of(
+                    BackingId(7),
+                    ByteRange {
+                        offset: 64,
+                        length: 64
+                    }
+                ),
+                Some(ContentVersion(6))
+            );
+        }
+    }
+
+    /// A completion that lost the race publishes nothing and says so.
+    ///
+    /// The stale-completion rule, at the seam where a guest would see it: the
+    /// newer write owns the bytes, so the older one's are never readable. It is
+    /// an observation and not a refusal — the transaction ran, and what did not
+    /// happen is its bytes becoming visible.
+    #[test]
+    fn a_completion_beaten_by_newer_content_publishes_nothing_and_names_it() {
+        let mut interp = Interpreter::new();
+        let newer = AccessIntent {
+            output_content_version: Some(ContentVersion(9)),
+            ..write_access(7, 0, 128)
+        };
+        let older = AccessIntent {
+            output_content_version: Some(ContentVersion(4)),
+            ..write_access(7, 32, 64)
+        };
+        for (n, access) in [newer, older].into_iter().enumerate() {
+            let mut b = builder(n as u64 + 1);
+            b.declare_access(access);
+            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+        }
+        assert_eq!(
+            interp.trace(),
+            &[
+                Observation::VersionPublished {
+                    backing: BackingId(7),
+                    region: newer.key,
+                    version: ContentVersion(9),
+                },
+                Observation::VersionBeaten {
+                    backing: BackingId(7),
+                    region: older.key,
+                    version: ContentVersion(4),
+                    landed: 0,
+                },
+            ],
+            "the beaten write must not also read as published"
+        );
+        assert_eq!(
+            interp.content_mut().version_of(
+                BackingId(7),
+                ByteRange {
+                    offset: 32,
+                    length: 64
+                }
+            ),
+            Some(ContentVersion(9)),
+            "the newer content still owns those bytes"
+        );
+    }
+
+    /// A partly beaten completion publishes: some of its bytes did become
+    /// current, and a guest reading those sees them.
+    #[test]
+    fn a_partly_beaten_completion_publishes_the_part_that_landed() {
+        let mut interp = Interpreter::new();
+        let newer = AccessIntent {
+            output_content_version: Some(ContentVersion(9)),
+            ..write_access(7, 64, 64)
+        };
+        let straddling = AccessIntent {
+            output_content_version: Some(ContentVersion(4)),
+            ..write_access(7, 0, 128)
+        };
+        for (n, access) in [newer, straddling].into_iter().enumerate() {
+            let mut b = builder(n as u64 + 1);
+            b.declare_access(access);
+            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+        }
+        assert_eq!(
+            interp.trace()[1..],
+            [
+                Observation::VersionBeaten {
+                    backing: BackingId(7),
+                    region: straddling.key,
+                    version: ContentVersion(4),
+                    landed: 64,
+                },
+                Observation::VersionPublished {
+                    backing: BackingId(7),
+                    region: straddling.key,
+                    version: ContentVersion(4),
+                },
+            ],
+            "half landed, so it is both beaten and published"
+        );
     }
 }
