@@ -786,9 +786,6 @@ pub struct Command {
     pub tile_threads: [u64; 3],
     /// Value of a [`Kind::SetFloatState`] record.
     pub float_value: f32,
-    /// The sampler bind carried per-entry LOD clamps this decoder did not lift.
-    /// Only ever true on [`Kind::SetSampler`]; see [`wire::OPCODE_SET_VERTEX_SAMPLER_LOD`].
-    pub has_sampler_lod: bool,
     /// The vertex buffer bind carried a per-entry attribute stride this decoder
     /// did not lift. True on [`Kind::SetBuffer`] and [`Kind::SetBufferOffset`];
     /// see [`wire::OPCODE_SET_VERTEX_BUFFER_STRIDE`]. The buffer still binds — what is
@@ -1111,7 +1108,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             } else {
                 Stage::Fragment
             };
-            out.has_sampler_lod = true;
             out.first = head.first.get();
             out.count = head.count.get();
             if out.count == 0 {

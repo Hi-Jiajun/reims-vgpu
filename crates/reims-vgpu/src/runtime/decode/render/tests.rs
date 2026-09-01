@@ -1988,35 +1988,45 @@ fn a_sampler_bind_with_lod_clamps_is_still_a_sampler_bind() {
         for i in 0..COUNT as usize {
             let e = OP_HEADER_LEN + BIND_ENTRIES + i * SAMPLER_LOD_BIND_ENTRY_SIZE;
             st32(&mut v[e..], 0x6363 + i as u32);
-            // Clamps this decoder does not lift. They are here so a decoder
-            // reading at the plain four-byte stride would pick one up as a
-            // ref and fail the assertion below.
-            st32(&mut v[e + 4..], 0x3e80_0000); // 0.25
-            st32(&mut v[e + 8..], 0x3f40_0000); // 0.75
+            // A distinct clamp pair per entry. Both halves are lifted, and
+            // `runtime::exec` zips them against the refs by position — so a
+            // decoder that read one entry's clamps for another's slot, or read
+            // at the plain four-byte stride and took a clamp for a ref, has to
+            // fail here rather than downstream where the pairing is invisible.
+            st32(&mut v[e + 4..], 0x3e80_0000 + i as u32); // ~0.25
+            st32(&mut v[e + 8..], 0x3f40_0000 + i as u32); // ~0.75
         }
 
         let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
         assert_eq!(c.kind, Kind::SetSampler, "op {op:#x}");
         assert_eq!(c.stage, stage, "op {op:#x}");
-        assert!(c.has_sampler_lod, "op {op:#x}");
         assert_eq!(c.first, 3, "op {op:#x}");
         assert_eq!(
             c.ref_binds,
             vec![0x6363, 0x6364],
             "op {op:#x} read the entries at the wrong stride"
         );
+        assert_eq!(
+            c.sampler_lod_binds,
+            vec![(0x3e80_0000, 0x3f40_0000), (0x3e80_0001, 0x3f40_0001)],
+            "op {op:#x} lost the clamps or paired them with the wrong slot"
+        );
         assert_eq!(c.sampler_ref, 0x6363, "op {op:#x}");
     }
 
-    // The plain forms keep the four-byte stride and say they carry no
-    // clamps, so the flag is the record's and not the family's.
+    // The plain forms keep the four-byte stride and carry no clamps at all,
+    // so the clamp list is empty rather than defaulted — and `exec`'s zip
+    // gives those slots `None` rather than a clamp the record never carried.
     let total = OP_HEADER_LEN + BIND_ENTRIES + REF_BIND_ENTRY_SIZE;
     let mut v = hdr(wire::OPCODE_SET_VERTEX_SAMPLER, total);
     st32(&mut v[OP_HEADER_LEN + BIND_COUNT..], 1);
     st32(&mut v[OP_HEADER_LEN + BIND_ENTRIES..], 0x6363);
     let c = decode(&v).expect("plain sampler bind");
-    assert!(!c.has_sampler_lod);
     assert_eq!(c.ref_binds, vec![0x6363]);
+    assert!(
+        c.sampler_lod_binds.is_empty(),
+        "a plain bind must not invent a clamp"
+    );
 }
 
 /// The accepted-opcode window ends exactly where Apple's render manifest
