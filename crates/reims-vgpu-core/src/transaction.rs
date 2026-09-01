@@ -272,4 +272,49 @@ mod tests {
             "CmdNOP's whole obligation is retiring its stamps"
         );
     }
+    /// The whole model's totality claim, in one place: a judged packet reaches
+    /// exactly one payload class, and that class's own vocabulary then names
+    /// exactly what the packet is. Each class checks its half in its own
+    /// module; this is the join, and it is the test that fails when a class
+    /// gains a member nobody gave a meaning to.
+    ///
+    /// `Exec` is the one class whose members are not enumerated here, because
+    /// there is exactly one of them and `exactly_one_packet_class_reaches_an_executor`
+    /// above says so.
+    #[test]
+    fn every_judged_packet_reaches_a_class_and_a_meaning_within_it() {
+        use crate::control::ControlKind;
+        use crate::lifecycle::LifecycleKind;
+        use crate::query::QueryKind;
+        let mut counts = [0usize; 5];
+        for p in LEDGER {
+            let Some(class) = classify(p.channel, p.opcode) else {
+                continue;
+            };
+            let named = match class {
+                PayloadClass::Exec => (p.channel, p.opcode) == (Channel::Child, 0x37),
+                PayloadClass::ResourceLifecycle => LifecycleKind::of(p.channel, p.opcode).is_some(),
+                PayloadClass::Query => QueryKind::of(p.channel, p.opcode).is_some(),
+                PayloadClass::Control => ControlKind::of(p.channel, p.opcode).is_some(),
+                // The present forms are enumerated in `classify` itself and
+                // their behavior is `crate::present`'s stream rather than a
+                // per-opcode meaning, so reaching the class is the whole claim.
+                PayloadClass::Present => true,
+            };
+            assert!(
+                named,
+                "{} {:#04x} ({}) reaches {} and has no meaning inside it",
+                p.channel.name(),
+                p.opcode,
+                p.name,
+                class.name()
+            );
+            counts[class as usize] += 1;
+        }
+        assert_eq!(
+            counts,
+            [1, 15, 4, 3, 23],
+            "one EXEC, fifteen lifecycle rows, four queries, three presents,              and twenty-three control packets. A change here is a change to              what the guest may send, not a table edit."
+        );
+    }
 }
