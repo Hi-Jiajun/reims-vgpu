@@ -165,6 +165,14 @@ pub struct Reported<'a> {
     /// substituting one for the other here would make the census say a driver
     /// answered when it did not.
     pub dynamic_primitive_topology_unrestricted: Option<bool>,
+    /// `…ExtendedDynamicState3FeaturesEXT::extendedDynamicState3PolygonMode`.
+    ///
+    /// A *feature*, unlike the property above: the two live in different
+    /// structures of the same extension, and a device may report the property
+    /// while offering neither dynamic member.
+    pub extended_dynamic_state3_polygon_mode: bool,
+    /// `…ExtendedDynamicState3FeaturesEXT::extendedDynamicState3DepthClampEnable`.
+    pub extended_dynamic_state3_depth_clamp_enable: bool,
     /// `…VertexAttributeDivisorFeatures::vertexAttributeInstanceRateDivisor`.
     pub vertex_attribute_instance_rate_divisor: bool,
     /// `…VertexAttributeDivisorFeatures::vertexAttributeInstanceRateZeroDivisor`.
@@ -276,6 +284,10 @@ pub struct DeviceExtensions {
     pub synchronization2: bool,
     pub dynamic_rendering: bool,
     pub extended_dynamic_state: bool,
+    /// Enabled only where a dynamic member this rail actually sets came back
+    /// with it. The topology *property* is readable without enabling anything,
+    /// so a device that reports it and no feature does not enumerate here.
+    pub extended_dynamic_state_3: bool,
     /// Whichever spelling this device enumerated, when the capability did not
     /// arrive through core.
     pub vertex_attribute_divisor: Option<&'static str>,
@@ -297,6 +309,10 @@ impl DeviceExtensions {
             (
                 self.extended_dynamic_state,
                 extension::EXTENDED_DYNAMIC_STATE,
+            ),
+            (
+                self.extended_dynamic_state_3,
+                extension::EXTENDED_DYNAMIC_STATE_3,
             ),
         ] {
             if wanted {
@@ -384,6 +400,10 @@ impl Census {
             || reported.has(extension::VERTEX_ATTRIBUTE_DIVISOR)
             || reported.has(extension::VERTEX_ATTRIBUTE_DIVISOR_EXT);
 
+        // Whether the second dynamic-state extension is present at all, named
+        // once because three decisions below read it.
+        let dynamic_state_3 = reported.has(extension::EXTENDED_DYNAMIC_STATE_3);
+
         let families = queues::families(reported.queue_families);
         let queues = QueueChoice::from_families(&families)
             .map_err(|decline| Floor::NoUsableQueue { decline })?;
@@ -420,6 +440,18 @@ impl Census {
             raster: crate::raster::RasterCell {
                 depth_clamp: reported.depth_clamp,
                 fill_mode_non_solid: reported.fill_mode_non_solid,
+                // Core from 1.3, and both halves below it — for the reason
+                // `synchronization2` needs both.
+                dynamic_cull_and_winding: api.at_least(1, 3)
+                    || (reported.has(extension::EXTENDED_DYNAMIC_STATE)
+                        && reported.extended_dynamic_state),
+                // Never promoted, so these two are only ever the extension's,
+                // and each needs its own feature: the extension groups thirty
+                // dynamic members and a device may offer any subset of them.
+                dynamic_polygon_mode: dynamic_state_3
+                    && reported.extended_dynamic_state3_polygon_mode,
+                dynamic_depth_clamp: dynamic_state_3
+                    && reported.extended_dynamic_state3_depth_clamp_enable,
             },
             buffers: crate::buffer::BufferLimits {
                 max_buffer_size: reported.max_buffer_size,
@@ -443,7 +475,7 @@ impl Census {
                 // Never promoted, so the property is only ever what the
                 // extension reported. A device that was not asked is
                 // restricted, which is the conservative rung.
-                unrestricted: reported.has(extension::EXTENDED_DYNAMIC_STATE_3)
+                unrestricted: dynamic_state_3
                     && reported
                         .dynamic_primitive_topology_unrestricted
                         .unwrap_or(false),
@@ -486,6 +518,13 @@ impl Census {
                 extended_dynamic_state: reported.has(extension::EXTENDED_DYNAMIC_STATE)
                     && reported.extended_dynamic_state
                     && !api.at_least(1, 3),
+                // No version clause, because nothing promoted this one. It is
+                // enumerated only where a member this rail sets came back with
+                // it: enabling an extension whose every feature is off buys
+                // nothing and still has to be reported as enabled.
+                extended_dynamic_state_3: dynamic_state_3
+                    && (reported.extended_dynamic_state3_polygon_mode
+                        || reported.extended_dynamic_state3_depth_clamp_enable),
                 // Only where a divisor capability was actually admitted, and
                 // under the name this device enumerated. The KHR spelling wins
                 // where both are present, because it is the one core promoted.
@@ -638,7 +677,9 @@ impl Census {
              push_max={} desc_buffer={} desc_qualified={} queue_family={} compute={} \
              mirror_clamp={} aniso={} aniso_max={} dual_src={} independent_blend={} \
              dyn_topology={} topology_unrestricted={} vertex_formats={} \
-             vertex_divisor={} vertex_zero_divisor={} vertex_max_divisor={}",
+             vertex_divisor={} vertex_zero_divisor={} vertex_max_divisor={} \
+             depth_clamp={} fill_non_solid={} dyn_cull_winding={} dyn_polygon={} \
+             dyn_depth_clamp={}",
             self.api,
             self.memory.topology.slug(),
             self.memory.signal.slug(),
@@ -662,6 +703,11 @@ impl Census {
             self.vertex.instance_rate_divisor,
             self.vertex.zero_divisor,
             self.vertex.max_divisor,
+            self.raster.depth_clamp,
+            self.raster.fill_mode_non_solid,
+            self.raster.dynamic_cull_and_winding,
+            self.raster.dynamic_polygon_mode,
+            self.raster.dynamic_depth_clamp,
         )
     }
 }
@@ -730,6 +776,8 @@ mod tests {
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
             dynamic_primitive_topology_unrestricted: None,
+            extended_dynamic_state3_polygon_mode: false,
+            extended_dynamic_state3_depth_clamp_enable: false,
             vertex_attribute_instance_rate_divisor: false,
             vertex_attribute_instance_rate_zero_divisor: false,
             max_vertex_attrib_divisor: 0,
@@ -993,9 +1041,98 @@ mod tests {
             "vertex_divisor=false",
             "vertex_zero_divisor=false",
             "vertex_max_divisor=0",
+            "depth_clamp=false",
+            "fill_non_solid=false",
+            "dyn_cull_winding=false",
+            "dyn_polygon=false",
+            "dyn_depth_clamp=false",
         ] {
             assert!(line.contains(fact), "{fact} missing from {line}");
         }
+    }
+
+    /// The three dynamic-rasterizer bits, and the three different ways they
+    /// are established.
+    ///
+    /// The first has a core route and the other two never will, so a version
+    /// bump must move exactly one of them. The two extension-only bits need
+    /// their own feature each, because they are two members of a
+    /// thirty-member structure and a device may offer either alone — which is
+    /// also why the extension is enumerated for the union and not for the
+    /// presence of the extension string.
+    #[test]
+    fn the_dynamic_rasterizer_bits_each_have_their_own_route() {
+        let memory = mem::intel_igpu();
+        let families = integrated_families();
+        let base = |api| reported(api, BASELINE, &memory, &families);
+
+        // 1.2 with nothing: every rasterizer state is baked.
+        let bare = Census::take(base(packed(1, 2))).expect("admitted");
+        assert_eq!(bare.raster(), crate::raster::RasterCell::default());
+        assert!(!bare.extensions().extended_dynamic_state_3);
+
+        // The pair arrives by version, and the other two do not follow it.
+        let promoted = Census::take(base(packed(1, 3))).expect("admitted");
+        assert!(promoted.raster().dynamic_cull_and_winding);
+        assert!(!promoted.raster().dynamic_polygon_mode);
+        assert!(!promoted.raster().dynamic_depth_clamp);
+        // Nothing to enumerate: 1.3 made those commands core.
+        assert!(!promoted.extensions().extended_dynamic_state);
+
+        // The pair below 1.3 needs the extension *and* the feature.
+        let mut r = base(packed(1, 2));
+        let with_eds = [extension::SWAPCHAIN, extension::EXTENDED_DYNAMIC_STATE];
+        r.extensions = &with_eds;
+        assert!(
+            !Census::take(r)
+                .expect("admitted")
+                .raster()
+                .dynamic_cull_and_winding
+        );
+        let mut r = base(packed(1, 2));
+        r.extensions = &with_eds;
+        r.extended_dynamic_state = true;
+        let classed = Census::take(r).expect("admitted");
+        assert!(classed.raster().dynamic_cull_and_winding);
+        assert!(classed.extensions().extended_dynamic_state);
+
+        // Each ext3 member on its own, and neither implied by the other.
+        let with_eds3 = [extension::SWAPCHAIN, extension::EXTENDED_DYNAMIC_STATE_3];
+        for (polygon, clamp) in [(true, false), (false, true), (true, true)] {
+            let mut r = base(packed(1, 4));
+            r.extensions = &with_eds3;
+            r.extended_dynamic_state3_polygon_mode = polygon;
+            r.extended_dynamic_state3_depth_clamp_enable = clamp;
+            let census = Census::take(r).expect("admitted");
+            assert_eq!(census.raster().dynamic_polygon_mode, polygon);
+            assert_eq!(census.raster().dynamic_depth_clamp, clamp);
+            // Enumerated for the union, so the device is created with the
+            // extension whenever either member will be commanded.
+            assert!(census.extensions().extended_dynamic_state_3);
+            assert!(census
+                .extensions()
+                .names()
+                .contains(&extension::EXTENDED_DYNAMIC_STATE_3));
+        }
+
+        // The extension string with neither feature enumerates nothing: an
+        // extension whose every member is off buys nothing and would still
+        // have to be reported as enabled.
+        let mut r = base(packed(1, 4));
+        r.extensions = &with_eds3;
+        let neither = Census::take(r).expect("admitted");
+        assert!(!neither.raster().dynamic_polygon_mode);
+        assert!(!neither.raster().dynamic_depth_clamp);
+        assert!(!neither.extensions().extended_dynamic_state_3);
+
+        // A feature reported without the extension is not a route. Nothing
+        // promoted this one, so there is no version that makes it one.
+        let mut r = base(packed(1, 4));
+        r.extended_dynamic_state3_polygon_mode = true;
+        r.extended_dynamic_state3_depth_clamp_enable = true;
+        let lying = Census::take(r).expect("admitted");
+        assert!(!lying.raster().dynamic_polygon_mode);
+        assert!(!lying.raster().dynamic_depth_clamp);
     }
 
     /// The two facts a sampler plan reads reach it verbatim, and the limit is

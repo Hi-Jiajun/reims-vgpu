@@ -446,6 +446,11 @@ unsafe fn judge(
     let mut synchronization2 = vk::PhysicalDeviceSynchronization2Features::default();
     let mut dynamic_rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default();
     let mut extended_dynamic_state = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
+    // The *features* of the third extension, distinct from its properties
+    // structure queried further down: the polygon-mode and depth-clamp members
+    // are two of the thirty this one carries, and a device may offer any
+    // subset.
+    let mut extended_dynamic_state3 = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default();
     // One structure for both spellings: `VK_EXT_vertex_attribute_divisor`'s
     // feature struct is an alias of the KHR one that 1.4 promoted, so the same
     // query answers on all three routes.
@@ -465,6 +470,12 @@ unsafe fn judge(
     }
     if has(extension::EXTENDED_DYNAMIC_STATE) {
         features = features.push_next(&mut extended_dynamic_state);
+    }
+    // Never promoted, so the extension is the only route and an unenumerated
+    // device is never asked — the structure below stays zeroed, which is the
+    // same answer.
+    if has(extension::EXTENDED_DYNAMIC_STATE_3) {
+        features = features.push_next(&mut extended_dynamic_state3);
     }
     // 1.4 promoted the structure, so a 1.4 device answers it whether or not it
     // enumerates either extension name; below that, either name is a route.
@@ -559,6 +570,12 @@ unsafe fn judge(
         sampler_anisotropy: core_features.sampler_anisotropy == vk::TRUE,
         extended_dynamic_state: extended_dynamic_state.extended_dynamic_state == vk::TRUE,
         dynamic_primitive_topology_unrestricted,
+        extended_dynamic_state3_polygon_mode: extended_dynamic_state3
+            .extended_dynamic_state3_polygon_mode
+            == vk::TRUE,
+        extended_dynamic_state3_depth_clamp_enable: extended_dynamic_state3
+            .extended_dynamic_state3_depth_clamp_enable
+            == vk::TRUE,
         vertex_attribute_instance_rate_divisor: divisor.vertex_attribute_instance_rate_divisor
             == vk::TRUE,
         vertex_attribute_instance_rate_zero_divisor: divisor
@@ -609,6 +626,8 @@ mod tests {
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
             dynamic_primitive_topology_unrestricted: None,
+            extended_dynamic_state3_polygon_mode: false,
+            extended_dynamic_state3_depth_clamp_enable: false,
             vertex_attribute_instance_rate_divisor: false,
             vertex_attribute_instance_rate_zero_divisor: false,
             max_vertex_attrib_divisor: 0,
@@ -841,6 +860,8 @@ mod tests {
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
             dynamic_primitive_topology_unrestricted: None,
+            extended_dynamic_state3_polygon_mode: false,
+            extended_dynamic_state3_depth_clamp_enable: false,
             vertex_attribute_instance_rate_divisor: false,
             vertex_attribute_instance_rate_zero_divisor: false,
             max_vertex_attrib_divisor: 0,
