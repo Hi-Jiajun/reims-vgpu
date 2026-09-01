@@ -16,10 +16,11 @@
 //!
 //! # What a session owns and what it does not
 //!
-//! It owns the ordinal counters, the per-channel sequences, the hazard graph
-//! and the readiness service. It owns no resources, no pipelines and no host
-//! objects, and it cannot: those live behind a lease whose identity carries
-//! this session's generation, and the crate they live in is not this one.
+//! It owns the ordinal counters, the per-channel sequences, the hazard graph,
+//! the readiness service and each channel's publication order. It owns no
+//! resources, no pipelines and no host objects, and it cannot: those live
+//! behind a lease whose identity carries this session's generation, and the
+//! crate they live in is not this one.
 
 use crate::access::AccessIntent;
 use crate::depend::DependencyGraph;
@@ -27,6 +28,7 @@ use crate::identity::{
     ChannelId, ChannelSequence, CompletionStamp, IngressOrdinal, SessionGeneration, SessionId,
     StampWait,
 };
+use crate::publish::{Publisher, Release, RetireRefusal};
 use crate::ready::Scheduler;
 use crate::transaction::{classify, DeviceTransaction, PayloadClass};
 use reims_vgpu_protocol::packets::{find, Channel};
@@ -99,6 +101,10 @@ pub struct SessionModel {
     channel_sequence: BTreeMap<ChannelId, ChannelSequence>,
     graph: DependencyGraph,
     scheduler: Scheduler,
+    publisher: Publisher,
+    /// Which channel position each admitted transaction holds, so completion
+    /// can find its publication domain without the caller carrying it back.
+    position: BTreeMap<IngressOrdinal, (ChannelId, ChannelSequence)>,
     refusals: usize,
 }
 
@@ -112,6 +118,8 @@ impl SessionModel {
             channel_sequence: BTreeMap::new(),
             graph: DependencyGraph::new(),
             scheduler: Scheduler::new(),
+            publisher: Publisher::new(),
+            position: BTreeMap::new(),
             refusals: 0,
         }
     }
@@ -176,6 +184,9 @@ impl SessionModel {
             .next();
         self.channel_sequence.insert(packet.domain, sequence);
 
+        self.publisher.admit(packet.domain, sequence);
+        self.position.insert(ingress, (packet.domain, sequence));
+
         let hazard_waits = self.graph.admit(ingress, &packet.accesses);
         let ready = self.scheduler.admit(
             ingress,
@@ -199,16 +210,71 @@ impl SessionModel {
         })
     }
 
-    /// Complete a transaction: publish its stamp, release its dependents, and
-    /// stop its accesses creating edges.
+    /// Complete a transaction: release its dependents, stop its accesses
+    /// creating edges, and hand its channel's publication order whatever it
+    /// now owes.
     ///
-    /// The two halves are one call because they are one fact. A completion that
-    /// released dependents without retiring accesses would leave a finished
-    /// transaction ordering later work forever; one that retired accesses
-    /// without publishing would lose the stamp.
-    pub fn complete(&mut self, ingress: IngressOrdinal) {
-        self.scheduler.complete(ingress);
+    /// The first two halves are one call because they are one fact. A
+    /// completion that released dependents without retiring accesses would
+    /// leave a finished transaction ordering later work forever.
+    ///
+    /// The third is deliberately *not* the same fact. A stamp becomes readable
+    /// when its channel's publication order reaches it, which may be now or
+    /// may be after an earlier position finishes, so what comes back is what
+    /// the channel actually published — possibly this transaction's stamp,
+    /// possibly a queue of them, possibly nothing. Whatever it published is
+    /// also published to the readiness service, because a packet waiting on a
+    /// completion word waits for the word the guest would read.
+    pub fn complete(&mut self, ingress: IngressOrdinal) -> Vec<Release> {
+        let owed = self.scheduler.complete(ingress);
         self.graph.retire(ingress);
+        let (domain, sequence) = self
+            .position
+            .remove(&ingress)
+            .expect("completing a transaction that holds no channel position");
+        let released = self.publisher.complete(domain, sequence, owed);
+        for release in &released {
+            if let Some(stamp) = release.stamp {
+                self.scheduler.publish(stamp);
+            }
+        }
+        released
+    }
+
+    /// Remove a transaction that will never publish, releasing whatever its
+    /// channel was holding behind it.
+    ///
+    /// A position that cannot finish still holds its channel's head, so
+    /// something has to take it out. Nothing here decides *that* it cannot
+    /// finish; the caller does, and says so on its failure channel.
+    pub fn withdraw(&mut self, ingress: IngressOrdinal) -> Vec<Release> {
+        let (domain, sequence) = self
+            .position
+            .remove(&ingress)
+            .expect("withdrawing a transaction that holds no channel position");
+        let released = self.publisher.withdraw(domain, sequence);
+        for release in &released {
+            if let Some(stamp) = release.stamp {
+                self.scheduler.publish(stamp);
+            }
+        }
+        released
+    }
+
+    #[must_use]
+    pub const fn publisher(&self) -> &Publisher {
+        &self.publisher
+    }
+
+    /// End a channel's publication lifetime.
+    ///
+    /// # Errors
+    ///
+    /// If the channel still holds unreleased positions.
+    pub fn retire_channel(&mut self, domain: ChannelId) -> Result<(), RetireRefusal> {
+        self.publisher.retire(domain)?;
+        self.channel_sequence.remove(&domain);
+        Ok(())
     }
 
     /// Transactions that have become ready since the last call.
@@ -357,18 +423,109 @@ mod tests {
         assert_eq!(r.hazard_waits, vec![w.transaction.ingress]);
         assert_eq!(s.take_ready(), vec![w.transaction.ingress]);
 
-        s.complete(w.transaction.ingress);
+        let released = s.complete(w.transaction.ingress);
         assert_eq!(s.take_ready(), vec![r.transaction.ingress]);
+        assert_eq!(
+            released,
+            vec![Release {
+                sequence: ChannelSequence(1),
+                stamp: writer.completion,
+            }],
+            "it was its channel's head, so its stamp published at once"
+        );
         assert_eq!(
             s.scheduler().published_value(StampSlot(0)),
             Some(StampValue(1)),
-            "completion published the stamp as well as releasing the hazard"
+            "and a packet waiting on that word may now run"
         );
         // And the completed transaction stops ordering later work.
         let mut later = packet(0x37);
         later.accesses = vec![whole(1, AccessMode::Write)];
         let l = s.admit(&later).expect("accepted");
         assert_eq!(l.hazard_waits, vec![r.transaction.ingress]);
+    }
+
+    /// Out-of-order completion is ordinary; out-of-order publication is not.
+    #[test]
+    fn a_channel_publishes_in_its_own_order_however_the_work_finishes() {
+        let mut s = SessionModel::new(SessionId(1));
+        let mut first = packet(0x37);
+        first.completion = Some(CompletionStamp {
+            slot: StampSlot(0),
+            value: StampValue(1),
+        });
+        let mut second = packet(0x37);
+        second.completion = Some(CompletionStamp {
+            slot: StampSlot(0),
+            value: StampValue(2),
+        });
+        let a = s.admit(&first).expect("accepted");
+        let b = s.admit(&second).expect("accepted");
+
+        assert!(
+            s.complete(b.transaction.ingress).is_empty(),
+            "the second position finished first and published nothing"
+        );
+        assert_eq!(
+            s.scheduler().published_value(StampSlot(0)),
+            None,
+            "a guest polling that word must not see the later value first"
+        );
+        assert_eq!(
+            s.publisher().blocked(),
+            vec![(ChannelId(2), 1)],
+            "and the cost of holding it is counted"
+        );
+        assert_eq!(
+            s.complete(a.transaction.ingress)
+                .into_iter()
+                .map(|r| r.stamp)
+                .collect::<Vec<_>>(),
+            vec![first.completion, second.completion],
+            "the head finishing publishes both, in channel order"
+        );
+    }
+
+    /// A position that cannot finish must leave, or its channel never publishes
+    /// again.
+    #[test]
+    fn withdrawing_a_head_releases_what_was_queued_behind_it() {
+        let mut s = SessionModel::new(SessionId(1));
+        let mut second = packet(0x37);
+        second.completion = Some(CompletionStamp {
+            slot: StampSlot(0),
+            value: StampValue(2),
+        });
+        let a = s.admit(&packet(0x37)).expect("accepted");
+        let b = s.admit(&second).expect("accepted");
+        assert!(s.complete(b.transaction.ingress).is_empty());
+        assert_eq!(
+            s.withdraw(a.transaction.ingress)
+                .into_iter()
+                .map(|r| r.stamp)
+                .collect::<Vec<_>>(),
+            vec![second.completion]
+        );
+        assert_eq!(
+            s.scheduler().published_value(StampSlot(0)),
+            Some(StampValue(2))
+        );
+    }
+
+    #[test]
+    fn a_channel_with_unpublished_work_cannot_end_its_lifetime() {
+        let mut s = SessionModel::new(SessionId(1));
+        let a = s.admit(&packet(0x37)).expect("accepted");
+        assert_eq!(
+            s.retire_channel(ChannelId(2)),
+            Err(RetireRefusal::LivePositions { outstanding: 1 })
+        );
+        s.complete(a.transaction.ingress);
+        assert_eq!(s.retire_channel(ChannelId(2)), Ok(()));
+        // A later definition of the channel starts at position one rather than
+        // continuing the lifetime that just ended.
+        let next = s.admit(&packet(0x37)).expect("accepted");
+        assert_eq!(next.transaction.channel_sequence, ChannelSequence(1));
     }
 
     /// A reset opens a new lifetime and does not throw away work that has not

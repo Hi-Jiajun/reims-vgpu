@@ -26,17 +26,25 @@
 //!
 //! # Publication order is the one rule the trace enforces
 //!
-//! A transaction's content versions and its completion stamp become visible
-//! together, and both only after the work is done. The interpreter emits the
-//! versions before the stamp within one transaction, which is the order the
-//! plan requires — a guest that polled the stamp and then read the content must
-//! not be able to see the flag without the bytes. Emitting them in the other
-//! order would make the trace agree with an implementation that has that bug.
+//! A transaction's content versions become visible when its work completes.
+//! Its completion stamp becomes visible later, when ordered guest publication
+//! releases it — see [`crate::publish`] — and never earlier. So the two halves
+//! are [`Interpreter::complete`], which applies the work and hands back the
+//! stamp the transaction now *owes*, and [`Interpreter::publish`], which pays
+//! it. [`Interpreter::run`] is the two back to back, which is what a schedule
+//! of one transaction at a time makes them.
+//!
+//! Keeping them apart is the point: a guest that polled the stamp and then read
+//! the content must not be able to see the flag without the bytes. An
+//! interpreter that wrote the stamp inside `complete` would agree with an
+//! implementation that has exactly that bug.
 
 use crate::access::{AccessKey, ContentVersion};
 use crate::content::{ContentLedger, Replica};
 use crate::exec::{ExecTransaction, Prerequisite, ResolvedOperation};
-use crate::identity::{IngressOrdinal, ResourceId, SessionGeneration, StampSlot, StampValue};
+use crate::identity::{
+    CompletionStamp, IngressOrdinal, ResourceId, SessionGeneration, StampSlot, StampValue,
+};
 use crate::sync::{EventKind, FenceKind};
 use std::collections::HashMap;
 
@@ -179,17 +187,48 @@ impl Interpreter {
         (self.ran, self.refused)
     }
 
-    /// Run one transaction to completion.
+    /// Run one transaction to completion and publish its stamp at once.
     ///
     /// Serial in the strongest sense: when this returns, the transaction's work
     /// is done and everything it publishes is visible. There is no pending
     /// state for a later call to discover.
+    ///
+    /// That is only the serial case. A device publishes in channel order, so
+    /// the two halves are [`Self::complete`] and [`Self::publish`]; this is
+    /// them back to back, which is what a schedule of one transaction at a
+    /// time makes them.
     pub fn run(&mut self, tx: &ExecTransaction) -> Outcome {
+        match self.complete(tx) {
+            Ok(owed) => {
+                if let Some(stamp) = owed {
+                    self.publish(stamp);
+                }
+                Outcome::Ran
+            }
+            Err(refusal) => Outcome::Refused(refusal),
+        }
+    }
+
+    /// Apply a transaction's work and publish everything that becomes visible
+    /// when it completes: its records' effects and its content versions.
+    ///
+    /// Returns the completion stamp it now **owes**. A stamp is not visible at
+    /// completion — see [`crate::publish`] — so handing it back rather than
+    /// writing it is what keeps the two events apart in the reference as well
+    /// as in the device.
+    ///
+    /// # Errors
+    ///
+    /// The refusal, which is also appended to the trace: a guest that is
+    /// refused observes the refusal.
+    pub fn complete(&mut self, tx: &ExecTransaction) -> Result<Option<CompletionStamp>, Refusal> {
         if tx.session != self.generation {
-            return self.refuse(tx.ingress, Refusal::StaleGeneration);
+            self.refuse(tx.ingress, Refusal::StaleGeneration);
+            return Err(Refusal::StaleGeneration);
         }
         if let Some(refusal) = self.unmet_prerequisite(tx) {
-            return self.refuse(tx.ingress, refusal);
+            self.refuse(tx.ingress, refusal);
+            return Err(refusal);
         }
 
         // The records run in order, and the ones with observable state are the
@@ -225,32 +264,35 @@ impl Interpreter {
                 version: reservation.to,
             });
         }
-        if let Some(stamp) = tx.publication.stamp {
-            // Later in the wrapping order, and only observed when it advances.
-            // A completion word is a monotone point the guest polls: a value
-            // that does not advance it writes nothing the guest can read, and
-            // a plain overwrite would let the slot go backwards. This is the
-            // same rule [`crate::ready::Scheduler::publish`] applies and the
-            // same rule a signal that does not advance an event gets above —
-            // stating it in one of the three places and not the others is how
-            // the reference and the scheduler come to mean different things.
-            let standing = self.stamps.get(&stamp.slot).copied();
-            if standing.is_none_or(|at| stamp.value.follows(at)) {
-                self.stamps.insert(stamp.slot, stamp.value);
-                self.trace.push(Observation::StampPublished {
-                    slot: stamp.slot,
-                    value: stamp.value,
-                });
-            }
-        }
         self.ran += 1;
-        Outcome::Ran
+        Ok(tx.publication.stamp)
     }
 
-    fn refuse(&mut self, ingress: IngressOrdinal, reason: Refusal) -> Outcome {
+    /// Make a completion word readable, as ordered guest publication releases
+    /// it.
+    ///
+    /// Later in the wrapping order, and only observed when it advances. A
+    /// completion word is a monotone point the guest polls: a value that does
+    /// not advance it writes nothing the guest can read, and a plain overwrite
+    /// would let the slot go backwards. This is the same rule
+    /// [`crate::ready::Scheduler::publish`] applies and the same rule a signal
+    /// that does not advance an event gets above — stating it in one of the
+    /// three places and not the others is how the reference and the scheduler
+    /// come to mean different things.
+    pub fn publish(&mut self, stamp: CompletionStamp) {
+        let standing = self.stamps.get(&stamp.slot).copied();
+        if standing.is_none_or(|at| stamp.value.follows(at)) {
+            self.stamps.insert(stamp.slot, stamp.value);
+            self.trace.push(Observation::StampPublished {
+                slot: stamp.slot,
+                value: stamp.value,
+            });
+        }
+    }
+
+    fn refuse(&mut self, ingress: IngressOrdinal, reason: Refusal) {
         self.refused += 1;
         self.trace.push(Observation::Refused { ingress, reason });
-        Outcome::Refused(reason)
     }
 
     /// The first prerequisite this transaction cannot meet, if any.

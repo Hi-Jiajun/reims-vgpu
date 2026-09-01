@@ -289,6 +289,51 @@ fn every_permitted_schedule_means_what_the_serial_one_meant() {
     );
 }
 
+/// The claim ordered publication adds to the exit: however the work finishes,
+/// each channel tells the guest about it in channel order.
+#[test]
+fn a_channel_publishes_in_its_own_order_however_the_schedule_runs() {
+    let mut ever_held = false;
+    for workload in 0..24u64 {
+        let batch = mixed(workload, 14);
+        let reference = serial(&batch);
+        for seed in 0..24u64 {
+            let run = parallel(&batch, seed);
+            for domain in reference.domains() {
+                assert_eq!(
+                    run.published_by(domain),
+                    reference.published_by(domain),
+                    "workload {workload} seed {seed} published channel {domain:?} differently"
+                );
+            }
+            ever_held |= run.blocked.iter().any(|(_, held)| *held > 0);
+        }
+    }
+    assert!(
+        ever_held,
+        "no schedule ever finished work ahead of its channel's head, so the \
+         FIFO was never asked to hold anything and this proves nothing"
+    );
+}
+
+/// And a schedule that finishes in channel order costs the FIFO nothing.
+#[test]
+fn a_hazard_chain_never_holds_a_position() {
+    let run = parallel_with(&chain(6), |_| 0);
+    assert!(run.blocked.is_empty());
+}
+
+#[test]
+fn the_equivalence_relation_rejects_a_channel_that_published_out_of_order() {
+    let reference = serial(&chain(3));
+    let mut broken = reference.clone();
+    broken.releases.swap(0, 2);
+    assert!(matches!(
+        equivalent(&reference, &broken),
+        Err(Divergence::PublicationOrder { .. })
+    ));
+}
+
 /// The compiler's cost is proportional to what overlaps, and the census is how
 /// that is checked rather than asserted. Independent work compiles no edges.
 #[test]
@@ -490,8 +535,9 @@ fn the_equivalence_relation_rejects_a_stamp_that_goes_backwards() {
 fn the_equivalence_relation_rejects_a_publication_split_by_another_transaction() {
     let reference = serial(&chain(3));
     let mut broken = reference.clone();
-    // Two transactions' spans overlap: one published inside the other.
-    broken.spans[1].1.start += 1;
+    // Two transactions' completion windows overlap: one made its versions
+    // visible while another was still making its own visible.
+    broken.spans[1].1.start = broken.spans[0].1.start;
     assert!(matches!(
         equivalent(&reference, &broken),
         Err(Divergence::SplitPublication { .. })

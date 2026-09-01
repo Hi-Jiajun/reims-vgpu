@@ -33,18 +33,24 @@
 //! other sequence would be showing the guest stale bytes under a fresh
 //! version.
 //!
-//! A completion stamp and an event generation are compared by their **final
-//! value**, and every publication must advance. These are monotone points that
-//! independent work races to on purpose: two packets that touch no common
-//! memory carry no ordering, and the guest that submitted them asked for none.
-//! Requiring their publications in a fixed order would be requiring the device
-//! to serialise work the guest deliberately left independent.
+//! A **channel's releases** are compared in order. Work may finish in any order
+//! the dependency graph permits, but each channel tells the guest about it in
+//! channel order — that is [`crate::publish`]'s contract, and comparing the
+//! release sequence is how a schedule that violated it is caught even when the
+//! resulting slot values happen to agree.
 //!
-//! A transaction's own observations must be **contiguous** in the trace, and
-//! its versions must precede its stamp. Publication is per-transaction and
-//! atomic: a guest that polled the stamp and then read the content must not be
-//! able to see the flag without the bytes, and interleaving another
-//! transaction's publication inside one is the same failure wearing a
+//! An event generation, and a stamp slot two channels share, are compared by
+//! their **final value**, and every publication must advance. These are
+//! monotone points that independent work races to on purpose: two packets that
+//! touch no common memory carry no ordering, and the guest that submitted them
+//! asked for none. Requiring a fixed order across channels would be requiring
+//! the device to serialise work the guest deliberately left independent.
+//!
+//! A transaction's completion-visible observations must be **contiguous** in
+//! the trace, and its completion word must land after them and never inside
+//! them. A guest that polled the stamp and then read the content must not be
+//! able to see the flag without the bytes; another transaction's versions
+//! landing inside one's completion window is the same failure wearing a
 //! different shape.
 //!
 //! # The batch has to be one a serial run could execute
@@ -61,10 +67,12 @@ use crate::access::{BackingId, ContentVersion};
 use crate::depend::{Census, DependencyGraph};
 use crate::exec::{ExecTransaction, Prerequisite};
 use crate::identity::{
-    IngressOrdinal, ResourceId, SessionGeneration, StampSlot, StampValue, StampWait,
+    ChannelId, ChannelSequence, IngressOrdinal, ResourceId, SessionGeneration, StampSlot,
+    StampValue, StampWait,
 };
-use crate::interpret::{Interpreter, Observation, Outcome, Refusal};
+use crate::interpret::{Interpreter, Observation, Refusal};
 use crate::prereq::{WaitGraph, WaitPoint};
+use crate::publish::{Publisher, Release};
 use crate::ready::Scheduler;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
@@ -262,11 +270,25 @@ fn version_races(batch: &[ExecTransaction]) -> Result<(), Ineligible> {
 pub struct Run {
     /// Every observation, in the order it became visible.
     pub trace: Vec<Observation>,
-    /// Completion order, and where each transaction's observations sit.
+    /// Completion order, and where each transaction's completion-visible
+    /// observations sit. Its stamp is not in this window: a stamp becomes
+    /// visible at publication, which is a later event.
     pub spans: Vec<(IngressOrdinal, Range<usize>)>,
+    /// What each channel released, in the order it released it.
+    pub releases: Vec<(ChannelId, Release)>,
+    /// Where each transaction's completion stamp landed in the trace, for the
+    /// stamps that advanced their slot and so produced an observation.
+    pub stamp_at: Vec<(IngressOrdinal, usize)>,
     /// Transactions the scheduler never released. Empty for an eligible batch;
     /// a non-empty one is a defect in the readiness service, not in the batch.
     pub stalled: Vec<IngressOrdinal>,
+    /// The most positions each channel ever held behind an unfinished head.
+    ///
+    /// What ordered publication cost this schedule. Zero for every channel
+    /// means the work also *finished* in channel order and the FIFO never had
+    /// to hold anything — which is a fact about the schedule, not about the
+    /// contract.
+    pub blocked: Vec<(ChannelId, usize)>,
     /// What compiling this batch's hazards cost.
     pub census: Census,
 }
@@ -277,28 +299,101 @@ impl Run {
     pub fn order(&self) -> Vec<IngressOrdinal> {
         self.spans.iter().map(|(o, _)| *o).collect()
     }
+
+    /// One channel's releases, in publication order.
+    #[must_use]
+    pub fn published_by(&self, domain: ChannelId) -> Vec<Release> {
+        self.releases
+            .iter()
+            .filter(|(d, _)| *d == domain)
+            .map(|(_, r)| *r)
+            .collect()
+    }
+
+    /// Every channel that published anything, in a stable order.
+    #[must_use]
+    pub fn domains(&self) -> Vec<ChannelId> {
+        let mut out: Vec<_> = self.releases.iter().map(|(d, _)| *d).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// Which transaction holds each channel position.
+fn positions(batch: &[ExecTransaction]) -> HashMap<(ChannelId, ChannelSequence), IngressOrdinal> {
+    batch
+        .iter()
+        .map(|tx| ((tx.domain, tx.domain_sequence), tx.ingress))
+        .collect()
+}
+
+/// Pay the stamps a channel just released, in the order it released them.
+///
+/// The one place a completion word becomes readable, so that the serial run
+/// and the parallel one cannot differ in *how* they publish — only in when.
+fn pay(
+    releases: Vec<Release>,
+    domain: ChannelId,
+    interpreter: &mut Interpreter,
+    mut scheduler: Option<&mut Scheduler>,
+    at: &HashMap<(ChannelId, ChannelSequence), IngressOrdinal>,
+    run: &mut Run,
+) {
+    for release in releases {
+        if let Some(stamp) = release.stamp {
+            let before = interpreter.trace().len();
+            interpreter.publish(stamp);
+            if interpreter.trace().len() > before {
+                run.stamp_at.push((at[&(domain, release.sequence)], before));
+            }
+            if let Some(scheduler) = scheduler.as_deref_mut() {
+                scheduler.publish(stamp);
+            }
+        }
+        run.releases.push((domain, release));
+    }
 }
 
 /// Run the batch one transaction at a time in ingress order.
 ///
-/// The reference. No scheduler, no readiness, nothing to be concurrent about.
+/// The reference. No scheduler, no readiness, nothing to be concurrent about —
+/// but publication still goes through the same [`Publisher`], because ordered
+/// guest publication is a contract and not a consequence of concurrency.
 #[must_use]
 pub fn serial(batch: &[ExecTransaction]) -> Run {
+    let at = positions(batch);
     let mut interpreter = Interpreter::new();
+    let mut publisher = Publisher::new();
     let mut run = Run::default();
     for tx in batch {
+        publisher.admit(tx.domain, tx.domain_sequence);
         let start = interpreter.trace().len();
-        let outcome = interpreter.run(tx);
+        let owed = interpreter.complete(tx);
         run.spans
             .push((tx.ingress, start..interpreter.trace().len()));
-        debug_assert!(
-            matches!(outcome, Outcome::Ran)
-                || matches!(outcome, Outcome::Refused(Refusal::StaleGeneration)),
-            "an eligible batch has no unmeetable wait in ingress order"
-        );
+        let released = match owed {
+            Ok(stamp) => publisher.complete(tx.domain, tx.domain_sequence, stamp),
+            // A refused position never publishes, and must not hold the ones
+            // behind it.
+            Err(_) => publisher.withdraw(tx.domain, tx.domain_sequence),
+        };
+        pay(released, tx.domain, &mut interpreter, None, &at, &mut run);
+        note_blocked(&publisher, &mut run);
     }
     run.trace = interpreter.trace().to_vec();
     run
+}
+
+/// Keep the high-water mark of held positions per channel.
+fn note_blocked(publisher: &Publisher, run: &mut Run) {
+    for (domain, held) in publisher.blocked() {
+        match run.blocked.iter_mut().find(|(d, _)| *d == domain) {
+            Some(slot) => slot.1 = slot.1.max(held),
+            None => run.blocked.push((domain, held)),
+        }
+    }
+    run.blocked.sort_unstable();
 }
 
 /// Run the batch through the dependency graph and readiness service,
@@ -330,6 +425,7 @@ pub fn parallel_with(
 ) -> Run {
     let by_ordinal: HashMap<IngressOrdinal, &ExecTransaction> =
         batch.iter().map(|tx| (tx.ingress, tx)).collect();
+    let at = positions(batch);
 
     // Explicit event waits become ordinal prerequisites. Eligibility has
     // already established that every producer is earlier, so this cannot
@@ -347,8 +443,10 @@ pub fn parallel_with(
 
     let mut graph = DependencyGraph::new();
     let mut scheduler = Scheduler::new();
+    let mut publisher = Publisher::new();
     let mut pool: Vec<IngressOrdinal> = Vec::new();
     for tx in batch {
+        publisher.admit(tx.domain, tx.domain_sequence);
         let mut prerequisites = graph.admit(tx.ingress, &tx.accesses);
         prerequisites.extend(explicit.remove(&tx.ingress).unwrap_or_default());
         prerequisites.sort_unstable();
@@ -380,14 +478,29 @@ pub fn parallel_with(
         let ordinal = pool.remove(pick(&pool));
         let tx = by_ordinal[&ordinal];
         let start = interpreter.trace().len();
-        let outcome = interpreter.run(tx);
+        let owed = interpreter.complete(tx);
         debug_assert!(
-            matches!(outcome, Outcome::Ran),
+            owed.is_ok(),
             "the readiness service released {ordinal:?} and the interpreter refused it"
         );
         run.spans.push((ordinal, start..interpreter.trace().len()));
-        scheduler.complete(ordinal);
+
+        // Completion releases hazard dependents at once, because they wait for
+        // the work. The stamp it owes is paid only when this channel's
+        // publication order reaches it, and whatever waits on that stamp is
+        // released then and not before.
+        let scheduled = scheduler.complete(ordinal);
         graph.retire(ordinal);
+        let released = publisher.complete(tx.domain, tx.domain_sequence, scheduled);
+        pay(
+            released,
+            tx.domain,
+            &mut interpreter,
+            Some(&mut scheduler),
+            &at,
+            &mut run,
+        );
+        note_blocked(&publisher, &mut run);
     }
     run.stalled = scheduler.stalled();
     run.trace = interpreter.trace().to_vec();
@@ -430,6 +543,13 @@ pub enum Divergence {
         serial: usize,
         parallel: usize,
     },
+    /// A channel published a different sequence of positions, or published
+    /// them in a different order.
+    PublicationOrder {
+        domain: ChannelId,
+        serial: Vec<Release>,
+        parallel: Vec<Release>,
+    },
     /// A transaction was refused in one run and not the other.
     Refusals {
         serial: Vec<(IngressOrdinal, Refusal)>,
@@ -452,6 +572,7 @@ impl Divergence {
             Self::EventOutcome { .. } => "diverge_event_outcome",
             Self::NonMonotonePublication { .. } => "diverge_non_monotone_publication",
             Self::FenceUpdates { .. } => "diverge_fence_updates",
+            Self::PublicationOrder { .. } => "diverge_publication_order",
             Self::Refusals { .. } => "diverge_refusals",
             Self::SplitPublication { .. } => "diverge_split_publication",
             Self::StampBeforeVersions { .. } => "diverge_stamp_before_versions",
@@ -550,6 +671,21 @@ pub fn equivalent(serial: &Run, parallel: &Run) -> Result<(), Divergence> {
         });
     }
 
+    let mut domains = serial.domains();
+    domains.extend(parallel.domains());
+    domains.sort_unstable();
+    domains.dedup();
+    for domain in domains {
+        let (a, b) = (serial.published_by(domain), parallel.published_by(domain));
+        if a != b {
+            return Err(Divergence::PublicationOrder {
+                domain,
+                serial: a,
+                parallel: b,
+            });
+        }
+    }
+
     monotone(parallel)?;
     atomic_publication(parallel)
 }
@@ -580,26 +716,37 @@ fn monotone(run: &Run) -> Result<(), Divergence> {
     Ok(())
 }
 
-/// A transaction's observations are contiguous and its versions precede its
-/// stamp.
+/// What a transaction makes visible at completion is made visible all at once,
+/// and its completion word comes after it.
 fn atomic_publication(run: &Run) -> Result<(), Divergence> {
-    let mut covered = 0usize;
     let mut spans: Vec<_> = run.spans.clone();
     spans.sort_by_key(|(_, r)| r.start);
-    for (ordinal, span) in spans {
-        if span.start != covered {
-            return Err(Divergence::SplitPublication { ordinal });
+    let mut covered = 0usize;
+    for (ordinal, span) in &spans {
+        if span.start < covered {
+            return Err(Divergence::SplitPublication { ordinal: *ordinal });
         }
         covered = span.end;
-        let mut seen_stamp = false;
-        for observation in &run.trace[span] {
-            match observation {
-                Observation::StampPublished { .. } => seen_stamp = true,
-                Observation::VersionPublished { .. } if seen_stamp => {
-                    return Err(Divergence::StampBeforeVersions { ordinal });
-                }
-                _ => {}
-            }
+        if run.trace[span.clone()]
+            .iter()
+            .any(|o| matches!(o, Observation::StampPublished { .. }))
+        {
+            // A stamp is not visible at completion. One inside a completion
+            // window is the failure a guest sees as a fresh flag over stale
+            // bytes.
+            return Err(Divergence::StampBeforeVersions { ordinal: *ordinal });
+        }
+    }
+    for (ordinal, at) in &run.stamp_at {
+        if !matches!(run.trace[*at], Observation::StampPublished { .. }) {
+            return Err(Divergence::StampBeforeVersions { ordinal: *ordinal });
+        }
+        let end = spans
+            .iter()
+            .find(|(o, _)| o == ordinal)
+            .map_or(0, |(_, span)| span.end);
+        if *at < end {
+            return Err(Divergence::StampBeforeVersions { ordinal: *ordinal });
         }
     }
     Ok(())

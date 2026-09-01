@@ -126,21 +126,26 @@ impl Scheduler {
         self.published.get(&slot).copied()
     }
 
-    /// Complete a transaction: publish its stamp and release what was waiting
-    /// on it.
+    /// Complete a transaction: release what was waiting on it, and hand back
+    /// the stamp it now owes.
     ///
-    /// The stamp is published **before** dependents are released, which is the
-    /// order the contract requires of the device as a whole — results visible
-    /// before the completion word — reproduced here so a model schedule cannot
-    /// be correct in a way the device could not be.
+    /// It does **not** publish that stamp. When a completion word becomes
+    /// readable is [`crate::publish`]'s question, not readiness's: a channel
+    /// publishes in its own order, so a transaction that finishes ahead of an
+    /// earlier position in its channel owes its stamp and may not yet pay it.
+    /// A scheduler that published here would be deciding, silently, that
+    /// completion and publication are the same event.
+    ///
+    /// Hazard dependents are released regardless, because they wait for the
+    /// *work* and not for the guest being told about it.
     ///
     /// # Panics
     ///
     /// If `ordinal` was never admitted or has already completed. Completing a
-    /// transaction twice would publish its stamp twice and decrement its
+    /// transaction twice would hand its stamp back twice and decrement its
     /// dependents past zero, and both of those are silent corruptions rather
     /// than loud ones.
-    pub fn complete(&mut self, ordinal: IngressOrdinal) {
+    pub fn complete(&mut self, ordinal: IngressOrdinal) -> Option<CompletionStamp> {
         let done = self
             .pending
             .remove(&ordinal)
@@ -151,9 +156,6 @@ impl Scheduler {
                 set.remove(&ordinal);
             }
         }
-        if let Some(stamp) = done.completion {
-            self.publish(stamp);
-        }
         for dep in self.dependents.remove(&ordinal).unwrap_or_default() {
             if let Some(p) = self.pending.get_mut(&dep) {
                 p.remaining_hazards -= 1;
@@ -162,6 +164,7 @@ impl Scheduler {
                 }
             }
         }
+        done.completion
     }
 
     /// Publish a stamp value without completing a transaction.
@@ -332,17 +335,25 @@ mod tests {
         assert_eq!(s.published_value(StampSlot(0)), Some(StampValue(20)));
     }
 
+    /// Completion hands the stamp back; it does not publish it. A hazard
+    /// dependent waits for the work and is released at once; a stamp waiter
+    /// waits for the guest-visible word and is not.
     #[test]
-    fn completion_publishes_before_it_releases() {
+    fn completion_releases_hazard_dependents_and_owes_its_stamp() {
         let mut s = Scheduler::new();
         s.admit(ord(1), &[], &[], Some(stamp(7, 1)));
-        // Two ways to be waiting on ordinal 1: through the hazard graph and
-        // through its stamp. Both must be released by one completion.
         s.admit(ord(2), &[ord(1)], &[], None);
         s.admit(ord(3), &[], &[wait(7, 1)], None);
         s.take_ready();
-        s.complete(ord(1));
-        assert_eq!(s.take_ready(), vec![ord(2), ord(3)]);
+        let owed = s.complete(ord(1));
+        assert_eq!(owed, Some(stamp(7, 1)));
+        assert_eq!(
+            s.take_ready(),
+            vec![ord(2)],
+            "the stamp waiter waits for publication, which has not happened"
+        );
+        s.publish(owed.expect("a stamp"));
+        assert_eq!(s.take_ready(), vec![ord(3)]);
     }
 
     #[test]
@@ -367,7 +378,8 @@ mod tests {
         // answer changed without a clock being involved.
         s.admit(ord(2), &[], &[], Some(stamp(2, 100)));
         assert!(s.stalled().is_empty());
-        s.complete(ord(2));
+        let owed = s.complete(ord(2)).expect("a stamp");
+        s.publish(owed);
         assert_eq!(s.take_ready(), vec![ord(1)]);
     }
 
