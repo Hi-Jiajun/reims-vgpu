@@ -32,6 +32,8 @@
 //!   and what a barrier's scope word names.
 //! - [`segment`] — what a segment-type byte means: which encoder wrote it, and
 //!   which rail its records are read on.
+//! - [`resource_state`] — what the content-representation records ask for:
+//!   which directive, at which granularity.
 //! - [`residency`] — what a `useResource`/`useHeap` declaration says, split so
 //!   that the half a per-draw binder owes nothing on cannot hide the half it
 //!   does.
@@ -49,5 +51,6 @@ pub mod closure;
 pub mod extent;
 pub mod packets;
 pub mod residency;
+pub mod resource_state;
 pub mod segment;
 pub mod sync;

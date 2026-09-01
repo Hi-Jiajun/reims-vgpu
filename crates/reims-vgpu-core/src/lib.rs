@@ -31,6 +31,7 @@ pub mod operation;
 pub mod pipeline;
 pub mod range_set;
 pub mod ready;
+pub mod resource_state;
 pub mod session;
 pub mod stream;
 pub mod sync;
