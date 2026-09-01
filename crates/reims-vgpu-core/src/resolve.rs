@@ -81,6 +81,20 @@ pub trait RefResolver {
     fn resource(&self, object_ref: u32) -> Option<ResourceId>;
 }
 
+/// Which backing a guest mapping's surface currently occupies.
+///
+/// **A separate trait from [`RefResolver`] because it answers about a separate
+/// namespace.** A mapping id and an object-list ref arrive as `u32`s that
+/// overlap numerically and name unrelated things — see
+/// [`crate::identity::MappingId`] — so a resolver that answered both from one
+/// method would let a caller ask the wrong question and get a plausible answer.
+/// The mapper owns this one; the object list owns the other.
+pub trait MappingResolver {
+    /// The backing a mapping's surface is resolved to, or `None` when the
+    /// mapping names no live surface.
+    fn backing(&self, mapping: crate::identity::MappingId) -> Option<crate::access::BackingId>;
+}
+
 /// Why a record could not become an operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolveRefusal {

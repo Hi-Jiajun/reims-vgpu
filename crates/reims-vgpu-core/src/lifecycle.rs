@@ -431,6 +431,16 @@ pub enum ResolveRefusal {
     /// because an operation carrying the *old* backing would re-point nothing
     /// while reporting success.
     NeedsStorage { kind: LifecycleKind },
+    /// The command is not a backing retirement, so there is nothing for
+    /// [`backing_retirement`] to read.
+    NotABackingRetirement { kind: LifecycleKind },
+    /// The retirement names a mapping the mapper holds no surface for.
+    ///
+    /// Carries the guest's number for [`Self::UnknownRef`]'s reason, and is a
+    /// *different* refusal from it: the two numbers come from namespaces that
+    /// overlap, so a log that spelled them the same way would send a reader to
+    /// the object list to look for a mapping.
+    UnknownMapping { mapping: u32 },
     /// The command is not a map-or-unmap notice, so there is no interval for
     /// [`map_notice`] to read. [`NotAResourceList`](Self::NotAResourceList)'s
     /// sibling, and a caller asking the wrong question rather than a malformed
@@ -449,6 +459,8 @@ impl ResolveRefusal {
             Self::UnknownRef { .. } => "lifecycle_unknown_ref",
             Self::NotAnObjectReference { .. } => "lifecycle_not_an_object_reference",
             Self::NeedsStorage { .. } => "lifecycle_needs_storage",
+            Self::NotABackingRetirement { .. } => "lifecycle_not_a_backing_retirement",
+            Self::UnknownMapping { .. } => "lifecycle_unknown_mapping",
             Self::NotAMapNotice { .. } => "lifecycle_not_a_map_notice",
             Self::ShortNotice(_) => fifo::ShortPayload::SLUG,
         }
@@ -592,6 +604,45 @@ pub fn object_reference(
         // `ReplacePhysical`, and nothing else reaches here.
         other => Err(ResolveRefusal::NeedsStorage { kind: other }),
     }
+}
+
+/// Turn a backing-retirement packet's payload into the operation it names.
+///
+/// The one join that needs a [`crate::resolve::MappingResolver`] rather than a
+/// [`crate::resolve::RefResolver`]. Its record's first word is a **mapping**
+/// id — the surface whose host backing is being retired — and mapping ids and
+/// object-list refs are numerically overlapping namespaces for unrelated
+/// things, so resolving this one through the object list would retire whatever
+/// backing happened to share the integer.
+///
+/// The record is also the reverse of the `{task, object}` pair two other
+/// commands carry: `{object, task}`. Nothing about the bytes distinguishes
+/// them, which is why the offsets are
+/// [`reims_vgpu_protocol::fifo::decode_delete_backing`]'s and not restated here.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a kind that is not a retirement, a payload too short, or
+/// a mapping naming no live surface.
+pub fn backing_retirement(
+    kind: LifecycleKind,
+    payload: &[u8],
+    resolver: &impl crate::resolve::MappingResolver,
+) -> Result<LifecycleOp, ResolveRefusal> {
+    if kind != LifecycleKind::DeleteBacking {
+        return Err(ResolveRefusal::NotABackingRetirement { kind });
+    }
+    let command = fifo::decode_delete_backing(payload).map_err(ResolveRefusal::ShortNotice)?;
+    let mapping = crate::identity::MappingId(command.object_id);
+    let backing = resolver
+        .backing(mapping)
+        .ok_or(ResolveRefusal::UnknownMapping {
+            mapping: command.object_id,
+        })?;
+    Ok(LifecycleOp::DeleteBacking {
+        task: TaskId(command.task_id),
+        backing,
+    })
 }
 
 /// Turn one map-or-unmap packet's payload into the operation it names.
@@ -1825,6 +1876,45 @@ mod tests {
         ));
     }
 
+    /// A retirement's first word is a mapping and its second is the task, and
+    /// the mapping resolves through the mapper rather than the object list.
+    ///
+    /// The record is the reverse of the `{task, object}` pair, and the two
+    /// numbers here are different so a swap cannot pass: read backwards this
+    /// would retire task 4's number as a mapping.
+    #[test]
+    fn a_backing_retirement_names_a_mapping_first_and_a_task_second() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&9u32.to_le_bytes());
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            backing_retirement(LifecycleKind::DeleteBacking, &payload, &EveryMapping),
+            Ok(LifecycleOp::DeleteBacking {
+                task: TaskId(4),
+                backing: BackingId(1_009),
+            })
+        );
+    }
+
+    /// A mapping the mapper holds no surface for refuses under its own name.
+    ///
+    /// Not `UnknownRef`: that one names an object-list ref, and the two number
+    /// spaces overlap, so one slug for both would send a reader to the object
+    /// list to look for a mapping.
+    #[test]
+    fn a_retirement_naming_no_live_surface_refuses_as_a_mapping() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&9u32.to_le_bytes());
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        let refusal = backing_retirement(LifecycleKind::DeleteBacking, &payload, &NoMapping)
+            .expect_err("no live surface");
+        assert_eq!(refusal, ResolveRefusal::UnknownMapping { mapping: 9 });
+        assert_ne!(
+            refusal.slug(),
+            ResolveRefusal::UnknownRef { object_ref: 9 }.slug()
+        );
+    }
+
     /// A definition's word is doubled and a deletion's is not, and the join
     /// reads each the way its own command carries it.
     ///
@@ -1974,6 +2064,7 @@ mod tests {
                 task_lifetime(kind, &payload).is_ok(),
                 object_reference(kind, &payload, &Everything).is_ok(),
                 map_notice(kind, &payload).is_ok(),
+                backing_retirement(kind, &payload, &EveryMapping).is_ok(),
                 resource_list(kind, &payload, &Everything).is_ok(),
             ];
             let reached = joins.iter().filter(|ok| **ok).count();
@@ -1996,10 +2087,6 @@ mod tests {
                 // Its record resolves and its operation still needs storage the
                 // wire does not carry — see `ResolveRefusal::NeedsStorage`.
                 LifecycleKind::ReplacePhysical,
-                // Its two words are `{object, task}`, the reverse of every
-                // other pair, and the backing it retires is an id space this
-                // crate has no resolver for.
-                LifecycleKind::DeleteBacking,
             ],
             "the lifecycle commands that still cannot become an operation"
         );
@@ -2292,6 +2379,27 @@ mod tests {
                 slot: ObjectListRef(object_ref),
                 generation: SlotGeneration(1),
             })
+        }
+    }
+
+    /// A mapper that resolves every mapping, and one that resolves none.
+    ///
+    /// Deliberately answers a *different* backing than [`Everything`]'s slot
+    /// numbers would suggest: a test that used one number for both namespaces
+    /// would pass against a resolver that confused them.
+    struct EveryMapping;
+
+    impl crate::resolve::MappingResolver for EveryMapping {
+        fn backing(&self, mapping: crate::identity::MappingId) -> Option<BackingId> {
+            Some(BackingId(u64::from(mapping.0) + 1_000))
+        }
+    }
+
+    struct NoMapping;
+
+    impl crate::resolve::MappingResolver for NoMapping {
+        fn backing(&self, _mapping: crate::identity::MappingId) -> Option<BackingId> {
+            None
         }
     }
 
