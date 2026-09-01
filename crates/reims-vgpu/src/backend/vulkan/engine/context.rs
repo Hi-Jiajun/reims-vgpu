@@ -545,6 +545,19 @@ pub(crate) struct DeviceContext {
     /// `VK_KHR_push_descriptor` entry points, present only when the extension
     /// was advertised, queried, and enabled for this device.
     pub push_descriptor: Option<ash::khr::push_descriptor::Device>,
+    /// `VK_EXT_extended_dynamic_state` entry points — `vkCmdSetCullModeEXT`
+    /// and `vkCmdSetFrontFaceEXT` — present only where
+    /// [`crate::backend::vulkan::caps::DeviceFeatures::dynamic_cull_and_winding`]
+    /// admitted them and the extension was therefore enabled.
+    ///
+    /// `None` is not a degraded rung: the pipeline bakes those two members
+    /// instead, which is what every host below this extension has always done.
+    pub extended_dynamic_state: Option<ash::ext::extended_dynamic_state::Device>,
+    /// `VK_EXT_extended_dynamic_state3` entry points. `Some` when *either*
+    /// polygon mode or depth-clamp enable was admitted, because one extension
+    /// string carries both; which of the two may actually be recorded is the
+    /// feature flag, not this option.
+    pub extended_dynamic_state3: Option<ash::ext::extended_dynamic_state3::Device>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -1077,6 +1090,8 @@ impl DeviceContext {
         // asking for a feature a device declined fails `vkCreateDevice`.
         let mut en_image_robustness = features.enabled_image_robustness();
         let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
+        let mut en_extended_dynamic_state = features.enabled_extended_dynamic_state();
+        let mut en_extended_dynamic_state3 = features.enabled_extended_dynamic_state3();
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -1093,6 +1108,12 @@ impl DeviceContext {
         }
         if features.attachment_feedback_loop_layout {
             dci = dci.push_next(&mut en_attachment_feedback);
+        }
+        if features.dynamic_cull_and_winding {
+            dci = dci.push_next(&mut en_extended_dynamic_state);
+        }
+        if features.wants_extended_dynamic_state3() {
+            dci = dci.push_next(&mut en_extended_dynamic_state3);
         }
         let device = instance
             .create_device(pd, &dci, None)
@@ -1196,6 +1217,12 @@ impl DeviceContext {
             .push_descriptor
             .is_available()
             .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+        let extended_dynamic_state = features
+            .dynamic_cull_and_winding
+            .then(|| ash::ext::extended_dynamic_state::Device::new(&instance, &device));
+        let extended_dynamic_state3 = features
+            .wants_extended_dynamic_state3()
+            .then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device));
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
@@ -1298,6 +1325,8 @@ impl DeviceContext {
             memory_properties,
             external_memory_host,
             push_descriptor,
+            extended_dynamic_state,
+            extended_dynamic_state3,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,

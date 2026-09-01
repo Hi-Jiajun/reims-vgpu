@@ -612,6 +612,14 @@ engine_counters! {
         /// buffer and held for every draw after it, because the value this
         /// device sets does not vary.
         dynstate_depth_bias_held,
+        /// The rasterization members a draw did not re-record, counted per
+        /// draw and not per member: the cull mode, winding, fill mode and
+        /// depth-clip mode are one Metal encoder state set, and a draw either
+        /// left all of them alone or changed some. Out of every draw on a host
+        /// that made any of them dynamic, and never counted on a host that
+        /// bakes all four — where it reads zero because nothing was ever
+        /// asked, not because nothing was held.
+        dynstate_raster_held,
         /// Vertex-buffer binding slots requested by draws. This must equal
         /// `vertex_buffer_bind_emitted`; compare either with
         /// `vertex_buffer_bind_calls` to measure contiguous bulk encoding.

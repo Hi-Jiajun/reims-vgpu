@@ -3182,6 +3182,36 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(mode)),
     };
+    // The four fixed-function encoder states, parsed and placed in one call
+    // before anything is recorded, for the reason the occlusion query above is:
+    // an ordinal this device cannot serve refuses the draw rather than being
+    // folded onto a neighbour.
+    //
+    // One call, two halves. Whichever members this host supplies per draw carry
+    // their baked default in `state` — which is the pipeline key below — and the
+    // guest's own values in `dynamic`, which the encoder records further down.
+    // A member is in exactly one half, so a guest that toggles culling around a
+    // draw stops compiling a second pipeline for it wherever the host offers
+    // `VK_EXT_extended_dynamic_state`.
+    //
+    // Making a state dynamic does not make its capability free: `plan` still
+    // refuses `MTLDepthClipModeClamp` without `depthClamp` and
+    // `MTLTriangleFillModeLines` without `fillModeNonSolid`, on both paths.
+    let raster_cell = reims_vgpu_vulkan::raster::RasterCell {
+        depth_clamp: ctx.features.depth_clamp,
+        fill_mode_non_solid: ctx.features.fill_mode_non_solid,
+        dynamic_cull_and_winding: ctx.features.dynamic_cull_and_winding,
+        dynamic_polygon_mode: ctx.features.dynamic_polygon_mode,
+        dynamic_depth_clamp: ctx.features.dynamic_depth_clamp,
+    };
+    let raster_plan = match reims_vgpu_vulkan::raster::plan(req.raster, raster_cell) {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            let reason = super::reason::DrawReason::Raster(refusal);
+            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            return Err(DrawError::Unsupported(reason));
+        }
+    };
     let pipeline_key =
         PipelineKey {
             vert: vert_digest,
@@ -3218,7 +3248,7 @@ pub(crate) unsafe fn execute_draw_inner(
             // Taken from the pass key this draw built, not from `pass`, which
             // erases it once feedback stops changing the render pass.
             feedback_colors: pass_key.feedback_colors,
-            raster: req.raster,
+            raster: raster_plan.state,
             depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
             depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
             depth_compare: req
@@ -5197,6 +5227,11 @@ pub(crate) unsafe fn execute_draw_inner(
     // every draw must have been given values — see `set_dynamic_depth_bias`
     // for why they are zero.
     unsafe { pools.set_dynamic_depth_bias(&ctx.device, cb, counters) };
+    // The rasterization members this host supplies per draw, `Some` exactly
+    // where the pipeline above baked a placeholder. A pipeline that declares a
+    // state dynamic and never receives it draws undefined, so the same `Plan`
+    // that decided which members are dynamic is the one that supplies them.
+    unsafe { pools.set_dynamic_raster(ctx, cb, counters, raster_plan.dynamic) };
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
     // dynamic state; front/back set together because Metal's split refs are one

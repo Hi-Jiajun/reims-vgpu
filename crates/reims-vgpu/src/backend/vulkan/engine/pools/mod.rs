@@ -856,6 +856,16 @@ pub(crate) struct CbGraphicsState {
     /// going *unset*, which is undefined for a pipeline that declares it
     /// dynamic.
     depth_bias_set: bool,
+    /// The rasterization members last handed to `vkCmdSetCullModeEXT`,
+    /// `vkCmdSetFrontFaceEXT`, `vkCmdSetPolygonModeEXT` and
+    /// `vkCmdSetDepthClampEnableEXT`.
+    ///
+    /// The whole `DynamicRaster` rather than four fields, so the held value is
+    /// exactly what was recorded and cannot describe half a set. `None` is a
+    /// command buffer nothing has been recorded into yet; on a host that bakes
+    /// all four members the recorded value is all-`None` and this holds from
+    /// the second draw onwards, which costs four comparisons and no calls.
+    raster: Option<reims_vgpu_vulkan::raster::DynamicRaster>,
     /// The four floats last handed to `vkCmdSetBlendConstants`, by bit pattern.
     ///
     /// Compared as bits rather than as floats so the cache is a plain equality

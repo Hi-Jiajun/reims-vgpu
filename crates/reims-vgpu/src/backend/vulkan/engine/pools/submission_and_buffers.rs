@@ -1869,6 +1869,7 @@ impl ResourcePools {
         self.cb_graphics.stencil = None;
         self.cb_graphics.blend_constants = None;
         self.cb_graphics.depth_bias_set = false;
+        self.cb_graphics.raster = None;
         self.cb_graphics.push_layout = None;
         self.cb_graphics.push_bindings.clear();
     }
@@ -2482,6 +2483,57 @@ impl ResourcePools {
         }
         g.depth_bias_set = true;
         unsafe { device.cmd_set_depth_bias(cb, 0.0, 0.0, 0.0) };
+    }
+
+    /// Record whichever rasterization members this host supplies per draw,
+    /// unless this command buffer already carries exactly these values.
+    ///
+    /// `values` is `Some` in exactly the members
+    /// `reims_vgpu_vulkan::raster::plan` left as placeholders in the pipeline,
+    /// so setting every `Some` reproduces the guest's state and setting none of
+    /// them is a host that baked all four. A pipeline that declares a state
+    /// dynamic and never receives it draws undefined, which is why the caller
+    /// asks on every draw rather than on the ones it thinks changed.
+    ///
+    /// Each member is guarded by the loader that carries its entry point, and
+    /// both loaders are `Some` on exactly the devices whose feature bits put a
+    /// `Some` in `values` — so an entry point the device never enabled cannot
+    /// be reached from here.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_raster(
+        &mut self,
+        ctx: &super::super::context::DeviceContext,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        values: reims_vgpu_vulkan::raster::DynamicRaster,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.raster == Some(values) {
+            counters
+                .dynstate_raster_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.raster = Some(values);
+        if let Some(eds) = ctx.extended_dynamic_state.as_ref() {
+            if let Some(cull) = values.cull_mode {
+                unsafe { eds.cmd_set_cull_mode(cb, cull) };
+            }
+            if let Some(front) = values.front_face {
+                unsafe { eds.cmd_set_front_face(cb, front) };
+            }
+        }
+        if let Some(eds3) = ctx.extended_dynamic_state3.as_ref() {
+            if let Some(mode) = values.polygon_mode {
+                unsafe { eds3.cmd_set_polygon_mode(cb, mode) };
+            }
+            if let Some(clamp) = values.depth_clamp_enable {
+                unsafe { eds3.cmd_set_depth_clamp_enable(cb, clamp) };
+            }
+        }
     }
 
     /// Record `vkCmdSetBlendConstants` unless this command buffer already

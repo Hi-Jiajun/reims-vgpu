@@ -609,14 +609,23 @@ pub(crate) struct PipelineKey {
     /// is a draw sampling an attachment it is writing with no feedback loop
     /// enabled — undefined behaviour, reported nowhere.
     pub feedback_colors: u8,
-    /// The four fixed-function encoder states, as the guest's own ordinals.
+    /// The rasterization state this pipeline is built with — already parsed,
+    /// already normalized against this host.
     ///
-    /// All four are `VkPipelineRasterizationStateCreateInfo` members below
-    /// `VK_EXT_extended_dynamic_state` and `…_state3`, so on this rail's
-    /// baseline two draws differing only in a cull mode need two pipelines and
-    /// the states are part of the key. They are held unparsed here for the
-    /// reason [`Self::blend`] is: one layer decides what an ordinal means.
-    pub raster: reims_vgpu_vulkan::raster::GuestRasterState,
+    /// The one member of this key that is **not** the guest's raw ordinals,
+    /// and deliberately: on a host that supplies the cull mode, the winding,
+    /// the fill mode or the depth-clip mode per draw, those members carry
+    /// their baked default here and the guest's values ride to the encoder
+    /// instead. Two draws differing only in a dynamic member are then the same
+    /// key and share one pipeline, which is the whole payoff — a key holding
+    /// the ordinals could not express that, because it could not tell which of
+    /// them this device still bakes.
+    ///
+    /// `reims_vgpu_vulkan::raster::plan` is still the one layer that decides
+    /// what an ordinal means; it is called at the draw seam that builds this
+    /// key rather than here, because the same call produces the encoder half.
+    /// So this field cannot hold an ordinal nobody parsed.
+    pub raster: reims_vgpu_vulkan::raster::RasterizationState,
     /// Depth-test pipeline state. Meaningful only when `pass.depth.is_some()`;
     /// otherwise all-default (test/write off) and no depth-stencil state is
     /// attached, so the color-only pipeline is byte-identical to the pre-depth
@@ -2176,36 +2185,6 @@ impl ObjectCaches {
         }
         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
 
-        // The four fixed-function encoder states, parsed and weighed against
-        // this device in one place. Two of them have a mode that is an
-        // optional Vulkan feature — `MTLDepthClipModeClamp` needs `depthClamp`
-        // and `MTLTriangleFillModeLines` needs `fillModeNonSolid` — and
-        // neither has a substitute: clipping where the guest asked to clamp
-        // throws away geometry it expected to keep, and filling where it asked
-        // for lines draws solid triangles over a wireframe. Both refuse by
-        // name, and both refuse only for the mode that needs the feature.
-        //
-        // The dynamic rungs are not taken here: this cache still keys a
-        // pipeline on all four states, so the cell reports no dynamic state
-        // and the plan bakes every member.
-        let raster_cell = reims_vgpu_vulkan::raster::RasterCell {
-            depth_clamp: ctx.features.depth_clamp,
-            fill_mode_non_solid: ctx.features.fill_mode_non_solid,
-            dynamic_cull_and_winding: false,
-            dynamic_polygon_mode: false,
-            dynamic_depth_clamp: false,
-        };
-        let raster_plan = match reims_vgpu_vulkan::raster::plan(key.raster, raster_cell) {
-            Ok(plan) => plan,
-            Err(refusal) => {
-                let reason = super::reason::DrawReason::Raster(refusal);
-                crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
-                let err = DrawError::Unsupported(reason);
-                self.pipelines.insert_negative(key.clone(), err.clone());
-                return Err(err);
-            }
-        };
-
         // Every colour attachment, parsed once and planned once.
         //
         // Built here rather than beside the create-info below because both
@@ -2507,11 +2486,18 @@ impl ObjectCaches {
             vk::DynamicState::BLEND_CONSTANTS,
         ];
         // `DEPTH_BIAS`, and whichever rasterization members this host supplies
-        // per draw — none of them yet. Metal has no way to say "this pipeline
-        // cannot be biased", so the pipeline always enables biasing and always
-        // takes the three values dynamically; see
-        // `reims_vgpu_vulkan::raster`.
-        dynamic_states.extend(raster_plan.state.dynamic.states());
+        // per draw — the cull mode and winding under
+        // `VK_EXT_extended_dynamic_state`, the fill mode and depth-clip mode
+        // under `…_state3`, and none of them on a host with neither. Metal has
+        // no way to say "this pipeline cannot be biased", so the pipeline
+        // always enables biasing and always takes the three values
+        // dynamically; see `reims_vgpu_vulkan::raster`.
+        //
+        // Read off the key rather than recomputed, because the key *is* the
+        // plan's baked half: the states listed here and the placeholders in
+        // `key.raster` are two readings of one `RasterDynamic`, and a second
+        // derivation could disagree with it.
+        dynamic_states.extend(key.raster.dynamic.states());
         if key.stencil.is_some() {
             dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
         }
@@ -2523,7 +2509,7 @@ impl ObjectCaches {
         let vp_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(key.viewport_slots)
             .scissor_count(key.viewport_slots);
-        let raster = raster_plan.state.native();
+        let raster = key.raster.native();
         // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
         // so it reaches this device inside the serializer-object pipeline's own
         // compact-TLV block. The pass key carries that decoded count, and the
