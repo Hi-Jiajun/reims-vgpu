@@ -221,6 +221,15 @@ pub fn plan(texture: Texture, format: vk::Format, route: Route) -> Result<ImageP
     if !any && declared.contains(TextureUsage::PIXEL_FORMAT_VIEW) {
         flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
     }
+    if kind.dimensions() == Dimensions::Three && wants(TextureUsage::RENDER_TARGET) {
+        // A render pass attaches one depth slice of a volume through a 2D view
+        // over it, and that view is illegal without this flag. The flag is a
+        // property of the image, so it cannot be added when the pass arrives —
+        // and a volume the guest declared as a target that could not be
+        // attached would fail at pass setup, naming the pass. See
+        // [`crate::view::attachments`].
+        flags |= vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE;
+    }
 
     let samples = sample_flags(texture.sample_count())?;
     let extent = texture.extent();
@@ -855,5 +864,60 @@ mod tests {
             assert!(refusal.to_string().starts_with(refusal.slug()));
             assert!(refusal.slug().starts_with("vk_image_"));
         }
+    }
+
+    #[test]
+    fn a_volume_declared_as_a_target_can_have_its_slices_attached() {
+        let target = plan(
+            texture(TextureKind::D3, TextureUsage::RENDER_TARGET),
+            COLOR,
+            optimal(),
+        )
+        .expect("plannable");
+        assert!(target
+            .flags
+            .contains(vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE));
+
+        // Not on a volume nobody said would be rendered to: the flag can
+        // restrict what a driver does with the image, and it buys nothing for
+        // one that will only ever be sampled.
+        let sampled = plan(
+            texture(TextureKind::D3, TextureUsage::SHADER_READ),
+            COLOR,
+            optimal(),
+        )
+        .expect("plannable");
+        assert!(!sampled
+            .flags
+            .contains(vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE));
+
+        // And on no flat texture, whose attachments are ordinary layer views.
+        for kind in TextureKind::ALL {
+            if kind.dimensions() == Dimensions::Three {
+                continue;
+            }
+            let flat = plan(texture(kind, TextureUsage::RENDER_TARGET), COLOR, optimal())
+                .expect("plannable");
+            assert!(
+                !flat
+                    .flags
+                    .contains(vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE),
+                "{}",
+                kind.name()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_usage_volume_is_attachable_because_unknown_includes_a_target() {
+        let any = plan(
+            texture(TextureKind::D3, TextureUsage::UNKNOWN),
+            COLOR,
+            optimal(),
+        )
+        .expect("plannable");
+        assert!(any
+            .flags
+            .contains(vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE));
     }
 }

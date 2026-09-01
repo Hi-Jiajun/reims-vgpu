@@ -29,6 +29,7 @@ use reims_vgpu_vulkan::memory::{select_memory_type, MappedMemoryKind, MemoryClas
 use reims_vgpu_vulkan::placement::Route;
 use reims_vgpu_vulkan::pools::WorkerPool;
 use reims_vgpu_vulkan::timeline::Timeline;
+use reims_vgpu_vulkan::view;
 
 /// What the GPU writes, and what the CPU has to read back.
 const PATTERN: u32 = 0xABCD_EF01;
@@ -414,6 +415,29 @@ fn a_decoded_texture_becomes_an_image_the_driver_admitted() {
         })
     );
 
+    // Every view this texture is addressable through, created for real. The
+    // expansion is pure arithmetic and unit-tested as such; what a driver has
+    // to agree with is that eighty-four single-slice views over a
+    // cube-compatible image are legal, which no arithmetic can establish.
+    let whole = view::whole(texture, vk::Format::R8G8B8A8_UNORM).create_info(image);
+    let sampled = unsafe { device.create_image_view(&whole, None) }
+        .expect("a cube-array view over a cube-compatible image");
+    let expansion = view::attachments(texture, vk::Format::R8G8B8A8_UNORM);
+    assert_eq!(expansion.len() as u32, texture.subresources());
+    let attachments: Vec<vk::ImageView> = expansion
+        .iter()
+        .map(|attachment| {
+            unsafe { device.create_image_view(&attachment.plan.create_info(image), None) }
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "level {} slice {} refused: {e}",
+                        attachment.level, attachment.slice
+                    )
+                })
+        })
+        .collect();
+    println!("views whole=1 attachments={}", attachments.len());
+
     // The buffer half, through the same census. `maxBufferSize` is core in 1.3
     // and an extension below it, so whether this host reported one at all is a
     // real answer and the run prints it.
@@ -436,6 +460,10 @@ fn a_decoded_texture_becomes_an_image_the_driver_admitted() {
 
     unsafe {
         device.device_wait_idle().expect("idle before teardown");
+        for attachment in attachments {
+            device.destroy_image_view(attachment, None);
+        }
+        device.destroy_image_view(sampled, None);
         device.destroy_image(image, None);
         device.free_memory(memory, None);
     }
