@@ -107,9 +107,22 @@ pub struct Census {
     pub transfers_planned: usize,
     /// Bytes in those transfers.
     pub transfer_bytes: u64,
-    /// Reads that needed no transfer. The number that says how much the
-    /// per-byte freshness is buying over a per-resource flag.
+    /// Reads that needed no transfer because the replica was already fresh for
+    /// every byte. The number that says how much the per-byte freshness is
+    /// buying over a per-resource flag.
     pub reads_already_fresh: usize,
+    /// Reads that needed no transfer because no replica held the bytes they
+    /// were behind on — content nothing has ever written.
+    ///
+    /// A separate count and not part of [`Self::reads_already_fresh`], because
+    /// the two say opposite things about the ledger. A read that was already
+    /// fresh is the per-byte freshness paying for itself; a read over content
+    /// nobody has written is a resource being read before it is filled, and a
+    /// stream where that number is large is one where the guest is reading
+    /// undefined bytes rather than one where this ledger is working well.
+    /// Together they account for every read [`ContentLedger::transfer_for_read`]
+    /// answered with `None`, so a caller can tell that it has seen all of them.
+    pub reads_with_no_source: usize,
 }
 
 impl ContentLedger {
@@ -299,6 +312,7 @@ impl ContentLedger {
             }
         }
         if movable.is_empty() {
+            self.census.reads_with_no_source += 1;
             return None;
         }
         self.census.transfers_planned += 1;
@@ -518,6 +532,41 @@ mod tests {
             &[r(0, 64)],
             "only the declared extent moves; the rest was never anyone's"
         );
+    }
+
+    /// The two ways a read can owe nothing are two different facts, and a
+    /// census that folded them together would report a device whose resources
+    /// are read before they are written as a device whose freshness tracking is
+    /// working. Every `None` lands in exactly one of them.
+    #[test]
+    fn a_read_over_content_nobody_wrote_is_counted_apart_from_a_fresh_one() {
+        let mut c = ContentLedger::new();
+        c.declare(B, r(0, 64), Replica::GuestPages);
+        assert!(
+            c.transfer_for_read(B, r(64, 64), Replica::DeviceOwned)
+                .is_none(),
+            "nothing has written past the extent"
+        );
+        assert_eq!(c.census().reads_with_no_source, 1);
+        assert_eq!(c.census().reads_already_fresh, 0);
+
+        assert!(c
+            .transfer_for_read(B, r(0, 64), Replica::GuestPages)
+            .is_none());
+        assert_eq!(c.census().reads_already_fresh, 1);
+        assert_eq!(
+            c.census().reads_with_no_source,
+            1,
+            "a fresh read is not a sourceless one"
+        );
+
+        // And a read that owes a transfer is neither.
+        assert!(c
+            .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
+            .is_some());
+        assert_eq!(c.census().reads_already_fresh, 1);
+        assert_eq!(c.census().reads_with_no_source, 1);
+        assert_eq!(c.census().transfers_planned, 1);
     }
 
     /// A discard drops a copy and not the content, so the version does not
