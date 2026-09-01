@@ -269,9 +269,13 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 ///
 /// Other kinds remain fail-visible until this device owns a corresponding
 /// per-kind object registry. Their counters say which contract gap is active.
-fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8], packet: &Packet) {
-    let task_id = ld32(&payload[0..]);
-    let record = &payload[4..];
+fn apply_delete_object(
+    state: &mut DeviceState,
+    channel_id: u32,
+    command: &crate::protocol::fifo::DeleteObjectCommand<'_>,
+    packet: &Packet,
+) {
+    let crate::protocol::fifo::DeleteObjectCommand { task_id, record } = *command;
     let Ok(op) = reims_vgpu_wire::op::op(record, 0) else {
         Emit::decline(
             "child_delete_object",
@@ -3678,6 +3682,20 @@ fn apply_map_family<H: HostMemory + HostOps>(
             return;
         }
     };
+    // The same, for the retirement that shares this arm. A payload too short to
+    // name the surface is one whose backing this device cannot condemn, and the
+    // id is reused within tens of milliseconds under scroll — so a dropped
+    // retirement is later pixels written into pages the guest has recycled.
+    let retire = match matches!(family, MapFamily::DeleteIOSurfaceBacking2)
+        .then(|| crate::protocol::fifo::decode_delete_backing(&packet.payload))
+        .transpose()
+    {
+        Ok(retire) => retire,
+        Err(short) => {
+            note_short_payload(family.slug(), Some(channel_id), &short);
+            return;
+        }
+    };
     if let Some(crate::protocol::fifo::MapMemoryCommand {
         task_id,
         gva,
@@ -3826,14 +3844,15 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // (exact-base only, no multi-key heap maps) and RE-justified, so
         // the broad implementation is not kept around to be switched
         // back on. See kb map-memory2 / xnu-pte-corruption-windowserver.
-    } else if family == MapFamily::DeleteIOSurfaceBacking2 && plen >= 8 {
+    } else if let Some(retire) = retire {
         // The live Ventura payload agrees with the resource contract:
-        // `{objectID, taskID}`. This is the lifetime
-        // boundary for the host IOSurface backing, not stamp-only
-        // bookkeeping. Keeping page_entries after it lets later id
-        // reuse/clear write pixels into pages the guest has recycled.
-        let object_id = crate::protocol::endian::ld32(&packet.payload[0..]);
-        let task_id = crate::protocol::endian::ld32(&packet.payload[4..]);
+        // `{objectID, taskID}` — **the reverse** of the `{task, object}` pair
+        // `CmdDeleteResource` and `CmdReplacePhysical` carry, which is why the
+        // offsets are the decoder's and not two `ld32`s here. This is the
+        // lifetime boundary for the host IOSurface backing, not stamp-only
+        // bookkeeping. Keeping page_entries after it lets later id reuse/clear
+        // write pixels into pages the guest has recycled.
+        let crate::protocol::fifo::DeleteBackingCommand { object_id, task_id } = retire;
         // Never write guest pages here — the delete trails the guest's
         // CPU-side release asynchronously and the pages may already be
         // recycled (boot-16 PTE-corruption panic: a 14.7 MB delete-time
@@ -4247,20 +4266,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // as a command this device merely has not implemented — those are
             // different problems and only one of them is closed by writing a
             // handler.
-            let plen = packet.payload.len();
-            if !packet_short("delete_object", Some(channel_id), plen, 12) {
-                let record_len = ld32(&packet.payload[8..]) as usize;
-                // The record starts one word in, so it is `record_len + 4` that
-                // has to fit. Saturating, because the guest's length is an
-                // arbitrary `u32` and the sum is what overflows.
-                if !packet_short(
-                    "delete_object_record",
-                    Some(channel_id),
-                    plen,
-                    record_len.saturating_add(4),
-                ) {
-                    apply_delete_object(state, channel_id, &packet.payload, packet);
-                }
+            match crate::protocol::fifo::decode_delete_object(&packet.payload) {
+                Ok(command) => apply_delete_object(state, channel_id, &command, packet),
+                Err(error) => note_short_payload(error.slug(), Some(channel_id), &error.short()),
             }
         }
         // `CmdDebug`, a host-side trace marker. Nothing is owed to the guest, but

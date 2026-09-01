@@ -4837,6 +4837,18 @@ fn every_short_control_packet_names_itself() {
         // A delete with no id used to default to task `0`, which is the kernel
         // task, and retire its resolutions without a line.
         (CHILD_OP_DELETE_TASK, crate::protocol::fifo::DELETE_TASK_LEN),
+        // A retirement too short to name a surface is one whose backing stays
+        // live while the guest recycles the id.
+        (
+            CHILD_OP_DELETE_IOSURFACE_BACKING2,
+            crate::protocol::fifo::DELETE_BACKING_LEN,
+        ),
+        // The two framing bounds of a destroy command; the record-length one is
+        // driven below, where a record can claim more than the payload holds.
+        (
+            CHILD_OP_DELETE_OBJECT,
+            crate::protocol::fifo::DELETE_OBJECT_LEN,
+        ),
     ] {
         process_child_packet(&mut state, &mut host, 4, &short(opcode, need - 1));
     }
@@ -4864,6 +4876,8 @@ fn every_short_control_packet_names_itself() {
         "reason=map_memory2_short site=ch4",
         "reason=unmap_memory_short site=ch4",
         "reason=delete_task_short site=ch4",
+        "reason=delete_iosurface_backing2_short site=ch4",
+        "reason=delete_object_short site=ch4",
     ] {
         assert!(
             log.contains(reason),

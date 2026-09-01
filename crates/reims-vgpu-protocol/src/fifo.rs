@@ -173,6 +173,137 @@ pub fn decode_set_object_list(payload: &[u8]) -> Result<SetObjectListCommand, Sh
     })
 }
 
+/// `CmdDeleteIOSurfaceBacking2` (`0x36`): an object and a task, **in that
+/// order**.
+///
+/// The same two `u32`s [`TASK_OBJECT_TASK_ID`]'s record carries and the reverse
+/// arrangement of them. That is the whole reason this is a separate decode: the
+/// two records are indistinguishable by length, both fields are plain `u32`s,
+/// and reading one at the other's offsets resolves the object as a task and the
+/// task as an object without any check failing.
+///
+/// The object here is a **mapping** id — the surface whose host backing is
+/// being retired — and not an object-list ref. The two number spaces overlap.
+pub const DELETE_BACKING_OBJECT_ID: usize = 0x00;
+pub const DELETE_BACKING_TASK_ID: usize = DELETE_BACKING_OBJECT_ID + 4;
+pub const DELETE_BACKING_LEN: usize = DELETE_BACKING_TASK_ID + 4;
+
+/// A backing retirement, decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeleteBackingCommand {
+    /// The mapping whose backing is retired.
+    pub object_id: u32,
+    pub task_id: u32,
+}
+
+/// Decode a backing retirement.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the command's two words.
+pub fn decode_delete_backing(payload: &[u8]) -> Result<DeleteBackingCommand, ShortPayload> {
+    if payload.len() < DELETE_BACKING_LEN {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need: DELETE_BACKING_LEN,
+        });
+    }
+    Ok(DeleteBackingCommand {
+        object_id: ld32(&payload[DELETE_BACKING_OBJECT_ID..]),
+        task_id: ld32(&payload[DELETE_BACKING_TASK_ID..]),
+    })
+}
+
+/// `CmdDeleteObject` (`0x28`): a task, then one self-describing destroy record.
+///
+/// The guest writes the task id into four bytes of command space and copies the
+/// record in after it, so the command declares no length of its own — the
+/// record's header carries one, and it is the record's, not the command's.
+pub const DELETE_OBJECT_TASK_ID: usize = 0x00;
+/// Where the record starts. Every offset inside it is relative to this.
+pub const DELETE_OBJECT_RECORD: usize = DELETE_OBJECT_TASK_ID + 4;
+/// The record's own byte length: its header's second word, and therefore four
+/// bytes into the record rather than into the command.
+pub const DELETE_OBJECT_RECORD_LEN: usize = DELETE_OBJECT_RECORD + 4;
+/// The floor — the task word plus the record's own header. A payload below it
+/// cannot even say how long the record claims to be.
+pub const DELETE_OBJECT_LEN: usize = DELETE_OBJECT_RECORD_LEN + 4;
+
+/// A destroy command, framed.
+///
+/// The record is handed back as bytes: what is in it is the destroy family's
+/// business, and this layer's job is that the slice really is inside the
+/// payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeleteObjectCommand<'a> {
+    pub task_id: u32,
+    pub record: &'a [u8],
+}
+
+/// Why a destroy command's framing does not hold.
+///
+/// Two cases and not one, because they are different guest defects: a payload
+/// too short to hold a record header means the command was truncated, while a
+/// record claiming more than the payload holds means the record's own length
+/// word is wrong. Only the second says anything about the record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteObjectError {
+    ShortHeader(ShortPayload),
+    RecordTruncated(ShortPayload),
+}
+
+impl DeleteObjectError {
+    #[must_use]
+    pub const fn short(self) -> ShortPayload {
+        match self {
+            Self::ShortHeader(short) | Self::RecordTruncated(short) => short,
+        }
+    }
+
+    /// The reason stem the refusal reports under, without the `_short` suffix
+    /// the failure channel appends.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::ShortHeader(_) => "delete_object",
+            Self::RecordTruncated(_) => "delete_object_record",
+        }
+    }
+}
+
+/// Frame a destroy command: the task it acts in, and the record it carries.
+///
+/// # Errors
+///
+/// [`DeleteObjectError`] when the payload cannot hold a record header, or when
+/// the record's declared length runs past the payload. Both bounds are checked
+/// here so a corrupt packet is reported as corrupt rather than as a command
+/// this device merely has not implemented — those are different problems and
+/// only one of them is closed by writing a handler.
+pub fn decode_delete_object(payload: &[u8]) -> Result<DeleteObjectCommand<'_>, DeleteObjectError> {
+    if payload.len() < DELETE_OBJECT_LEN {
+        return Err(DeleteObjectError::ShortHeader(ShortPayload {
+            plen: payload.len(),
+            need: DELETE_OBJECT_LEN,
+        }));
+    }
+    let record_len = ld32(&payload[DELETE_OBJECT_RECORD_LEN..]) as usize;
+    // The record starts one word in, so it is `record_len + DELETE_OBJECT_RECORD`
+    // that has to fit. Saturating, because the guest's length is an arbitrary
+    // `u32` and the sum is what overflows.
+    let need = record_len.saturating_add(DELETE_OBJECT_RECORD);
+    if payload.len() < need {
+        return Err(DeleteObjectError::RecordTruncated(ShortPayload {
+            plen: payload.len(),
+            need,
+        }));
+    }
+    Ok(DeleteObjectCommand {
+        task_id: ld32(&payload[DELETE_OBJECT_TASK_ID..]),
+        record: &payload[DELETE_OBJECT_RECORD..],
+    })
+}
+
 /// `CmdMapMemory2` (`0x39`) and `CmdUnmapMemory` (`0x22`): the interval of one
 /// task's GPU virtual address space the guest has just changed.
 ///
@@ -1340,6 +1471,89 @@ mod tests {
             }
             other => panic!("expected Truncated, got {other:?}"),
         }
+    }
+
+    /// The two `{u32, u32}` records disagree about which word is which, and
+    /// the same eight bytes decode to swapped fields.
+    ///
+    /// Nothing about the bytes can tell them apart — same length, both fields
+    /// plain `u32`s — so this is what the separation buys: a reader that picked
+    /// the wrong decode retires the backing of whatever mapping shares the
+    /// task's number.
+    #[test]
+    fn the_backing_retirement_reverses_the_task_object_pair() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x1111_1111u32.to_le_bytes());
+        bytes.extend_from_slice(&0x2222_2222u32.to_le_bytes());
+        let pair = decode_task_object(&bytes).expect("eight bytes");
+        let retire = decode_delete_backing(&bytes).expect("eight bytes");
+        assert_eq!(
+            (pair.task_id, pair.object_id),
+            (retire.object_id, retire.task_id),
+            "one record's task is the other's object"
+        );
+        assert_eq!(
+            DELETE_BACKING_LEN, TASK_OBJECT_LEN,
+            "and nothing else tells them apart"
+        );
+        assert_eq!(
+            decode_delete_backing(&bytes[..DELETE_BACKING_LEN - 1]),
+            Err(ShortPayload {
+                plen: DELETE_BACKING_LEN - 1,
+                need: DELETE_BACKING_LEN,
+            })
+        );
+    }
+
+    /// A destroy command's two bounds, and the fact that they are two.
+    ///
+    /// A payload too short for a record header and a record whose length runs
+    /// past the payload are different guest defects, and only the second says
+    /// anything about the record.
+    #[test]
+    fn a_destroy_command_is_framed_by_the_records_own_length() {
+        // Task 1, a twelve-byte destroy record: `{opcode, len}` then the ref.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0x1234u32.to_le_bytes());
+        bytes.extend_from_slice(&12u32.to_le_bytes());
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+        let framed = decode_delete_object(&bytes).expect("the record fits");
+        assert_eq!(framed.task_id, 1);
+        assert_eq!(
+            framed.record.len(),
+            12,
+            "the record is the payload past the task word"
+        );
+
+        // A record claiming one byte more than the payload holds.
+        let mut over = bytes.clone();
+        over[DELETE_OBJECT_RECORD_LEN..DELETE_OBJECT_RECORD_LEN + 4]
+            .copy_from_slice(&13u32.to_le_bytes());
+        let err = decode_delete_object(&over).expect_err("the record does not fit");
+        assert_eq!(err.slug(), "delete_object_record");
+        assert_eq!(err.short().need, 13 + DELETE_OBJECT_RECORD);
+
+        // A length that would overflow the sum is refused, not wrapped.
+        let mut huge = bytes.clone();
+        huge[DELETE_OBJECT_RECORD_LEN..DELETE_OBJECT_RECORD_LEN + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_delete_object(&huge),
+            Err(DeleteObjectError::RecordTruncated(_))
+        ));
+
+        // And too short to hold a header at all.
+        let err =
+            decode_delete_object(&bytes[..DELETE_OBJECT_LEN - 1]).expect_err("no record header");
+        assert_eq!(err.slug(), "delete_object");
+        assert_eq!(
+            err.short(),
+            ShortPayload {
+                plen: DELETE_OBJECT_LEN - 1,
+                need: DELETE_OBJECT_LEN,
+            }
+        );
     }
 
     /// The task comes first, and the two commands carrying this record agree.
