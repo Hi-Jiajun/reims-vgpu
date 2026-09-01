@@ -79,6 +79,36 @@
 //! the enable off, so this costs a guest that never biases nothing; leaving it
 //! clear would silently drop the bias of a guest that does.
 //!
+//! # The line width is real, and it is only a question where lines are drawn
+//!
+//! `setLineWidth:` is a render-encoder command carrying one `float`, and this
+//! project has Apple's own record for it. It is encoder state like the four
+//! above — the guest changes it between draws of one pipeline — and
+//! `VK_DYNAMIC_STATE_LINE_WIDTH` is Vulkan 1.0 core, so keeping it that way
+//! costs no capability at all.
+//!
+//! What does cost a capability is a width other than 1.0:
+//! `VkPhysicalDeviceFeatures::wideLines`, bounded by `lineWidthRange` and
+//! quantised by `lineWidthGranularity`. Without the feature,
+//! `vkCmdSetLineWidth` with anything but 1.0 is invalid use — not a wider line
+//! drawn thin, but undefined behaviour.
+//!
+//! So the width is a **conditional** question: Vulkan applies it to line
+//! primitives and to `POLYGON_MODE_LINE`, and to nothing else. A guest that
+//! sets a width and then draws filled triangles has asked this device for
+//! nothing, so refusing that draw would be refusing it for a state it never
+//! uses — and the honest width to record for it is 1.0, which every device
+//! takes. Whether a draw rasterizes lines is a joint fact of this state and
+//! the topology, so it is not answerable in this module alone.
+//!
+//! **This rail does not carry the width yet.** It is decoded
+//! (`OPCODE_SET_LINE_WIDTH`) and dropped with the route
+//! `render_line_width_dropped`, and the closure ledger's row 0x0088 is
+//! `Unresolved` for it. When it is carried it belongs on the encoder and not
+//! in [`RasterizationState`]: dynamic on every host, so never a pipeline-cache
+//! dimension, and two draws differing only in it would always share a
+//! pipeline.
+//!
 //! # An unknown ordinal is not the default
 //!
 //! Every parse here is a closed set returning `None` outside it. Folding an
@@ -391,10 +421,11 @@ impl RasterizationState {
             depth_bias_constant_factor: 0.0,
             depth_bias_clamp: 0.0,
             depth_bias_slope_factor: 0.0,
-            // Metal has no line-width state at all, so one is not a default
-            // standing in for something — it is the only width this API can
-            // ask for, and the only width a device without `wideLines` may be
-            // given.
+            // One, because this rail does not carry the guest's width yet —
+            // see the module doc. Not a default standing in for a state that
+            // does not exist: `setLineWidth:` is real, and one is the width
+            // every device takes and the only width a device without
+            // `wideLines` may be given.
             line_width: 1.0,
             _marker: core::marker::PhantomData,
         }
