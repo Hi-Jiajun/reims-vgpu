@@ -1363,7 +1363,7 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
         None,
         "an intermediate record stores nothing guest-visible"
     );
-    req.colors[0].store_action = crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    req.colors[0].store_action = reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
     assert_eq!(
         mapper_ref_texture_store_identity(&state, &req, true),
         None,
@@ -1438,7 +1438,7 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
 
     // The refusals. A LOAD the resident cannot serve must not produce a query at
     // all, or the counters below it would divide all draws instead of candidates.
-    req.colors[0].load_action = crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR;
+    req.colors[0].load_action = reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_CLEAR;
     assert!(
         mapper_ref_texture_load_currency_query(&state, &req).is_none(),
         "a CLEAR has no prior content to be current"
@@ -1450,7 +1450,7 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
         "an explicit seed was already selected by RT provenance"
     );
     req.colors[0].target_seed_rgba = None;
-    req.colors[0].store_action = crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    req.colors[0].store_action = reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
     assert!(
         mapper_ref_texture_load_currency_query(&state, &req).is_none(),
         "a record that discards its target renders into no resident worth naming"
@@ -2822,8 +2822,8 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
 
 #[test]
 fn mrt_draw_request_keeps_multisample_source_and_resolve_destination_distinct() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -2856,9 +2856,9 @@ fn mrt_draw_request_keeps_multisample_source_and_resolve_destination_distinct() 
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encode() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::RenderPipelineDescriptor;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -2913,8 +2913,8 @@ fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encod
 
 #[test]
 fn mrt_draw_request_refuses_a_resolve_destination_with_different_geometry() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -6333,7 +6333,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     let armed = sync_store_allowed_pages(&state, &host, 1, Some(&c0), true)
         .expect("a resolvable GVA target must be bounded");
     let mut resolve = c0.clone();
-    resolve.store_action = crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+    resolve.store_action = reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
     assert!(
         sync_store_allowed_pages(&state, &host, 1, Some(&resolve), true).is_some(),
         "a resolve publishes into the same guest destination and needs the same bound"
@@ -7533,10 +7533,10 @@ fn the_buffer_backed_texture_rail_pays_for_its_texture_reference() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
-    use crate::contract::pass_action::{
+    use crate::runtime::draw::vulkan::mapper_ref_texture_load_is_a_seed_candidate;
+    use reims_vgpu_protocol::pass_action::{
         MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD,
     };
-    use crate::runtime::draw::vulkan::mapper_ref_texture_load_is_a_seed_candidate;
 
     let mut c0 = ColorRtRequest {
         load_action: MTL_LOAD_ACTION_LOAD,

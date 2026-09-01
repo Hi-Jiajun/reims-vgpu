@@ -61,20 +61,20 @@ pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_STRIDE_DYNAMIC: u64 = u64::MAX;
 
 pub const REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT: u32 = 252;
 pub const REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8: u32 = 253;
-// `contract::pass_action` declares these five as the `u16` the render-pass
+// `protocol::pass_action` declares these five as the `u16` the render-pass
 // attachment prefix carries them in, and the encode path converts between the
 // two widths. Widening the contract's `u16` here is the conversion, so there is
 // one definition and no second spelling to drift from it.
 pub const REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE: u32 =
-    crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE as u32;
+    reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE as u32;
 pub const REIMS_VGPU_MTL_LOAD_ACTION_LOAD: u32 =
-    crate::contract::pass_action::MTL_LOAD_ACTION_LOAD as u32;
+    reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_LOAD as u32;
 pub const REIMS_VGPU_MTL_LOAD_ACTION_CLEAR: u32 =
-    crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR as u32;
+    reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_CLEAR as u32;
 pub const REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE: u32 =
-    crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE as u32;
+    reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE as u32;
 pub const REIMS_VGPU_MTL_STORE_ACTION_STORE: u32 =
-    crate::contract::pass_action::MTL_STORE_ACTION_STORE as u32;
+    reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_STORE as u32;
 
 pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ: u32 = 0;
 pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE: u32 = 1;

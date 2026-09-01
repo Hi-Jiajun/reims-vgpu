@@ -15,8 +15,6 @@ use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 /// as the compute-pipeline block below.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::contract::pass_action::MTL_STORE_ACTION_STORE;
 use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::decode::resource::{
@@ -47,6 +45,8 @@ use crate::runtime::host::FakeHost;
 /// test needs this same set; it was spelled inside 29 test bodies before.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::mapping_write;
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_STORE;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use std::path::PathBuf;
 use std::sync::Mutex;

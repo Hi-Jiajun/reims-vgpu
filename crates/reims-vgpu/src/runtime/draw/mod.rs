@@ -37,12 +37,6 @@ use crate::observe::Decline;
 // longer downgrade at all: they carry the source format through to the bind.
 // Only the tests read it here; the rail that acts on it imports its own. The
 // Metal arm tests the band instead (`load_action_in_contract`).
-#[cfg(test)]
-use crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE;
-use crate::contract::pass_action::{is_declared_load_action, is_declared_store_action};
-use crate::contract::pass_action::{
-    MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
-};
 use crate::runtime::decode::render::{
     ColorAttachment, DepthAttachment, ScissorRect, StencilAttachment,
 };
@@ -60,6 +54,12 @@ use crate::runtime::mapper;
 use crate::runtime::mapping_write;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
+#[cfg(test)]
+use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
+use reims_vgpu_protocol::pass_action::{is_declared_load_action, is_declared_store_action};
+use reims_vgpu_protocol::pass_action::{
+    MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
+};
 
 // The Vulkan half of this path, named rather than re-exported flat — the
 // sibling of `metal`, and gated once here rather than per item.
@@ -2371,7 +2371,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             // undefined permits them, `backend::metal::render` hands the same
             // wire word to Metal which preserves them, and the guest declares
             // DontCare and then redraws only its damage rectangle.
-            // `contract::pass_action::LoadAction::preserves_prior_contents`
+            // `protocol::pass_action::LoadAction::preserves_prior_contents`
             // states that term and answers true for both ordinals. The seed
             // block in `draw::vulkan` was widened to it, and the
             // secondary-attachment path in the same file spells it directly as
@@ -2664,7 +2664,7 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
     c: &ColorRtRequest,
 ) -> Option<StoreTargetPages> {
     if c.target_gva == 0
-        || !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action)
+        || !reims_vgpu_protocol::pass_action::store_action_publishes_single_sample(c.store_action)
         || c.width == 0
         || c.height == 0
     {

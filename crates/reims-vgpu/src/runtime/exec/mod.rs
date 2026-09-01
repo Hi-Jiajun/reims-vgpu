@@ -14,11 +14,6 @@ pub mod vulkan;
 use crate::backend::Backend as _;
 use crate::contract::draw::DrawArgs;
 use crate::contract::endian::{ld32, ld64};
-use crate::contract::pass_action::{
-    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
-    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
-    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
-};
 use crate::contract::pixel_format::{self, ClearImageEncoding};
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
@@ -55,6 +50,11 @@ use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+use reims_vgpu_protocol::pass_action::{
+    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
+    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
+    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+};
 use reims_vgpu_wire::ops::blit as wire_blit;
 use reims_vgpu_wire::ops::render as wire_render;
 use reims_vgpu_wire::ops::render_pass as wire_pass;

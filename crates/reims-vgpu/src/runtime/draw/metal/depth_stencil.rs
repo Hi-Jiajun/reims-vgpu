@@ -13,16 +13,16 @@
 //! with nothing in the log.
 
 use super::{degrade_log_first, load_linear_raw, DeviceState, DrawEncodeRequest};
-use crate::contract::pass_action::{
-    is_declared_load_action, is_declared_store_action, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
-    MTL_STORE_ACTION_STORE,
-};
 use crate::runtime::decode::render::{
     attachment_subresource_is_bindable, AttachSubresource, DepthAttachment, LevelSupport,
     StencilAttachment,
 };
 use crate::runtime::host::HostMemory;
 use crate::runtime::{mapper, mapping_write, objects, HostOps};
+use reims_vgpu_protocol::pass_action::{
+    is_declared_load_action, is_declared_store_action, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
+    MTL_STORE_ACTION_STORE,
+};
 
 fn fill_depth32(buf: &mut [u8], depth: f32) {
     let bits = depth.to_bits().to_le_bytes();

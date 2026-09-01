@@ -613,7 +613,7 @@ pub struct DrawRequest {
     /// answer for it and clears. Only a caller that has decoded a real load
     /// action fills this in, so an unfilled request cannot silently acquire a
     /// preserving reading it was never given evidence for.
-    pub color0_declared: Option<crate::contract::pass_action::LoadAction>,
+    pub color0_declared: Option<reims_vgpu_protocol::pass_action::LoadAction>,
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,

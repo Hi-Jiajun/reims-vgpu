@@ -29,6 +29,7 @@ pub mod content;
 pub mod depend;
 pub mod identity;
 pub mod operation;
+pub mod pass;
 pub mod pipeline;
 pub mod range_set;
 pub mod ready;

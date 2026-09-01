@@ -25,8 +25,10 @@
 //! means. Modules move as they become movable: protocol is `no_std` and this
 //! crate's refusal vocabulary is not, so the observe-free modules go first.
 //! `extent` — the guest API's three-dimensional extent and its tightly-packed
-//! image arithmetic — is now `reims_vgpu_protocol::extent`, and this crate uses
-//! it from there rather than keeping a second spelling.
+//! image arithmetic — is now `reims_vgpu_protocol::extent`, and `pass_action` —
+//! the `MTLLoadAction`/`MTLStoreAction` ordinals — is
+//! `reims_vgpu_protocol::pass_action`. This crate uses both from there rather
+//! than keeping a second spelling.
 //!
 //! The one dependency that looks like a device dependency and is not is
 //! `reims_vgpu_observe`: a check that refuses has to be able to *name* its
@@ -42,7 +44,6 @@ pub mod gva;
 pub mod gva_resolve;
 pub mod iosurface_pages;
 pub mod mipmap;
-pub mod pass_action;
 pub mod pixel_format;
 pub mod vertex_step;
 pub mod visibility;

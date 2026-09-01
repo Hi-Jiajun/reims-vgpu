@@ -956,7 +956,7 @@ mod gva_copying_arm_tests {
             // assertion below is about where the bytes landed and not about the
             // conversion, which has its own tests.
             format: crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
-            store_action: crate::contract::pass_action::MTL_STORE_ACTION_STORE,
+            store_action: reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_STORE,
             ..Default::default()
         }
     }

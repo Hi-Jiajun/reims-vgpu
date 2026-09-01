@@ -36,6 +36,11 @@
 //!   which rail its records are read on.
 //! - [`resource_state`] — what the content-representation records ask for:
 //!   which directive, at which granularity.
+//! - [`render`] — which render-encoder record an opcode names, the eight draw
+//!   shapes behind its fourteen draw opcodes, and the stage no wire field
+//!   carries.
+//! - [`pass_action`] — the load and store ordinals a render-pass attachment
+//!   carries, and the closed sets behind them.
 //! - [`residency`] — what a `useResource`/`useHeap` declaration says, split so
 //!   that the half a per-draw binder owes nothing on cannot hide the half it
 //!   does.
@@ -53,6 +58,8 @@ pub mod closure;
 pub mod compute;
 pub mod extent;
 pub mod packets;
+pub mod pass_action;
+pub mod render;
 pub mod residency;
 pub mod resource_state;
 pub mod segment;

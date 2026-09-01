@@ -46,7 +46,7 @@ pub const MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE: u16 = 3;
 
 /// Whether `raw` is one of the three `MTLLoadAction` values.
 ///
-/// The set is *closed* in the same sense as [`crate::dispatch`]'s:
+/// The set is *closed* in the same sense as the dispatch-type ordinals are:
 /// `MTLLoadAction` has exactly these three, so a fourth ordinal is a corrupt
 /// record or a wrong wire offset rather than a guest feature this device has no
 /// contract for yet.

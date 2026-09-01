@@ -1754,7 +1754,7 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
         width: debt.width,
         height: debt.height,
         format: debt.format,
-        store_action: crate::contract::pass_action::MTL_STORE_ACTION_STORE,
+        store_action: reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_STORE,
         ..Default::default()
     };
     crate::runtime::drain::note_store_route(site.route());

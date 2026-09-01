@@ -86,7 +86,7 @@ pub mod window;
 // `abi.rs`'s apparent references are `MTL*` type names in prose, and its sole
 // import is `core::mem::offset_of`. All three are chained to `abi`, and `abi`
 // must stay where it is: it is a **mirror of an archived C header**, its
-// provenance is the point, and `contract::dispatch` and `contract::pass_action`
+// provenance is the point, and `contract::dispatch` and `protocol::pass_action`
 // record the reasoning. The values that are genuinely shared — the ones that
 // arrive on the wire and are consumed by both backends — were already lifted
 // into `contract/`, with `const` assertions in the mirror pinning the two

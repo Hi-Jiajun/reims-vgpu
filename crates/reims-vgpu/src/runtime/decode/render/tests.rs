@@ -472,7 +472,7 @@ fn execute_commands_range_and_indirect() {
 #[test]
 fn depth_and_stencil_pass_slots() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
+    use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
     let mut payload = vec![0u8; PASS_MIN_PAYLOAD];
     // depth @0
     st32(

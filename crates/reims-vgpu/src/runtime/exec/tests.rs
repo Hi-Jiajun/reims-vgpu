@@ -7,13 +7,13 @@ use reims_vgpu_wire::OP_HEADER_LEN;
 
 use super::*;
 use crate::contract::endian::{st16, st32, st64};
-use crate::contract::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::decode::render::{
     PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
     PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE,
 };
 use crate::runtime::host::FakeHost;
+use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 
 #[test]
 fn render_pass_chain_edges_follow_the_decoded_encoder() {
@@ -2593,7 +2593,7 @@ fn dropped_clear_logs_once_per_reason_target() {
 /// pass by coincidence.
 #[test]
 fn a_store_action_override_reaches_the_slot_it_names() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
@@ -2678,9 +2678,9 @@ fn a_store_action_override_reaches_the_slot_it_names() {
 /// the wrong one cannot pass.
 #[test]
 fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     use crate::runtime::decode::render::StencilAttachment;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
@@ -3774,7 +3774,7 @@ fn a_later_icb_execute_opens_its_pass_with_load() {
             1u32,
             ColorAttachment {
                 texture_ref: 12,
-                load_action: crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE,
+                load_action: reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE,
                 store_action: MTL_STORE_ACTION_STORE,
                 clear_color: [0.0; 4],
                 // A second attachment whose action is *not* CLEAR, so the
@@ -5172,11 +5172,11 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
 /// without restoring the seed leaves the original bug.
 #[test]
 fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     use crate::runtime::decode::render::{
         PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
         PASS_COLOR_ATTACH_OFF,
     };
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
     let seeded = |store_action: u16| {
         let mut payload = vec![0u8; 0x400];
@@ -5240,7 +5240,7 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
 /// The two resolve-carrying actions have different publication contracts.
 #[test]
 fn a_clear_distinguishes_resolve_only_from_store_and_resolve() {
-    use crate::contract::pass_action::{
+    use reims_vgpu_protocol::pass_action::{
         MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
         MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
     };

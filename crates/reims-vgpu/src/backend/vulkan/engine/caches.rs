@@ -176,7 +176,7 @@ pub(crate) struct DepthAttachKey {
 /// its prior contents and arrived with none of them. They are not the same
 /// request and they do not have the same lawful answer.
 ///
-/// [`crate::contract::pass_action::LoadAction::preserves_prior_contents`]
+/// [`reims_vgpu_protocol::pass_action::LoadAction::preserves_prior_contents`]
 /// states the term: `MTLLoadActionDontCare` declares the prior contents
 /// *undefined*, and undefined permits any contents — including the ones already
 /// there. Clearing is the one reading that destroys them, and the colour it
@@ -2727,7 +2727,7 @@ impl ObjectCaches {
 #[cfg(test)]
 mod color0_load_tests {
     use super::*;
-    use crate::contract::pass_action::LoadAction;
+    use reims_vgpu_protocol::pass_action::LoadAction;
 
     /// A pass that promises its prior contents and arrives with none of them
     /// must not write the attachment.

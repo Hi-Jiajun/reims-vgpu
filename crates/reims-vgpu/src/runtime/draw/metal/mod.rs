@@ -16,8 +16,8 @@
 use super::*;
 
 use crate::backend::metal::render::{RetainedColorTarget, RetainedColorTexture};
-use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
 use crate::runtime::chain_phase;
+use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
 // The Metal ICB execute half of this rail.
 pub mod icb;
@@ -1314,7 +1314,7 @@ fn load_linear_raw<M: HostMemory + HostOps>(
 
 /// Decoded `MTLLoadAction` → the Metal C ABI value.
 ///
-/// This maps nothing. `contract::pass_action` and `backend::metal::abi` declare
+/// This maps nothing. `protocol::pass_action` and `backend::metal::abi` declare
 /// the same three ordinals, in `u16` and `u32`, and `const` assertions in the
 /// mirror pin them equal — so every arm below is a widening. It reads as a
 /// translation table because it had to be one: until those two declarations
