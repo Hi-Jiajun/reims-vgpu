@@ -30,6 +30,8 @@
 //!   than its closure.
 //! - [`compute`] — which compute-encoder record an opcode names, and the pass
 //!   dispatch type that only reaches the wire through the descriptor.
+//! - [`decode`] — records lifted out of bytes, with the guest's own refs still
+//!   on them.
 //! - [`extent`] — the guest API's three-dimensional extent, its mip-level
 //!   dimensions, and the byte arithmetic of a tightly-packed image.
 //! - [`sync`] — which opcode is a fence, an event or a barrier, on which rail,
@@ -59,6 +61,7 @@ pub mod bind;
 pub mod blit;
 pub mod closure;
 pub mod compute;
+pub mod decode;
 pub mod extent;
 pub mod packets;
 pub mod pass_action;
