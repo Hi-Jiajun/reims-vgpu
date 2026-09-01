@@ -1482,11 +1482,15 @@ impl Lifecycle {
             }
             // Its own pages: nothing else names them, so the content goes with
             // the backing the namespace just handed back.
-            Some(Resident::Dedicated { backing, .. }) => {
-                if matches!(teardown, Teardown::Now { .. }) {
-                    self.content.forget(backing);
-                }
-            }
+            Some(Resident::Dedicated { backing, .. }) => match teardown {
+                // Nothing reads it and nothing names it: the content dies with
+                // the backing the namespace just handed back.
+                Teardown::Now { .. } => self.content.forget(backing),
+                // Someone else still answers for these bytes. Forgetting here
+                // would drop the content authority out from under a reader or
+                // a live name.
+                Teardown::WhenUsesRetire { .. } | Teardown::HeldByAnotherName { .. } => {}
+            },
             None => {}
         }
         Ok(effects)
@@ -1542,8 +1546,11 @@ impl Lifecycle {
         // The new pages are the guest's and every copy of the old ones is of
         // memory this resource no longer names.
         self.content.declare(backing, extent, Replica::GuestPages);
-        if let Teardown::Now { backing: old } = teardown {
-            self.content.forget(old);
+        match teardown {
+            Teardown::Now { backing: old } => self.content.forget(old),
+            // The old bytes are still read by accepted work, or still named by
+            // another slot. Either way their authority is not ours to drop.
+            Teardown::WhenUsesRetire { .. } | Teardown::HeldByAnotherName { .. } => {}
         }
         Ok(Effects {
             teardowns: vec![teardown],

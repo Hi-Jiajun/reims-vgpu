@@ -83,13 +83,21 @@ impl Refusal {
 
 /// What a delete or a physical replacement left behind.
 ///
-/// Two variants rather than an `Option` with a comment, because the caller has
-/// to do something different in each case and a caller that ignored the
+/// Distinct variants rather than an `Option` with a comment, because the caller
+/// has to do something different in each case and a caller that ignored the
 /// difference would either free memory the GPU is reading or leak it.
+///
+/// The three answers are the three reasons a backing may not be freed yet:
+/// nothing is holding it (free it), work is holding it (wait for the release),
+/// or *another live name* is holding it (do nothing at all — that name will
+/// answer for it when it goes). The third is not a zero-outstanding
+/// [`Self::WhenUsesRetire`]: no release is owed to this caller, and one spelled
+/// that way would be a handback that never arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use = "a backing that is owed teardown is one nothing else will free"]
 pub enum Teardown {
-    /// Nothing accepted still reads this backing. It may be torn down now.
+    /// Nothing accepted still reads this backing and no live name resolves to
+    /// it. It may be torn down now.
     Now { backing: BackingId },
     /// Accepted work still reads it. [`Namespace::release`] returns it when the
     /// last use retires.
@@ -97,13 +105,19 @@ pub enum Teardown {
         backing: BackingId,
         outstanding: usize,
     },
+    /// A different live name still resolves to this backing. The caller owns no
+    /// teardown for it: the storage stays, and the last name to leave will
+    /// carry it out.
+    HeldByAnotherName { backing: BackingId },
 }
 
 impl Teardown {
     #[must_use]
     pub const fn backing(self) -> BackingId {
         match self {
-            Self::Now { backing } | Self::WhenUsesRetire { backing, .. } => backing,
+            Self::Now { backing }
+            | Self::WhenUsesRetire { backing, .. }
+            | Self::HeldByAnotherName { backing } => backing,
         }
     }
 }
@@ -128,20 +142,19 @@ struct Slot {
     outstanding: usize,
 }
 
-/// A backing whose name has moved on, kept alive by the work still reading it.
-#[derive(Clone, Copy, Debug)]
-struct Retiring {
-    backing: BackingId,
-    outstanding: usize,
-}
-
 /// One session generation's object namespace.
 #[derive(Debug, Default)]
 pub struct Namespace {
     slots: HashMap<ObjectListRef, Slot>,
-    /// Backings detached from their slot by a delete or a replacement, still
-    /// held by accepted work.
-    retiring: Vec<Retiring>,
+    /// Backings detached from a slot by a delete or a replacement, still held
+    /// by accepted work, counted *per backing* rather than per detachment.
+    ///
+    /// Several names may legitimately resolve to one backing — every resource
+    /// placed in a heap is declared with the heap's — and a slot may be pointed
+    /// back at a backing it detached earlier. Claims kept per detachment would
+    /// be several counters over one piece of storage, each reaching zero on its
+    /// own and each handing the same storage back.
+    retiring: HashMap<BackingId, usize>,
     resolved: usize,
     refused: usize,
 }
@@ -216,11 +229,13 @@ impl Namespace {
     ///
     /// As [`Self::resolve`], minus the generation check there is no input for.
     pub fn resolve_slot(&mut self, slot: ObjectListRef) -> Result<Lease, Refusal> {
-        let generation = self
-            .slots
-            .get(&slot)
-            .map(|s| s.generation)
-            .ok_or(Refusal::NotDeclared { slot })?;
+        let Some(generation) = self.slots.get(&slot).map(|s| s.generation) else {
+            // Counted here, because [`Self::resolve`] never sees it. A name
+            // this door refused is still a name refused, and a census that
+            // dropped it would report a clean run over a slot nothing declared.
+            self.refused += 1;
+            return Err(Refusal::NotDeclared { slot });
+        };
         self.resolve(ResourceId { slot, generation })
     }
 
@@ -231,17 +246,16 @@ impl Namespace {
     /// is the shape of a use-after-free.
     pub fn acquire(&mut self, lease: Lease) {
         if let Some(slot) = self.slots.get_mut(&lease.id.slot) {
-            if !slot.deleted && slot.backing == lease.backing {
+            if slot.generation == lease.id.generation
+                && !slot.deleted
+                && slot.backing == lease.backing
+            {
                 slot.outstanding += 1;
                 return;
             }
         }
-        if let Some(entry) = self
-            .retiring
-            .iter_mut()
-            .find(|r| r.backing == lease.backing)
-        {
-            entry.outstanding += 1;
+        if let Some(claims) = self.retiring.get_mut(&lease.backing) {
+            *claims += 1;
         }
     }
 
@@ -251,20 +265,24 @@ impl Namespace {
     /// already moved on — the deferred half of [`Teardown::WhenUsesRetire`].
     pub fn release(&mut self, lease: Lease) -> Option<BackingId> {
         if let Some(slot) = self.slots.get_mut(&lease.id.slot) {
-            if !slot.deleted && slot.backing == lease.backing && slot.outstanding > 0 {
+            if slot.generation == lease.id.generation
+                && !slot.deleted
+                && slot.backing == lease.backing
+                && slot.outstanding > 0
+            {
                 slot.outstanding -= 1;
                 return None;
             }
         }
-        let at = self
-            .retiring
-            .iter()
-            .position(|r| r.backing == lease.backing)?;
-        self.retiring[at].outstanding -= 1;
-        if self.retiring[at].outstanding == 0 {
-            return Some(self.retiring.remove(at).backing);
+        let claims = self.retiring.get_mut(&lease.backing)?;
+        *claims -= 1;
+        if *claims > 0 {
+            return None;
         }
-        None
+        self.retiring.remove(&lease.backing);
+        // Nothing is owed any more, but the storage is only the caller's to
+        // free if no name still resolves to it.
+        (!self.named_by_a_live_slot(lease.backing)).then_some(lease.backing)
     }
 
     /// Delete an object: stop it resolving, and leave accepted work alone.
@@ -305,19 +323,33 @@ impl Namespace {
         Ok(self.detach(lease.backing, outstanding))
     }
 
-    /// Detach a backing from its slot, keeping it alive if work still reads it.
+    /// Detach a backing from its slot, keeping it alive if anything still holds
+    /// it — accepted work, or another live name.
+    ///
+    /// Called after the slot has already been deleted or repointed, so the
+    /// departing name is not among the live ones.
     fn detach(&mut self, backing: BackingId, outstanding: usize) -> Teardown {
-        if outstanding == 0 {
-            return Teardown::Now { backing };
+        let claims = self.retiring.entry(backing).or_insert(0);
+        *claims += outstanding;
+        let claims = *claims;
+        if claims > 0 {
+            return Teardown::WhenUsesRetire {
+                backing,
+                outstanding: claims,
+            };
         }
-        self.retiring.push(Retiring {
-            backing,
-            outstanding,
-        });
-        Teardown::WhenUsesRetire {
-            backing,
-            outstanding,
+        self.retiring.remove(&backing);
+        if self.named_by_a_live_slot(backing) {
+            return Teardown::HeldByAnotherName { backing };
         }
+        Teardown::Now { backing }
+    }
+
+    /// Whether any undeleted slot still resolves to this backing.
+    fn named_by_a_live_slot(&self, backing: BackingId) -> bool {
+        self.slots
+            .values()
+            .any(|s| !s.deleted && s.backing == backing)
     }
 
     /// Accepted uses of a name's current backing that have not retired.
@@ -354,7 +386,10 @@ impl Namespace {
         out
     }
 
-    /// Backings detached from their slot and still held by accepted work.
+    /// Distinct backings detached from a slot and still held by accepted work.
+    ///
+    /// Counted per backing, not per detachment: two names over one piece of
+    /// storage owe one handback between them, not two.
     #[must_use]
     pub fn awaiting_teardown(&self) -> usize {
         self.retiring.len()
@@ -567,11 +602,13 @@ mod tests {
             ns.resolve_slot(slot(4)),
             Err(Refusal::NotDeclared { slot: slot(4) })
         );
-        assert_eq!(
-            ns.census(),
-            (0, 1),
-            "one refusal, and the probe was not one"
-        );
+        // Both doors resolve a name and both refused, so the census counts
+        // two. `resolve_slot`'s undeclared path returns before `resolve` sees
+        // it, and a census that let it through would report a clean run over a
+        // slot nothing ever declared. The uncounted door is
+        // `RefResolver::resource`, which asks identity and takes nothing —
+        // see `resolving_for_identity_is_not_a_lease`.
+        assert_eq!(ns.census(), (0, 2), "both doors refused a name");
     }
 
     /// No live identity carries the default generation, so a zeroed structure
@@ -633,5 +670,542 @@ mod tests {
         assert_eq!(ns.census(), (before.0 + 1, before.1));
         ns.acquire(lease);
         assert_eq!(ns.outstanding(id), 1, "the lease is the claim");
+    }
+
+    /// Several live names over one backing is the ordinary path —
+    /// `lifecycle::create_resource` declares every heap-placed resource with
+    /// the heap's backing — so a delete of one of them must hand nothing back.
+    #[test]
+    fn a_backing_two_names_share_is_not_handed_back_when_one_of_them_goes() {
+        let mut ns = Namespace::new();
+        let b = backing(7);
+        let a = ns.declare(slot(1), b).expect("free slot");
+        let c = ns.declare(slot(2), b).expect("free slot");
+        let la = ns.resolve(a).expect("live");
+        ns.acquire(la);
+        let lc = ns.resolve(c).expect("live");
+        ns.acquire(lc);
+
+        assert_eq!(
+            ns.delete(a),
+            Ok(Teardown::WhenUsesRetire {
+                backing: b,
+                outstanding: 1,
+            })
+        );
+        assert_eq!(
+            ns.release(la),
+            None,
+            "storage handed back while another name still resolves to it"
+        );
+        assert_eq!(ns.resolve(c).expect("still live").backing, b);
+        assert_eq!(ns.outstanding(c), 1);
+
+        // Only the last name out carries it.
+        assert_eq!(
+            ns.delete(c),
+            Ok(Teardown::WhenUsesRetire {
+                backing: b,
+                outstanding: 1
+            })
+        );
+        assert_eq!(ns.release(lc), Some(b));
+    }
+
+    /// A name whose backing nothing else holds, deleted while a *live* name
+    /// still resolves to that backing, is owed no teardown at all — and saying
+    /// so as a zero-outstanding `WhenUsesRetire` would promise a handback no
+    /// release can ever deliver.
+    #[test]
+    fn a_delete_another_live_name_answers_for_says_so() {
+        let mut ns = Namespace::new();
+        let b = backing(7);
+        let a = ns.declare(slot(1), b).expect("free slot");
+        let c = ns.declare(slot(2), b).expect("free slot");
+
+        assert_eq!(ns.delete(a), Ok(Teardown::HeldByAnotherName { backing: b }));
+        assert_eq!(ns.awaiting_teardown(), 0, "nothing is owed");
+        assert_eq!(ns.delete(c), Ok(Teardown::Now { backing: b }));
+    }
+
+    /// A slot pointed back at a backing it detached earlier reaches the
+    /// namespace twice over one piece of storage. Claims kept per detachment
+    /// would be two counters over it, each reaching zero and each handing the
+    /// same storage back.
+    #[test]
+    fn a_backing_a_name_returns_to_is_handed_back_once() {
+        let mut ns = Namespace::new();
+        let b = backing(7);
+        let id = ns.declare(slot(1), b).expect("free slot");
+        let lease = ns.resolve(id).expect("live");
+        ns.acquire(lease);
+
+        assert_eq!(
+            ns.replace_physical(id, backing(8)),
+            Ok(Teardown::WhenUsesRetire {
+                backing: b,
+                outstanding: 1,
+            })
+        );
+        // Back to `b`, which is still owed a handback, and away again.
+        assert_eq!(
+            ns.replace_physical(id, b),
+            Ok(Teardown::Now {
+                backing: backing(8)
+            })
+        );
+        assert_eq!(
+            ns.replace_physical(id, backing(9)),
+            Ok(Teardown::WhenUsesRetire {
+                backing: b,
+                outstanding: 1,
+            }),
+            "the two visits to this storage owe one handback between them"
+        );
+        assert_eq!(ns.awaiting_teardown(), 1);
+        assert_eq!(ns.release(lease), Some(b));
+        assert_eq!(ns.awaiting_teardown(), 0);
+    }
+
+    /// A slot redeclared over the same backing is a different occupancy. Its
+    /// claims are its own, and a release from the previous occupant must not
+    /// pay them off.
+    #[test]
+    fn a_redeclared_slot_does_not_absorb_the_previous_occupants_release() {
+        let mut ns = Namespace::new();
+        let b = backing(7);
+        let first = ns.declare(slot(1), b).expect("free slot");
+        let lease = ns.resolve(first).expect("live");
+        ns.acquire(lease);
+        assert_eq!(
+            ns.delete(first),
+            Ok(Teardown::WhenUsesRetire {
+                backing: b,
+                outstanding: 1,
+            })
+        );
+
+        let second = ns.declare(slot(1), b).expect("deleted slot");
+        let fresh = ns.resolve(second).expect("live");
+        ns.acquire(fresh);
+        assert_eq!(ns.outstanding(second), 1);
+
+        assert_eq!(
+            ns.release(lease),
+            None,
+            "the backing is still named by the slot's new occupant"
+        );
+        assert_eq!(
+            ns.outstanding(second),
+            1,
+            "a stale lease paid off the new occupant's claim"
+        );
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// Deliberately tiny pools, so several live names share one backing
+    /// constantly and slots are redeclared under leases still in flight.
+    /// Everything interesting here is about storage outliving one of its names.
+    const SLOTS: u64 = 4;
+    const BACKINGS: u64 = 3;
+
+    #[derive(Clone, Copy, Debug)]
+    struct ShadowSlot {
+        generation: SlotGeneration,
+        backing: BackingId,
+        deleted: bool,
+        /// Claims taken through *this* occupancy of the slot.
+        claims: usize,
+    }
+
+    /// **The invariant the module exists for, driven over histories.**
+    ///
+    /// A backing is handed back exactly once, and never while anything still
+    /// holds it — accepted work, or another live name. `create_resource`
+    /// declares every heap-placed resource with the *heap's* backing, so
+    /// several names over one piece of storage is the ordinary path and not a
+    /// corner; a slot may also be pointed back at a backing it detached
+    /// earlier, which is the same storage reaching the namespace twice.
+    ///
+    /// The shadow counts claims per *occupancy* — a slot at one generation
+    /// pointing at one backing — and moves them to a per-backing detached pool
+    /// when that occupancy lets go. That split is the one thing it has to state
+    /// the way the module does, because two leases naming the same slot,
+    /// generation and backing are genuinely indistinguishable and something has
+    /// to say which counter a late release pays. Everything the sweep actually
+    /// asserts — exactly-once, never-early, and every observer — is checked
+    /// against the shadow's own bookkeeping.
+    #[test]
+    fn a_backing_is_handed_back_exactly_once_and_never_under_a_live_name() {
+        let mut handbacks_now = 0usize;
+        let mut handbacks_on_release = 0usize;
+        let mut deletes_that_waited = 0usize;
+        let mut held_by_another_name = 0usize;
+        let mut refused_occupied = 0usize;
+        let mut refused_stale = 0usize;
+        let mut refused_deleted = 0usize;
+        let mut refused_undeclared = 0usize;
+        let mut replacements = 0usize;
+        let mut late_releases = 0usize;
+
+        for seed in 0..384u64 {
+            let mut rng = Rng::new(seed);
+            let mut ns = Namespace::new();
+            let mut shadow: HashMap<ObjectListRef, ShadowSlot> = HashMap::new();
+            // Claims whose occupancy has let go of them: per backing, because
+            // several names may have shared it.
+            let mut detached: HashMap<BackingId, usize> = HashMap::new();
+            let mut names: Vec<ResourceId> = Vec::new();
+            let mut leases: Vec<Lease> = Vec::new();
+            let mut resolved = 0usize;
+            let mut refused = 0usize;
+
+            // A backing nothing names and nothing holds.
+            let unowned = |shadow: &HashMap<ObjectListRef, ShadowSlot>,
+                           detached: &HashMap<BackingId, usize>,
+                           b: BackingId| {
+                !shadow.values().any(|s| !s.deleted && s.backing == b)
+                    && !shadow
+                        .values()
+                        .any(|s| !s.deleted && s.claims > 0 && s.backing == b)
+                    && detached.get(&b).copied().unwrap_or(0) == 0
+            };
+            let named_live = |shadow: &HashMap<ObjectListRef, ShadowSlot>, b: BackingId| {
+                shadow.values().any(|s| !s.deleted && s.backing == b)
+            };
+
+            for _ in 0..64 {
+                match rng.below(12) {
+                    // Declare.
+                    0..=2 => {
+                        let sl = slot(rng.below(SLOTS) as u32);
+                        let b = backing(rng.below(BACKINGS));
+                        let occupied = shadow.get(&sl).is_some_and(|s| !s.deleted);
+                        match ns.declare(sl, b) {
+                            Ok(id) => {
+                                assert!(!occupied, "seed {seed}: redeclared a live slot");
+                                let generation = shadow.get(&sl).map_or_else(
+                                    || SlotGeneration::default().next(),
+                                    |s| s.generation.next(),
+                                );
+                                assert_eq!(id.generation, generation, "seed {seed}");
+                                assert_eq!(id.slot, sl);
+                                shadow.insert(
+                                    sl,
+                                    ShadowSlot {
+                                        generation,
+                                        backing: b,
+                                        deleted: false,
+                                        claims: 0,
+                                    },
+                                );
+                                names.push(id);
+                            }
+                            Err(Refusal::SlotOccupied { slot: s }) => {
+                                assert!(occupied, "seed {seed}");
+                                assert_eq!(s, sl);
+                                refused_occupied += 1;
+                            }
+                            Err(other) => panic!("seed {seed}: declare refused as {other:?}"),
+                        }
+                    }
+                    // Resolve a name, possibly a stale one, and acquire it.
+                    3..=5 => {
+                        let sl = slot(rng.below(SLOTS) as u32);
+                        match ns.resolve_slot(sl) {
+                            Ok(lease) => {
+                                resolved += 1;
+                                let sh = shadow.get_mut(&sl).expect("resolved");
+                                assert!(!sh.deleted, "seed {seed}: a deleted slot resolved");
+                                assert_eq!(lease.backing, sh.backing, "seed {seed}");
+                                assert_eq!(lease.id.generation, sh.generation, "seed {seed}");
+                                ns.acquire(lease);
+                                sh.claims += 1;
+                                leases.push(lease);
+                            }
+                            Err(Refusal::NotDeclared { .. }) => {
+                                refused += 1;
+                                refused_undeclared += 1;
+                                assert!(!shadow.contains_key(&sl), "seed {seed}");
+                            }
+                            Err(Refusal::Deleted { .. }) => {
+                                refused += 1;
+                                refused_deleted += 1;
+                                assert!(shadow[&sl].deleted, "seed {seed}");
+                            }
+                            Err(other) => panic!("seed {seed}: resolve refused as {other:?}"),
+                        }
+                    }
+                    // Release a lease, in any order, however late.
+                    6..=8 if !leases.is_empty() => {
+                        let which = rng.below(leases.len() as u64) as usize;
+                        let lease = leases.swap_remove(which);
+                        let live_here = shadow.get_mut(&lease.id.slot).filter(|s| {
+                            s.generation == lease.id.generation
+                                && !s.deleted
+                                && s.backing == lease.backing
+                                && s.claims > 0
+                        });
+                        let expected = if let Some(sh) = live_here {
+                            sh.claims -= 1;
+                            None
+                        } else {
+                            late_releases += 1;
+                            let pool = detached
+                                .get_mut(&lease.backing)
+                                .expect("a released claim was taken somewhere");
+                            *pool -= 1;
+                            if *pool > 0 {
+                                None
+                            } else {
+                                detached.remove(&lease.backing);
+                                (!named_live(&shadow, lease.backing)).then_some(lease.backing)
+                            }
+                        };
+                        assert_eq!(ns.release(lease), expected, "seed {seed}: release");
+                        if expected.is_some() {
+                            assert!(
+                                unowned(&shadow, &detached, lease.backing),
+                                "seed {seed}: {:?} handed back under a live holder",
+                                lease.backing
+                            );
+                            handbacks_on_release += 1;
+                        }
+                    }
+                    // Delete a name, possibly a stale one.
+                    9..=10 if !names.is_empty() => {
+                        let id = names[rng.below(names.len() as u64) as usize];
+                        let expected = expected_resolution(&shadow, id);
+                        match ns.delete(id) {
+                            Ok(teardown) => {
+                                assert!(expected.is_ok(), "seed {seed}: deleted a stale name");
+                                resolved += 1;
+                                let sh = shadow.get_mut(&id.slot).expect("live");
+                                let b = sh.backing;
+                                let moved = sh.claims;
+                                sh.claims = 0;
+                                sh.deleted = true;
+                                assert_eq!(
+                                    teardown,
+                                    detach_expectation(&shadow, &mut detached, b, moved),
+                                    "seed {seed}: delete teardown"
+                                );
+                                account(
+                                    teardown,
+                                    &mut handbacks_now,
+                                    &mut deletes_that_waited,
+                                    &mut held_by_another_name,
+                                );
+                                if matches!(teardown, Teardown::Now { .. }) {
+                                    assert!(
+                                        unowned(&shadow, &detached, b),
+                                        "seed {seed}: {b:?} freed under a live holder"
+                                    );
+                                }
+                            }
+                            Err(refusal) => {
+                                refused += 1;
+                                assert_eq!(Err(refusal), expected, "seed {seed}: delete");
+                                count_refusal(
+                                    refusal,
+                                    &mut refused_stale,
+                                    &mut refused_deleted,
+                                    &mut refused_undeclared,
+                                );
+                            }
+                        }
+                    }
+                    // Point a name at different memory.
+                    _ if !names.is_empty() => {
+                        let id = names[rng.below(names.len() as u64) as usize];
+                        let to = backing(rng.below(BACKINGS));
+                        let expected = expected_resolution(&shadow, id);
+                        match ns.replace_physical(id, to) {
+                            Ok(teardown) => {
+                                assert!(expected.is_ok(), "seed {seed}: replaced a stale name");
+                                resolved += 1;
+                                replacements += 1;
+                                let sh = shadow.get_mut(&id.slot).expect("live");
+                                let old = sh.backing;
+                                let moved = sh.claims;
+                                sh.claims = 0;
+                                sh.backing = to;
+                                assert_eq!(
+                                    teardown,
+                                    detach_expectation(&shadow, &mut detached, old, moved),
+                                    "seed {seed}: replace teardown"
+                                );
+                                account(
+                                    teardown,
+                                    &mut handbacks_now,
+                                    &mut deletes_that_waited,
+                                    &mut held_by_another_name,
+                                );
+                                if matches!(teardown, Teardown::Now { .. }) {
+                                    assert!(
+                                        unowned(&shadow, &detached, old),
+                                        "seed {seed}: {old:?} freed under a live holder"
+                                    );
+                                }
+                            }
+                            Err(refusal) => {
+                                refused += 1;
+                                assert_eq!(Err(refusal), expected, "seed {seed}: replace");
+                                count_refusal(
+                                    refusal,
+                                    &mut refused_stale,
+                                    &mut refused_deleted,
+                                    &mut refused_undeclared,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Every observer agrees with the shadow after every step.
+                assert_eq!(
+                    ns.live_names(),
+                    {
+                        let mut v: Vec<ResourceId> = shadow
+                            .iter()
+                            .filter(|(_, s)| !s.deleted)
+                            .map(|(sl, s)| ResourceId {
+                                slot: *sl,
+                                generation: s.generation,
+                            })
+                            .collect();
+                        v.sort_unstable_by_key(|id| id.slot.0);
+                        v
+                    },
+                    "seed {seed}: live_names"
+                );
+                assert_eq!(
+                    ns.awaiting_teardown(),
+                    detached.len(),
+                    "seed {seed}: awaiting_teardown"
+                );
+                assert_eq!(ns.census(), (resolved, refused), "seed {seed}: census");
+                for id in &names {
+                    let expected = shadow
+                        .get(&id.slot)
+                        .filter(|s| s.generation == id.generation)
+                        .map_or(0, |s| s.claims);
+                    assert_eq!(ns.outstanding(*id), expected, "seed {seed}: outstanding");
+                }
+            }
+        }
+
+        // Non-vacuity: every shape an assertion above depends on reaching.
+        assert!(handbacks_now > 700, "immediate handbacks: {handbacks_now}");
+        assert!(
+            handbacks_on_release > 200,
+            "handbacks owed to a release: {handbacks_on_release}"
+        );
+        assert!(
+            deletes_that_waited > 400,
+            "detachments that could not free yet: {deletes_that_waited}"
+        );
+        assert!(
+            held_by_another_name > 200,
+            "detachments another live name answers for: {held_by_another_name}"
+        );
+        assert!(
+            late_releases > 400,
+            "releases after a detach: {late_releases}"
+        );
+        assert!(replacements > 300, "replacements: {replacements}");
+        assert!(refused_occupied > 200, "slot occupied: {refused_occupied}");
+        assert!(refused_stale > 200, "stale generation: {refused_stale}");
+        assert!(refused_deleted > 200, "deleted: {refused_deleted}");
+        assert!(
+            refused_undeclared > 100,
+            "not declared: {refused_undeclared}"
+        );
+    }
+
+    /// What a resolution of this name must answer, from the shadow alone.
+    fn expected_resolution(
+        shadow: &HashMap<ObjectListRef, ShadowSlot>,
+        id: ResourceId,
+    ) -> Result<BackingId, Refusal> {
+        match shadow.get(&id.slot) {
+            None => Err(Refusal::NotDeclared { slot: id.slot }),
+            Some(s) if s.generation != id.generation => Err(Refusal::StaleGeneration {
+                slot: id.slot,
+                named: id.generation,
+                current: s.generation,
+            }),
+            Some(s) if s.deleted => Err(Refusal::Deleted { id }),
+            Some(s) => Ok(s.backing),
+        }
+    }
+
+    /// What a detachment of `backing`, carrying `moved` claims away from the
+    /// occupancy that is letting go, must answer — and the shadow's own
+    /// bookkeeping for it.
+    fn detach_expectation(
+        shadow: &HashMap<ObjectListRef, ShadowSlot>,
+        detached: &mut HashMap<BackingId, usize>,
+        backing: BackingId,
+        moved: usize,
+    ) -> Teardown {
+        let pool = detached.entry(backing).or_insert(0);
+        *pool += moved;
+        if *pool > 0 {
+            return Teardown::WhenUsesRetire {
+                backing,
+                outstanding: *pool,
+            };
+        }
+        detached.remove(&backing);
+        if shadow.values().any(|s| !s.deleted && s.backing == backing) {
+            Teardown::HeldByAnotherName { backing }
+        } else {
+            Teardown::Now { backing }
+        }
+    }
+
+    fn account(teardown: Teardown, now: &mut usize, waited: &mut usize, held: &mut usize) {
+        match teardown {
+            Teardown::Now { .. } => *now += 1,
+            Teardown::WhenUsesRetire { .. } => *waited += 1,
+            Teardown::HeldByAnotherName { .. } => *held += 1,
+        }
+    }
+
+    fn count_refusal(
+        refusal: Refusal,
+        stale: &mut usize,
+        deleted: &mut usize,
+        undeclared: &mut usize,
+    ) {
+        match refusal {
+            Refusal::StaleGeneration { .. } => *stale += 1,
+            Refusal::Deleted { .. } => *deleted += 1,
+            Refusal::NotDeclared { .. } => *undeclared += 1,
+            Refusal::SlotOccupied { .. } => panic!("resolution cannot refuse as occupied"),
+        }
     }
 }
