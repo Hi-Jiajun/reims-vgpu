@@ -41,7 +41,7 @@
 
 use crate::access::{AccessKey, ContentVersion};
 use crate::content::{ContentLedger, Replica};
-use crate::exec::{published_versions, Prerequisite, ResolvedOperation};
+use crate::exec::{published_versions, Prerequisite, ResolvedOperation, VersionPublication};
 use crate::identity::{
     CompletionStamp, IngressOrdinal, ResourceId, SessionGeneration, StampSlot, StampValue,
 };
@@ -409,16 +409,45 @@ impl Interpreter {
                 },
                 None => pending.unanswerable(crate::query::Stall::NoAnswer),
             };
-            if let Some(reason) = completed.stall() {
-                self.trace.push(Observation::QueryUnanswered {
-                    ingress: tx.identity.ingress,
-                    kind: completed.kind(),
-                    reason,
-                });
-                self.ran += 1;
-                // The stamp, and nothing else. This is the whole of the
-                // difference between a stalled query and an answered one.
-                return Ok(completed.publication());
+            match completed.answer() {
+                crate::query::Answer::None(reason) => {
+                    self.trace.push(Observation::QueryUnanswered {
+                        ingress: tx.identity.ingress,
+                        kind: completed.kind(),
+                        reason,
+                    });
+                    self.ran += 1;
+                    // The stamp, and nothing else. This is the whole of the
+                    // difference between a stalled query and an answered one.
+                    return Ok(completed.publication());
+                }
+                // **The answer's own window, not the destination's.** The guest
+                // hands over whatever buffer it had — a page is ordinary — and
+                // the reply is sixteen bytes or a short run of pairs.
+                // Publishing the access's whole range would tell the content
+                // authority that everything past the reply is current device
+                // content, so a later read of those bytes would skip the
+                // transfer that would have made that true. `ReplyWrite` names
+                // the window for exactly this reason.
+                crate::query::Answer::Written(reply) => {
+                    if let Some(to) = query.access().output_content_version {
+                        self.publish_version(&VersionPublication {
+                            backing: reply.backing,
+                            region: AccessKey::Range(
+                                crate::access::ResourceKey {
+                                    backing: reply.backing,
+                                    // A reply destination is a guest buffer the
+                                    // request named, never a heap window.
+                                    heap: None,
+                                },
+                                reply.bytes,
+                            ),
+                            to,
+                        });
+                    }
+                    self.ran += 1;
+                    return Ok(completed.publication());
+                }
             }
         }
 
@@ -426,45 +455,55 @@ impl Interpreter {
         // becomes visible. Both come from the same list — the accesses — so a
         // version cannot be published for memory nothing wrote.
         for published in published_versions(tx.accesses()) {
-            // The version the access reserved, not one this ledger mints: the
-            // reservation happened when the transaction was planned, and a
-            // completion that took a fresh number here would beat every writer
-            // that reserved after it and lose to none.
-            let beaten = written_bytes(self.model.content(), published.region).map(|bytes| {
-                self.model.content_mut().materialize(
-                    published.backing,
-                    bytes,
-                    published.to,
-                    Replica::DeviceOwned,
-                )
-            });
-            match beaten {
-                Some(applied) if applied.was_partly_stale() => {
-                    self.trace.push(Observation::VersionBeaten {
-                        backing: published.backing,
-                        region: published.region,
-                        version: published.to,
-                        landed: applied.taken.len(),
-                    });
-                    if applied.is_empty() {
-                        // Nothing became current, so nothing was published.
-                        continue;
-                    }
-                }
-                // A subresource or whole-backing write names no bytes this
-                // crate can place — see `written_bytes` — so its effect is the
-                // version alone and there is nothing for a newer write to have
-                // beaten it over.
-                _ => {}
-            }
-            self.trace.push(Observation::VersionPublished {
-                backing: published.backing,
-                region: published.region,
-                version: published.to,
-            });
+            self.publish_version(&published);
         }
         self.ran += 1;
         Ok(tx.completion)
+    }
+
+    /// Make one version current, and observe what that did.
+    ///
+    /// One body for the access-derived publications and for a query's reply
+    /// window, because the rule about *what happened* is the same for both: a
+    /// version may be beaten by a newer write, and a beaten one is a completion
+    /// rather than a refusal.
+    fn publish_version(&mut self, published: &VersionPublication) {
+        // The version the access reserved, not one this ledger mints: the
+        // reservation happened when the transaction was planned, and a
+        // completion that took a fresh number here would beat every writer
+        // that reserved after it and lose to none.
+        let beaten = written_bytes(self.model.content(), published.region).map(|bytes| {
+            self.model.content_mut().materialize(
+                published.backing,
+                bytes,
+                published.to,
+                Replica::DeviceOwned,
+            )
+        });
+        match beaten {
+            Some(applied) if applied.was_partly_stale() => {
+                self.trace.push(Observation::VersionBeaten {
+                    backing: published.backing,
+                    region: published.region,
+                    version: published.to,
+                    landed: applied.taken.len(),
+                });
+                if applied.is_empty() {
+                    // Nothing became current, so nothing was published.
+                    return;
+                }
+            }
+            // A subresource or whole-backing write names no bytes this crate
+            // can place — see `written_bytes` — so its effect is the version
+            // alone and there is nothing for a newer write to have beaten it
+            // over.
+            _ => {}
+        }
+        self.trace.push(Observation::VersionPublished {
+            backing: published.backing,
+            region: published.region,
+            version: published.to,
+        });
     }
 
     /// Make a completion word readable, as ordered guest publication releases
@@ -798,13 +837,20 @@ mod tests {
         );
     }
 
-    /// An answer that fits publishes the destination's version, then the stamp
-    /// — in that order, because a guest that polls the word and then reads the
-    /// reply must not see the flag without the bytes.
+    /// An answer publishes **the window it occupies**, then the stamp.
+    ///
+    /// The order first: a guest that polls the word and then reads the reply
+    /// must not see the flag without the bytes.
+    ///
+    /// The window second, and it is the destination's *prefix*, not the
+    /// destination. The guest hands over whatever buffer it had — a page here —
+    /// and the reply is sixteen bytes. Publishing the access's whole range
+    /// would tell the content authority that the 4080 bytes after the reply are
+    /// current device content, so a later read of them would skip the transfer
+    /// that would have made that true.
     #[test]
-    fn an_answered_query_publishes_its_reply_before_its_stamp() {
-        assert_eq!(
-            ran_query(Some(16), 4096),
+    fn an_answered_query_publishes_the_window_it_wrote_and_not_the_one_it_was_given() {
+        let reply = |length| {
             vec![
                 Observation::VersionPublished {
                     backing: BackingId(9),
@@ -813,10 +859,7 @@ mod tests {
                             backing: BackingId(9),
                             heap: None,
                         },
-                        ByteRange {
-                            offset: 0,
-                            length: 4096,
-                        },
+                        ByteRange { offset: 0, length },
                     ),
                     version: ContentVersion(1),
                 },
@@ -825,6 +868,54 @@ mod tests {
                     value: StampValue(1),
                 },
             ]
+        };
+        assert_eq!(ran_query(Some(16), 4096), reply(16));
+        // And an answer that fills its window publishes all of it: the rule is
+        // the answer's length, not "less than the destination".
+        assert_eq!(ran_query(Some(4096), 4096), reply(4096));
+    }
+
+    /// The bytes past an answer keep the version they had.
+    ///
+    /// The failure this prevents is silent: a query into a page marks the page
+    /// device-fresh, a later read of its tail finds nothing owed, and the guest
+    /// is served whatever the device replica happened to hold.
+    #[test]
+    fn the_bytes_past_a_reply_are_not_made_current_by_it() {
+        let mut interp = Interpreter::new();
+        interp.content_mut().declare(
+            BackingId(9),
+            ByteRange {
+                offset: 0,
+                length: 4096,
+            },
+            Replica::GuestPages,
+        );
+        interp.answers_from(Box::new(AnswersWith(16)));
+        assert_eq!(interp.run(&query(1, BackingId(9), 4096)), Outcome::Ran);
+
+        let content = interp.content_mut();
+        assert!(
+            content.is_fresh(
+                BackingId(9),
+                ByteRange {
+                    offset: 0,
+                    length: 16,
+                },
+                Replica::DeviceOwned,
+            ),
+            "the reply is device content"
+        );
+        assert!(
+            !content.is_fresh(
+                BackingId(9),
+                ByteRange {
+                    offset: 16,
+                    length: 4080,
+                },
+                Replica::DeviceOwned,
+            ),
+            "and nothing wrote the rest of the page"
         );
     }
 
