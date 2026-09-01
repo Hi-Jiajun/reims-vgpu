@@ -203,7 +203,10 @@ pub(crate) fn registry(
     // The effects are the caller's obligation and there are none here: a task
     // definition owes no transfer and frees no storage.
     let _ = model
-        .apply(&LifecycleOp::DefineTask { task })
+        .apply(&LifecycleOp::DefineTask {
+            task,
+            kernel: false,
+        })
         .expect("a fresh task");
     for &slot in slots {
         let _ = model

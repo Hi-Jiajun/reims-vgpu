@@ -4130,25 +4130,34 @@ fn process_child_packet<H: HostMemory + HostOps>(
             apply_set_object_list(state, &packet.payload, Some(channel_id));
         }
         CHILD_OP_DELETE_RESOURCE => {
-            if !packet_short("delete_resource", Some(channel_id), packet.payload.len(), 8) {
-                let task_id = ld32(&packet.payload[0..]);
-                let id = ld32(&packet.payload[4..]);
-                // Which references resolved through this object is not knowable
-                // from the packet, so the task's resolutions go together.
-                // Scoped to the reference the packet names, like every other
-                // response to this opcode — `objects`, the host copies and
-                // `texture_to_mapping` are all keyed `(task, ref)`. Retiring
-                // the whole task here was the outlier and the device's largest
-                // source of re-walks: 54 109 resolutions dropped on one driven
-                // boot, 95% of every bind miss.
-                note_bb_retired(
-                    "bb_retire_delete_resource",
-                    state.retire_bound_buffers_for_ref(task_id, id),
-                );
-                if crate::runtime::writeback_debt::retire_gva_resource(state, task_id, id) {
-                    note_store_route("gva_resource_retired");
+            // The same `{task_id, object_id}` record `CmdReplacePhysical`
+            // carries, through the same decode. This arm had its own literal
+            // `8` and its own two `ld32`s at literal offsets, which is a fourth
+            // spelling of one pair — and the third command with these two words
+            // carries them the other way round.
+            match crate::protocol::fifo::decode_task_object(&packet.payload) {
+                Err(short) => note_short_payload("delete_resource", Some(channel_id), &short),
+                Ok(crate::protocol::fifo::TaskObjectCommand {
+                    task_id,
+                    object_id: id,
+                }) => {
+                    // Which references resolved through this object is not knowable
+                    // from the packet, so the task's resolutions go together.
+                    // Scoped to the reference the packet names, like every other
+                    // response to this opcode — `objects`, the host copies and
+                    // `texture_to_mapping` are all keyed `(task, ref)`. Retiring
+                    // the whole task here was the outlier and the device's largest
+                    // source of re-walks: 54 109 resolutions dropped on one driven
+                    // boot, 95% of every bind miss.
+                    note_bb_retired(
+                        "bb_retire_delete_resource",
+                        state.retire_bound_buffers_for_ref(task_id, id),
+                    );
+                    if crate::runtime::writeback_debt::retire_gva_resource(state, task_id, id) {
+                        note_store_route("gva_resource_retired");
+                    }
+                    let _ = state.delete_object(task_id, id);
                 }
-                let _ = state.delete_object(task_id, id);
             }
         }
         // PVG CmdDeleteTask (0x20) on child channels too (was SMALL_ID alias only in decode).
@@ -4487,7 +4496,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // call a decoder that checked the same floor again — so the second
             // check was unreachable, and its `None` arm would have dropped the
             // packet in silence if it ever were reached.
-            match crate::protocol::fifo::decode_replace_physical(&packet.payload) {
+            match crate::protocol::fifo::decode_task_object(&packet.payload) {
                 Ok(cmd) => {
                     // The GPA behind this resource changes here. The command is
                     // scoped to one task-local resource id, so unrelated

@@ -192,6 +192,14 @@ pub enum Storage {
 pub enum LifecycleOp {
     DefineTask {
         task: TaskId,
+        /// Whether the guest registered this as its kernel task.
+        ///
+        /// Carried because the packet's first word is `(task_id << 1) |
+        /// is_kernel_task` and dropping the low bit makes the kernel task —
+        /// whose own id is `0` — indistinguishable from a user task in slot
+        /// zero. They are not the same registration and their teardowns do not
+        /// cost the same.
+        kernel: bool,
     },
     DeleteTask {
         task: TaskId,
@@ -280,7 +288,7 @@ impl LifecycleOp {
     #[must_use]
     pub const fn task(&self) -> TaskId {
         match self {
-            Self::DefineTask { task }
+            Self::DefineTask { task, .. }
             | Self::DeleteTask { task }
             | Self::CreateResource { task, .. }
             | Self::DeleteResource { task, .. }
@@ -373,6 +381,21 @@ pub enum ResolveRefusal {
     /// Carries the guest's number, because the number is what a log line has to
     /// contain for anyone to find which object the guest thought it had.
     UnknownRef { object_ref: u32 },
+    /// The command carries no `{task, object}` record, so there is nothing for
+    /// [`object_reference`] to read.
+    NotAnObjectReference { kind: LifecycleKind },
+    /// The record resolved, and the operation still cannot be built: it names
+    /// the pages behind the object, and a [`crate::resolve::RefResolver`]
+    /// answers identity only.
+    ///
+    /// `ReplacePhysical` is the case. Its packet is a bare `{task, object}` —
+    /// the guest re-points a resource at host frames it has already wired, at
+    /// the *same* GPU-VA — so the new backing and extent are not on the wire at
+    /// all. They come from whatever holds the object's storage, which is a
+    /// registry this crate does not yet have. Named rather than approximated,
+    /// because an operation carrying the *old* backing would re-point nothing
+    /// while reporting success.
+    NeedsStorage { kind: LifecycleKind },
     /// The command is not a map-or-unmap notice, so there is no interval for
     /// [`map_notice`] to read. [`NotAResourceList`](Self::NotAResourceList)'s
     /// sibling, and a caller asking the wrong question rather than a malformed
@@ -389,6 +412,8 @@ impl ResolveRefusal {
             Self::NotAResourceList { .. } => "lifecycle_not_a_resource_list",
             Self::Payload(inner) => inner.slug(),
             Self::UnknownRef { .. } => "lifecycle_unknown_ref",
+            Self::NotAnObjectReference { .. } => "lifecycle_not_an_object_reference",
+            Self::NeedsStorage { .. } => "lifecycle_needs_storage",
             Self::NotAMapNotice { .. } => "lifecycle_not_a_map_notice",
             Self::ShortNotice(_) => fifo::ShortPayload::SLUG,
         }
@@ -455,6 +480,83 @@ pub fn resource_list(
         // must be a caller-visible refusal rather than a lost packet.
         other => return Err(ResolveRefusal::NotAResourceList { kind: other }),
     })
+}
+
+/// Turn a task-lifetime packet's payload into the operation it names.
+///
+/// Takes no resolver, as [`map_notice`] does not: a task is named by its own
+/// slot number and there is nothing about that number device state could answer
+/// differently.
+///
+/// The two commands do **not** carry the id the same way. A definition's first
+/// word is `(task_id << 1) | is_kernel_task`; a deletion's is a plain slot.
+/// Reading either at the other's convention indexes every slot at twice or half
+/// its number, which is why the shift lives in
+/// [`reims_vgpu_protocol::fifo::DefineTaskId`] and not at a call site.
+///
+/// The definition's address-space extent and page-table directory are not
+/// carried into the operation. They are the address-resolution owner's, this
+/// crate resolves no address, and an operation holding a page frame it never
+/// reads is a field that goes stale unnoticed.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a kind that is neither of the two, or a payload too
+/// short. A short deletion is refused rather than defaulted, because slot `0`
+/// is the kernel task.
+pub fn task_lifetime(kind: LifecycleKind, payload: &[u8]) -> Result<LifecycleOp, ResolveRefusal> {
+    match kind {
+        LifecycleKind::DefineTask => {
+            let command = fifo::decode_define_task(payload).map_err(ResolveRefusal::ShortNotice)?;
+            Ok(LifecycleOp::DefineTask {
+                task: TaskId(command.id.task_id),
+                kernel: command.id.kernel,
+            })
+        }
+        LifecycleKind::DeleteTask => {
+            let task = fifo::decode_delete_task(payload).map_err(ResolveRefusal::ShortNotice)?;
+            Ok(LifecycleOp::DeleteTask { task: TaskId(task) })
+        }
+        other => Err(ResolveRefusal::NotAnObjectReference { kind: other }),
+    }
+}
+
+/// Turn a `{task, object}` packet's payload into the operation it names.
+///
+/// Two commands carry that record. Only one of them becomes an operation from
+/// it: a delete names what to retire and nothing else, while a re-point names
+/// pages that are not on the wire — see [`ResolveRefusal::NeedsStorage`].
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a kind carrying no such record, a payload too short, a
+/// ref naming nothing live, or a kind whose operation needs storage this
+/// resolver cannot name.
+pub fn object_reference(
+    kind: LifecycleKind,
+    payload: &[u8],
+    resolver: &impl crate::resolve::RefResolver,
+) -> Result<LifecycleOp, ResolveRefusal> {
+    if !matches!(
+        kind,
+        LifecycleKind::DeleteResource | LifecycleKind::ReplacePhysical
+    ) {
+        return Err(ResolveRefusal::NotAnObjectReference { kind });
+    }
+    let command = fifo::decode_task_object(payload).map_err(ResolveRefusal::ShortNotice)?;
+    // The ref is resolved before the kind is judged, so a re-point naming a
+    // dead object refuses as a dead object rather than as unfinished work here.
+    let resource = resolver
+        .resource(command.object_id)
+        .ok_or(ResolveRefusal::UnknownRef {
+            object_ref: command.object_id,
+        })?;
+    let task = TaskId(command.task_id);
+    match kind {
+        LifecycleKind::DeleteResource => Ok(LifecycleOp::DeleteResource { task, resource }),
+        // `ReplacePhysical`, and nothing else reaches here.
+        other => Err(ResolveRefusal::NeedsStorage { kind: other }),
+    }
 }
 
 /// Turn one map-or-unmap packet's payload into the operation it names.
@@ -823,7 +925,7 @@ impl Lifecycle {
     /// name.
     pub fn apply(&mut self, op: &LifecycleOp) -> Result<Effects, Refusal> {
         match op {
-            LifecycleOp::DefineTask { task } => self.define_task(*task),
+            LifecycleOp::DefineTask { task, .. } => self.define_task(*task),
             LifecycleOp::DeleteTask { task } => self.delete_task(*task),
             LifecycleOp::CreateResource {
                 task,
@@ -1227,7 +1329,13 @@ mod tests {
     /// A task with one dedicated resource in slot 0, and the name it got.
     fn with_one_resource(length: u64) -> (Lifecycle, ResourceId) {
         let mut l = Lifecycle::new();
-        apply_inert(&mut l, &LifecycleOp::DefineTask { task: TASK });
+        apply_inert(
+            &mut l,
+            &LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+            },
+        );
         apply_inert(
             &mut l,
             &LifecycleOp::CreateResource {
@@ -1500,7 +1608,13 @@ mod tests {
     #[test]
     fn a_placed_resource_refuses_a_physical_replacement() {
         let mut l = Lifecycle::new();
-        apply_inert(&mut l, &LifecycleOp::DefineTask { task: TASK });
+        apply_inert(
+            &mut l,
+            &LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+            },
+        );
         l.declare_heap(TASK, 3, BackingId(50), 4096).expect("heap");
         apply_inert(
             &mut l,
@@ -1531,7 +1645,13 @@ mod tests {
     #[test]
     fn placing_a_second_resource_leaves_the_first_ones_content_alone() {
         let mut l = Lifecycle::new();
-        apply_inert(&mut l, &LifecycleOp::DefineTask { task: TASK });
+        apply_inert(
+            &mut l,
+            &LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+            },
+        );
         l.declare_heap(TASK, 3, BackingId(50), 4096).expect("heap");
         let place = |l: &mut Lifecycle, slot: u32, offset: u64| {
             apply_inert(
@@ -1566,7 +1686,13 @@ mod tests {
     #[test]
     fn deleting_a_task_retires_its_objects_and_frees_its_heap_storage() {
         let mut l = Lifecycle::new();
-        apply_inert(&mut l, &LifecycleOp::DefineTask { task: TASK });
+        apply_inert(
+            &mut l,
+            &LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+            },
+        );
         l.declare_heap(TASK, 3, BackingId(50), 4096).expect("heap");
         apply_inert(
             &mut l,
@@ -1607,7 +1733,10 @@ mod tests {
     fn a_live_task_cannot_be_redefined() {
         let (mut l, _) = with_one_resource(256);
         assert_eq!(
-            l.apply(&LifecycleOp::DefineTask { task: TASK }),
+            l.apply(&LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+            }),
             Err(Refusal::TaskExists { task: TASK }),
             "silently replacing would orphan every object it owns"
         );
@@ -1618,7 +1747,13 @@ mod tests {
     #[test]
     fn deleting_a_backing_retires_the_resources_that_named_it() {
         let mut l = Lifecycle::new();
-        apply_inert(&mut l, &LifecycleOp::DefineTask { task: TASK });
+        apply_inert(
+            &mut l,
+            &LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+            },
+        );
         for slot in 0..2 {
             apply_inert(
                 &mut l,
@@ -1653,6 +1788,189 @@ mod tests {
             l.resolve(TASK, name(0)),
             Err(Refusal::Namespace { .. })
         ));
+    }
+
+    /// A definition's word is doubled and a deletion's is not, and the join
+    /// reads each the way its own command carries it.
+    ///
+    /// The pair that makes it matter: a definition of user task 1 sends `2`,
+    /// and a deletion of user task 1 sends `1`. Swap the conventions and the
+    /// definition registers task 2 while the deletion retires the kernel task.
+    #[test]
+    fn a_task_definition_is_doubled_and_a_deletion_is_not() {
+        let mut define = vec![0u8; fifo::DEFINE_TASK_LEN];
+        define[..4].copy_from_slice(
+            &fifo::DefineTaskId {
+                task_id: 1,
+                kernel: false,
+            }
+            .to_raw()
+            .to_le_bytes(),
+        );
+        assert_eq!(
+            task_lifetime(LifecycleKind::DefineTask, &define),
+            Ok(LifecycleOp::DefineTask {
+                task: TaskId(1),
+                kernel: false,
+            })
+        );
+        assert_eq!(
+            task_lifetime(LifecycleKind::DeleteTask, &1u32.to_le_bytes()),
+            Ok(LifecycleOp::DeleteTask { task: TaskId(1) })
+        );
+
+        // And the registration a dropped class bit would hide: the kernel task
+        // and user task zero are two registrations of slot zero.
+        let mut kernel = vec![0u8; fifo::DEFINE_TASK_LEN];
+        kernel[..4].copy_from_slice(
+            &fifo::DefineTaskId {
+                task_id: 0,
+                kernel: true,
+            }
+            .to_raw()
+            .to_le_bytes(),
+        );
+        assert_eq!(
+            task_lifetime(LifecycleKind::DefineTask, &kernel),
+            Ok(LifecycleOp::DefineTask {
+                task: TaskId(0),
+                kernel: true,
+            })
+        );
+    }
+
+    /// A deletion with no id refuses. It does not name slot `0`, which is the
+    /// kernel task.
+    #[test]
+    fn a_short_task_deletion_does_not_name_the_kernel_task() {
+        assert_eq!(
+            task_lifetime(LifecycleKind::DeleteTask, &[0u8; 3]),
+            Err(ResolveRefusal::ShortNotice(fifo::ShortPayload {
+                plen: 3,
+                need: fifo::DELETE_TASK_LEN,
+            }))
+        );
+        assert_eq!(
+            task_lifetime(
+                LifecycleKind::DefineTask,
+                &vec![0u8; fifo::DEFINE_TASK_LEN - 1]
+            ),
+            Err(ResolveRefusal::ShortNotice(fifo::ShortPayload {
+                plen: fifo::DEFINE_TASK_LEN - 1,
+                need: fifo::DEFINE_TASK_LEN,
+            }))
+        );
+    }
+
+    /// A delete names an object and becomes an operation; a re-point names the
+    /// same two words and cannot.
+    ///
+    /// The re-point's new backing and extent are nowhere on the wire — the
+    /// guest wired the pages itself and re-committed them at the same GPU-VA —
+    /// so the refusal names what is missing rather than letting an operation
+    /// carrying the *old* backing report a re-point that moved nothing.
+    #[test]
+    fn a_delete_resolves_from_its_ref_and_a_repoint_needs_more_than_one() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&TASK.0.to_le_bytes());
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        let resource = ResourceId {
+            slot: ObjectListRef(7),
+            generation: SlotGeneration(1),
+        };
+        assert_eq!(
+            object_reference(LifecycleKind::DeleteResource, &payload, &Everything),
+            Ok(LifecycleOp::DeleteResource {
+                task: TASK,
+                resource,
+            })
+        );
+        assert_eq!(
+            object_reference(LifecycleKind::ReplacePhysical, &payload, &Everything),
+            Err(ResolveRefusal::NeedsStorage {
+                kind: LifecycleKind::ReplacePhysical,
+            })
+        );
+    }
+
+    /// A ref naming nothing live refuses on the ref, for both kinds — the
+    /// object is judged before the operation is.
+    #[test]
+    fn an_object_reference_naming_nothing_refuses_on_the_ref() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&TASK.0.to_le_bytes());
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        for kind in [
+            LifecycleKind::DeleteResource,
+            LifecycleKind::ReplacePhysical,
+        ] {
+            assert_eq!(
+                object_reference(kind, &payload, &Nothing),
+                Err(ResolveRefusal::UnknownRef { object_ref: 7 })
+            );
+        }
+    }
+
+    /// Each join refuses every kind that is not its own, and the kinds that
+    /// still have no join are named.
+    ///
+    /// Two claims in one test because they are the same census. A kind read by
+    /// two joins would have one command's offsets applied to another's payload;
+    /// a kind read by none is unfinished work, and listing them here is what
+    /// keeps "which lifecycle commands can still not become an operation" an
+    /// answer rather than a search.
+    #[test]
+    fn every_lifecycle_kind_reaches_at_most_one_join() {
+        // Every kind the packet ledger classifies is in the list, so a
+        // thirteenth cannot skip the sweep below.
+        let mut classified: Vec<LifecycleKind> = LEDGER
+            .iter()
+            .filter_map(|p| LifecycleKind::of(p.channel, p.opcode))
+            .collect();
+        classified.sort_unstable();
+        classified.dedup();
+        let mut named = ALL_KINDS.to_vec();
+        named.sort_unstable();
+        assert_eq!(classified, named);
+
+        // Long enough for any of the records, so a refusal is about the kind
+        // and never about the length.
+        let payload = vec![0u8; 64];
+        let mut unjoined = Vec::new();
+        for kind in ALL_KINDS {
+            let joins = [
+                task_lifetime(kind, &payload).is_ok(),
+                object_reference(kind, &payload, &Everything).is_ok(),
+                map_notice(kind, &payload).is_ok(),
+                resource_list(kind, &payload, &Everything).is_ok(),
+            ];
+            let reached = joins.iter().filter(|ok| **ok).count();
+            assert!(
+                reached <= 1,
+                "{} is read by more than one join",
+                kind.name()
+            );
+            if reached == 0 {
+                unjoined.push(kind);
+            }
+        }
+        assert_eq!(
+            unjoined,
+            vec![
+                // Its packet says where a task's object list is and how long;
+                // the operation is the per-entry walk's result, and the walk
+                // reads guest memory this crate does not address.
+                LifecycleKind::SetObjectList,
+                // Its record resolves and its operation still needs storage the
+                // wire does not carry — see `ResolveRefusal::NeedsStorage`.
+                LifecycleKind::ReplacePhysical,
+                // Its two words are `{object, task}`, the reverse of every
+                // other pair, and the backing it retires is an id space this
+                // crate has no resolver for.
+                LifecycleKind::DeleteBacking,
+            ],
+            "the lifecycle commands that still cannot become an operation"
+        );
     }
 
     /// The notice's fields as the packet carries them, and the direction the
@@ -1856,7 +2174,13 @@ mod tests {
     #[test]
     fn a_recorded_write_cannot_leave_its_resource() {
         let mut l = Lifecycle::new();
-        apply_inert(&mut l, &LifecycleOp::DefineTask { task: TASK });
+        apply_inert(
+            &mut l,
+            &LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+            },
+        );
         l.declare_heap(TASK, 3, BackingId(50), 4096).expect("heap");
         for (slot, offset) in [(0u32, 0u64), (1, 256)] {
             apply_inert(
@@ -1903,6 +2227,28 @@ mod tests {
     }
 
     // ------------------------------------------- bytes to a lifecycle op
+
+    /// Every lifecycle kind, so a test over the set cannot silently miss one
+    /// that is added later.
+    ///
+    /// Held against [`LifecycleKind::of`] by
+    /// `every_lifecycle_kind_reaches_at_most_one_join`, which requires every
+    /// kind the packet ledger classifies to appear here — so a thirteenth kind
+    /// cannot quietly skip a join test.
+    const ALL_KINDS: [LifecycleKind; 12] = [
+        LifecycleKind::DefineTask,
+        LifecycleKind::DeleteTask,
+        LifecycleKind::SetObjectList,
+        LifecycleKind::DeleteResource,
+        LifecycleKind::MapMemory,
+        LifecycleKind::UnmapMemory,
+        LifecycleKind::ReplacePhysical,
+        LifecycleKind::Invalidate,
+        LifecycleKind::Synchronize,
+        LifecycleKind::SynchronizeAndDiscard,
+        LifecycleKind::Discard,
+        LifecycleKind::DeleteBacking,
+    ];
 
     /// A resolver that answers every ref, so a resolution test is about the
     /// list and not about whether the objects exist.

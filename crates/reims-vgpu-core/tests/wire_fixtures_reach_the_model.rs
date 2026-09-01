@@ -500,7 +500,10 @@ fn registry_holding(seen: &std::collections::BTreeSet<u32>) -> Lifecycle {
     // The effects are the caller's obligation and there are none here: a task
     // definition owes no transfer and frees no storage.
     let _ = model
-        .apply(&LifecycleOp::DefineTask { task: TASK })
+        .apply(&LifecycleOp::DefineTask {
+            task: TASK,
+            kernel: false,
+        })
         .expect("a fresh task");
     for slot in seen {
         let _ = model

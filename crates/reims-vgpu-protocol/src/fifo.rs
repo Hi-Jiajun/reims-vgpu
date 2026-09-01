@@ -32,7 +32,6 @@ pub const CHILD_RESOURCE_LIST_HEADER_LEN: u32 = 8;
 pub const CHILD_INVALIDATE_RECORD_LEN: u32 = 8;
 /// Per-object record on Synchronize: `{object_id u32}` only (no validity ops).
 pub const CHILD_SYNCHRONIZE_RECORD_LEN: u32 = 4;
-/// CmdReplacePhysical (`0x3c`): a fixed `{task_id, object_id}` pair, no list.
 /// `CmdDefineTask2`: the identity, extent and page-table root of one task.
 ///
 /// The first word is **not** a task id. It is `(task_id << 1) | is_kernel_task`,
@@ -227,9 +226,20 @@ pub fn decode_map_memory(payload: &[u8]) -> Result<MapMemoryCommand, ShortPayloa
     })
 }
 
-pub const CHILD_REPLACE_PHYSICAL_TASK_ID: u32 = 0x00;
-pub const CHILD_REPLACE_PHYSICAL_OBJECT_ID: u32 = 0x04;
-pub const CHILD_REPLACE_PHYSICAL_LEN: u32 = 8;
+/// `CmdDeleteResource` (`0x25`) and `CmdReplacePhysical` (`0x3c`): a task and
+/// one of its objects.
+///
+/// Two commands, one record, and the offsets are stated once because the two
+/// arms that read them were two spellings of the same pair.
+///
+/// **`CmdDeleteIOSurfaceBacking2` (`0x36`) is not one of them.** Its payload is
+/// the same two words in the *opposite* order — `{object_id, task_id}` — so a
+/// reader that reached for this record would resolve the object as a task and
+/// the task as an object. It has its own decode, and this note is why it is not
+/// folded in here.
+pub const TASK_OBJECT_TASK_ID: usize = 0x00;
+pub const TASK_OBJECT_OBJECT_ID: usize = TASK_OBJECT_TASK_ID + 4;
+pub const TASK_OBJECT_LEN: usize = TASK_OBJECT_OBJECT_ID + 4;
 /// The two device-info request forms, and where each keeps its words.
 ///
 /// The newer form carries a parse ceiling the older one does not, and it sits
@@ -677,9 +687,13 @@ pub struct InvalidateResourcesCommand {
     pub records: Vec<InvalidateResourceRecord>,
 }
 
-/// FIFO CmdReplacePhysical (0x3c) payload — `{task_id, object_id}`, 8 bytes.
+/// A task and one of its objects: the whole payload of `CmdDeleteResource`
+/// (`0x25`) and of `CmdReplacePhysical` (`0x3c`).
+///
+/// See [`TASK_OBJECT_TASK_ID`] for the third command that carries the same two
+/// words in the other order and must not reach this decode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReplacePhysicalCommand {
+pub struct TaskObjectCommand {
     pub task_id: u32,
     pub object_id: u32,
 }
@@ -838,10 +852,11 @@ pub fn decode_channel_lifetime(payload: &[u8]) -> Result<u32, ShortPayload> {
     Ok(ld32(&payload[CHANNEL_LIFETIME_CHANNEL_ID as usize..]))
 }
 
-/// Decode CmdReplacePhysical (`0x3c`): `{task_id, object_id}`, 8 bytes.
+/// Decode a `{task_id, object_id}` payload: `CmdDeleteResource` (`0x25`) or
+/// `CmdReplacePhysical` (`0x3c`), eight bytes.
 ///
-/// The guest emits this once per attached resource at the tail of a re-commit
-/// into the GPU page table — that is, after the range was released, its pages
+/// `CmdReplacePhysical` is emitted once per attached resource at the tail of a
+/// re-commit into the GPU page table — after the range was released, its pages
 /// were wired to different host frames, and the new PFNs were written back at
 /// the *same* GPU-VA. It therefore carries no address of its own: the GVA is
 /// unchanged, and only the translation behind it moved.
@@ -852,19 +867,19 @@ pub fn decode_channel_lifetime(payload: &[u8]) -> Result<u32, ShortPayload> {
 /// # Errors
 ///
 /// [`ShortPayload`] when the payload cannot hold the command's eight bytes.
-/// Typed rather than a bare `None`, so the one caller reports it instead of
-/// checking the same floor itself and dropping the `None` in silence.
-pub fn decode_replace_physical(payload: &[u8]) -> Result<ReplacePhysicalCommand, ShortPayload> {
-    let need = CHILD_REPLACE_PHYSICAL_LEN as usize;
+/// Typed rather than a bare `None`, so callers report it instead of checking
+/// the same floor themselves and dropping the `None` in silence.
+pub fn decode_task_object(payload: &[u8]) -> Result<TaskObjectCommand, ShortPayload> {
+    let need = TASK_OBJECT_LEN;
     if payload.len() < need {
         return Err(ShortPayload {
             plen: payload.len(),
             need,
         });
     }
-    Ok(ReplacePhysicalCommand {
-        task_id: ld32(&payload[CHILD_REPLACE_PHYSICAL_TASK_ID as usize..]),
-        object_id: ld32(&payload[CHILD_REPLACE_PHYSICAL_OBJECT_ID as usize..]),
+    Ok(TaskObjectCommand {
+        task_id: ld32(&payload[TASK_OBJECT_TASK_ID..]),
+        object_id: ld32(&payload[TASK_OBJECT_OBJECT_ID..]),
     })
 }
 
@@ -1295,30 +1310,34 @@ mod tests {
         }
     }
 
-    /// `CmdReplacePhysical` had no test at all. It is the command that re-points
-    /// a resource at different host frames after a re-commit, so a decode that
-    /// read the wrong word would move the wrong resource — and its two words are
-    /// adjacent u32s, so either reading looks plausible.
+    /// The task comes first, and the two commands carrying this record agree.
+    ///
+    /// Its two words are adjacent `u32`s, so either reading looks plausible: a
+    /// decode that swapped them would re-point the wrong resource on
+    /// `CmdReplacePhysical` and delete the wrong one on `CmdDeleteResource`.
+    /// The third command with these two words carries them in the *opposite*
+    /// order and deliberately does not reach here — see
+    /// [`TASK_OBJECT_TASK_ID`].
     #[test]
-    fn replace_physical_reads_its_task_before_its_object() {
+    fn a_task_object_record_reads_its_task_before_its_object() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&0x1122_3344u32.to_le_bytes());
         payload.extend_from_slice(&0x5566_7788u32.to_le_bytes());
         assert_eq!(
-            decode_replace_physical(&payload),
-            Ok(ReplacePhysicalCommand {
+            decode_task_object(&payload),
+            Ok(TaskObjectCommand {
                 task_id: 0x1122_3344,
                 object_id: 0x5566_7788,
             })
         );
         // One byte short is not a replace. Refused rather than clamped: acting
         // on object id zero re-points whatever holds slot zero.
-        for plen in 0..CHILD_REPLACE_PHYSICAL_LEN as usize {
+        for plen in 0..TASK_OBJECT_LEN {
             assert_eq!(
-                decode_replace_physical(&payload[..plen]),
+                decode_task_object(&payload[..plen]),
                 Err(ShortPayload {
                     plen,
-                    need: CHILD_REPLACE_PHYSICAL_LEN as usize
+                    need: TASK_OBJECT_LEN
                 }),
                 "{plen}"
             );
@@ -1328,7 +1347,7 @@ mod tests {
         // not a malformed packet.
         payload.extend_from_slice(&[0xff; 16]);
         assert_eq!(
-            decode_replace_physical(&payload).map(|c| c.object_id),
+            decode_task_object(&payload).map(|c| c.object_id),
             Ok(0x5566_7788)
         );
     }
@@ -1426,10 +1445,7 @@ mod tests {
                         <= len
                 );
             }
-            assert_eq!(
-                decode_replace_physical(&payload).is_ok(),
-                len >= CHILD_REPLACE_PHYSICAL_LEN as usize
-            );
+            assert_eq!(decode_task_object(&payload).is_ok(), len >= TASK_OBJECT_LEN);
         }
         // A sweep where everything refuses proves only that refusing does not
         // panic, and one where nothing does proves only the happy path.
