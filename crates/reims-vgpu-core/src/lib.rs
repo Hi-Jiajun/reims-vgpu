@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod access;
+pub mod depend;
 pub mod identity;
 pub mod operation;
 pub mod transaction;
