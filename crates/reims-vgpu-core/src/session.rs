@@ -70,6 +70,9 @@ pub enum Refusal {
         named: SessionGeneration,
         current: SessionGeneration,
     },
+    /// The packet is held for a pipeline its payload does not lease. Parking
+    /// on it waits for a compilation this work has no interest in.
+    UnleasedPipelineWait { pipeline: ResourceId },
     /// The opcode declares one payload class and the decoded payload is
     /// another. Admitting it would order the packet as the wrong kind of work
     /// against a namespace that does not own what it names.
@@ -91,6 +94,7 @@ impl Refusal {
             Self::ChannelNotOpen { .. } => "ingress_channel_not_open",
             Self::ChannelAlreadyOpen { .. } => "ingress_channel_already_open",
             Self::PayloadMismatch { .. } => "ingress_payload_mismatch",
+            Self::UnleasedPipelineWait { .. } => "ingress_unleased_pipeline_wait",
             Self::GenerationClosed { .. } => "ingress_generation_closed",
         }
     }
@@ -315,6 +319,26 @@ impl SessionModel {
             });
         }
 
+        // A pipeline this packet is held for has to be a pipeline this packet
+        // uses. The wait list is a *subset* of the payload's leases — the ones
+        // whose compilation had not finished when the lease table was asked —
+        // so a wait naming a pipeline the payload never leased is a caller that
+        // built the two lists from different places. Holding on it parks the
+        // transaction for a compilation it has no interest in, which the guest
+        // experiences as a frame that never arrives and nothing explains.
+        //
+        // Non-EXEC payloads lease nothing, so their wait list must be empty:
+        // only GPU work uses a pipeline.
+        if let Some(unleased) = packet.pipeline_waits.iter().copied().find(|wait| {
+            packet
+                .payload
+                .exec()
+                .is_none_or(|work| !work.pipeline_leases.contains(wait))
+        }) {
+            self.refusals += 1;
+            return Err(Refusal::UnleasedPipelineWait { pipeline: unleased });
+        }
+
         if !self.open_channels.contains(&packet.domain) {
             self.refusals += 1;
             return Err(Refusal::ChannelNotOpen {
@@ -488,7 +512,7 @@ impl SessionModel {
 mod tests {
     use super::*;
     use crate::access::{AccessIntent, AccessKey, AccessMode, BackingId, ResourceKey};
-    use crate::identity::{StampSlot, StampValue};
+    use crate::identity::{ObjectListRef, SlotGeneration, StampSlot, StampValue};
     use crate::retire::Validity;
 
     /// A session with the two submission domains the tests use already open,
@@ -637,6 +661,47 @@ mod tests {
         assert_eq!(
             next.transaction.identity.domain_sequence,
             ChannelSequence(1)
+        );
+    }
+
+    /// A pipeline wait is a subset of the payload's leases. The two lists were
+    /// built from different places — the leases as the records resolved, the
+    /// waits from whatever the lease table said was still compiling — and
+    /// nothing tied them together, so a wait for a pipeline the packet never
+    /// uses was representable. It parks the transaction for a compilation it
+    /// has no interest in, which the guest sees as a frame that never arrives.
+    #[test]
+    fn a_packet_cannot_wait_for_a_pipeline_it_does_not_lease() {
+        let mut s = session();
+        let pipeline = ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration(1),
+        };
+        let mut wrong = packet(0x37);
+        wrong.pipeline_waits = vec![pipeline];
+        let err = s.admit(&wrong).expect_err("it leases nothing");
+        assert_eq!(err, Refusal::UnleasedPipelineWait { pipeline });
+        assert_eq!(err.slug(), "ingress_unleased_pipeline_wait");
+
+        // The same wait against a payload that does lease it is admitted, and
+        // held: the scheduler was told about the pipeline.
+        let mut leased = packet(0x37);
+        let Payload::Exec(work) = &mut leased.payload else {
+            panic!("an EXEC");
+        };
+        work.pipeline_leases.push(pipeline);
+        leased.pipeline_waits = vec![pipeline];
+        let admitted = s.admit(&leased).expect("accepted");
+        assert!(!admitted.ready, "a pipeline still compiling holds the work");
+        assert_eq!(admitted.transaction.identity.ingress, IngressOrdinal(1));
+
+        // And a packet that is not GPU work leases nothing, so it can wait for
+        // nothing: only an EXEC uses a pipeline.
+        let mut control = packet(0x1e);
+        control.pipeline_waits = vec![pipeline];
+        assert_eq!(
+            s.admit(&control),
+            Err(Refusal::UnleasedPipelineWait { pipeline })
         );
     }
 
