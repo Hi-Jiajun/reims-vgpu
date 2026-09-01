@@ -17,6 +17,8 @@
 //!
 //! # The parts
 //!
+//! - [`bind`] — the argument-table sizes a plural bind is truncated at, and
+//!   why they are capacity hints rather than bounds.
 //! - [`closure`] — the refusal-closure ledger. For every decodable operation,
 //!   exactly one outcome: implemented, contract-proven no-op on a named
 //!   capability cell, contract-proven unsupported with its exact refusal, or
@@ -53,6 +55,7 @@
 // must not reach is the host, not the heap.
 extern crate alloc;
 
+pub mod bind;
 pub mod blit;
 pub mod closure;
 pub mod compute;

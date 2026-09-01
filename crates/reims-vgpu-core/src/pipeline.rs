@@ -27,6 +27,7 @@
 //! owns when they may start, what a waiting transaction observes, and when the
 //! result may be dropped.
 
+use crate::access::AccessMode;
 use crate::identity::{ResourceId, SessionGeneration};
 use std::collections::HashMap;
 
@@ -98,6 +99,70 @@ impl PipelineState {
                     Self::Retired
                 )
         )
+    }
+}
+
+/// What a compiled pipeline does with each slot it binds.
+///
+/// # An immutable fact, published by whoever compiled it
+///
+/// Nothing in this crate can read a shader. Which of an encoder's bound slots a
+/// pipeline actually references, and in which direction, is discovered during
+/// translation — by the executor, which is the layer that has the shader — and
+/// it reaches the model as this, once, when the pipeline becomes ready. That is
+/// the plan's rule about what advances semantic state: an immutable fact
+/// returned by an executor, not a query the model makes.
+///
+/// # Why the alternative is expensive rather than wrong
+///
+/// Without one, [`crate::encoder`] gives every bound slot
+/// [`AccessMode::Unknown`], which conflicts with everything. No edge is missed;
+/// a great many are added. The point of publishing this is to buy those back,
+/// and the point of `Unknown` being its own variant is that the census can say
+/// how many are still being paid for.
+///
+/// # A slot past the end is unreferenced, not unknown
+///
+/// The tables are as long as the pipeline's own binding set. A bound slot
+/// beyond them is one the shader does not name, so it contributes nothing —
+/// falling back to `Unknown` there would make a guest with a long-tailed bind
+/// table pay forever for slots no shader reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BindingUsage {
+    buffers: Vec<Option<AccessMode>>,
+    textures: Vec<Option<AccessMode>>,
+}
+
+impl BindingUsage {
+    #[must_use]
+    pub fn new(buffers: Vec<Option<AccessMode>>, textures: Vec<Option<AccessMode>>) -> Self {
+        Self { buffers, textures }
+    }
+
+    /// What the pipeline does with buffer slot `slot`, or `None` if it does not
+    /// reference it.
+    #[must_use]
+    pub fn buffer(&self, slot: u32) -> Option<AccessMode> {
+        self.buffers.get(slot as usize).copied().flatten()
+    }
+
+    /// What the pipeline does with texture slot `slot`.
+    #[must_use]
+    pub fn texture(&self, slot: u32) -> Option<AccessMode> {
+        self.textures.get(slot as usize).copied().flatten()
+    }
+
+    /// Whether the pipeline writes anything through its bindings.
+    ///
+    /// A pipeline that only reads cannot be the producer half of a hazard, so
+    /// this is worth one question rather than a scan at every draw.
+    #[must_use]
+    pub fn writes_anything(&self) -> bool {
+        self.buffers
+            .iter()
+            .chain(self.textures.iter())
+            .flatten()
+            .any(|m| m.writes())
     }
 }
 
