@@ -137,6 +137,10 @@ pub struct Reported<'a> {
     /// *meaningful* where `sampler_anisotropy` is set, and the cell it lands
     /// in says so.
     pub max_sampler_anisotropy: f32,
+    /// `VkPhysicalDeviceFeatures::dualSrcBlend`.
+    pub dual_src_blend: bool,
+    /// `VkPhysicalDeviceFeatures::independentBlend`.
+    pub independent_blend: bool,
     /// `VkPhysicalDeviceVulkan12Features::samplerMirrorClampToEdge`.
     ///
     /// 1.2 is the baseline and promoted the extension, so the name is never
@@ -289,6 +293,7 @@ pub struct Census {
     raster: crate::raster::RasterCell,
     buffers: crate::buffer::BufferLimits,
     samplers: crate::sampler::SamplerCell,
+    blend: crate::blend::BlendCell,
     host_pointer_import: bool,
     synchronization2: bool,
     can_present: bool,
@@ -358,6 +363,10 @@ impl Census {
             },
             buffers: crate::buffer::BufferLimits {
                 max_buffer_size: reported.max_buffer_size,
+            },
+            blend: crate::blend::BlendCell {
+                dual_source: reported.dual_src_blend,
+                independent: reported.independent_blend,
             },
             samplers: crate::sampler::SamplerCell {
                 mirror_clamp_to_edge: reported.sampler_mirror_clamp_to_edge,
@@ -460,6 +469,13 @@ impl Census {
         self.buffers
     }
 
+    /// The cell [`crate::blend::plan`] checks a dual-source factor against,
+    /// and [`crate::blend::independent`] a whole attachment list.
+    #[must_use]
+    pub const fn blend(&self) -> crate::blend::BlendCell {
+        self.blend
+    }
+
     /// The cell [`crate::sampler::plan`] translates an address mode and
     /// clamps an anisotropy request against.
     #[must_use]
@@ -504,7 +520,7 @@ impl Census {
         format!(
             "vk_census api={} topology={} signal={} import={} sync2={} mesh={} push={} \
              push_max={} desc_buffer={} desc_qualified={} queue_family={} compute={} \
-             mirror_clamp={} aniso={} aniso_max={}",
+             mirror_clamp={} aniso={} aniso_max={} dual_src={} independent_blend={}",
             self.api,
             self.memory.topology.slug(),
             self.memory.signal.slug(),
@@ -520,6 +536,8 @@ impl Census {
             self.samplers.mirror_clamp_to_edge,
             self.samplers.anisotropy,
             self.samplers.max_anisotropy,
+            self.blend.dual_source,
+            self.blend.independent,
         )
     }
 }
@@ -586,6 +604,8 @@ mod tests {
             fill_mode_non_solid: false,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
+            dual_src_blend: false,
+            independent_blend: false,
             sampler_mirror_clamp_to_edge: false,
             mesh_shader: false,
             descriptor_buffer: false,
@@ -835,6 +855,8 @@ mod tests {
             "mirror_clamp=false",
             "aniso=true",
             "aniso_max=16",
+            "dual_src=false",
+            "independent_blend=false",
         ] {
             assert!(line.contains(fact), "{fact} missing from {line}");
         }
@@ -927,6 +949,54 @@ mod tests {
         .expect("a repeat sampler needs no feature");
         assert!(!off.anisotropy_enable);
         assert!((off.max_anisotropy - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// The blend cell reaches the planner, and both halves of it decide
+    /// something a guest can ask for.
+    #[test]
+    fn the_blend_cell_carries_what_was_reported_and_gates_what_needs_a_feature() {
+        use crate::blend::{independent, plan, Refusal};
+        use reims_vgpu_core::blend::{
+            ColorAttachmentShape, ColorAttachmentState, ColorWriteMask, MTL_BLEND_FACTOR_ONE,
+            MTL_BLEND_FACTOR_SOURCE_1_COLOR, MTL_BLEND_FACTOR_ZERO, MTL_BLEND_OPERATION_ADD,
+        };
+
+        let memory = mem::apple_m3_max();
+        let families = integrated_families();
+        let bare =
+            Census::take(reported(packed(1, 2), BASELINE, &memory, &families)).expect("admitted");
+        assert!(!bare.blend().dual_source);
+        assert!(!bare.blend().independent);
+
+        let mut rich = reported(packed(1, 2), BASELINE, &memory, &families);
+        rich.dual_src_blend = true;
+        rich.independent_blend = true;
+        let rich = Census::take(rich).expect("admitted");
+
+        let dual = ColorAttachmentShape {
+            blending_enabled: true,
+            src_rgb: MTL_BLEND_FACTOR_SOURCE_1_COLOR,
+            dst_rgb: MTL_BLEND_FACTOR_ZERO,
+            op_rgb: MTL_BLEND_OPERATION_ADD,
+            src_alpha: MTL_BLEND_FACTOR_ONE,
+            dst_alpha: MTL_BLEND_FACTOR_ZERO,
+            op_alpha: MTL_BLEND_OPERATION_ADD,
+            write_mask: ColorWriteMask::ALL,
+        }
+        .checked()
+        .expect("a declaration the guest API admits");
+        assert!(matches!(
+            plan(&dual, bare.blend()),
+            Err(Refusal::NoDualSource { .. })
+        ));
+        let planned = plan(&dual, rich.blend()).expect("the device reports it");
+
+        let opaque = plan(&ColorAttachmentState::OPAQUE, rich.blend()).expect("nothing to refuse");
+        assert!(matches!(
+            independent(&[planned, opaque], bare.blend()),
+            Err(Refusal::NoIndependentBlend { .. })
+        ));
+        assert!(independent(&[planned, opaque], rich.blend()).is_ok());
     }
 
     /// The rule a device creation gets refused for breaking: a capability that

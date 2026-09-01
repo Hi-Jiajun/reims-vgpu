@@ -89,6 +89,7 @@
 
 pub mod barrier;
 pub mod bindings;
+pub mod blend;
 pub mod buffer;
 pub mod census;
 pub mod depth_stencil;

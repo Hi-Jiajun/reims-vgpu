@@ -78,6 +78,12 @@ pub struct Enabled {
     /// census cell [`crate::sampler::plan`] reads and the feature requested
     /// here are the same fact and are derived from the same place.
     pub sampler_anisotropy: bool,
+    /// `VkPhysicalDeviceFeatures::dualSrcBlend`, the 1.0 block again. A
+    /// pipeline naming a `SRC1_*` factor without it is invalid, and
+    /// [`crate::blend::plan`] refuses one against the same census cell.
+    pub dual_src_blend: bool,
+    /// `VkPhysicalDeviceFeatures::independentBlend`.
+    pub independent_blend: bool,
     /// `VkPhysicalDeviceVulkan12Features::samplerMirrorClampToEdge`. A
     /// promoted feature is still a feature: the address mode enumerant exists
     /// in core 1.2 whether or not it was enabled, and using it unenabled is
@@ -107,6 +113,8 @@ impl Enabled {
             depth_clamp: census.raster().depth_clamp,
             fill_mode_non_solid: census.raster().fill_mode_non_solid,
             sampler_anisotropy: census.samplers().anisotropy,
+            dual_src_blend: census.blend().dual_source,
+            independent_blend: census.blend().independent,
             sampler_mirror_clamp_to_edge: census.samplers().mirror_clamp_to_edge,
             core_promotions: census.api().at_least(1, 3),
         }
@@ -218,7 +226,9 @@ impl DeviceEpoch {
         let core_features = vk::PhysicalDeviceFeatures::default()
             .depth_clamp(enabled.depth_clamp)
             .fill_mode_non_solid(enabled.fill_mode_non_solid)
-            .sampler_anisotropy(enabled.sampler_anisotropy);
+            .sampler_anisotropy(enabled.sampler_anisotropy)
+            .dual_src_blend(enabled.dual_src_blend)
+            .independent_blend(enabled.independent_blend);
 
         let mut create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
@@ -377,6 +387,8 @@ mod tests {
             fill_mode_non_solid: false,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
+            dual_src_blend: false,
+            independent_blend: false,
             sampler_mirror_clamp_to_edge: false,
             mesh_shader: features.1,
             descriptor_buffer: features.2,
@@ -515,6 +527,8 @@ mod tests {
                         fill_mode_non_solid: false,
                         sampler_anisotropy: false,
                         max_sampler_anisotropy: 1.0,
+                        dual_src_blend: false,
+                        independent_blend: false,
                         sampler_mirror_clamp_to_edge: false,
                         mesh_shader: false,
                         descriptor_buffer: false,
@@ -560,6 +574,8 @@ mod tests {
                         fill_mode_non_solid: false,
                         sampler_anisotropy: false,
                         max_sampler_anisotropy: 16.0,
+                        dual_src_blend: false,
+                        independent_blend: false,
                         sampler_mirror_clamp_to_edge: false,
                         mesh_shader: false,
                         descriptor_buffer: false,
@@ -575,6 +591,49 @@ mod tests {
                 assert_eq!(enabled.sampler_mirror_clamp_to_edge, mirror);
                 assert_eq!(census.samplers().anisotropy, anisotropy);
                 assert_eq!(census.samplers().mirror_clamp_to_edge, mirror);
+            }
+        }
+    }
+
+    /// Same footing again: a pipeline naming `SRC1_*` without `dualSrcBlend`
+    /// is invalid, and `crate::blend::plan` refuses one against the very cell
+    /// this module's request is derived from.
+    #[test]
+    fn the_blend_features_are_enabled_exactly_when_reported() {
+        let memory = mem::apple_m3_max();
+        let families = families();
+        for dual in [false, true] {
+            for independent in [false, true] {
+                let census = Census::take(Reported {
+                    dual_src_blend: dual,
+                    independent_blend: independent,
+                    ..Reported {
+                        api_version: vk::make_api_version(0, 1, 2, 0),
+                        extensions: &[extension::SWAPCHAIN],
+                        timeline_semaphore: true,
+                        synchronization2: false,
+                        dynamic_rendering: false,
+                        depth_clamp: false,
+                        fill_mode_non_solid: false,
+                        sampler_anisotropy: false,
+                        max_sampler_anisotropy: 16.0,
+                        dual_src_blend: false,
+                        independent_blend: false,
+                        sampler_mirror_clamp_to_edge: false,
+                        mesh_shader: false,
+                        descriptor_buffer: false,
+                        max_push_descriptors: 0,
+                        max_buffer_size: None,
+                        memory: &memory,
+                        queue_families: &families,
+                    }
+                })
+                .expect("admitted");
+                let enabled = Enabled::for_census(&census);
+                assert_eq!(enabled.dual_src_blend, dual);
+                assert_eq!(enabled.independent_blend, independent);
+                assert_eq!(census.blend().dual_source, dual);
+                assert_eq!(census.blend().independent, independent);
             }
         }
     }
@@ -667,6 +726,8 @@ mod tests {
             fill_mode_non_solid: false,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
+            dual_src_blend: false,
+            independent_blend: false,
             sampler_mirror_clamp_to_edge: false,
             mesh_shader: false,
             descriptor_buffer: false,

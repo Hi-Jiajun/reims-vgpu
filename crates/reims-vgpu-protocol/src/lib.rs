@@ -54,6 +54,8 @@
 //!   does.
 //! - [`pixel_format`] — the format ordinals, what each one is made of, and the
 //!   conversions between a texel and the eight-bit colour the device carries.
+//! - [`blend`] — a colour attachment's blend equations and write mask, and
+//!   which of them a cleared `blendingEnabled` puts out of reach.
 //! - [`depth_stencil`] — `MTLDepthStencilDescriptor`'s ordinals, and which
 //!   of its two faces the record actually wrote.
 //! - [`sampler`] — `MTLSamplerDescriptor`'s ordinals, and the combinations
@@ -98,6 +100,7 @@
 extern crate alloc;
 
 pub mod bind;
+pub mod blend;
 pub mod blit;
 pub mod checked;
 pub mod closure;

@@ -94,6 +94,13 @@ pub use reims_vgpu_protocol::sampler;
 /// object.
 pub use reims_vgpu_protocol::depth_stencil;
 
+/// A colour attachment's blend state, re-exported from the protocol layer.
+///
+/// Which equation, which factors, which channels are writable — semantic on
+/// either rail. Whether a host can run the dual-source factors among them is
+/// not, and that question belongs to the executor that queried a device.
+pub use reims_vgpu_protocol::blend;
+
 pub mod stream;
 pub mod submit;
 pub mod sync;
