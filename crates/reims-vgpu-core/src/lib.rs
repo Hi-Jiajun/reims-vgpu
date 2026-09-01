@@ -39,6 +39,7 @@ pub mod pipeline;
 pub mod range_set;
 pub mod ready;
 pub mod render;
+pub mod resolve;
 pub mod resource_state;
 pub mod session;
 pub mod stream;

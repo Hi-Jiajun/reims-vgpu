@@ -45,6 +45,7 @@ pub use reims_vgpu_wire::op::Op;
 pub use reims_vgpu_wire::ops::render::{
     BufferBind, BufferStrideBind, RefBind, SamplerLodBind, ScissorRect, Viewport,
 };
+pub use reims_vgpu_wire::{F32le, U32le, U64le};
 
 pub use reims_vgpu_wire::ops::render_pass::RenderPassBody;
 
