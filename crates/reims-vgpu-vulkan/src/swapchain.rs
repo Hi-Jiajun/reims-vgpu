@@ -32,7 +32,7 @@
 //! the plan records that it was used; here there is no sibling that preserves
 //! the picture, so there is nothing to record and the answer is no.
 //!
-//! # One more image than the minimum, on purpose
+//! # One more image than the minimum, on purpose — and three under `MAILBOX`
 //!
 //! With exactly `minImageCount` images, `vkAcquireNextImageKHR` may have to
 //! wait for the presentation engine to release one — and waiting on a host
@@ -41,6 +41,18 @@
 //! holds the last. `maxImageCount` of zero means unbounded, which is a real
 //! answer and not a missing one, so the clamp only applies where the surface
 //! named a maximum.
+//!
+//! `MAILBOX` needs a third: one image queued for display, one being drawn, and
+//! one for the queued image to be *replaced* with. That replacement is the
+//! whole reason to be on the rung — with two images the mode still works and
+//! degrades to waiting for the queued frame, which is the behaviour `FIFO`
+//! already had. So [`MAILBOX_MIN_IMAGES`] is a floor on that arm only, and the
+//! surface's own maximum still wins over it: a surface that caps at two cannot
+//! be argued with.
+//!
+//! The floor is also the depth a presenter can usefully run at, which is why it
+//! is public. A presenter with more presents in flight than the swapchain has
+//! images has slots that can never be filled.
 //!
 //! The count requested is still only a request: `vkGetSwapchainImagesKHR`
 //! reports what the driver actually made, and that number is the one
@@ -302,9 +314,13 @@ fn extent(capabilities: &vk::SurfaceCapabilitiesKHR, wanted: vk::Extent2D) -> (v
     )
 }
 
-/// One more than the minimum, bounded by a maximum where the surface named one.
-fn image_count(capabilities: &vk::SurfaceCapabilitiesKHR) -> u32 {
-    let wanted = capabilities.min_image_count.saturating_add(1);
+/// One more than the minimum — three under `MAILBOX` — bounded by a maximum
+/// where the surface named one. See the module doc for both floors.
+fn image_count(capabilities: &vk::SurfaceCapabilitiesKHR, mode: vk::PresentModeKHR) -> u32 {
+    let mut wanted = capabilities.min_image_count.saturating_add(1);
+    if mode == vk::PresentModeKHR::MAILBOX {
+        wanted = wanted.max(MAILBOX_MIN_IMAGES);
+    }
     // Zero means unbounded, which is an answer and not an absent one.
     if capabilities.max_image_count == 0 {
         wanted
@@ -312,6 +328,10 @@ fn image_count(capabilities: &vk::SurfaceCapabilitiesKHR) -> u32 {
         wanted.min(capabilities.max_image_count)
     }
 }
+
+/// The images `MAILBOX` needs to be `MAILBOX`: one queued, one being drawn, one
+/// to replace the queued one with. See the module doc.
+pub const MAILBOX_MIN_IMAGES: u32 = 3;
 
 /// The best present mode this surface offers, under `narrowing`.
 fn present_mode(offered: &[vk::PresentModeKHR], narrowing: Narrowing) -> vk::PresentModeKHR {
@@ -401,11 +421,18 @@ pub fn plan(
         }));
     }
 
+    // The mode is chosen before the count because the count depends on it, and
+    // the two used to be computed apart: the mode was picked, the count derived
+    // from it, and then a literal `FIFO` handed to the create info — so a log
+    // read `present_mode=mailbox` beside a swapchain that was not, and the
+    // change that introduced the choice measured no effect because it never
+    // reached the driver. One value, decided once, in one structure.
+    let present_mode = present_mode(surface.present_modes, narrowing);
     Ok(Outcome::Ready(Plan {
         format,
-        present_mode: present_mode(surface.present_modes, narrowing),
+        present_mode,
         extent,
-        requested_images: image_count(&surface.capabilities),
+        requested_images: image_count(&surface.capabilities, present_mode),
         usage,
         composite_alpha,
         // The surface's own transform, so the image is never rotated. Asking
@@ -510,7 +537,10 @@ mod tests {
         assert_eq!(plan.format, srgb_space(BGRA));
         assert_eq!(plan.present_mode, vk::PresentModeKHR::MAILBOX);
         // One more than the minimum, so an acquire has somewhere to go while
-        // the presentation engine still holds the last image.
+        // the presentation engine still holds the last image. Also the
+        // `MAILBOX` floor, which this surface reaches without it — see
+        // `only_the_mailbox_rung_asks_for_a_third_image` for the case that
+        // separates them.
         assert_eq!(plan.requested_images, 3);
         assert_eq!(plan.extent, capabilities().current_extent);
         assert!(plan.extent_from_surface);
@@ -815,6 +845,60 @@ mod tests {
         assert_eq!(count(8, 0), 9);
         // A driver reporting the largest possible minimum does not wrap.
         assert_eq!(count(u32::MAX, 0), u32::MAX);
+    }
+
+    /// `MAILBOX` asks for a third image, and only `MAILBOX` does.
+    ///
+    /// The mode's whole advantage is replacing the queued frame rather than
+    /// queueing behind it, and with two images there is nothing to replace it
+    /// with — the rung is taken and its behaviour is `FIFO`'s. So the floor is
+    /// on that arm alone, which is the half a single fixture cannot show: a
+    /// floor applied to both modes and a floor applied to neither both pass a
+    /// test that only ever asks one of them.
+    #[test]
+    fn only_the_mailbox_rung_asks_for_a_third_image() {
+        let count = |min, max, offered: &[vk::PresentModeKHR]| {
+            ready(
+                vk::SurfaceCapabilitiesKHR {
+                    min_image_count: min,
+                    max_image_count: max,
+                    ..capabilities()
+                },
+                &[srgb_space(BGRA)],
+                offered,
+                wanted(),
+                Narrowing::default(),
+            )
+            .requested_images
+        };
+        let fifo: &[vk::PresentModeKHR] = &[vk::PresentModeKHR::FIFO];
+        let mailbox: &[vk::PresentModeKHR] =
+            &[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX];
+
+        // One spare would be two; the rung asks for the third.
+        assert_eq!(count(1, 0, fifo), 2);
+        assert_eq!(count(1, 0, mailbox), MAILBOX_MIN_IMAGES);
+        // Above the floor the ordinary rule governs both.
+        assert_eq!(count(4, 0, fifo), 5);
+        assert_eq!(count(4, 0, mailbox), 5);
+        // A surface that caps at two cannot be argued with, on either rung.
+        assert_eq!(count(1, 2, mailbox), 2);
+        // And the switch down to FIFO takes the floor away with the rung.
+        assert_eq!(
+            ready(
+                vk::SurfaceCapabilitiesKHR {
+                    min_image_count: 1,
+                    max_image_count: 0,
+                    ..capabilities()
+                },
+                &[srgb_space(BGRA)],
+                mailbox,
+                wanted(),
+                Narrowing { fifo_only: true },
+            )
+            .requested_images,
+            2
+        );
     }
 
     /// Transfer destination is asked for only when the composition copies, and

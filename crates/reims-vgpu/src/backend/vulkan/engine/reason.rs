@@ -26,7 +26,12 @@ use crate::backend::vulkan::translate::TranslateReason;
 use crate::observe::Decline;
 
 /// A request the engine understood and declined.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Clone` and not `Copy`: [`Self::SwapchainSurface`] carries the list of
+/// formats or colour spaces the surface actually offered, and that list is what
+/// makes the refusal actionable — a reason naming only "not offered" leaves the
+/// reader without the one thing they would go looking for next.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DrawReason {
     /// A validator rejected the SPIR-V module this device assembled, so it was
     /// never handed to the driver.
@@ -275,13 +280,16 @@ pub enum DrawReason {
     QueueCannotPresent {
         queue_family: u32,
     },
-    /// The surface's swapchain images cannot be a transfer destination, which
-    /// the present blit requires.
-    SwapchainLacksTransferDst,
-    /// The surface advertises no formats at all.
-    SwapchainNoSurfaceFormat,
-    /// The surface advertises no composite-alpha mode.
-    SwapchainNoCompositeAlpha,
+    /// The host window's surface cannot carry this composition: no formats at
+    /// all, not the scanout format, not under a colour space this device writes
+    /// through, no transfer destination for the present blit, or no
+    /// composite-alpha mode that leaves the frame alone.
+    ///
+    /// One arm carrying the rail's refusal rather than four flat variants, and
+    /// it delegates its slug for the same reason [`Self::SamplerDevice`] does:
+    /// the layer that asked the surface is the one that names what it answered,
+    /// and the answer is only actionable with the list it carries.
+    SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal),
     /// A binding one of this draw's two modules statically uses is absent from
     /// the descriptor set layout this draw would build.
     ///
@@ -384,9 +392,7 @@ impl crate::observe::Decline for DrawReason {
             }
             Self::SwapchainUnavailable => "swapchain_unavailable",
             Self::QueueCannotPresent { .. } => "queue_cannot_present",
-            Self::SwapchainLacksTransferDst => "swapchain_lacks_transfer_dst",
-            Self::SwapchainNoSurfaceFormat => "swapchain_no_surface_format",
-            Self::SwapchainNoCompositeAlpha => "swapchain_no_composite_alpha",
+            Self::SwapchainSurface(refusal) => refusal.slug(),
         }
     }
 }
@@ -506,6 +512,9 @@ impl std::fmt::Display for DrawReason {
             // The rail's own refusal already spells its slug and its fields;
             // printing it whole keeps one event to one reading.
             Self::BlendDevice(refusal) => write!(f, " {refusal}"),
+            // Same: the surface's answer is only actionable with what it
+            // offered, which the rail's refusal spells.
+            Self::SwapchainSurface(refusal) => write!(f, " {refusal}"),
             _ => Ok(()),
         }
     }
@@ -713,9 +722,25 @@ mod tests {
         },
         DrawReason::SwapchainUnavailable,
         DrawReason::QueueCannotPresent { queue_family: 0 },
-        DrawReason::SwapchainLacksTransferDst,
-        DrawReason::SwapchainNoSurfaceFormat,
-        DrawReason::SwapchainNoCompositeAlpha,
+        DrawReason::SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal::NoFormats),
+        DrawReason::SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal::FormatNotOffered {
+            wanted: ash::vk::Format::B8G8R8A8_UNORM,
+            offered: Vec::new(),
+        }),
+        DrawReason::SwapchainSurface(
+            reims_vgpu_vulkan::swapchain::Refusal::ColorSpaceNotOffered {
+                format: ash::vk::Format::B8G8R8A8_UNORM,
+                offered: Vec::new(),
+            },
+        ),
+        DrawReason::SwapchainSurface(
+            reims_vgpu_vulkan::swapchain::Refusal::NoTransferDestination {
+                supported: ash::vk::ImageUsageFlags::empty(),
+            },
+        ),
+        DrawReason::SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal::NoOpaqueComposite {
+            supported: ash::vk::CompositeAlphaFlagsKHR::empty(),
+        }),
         DrawReason::BlendDeclaration(reims_vgpu_core::blend::BlendRefusal::UnknownOrdinal {
             field: "src_rgb",
             ordinal: 0,
