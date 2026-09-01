@@ -448,6 +448,16 @@ pub enum ResolveRefusal {
     NotAMapNotice { kind: LifecycleKind },
     /// The notice's payload cannot hold its three fields.
     ShortNotice(fifo::ShortPayload),
+    /// The record resolved, and the operation is the result of walking a table
+    /// in guest memory this crate cannot address.
+    ///
+    /// `SetObjectList` is the case. Its packet says where a task's object list
+    /// is and how many entries it has; the operation is the per-entry result of
+    /// reading it, and every byte of it lives in pages the memory bound owns.
+    /// Named rather than approximated, for [`Self::NeedsStorage`]'s reason: an
+    /// operation built from the packet alone would rebind nothing while
+    /// reporting that it had.
+    NeedsGuestTable { kind: LifecycleKind },
 }
 
 impl ResolveRefusal {
@@ -463,6 +473,7 @@ impl ResolveRefusal {
             Self::UnknownMapping { .. } => "lifecycle_unknown_mapping",
             Self::NotAMapNotice { .. } => "lifecycle_not_a_map_notice",
             Self::ShortNotice(_) => fifo::ShortPayload::SLUG,
+            Self::NeedsGuestTable { .. } => "lifecycle_needs_guest_table",
         }
     }
 }
@@ -529,7 +540,59 @@ pub fn resource_list(
     })
 }
 
+/// Turn any lifecycle packet's payload into the operation it names.
+///
+/// **The one place a kind picks its join.** The five joins below each refuse
+/// every kind that is not their own, which makes a wrong pairing a value rather
+/// than a misread — but nothing said which one a given kind belongs to, so every
+/// caller with a packet had to know, and a caller that knew wrongly would read
+/// one command's offsets out of another's payload. `every_lifecycle_kind_
+/// reaches_at_most_one_join` could see that no kind is read by two; it could not
+/// make the choice for anyone.
+///
+/// The match is exhaustive over [`LifecycleKind`], so a thirteenth command is a
+/// compile error here rather than a packet that quietly reaches whichever arm
+/// came last.
+///
+/// Both resolvers are taken because the twelve commands need both namespaces
+/// and they are different namespaces — an object-list ref and a mapping id
+/// arrive as `u32`s that overlap numerically and name unrelated things, which is
+/// why [`crate::resolve::RefResolver`] and
+/// [`crate::resolve::MappingResolver`] are two traits.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`] from the join that owns the kind, or — for the two
+/// commands that resolve and still cannot become an operation —
+/// [`ResolveRefusal::NeedsStorage`] and [`ResolveRefusal::NeedsGuestTable`],
+/// which name what is missing rather than approximating it.
+pub fn operation(
+    kind: LifecycleKind,
+    payload: &[u8],
+    objects: &impl crate::resolve::RefResolver,
+    mappings: &impl crate::resolve::MappingResolver,
+) -> Result<LifecycleOp, ResolveRefusal> {
+    match kind {
+        LifecycleKind::DefineTask | LifecycleKind::DeleteTask => task_lifetime(kind, payload),
+        LifecycleKind::DeleteResource | LifecycleKind::ReplacePhysical => {
+            object_reference(kind, payload, objects)
+        }
+        LifecycleKind::MapMemory | LifecycleKind::UnmapMemory => map_notice(kind, payload),
+        LifecycleKind::DeleteBacking => backing_retirement(kind, payload, mappings),
+        LifecycleKind::Invalidate
+        | LifecycleKind::Synchronize
+        | LifecycleKind::SynchronizeAndDiscard
+        | LifecycleKind::Discard => resource_list(kind, payload, objects),
+        // The one command whose operation is not in its packet. See
+        // `ResolveRefusal::NeedsGuestTable`.
+        LifecycleKind::SetObjectList => Err(ResolveRefusal::NeedsGuestTable { kind }),
+    }
+}
+
 /// Turn a task-lifetime packet's payload into the operation it names.
+///
+/// Reached through [`operation`], which is what decides that this is the join
+/// a task-lifetime kind belongs to.
 ///
 /// Takes no resolver, as [`map_notice`] does not: a task is named by its own
 /// slot number and there is nothing about that number device state could answer
@@ -2107,6 +2170,36 @@ mod tests {
             ],
             "the lifecycle commands that still cannot become an operation"
         );
+
+        // And the dispatcher agrees with the sweep, kind for kind. The sweep
+        // above says no kind is read by two joins; this says which one each is
+        // read by, which is the half no caller could answer for itself.
+        for kind in ALL_KINDS {
+            let direct = [
+                task_lifetime(kind, &payload),
+                object_reference(kind, &payload, &Everything),
+                map_notice(kind, &payload),
+                backing_retirement(kind, &payload, &EveryMapping),
+                resource_list(kind, &payload, &Everything),
+            ]
+            .into_iter()
+            .find(Result::is_ok);
+            let through = operation(kind, &payload, &Everything, &EveryMapping);
+            match direct {
+                Some(op) => assert_eq!(through, op, "{}", kind.name()),
+                // The two with no join name what is missing rather than
+                // reaching a join that would read another command's offsets.
+                None => assert!(
+                    matches!(
+                        through,
+                        Err(ResolveRefusal::NeedsStorage { .. }
+                            | ResolveRefusal::NeedsGuestTable { .. })
+                    ),
+                    "{} became {through:?}",
+                    kind.name()
+                ),
+            }
+        }
     }
 
     /// The notice's fields as the packet carries them, and the direction the
