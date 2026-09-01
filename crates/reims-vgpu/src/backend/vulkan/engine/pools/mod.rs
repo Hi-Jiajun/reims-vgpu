@@ -902,6 +902,59 @@ pub(crate) struct CbGraphicsState {
     vertex_offsets: Vec<vk::DeviceSize>,
 }
 
+impl CbGraphicsState {
+    /// Forget every value recorded into the command buffer this state
+    /// describes, leaving only [`Self::cb`] and the scratch buffers.
+    ///
+    /// One method rather than an assignment list at each site, because there
+    /// are two sites — [`ResourcePools::forget_pass_echo`] and the
+    /// recycled-handle branch of `bind_graphics_pipeline` — and they are
+    /// the *same* claim: nothing recorded into the previous command buffer is
+    /// known any more. A field added to this struct and remembered at only one
+    /// of them is a draw that skips a real `vkCmdSet*` on a handle whose
+    /// `vkBeginCommandBuffer` made that state undefined, which is wrong
+    /// rendering reported nowhere.
+    ///
+    /// The scratch vectors are not state: they are rebuilt from scratch by the
+    /// draw that asks for them, and clearing them here would say they carried
+    /// something.
+    fn forget_recorded(&mut self) {
+        let Self {
+            cb: _,
+            pipeline,
+            pipeline_layout,
+            viewports,
+            scissors,
+            stencil,
+            depth_bias_set,
+            raster,
+            topology,
+            depth_stencil,
+            blend_constants,
+            push_layout,
+            push_bindings,
+            vp_scratch: _,
+            sc_scratch: _,
+            push_scratch: _,
+            vertex_scratch: _,
+            vertex_buffers: _,
+            vertex_offsets: _,
+        } = self;
+        *pipeline = None;
+        *pipeline_layout = None;
+        viewports.clear();
+        scissors.clear();
+        *stencil = None;
+        *depth_bias_set = false;
+        *raster = None;
+        *topology = None;
+        *depth_stencil = None;
+        *blend_constants = None;
+        *push_layout = None;
+        push_bindings.clear();
+    }
+}
+
 /// One normalized fixed-function vertex-buffer binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VertexBufferBinding {

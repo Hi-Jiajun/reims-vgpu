@@ -1897,18 +1897,7 @@ impl ResourcePools {
         debug_assert!(self.open_pass.is_none(), "forgetting an open render pass");
         self.last_pass = None;
         self.cb_graphics.cb = None;
-        self.cb_graphics.pipeline = None;
-        self.cb_graphics.pipeline_layout = None;
-        self.cb_graphics.viewports.clear();
-        self.cb_graphics.scissors.clear();
-        self.cb_graphics.stencil = None;
-        self.cb_graphics.blend_constants = None;
-        self.cb_graphics.depth_bias_set = false;
-        self.cb_graphics.raster = None;
-        self.cb_graphics.topology = None;
-        self.cb_graphics.depth_stencil = None;
-        self.cb_graphics.push_layout = None;
-        self.cb_graphics.push_bindings.clear();
+        self.cb_graphics.forget_recorded();
     }
 
     fn install_open_batch(&mut self, batch: OpenBatch) {
@@ -2272,17 +2261,12 @@ impl ResourcePools {
         let g = &mut self.cb_graphics;
         if g.cb != Some(cb) {
             // A recycled handle: everything the previous user of it bound was
-            // made undefined by the `vkBeginCommandBuffer` in between.
+            // made undefined by the `vkBeginCommandBuffer` in between. Every
+            // field, through the one method that knows what all of them are —
+            // this branch used to list them by hand and had fallen three
+            // behind.
             g.cb = Some(cb);
-            g.pipeline = None;
-            g.pipeline_layout = None;
-            g.viewports.clear();
-            g.scissors.clear();
-            g.stencil = None;
-            g.blend_constants = None;
-            g.depth_bias_set = false;
-            g.push_layout = None;
-            g.push_bindings.clear();
+            g.forget_recorded();
         }
         if g.pipeline == Some(pipeline) {
             counters
@@ -2298,9 +2282,33 @@ impl ResourcePools {
         }
         // Static state on the incoming pipeline may have replaced any of these,
         // so none of them is known any more.
+        //
+        // A bind makes a state undefined exactly where the incoming pipeline
+        // does *not* declare it dynamic, which is why this list is not
+        // `forget_recorded`:
+        //
+        // - The viewport, scissor, blend colour and depth bias are declared by
+        //   every graphics pipeline this cache builds, so clearing them is
+        //   conservative rather than required. Kept, because it costs one
+        //   re-record per pipeline change and the alternative is a claim about
+        //   an unconditional list that a future conditional would break.
+        // - The stencil reference and the depth-stencil state are declared
+        //   *conditionally* — see `DepthStencilPlan::states`, which lists the
+        //   reference only for a pipeline whose stencil test is on, and the
+        //   eight dynamic members only for a pipeline whose pass carries depth.
+        //   So a bind genuinely can make either undefined, and clearing them is
+        //   required rather than conservative.
+        // - The rasterizer members and the primitive topology are *not* here.
+        //   Whether they are dynamic is `RasterDynamic::of(cell)` and
+        //   `TopologyCell::dynamic`, both pure functions of this device's
+        //   feature bits — so on any one device either every pipeline declares
+        //   them or none does, and a bind can never turn one static. Clearing
+        //   them would re-record five commands per pipeline change that no
+        //   pipeline could have disturbed.
         g.viewports.clear();
         g.scissors.clear();
         g.stencil = None;
+        g.depth_stencil = None;
         g.blend_constants = None;
         g.depth_bias_set = false;
         unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline) };
