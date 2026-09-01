@@ -209,6 +209,28 @@ impl<V> PartialEq for Variant<V> {
 
 impl<V> Eq for Variant<V> {}
 
+/// Publishing into a family the flight did not come from, with everything the
+/// caller handed over given back.
+///
+/// The compiled value comes back because it is a native object nobody else has
+/// a name for: dropping it here would leak a `VkPipeline` on a path that is
+/// already a caller bug, and a leak is the one failure that does not show up in
+/// the run that caused it. The flight comes back for the same reason — it is
+/// the right to compile that key, it is not `Clone`, and consuming it would
+/// leave the key it names stuck in `Compiling` forever.
+#[derive(Debug)]
+pub struct Misdirected<K, V, R> {
+    pub wrong: WrongFamily,
+    pub flight: Flight<K>,
+    pub outcome: Result<V, R>,
+}
+
+impl<K, V, R> std::fmt::Display for Misdirected<K, V, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.wrong, f)
+    }
+}
+
 /// Publishing into a family the flight did not come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WrongFamily {
@@ -354,19 +376,23 @@ impl<K: Eq + Hash + Clone + Debug, V, R: Clone> VariantFamily<K, V, R> {
     ///
     /// # Errors
     ///
-    /// [`WrongFamily`] when the flight came from another family. Neither family
-    /// is modified: the caller still owns the compiled value and can give it
-    /// back to whoever should have had it.
+    /// [`Misdirected`] when the flight came from another family. Neither family
+    /// is modified, and the flight and the compiled value come back so the
+    /// caller can give them to whoever should have had them.
     pub fn publish(
         &mut self,
         flight: Flight<K>,
         outcome: Result<V, R>,
-    ) -> Result<Readiness<V, R>, WrongFamily> {
+    ) -> Result<Readiness<V, R>, Misdirected<K, V, R>> {
         if flight.family != self.id {
             self.census.foreign += 1;
-            return Err(WrongFamily {
-                flight: flight.family,
-                family: self.id,
+            return Err(Misdirected {
+                wrong: WrongFamily {
+                    flight: flight.family,
+                    family: self.id,
+                },
+                flight,
+                outcome,
             });
         }
         let Flight { key, .. } = flight;
@@ -513,8 +539,15 @@ mod tests {
         assert_eq!(family.census().refused, 1);
     }
 
-    /// A flight published into the wrong family changes nothing anywhere, so
-    /// the caller still owns what it compiled.
+    /// A flight published into the wrong family changes nothing anywhere, and
+    /// hands back everything the caller gave it.
+    ///
+    /// The value coming back is the point, not a convenience: it is a native
+    /// object nobody else has a name for, and dropping it on a path that is
+    /// already a caller bug would leak it silently. The flight coming back is
+    /// the same claim for the right to compile — it is not `Clone`, so
+    /// consuming it would leave the key stuck compiling for the life of the
+    /// family.
     #[test]
     fn a_foreign_flight_is_refused_without_mutating_either_family() {
         let mut mine = Family::new();
@@ -523,12 +556,12 @@ mod tests {
 
         let flight = theirs.begin_flight(3).expect("their flight");
         let before = mine.len();
-        let refused = mine
+        let misdirected = mine
             .publish(flight, Ok(Native(5)))
             .expect_err("not mine to publish");
-        assert_eq!(refused.family, mine.id());
-        assert_eq!(refused.flight, theirs.id());
-        assert_eq!(refused.slug(), "vk_variant_wrong_family");
+        assert_eq!(misdirected.wrong.family, mine.id());
+        assert_eq!(misdirected.wrong.flight, theirs.id());
+        assert_eq!(misdirected.wrong.slug(), "vk_variant_wrong_family");
 
         assert_eq!(mine.len(), before, "the wrong family gained an entry");
         assert!(
@@ -536,6 +569,16 @@ mod tests {
             "the right family lost its flight"
         );
         assert_eq!(mine.census().foreign, 1);
+
+        // Everything came back, so the misdirected publication is recoverable
+        // rather than a leak plus a stuck key.
+        assert!(matches!(misdirected.outcome, Ok(Native(5))));
+        assert_eq!(*misdirected.flight.key(), 3);
+        let readiness = theirs
+            .publish(misdirected.flight, misdirected.outcome)
+            .expect("its own family this time");
+        assert!(readiness.is_ready());
+        assert!(theirs.request(&3).is_ready());
     }
 
     /// The claim that makes a recorded command buffer safe.

@@ -43,6 +43,23 @@
 //! that took the other rung would compile a different number of them for one
 //! guest.
 //!
+//! # A draw never compiles, and never asks twice
+//!
+//! [`Store`] is where the key becomes a cache. It holds one
+//! [`crate::variant::VariantFamily`] per *semantic* pipeline —
+//! [`reims_vgpu_core::pipeline::PipelineTable`]'s key, not this module's — so
+//! that retiring one guest pipeline object retires exactly the native
+//! pipelines built for it. A single device-wide map keyed on [`GraphicsKey`]
+//! would be smaller and would make that deletion either destroy variants
+//! another guest object still names or destroy nothing at all, because
+//! nothing in the key says whose it is.
+//!
+//! The store compiles nothing and destroys nothing. A flight is the right to
+//! compile a key, granted once; every other asker waits. A compilation's
+//! result is published back, and [`Store::collect`] hands back the natives
+//! whose only holder was the store — never one a recorded command buffer
+//! still names.
+//!
 //! # What this module refuses
 //!
 //! Only composition failures — a state that is individually translatable and
@@ -53,9 +70,11 @@
 //! worse, a silently ignored piece of guest state.
 
 use ash::vk;
+use reims_vgpu_core::identity::ResourceId;
+use std::collections::HashMap;
 use std::ffi::CStr;
 
-use crate::{blend, depth_stencil, raster, renderpass, topology, vertex};
+use crate::{blend, depth_stencil, raster, renderpass, topology, variant, vertex};
 
 /// One shader stage, as far as identity is concerned.
 ///
@@ -448,6 +467,265 @@ impl Build {
             topology: topology::topology(declared),
             ..vk::PipelineInputAssemblyStateCreateInfo::default()
         }
+    }
+}
+
+/// Why a native variant will never exist.
+///
+/// Two arms because they fail differently and a caller reading the failure
+/// channel needs to tell them apart: a composition this rail refused is a gap
+/// in the translation, and a driver refusal is the host declining something
+/// this rail believed was legal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VariantRefusal {
+    /// [`build`] refused the composition.
+    Composition(Refusal),
+    /// The driver refused `vkCreateGraphicsPipelines`.
+    Driver(vk::Result),
+}
+
+impl VariantRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Composition(refusal) => refusal.slug(),
+            Self::Driver(_) => "vk_pipeline_driver_refused",
+        }
+    }
+}
+
+impl std::fmt::Display for VariantRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Composition(refusal) => refusal.fmt(f),
+            Self::Driver(result) => write!(f, "{} result={result:?}", self.slug()),
+        }
+    }
+}
+
+/// A compiled `VkPipeline`, and what a recorder must do before drawing with it.
+///
+/// The dynamic-state list travels with the handle rather than being looked up
+/// from the key, because a recorder holds a [`variant::Variant`] and a
+/// `Variant` hands out its value and not its key. Binding a pipeline and
+/// leaving one of its declared dynamic states unset is undefined rasterization
+/// rather than a validation failure on every driver, so the obligation belongs
+/// next to the thing that creates it.
+#[derive(Debug)]
+pub struct Native {
+    pub pipeline: vk::Pipeline,
+    pub dynamic: Vec<vk::DynamicState>,
+}
+
+impl Native {
+    /// Whether `state` must be set before a draw with this pipeline.
+    #[must_use]
+    pub fn declares(&self, state: vk::DynamicState) -> bool {
+        self.dynamic.contains(&state)
+    }
+}
+
+/// What a caller asking the store about a key learns.
+///
+/// [`variant::Readiness`]'s four answers plus the one a family cannot express:
+/// a retired family is not a miss, and a caller that read it as one would
+/// compile into it forever.
+#[derive(Debug)]
+pub enum Answer {
+    /// Nobody has asked for this key. Take a flight.
+    Absent,
+    /// Somebody else's flight is outstanding. Wait.
+    Compiling,
+    Ready(variant::Variant<Native>),
+    /// Terminal, with the reason.
+    Refused(VariantRefusal),
+    /// The native side of this semantic pipeline has retired: the guest
+    /// deleted it, or its session generation closed. There is nothing to
+    /// compile into.
+    Retired,
+}
+
+impl Answer {
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    /// Whether the caller should take a compile flight.
+    ///
+    /// Only [`Self::Absent`]. `Compiling` is somebody else's, `Refused` is
+    /// terminal, and `Retired` has no family to compile into.
+    #[must_use]
+    pub const fn wants_a_flight(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
+/// What a [`Store`] is holding, for the report line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreCensus {
+    /// Families, live and retired-but-not-yet-collected.
+    pub families: usize,
+    /// Keys across every family, in any state.
+    pub variants: usize,
+    /// Asked about a semantic pipeline whose family had retired.
+    pub retired_lookups: u64,
+    /// Published a flight into the wrong family. Always a caller bug, and
+    /// never a mutation.
+    pub foreign_flights: u64,
+}
+
+/// Every semantic pipeline's family of native variants.
+///
+/// # One family per semantic pipeline, not one map for the device
+///
+/// [`reims_vgpu_core::pipeline::PipelineTable`] owns when a guest pipeline
+/// object exists; this owns the `VkPipeline` values built for it, and the two
+/// are keyed the same way so retirement is exact. A single device-wide map
+/// keyed on [`GraphicsKey`] would be smaller and would make deleting one guest
+/// pipeline either destroy variants another still names or destroy nothing —
+/// there would be no way to tell which entries were whose. Two guest pipelines
+/// that happen to produce an equal key therefore compile twice, and that is the
+/// price of being able to retire one of them.
+///
+/// # It compiles nothing and destroys nothing
+///
+/// A flight is the right to compile, not the compilation, for the reason
+/// [`variant`] gives. [`Store::collect`] hands back the natives whose only
+/// holder was the store, and the caller destroys them — a store that called
+/// `vkDestroyPipeline` itself would be destroying handles a recorded command
+/// buffer still names.
+#[derive(Debug, Default)]
+pub struct Store {
+    families: HashMap<ResourceId, variant::VariantFamily<GraphicsKey, Native, VariantRefusal>>,
+    census: StoreCensus,
+}
+
+impl Store {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn census(&self) -> StoreCensus {
+        StoreCensus {
+            families: self.families.len(),
+            variants: self
+                .families
+                .values()
+                .map(variant::VariantFamily::len)
+                .sum(),
+            ..self.census
+        }
+    }
+
+    /// Ask what exists for `key` under the semantic pipeline `id`.
+    ///
+    /// Creates the family on first sight, which is what makes the first draw
+    /// of a newly created guest pipeline a miss rather than a refusal. It does
+    /// **not** resurrect a retired one.
+    pub fn request(&mut self, id: ResourceId, key: &GraphicsKey) -> Answer {
+        let family = self.families.entry(id).or_default();
+        if family.is_retired() {
+            self.census.retired_lookups += 1;
+            return Answer::Retired;
+        }
+        match family.request(key) {
+            variant::Readiness::Absent => Answer::Absent,
+            variant::Readiness::Compiling => Answer::Compiling,
+            variant::Readiness::Ready(native) => Answer::Ready(native),
+            variant::Readiness::Refused(reason) => Answer::Refused(reason),
+        }
+    }
+
+    /// Take the right to compile `key` under `id`.
+    ///
+    /// `None` where [`Answer::wants_a_flight`] would have said no, including a
+    /// retired family — a variant compiled into one nobody can acquire from is
+    /// work with no consumer.
+    pub fn begin_flight(
+        &mut self,
+        id: ResourceId,
+        key: GraphicsKey,
+    ) -> Option<variant::Flight<GraphicsKey>> {
+        self.families.entry(id).or_default().begin_flight(key)
+    }
+
+    /// Publish a compilation's outcome under `id`.
+    ///
+    /// # Errors
+    ///
+    /// [`variant::Misdirected`] when the flight belongs to another semantic
+    /// pipeline. Nothing is modified, and the flight and the compiled pipeline
+    /// come back — the caller still has the only name for that `VkPipeline`
+    /// and must either publish it where it belongs or destroy it.
+    ///
+    /// Boxed because it carries a whole key and a compiled pipeline, and this
+    /// is a caller bug rather than a path a draw takes: an allocation here
+    /// costs nothing anybody measures, and leaving it unboxed would make every
+    /// successful publication return the same three hundred bytes.
+    pub fn publish(
+        &mut self,
+        id: ResourceId,
+        flight: variant::Flight<GraphicsKey>,
+        outcome: Result<Native, VariantRefusal>,
+    ) -> Result<(), Box<variant::Misdirected<GraphicsKey, Native, VariantRefusal>>> {
+        let family = self.families.entry(id).or_default();
+        match family.publish(flight, outcome) {
+            Ok(_) => Ok(()),
+            Err(misdirected) => {
+                self.census.foreign_flights += 1;
+                Err(Box::new(misdirected))
+            }
+        }
+    }
+
+    /// The guest deleted this pipeline, or its generation closed.
+    ///
+    /// Nothing is destroyed: work already recorded against these variants is
+    /// still going to run. Returns whether there was a family to retire.
+    pub fn retire(&mut self, id: ResourceId) -> bool {
+        match self.families.get_mut(&id) {
+            Some(family) if !family.is_retired() => {
+                family.retire();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Every family, at the end of the device epoch or the session generation.
+    pub fn retire_all(&mut self) {
+        for family in self.families.values_mut() {
+            family.retire();
+        }
+    }
+
+    /// Take back every native nobody else is holding, from every retired
+    /// family.
+    ///
+    /// A family that has retired and has nothing left is dropped, so a guest
+    /// that creates and deletes pipelines all session does not leave one empty
+    /// family per deletion behind. A family with variants an outstanding
+    /// [`variant::Variant`] still names is kept and collected by a later call.
+    #[must_use = "the collected pipelines are handles that need destroying"]
+    pub fn collect(&mut self) -> Vec<Native> {
+        let mut freed = Vec::new();
+        self.families.retain(|_, family| {
+            freed.extend(family.collect());
+            !(family.is_retired() && family.is_empty())
+        });
+        freed
+    }
+
+    /// How many families have retired and not yet been fully collected.
+    #[must_use]
+    pub fn retiring(&self) -> usize {
+        self.families
+            .values()
+            .filter(|family| family.is_retired())
+            .count()
     }
 }
 
@@ -1083,5 +1361,321 @@ mod tests {
         .expect("built");
         assert_eq!(build.entries[0].as_c_str(), c"");
         assert_ne!(build.entries[0].as_c_str(), MAIN);
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use ash::vk::Handle;
+    use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
+    use reims_vgpu_core::topology::PrimitiveType;
+
+    fn id(slot: u32, generation: u64) -> ResourceId {
+        ResourceId {
+            slot: ObjectListRef(slot),
+            generation: SlotGeneration(generation),
+        }
+    }
+
+    fn compat() -> renderpass::Compatibility {
+        renderpass::Compatibility {
+            color: vec![vk::Format::B8G8R8A8_UNORM],
+            depth_stencil: None,
+            depth: false,
+            stencil: false,
+            samples: vk::SampleCountFlags::TYPE_1,
+        }
+    }
+
+    fn key(module: u64) -> GraphicsKey {
+        GraphicsKey {
+            stages: vec![StageKey {
+                stage: vk::ShaderStageFlags::VERTEX,
+                module: vk::ShaderModule::from_raw(module),
+                entry: "main".into(),
+            }],
+            layout: vk::PipelineLayout::from_raw(1),
+            bindings: Vec::new(),
+            attributes: Vec::new(),
+            topology: topology::TopologyKey::Exact(PrimitiveType::Triangle),
+            raster: raster::plan(
+                raster::GuestRasterState::DEFAULT,
+                raster::RasterCell::default(),
+            )
+            .expect("the defaults need no feature")
+            .state,
+            multisample: MultisamplePlan::default(),
+            depth_stencil: None,
+            blend: vec![blend::AttachmentPlan {
+                blend_enable: false,
+                src_color_blend_factor: vk::BlendFactor::ONE,
+                dst_color_blend_factor: vk::BlendFactor::ZERO,
+                color_blend_op: vk::BlendOp::ADD,
+                src_alpha_blend_factor: vk::BlendFactor::ONE,
+                dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+                alpha_blend_op: vk::BlendOp::ADD,
+                color_write_mask: vk::ColorComponentFlags::RGBA,
+            }],
+            compatibility: compat(),
+            viewports: 1,
+        }
+    }
+
+    fn native(raw: u64) -> Native {
+        Native {
+            pipeline: vk::Pipeline::from_raw(raw),
+            dynamic: vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR],
+        }
+    }
+
+    /// The whole point of the store: a second draw of the same configuration
+    /// does not compile.
+    #[test]
+    fn a_second_draw_of_one_configuration_does_not_compile() {
+        let mut store = Store::new();
+        let pipeline = id(7, 1);
+
+        assert!(matches!(store.request(pipeline, &key(1)), Answer::Absent));
+        let flight = store.begin_flight(pipeline, key(1)).expect("first asker");
+        // Everybody else waits rather than starting a second compilation.
+        assert!(matches!(
+            store.request(pipeline, &key(1)),
+            Answer::Compiling
+        ));
+        assert!(store.begin_flight(pipeline, key(1)).is_none());
+
+        store
+            .publish(pipeline, flight, Ok(native(0xAA)))
+            .expect("its own family");
+
+        for _ in 0..10 {
+            let Answer::Ready(variant) = store.request(pipeline, &key(1)) else {
+                panic!("a compiled key is ready");
+            };
+            assert_eq!(variant.pipeline, vk::Pipeline::from_raw(0xAA));
+            assert!(!store.request(pipeline, &key(1)).wants_a_flight());
+        }
+        assert_eq!(store.census().families, 1);
+        assert_eq!(store.census().variants, 1);
+    }
+
+    /// The obligation the handle carries: a recorder holds a variant and not a
+    /// key, so the dynamic states it must set travel with the pipeline.
+    #[test]
+    fn a_native_names_the_states_a_recorder_must_set() {
+        let native = native(0xAA);
+        assert!(native.declares(vk::DynamicState::VIEWPORT));
+        assert!(native.declares(vk::DynamicState::SCISSOR));
+        assert!(!native.declares(vk::DynamicState::CULL_MODE));
+    }
+
+    /// Two semantic pipelines are two families, even for an identical key.
+    /// That is what makes retiring one exact — a device-wide map keyed on the
+    /// graphics key could not tell whose entries were whose.
+    #[test]
+    fn two_semantic_pipelines_are_two_families_for_one_key() {
+        let mut store = Store::new();
+        let (first, second) = (id(7, 1), id(8, 1));
+
+        for pipeline in [first, second] {
+            let flight = store.begin_flight(pipeline, key(1)).expect("its own");
+            store
+                .publish(pipeline, flight, Ok(native(0xAA)))
+                .expect("its own family");
+        }
+        assert_eq!(store.census().families, 2);
+        assert_eq!(store.census().variants, 2);
+
+        // Retiring one leaves the other untouched and reachable.
+        assert!(store.retire(first));
+        assert!(matches!(store.request(first, &key(1)), Answer::Retired));
+        assert!(store.request(second, &key(1)).is_ready());
+        assert_eq!(store.retiring(), 1);
+    }
+
+    /// A retired family answers `Retired` and not `Absent`. A caller that read
+    /// it as a miss would take a flight it can never publish, every draw,
+    /// forever.
+    #[test]
+    fn a_retired_family_is_not_a_miss() {
+        let mut store = Store::new();
+        let pipeline = id(7, 1);
+        let flight = store.begin_flight(pipeline, key(1)).expect("first");
+        store
+            .publish(pipeline, flight, Ok(native(0xAA)))
+            .expect("own");
+        assert!(store.retire(pipeline));
+
+        for _ in 0..10 {
+            let answer = store.request(pipeline, &key(1));
+            assert!(matches!(answer, Answer::Retired));
+            assert!(!answer.wants_a_flight());
+            assert!(!answer.is_ready());
+            assert!(store.begin_flight(pipeline, key(1)).is_none());
+        }
+        assert_eq!(store.census().retired_lookups, 10);
+        // Retiring twice is not a second retirement.
+        assert!(!store.retire(pipeline));
+        // And a pipeline that was never there has nothing to retire.
+        assert!(!store.retire(id(99, 1)));
+    }
+
+    /// A refusal is terminal and is not a retirement: the family is alive, the
+    /// key will never compile, and a guest drawing it every frame produces one
+    /// refusal rather than one per frame.
+    #[test]
+    fn a_refused_key_stays_refused_while_its_family_lives() {
+        let mut store = Store::new();
+        let pipeline = id(7, 1);
+        let flight = store.begin_flight(pipeline, key(1)).expect("first");
+        store
+            .publish(
+                pipeline,
+                flight,
+                Err(VariantRefusal::Composition(Refusal::NoVertexStage)),
+            )
+            .expect("own");
+
+        for _ in 0..10 {
+            let answer = store.request(pipeline, &key(1));
+            assert!(matches!(
+                answer,
+                Answer::Refused(VariantRefusal::Composition(Refusal::NoVertexStage))
+            ));
+            assert!(!answer.wants_a_flight());
+            assert!(store.begin_flight(pipeline, key(1)).is_none());
+        }
+        // A different key in the same family is still compilable.
+        assert!(store.request(pipeline, &key(2)).wants_a_flight());
+    }
+
+    /// A driver refusal and a composition refusal are different facts on the
+    /// failure channel.
+    #[test]
+    fn the_two_refusals_do_not_read_alike() {
+        let composition = VariantRefusal::Composition(Refusal::NoViewport);
+        let driver = VariantRefusal::Driver(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        assert_ne!(composition, driver);
+        assert_eq!(composition.slug(), "vk_pipeline_no_viewport");
+        assert_eq!(driver.slug(), "vk_pipeline_driver_refused");
+        assert!(driver.to_string().contains("ERROR_OUT_OF_DEVICE_MEMORY"));
+    }
+
+    /// A held variant survives collection, and is freed by a later one. This
+    /// is what keeps a recorded command buffer from naming a destroyed
+    /// pipeline.
+    #[test]
+    fn a_variant_a_recorder_holds_is_not_collected_under_it() {
+        let mut store = Store::new();
+        let pipeline = id(7, 1);
+        let flight = store.begin_flight(pipeline, key(1)).expect("first");
+        store
+            .publish(pipeline, flight, Ok(native(0xAA)))
+            .expect("own");
+
+        let Answer::Ready(held) = store.request(pipeline, &key(1)) else {
+            panic!("ready");
+        };
+        store.retire(pipeline);
+
+        // Nothing to destroy while a recorder holds it, and the family stays.
+        assert!(store.collect().is_empty());
+        assert_eq!(store.census().families, 1);
+        assert_eq!(held.pipeline, vk::Pipeline::from_raw(0xAA));
+
+        drop(held);
+        let freed = store.collect();
+        assert_eq!(freed.len(), 1);
+        assert_eq!(freed[0].pipeline, vk::Pipeline::from_raw(0xAA));
+        // The empty retired family goes with it, so a session of creates and
+        // deletes does not leave one husk per deletion.
+        assert_eq!(store.census().families, 0);
+        assert_eq!(store.retiring(), 0);
+        assert!(store.collect().is_empty());
+    }
+
+    /// Collection touches only retired families. A live one keeps everything,
+    /// however many variants it has.
+    #[test]
+    fn collection_takes_nothing_from_a_live_family() {
+        let mut store = Store::new();
+        let (live, dead) = (id(7, 1), id(8, 1));
+        for (pipeline, module, raw) in [(live, 1, 0xAA), (dead, 2, 0xBB)] {
+            let flight = store.begin_flight(pipeline, key(module)).expect("first");
+            store
+                .publish(pipeline, flight, Ok(native(raw)))
+                .expect("own");
+        }
+        store.retire(dead);
+
+        let freed = store.collect();
+        assert_eq!(freed.len(), 1);
+        assert_eq!(freed[0].pipeline, vk::Pipeline::from_raw(0xBB));
+        assert_eq!(store.census().families, 1);
+        assert!(store.request(live, &key(1)).is_ready());
+    }
+
+    /// The end of the device epoch retires every family at once, and one
+    /// collection frees everything nobody holds.
+    #[test]
+    fn retiring_every_family_frees_every_unheld_variant() {
+        let mut store = Store::new();
+        for slot in 0..5u32 {
+            let pipeline = id(slot, 1);
+            for module in 0..3u64 {
+                let flight = store.begin_flight(pipeline, key(module)).expect("first");
+                store
+                    .publish(pipeline, flight, Ok(native(u64::from(slot) * 16 + module)))
+                    .expect("own");
+            }
+        }
+        assert_eq!(store.census().families, 5);
+        assert_eq!(store.census().variants, 15);
+
+        store.retire_all();
+        assert_eq!(store.retiring(), 5);
+        let freed = store.collect();
+        assert_eq!(freed.len(), 15);
+        assert_eq!(store.census().families, 0);
+        assert_eq!(store.census().variants, 0);
+    }
+
+    /// A flight published under the wrong semantic pipeline changes nothing
+    /// and hands the compiled pipeline back. Dropping it here would leak a
+    /// `VkPipeline` nobody else has a name for.
+    #[test]
+    fn a_flight_published_under_the_wrong_pipeline_comes_back_whole() {
+        let mut store = Store::new();
+        let (mine, theirs) = (id(7, 1), id(8, 1));
+        // Give the wrong family an existence of its own, so the failure is a
+        // mismatch rather than an absence.
+        let seed = store.begin_flight(mine, key(9)).expect("first");
+        store.publish(mine, seed, Ok(native(1))).expect("own");
+
+        let flight = store.begin_flight(theirs, key(1)).expect("their flight");
+        let misdirected = store
+            .publish(mine, flight, Ok(native(0xAA)))
+            .expect_err("not this pipeline's to publish");
+        assert_eq!(store.census().foreign_flights, 1);
+
+        // Neither family moved: the wrong one gained nothing and the right one
+        // still has its flight outstanding.
+        assert_eq!(store.census().variants, 2, "one ready, one compiling");
+        assert!(matches!(store.request(theirs, &key(1)), Answer::Compiling));
+
+        // And the publication is recoverable rather than a leak plus a key
+        // stuck compiling for the life of the family.
+        assert!(matches!(
+            misdirected.outcome,
+            Ok(Native {
+                pipeline: p,
+                ..
+            }) if p == vk::Pipeline::from_raw(0xAA)
+        ));
+        store
+            .publish(theirs, misdirected.flight, misdirected.outcome)
+            .expect("its own family this time");
+        assert!(store.request(theirs, &key(1)).is_ready());
     }
 }
