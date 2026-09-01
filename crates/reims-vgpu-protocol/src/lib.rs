@@ -26,6 +26,8 @@
 //!   other half of what a guest sends and which the manifest cannot enumerate.
 //! - [`blit`] — which transfer a blit opcode names, which is its shape rather
 //!   than its closure.
+//! - [`compute`] — which compute-encoder record an opcode names, and the pass
+//!   dispatch type that only reaches the wire through the descriptor.
 //! - [`extent`] — the guest API's three-dimensional extent, its mip-level
 //!   dimensions, and the byte arithmetic of a tightly-packed image.
 //! - [`sync`] — which opcode is a fence, an event or a barrier, on which rail,
@@ -48,6 +50,7 @@ extern crate alloc;
 
 pub mod blit;
 pub mod closure;
+pub mod compute;
 pub mod extent;
 pub mod packets;
 pub mod residency;

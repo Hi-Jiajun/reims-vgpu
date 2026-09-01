@@ -24,6 +24,7 @@
 
 pub mod access;
 pub mod blit;
+pub mod compute;
 pub mod content;
 pub mod depend;
 pub mod identity;
