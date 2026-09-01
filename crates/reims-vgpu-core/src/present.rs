@@ -18,6 +18,18 @@
 //! resource lifecycle and no other surface is held by it. A device that waited
 //! for an image inside a general drain would let a slow display stop compute.
 //!
+//! # A present that cannot acquire is parked here, and nowhere else
+//!
+//! Refusing an acquire is not the whole answer, because the packet that asked
+//! for it is a transaction the guest is waiting on: dropping it is a lost frame
+//! and a completion word that never arrives. So a present with no image to take
+//! parks in *this surface's* queue, in arrival order, and
+//! [`PresentStream::wake`] hands it back when an image frees. Nothing outside
+//! the surface is held: another surface has its own stream, and a channel with
+//! no present on it never touches this queue at all. That is what
+//! "backpressure does not head-of-line block" means structurally rather than by
+//! convention — there is no shared queue for a slow display to fill.
+//!
 //! # Order is FIFO unless the contract says a pending present may be replaced
 //!
 //! Presenting in submission order is the default and the only safe assumption.
@@ -36,7 +48,7 @@
 //! exactness [`crate::retire`] applies to every other native object — and the
 //! caller gets it back when that point is reached, never before.
 
-use crate::identity::TimelinePoint;
+use crate::identity::{CompletionStamp, IngressOrdinal, TimelinePoint};
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
 
@@ -147,6 +159,36 @@ pub struct Retired {
     pub last_use: TimelinePoint,
 }
 
+/// A present packet that has not got an image yet.
+///
+/// Carries the completion word because the packet's obligation travels with it:
+/// a parked present that lost its stamp is a guest waiting on a word nothing
+/// can publish any more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentRequest {
+    pub ingress: IngressOrdinal,
+    pub stamp: Option<CompletionStamp>,
+}
+
+/// What admitting a present packet did.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a present that is neither acquired nor parked is a frame nothing will ever show"]
+pub enum Admission {
+    /// An image was free and the frame may be drawn.
+    Acquired {
+        request: PresentRequest,
+        ticket: Ticket,
+    },
+    /// Every returned image is in flight. The request is held in this surface's
+    /// own queue behind `ahead` others, and nothing outside this surface is
+    /// held with it.
+    Parked { ahead: usize },
+    /// No swapchain has been configured. Parking would be waiting for an image
+    /// from a swapchain that does not exist, so this is the one present the
+    /// caller has to answer for itself.
+    NotConfigured,
+}
+
 #[derive(Debug)]
 struct InFlight {
     sequence: u64,
@@ -166,6 +208,8 @@ pub struct PresentStream {
     requested_depth: Option<usize>,
     next_sequence: u64,
     in_flight: VecDeque<InFlight>,
+    /// Present packets waiting for an image, oldest first.
+    parked: VecDeque<PresentRequest>,
     retiring: Vec<Retired>,
     presented: usize,
     superseded: usize,
@@ -182,6 +226,7 @@ impl PresentStream {
             requested_depth: None,
             next_sequence: 0,
             in_flight: VecDeque::new(),
+            parked: VecDeque::new(),
             retiring: Vec::new(),
             presented: 0,
             superseded: 0,
@@ -282,9 +327,22 @@ impl PresentStream {
     /// [`Refusal::NotConfigured`] before a swapchain exists, and
     /// [`Refusal::NoFreeImage`] when all of them are in flight.
     pub fn acquire(&mut self) -> Result<Ticket, Refusal> {
+        let outcome = self.take_image();
+        if matches!(outcome, Err(Refusal::NoFreeImage { .. })) {
+            self.backpressured += 1;
+        }
+        outcome
+    }
+
+    /// Reserve an image without charging the backpressure census.
+    ///
+    /// Separate because [`Self::wake`] asks whether an image is free on every
+    /// image release, and counting those as backpressure would make the number
+    /// that says whether the returned count is the bottleneck grow with how
+    /// often the stream is polled rather than with how often a frame waited.
+    fn take_image(&mut self) -> Result<Ticket, Refusal> {
         let images = self.images.ok_or(Refusal::NotConfigured)?;
         if self.in_flight.len() >= images {
-            self.backpressured += 1;
             return Err(Refusal::NoFreeImage { images });
         }
         let used: Vec<usize> = self.in_flight.iter().map(|f| f.image).collect();
@@ -303,6 +361,58 @@ impl PresentStream {
             sequence,
             image,
         })
+    }
+
+    /// Admit a present packet: give it an image, or park it for one.
+    ///
+    /// A request parks behind anything already parked even when an image is
+    /// free, because the frame ahead of it asked first and presenting them out
+    /// of arrival order is the reordering [`Order`] exists to decide about —
+    /// not something a queue drains its way into.
+    pub fn submit(&mut self, request: PresentRequest) -> Admission {
+        if self.parked.is_empty() {
+            match self.take_image() {
+                Ok(ticket) => return Admission::Acquired { request, ticket },
+                Err(Refusal::NotConfigured) => return Admission::NotConfigured,
+                Err(_) => self.backpressured += 1,
+            }
+        }
+        let ahead = self.parked.len();
+        self.parked.push_back(request);
+        Admission::Parked { ahead }
+    }
+
+    /// The parked presents that can acquire now, oldest first.
+    ///
+    /// Call after an image is released — [`Self::complete`] — or after a
+    /// swapchain is replaced with more images. Returns nothing when nothing is
+    /// waiting, which is the ordinary case and is not a refusal.
+    #[must_use]
+    pub fn wake(&mut self) -> Vec<(PresentRequest, Ticket)> {
+        let mut woken = Vec::new();
+        while !self.parked.is_empty() {
+            let Ok(ticket) = self.take_image() else { break };
+            let request = self.parked.pop_front().expect("not empty");
+            woken.push((request, ticket));
+        }
+        woken
+    }
+
+    /// Presents waiting for an image.
+    #[must_use]
+    pub fn parked(&self) -> usize {
+        self.parked.len()
+    }
+
+    /// Give back every parked present without acquiring for it.
+    ///
+    /// For a teardown or a reset: the frames will not be shown, and their
+    /// completion words are still owed. Dropping them silently is the hang this
+    /// returns them to prevent, so there is no path that discards a parked
+    /// present without handing it to somebody.
+    #[must_use = "a parked present nobody takes is a completion word nothing publishes"]
+    pub fn abandon_parked(&mut self) -> Vec<PresentRequest> {
+        self.parked.drain(..).collect()
     }
 
     /// Where a ticket's frame is.
@@ -655,5 +765,156 @@ mod tests {
     fn a_swapchain_of_no_images_is_a_contract_violation() {
         let mut s = PresentStream::new(Order::Fifo);
         s.configure(2, 0);
+    }
+    fn request(ingress: u64) -> PresentRequest {
+        PresentRequest {
+            ingress: IngressOrdinal(ingress),
+            stamp: Some(CompletionStamp {
+                slot: crate::identity::StampSlot(1),
+                value: crate::identity::StampValue(ingress as u32),
+            }),
+        }
+    }
+
+    /// A present with no image left does not vanish and does not wait: it
+    /// parks in this surface's own queue, and the image release is what hands
+    /// it back.
+    #[test]
+    fn a_present_with_no_image_parks_and_wakes_in_arrival_order() {
+        let mut s = PresentStream::new(Order::Fifo);
+        s.configure(2, 2);
+        let mut tickets = Vec::new();
+        for i in 0..2 {
+            let Admission::Acquired { ticket, .. } = s.submit(request(i)) else {
+                panic!("an image was free");
+            };
+            tickets.push(ticket);
+        }
+        assert_eq!(s.submit(request(2)), Admission::Parked { ahead: 0 });
+        assert_eq!(s.submit(request(3)), Admission::Parked { ahead: 1 });
+        assert_eq!(s.parked(), 2);
+        assert!(s.wake().is_empty(), "no image has been released yet");
+
+        s.ready(&tickets[0]).expect("drawn");
+        s.queue(&tickets[0]).expect("head of the order");
+        s.complete(&tickets[0]).expect("shown");
+        let woken = s.wake();
+        assert_eq!(woken.len(), 1, "one image freed, one present woken");
+        assert_eq!(woken[0].0, request(2), "the one that asked first");
+        assert_eq!(s.parked(), 1);
+        s.ready(&tickets[1]).expect("drawn");
+        s.queue(&tickets[1]).expect("head of the order now");
+        s.complete(&tickets[1]).expect("shown");
+        assert_eq!(s.wake()[0].0, request(3));
+        assert_eq!(s.parked(), 0);
+    }
+
+    /// A request parks behind anything already parked even when an image is
+    /// free, or a queue drains its way into presenting frames out of order.
+    #[test]
+    fn a_present_never_overtakes_one_already_parked() {
+        let mut s = PresentStream::new(Order::Fifo);
+        s.configure(1, 1);
+        let Admission::Acquired { ticket, .. } = s.submit(request(0)) else {
+            panic!("the first image was free");
+        };
+        assert_eq!(s.submit(request(1)), Admission::Parked { ahead: 0 });
+        s.ready(&ticket).expect("drawn");
+        s.queue(&ticket).expect("head");
+        s.complete(&ticket).expect("shown");
+        // An image is free now, and the newcomer still goes behind.
+        assert_eq!(s.submit(request(2)), Admission::Parked { ahead: 1 });
+        let woken = s.wake();
+        assert_eq!(woken.len(), 1);
+        assert_eq!(woken[0].0, request(1), "the older request took the image");
+    }
+
+    /// The structural half of "backpressure does not head-of-line block":
+    /// there is no queue for a slow display to fill that another surface
+    /// reaches.
+    #[test]
+    fn a_full_surface_does_not_hold_another_ones_presents() {
+        let mut slow = PresentStream::new(Order::Fifo);
+        slow.configure(1, 1);
+        let mut fast = PresentStream::new(Order::Fifo);
+        fast.configure(2, 2);
+        let Admission::Acquired { .. } = slow.submit(request(0)) else {
+            panic!("the first image was free");
+        };
+        assert_eq!(slow.submit(request(1)), Admission::Parked { ahead: 0 });
+        assert!(matches!(
+            fast.submit(request(2)),
+            Admission::Acquired { .. }
+        ));
+        assert_eq!(fast.parked(), 0);
+    }
+
+    /// Resizing while presents are parked: they belong to the surface, not to
+    /// the swapchain, so a larger replacement is what lets them through.
+    #[test]
+    fn parked_presents_survive_a_swapchain_replacement() {
+        let mut s = PresentStream::new(Order::Fifo);
+        s.configure(1, 1);
+        let Admission::Acquired { ticket, .. } = s.submit(request(0)) else {
+            panic!("the first image was free");
+        };
+        assert_eq!(s.submit(request(1)), Admission::Parked { ahead: 0 });
+        let retired = s.replace(3, 3, at(7));
+        assert_eq!(retired.generation, SwapchainGeneration::FIRST);
+        assert_eq!(
+            s.phase(&ticket),
+            None,
+            "the in-flight frame belonged to a swapchain that is gone"
+        );
+        let woken = s.wake();
+        assert_eq!(woken.len(), 1, "the parked present takes a new image");
+        assert_eq!(woken[0].0, request(1));
+        assert_eq!(woken[0].1.generation, SwapchainGeneration::FIRST.next());
+    }
+
+    #[test]
+    fn a_present_with_no_swapchain_is_not_parked() {
+        let mut s = PresentStream::new(Order::Fifo);
+        assert_eq!(s.submit(request(0)), Admission::NotConfigured);
+        assert_eq!(
+            s.parked(),
+            0,
+            "parking would be waiting for a swapchain that does not exist"
+        );
+    }
+
+    #[test]
+    fn abandoning_parked_presents_hands_them_back() {
+        let mut s = PresentStream::new(Order::Fifo);
+        s.configure(1, 1);
+        let Admission::Acquired { .. } = s.submit(request(0)) else {
+            panic!("the first image was free");
+        };
+        assert_eq!(s.submit(request(1)), Admission::Parked { ahead: 0 });
+        assert_eq!(s.submit(request(2)), Admission::Parked { ahead: 1 });
+        assert_eq!(s.abandon_parked(), vec![request(1), request(2)]);
+        assert_eq!(s.parked(), 0);
+    }
+
+    /// The backpressure census counts frames that waited, not polls that found
+    /// nothing.
+    #[test]
+    fn waking_an_empty_queue_is_not_backpressure() {
+        let mut s = PresentStream::new(Order::Fifo);
+        s.configure(1, 1);
+        let Admission::Acquired { ticket, .. } = s.submit(request(0)) else {
+            panic!("the first image was free");
+        };
+        assert_eq!(s.submit(request(1)), Admission::Parked { ahead: 0 });
+        assert_eq!(s.census().2, 1, "one frame waited");
+        for _ in 0..10 {
+            assert!(s.wake().is_empty());
+        }
+        assert_eq!(s.census().2, 1, "and ten polls did not make it ten");
+        s.ready(&ticket).expect("drawn");
+        s.queue(&ticket).expect("head");
+        s.complete(&ticket).expect("shown");
+        assert_eq!(s.wake().len(), 1);
+        assert_eq!(s.census().2, 1);
     }
 }
