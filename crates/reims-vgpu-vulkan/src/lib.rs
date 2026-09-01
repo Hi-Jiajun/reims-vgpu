@@ -44,6 +44,8 @@
 //!   is a performance bug and never a correctness one: topology selects a
 //!   preference order, the required flags are always the fallback, and nothing
 //!   may branch on topology in a way the guest can observe.
+//! - [`record`] — issuing the planned commands into a command buffer, and the
+//!   one choice it makes: which spelling of a barrier this host takes.
 //! - [`recording`] — everything one native recording owns, held as one value
 //!   from the slots it takes to the pipelines it releases.
 //! - [`queues`] — which queue family this rail submits to, and the value that
@@ -94,6 +96,7 @@ pub mod mipmap;
 pub mod placement;
 pub mod pools;
 pub mod queues;
+pub mod record;
 pub mod recording;
 pub mod resident;
 pub mod staging;

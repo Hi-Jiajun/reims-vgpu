@@ -18,17 +18,26 @@
 //! distinguishable from a passing one in the output.
 
 use ash::vk;
+use reims_vgpu_core::blit::{BufferSpan, FillPattern};
 use reims_vgpu_core::identity::DeviceEpoch as EpochId;
+use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SessionGeneration, SlotGeneration};
 use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+use reims_vgpu_core::retire::{Lifetime, NativeRetirement};
 use reims_vgpu_core::texture_shape::{TextureKind, TextureShape, TextureUsage};
 use reims_vgpu_vulkan::buffer;
 use reims_vgpu_vulkan::device::DeviceEpoch;
 use reims_vgpu_vulkan::host::VulkanHost;
 use reims_vgpu_vulkan::image;
+use reims_vgpu_vulkan::layout;
 use reims_vgpu_vulkan::memory::{select_memory_type, MappedMemoryKind, MemoryClass};
+use reims_vgpu_vulkan::mipmap;
 use reims_vgpu_vulkan::placement::Route;
 use reims_vgpu_vulkan::pools::WorkerPool;
+use reims_vgpu_vulkan::record;
+use reims_vgpu_vulkan::resident;
+use reims_vgpu_vulkan::staging;
 use reims_vgpu_vulkan::timeline::Timeline;
+use reims_vgpu_vulkan::transfer;
 use reims_vgpu_vulkan::view;
 
 /// What the GPU writes, and what the CPU has to read back.
@@ -467,5 +476,652 @@ fn a_decoded_texture_becomes_an_image_the_driver_admitted() {
         device.destroy_image(image, None);
         device.free_memory(memory, None);
     }
+    drop(epoch);
+}
+
+/// The ragged fill, end to end on the GPU.
+///
+/// The split into a staged head, a native interior and a staged tail is pure
+/// arithmetic and unit-tested as such. What only a device can settle is
+/// whether those three commands, run together, write exactly the bytes the
+/// guest named — no byte outside the range, and none inside it left out. So
+/// this zeroes a buffer on the GPU, runs a fill over a range that starts and
+/// ends off a four-byte boundary, and reads every byte back.
+#[test]
+fn a_ragged_fill_writes_exactly_the_range_the_guest_named() {
+    let Ok(host) = VulkanHost::open("reims-vgpu-vulkan fill integration") else {
+        println!("no real device: nothing to fill");
+        return;
+    };
+    let census = host.census();
+    let mut epoch = DeviceEpoch::create(
+        host.instance(),
+        host.physical_device(),
+        census,
+        EpochId::FIRST,
+    )
+    .expect("the driver refused a set its own census admitted");
+    let device = epoch.device().clone();
+    let family = census.queues().universal().index;
+    let owner = epoch
+        .queues()
+        .claim_in(family, 0)
+        .expect("the chosen family has queue zero");
+    // SAFETY: the family and index came from an owner this epoch handed out.
+    let queue = unsafe { device.get_device_queue(owner.family(), owner.index()) };
+
+    let properties = unsafe {
+        host.instance()
+            .get_physical_device_memory_properties(host.physical_device())
+    };
+    let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
+    let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance3);
+    unsafe {
+        host.instance()
+            .get_physical_device_properties2(host.physical_device(), &mut properties2);
+    }
+    let limits = unsafe {
+        host.instance()
+            .get_physical_device_properties(host.physical_device())
+    }
+    .limits;
+
+    // One host-visible buffer per role, each allocated through the rail's own
+    // memory selection so the class it lands on is a real host answer.
+    let make = |size: u64, class: MemoryClass| {
+        let buffer = unsafe {
+            device.create_buffer(
+                &buffer::plan(
+                    size,
+                    Route::HostStaging { working: class },
+                    census.buffers(),
+                )
+                .unwrap_or_else(|refusal| panic!("{refusal}"))
+                .create_info(),
+                None,
+            )
+        }
+        .expect("a buffer bindable as every class");
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let pick = select_memory_type(
+            &properties,
+            requirements.memory_type_bits,
+            &census.memory().topology.request(class),
+            requirements.size,
+            maintenance3.max_memory_allocation_size,
+        )
+        .expect("a host-visible type exists on every Vulkan device");
+        let memory = unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(pick.index),
+                None,
+            )
+        }
+        .expect("the selected type allocates");
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }.expect("bind");
+        (buffer, memory, requirements.size, pick.index)
+    };
+
+    const BYTES: u64 = 256;
+    const START: u64 = 1;
+    const LENGTH: u64 = 253;
+    const VALUE: u8 = 0xAB;
+
+    let (dest, dest_memory, dest_size, dest_type) = make(BYTES, MemoryClass::Readback);
+    let (scratch, scratch_memory, scratch_size, _) = make(64, MemoryClass::Upload);
+    let mapped =
+        unsafe { device.map_memory(scratch_memory, 0, scratch_size, vk::MemoryMapFlags::empty()) }
+            .expect("upload memory is host visible");
+    let mut arena = staging::Arena::adopt(
+        64,
+        limits.non_coherent_atom_size,
+        vec![scratch],
+        vec![scratch_memory],
+        vec![mapped.cast::<u8>()],
+    );
+
+    // The guest's name for the destination, resolved the way every transfer
+    // resolves one.
+    let mut residency = resident::Residency::new();
+    let mut retirement = NativeRetirement::new();
+    let name = ResourceId {
+        slot: ObjectListRef(1),
+        generation: SlotGeneration(1),
+    };
+    residency
+        .publish(
+            name,
+            Lifetime::new(SessionGeneration::FIRST, EpochId::FIRST),
+            resident::Native::Buffer(resident::NativeBuffer {
+                buffer: dest,
+                memory: dest_memory,
+                plan: buffer::plan(
+                    BYTES,
+                    Route::HostStaging {
+                        working: MemoryClass::Readback,
+                    },
+                    census.buffers(),
+                )
+                .expect("plannable"),
+            }),
+            &mut retirement,
+        )
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let plan = transfer::plan_fill(
+        BufferSpan {
+            buffer: name,
+            offset: START,
+            length: LENGTH,
+        },
+        FillPattern::Byte(VALUE),
+        &residency,
+        &mut arena,
+    )
+    .unwrap_or_else(|refusal| panic!("{refusal}"));
+    let head = plan
+        .head
+        .expect("a head, because 1 is not a multiple of four");
+    let tail = plan.tail.expect("a tail, because 254 is not either");
+    println!(
+        "fill head={}@{} middle={}@{} tail={}@{}",
+        head.length,
+        head.dest_offset,
+        plan.middle.expect("an interior").size,
+        plan.middle.expect("an interior").offset,
+        tail.length,
+        tail.dest_offset,
+    );
+
+    // The CPU half: the edge bytes into the arena, flushed over the range the
+    // arena says covers them.
+    for edge in [head, tail] {
+        // SAFETY: the window came from this arena and nothing has been
+        // submitted against it.
+        unsafe { arena.set(edge.window, edge.byte) };
+    }
+    let scratch_kind = MappedMemoryKind::of(&properties, {
+        let requirements = unsafe { device.get_buffer_memory_requirements(scratch) };
+        select_memory_type(
+            &properties,
+            requirements.memory_type_bits,
+            &census.memory().topology.request(MemoryClass::Upload),
+            requirements.size,
+            maintenance3.max_memory_allocation_size,
+        )
+        .expect("an upload type")
+        .index
+    });
+    if !scratch_kind.coherent {
+        let (offset, size) = arena.flush_range(head.window);
+        let (tail_offset, tail_size) = arena.flush_range(tail.window);
+        let ranges = [
+            vk::MappedMemoryRange::default()
+                .memory(scratch_memory)
+                .offset(offset)
+                .size(size),
+            vk::MappedMemoryRange::default()
+                .memory(scratch_memory)
+                .offset(tail_offset)
+                .size(tail_size),
+        ];
+        unsafe { device.flush_mapped_memory_ranges(&ranges) }.expect("flush");
+    }
+
+    // Record: zero the whole buffer, barrier, then the fill.
+    let pool = unsafe {
+        device.create_command_pool(
+            &vk::CommandPoolCreateInfo::default().queue_family_index(owner.family()),
+            None,
+        )
+    }
+    .expect("a command pool");
+    let command = unsafe {
+        device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1),
+        )
+    }
+    .expect("a command buffer")[0];
+    let recorder = record::Recorder::new(&device, command, census.synchronization2());
+    unsafe {
+        device
+            .begin_command_buffer(
+                command,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .expect("begin");
+        device.cmd_fill_buffer(command, dest, 0, BYTES, 0);
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ);
+        device.cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[barrier],
+            &[],
+            &[],
+        );
+        recorder.fill(&plan, &arena);
+        device.end_command_buffer(command).expect("end");
+    }
+
+    let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    let semaphore = unsafe {
+        device.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut type_info),
+            None,
+        )
+    }
+    .expect("timeline semaphores are the support floor");
+    let mut timeline = Timeline::adopt(semaphore);
+    let point = timeline.reserve();
+    let commands = [command];
+    let signals = [semaphore];
+    let values = [point.0];
+    let mut timeline_info =
+        vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+    let submit = vk::SubmitInfo::default()
+        .command_buffers(&commands)
+        .signal_semaphores(&signals)
+        .push_next(&mut timeline_info);
+    unsafe { device.queue_submit(queue, &[submit], vk::Fence::null()) }.expect("submit");
+    arena.submitted(point);
+    // SAFETY: the semaphore belongs to this device and is alive.
+    unsafe { timeline.wait(&device, point, TIMEOUT_NS) }.expect("the GPU signalled the point");
+    // SAFETY: as above.
+    let reached = unsafe { timeline.poll(&device) }.expect("a forwards reading");
+    assert_eq!(arena.recycle(reached), 1, "the timeline returns the chunk");
+
+    // Every byte, checked against the range the guest named.
+    let kind = MappedMemoryKind::of(&properties, dest_type);
+    let read = unsafe { device.map_memory(dest_memory, 0, dest_size, vk::MemoryMapFlags::empty()) }
+        .expect("host visible");
+    if !kind.coherent {
+        let range = vk::MappedMemoryRange::default()
+            .memory(dest_memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        unsafe { device.invalidate_mapped_memory_ranges(&[range]) }.expect("invalidate");
+    }
+    // SAFETY: the mapping covers `dest_size >= BYTES` bytes and the GPU is done.
+    let bytes = unsafe { std::slice::from_raw_parts(read.cast::<u8>(), BYTES as usize) };
+    for (index, byte) in bytes.iter().enumerate() {
+        let index = index as u64;
+        let inside = (START..START + LENGTH).contains(&index);
+        assert_eq!(
+            *byte,
+            if inside { VALUE } else { 0 },
+            "byte {index} is {byte:#04x}, and it is {} the range",
+            if inside { "inside" } else { "outside" }
+        );
+    }
+    println!("filled bytes {START}..{} and nothing else", START + LENGTH);
+    unsafe { device.unmap_memory(dest_memory) };
+
+    unsafe {
+        device.device_wait_idle().expect("idle before teardown");
+        device.unmap_memory(scratch_memory);
+        device.destroy_command_pool(pool, None);
+        device.destroy_semaphore(semaphore, None);
+        device.destroy_buffer(dest, None);
+        device.free_memory(dest_memory, None);
+        device.destroy_buffer(scratch, None);
+        device.free_memory(scratch_memory, None);
+    }
+    epoch.queues().release(owner);
+    drop(epoch);
+}
+
+/// The mip ladder, run on the GPU and read back.
+///
+/// A filtered reduction of a constant image is that constant at every level.
+/// So this fills level zero with one colour, runs the ladder this rail plans,
+/// and reads the single texel of the top level. A ladder whose barriers were
+/// in the wrong order, whose extents were level zero's, or whose blit named
+/// the wrong layouts fails here and passes every unit test in the crate.
+#[test]
+fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
+    let Ok(host) = VulkanHost::open("reims-vgpu-vulkan mipmap integration") else {
+        println!("no real device: nothing to reduce");
+        return;
+    };
+    let census = host.census();
+    let mut epoch = DeviceEpoch::create(
+        host.instance(),
+        host.physical_device(),
+        census,
+        EpochId::FIRST,
+    )
+    .expect("the driver refused a set its own census admitted");
+    let device = epoch.device().clone();
+    let family = census.queues().universal().index;
+    let owner = epoch
+        .queues()
+        .claim_in(family, 0)
+        .expect("the chosen family has queue zero");
+    // SAFETY: the family and index came from an owner this epoch handed out.
+    let queue = unsafe { device.get_device_queue(owner.family(), owner.index()) };
+
+    const SIDE: u32 = 4;
+    const LEVELS: u32 = 3;
+    const TEXEL: [u8; 4] = [0x10, 0x20, 0x30, 0x40];
+    let format = vk::Format::R8G8B8A8_UNORM;
+
+    // Measured, not assumed: a format that cannot be linearly filtered here
+    // must refuse rather than drop to nearest.
+    let format_properties = unsafe {
+        host.instance()
+            .get_physical_device_format_properties(host.physical_device(), format)
+    };
+    let support = mipmap::FilterSupport {
+        linear_blit_source: format_properties
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR),
+    };
+    println!("linear blit source={}", support.linear_blit_source);
+
+    let declaration = TextureShape {
+        kind: TextureKind::D2.ordinal(),
+        width: SIDE,
+        height: SIDE,
+        depth: 1,
+        mipmap_level_count: LEVELS,
+        sample_count: 1,
+        array_length: 1,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        usage: TextureUsage::SHADER_READ,
+    };
+    let texture = declaration.checked().expect("a valid declaration");
+    let plan = image::plan(
+        texture,
+        format,
+        Route::HostStaging {
+            working: MemoryClass::DeviceLocal,
+        },
+    )
+    .expect("plannable");
+    let query = plan.query();
+    let reported = unsafe {
+        host.instance().get_physical_device_image_format_properties(
+            host.physical_device(),
+            query.format,
+            query.image_type,
+            query.tiling,
+            query.usage,
+            query.flags,
+        )
+    }
+    .expect("RGBA8 sampled is universal");
+    let admitted = plan
+        .admitted(reported)
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
+    let image = unsafe { device.create_image(&admitted.create_info(), None) }.expect("an image");
+
+    let properties = unsafe {
+        host.instance()
+            .get_physical_device_memory_properties(host.physical_device())
+    };
+    let mut maintenance3 = vk::PhysicalDeviceMaintenance3Properties::default();
+    let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance3);
+    unsafe {
+        host.instance()
+            .get_physical_device_properties2(host.physical_device(), &mut properties2);
+    }
+    let bind = |requirements: vk::MemoryRequirements, class: MemoryClass| {
+        let pick = select_memory_type(
+            &properties,
+            requirements.memory_type_bits,
+            &census.memory().topology.request(class),
+            requirements.size,
+            maintenance3.max_memory_allocation_size,
+        )
+        .expect("a memory type for this class");
+        let memory = unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(pick.index),
+                None,
+            )
+        }
+        .expect("the selected type allocates");
+        (memory, pick.index, requirements.size)
+    };
+    let (image_memory, _, _) = bind(
+        unsafe { device.get_image_memory_requirements(image) },
+        MemoryClass::DeviceLocal,
+    );
+    unsafe { device.bind_image_memory(image, image_memory, 0) }.expect("bind");
+
+    // One host-visible buffer carrying level zero's texels up and the top
+    // level's one texel back.
+    let staging_bytes = u64::from(SIDE * SIDE * 4);
+    let staging = unsafe {
+        device.create_buffer(
+            &buffer::plan(
+                staging_bytes,
+                Route::HostStaging {
+                    working: MemoryClass::Readback,
+                },
+                census.buffers(),
+            )
+            .expect("plannable")
+            .create_info(),
+            None,
+        )
+    }
+    .expect("a staging buffer");
+    let requirements = unsafe { device.get_buffer_memory_requirements(staging) };
+    let (staging_memory, staging_type, staging_size) = bind(requirements, MemoryClass::Readback);
+    unsafe { device.bind_buffer_memory(staging, staging_memory, 0) }.expect("bind");
+
+    let kind = MappedMemoryKind::of(&properties, staging_type);
+    let mapped =
+        unsafe { device.map_memory(staging_memory, 0, staging_size, vk::MemoryMapFlags::empty()) }
+            .expect("host visible");
+    // SAFETY: the mapping covers at least `staging_bytes`, and nothing is
+    // submitted against it yet.
+    unsafe {
+        let bytes = std::slice::from_raw_parts_mut(mapped.cast::<u8>(), staging_bytes as usize);
+        for texel in bytes.chunks_exact_mut(4) {
+            texel.copy_from_slice(&TEXEL);
+        }
+    }
+    if !kind.coherent {
+        let range = vk::MappedMemoryRange::default()
+            .memory(staging_memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        unsafe { device.flush_mapped_memory_ranges(&[range]) }.expect("flush");
+    }
+
+    // The layout tracker owns every transition below, including the two the
+    // ladder does not plan: getting level zero written, and getting the top
+    // level readable afterwards.
+    let tracked = layout::ImageId(1);
+    let mut tracker = layout::LayoutTracker::new();
+    tracker.declare(tracked, LEVELS, 1, 1, Some(owner.family()));
+    let aspect = view::aspect(MTL_FORMAT_RGBA8_UNORM);
+
+    let pool = unsafe {
+        device.create_command_pool(
+            &vk::CommandPoolCreateInfo::default().queue_family_index(owner.family()),
+            None,
+        )
+    }
+    .expect("a command pool");
+    let command = unsafe {
+        device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1),
+        )
+    }
+    .expect("a command buffer")[0];
+    let recorder = record::Recorder::new(&device, command, census.synchronization2());
+    unsafe {
+        device
+            .begin_command_buffer(
+                command,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .expect("begin");
+    }
+
+    // Level zero, from the staging buffer. Its contents are about to be
+    // entirely overwritten, so the transition discards.
+    let upload = tracker
+        .plan(
+            tracked,
+            layout::Subresource::new(0, 0),
+            layout::Use::TransferDst,
+            layout::Contents::Discard,
+        )
+        .expect("a declared subresource")
+        .expect("UNDEFINED is not TRANSFER_DST");
+    // SAFETY: the command buffer is recording and every handle is this
+    // device's.
+    unsafe { recorder.transition(image, &upload, aspect) };
+    let region = vk::BufferImageCopy {
+        buffer_offset: 0,
+        buffer_row_length: 0,
+        buffer_image_height: 0,
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: aspect,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        image_offset: vk::Offset3D::default(),
+        image_extent: vk::Extent3D {
+            width: SIDE,
+            height: SIDE,
+            depth: 1,
+        },
+    };
+    // SAFETY: as above; level zero is in TRANSFER_DST by the transition just
+    // recorded.
+    unsafe {
+        recorder.transfer(&transfer::Command::CopyBufferToImage {
+            source: staging,
+            dest: image,
+            regions: vec![region],
+        });
+    }
+
+    let ladder = mipmap::plan(tracked, texture, support, &mut tracker)
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
+    assert_eq!(
+        ladder
+            .iter()
+            .filter(|s| matches!(s, mipmap::Step::Blit(_)))
+            .count(),
+        (LEVELS - 1) as usize
+    );
+    // SAFETY: as above; the ladder's own transitions put each level into the
+    // layout its blit needs.
+    unsafe { recorder.mipmap(image, &ladder, aspect) };
+
+    // And the top level out. The ladder left it a transfer destination.
+    let readback = tracker
+        .plan(
+            tracked,
+            layout::Subresource::new(LEVELS - 1, 0),
+            layout::Use::TransferSrc,
+            layout::Contents::Keep,
+        )
+        .expect("a declared subresource")
+        .expect("TRANSFER_DST is not TRANSFER_SRC");
+    // SAFETY: as above.
+    unsafe { recorder.transition(image, &readback, aspect) };
+    // SAFETY: as above.
+    unsafe {
+        recorder.transfer(&transfer::Command::CopyImageToBuffer {
+            source: image,
+            dest: staging,
+            regions: vec![vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: aspect,
+                    mip_level: LEVELS - 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D::default(),
+                image_extent: vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            }],
+        });
+    }
+    unsafe { device.end_command_buffer(command) }.expect("end");
+
+    let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    let semaphore = unsafe {
+        device.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut type_info),
+            None,
+        )
+    }
+    .expect("timeline semaphores are the support floor");
+    let mut timeline = Timeline::adopt(semaphore);
+    let point = timeline.reserve();
+    let commands = [command];
+    let signals = [semaphore];
+    let values = [point.0];
+    let mut timeline_info =
+        vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+    let submit = vk::SubmitInfo::default()
+        .command_buffers(&commands)
+        .signal_semaphores(&signals)
+        .push_next(&mut timeline_info);
+    unsafe { device.queue_submit(queue, &[submit], vk::Fence::null()) }.expect("submit");
+    // SAFETY: the semaphore is this device's and is alive.
+    unsafe { timeline.wait(&device, point, TIMEOUT_NS) }.expect("the GPU signalled the point");
+
+    if !kind.coherent {
+        let range = vk::MappedMemoryRange::default()
+            .memory(staging_memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        unsafe { device.invalidate_mapped_memory_ranges(&[range]) }.expect("invalidate");
+    }
+    // SAFETY: the mapping is at least four bytes and the GPU is done.
+    let top = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 4) };
+    assert_eq!(
+        top, TEXEL,
+        "the top level of a constant image is not that constant"
+    );
+    println!("reduced {SIDE}x{SIDE} to {top:?} through {LEVELS} levels");
+
+    unsafe {
+        device.device_wait_idle().expect("idle before teardown");
+        device.unmap_memory(staging_memory);
+        device.destroy_command_pool(pool, None);
+        device.destroy_semaphore(semaphore, None);
+        device.destroy_buffer(staging, None);
+        device.free_memory(staging_memory, None);
+        device.destroy_image(image, None);
+        device.free_memory(image_memory, None);
+    }
+    epoch.queues().release(owner);
     drop(epoch);
 }

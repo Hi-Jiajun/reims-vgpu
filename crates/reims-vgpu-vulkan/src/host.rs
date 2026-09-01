@@ -260,20 +260,31 @@ impl VulkanHost {
         }
 
         let name = CString::new(application).unwrap_or_else(|_| c"reims-vgpu".to_owned());
-        // Ask for the baseline and no more. A higher `apiVersion` here does not
-        // enable anything — every capability above 1.2 is gated on the census —
-        // and asking for one the loader lacks is an instance-creation failure
-        // for no gain.
+        // Ask for what the loader has, not for the baseline.
+        //
+        // `VkApplicationInfo::apiVersion` is not a hint and not a minimum: it
+        // caps the version of *core* functionality the instance and its
+        // devices expose. Requesting 1.2 on a 1.4 device leaves
+        // `vkCmdPipelineBarrier2` — core in 1.3 — unresolvable, while
+        // `VkPhysicalDeviceProperties::apiVersion` still reports 1.4. A census
+        // reading only the device would then admit a promoted capability whose
+        // entry point does not load, and the failure is a null function
+        // pointer at record time rather than a refusal.
+        //
+        // So the request is the loader's own version, and what this rail
+        // *uses* stays gated on the census below — which is now told the
+        // effective version rather than the device's.
+        let requested = vk::make_api_version(0, loader_version.major, loader_version.minor, 0);
         let app = vk::ApplicationInfo::default()
             .application_name(&name)
-            .api_version(vk::API_VERSION_1_2);
+            .api_version(requested);
         let create = vk::InstanceCreateInfo::default().application_info(&app);
 
         // SAFETY: `create` and everything it points at outlive the call.
         let instance = unsafe { entry.create_instance(&create, None) }
             .map_err(|result| OpenFailure::CreateInstance { result })?;
 
-        match Self::choose(&instance) {
+        match Self::choose(&instance, requested) {
             Ok((physical, class, census)) => Ok(Self {
                 _entry: entry,
                 instance,
@@ -299,6 +310,7 @@ impl VulkanHost {
     /// the instance the caller owns as its only cleanup.
     fn choose(
         instance: &ash::Instance,
+        requested: u32,
     ) -> Result<(vk::PhysicalDevice, DeviceClass, Census), OpenFailure> {
         // SAFETY: the instance outlives this call.
         let devices = unsafe { instance.enumerate_physical_devices() }
@@ -310,7 +322,7 @@ impl VulkanHost {
             .enumerate()
             .map(|(index, physical)| {
                 // SAFETY: `physical` came from this instance's enumeration.
-                let (class, verdict) = unsafe { judge(instance, physical) };
+                let (class, verdict) = unsafe { judge(instance, physical, requested) };
                 (
                     physical,
                     Candidate {
@@ -371,7 +383,31 @@ impl std::fmt::Debug for VulkanHost {
     }
 }
 
+/// The version of core functionality a device actually exposes.
+///
+/// The lesser of what the device reports and what the instance asked for.
+/// `VkApplicationInfo::apiVersion` caps core functionality rather than
+/// requesting a floor, so a 1.4 device under a 1.2 instance exposes 1.2 — and
+/// a census told 1.4 there would admit `vkCmdPipelineBarrier2` on a device
+/// where it does not resolve.
+///
+/// A function rather than a `min` at the one call site because the rule is the
+/// claim, and the call site is the half that needs a device to reach.
+#[must_use]
+pub const fn effective_api(device: u32, requested: u32) -> u32 {
+    if device < requested {
+        device
+    } else {
+        requested
+    }
+}
+
 /// Read one physical device and hand it to the census.
+///
+/// `requested` is the instance's `VkApplicationInfo::apiVersion`. It is not
+/// informational: the version of core functionality actually usable is the
+/// lesser of it and what the device reports, and the census is told that
+/// lesser value so every promotion it admits is one whose entry point loads.
 ///
 /// # Safety
 ///
@@ -379,9 +415,11 @@ impl std::fmt::Debug for VulkanHost {
 unsafe fn judge(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
+    requested: u32,
 ) -> (DeviceClass, Result<Census, Floor>) {
     let properties = unsafe { instance.get_physical_device_properties(physical) };
     let class = DeviceClass::of(properties.device_type);
+    let effective = effective_api(properties.api_version, requested);
 
     let extension_properties =
         unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
@@ -427,7 +465,7 @@ unsafe fn judge(
     // `VK_KHR_maintenance4`. Asked for only when one of those is true, so that
     // a device that never answered is distinguishable from one that answered
     // zero — see `crate::buffer::BufferLimits`.
-    let api = ApiVersion::decode(properties.api_version);
+    let api = ApiVersion::decode(effective);
     let max_buffer_size = (api.at_least(1, 3) || has(extension::MAINTENANCE_4)).then(|| {
         let mut maintenance4 = vk::PhysicalDeviceMaintenance4Properties::default();
         let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance4);
@@ -439,7 +477,7 @@ unsafe fn judge(
     let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
 
     let verdict = Census::take(Reported {
-        api_version: properties.api_version,
+        api_version: effective,
         extensions: &names,
         timeline_semaphore: vulkan12.timeline_semaphore == vk::TRUE,
         synchronization2: synchronization2.synchronization2 == vk::TRUE,
@@ -656,5 +694,52 @@ mod tests {
                 assert!(!failure.slug().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn the_usable_version_is_the_lesser_of_the_device_and_the_instance() {
+        let v = |major, minor| vk::make_api_version(0, major, minor, 0);
+        // The case that produced a null `vkCmdPipelineBarrier2`: a 1.4 device
+        // under a 1.2 instance exposes 1.2 core, whatever it reports.
+        assert_eq!(effective_api(v(1, 4), v(1, 2)), v(1, 2));
+        // A loader ahead of the device caps at the device.
+        assert_eq!(effective_api(v(1, 2), v(1, 4)), v(1, 2));
+        assert_eq!(effective_api(v(1, 3), v(1, 3)), v(1, 3));
+    }
+
+    #[test]
+    fn a_census_taken_at_the_effective_version_does_not_admit_a_promotion() {
+        let memory = crate::memory::fixtures::nvidia_discrete();
+        let families = [vk::QueueFamilyProperties {
+            queue_flags: vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
+            queue_count: 1,
+            timestamp_valid_bits: 64,
+            min_image_transfer_granularity: vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        }];
+        // The device is 1.3, so synchronization2 is core on it — but only if
+        // the instance asked for 1.3. Under a 1.2 instance the census must not
+        // report it, because the entry point will not load.
+        let capped = Census::take(Reported {
+            api_version: effective_api(
+                vk::make_api_version(0, 1, 3, 0),
+                vk::make_api_version(0, 1, 2, 0),
+            ),
+            extensions: &[extension::SWAPCHAIN],
+            timeline_semaphore: true,
+            synchronization2: false,
+            mesh_shader: false,
+            descriptor_buffer: false,
+            max_push_descriptors: 0,
+            max_buffer_size: None,
+            memory: &memory,
+            queue_families: &families,
+        })
+        .expect("1.2 with timeline semaphores is the baseline");
+        assert!(!capped.synchronization2());
+        assert_eq!(capped.api(), ApiVersion { major: 1, minor: 2 });
     }
 }
