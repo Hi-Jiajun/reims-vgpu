@@ -2411,8 +2411,17 @@ impl ObjectCaches {
         if !vertex_binding_divisors.is_empty() {
             vtx_input = vtx_input.push_next(&mut vertex_divisor_state);
         }
-        let input_asm =
-            vk::PipelineInputAssemblyStateCreateInfo::default().topology(key.topology.vk());
+        // The rungs above the baseline are not wired: this cache still keys a
+        // pipeline on the exact primitive type, so the topology is declared
+        // rather than set per draw and `TopologyCell` is the floor every host
+        // meets. Naming the cell rather than omitting it is what will make
+        // turning a rung on a change to one value.
+        const TOPOLOGY: reims_vgpu_vulkan::topology::TopologyCell =
+            reims_vgpu_vulkan::topology::TopologyCell {
+                dynamic: false,
+                unrestricted: false,
+            };
+        let input_asm = reims_vgpu_vulkan::topology::plan(key.topology.0, TOPOLOGY).native();
         // Dynamic viewport/scissor so L5 key need not include extent (flip flag is static).
         // Stencil reference is dynamic (Metal's `SetStencilReferenceValue` is a
         // command distinct from the state object) so distinct references reuse

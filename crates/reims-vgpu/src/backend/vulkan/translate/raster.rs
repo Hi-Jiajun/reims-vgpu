@@ -1,5 +1,5 @@
-//! `MTLPrimitiveType`, cull mode, winding, compare function, stencil operation
-//! and index type → their Vulkan spellings.
+//! Cull mode, winding, fill mode, depth clip mode, compare function, stencil
+//! operation and index type → their Vulkan spellings.
 //!
 //! Metal and Vulkan agree on the *ordering* of several of these enums, which
 //! makes a numeric cast tempting and wrong: the agreement is a coincidence of
@@ -11,21 +11,9 @@ use ash::vk;
 
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::{
-    CullMode, DepthClipMode, FillMode, IndexType, PrimitiveTopology, SamplerCompareFunction,
-    StencilOp, VisibilityResultMode,
+    CullMode, DepthClipMode, FillMode, IndexType, SamplerCompareFunction, StencilOp,
+    VisibilityResultMode,
 };
-
-/// `MTLPrimitiveType` (SDK numeric values).
-pub fn primitive_topology(mtl: u32) -> Result<PrimitiveTopology, TranslateReason> {
-    Ok(match mtl {
-        0 => PrimitiveTopology::Point,
-        1 => PrimitiveTopology::Line,
-        2 => PrimitiveTopology::LineStrip,
-        3 => PrimitiveTopology::Triangle,
-        4 => PrimitiveTopology::TriangleStrip,
-        other => return Err(TranslateReason::UnknownPrimitiveType(other)),
-    })
-}
 
 /// `MTLCullMode` (SDK numeric values).
 pub fn cull_mode(mtl: u32) -> Result<CullMode, TranslateReason> {
@@ -105,16 +93,6 @@ pub fn index_type(mtl: u32) -> Option<IndexType> {
         0 => Some(IndexType::U16),
         1 => Some(IndexType::U32),
         _ => None,
-    }
-}
-
-pub fn vk_topology(topology: PrimitiveTopology) -> vk::PrimitiveTopology {
-    match topology {
-        PrimitiveTopology::Point => vk::PrimitiveTopology::POINT_LIST,
-        PrimitiveTopology::Line => vk::PrimitiveTopology::LINE_LIST,
-        PrimitiveTopology::LineStrip => vk::PrimitiveTopology::LINE_STRIP,
-        PrimitiveTopology::Triangle => vk::PrimitiveTopology::TRIANGLE_LIST,
-        PrimitiveTopology::TriangleStrip => vk::PrimitiveTopology::TRIANGLE_STRIP,
     }
 }
 
@@ -251,7 +229,7 @@ mod tests {
     fn the_advertised_primitive_types_are_the_executable_ones() {
         for mtl in 0..=8u32 {
             assert_eq!(
-                primitive_topology(mtl).is_ok(),
+                reims_vgpu_core::topology::PrimitiveType::parse(mtl).is_some(),
                 crate::protocol::draw::primitive_type_executable(mtl),
                 "primitive type {mtl}: advertisement and translation disagree"
             );
@@ -262,13 +240,6 @@ mod tests {
     /// by its own slug rather than a shared one.
     #[test]
     fn each_raster_enum_is_total_over_its_sdk_range() {
-        for mtl in 0..=4u32 {
-            assert!(primitive_topology(mtl).is_ok(), "primitive {mtl}");
-        }
-        assert_eq!(
-            primitive_topology(5).unwrap_err(),
-            TranslateReason::UnknownPrimitiveType(5)
-        );
         for mtl in 0..=2u32 {
             assert!(cull_mode(mtl).is_ok(), "cull {mtl}");
         }
@@ -348,25 +319,6 @@ mod tests {
         assert_eq!(
             stencil_operation(99).unwrap_err(),
             TranslateReason::UnknownStencilOperation(99)
-        );
-    }
-
-    /// Spot-check the arms whose Metal and Vulkan names differ, so a
-    /// "the orderings match, just cast it" refactor cannot pass.
-    ///
-    /// The compare and stencil spellings used to be checked here too. They are
-    /// `reims_vgpu_vulkan::depth_stencil`'s now — it holds the only copy — and
-    /// both the injectivity sweep and the differing-name arms went with them.
-    #[test]
-    fn the_arms_whose_names_differ_are_spelled_out() {
-        // Metal's strip primitives are 2 and 4, not 4 and 5.
-        assert_eq!(
-            vk_topology(primitive_topology(2).unwrap()),
-            vk::PrimitiveTopology::LINE_STRIP
-        );
-        assert_eq!(
-            vk_topology(primitive_topology(4).unwrap()),
-            vk::PrimitiveTopology::TRIANGLE_STRIP
         );
     }
 

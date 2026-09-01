@@ -127,8 +127,6 @@ pub enum TranslateReason {
     /// than a device-wide gap, which is exactly the kind of thing one shared
     /// slug hides.
     VertexStepFunctionPerPatch(u32),
-    /// `MTLPrimitiveType` value outside the SDK enum.
-    UnknownPrimitiveType(u32),
     /// `MTLCompareFunction` value outside the SDK enum (depth, stencil and
     /// sampler compare share the Metal enum, hence one reason).
     UnknownCompareFunction(u32),
@@ -195,7 +193,6 @@ impl crate::observe::Decline for TranslateReason {
             Self::UnknownVertexFormat(_) => "unknown_vertex_format",
             Self::UnknownVertexStepFunction(_) => "unknown_vertex_step_function",
             Self::VertexStepFunctionPerPatch(_) => "vertex_step_function_per_patch",
-            Self::UnknownPrimitiveType(_) => "unknown_primitive_type",
             Self::UnknownCompareFunction(_) => "unknown_compare_function",
             Self::UnknownStencilOperation(_) => "unknown_stencil_operation",
             Self::UnknownCullMode(_) => "unknown_cull_mode",
@@ -229,7 +226,6 @@ impl TranslateReason {
             Self::UnknownVertexFormat(v)
             | Self::UnknownVertexStepFunction(v)
             | Self::VertexStepFunctionPerPatch(v)
-            | Self::UnknownPrimitiveType(v)
             | Self::UnknownCompareFunction(v)
             | Self::UnknownStencilOperation(v)
             | Self::UnknownCullMode(v)
@@ -274,7 +270,6 @@ mod tests {
         TranslateReason::UnknownVertexFormat(0),
         TranslateReason::UnknownVertexStepFunction(0),
         TranslateReason::VertexStepFunctionPerPatch(0),
-        TranslateReason::UnknownPrimitiveType(0),
         TranslateReason::UnknownCompareFunction(0),
         TranslateReason::UnknownStencilOperation(0),
         TranslateReason::UnknownCullMode(0),
@@ -311,18 +306,17 @@ mod tests {
                 TranslateReason::UnknownVertexFormat(_) => 5,
                 TranslateReason::UnknownVertexStepFunction(_) => 6,
                 TranslateReason::VertexStepFunctionPerPatch(_) => 7,
-                TranslateReason::UnknownPrimitiveType(_) => 8,
-                TranslateReason::UnknownCompareFunction(_) => 9,
-                TranslateReason::UnknownStencilOperation(_) => 10,
-                TranslateReason::UnknownCullMode(_) => 11,
-                TranslateReason::UnknownWinding(_) => 12,
-                TranslateReason::UnknownFillMode(_) => 13,
-                TranslateReason::UnknownDepthClipMode(_) => 14,
-                TranslateReason::UnknownSwizzleSelector(_) => 15,
-                TranslateReason::FormatNotVertexBuffer(_) => 16,
-                TranslateReason::VertexFormatWidenReadAsFour(_) => 17,
-                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 18,
-                TranslateReason::UnknownVisibilityResultMode(_) => 19,
+                TranslateReason::UnknownCompareFunction(_) => 8,
+                TranslateReason::UnknownStencilOperation(_) => 9,
+                TranslateReason::UnknownCullMode(_) => 10,
+                TranslateReason::UnknownWinding(_) => 11,
+                TranslateReason::UnknownFillMode(_) => 12,
+                TranslateReason::UnknownDepthClipMode(_) => 13,
+                TranslateReason::UnknownSwizzleSelector(_) => 14,
+                TranslateReason::FormatNotVertexBuffer(_) => 15,
+                TranslateReason::VertexFormatWidenReadAsFour(_) => 16,
+                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 17,
+                TranslateReason::UnknownVisibilityResultMode(_) => 18,
             }
         }
         let mut seen: Vec<usize> = ALL.iter().map(|r| index(*r)).collect();

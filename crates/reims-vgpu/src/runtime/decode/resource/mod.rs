@@ -2938,7 +2938,8 @@ pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 /// * [`PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY`] declares the *class* of primitive
 ///   the pipeline is compiled for. It does not select one: every draw record
 ///   carries its own `MTLPrimitiveType`, which
-///   `translate::raster::primitive_topology` turns into the
+///   `reims_vgpu_core::topology::PrimitiveType` parses and
+///   `reims_vgpu_vulkan::topology` plans into the
 ///   `VkPipelineInputAssemblyStateCreateInfo` topology, so the class restates
 ///   what the draw already names — the same relationship the two attachment
 ///   formats above have with the pass descriptor. Metal requires a draw's

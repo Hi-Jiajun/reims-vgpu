@@ -917,19 +917,22 @@ pub struct ScissorResource {
     pub height: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum PrimitiveTopology {
-    Point,
-    Line,
-    LineStrip,
-    #[default]
-    Triangle,
-    TriangleStrip,
-}
+/// The `MTLPrimitiveType` a draw names, with this engine's answer for a request
+/// that names none.
+///
+/// A newtype over [`reims_vgpu_core::topology::PrimitiveType`] rather than a
+/// second enum beside it, and it exists only for the `Default`. Metal has no
+/// default primitive type — `drawPrimitives:` states one on every call — so
+/// there is no wire fact for the protocol layer to record, and the value a
+/// zero-built [`DrawRequest`] carries is this crate's convention rather than
+/// anything the guest declared. Keeping the convention here is what lets the
+/// enum itself stay a statement about `MTLPrimitiveType` and nothing else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct PrimitiveTopology(pub reims_vgpu_core::topology::PrimitiveType);
 
-impl PrimitiveTopology {
-    pub(crate) fn vk(self) -> vk::PrimitiveTopology {
-        translate::raster::vk_topology(self)
+impl Default for PrimitiveTopology {
+    fn default() -> Self {
+        Self(reims_vgpu_core::topology::PrimitiveType::Triangle)
     }
 }
 
@@ -2902,7 +2905,10 @@ mod tests {
     fn default_requests_keep_optional_product_paths_disabled() {
         let draw = DrawRequest::default();
         assert_eq!((draw.width, draw.height, draw.vertex_count), (0, 0, 0));
-        assert_eq!(draw.primitive_topology, PrimitiveTopology::Triangle);
+        assert_eq!(
+            draw.primitive_topology,
+            PrimitiveTopology(reims_vgpu_core::topology::PrimitiveType::Triangle)
+        );
         assert_eq!(draw.cull_mode, CullMode::None);
         assert!(draw.target_identity.is_none());
         assert!(draw.depth.is_none());

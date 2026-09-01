@@ -198,7 +198,7 @@ fn batch_req(
         first_vertex: 0,
         instance_count: Some(1),
         base_instance: 0,
-        primitive_topology: PrimitiveTopology::Triangle,
+        primitive_topology: PrimitiveTopology(reims_vgpu_core::topology::PrimitiveType::Triangle),
         target_identity: Some(identity.clone()),
         load_from_target,
         skip_readback: true,
@@ -802,7 +802,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         vertex_count: 6,
         first_vertex: 0,
         instance_count: Some(1),
-        primitive_topology: PrimitiveTopology::Triangle,
+        primitive_topology: PrimitiveTopology(reims_vgpu_core::topology::PrimitiveType::Triangle),
         target_identity: Some(identity.clone()),
         skip_readback: true,
         ..Default::default()

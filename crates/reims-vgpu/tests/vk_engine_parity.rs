@@ -142,7 +142,7 @@ fn engine_req(vert: &[u32], frag: &[u32], w: u32, h: u32) -> DrawRequest {
         first_vertex: 0,
         instance_count: Some(1),
         base_instance: 0,
-        primitive_topology: PrimitiveTopology::Triangle,
+        primitive_topology: PrimitiveTopology(reims_vgpu_core::topology::PrimitiveType::Triangle),
         ..Default::default()
     }
 }

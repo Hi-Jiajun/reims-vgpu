@@ -8640,10 +8640,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // so a change made at the decode site would appear to take effect
             // everywhere while this path quietly kept the old answer.
             instance_count: Some(req.instance_count),
+            // The ordinal is parsed by the layer that owns `MTLPrimitiveType`.
+            // The substitution on an out-of-contract value is unchanged and is
+            // still wrong for this one field — a primitive type is an argument
+            // to `drawPrimitives:` rather than a descriptor property left
+            // unset, so "Metal's default" does not exist for it — but it is
+            // `raster_or_default`'s shape and belongs to whichever change
+            // takes that helper's four callers together.
             primitive_topology: raster_or_default(
                 Some(req.primitive_type),
-                translate::raster::primitive_topology,
-                crate::backend::vulkan::engine::PrimitiveTopology::Triangle,
+                |ordinal| {
+                    reims_vgpu_core::topology::PrimitiveType::parse(ordinal)
+                        .map(crate::backend::vulkan::engine::PrimitiveTopology)
+                        .ok_or(())
+                },
+                crate::backend::vulkan::engine::PrimitiveTopology::default(),
                 req.pipeline_ref,
                 "primitive_type_unmapped",
             ),
