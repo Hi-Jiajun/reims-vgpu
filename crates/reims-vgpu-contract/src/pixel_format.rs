@@ -3219,9 +3219,29 @@ pub fn convert_row_to_rgba8(format: u16, src: &[u8], pixels: u32, dst_rgba: &mut
 /// RGBA16F  4.1 GB/s   4 GB/s
 /// ```
 ///
-/// `RGBA16Float` is the control again: it already had a hoisted arm and does not
-/// move. The rates are per byte of **RGBA8 in**, so the arms are comparable to
-/// each other across differing texel widths.
+/// The rates are per byte of **RGBA8 in**, so the arms are comparable to each
+/// other across differing texel widths.
+///
+/// # `Rgba16Float` is the expensive arm, and it is the one that runs
+///
+/// Every other arm here moves bytes. This one looks up four `unorm8` values in
+/// a 256-entry table per texel and writes eight bytes, and no portable
+/// formulation vectorises a gather. At a live frame's geometry — 1920x1080,
+/// row by row over a whole 8.29 MB frame, release, M3 Max — it costs
+/// **4.6 ms a frame against 0.40 ms** for the `Bgra8` arm over the identical
+/// source. Fourteen times, on compute, not memory.
+///
+/// That is not a curiosity. `mapping_write`'s measured census (1c81555a) says
+/// the macOS window server's main compositing surface is
+/// `MTLPixelFormatRGBA16Float`, that 201 of 201 flushes in a driven boot took
+/// this arm, and that it is ~80 % of the Metal rail's `store_us`.
+///
+/// The four table loads are written as four independent `u64` widenings
+/// assembled into one eight-byte store rather than four two-byte stores. That
+/// is worth 20 % (5.7 ms to 4.6 ms) and is the whole of what the scalar shape
+/// has to give; the rest of this bar is not a conversion to be tuned but a
+/// conversion that should not be happening, since the bytes arrive already
+/// quantised to 256 levels per channel. See `mapping_write`'s doc.
 ///
 /// # Why the arm set differs from [`RowToRgba8`]'s
 ///
@@ -3328,10 +3348,11 @@ impl Rgba8ToRow {
             Self::Rgba16Float => {
                 let lut = unorm8_to_f16_lut();
                 for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(8)) {
-                    st16(&mut d[0..2], lut[s[COMPONENT_R] as usize]);
-                    st16(&mut d[2..4], lut[s[COMPONENT_G] as usize]);
-                    st16(&mut d[4..6], lut[s[COMPONENT_B] as usize]);
-                    st16(&mut d[6..8], lut[s[COMPONENT_A] as usize]);
+                    let r = u64::from(lut[s[COMPONENT_R] as usize]);
+                    let g = u64::from(lut[s[COMPONENT_G] as usize]);
+                    let b = u64::from(lut[s[COMPONENT_B] as usize]);
+                    let a = u64::from(lut[s[COMPONENT_A] as usize]);
+                    d.copy_from_slice(&(r | (g << 16) | (b << 32) | (a << 48)).to_le_bytes());
                 }
             }
             Self::Bgr10A2 => {
