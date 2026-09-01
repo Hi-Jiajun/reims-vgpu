@@ -77,7 +77,7 @@ pub const fn stencil_op(guest: GuestOp) -> vk::StencilOp {
 /// Spelled out rather than held as a `vk::StencilOpState`, which is not `Eq` —
 /// and a translation whose result cannot be compared is one whose mappings
 /// cannot be asserted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FacePlan {
     pub fail_op: vk::StencilOp,
     pub pass_op: vk::StencilOp,
@@ -123,7 +123,7 @@ impl FacePlan {
 }
 
 /// A depth-stencil state as this rail would build it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DepthStencilPlan {
     /// Always true. See the module doc.
     pub depth_test_enable: bool,

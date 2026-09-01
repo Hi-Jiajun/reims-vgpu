@@ -102,6 +102,7 @@ pub mod layout;
 pub mod memory;
 pub mod mipmap;
 pub mod pass;
+pub mod pipeline;
 pub mod placement;
 pub mod pools;
 pub mod queues;

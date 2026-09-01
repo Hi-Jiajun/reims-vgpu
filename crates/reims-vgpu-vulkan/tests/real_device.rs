@@ -18,6 +18,7 @@
 //! distinguishable from a passing one in the output.
 
 use ash::vk;
+use reims_vgpu_core::blend::ColorAttachmentState;
 use reims_vgpu_core::blit::{BufferSpan, FillPattern};
 use reims_vgpu_core::identity::DeviceEpoch as EpochId;
 use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SessionGeneration, SlotGeneration};
@@ -25,7 +26,9 @@ use reims_vgpu_core::pass::{LoadAction, PassDescriptor, RenderTargetExtent, Stor
 use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM;
 use reims_vgpu_core::retire::{Lifetime, NativeRetirement};
 use reims_vgpu_core::texture_shape::{TextureKind, TextureShape, TextureUsage};
+use reims_vgpu_core::topology::PrimitiveType;
 use reims_vgpu_core::vertex_format::VertexFormat;
+use reims_vgpu_vulkan::blend;
 use reims_vgpu_vulkan::buffer;
 use reims_vgpu_vulkan::device::DeviceEpoch;
 use reims_vgpu_vulkan::host::VulkanHost;
@@ -34,13 +37,16 @@ use reims_vgpu_vulkan::layout;
 use reims_vgpu_vulkan::memory::{select_memory_type, MappedMemoryKind, MemoryClass};
 use reims_vgpu_vulkan::mipmap;
 use reims_vgpu_vulkan::pass;
+use reims_vgpu_vulkan::pipeline;
 use reims_vgpu_vulkan::placement::Route;
 use reims_vgpu_vulkan::pools::WorkerPool;
+use reims_vgpu_vulkan::raster;
 use reims_vgpu_vulkan::record;
 use reims_vgpu_vulkan::renderpass;
 use reims_vgpu_vulkan::resident;
 use reims_vgpu_vulkan::staging;
 use reims_vgpu_vulkan::timeline::Timeline;
+use reims_vgpu_vulkan::topology;
 use reims_vgpu_vulkan::transfer;
 use reims_vgpu_vulkan::vertex;
 use reims_vgpu_vulkan::view;
@@ -1364,5 +1370,243 @@ fn a_planned_pass_becomes_a_render_pass_and_a_framebuffer_this_driver_accepts() 
         device.destroy_image_view(image_view, None);
         device.destroy_image(image, None);
         device.free_memory(memory, None);
+    }
+}
+
+/// The two halves of the pipeline-assembly probe: `tests/shaders/
+/// pipeline_probe.vert` and `.frag`, compiled with `glslc -O`.
+///
+/// Embedded rather than compiled at test time, for the reason this repository
+/// already embeds its scatter kernel: a shader toolchain is not a requirement
+/// for running the tests. The risk that buys is source and words drifting
+/// apart, which
+/// `the_embedded_probe_spirv_matches_its_source` catches where `glslc` exists
+/// and reports as skipped where it does not.
+mod probe_spirv {
+    pub const PROBE_VERT_SPIRV: [u32; 129] = [
+        0x07230203, 0x00010000, 0x000d000b, 0x00000015, 0x00000000, 0x00020011, 0x00000001,
+        0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
+        0x00000000, 0x00000001, 0x0007000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000,
+        0x0000000d, 0x00000011, 0x00030047, 0x0000000b, 0x00000002, 0x00050048, 0x0000000b,
+        0x00000000, 0x0000000b, 0x00000000, 0x00050048, 0x0000000b, 0x00000001, 0x0000000b,
+        0x00000001, 0x00050048, 0x0000000b, 0x00000002, 0x0000000b, 0x00000003, 0x00050048,
+        0x0000000b, 0x00000003, 0x0000000b, 0x00000004, 0x00040047, 0x00000011, 0x0000001e,
+        0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+        0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040015,
+        0x00000008, 0x00000020, 0x00000000, 0x0004002b, 0x00000008, 0x00000009, 0x00000001,
+        0x0004001c, 0x0000000a, 0x00000006, 0x00000009, 0x0006001e, 0x0000000b, 0x00000007,
+        0x00000006, 0x0000000a, 0x0000000a, 0x00040020, 0x0000000c, 0x00000003, 0x0000000b,
+        0x0004003b, 0x0000000c, 0x0000000d, 0x00000003, 0x00040015, 0x0000000e, 0x00000020,
+        0x00000001, 0x0004002b, 0x0000000e, 0x0000000f, 0x00000000, 0x00040020, 0x00000010,
+        0x00000001, 0x00000007, 0x0004003b, 0x00000010, 0x00000011, 0x00000001, 0x00040020,
+        0x00000013, 0x00000003, 0x00000007, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+        0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000007, 0x00000012, 0x00000011,
+        0x00050041, 0x00000013, 0x00000014, 0x0000000d, 0x0000000f, 0x0003003e, 0x00000014,
+        0x00000012, 0x000100fd, 0x00010038,
+    ];
+
+    pub const PROBE_FRAG_SPIRV: [u32; 76] = [
+        0x07230203, 0x00010000, 0x000d000b, 0x0000000d, 0x00000000, 0x00020011, 0x00000001,
+        0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
+        0x00000000, 0x00000001, 0x0006000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000,
+        0x00000009, 0x00030010, 0x00000004, 0x00000007, 0x00040047, 0x00000009, 0x0000001e,
+        0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+        0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020,
+        0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003,
+        0x0004002b, 0x00000006, 0x0000000a, 0x3f800000, 0x0004002b, 0x00000006, 0x0000000b,
+        0x00000000, 0x0007002c, 0x00000007, 0x0000000c, 0x0000000a, 0x0000000b, 0x0000000b,
+        0x0000000a, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
+        0x00000005, 0x0003003e, 0x00000009, 0x0000000c, 0x000100fd, 0x00010038,
+    ];
+}
+
+/// The embedded probe words are what the sources compile to.
+///
+/// Skips rather than fails without `glslc`, so a checkout with no shader
+/// toolchain reports "not checked" instead of claiming it checked.
+#[test]
+fn the_embedded_probe_spirv_matches_its_source() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/shaders");
+    let mut checked = 0;
+    for (name, embedded) in [
+        ("pipeline_probe.vert", &probe_spirv::PROBE_VERT_SPIRV[..]),
+        ("pipeline_probe.frag", &probe_spirv::PROBE_FRAG_SPIRV[..]),
+    ] {
+        let out = std::env::temp_dir().join(format!("reims-vgpu-{name}.spv"));
+        let Ok(status) = std::process::Command::new("glslc")
+            .arg("-O")
+            .arg(dir.join(name))
+            .arg("-o")
+            .arg(&out)
+            .status()
+        else {
+            println!("no glslc: {name} not checked against its source");
+            continue;
+        };
+        assert!(status.success(), "glslc refused {name}");
+        let bytes = std::fs::read(&out).expect("glslc wrote no output");
+        let recompiled: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            recompiled, embedded,
+            "{name} no longer compiles to the embedded words - recompile and update them"
+        );
+        let _ = std::fs::remove_file(&out);
+        checked += 1;
+    }
+    println!("probe spirv checked={checked}");
+}
+
+/// A planned pipeline is one this driver creates.
+///
+/// Everything the assembly composes is real here: two shader modules, a
+/// pipeline layout, a vertex input the vertex shader consumes, and the pass
+/// this host's own carrier chose. Nothing is drawn — the claim under test is
+/// that the create info is one Vulkan accepts, which is the only claim the
+/// unit tests cannot make on their own.
+#[test]
+fn an_assembled_key_becomes_a_pipeline_this_driver_accepts() {
+    let Ok(host) = VulkanHost::open("reims-vgpu-vulkan pipeline integration") else {
+        println!("no real device: nothing to assemble");
+        return;
+    };
+    let census = host.census();
+    let epoch = DeviceEpoch::create(
+        host.instance(),
+        host.physical_device(),
+        census,
+        EpochId::FIRST,
+    )
+    .expect("the driver refused a set its own census admitted");
+    let device = epoch.device().clone();
+
+    let module = |words: &[u32]| {
+        let info = vk::ShaderModuleCreateInfo::default().code(words);
+        unsafe { device.create_shader_module(&info, None) }.expect("our own SPIR-V")
+    };
+    let vertex = module(&probe_spirv::PROBE_VERT_SPIRV);
+    let fragment = module(&probe_spirv::PROBE_FRAG_SPIRV);
+    let layout =
+        unsafe { device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None) }
+            .expect("an empty layout is always creatable");
+
+    // The rasterizer state, planned against this host's real cell — so a host
+    // with the dynamic-state features exercises the dynamic arm and one
+    // without exercises the baked arm, rather than the test choosing.
+    let raster_cell = census.raster();
+    let raster_plan = raster::plan(
+        raster::GuestRasterState {
+            cull_mode: raster::MTL_CULL_MODE_BACK,
+            winding: raster::MTL_WINDING_COUNTER_CLOCKWISE,
+            ..raster::GuestRasterState::DEFAULT
+        },
+        raster_cell,
+    )
+    .expect("the two states this asks for need no optional feature");
+
+    let key = pipeline::GraphicsKey {
+        stages: vec![
+            pipeline::StageKey {
+                stage: vk::ShaderStageFlags::VERTEX,
+                module: vertex,
+                entry: "main".into(),
+            },
+            pipeline::StageKey {
+                stage: vk::ShaderStageFlags::FRAGMENT,
+                module: fragment,
+                entry: "main".into(),
+            },
+        ],
+        layout,
+        bindings: vec![vertex::BindingPlan {
+            binding: 0,
+            stride: 16,
+            input_rate: vk::VertexInputRate::VERTEX,
+            divisor: 1,
+        }],
+        attributes: vec![vertex::AttributePlan {
+            location: 0,
+            binding: 0,
+            format: vertex::format(VertexFormat::Float4),
+            offset: 0,
+            widened_from: None,
+        }],
+        topology: topology::key(PrimitiveType::Triangle, census.topology()),
+        raster: raster_plan.state,
+        multisample: pipeline::MultisamplePlan::default(),
+        depth_stencil: None,
+        blend: vec![blend::plan(&ColorAttachmentState::OPAQUE, census.blend())
+            .expect("a default attachment needs no feature")],
+        compatibility: renderpass::Compatibility {
+            color: vec![vk::Format::B8G8R8A8_UNORM],
+            depth_stencil: None,
+            depth: false,
+            stencil: false,
+            samples: vk::SampleCountFlags::TYPE_1,
+        },
+        viewports: 1,
+    };
+    let built = pipeline::build(key).unwrap_or_else(|refusal| panic!("{refusal}"));
+
+    // The carrier this host actually chose, so whichever rung it is on is the
+    // rung the driver is asked to accept.
+    let carrier = pass::select(census.passes(), pass::Narrowing::from_env()).carrier;
+    let render_pass = match carrier {
+        pass::Carrier::DynamicRendering => vk::RenderPass::null(),
+        pass::Carrier::RenderPassObject => {
+            let attachment = vk::AttachmentDescription::default()
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+            let reference = [vk::AttachmentReference::default()
+                .attachment(0)
+                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+            let subpass = [vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .color_attachments(&reference)];
+            let attachments = [attachment];
+            let info = vk::RenderPassCreateInfo::default()
+                .attachments(&attachments)
+                .subpasses(&subpass);
+            unsafe { device.create_render_pass(&info, None) }.expect("one colour attachment")
+        }
+    };
+
+    let pipelines = built.with_create_info(carrier, render_pass, |info| unsafe {
+        device.create_graphics_pipelines(
+            vk::PipelineCache::null(),
+            std::slice::from_ref(info),
+            None,
+        )
+    });
+    let pipelines =
+        pipelines.unwrap_or_else(|(_, e)| panic!("the driver refused the pipeline: {e}"));
+    let pipeline = pipelines[0];
+    assert_ne!(pipeline, vk::Pipeline::null());
+
+    println!(
+        "vk_pipeline carrier={} dynamic={} topology={:?} cull_dynamic={}",
+        carrier.name(),
+        built.dynamic_states().len(),
+        built.key().topology,
+        raster_plan.dynamic.cull_mode.is_some(),
+    );
+
+    // SAFETY: nothing was submitted, so nothing names any of these.
+    unsafe {
+        device.destroy_pipeline(pipeline, None);
+        if render_pass != vk::RenderPass::null() {
+            device.destroy_render_pass(render_pass, None);
+        }
+        device.destroy_pipeline_layout(layout, None);
+        device.destroy_shader_module(fragment, None);
+        device.destroy_shader_module(vertex, None);
     }
 }

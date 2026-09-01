@@ -146,7 +146,7 @@ pub fn write_mask(mask: ColorWriteMask) -> vk::ColorComponentFlags {
 /// Spelled out rather than held as the ash structure, which is not `Eq` — and
 /// a translation whose result cannot be compared is one whose mappings cannot
 /// be asserted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttachmentPlan {
     pub blend_enable: bool,
     pub src_color_blend_factor: vk::BlendFactor,

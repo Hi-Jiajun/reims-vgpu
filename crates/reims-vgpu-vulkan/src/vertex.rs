@@ -335,7 +335,7 @@ impl std::fmt::Display for Refusal {
 }
 
 /// One attribute, as `VkVertexInputAttributeDescription` would hold it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttributePlan {
     pub location: u32,
     pub binding: u32,
@@ -360,7 +360,7 @@ impl AttributePlan {
 
 /// One buffer layout, as `VkVertexInputBindingDescription` and its divisor
 /// would hold it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BindingPlan {
     pub binding: u32,
     pub stride: u32,
