@@ -48,6 +48,35 @@
 //! - [`residency`] — what a `useResource`/`useHeap` declaration says, split so
 //!   that the half a per-draw binder owes nothing on cannot hide the half it
 //!   does.
+//! - [`pixel_format`] — the format ordinals, what each one is made of, and the
+//!   conversions between a texel and the eight-bit colour the device carries.
+//! - [`mipmap`] — what a mipmap-generation request must satisfy before a
+//!   backend sees it, which is arithmetic over a format code and a size.
+//! - [`iosurface_pages`] — the mapper's descriptors and the page span a shared
+//!   surface occupies.
+//! - [`gva`] and [`gva_resolve`] — guest virtual addresses, and the guest
+//!   page-table walk's statuses on the failure channel.
+//! - [`draw`], [`dispatch`], [`vertex_step`], [`visibility`] — the closed
+//!   ordinal rules: which primitive types are executable, what a dispatch
+//!   record's grid resolves to, how a vertex step and its rate read together,
+//!   and what a visibility mode names.
+//! - [`checked`], [`endian`], [`fnv`] — the arithmetic underneath all of it.
+//!
+//! # Backend-neutral, and provably so
+//!
+//! What belongs *above* this crate is everything that knows how a host draws —
+//! Vulkan handles, SPIR-V, memory placement, descriptors, queue families, image
+//! layouts, host capability policy — and everything that knows the device is
+//! attached to QEMU. That used to be a rule held by habit while the vocabulary
+//! sat in a second crate beside this one. It is a fact here: `ash`, Metal, QEMU
+//! and the device's own state are not in scope, so a check cannot reach one by
+//! accident and a reviewer does not have to notice that it did.
+//!
+//! The one dependency that looks like a device dependency and is not is
+//! `reims_vgpu_observe`, taken **without** its `std` feature: a check that
+//! refuses has to be able to *name* its refusal, and the
+//! [`Decline`](reims_vgpu_observe::Decline) vocabulary is that name. It carries
+//! no policy, selects nothing, and does not bring the sink that logs it.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]

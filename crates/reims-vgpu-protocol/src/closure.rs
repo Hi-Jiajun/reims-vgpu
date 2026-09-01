@@ -31,7 +31,7 @@
 //!
 //! [`reims_vgpu_wire::manifest::MANIFEST`] enumerates the serializer's selectors
 //! from the runtime rather than from anyone's list, so the row set is not
-//! curated either: [`tests`] requires one row for every `(class, opcode)` the
+//! curated either: its test module requires one row for every `(class, opcode)` the
 //! manifest records and one for every selector it covers without a fixed opcode.
 //! When the manifest grows a selector, this ledger stops compiling its tests
 //! until someone records what the device does about it.
