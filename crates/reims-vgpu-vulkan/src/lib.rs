@@ -51,6 +51,9 @@
 //!   with it.
 //! - [`variant`] — the native pipelines one semantic pipeline turns into, who
 //!   is allowed to compile each, and why none of them is ever evicted.
+//! - [`submission`] — what happens to a timeline point between reserving it
+//!   and the GPU reaching it, and why a refused one is signalled rather than
+//!   forgotten.
 //! - [`timeline`] — which value a submission signals, and the bookkeeping that
 //!   keeps "reserved" and "reached" from being confused for each other.
 
@@ -72,5 +75,6 @@ pub mod memory;
 pub mod placement;
 pub mod pools;
 pub mod queues;
+pub mod submission;
 pub mod timeline;
 pub mod variant;
