@@ -564,6 +564,37 @@ pub(crate) trait Backend: Copy {
         false
     }
 
+    /// The mapping's published frame, read out of whatever resident this rail
+    /// holds for it, as tight RGBA8.
+    ///
+    /// The counterpart to [`Self::try_capture_from_resident`] for the *seed*
+    /// readers rather than the console: a colour LOAD seed and a sampled bind
+    /// both want the frame this device last published for a surface, and after
+    /// a Store cedes it ([`crate::runtime::mapping_write::FramePublication`])
+    /// the host cache no longer holds it.
+    ///
+    /// `generation` is what
+    /// [`crate::runtime::surface_cache::frame_generation`] named for this
+    /// mapping, and the caller must already have passed the seed door's
+    /// currency standard — this method does not re-derive either. A rail is
+    /// free to ignore it when its own resident identity already carries the
+    /// same evidence.
+    ///
+    /// `None` on a rail with no resident to ask, and equally on one whose
+    /// resident does not hold this frame. Both are lawful steady-state answers:
+    /// every caller falls through to the guest's own pages, which is the source
+    /// that was always behind this one.
+    fn published_frame_rgba8(
+        &self,
+        _state: &DeviceState,
+        _mapping_id: u32,
+        _width: u32,
+        _height: u32,
+        _generation: u64,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Retire whatever this rail retains for a guest object the guest has just
     /// declared dead.
     ///
@@ -1615,6 +1646,24 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.try_capture_from_resident(state, buf, mapping_id, width, height),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.try_capture_from_resident(state, buf, mapping_id, width, height),
+        }
+    }
+
+    fn published_frame_rgba8(
+        &self,
+        state: &DeviceState,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+        generation: u64,
+    ) -> Option<Vec<u8>> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.published_frame_rgba8(state, mapping_id, width, height, generation),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => {
+                b.published_frame_rgba8(state, mapping_id, width, height, generation)
+            }
         }
     }
 

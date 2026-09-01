@@ -281,18 +281,38 @@ pub fn take_frame_buffer(
 /// [`DeviceState::next_sampled_content_generation`] in the same breath as it
 /// changes them.
 ///
-/// `None` for a missing entry, a geometry mismatch, and the ceded shell
-/// [`cede_surface_to_resident`] leaves behind — the same three misses
-/// [`get_shared`] takes, delegated to the same reader so the two cannot
-/// disagree about what "this cache holds a frame" means.
+/// `None` for a missing entry and for a geometry mismatch. It **hits** on the
+/// ceded shell [`cede_surface_to_resident`] leaves behind, and that is the one
+/// place this reader deliberately parts company with [`get_shared`].
+///
+/// # The two questions this map answers, and why they are not one
+///
+/// "Which frame is this mapping's published content?" and "hand me that frame's
+/// bytes" look like one lookup and are not. A cession is precisely the state
+/// where the first has an answer and the second does not: the frame exists, it
+/// has a generation, and a rail's resident holds the bytes instead of this map.
+///
+/// This used to delegate to [`get_from_with_gen`] so the two "cannot disagree",
+/// which made the identity unavailable exactly when the bytes moved — so a rail
+/// that ceded lost its resident's content claim in the same breath as it earned
+/// it, and the next draw re-uploaded the whole attachment into the texture that
+/// already held it. Agreeing about *content* was never what the caller wanted:
+/// [`crate::runtime::draw::published_mapping_frame`] asks this to name the
+/// frame, and then either takes the bytes from [`get_shared`] or reads the
+/// rail's resident, and both of those still miss on a cession.
+///
+/// The generation itself carries the same meaning either way, because
+/// [`cede_surface_to_resident`] takes a fresh
+/// `DeviceState::next_sampled_content_generation` exactly as a byte-holding
+/// store does.
 pub fn frame_generation(
     state: &DeviceState,
     surface_id: u32,
     width: u32,
     height: u32,
 ) -> Option<u64> {
-    let (_, host_gen) = get_from_with_gen(&state.host_surfaces, &surface_id, width, height)?;
-    Some(host_gen)
+    let e = state.host_surfaces.get(&surface_id)?;
+    (e.width == width && e.height == height).then_some(e.host_gen)
 }
 
 /// Cede this mapping's cached frame to the engine resident a deferred mapper-ref-texture

@@ -767,6 +767,50 @@ fn a_ceded_surface_serves_a_miss_and_says_it_was_ceded() {
     assert_eq!(get(&state, 7, w, h).map(|b| b[0]), Some(0xB2));
 }
 
+/// A cession moves the frame's *bytes* and keeps its *identity*: the two byte
+/// readers miss and `frame_generation` still names the frame.
+///
+/// This is the whole point of the split, and getting it backwards is not a
+/// visible failure. `frame_generation` used to delegate to the same reader
+/// `get_shared` takes, so a cession retired the identity in the same breath as
+/// it moved the bytes — and a rail that ceded lost its resident's content claim
+/// at the exact moment it earned it, so the next draw re-uploaded the whole
+/// attachment into the texture that already held it. Nothing reports that; it
+/// reads only as the rail being slow.
+#[test]
+fn a_cession_keeps_the_frames_identity_and_moves_only_its_bytes() {
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    let (w, h) = (4u32, 4u32);
+    let need = (w * h * 4) as usize;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+
+    assert_eq!(
+        frame_generation(&state, 7, w, h),
+        None,
+        "an absent entry names no frame"
+    );
+    store(&mut state, 7, w, h, vec![0xA1u8; need]);
+    let stored = frame_generation(&state, 7, w, h).expect("a stored frame is named");
+
+    assert!(cede_surface_to_resident(&mut state, 7, w, h));
+    let ceded = frame_generation(&state, 7, w, h).expect("a ceded frame is still named");
+    assert_ne!(
+        ceded, stored,
+        "the cession replaced the frame, so it must name a new one"
+    );
+    assert!(
+        get(&state, 7, w, h).is_none() && get_shared(&state, 7, w, h).is_none(),
+        "the bytes moved to the rail, so both byte readers must miss"
+    );
+
+    assert_eq!(
+        frame_generation(&state, 7, w + 1, h),
+        None,
+        "a cession is scoped to the geometry it was taken at, for the identity \
+         reader exactly as for the byte readers"
+    );
+}
+
 /// A ceded entry is not the same thing as a stale-geometry one, and the
 /// classifier must not confuse them.
 ///

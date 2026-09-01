@@ -906,7 +906,7 @@ fn capture_fail_keeps_prior_frame() {
 /// finished content (not logo bleed under toolbar-only damage).
 #[test]
 fn dual_mid_clear_store_then_display_swap_both_composites() {
-    use crate::runtime::mapping_write::{write_bgra8, write_rgba8_image_changed};
+    use crate::runtime::mapping_write::{write_bgra8, write_rgba8_image_changed, FramePublication};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -929,7 +929,14 @@ fn dual_mid_clear_store_then_display_swap_both_composites() {
     // with image_changed vs clear seed — seed=None is the Clear contract).
     let clear = [0u8; 16];
     assert!(write_rgba8_image_changed(
-        &mut state, &mut host, 3, &clear, None, 2, 2
+        &mut state,
+        &mut host,
+        3,
+        &clear,
+        None,
+        2,
+        2,
+        FramePublication::HostCache
     ));
     // mid4: full finished frame (white).
     let full = [0xFFu8; 16];

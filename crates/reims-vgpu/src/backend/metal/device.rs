@@ -61,6 +61,45 @@ impl Backend for MetalBackend {
         Rail::Metal.name()
     }
 
+    fn present_resident_carries(
+        &self,
+        state: &DeviceState,
+        mapping: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<bool> {
+        crate::runtime::scanout::metal::present_resident_carries(state, mapping, width, height)
+    }
+
+    fn try_capture_from_resident(
+        &self,
+        state: &mut DeviceState,
+        buf: &mut Vec<u8>,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        crate::runtime::scanout::metal::try_capture_from_resident(
+            state, buf, mapping_id, width, height,
+        )
+    }
+
+    fn published_frame_rgba8(
+        &self,
+        _state: &DeviceState,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+        generation: u64,
+    ) -> Option<Vec<u8>> {
+        crate::backend::metal::resident::read_published_rgba8(
+            &crate::backend::metal::resident::ResidentColorKey::for_surface(
+                mapping_id, width, height,
+            ),
+            generation,
+        )
+    }
+
     fn reset(&self) {
         crate::runtime::icb::clear_icb_cache();
     }

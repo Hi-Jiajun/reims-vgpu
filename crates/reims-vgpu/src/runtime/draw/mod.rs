@@ -394,6 +394,28 @@ fn swap_rb_channels(src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// [`swap_rb_channels`] for a frame the caller already owns: one read-modify-write
+/// pass, no allocation.
+///
+/// # Why the pair and not just the allocating one
+///
+/// Both directions of this exchange exist because both call shapes exist. A
+/// reader handed an `Arc` or a borrowed cache slice cannot write through it and
+/// needs the fresh `Vec`; a reader that has just *produced* the frame — a
+/// resident readback, which is the shape both rails' capture and seed paths
+/// take — owns it, and making it allocate a second full frame to reorder four
+/// bytes at a time is a whole 8 MB of copy per present for nothing.
+///
+/// The exchange is its own inverse, so this serves both directions, and a
+/// trailing partial pixel is left as it is — the same tail rule
+/// [`swap_rb_channels`] follows, stated once so the two cannot drift.
+#[inline]
+pub(crate) fn swap_rb_channels_in_place(frame: &mut [u8]) {
+    for px in frame.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+}
+
 /// One slot of a render encoder's vertex or fragment buffer table.
 ///
 /// The stage is not a field. A bind lives in `vertex_buffers` or in
@@ -1952,7 +1974,16 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
          cause={} mid={mapping_id} {w}x{h} fmt={fmt:#x}",
         cause.tag()
     ));
-    let wrote = mapping_write::write_rgba8_image_changed(state, host, mapping_id, rgba, None, w, h);
+    let wrote = mapping_write::write_rgba8_image_changed(
+        state,
+        host,
+        mapping_id,
+        rgba,
+        None,
+        w,
+        h,
+        mapping_write::FramePublication::HostCache,
+    );
     if wrote {
         publish_surface_store(state, host, mapping_id, w, h, fmt);
     }
@@ -3568,20 +3599,46 @@ fn seed_from_published_surface<M: HostMemory + HostOps>(
                 NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteElsewhere) => {
                     "load_seed_color_surface_impossible"
                 }
-                // Current and empty: either this device has published nothing
-                // for the surface at this geometry yet, or the entry was ceded
-                // to a rail's resident and the frame lives there. Neither is a
-                // refusal of the witness, and naming it apart is what keeps the
-                // `unwatched` count readable.
+                // Current, and this device has published nothing for the
+                // surface at this geometry yet. Not a refusal of the witness,
+                // and naming it apart is what keeps the `unwatched` count
+                // readable. A frame ceded to a rail's resident no longer lands
+                // here — `frame_generation` names it, and the two sources below
+                // are what decide whether its bytes can be produced.
                 NoPublishedFrame::Unpublished(_) => "load_seed_color_surface_empty",
                 NoPublishedFrame::NotMapped => "load_seed_color_surface_impossible",
             });
             return None;
         }
     };
-    let bgra = crate::runtime::surface_cache::get_shared(state, frame.mapping_id, width, height)?;
-    crate::runtime::drain::note_store_route("load_seed_color_from_surface");
-    Some(swap_rb_channels(&bgra))
+    // Two sources for one frame, and the door above has already said which frame
+    // it is. The host cache holds the bytes unless the Store that published them
+    // ceded to the running rail's resident
+    // ([`crate::runtime::mapping_write::FramePublication`]), in which case the
+    // rail is asked for the same generation.
+    //
+    // Falling through silently is what this must not do. A missing colour LOAD
+    // seed leaves every texel the pass does not itself draw undefined — a
+    // rectangle of a compositing layer going blank until something redraws the
+    // whole of it — so both misses are named.
+    if let Some(bgra) =
+        crate::runtime::surface_cache::get_shared(state, frame.mapping_id, width, height)
+    {
+        crate::runtime::drain::note_store_route("load_seed_color_from_surface");
+        return Some(swap_rb_channels(&bgra));
+    }
+    let Some(rgba) = crate::backend::selected().published_frame_rgba8(
+        state,
+        frame.mapping_id,
+        width,
+        height,
+        frame.generation,
+    ) else {
+        crate::runtime::drain::note_store_route("load_seed_color_surface_unheld");
+        return None;
+    };
+    crate::runtime::drain::note_store_route("load_seed_color_from_resident");
+    Some(rgba)
 }
 
 /// Resolve sampled texture RGBA without requiring Metal feature (color LOAD seed path).

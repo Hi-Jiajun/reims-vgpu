@@ -79,16 +79,7 @@ fn plan_resident_target<M: HostMemory + HostOps>(
     use crate::backend::metal::resident::{self, ResidentColorKey};
     use crate::runtime::draw::NoPublishedFrame;
 
-    let key = ResidentColorKey {
-        mapping_id: c.mapping_id,
-        width,
-        height,
-        // The word this rail hands the backend for every colour target: 0, its
-        // `RGBA8Unorm` writeback format. Spelled from the same place the
-        // `ColorRt` below is built from rather than resolved here, so the two
-        // cannot name different formats for one texture.
-        pixel_format: 0,
-    };
+    let key = ResidentColorKey::for_surface(c.mapping_id, width, height);
     let generation = match crate::runtime::draw::published_surface_frame(
         state,
         host,
@@ -1131,6 +1122,20 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     },
                 )
             } else {
+                // The host copy of this frame is worth its 12.6 ms a flush
+                // only when nothing else holds the frame. This rail's own
+                // resident render target holds exactly `out_rgba` — it is the
+                // texture the pass rendered into and the readback came out of —
+                // and `publish_resident_target` below stamps it as this
+                // mapping's published frame the moment the write lands. So when
+                // there is a plan, the copy is a second one and the two readers
+                // that want it take
+                // `backend::metal::resident::read_published_bgra8` instead.
+                //
+                // Keyed on the plan and not on `holds_prior`: `holds_prior` is
+                // about the *prior* frame and is false on the very draw that
+                // creates the target, which is precisely a draw whose Store does
+                // publish a resident.
                 mapping_write::write_rgba8_image_changed(
                     state,
                     host,
@@ -1139,6 +1144,11 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     seed_for_store,
                     width,
                     height,
+                    if resident_plan.get(i).is_some_and(Option::is_some) {
+                        mapping_write::FramePublication::RailResident
+                    } else {
+                        mapping_write::FramePublication::HostCache
+                    },
                 )
             }
         } else if c.target_gva != 0 {
@@ -1874,32 +1884,48 @@ fn sampled_from_published_surface<M: HostMemory + HostOps>(
         (m.width, m.height)
     };
     crate::runtime::drain::note_store_route("metal_sampled_surface_asked");
-    if let Err(decline) =
-        crate::runtime::draw::published_mapping_frame(state, host, mapping_id, w, h)
-    {
-        crate::runtime::drain::note_store_route(match decline {
-            NoPublishedFrame::Uncurrent(_, SurfaceCurrency::Unwritten(_)) => {
-                "metal_sampled_surface_unwatched"
+    let published =
+        match crate::runtime::draw::published_mapping_frame(state, host, mapping_id, w, h) {
+            Ok(frame) => frame,
+            Err(decline) => {
+                crate::runtime::drain::note_store_route(match decline {
+                    NoPublishedFrame::Uncurrent(_, SurfaceCurrency::Unwritten(_)) => {
+                        "metal_sampled_surface_unwatched"
+                    }
+                    NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WrotePixels(_)) => {
+                        "metal_sampled_surface_repainted"
+                    }
+                    NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteUnknown) => {
+                        "metal_sampled_surface_unknown"
+                    }
+                    NoPublishedFrame::Unpublished(_) => "metal_sampled_surface_empty",
+                    // `serves` admits `WroteElsewhere` and the mapping and geometry were
+                    // both checked above, so either arm here is a contradiction between
+                    // this match and the gate rather than a guest behaviour.
+                    NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteElsewhere)
+                    | NoPublishedFrame::NotMapped => "metal_sampled_surface_impossible",
+                });
+                return None;
             }
-            NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WrotePixels(_)) => {
-                "metal_sampled_surface_repainted"
-            }
-            NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteUnknown) => {
-                "metal_sampled_surface_unknown"
-            }
-            NoPublishedFrame::Unpublished(_) => "metal_sampled_surface_empty",
-            // `serves` admits `WroteElsewhere` and the mapping and geometry were
-            // both checked above, so either arm here is a contradiction between
-            // this match and the gate rather than a guest behaviour.
-            NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteElsewhere)
-            | NoPublishedFrame::NotMapped => "metal_sampled_surface_impossible",
-        });
-        return None;
+        };
+    // Two sources for one frame, in the order of what they cost. The cache hands
+    // over an `Arc` and a whole-frame channel exchange; the resident hands over a
+    // GPU readback and no exchange. Which one holds the frame is decided by the
+    // Store that published it — see `mapping_write::FramePublication` — and both
+    // are gated on the *same* generation the door above just read, so neither can
+    // serve a frame the other has superseded.
+    if let Some(bgra) = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h) {
+        crate::runtime::drain::note_store_route("metal_sampled_from_surface");
+        crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", bgra.len() as u64);
+        return Some((w, h, swap_rb_channels(&bgra)));
     }
-    let bgra = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h)?;
-    crate::runtime::drain::note_store_route("metal_sampled_from_surface");
-    crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", bgra.len() as u64);
-    Some((w, h, swap_rb_channels(&bgra)))
+    let rgba = crate::backend::metal::resident::read_published_rgba8(
+        &crate::backend::metal::resident::ResidentColorKey::for_surface(mapping_id, w, h),
+        published.generation,
+    )?;
+    crate::runtime::drain::note_store_route("metal_sampled_from_resident");
+    crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", rgba.len() as u64);
+    Some((w, h, rgba))
 }
 
 /// normal-texture linear texture at mip `level`: strided guest rows → tight RGBA8.

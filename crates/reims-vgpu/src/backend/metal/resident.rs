@@ -94,6 +94,33 @@ pub struct ResidentColorKey {
 }
 
 impl ResidentColorKey {
+    /// The key this rail retains a mapper-ref-texture surface's colour render
+    /// target under.
+    ///
+    /// # Why this is a constructor and not four field writes
+    ///
+    /// Three call sites name this key for one texture: the draw that takes it,
+    /// the sampled bind that reads it, and the present capture that reads it.
+    /// [`Self::pixel_format`] is the rail's own word for the target's format and
+    /// not the guest's declaration, so a site that spelled it from the guest's
+    /// `format` would key a *different* resident than the one the draw filled —
+    /// and the failure is silent, because a key that matches nothing simply
+    /// misses and the reader falls through to a slower source that still
+    /// answers. Naming it once means the day this rail renders a target in the
+    /// format the guest declared, every site moves together or none does.
+    pub fn for_surface(mapping_id: u32, width: u32, height: u32) -> Self {
+        Self {
+            mapping_id,
+            width,
+            height,
+            // The word this rail hands the backend for every colour target: 0,
+            // its `RGBA8Unorm` writeback format. See
+            // `crate::runtime::draw::note_store_narrowing` for what that costs a
+            // guest that declared a wider one.
+            pixel_format: 0,
+        }
+    }
+
     fn bytes(&self, bpp: usize) -> u64 {
         u64::from(self.width)
             .saturating_mul(u64::from(self.height))
@@ -161,6 +188,24 @@ impl<T: Clone> Registry<T> {
         let holds_prior = content_gen != 0 && entry.content_gen == content_gen;
         entry.content_gen = 0;
         Some((entry.payload.clone(), holds_prior))
+    }
+
+    /// The payload for `key` **only if** its pixels are the frame published at
+    /// `content_gen`, leaving the claim in place.
+    ///
+    /// See [`borrow_published`] for why this one does not retire.
+    fn borrow_published(&mut self, key: &ResidentColorKey, content_gen: u64) -> Option<T> {
+        if content_gen == 0 {
+            return None;
+        }
+        let now = self.tick();
+        let idx = self.position(key)?;
+        let entry = &mut self.entries[idx];
+        if entry.content_gen != content_gen {
+            return None;
+        }
+        entry.used = now;
+        Some(entry.payload.clone())
     }
 
     fn admit(&mut self, key: ResidentColorKey, payload: T, bytes: u64) {
@@ -273,6 +318,81 @@ pub fn take(key: &ResidentColorKey, content_gen: u64) -> Option<(Texture, bool)>
     REGISTRY.lock().take(key, content_gen)
 }
 
+/// The retained texture for `key` **only if** its pixels are still the frame
+/// published at `content_gen`, without retiring that claim.
+///
+/// # The counterpart to `take`, and why the difference is not an oversight
+///
+/// [`take`] retires because its caller is about to *render into* the texture,
+/// so from the moment it is handed over the pixels stop being the published
+/// frame. This caller only reads them out and puts nothing back, so the frame
+/// the texture holds after the read is the same frame it held before — and
+/// retiring here would cost the next draw a whole-attachment upload for a claim
+/// that was never actually invalidated.
+///
+/// The generation test is the same one [`take`] applies and carries the same
+/// meaning: `content_gen` must be the surface cache's own generation for this
+/// mapping, read under the seed door's currency standard. A caller that passes a
+/// generation it did not check is asking this module to vouch for what it cannot
+/// see, and `0` — which
+/// `DeviceState::next_sampled_content_generation` never issues — is the honest
+/// spelling of "I have no published frame to compare against".
+pub fn borrow_published(key: &ResidentColorKey, content_gen: u64) -> Option<Texture> {
+    REGISTRY.lock().borrow_published(key, content_gen)
+}
+
+/// This mapping's published frame, read out of the resident colour target as
+/// tight RGBA8.
+///
+/// The one source that answers when [`crate::runtime::surface_cache`] has ceded
+/// a mapping's frame to this rail. Both of the cache's byte readers — the
+/// present capture and the sampled bind of a surface — take it from here rather
+/// than each reaching into the registry with their own idea of the key, the
+/// texel order, and the row stride.
+///
+/// `None` when no resident holds the frame at `content_gen`, which is a lawful
+/// steady-state answer (a cold mapping, a target the byte budget evicted, a
+/// frame some other writer has replaced) and never a failure the caller has to
+/// report as one.
+///
+/// # RGBA8, because that is what the texture holds
+///
+/// The resident is `RGBA8Unorm` — see [`ResidentColorKey::for_surface`] — so
+/// this is the readback verbatim, with no exchange. It is spelled in the name
+/// rather than left to the caller to infer, because the caller that wants BGRA8
+/// (the present capture) and the caller that wants RGBA8 (the sampled bind)
+/// would otherwise both have to know this rail's private choice of render-target
+/// format, and a wrong guess is a channel swap that renders as an orange sky
+/// rather than as a failure.
+pub fn read_published_rgba8(key: &ResidentColorKey, content_gen: u64) -> Option<Vec<u8>> {
+    use crate::contract::pixel_format::RGBA8_BPP;
+    // Only the format this rail actually renders colour targets in reads back as
+    // RGBA8. A key naming any other one is a future this function has not been
+    // taught, and `None` sends the caller to the source it already falls through
+    // to rather than to a frame with the wrong texels in it.
+    if key.pixel_format != 0 || key.width == 0 || key.height == 0 {
+        return None;
+    }
+    let stride = (key.width as usize).checked_mul(RGBA8_BPP as usize)?;
+    let need = stride.checked_mul(key.height as usize)?;
+    let texture = borrow_published(key, content_gen)?;
+    let mut rgba = vec![0u8; need];
+    let region = metal::MTLRegion {
+        origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        size: metal::MTLSize {
+            width: u64::from(key.width),
+            height: u64::from(key.height),
+            depth: 1,
+        },
+    };
+    texture.get_bytes(rgba.as_mut_ptr() as *mut _, stride as u64, region, 0);
+    // Count and bytes together: the rate is what says whether a reader is asking
+    // for whole frames it does not need, and neither number can say it alone.
+    crate::runtime::drain::note_store_route("metal_resident_reads");
+    crate::runtime::drain::note_store_route_n("metal_resident_read_bytes", need as u64);
+    Some(rgba)
+}
+
 /// Build a colour target for `key` and retain it.
 ///
 /// Returns `None` when Metal would not allocate the texture; the caller refuses
@@ -338,6 +458,53 @@ mod tests {
             height: 4,
             pixel_format: 0,
         }
+    }
+
+    /// A reader borrows the published frame without retiring the claim, and a
+    /// renderer taking the same target still does.
+    ///
+    /// The two are one hazard read from both sides. `take` must retire because
+    /// its caller overwrites the pixels; `borrow_published` must not, because
+    /// its caller only reads them — and a `borrow_published` that retired would
+    /// make every present capture and every sampled bind of a ceded surface cost
+    /// the *next* draw a whole-attachment upload, which reads as the rail being
+    /// slow and never as a failure.
+    #[test]
+    fn a_borrow_reads_the_published_frame_and_a_take_retires_it() {
+        let mut reg: Registry<u32> = Registry::new();
+        reg.admit(key(1), 11, 64);
+        reg.publish(&key(1), 7);
+
+        assert_eq!(reg.borrow_published(&key(1), 7), Some(11));
+        assert_eq!(
+            reg.borrow_published(&key(1), 7),
+            Some(11),
+            "reading the frame does not consume it"
+        );
+        assert_eq!(
+            reg.levels().2,
+            1,
+            "the target still holds a frame a load could be served from"
+        );
+
+        assert_eq!(
+            reg.borrow_published(&key(1), 8),
+            None,
+            "a frame the surface has been republished since is not this one"
+        );
+        assert_eq!(
+            reg.borrow_published(&key(1), 0),
+            None,
+            "0 is the caller having no frame to compare against, not a match"
+        );
+        assert_eq!(reg.borrow_published(&key(2), 7), None, "another mapping");
+
+        assert_eq!(reg.take(&key(1), 7), Some((11, true)));
+        assert_eq!(
+            reg.borrow_published(&key(1), 7),
+            None,
+            "the renderer took it, so the pixels are no longer the published frame"
+        );
     }
 
     /// A retained target may be loaded from only under the generation it was

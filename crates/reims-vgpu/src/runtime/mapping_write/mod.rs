@@ -1139,6 +1139,45 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     true
 }
 
+/// What becomes of this device's own copy of the frame a Store lands.
+///
+/// # Why the caller decides and not this writer
+///
+/// The host copy is not part of the write: the guest's pages hold the frame
+/// either way, and every reader of the copy has another source. What the copy
+/// buys is *speed* for two readers — the present capture and a sampled bind of
+/// the surface — and what it costs is a second whole-frame pass over the source,
+/// which a driven macos-13 Metal boot measured at 12.6 ms a flush, 43 % of that
+/// rail's `store_us`.
+///
+/// Only the caller knows whether that pass is worth running, because only the
+/// caller knows whether its rail is about to hold the same frame in a resident
+/// render target it can read instead. Deriving it here would mean this writer
+/// asking a rail a question about a texture, which is the wrong direction
+/// through the layer.
+///
+/// Both arms leave one invariant true, and it is the one the readers depend on:
+/// after either, [`crate::runtime::surface_cache::frame_generation`] names this
+/// frame. They differ only in where its bytes are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FramePublication {
+    /// Build the BGRA8 host copy and publish it. The frame is readable from
+    /// [`crate::runtime::surface_cache::get`] and its siblings.
+    HostCache,
+    /// Skip the copy and cede the frame to the caller's rail resident
+    /// ([`crate::runtime::surface_cache::cede_surface_to_resident`]).
+    ///
+    /// The caller is promising that a resident of its rail holds these same
+    /// pixels and can be read back — on the Metal rail that promise is
+    /// `backend::metal::resident::read_published_bgra8`, and it is kept by
+    /// `runtime::draw::metal::publish_resident_target` running after this
+    /// returns. A caller that cedes without a resident does not corrupt
+    /// anything: the guest's pages are still written, and the two byte readers
+    /// simply miss, which they already handle (the capture keeps the prior
+    /// frame, the sampled bind reads the guest's pages).
+    RailResident,
+}
+
 /// Write a tight RGBA8 image into a mapper-ref-texture mapping, optionally as changed-spans.
 ///
 /// Archive `apple_pv_gpu_write_mapper_ref_texture_image_changed`: when `seed_rgba` is present
@@ -1147,6 +1186,15 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
 /// was the Metal Load attachment content (unchanged texels match guest), without
 /// rewriting multi-MiB of identical bytes on every damage pass. `seed_rgba = None`
 /// always writes every row (Clear / multi-draw final / force-full).
+///
+/// `publication` says what becomes of the host copy of the frame; see
+/// [`FramePublication`], and note that it decides whether the second whole-frame
+/// pass over `rgba` runs at all.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the mapping writer keeps source rows, destination geometry and \
+              frame publication explicit"
+)]
 pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1155,6 +1203,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     seed_rgba: Option<&[u8]>,
     width: u32,
     height: u32,
+    publication: FramePublication,
 ) -> bool {
     if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
@@ -1258,8 +1307,26 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // has already removed the entry, so a refusal below leaves this cache
     // holding nothing rather than holding a frame the guest's half-written pages
     // no longer match. Publishing happens at the bottom, on success only.
-    let mut cache = crate::runtime::surface_cache::take_frame_buffer(state, mapping_id, mw, mh);
-    {
+    // Empty when the frame is ceded: nothing below reads it, because
+    // `cache_rows_are_native` is `&&`-ed with the same condition.
+    //
+    // Both arms *remove* this mapping's entry before the write, and that is the
+    // half that matters for correctness rather than for allocation reuse: a
+    // refusal below leaves the guest's pages half-written, and an entry that
+    // survived would go on claiming to be a frame those pages no longer hold.
+    // `take_frame_buffer` removes and hands back the allocation; the ceded arm
+    // has no allocation to want, so it removes and keeps nothing. Either way the
+    // claim is only put back at the bottom, on success.
+    let mut cache = match publication {
+        FramePublication::HostCache => {
+            crate::runtime::surface_cache::take_frame_buffer(state, mapping_id, mw, mh)
+        }
+        FramePublication::RailResident => {
+            crate::runtime::surface_cache::forget(state, mapping_id);
+            Vec::new()
+        }
+    };
+    if publication == FramePublication::HostCache {
         let _span_cache = crate::runtime::chain_phase::CostSpan::new("surface_changed_cache_us");
         // Converted straight into the cache buffer, overwriting the previous
         // frame. What that costs is measured: ~0.90 ms a flush moving 16.6 MB,
@@ -1325,10 +1392,12 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // the cache's row — `tight_row_bytes` and `rgba_stride` are computed from
     // different places and a format that made them differ would slice the wrong
     // bytes.
-    let cache_rows_are_native = matches!(
-        format,
-        MTL_FORMAT_BGRA8_UNORM | pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
-    ) && tight == rgba_stride as usize;
+    let cache_rows_are_native = publication == FramePublication::HostCache
+        && matches!(
+            format,
+            MTL_FORMAT_BGRA8_UNORM | pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
+        )
+        && tight == rgba_stride as usize;
 
     // Parsed once above `surface_changed_rows_us`, which this loop is: it runs
     // `mh` times a flush and used to re-answer "is this BGRA8" per row and then
@@ -1483,10 +1552,14 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // has no meaning without it: this rail's arms differ by 40x and by a factor
     // of two in destination width, and the census cannot say which arm ran.
     if crate::observe::first_sight("surface_row_native_format", u64::from(format)) {
+        // `publication` rides along because `cache_is_native` reads `false` for
+        // two unrelated reasons — a format whose texel is not the cache's, and a
+        // frame that has no cache at all — and the fix for each is the other's
+        // no-op.
         crate::observe::fail(format!(
             "surface_row_native_format format={format:#x} tight={tight} \
              rgba_stride={rgba_stride} cache_is_native={cache_rows_are_native} \
-             mapping={mapping_id}"
+             publication={publication:?} mapping={mapping_id}"
         ));
     }
     crate::runtime::drain::note_store_route_n(
@@ -1505,9 +1578,29 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     });
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
-    // Host render-cache (Linux §8.5): the frame built above, published now that
-    // the guest's pages hold it too.
-    crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
+    // Host render-cache (Linux §8.5): the frame, published now that the guest's
+    // pages hold it too. Both arms publish a *generation* for this frame — see
+    // `FramePublication` — and differ only in whether the bytes are here or in
+    // the caller's rail resident.
+    match publication {
+        FramePublication::HostCache => {
+            crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache)
+        }
+        FramePublication::RailResident => {
+            crate::runtime::drain::note_store_route(
+                if crate::runtime::surface_cache::cede_surface_to_resident(
+                    state, mapping_id, mw, mh,
+                ) {
+                    "surface_row_ceded"
+                } else {
+                    // A geometry this cache would not have stored anyway. The
+                    // guest's pages are written; nothing host-side claims the
+                    // frame, which is the same state a refused store leaves.
+                    "surface_row_cede_refused"
+                },
+            );
+        }
+    }
     // This write just made the host copy and the guest pages agree, so it is the
     // moment the copy's currency can be pinned. Nothing else arms this mapping:
     // the backing sampled ladder's first census read `gw_no_stamp` 14 092 against

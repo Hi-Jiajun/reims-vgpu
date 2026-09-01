@@ -25,6 +25,8 @@
 // The Vulkan rail's answers about a present's resident, named rather than
 // re-exported flat — a capture reaches them only through `Backend`, so this
 // module's own code never mentions a rail.
+#[cfg(feature = "backend-metal")]
+pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 

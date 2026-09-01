@@ -8146,3 +8146,31 @@ fn a_narrowed_target_is_counted_and_an_exact_one_is_quiet() {
         "every narrowed Store counts, so the census reports a rate"
     );
 }
+
+/// The two spellings of the R/B exchange must agree byte for byte, including on
+/// a trailing partial pixel.
+///
+/// They exist as a pair because both call shapes exist — a borrowed frame needs
+/// the allocating one, a produced frame needs the in-place one — and a pair is
+/// exactly the shape that drifts. The exchange is also its own inverse, which is
+/// what lets one function serve BGRA→RGBA and RGBA→BGRA, so that is checked
+/// here too rather than left as a claim in a doc comment.
+#[test]
+fn both_spellings_of_the_channel_exchange_agree_and_are_their_own_inverse() {
+    for len in 0..=37usize {
+        let src: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37)).collect();
+        let allocated = super::swap_rb_channels(&src);
+        let mut in_place = src.clone();
+        super::swap_rb_channels_in_place(&mut in_place);
+        assert_eq!(
+            in_place, allocated,
+            "len {len}: the in-place exchange must be the allocating one"
+        );
+        let round_trip = super::swap_rb_channels(&allocated);
+        assert_eq!(
+            round_trip, src,
+            "len {len}: the exchange is its own inverse, which is what lets one \
+             function serve both directions"
+        );
+    }
+}

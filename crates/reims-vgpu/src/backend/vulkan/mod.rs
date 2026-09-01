@@ -464,6 +464,17 @@ impl Backend for VulkanBackend {
         scanout::vulkan::try_capture_from_resident(state, buf, mapping_id, width, height)
     }
 
+    fn published_frame_rgba8(
+        &self,
+        state: &DeviceState,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+        _generation: u64,
+    ) -> Option<Vec<u8>> {
+        scanout::vulkan::published_frame_rgba8(state, mapping_id, width, height)
+    }
+
     fn order_completion_stamp<M: HostMemory + HostOps>(
         &self,
         state: &DeviceState,
