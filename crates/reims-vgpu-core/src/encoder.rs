@@ -55,28 +55,87 @@ mod table_hint {
 /// Indexed by slot, sparse in content and dense in storage: the guest binds
 /// low slots and leaves gaps, and a `Vec<Option<T>>` answers a lookup with one
 /// bounds check where a map would hash.
+///
+/// # A slot remembers whether the footprint already has it
+///
+/// A draw's footprint is a function of the binding and the pipeline's usage of
+/// it, and neither changes between two draws with no record in between — so the
+/// second draw's participation would be the first one's, again. That is not
+/// free: every participation is a namespace resolution, a residency lookup and,
+/// for a write, a *reserved content version*. A thousand draws over twenty
+/// bound slots would reserve twenty thousand versions of the same memory, of
+/// which one survives.
+///
+/// So a slot carries whether the open encoder has already declared it, and only
+/// the ones that have not are built. A transaction's footprint is a set; the
+/// declaration order inside it orders nothing, which is why declaring once is
+/// the same answer and not an approximation of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotTable<T> {
     slots: Vec<Option<T>>,
+    /// Parallel to `slots`: whether the current binding is already in the
+    /// footprint. Never longer than `slots`, and read only for bound slots.
+    declared: Vec<bool>,
 }
 
-impl<T: Copy> SlotTable<T> {
+impl<T: Copy + PartialEq> SlotTable<T> {
     #[must_use]
     pub fn with_hint(hint: u32) -> Self {
         Self {
             slots: Vec::with_capacity(hint as usize),
+            declared: Vec::with_capacity(hint as usize),
         }
     }
 
     /// Bind `value` at `slot`, growing the table if the guest reached past it.
+    ///
+    /// A bind of what the slot already holds changes nothing, including whether
+    /// the footprint has it. That is what the comparability of the binding
+    /// types is for: a guest that re-binds its whole table between draws — and
+    /// they do — must not make the next draw declare everything again.
     pub fn set(&mut self, slot: u32, value: Option<T>) {
         let index = slot as usize;
         if index >= self.slots.len() {
             // Nothing between the old end and the new slot was bound, so the
             // gap is empty rather than a copy of anything.
             self.slots.resize(index + 1, None);
+            self.declared.resize(index + 1, false);
+        }
+        if self.slots[index] == value {
+            return;
         }
         self.slots[index] = value;
+        self.declared[index] = false;
+    }
+
+    /// Every bound slot the open encoder has not declared yet.
+    ///
+    /// A slot past the end of `declared` is undeclared. The two vectors are not
+    /// zipped for exactly that reason: [`Self::undeclare`] empties one of them,
+    /// and a zip would then yield nothing at all rather than everything.
+    pub fn undeclared(&self) -> impl Iterator<Item = (u32, T)> + '_ {
+        self.slots.iter().enumerate().filter_map(|(i, v)| {
+            v.filter(|_| !self.declared.get(i).copied().unwrap_or(false))
+                .map(|v| (i as u32, v))
+        })
+    }
+
+    /// Record that the footprint now has every bound slot.
+    ///
+    /// Marks the slots a reflection said nothing about too: under this pipeline
+    /// they contribute nothing, and that is as much an answer as a
+    /// participation. A pipeline change is what takes it back.
+    pub fn mark_declared(&mut self) {
+        self.declared.clear();
+        self.declared.resize(self.slots.len(), true);
+    }
+
+    /// Forget what the footprint has, keeping the bindings.
+    ///
+    /// The pipeline decides what a bound slot contributes, so a new one makes
+    /// every slot's contribution a fresh question.
+    pub fn undeclare(&mut self) {
+        self.declared.clear();
     }
 
     #[must_use]
@@ -100,12 +159,16 @@ impl<T: Copy> SlotTable<T> {
 
     pub fn clear(&mut self) {
         self.slots.clear();
+        self.declared.clear();
     }
 }
 
 impl<T: Copy> Default for SlotTable<T> {
     fn default() -> Self {
-        Self { slots: Vec::new() }
+        Self {
+            slots: Vec::new(),
+            declared: Vec::new(),
+        }
     }
 }
 
@@ -149,8 +212,8 @@ impl StageTables {
     /// Written into a caller's buffer rather than returned, because this runs
     /// once per draw and a fresh `Vec` per draw is an allocation the frame does
     /// not need.
-    pub fn footprint_into(&self, usage: Option<&BindingUsage>, out: &mut Vec<Participation>) {
-        for (slot, binding) in self.buffers.bound() {
+    pub fn footprint_into(&mut self, usage: Option<&BindingUsage>, out: &mut Vec<Participation>) {
+        for (slot, binding) in self.buffers.undeclared() {
             let Some(buffer) = binding.buffer else {
                 continue;
             };
@@ -168,7 +231,7 @@ impl StageTables {
                 api_stages: NO_STAGES,
             });
         }
-        for (slot, binding) in self.textures.bound() {
+        for (slot, binding) in self.textures.undeclared() {
             let Some(texture) = binding.object else {
                 continue;
             };
@@ -182,6 +245,20 @@ impl StageTables {
                 api_stages: NO_STAGES,
             });
         }
+        // Both tables, after both loops: a slot that contributed nothing under
+        // this pipeline is as answered as one that contributed a
+        // participation, and only a new pipeline makes either a fresh
+        // question. Samplers bind no memory and are never in the footprint, so
+        // their slots are left alone.
+        self.buffers.mark_declared();
+        self.textures.mark_declared();
+    }
+
+    /// Forget what the footprint has, keeping the bindings. See
+    /// [`SlotTable::undeclare`].
+    fn undeclare(&mut self) {
+        self.buffers.undeclare();
+        self.textures.undeclare();
     }
 }
 
@@ -210,7 +287,7 @@ const NO_STAGES: u32 = 0;
 /// plural bind is one loop here rather than a slot number recomputed at every
 /// call site. A count that would reach past `u32` cannot exist: the entries
 /// came out of a transaction arena whose window is already a `u32` pair.
-fn bind_span<T: Copy>(table: &mut SlotTable<T>, first: u32, entries: &[T]) {
+fn bind_span<T: Copy + PartialEq>(table: &mut SlotTable<T>, first: u32, entries: &[T]) {
     for (offset, entry) in entries.iter().enumerate() {
         let Ok(offset) = u32::try_from(offset) else {
             return;
@@ -259,7 +336,7 @@ impl ComputeEncoderState {
     }
 
     /// What a dispatch reads through the bound slots.
-    pub fn footprint_into(&self, usage: Option<&BindingUsage>, out: &mut Vec<Participation>) {
+    pub fn footprint_into(&mut self, usage: Option<&BindingUsage>, out: &mut Vec<Participation>) {
         self.tables.footprint_into(usage, out);
     }
 
@@ -289,7 +366,15 @@ impl ComputeEncoderState {
                 offset,
                 stride,
             } => rebind_offset(&mut self.tables.buffers, index, offset, stride),
-            ComputeOp::SetPipeline { pipeline } => self.pipeline = Some(pipeline),
+            ComputeOp::SetPipeline { pipeline } => {
+                // What a bound slot contributes is the pipeline's answer, so a
+                // different pipeline makes every slot's contribution a fresh
+                // question. The same one changes nothing.
+                if self.pipeline != Some(pipeline) {
+                    self.pipeline = Some(pipeline);
+                    self.tables.undeclare();
+                }
+            }
             // State a dispatch carries rather than state a slot holds, and a
             // dispatch reads the tables without changing them.
             ComputeOp::SetStageInRegion { .. }
@@ -370,7 +455,7 @@ impl RenderEncoderState {
     /// vertex shader reads and the fragment shader writes is two participations
     /// on one resource, and collapsing them would lose the write.
     pub fn footprint_into(
-        &self,
+        &mut self,
         vertex_usage: Option<&BindingUsage>,
         fragment_usage: Option<&BindingUsage>,
         out: &mut Vec<Participation>,
@@ -431,7 +516,15 @@ impl RenderEncoderState {
                 offset,
                 stride,
             } => rebind_offset(&mut self.stage_mut(stage).buffers, index, offset, stride),
-            RenderOp::SetPipeline { pipeline } => self.pipeline = Some(pipeline),
+            RenderOp::SetPipeline { pipeline } => {
+                // See [`ComputeEncoderState::apply`]: the pipeline decides what
+                // a bound slot contributes, on both stages.
+                if self.pipeline != Some(pipeline) {
+                    self.pipeline = Some(pipeline);
+                    self.vertex.undeclare();
+                    self.fragment.undeclare();
+                }
+            }
             RenderOp::SetDepthStencilState { state } => self.depth_stencil = Some(state),
             RenderOp::SetVisibilityResultMode { mode, offset } => {
                 self.visibility = Some(VisibilityState { mode, offset });
@@ -764,14 +857,104 @@ mod tests {
         assert!(out.is_empty(), "samplers bind no memory");
     }
 
-    /// The footprint is written into the caller's buffer, so a draw loop
-    /// allocates nothing after the first.
+    /// The footprint is written into the caller's buffer rather than replacing
+    /// it, and a second draw over an unchanged table adds nothing to it.
+    ///
+    /// Both halves matter to the same loop. A draw declares its bindings, and
+    /// every participation it declares is a namespace resolution, a residency
+    /// lookup and — for a write, which an unreflected slot is — a reserved
+    /// content version. A thousand draws with no bind between them would
+    /// reserve a thousand versions of one buffer, of which one survives.
     #[test]
-    fn a_footprint_appends_rather_than_replacing() {
+    fn a_second_draw_over_an_unchanged_table_declares_nothing() {
         let mut state = ComputeEncoderState::default();
         state.tables.buffers.set(0, Some(buffer(1)));
-        let mut out = Vec::new();
+        let mut out = vec![];
         state.footprint_into(None, &mut out);
+        assert_eq!(out.len(), 1);
+        state.footprint_into(None, &mut out);
+        assert_eq!(out.len(), 1, "the second draw's bindings are already in it");
+
+        // A bind that changes nothing changes nothing here either: guests
+        // re-bind whole tables between draws.
+        state.tables.buffers.set(0, Some(buffer(1)));
+        state.footprint_into(None, &mut out);
+        assert_eq!(out.len(), 1);
+
+        // A bind of something else is a new participation, and only that slot's.
+        state.tables.buffers.set(3, Some(buffer(2)));
+        state.footprint_into(None, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].resource, res(2));
+    }
+
+    /// A new pipeline makes every bound slot a fresh question: what a slot
+    /// contributes is the pipeline's answer, and a table that stayed declared
+    /// across a pipeline change would hold the previous shader's answer.
+    #[test]
+    fn a_new_pipeline_re_declares_every_bound_slot() {
+        let mut state = ComputeEncoderState::default();
+        state.apply(
+            &ComputeOp::BindBuffers {
+                first: 0,
+                entries: BindSpan { start: 0, len: 1 },
+            },
+            &[buffer(1)],
+            &[],
+        );
+        let mut out = vec![];
+        state.footprint_into(None, &mut out);
+        assert_eq!(out.len(), 1);
+
+        // The same pipeline is not a change.
+        state.apply(&ComputeOp::SetPipeline { pipeline: res(9) }, &[], &[]);
+        state.apply(&ComputeOp::SetPipeline { pipeline: res(9) }, &[], &[]);
+        state.footprint_into(None, &mut out);
+        assert_eq!(out.len(), 2, "the first bind of it is a change");
+
+        state.apply(&ComputeOp::SetPipeline { pipeline: res(8) }, &[], &[]);
+        state.footprint_into(None, &mut out);
+        assert_eq!(out.len(), 3);
+        state.footprint_into(None, &mut out);
+        assert_eq!(out.len(), 3);
+    }
+
+    /// A render pipeline re-declares both stages. One stage kept would feed the
+    /// next draw the previous shader's answer about half its bindings.
+    #[test]
+    fn a_new_render_pipeline_re_declares_both_stages() {
+        let mut state = RenderEncoderState::default();
+        state
+            .stage_mut(ShaderStage::Vertex)
+            .buffers
+            .set(0, Some(buffer(1)));
+        state
+            .stage_mut(ShaderStage::Fragment)
+            .buffers
+            .set(0, Some(buffer(2)));
+        let mut out = vec![];
+        state.footprint_into(None, None, &mut out);
+        assert_eq!(out.len(), 2);
+        state.footprint_into(None, None, &mut out);
+        assert_eq!(out.len(), 2);
+
+        state.apply(&RenderOp::SetPipeline { pipeline: res(9) }, &[], &[]);
+        state.footprint_into(None, None, &mut out);
+        assert_eq!(out.len(), 4);
+    }
+
+    /// Unbinding a declared slot and binding it again declares it again: the
+    /// resource changed, whatever the footprint used to hold.
+    #[test]
+    fn a_slot_rebound_after_being_declared_is_declared_again() {
+        let mut state = ComputeEncoderState::default();
+        state.tables.buffers.set(0, Some(buffer(1)));
+        let mut out = vec![];
+        state.footprint_into(None, &mut out);
+        state.tables.buffers.set(0, None);
+        state.footprint_into(None, &mut out);
+        assert_eq!(out.len(), 1, "an unbound slot contributes nothing");
+        state.tables.buffers.set(0, Some(buffer(1)));
         state.footprint_into(None, &mut out);
         assert_eq!(out.len(), 2);
     }

@@ -497,7 +497,7 @@ impl EncoderBindings {
     /// [`crate::pipeline::BindingUsage`], and the layer that can produce it is
     /// the executor that compiled the shader — so the narrowing arrives with
     /// the pipeline, not from here.
-    fn footprint_into(&self, op: &ResolvedOperation, out: &mut Vec<Participation>) {
+    fn footprint_into(&mut self, op: &ResolvedOperation, out: &mut Vec<Participation>) {
         match (self, op) {
             (Self::Render(state), ResolvedOperation::Render(RenderOp::Draw(_))) => {
                 state.footprint_into(None, None, out);
@@ -973,6 +973,87 @@ mod tests {
             .iter()
             .filter(|a| backing(a.key) != Some(BackingId(5)))
             .all(|a| a.mode == AccessMode::Unknown));
+    }
+
+    /// Three draws over one binding table declare its slots once.
+    ///
+    /// Every participation is a namespace resolution, a residency lookup and a
+    /// reserved content version — an unreflected slot is an `Unknown`, which
+    /// writes — so a draw loop that re-declared would reserve one version of
+    /// each bound buffer per draw and keep the last.
+    #[test]
+    fn a_draw_loop_declares_its_bindings_once() {
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        let entries = bind_arena(&mut b, &[res(7), res(8)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
+                first: 0,
+                entries,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        for _ in 0..3 {
+            b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+                .expect("draw");
+        }
+        let mut named: Vec<_> = b.accesses.iter().filter_map(|a| backing(a.key)).collect();
+        named.sort_unstable();
+        assert_eq!(
+            named,
+            vec![
+                BackingId(5),
+                BackingId(5),
+                BackingId(5),
+                BackingId(7),
+                BackingId(8)
+            ],
+            "each draw names its own index buffer; the bindings are named once"
+        );
+    }
+
+    /// A pipeline bound between two draws re-declares the table: what a bound
+    /// slot contributes is the pipeline's answer.
+    #[test]
+    fn a_pipeline_between_two_draws_re_declares_the_bindings() {
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        let entries = bind_arena(&mut b, &[res(7)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
+                first: 0,
+                entries,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+            .expect("draw");
+        b.record(
+            ResolvedOperation::Render(RenderOp::SetPipeline { pipeline: res(9) }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("pipeline");
+        b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+            .expect("draw");
+        let declarations = b
+            .accesses
+            .iter()
+            .filter_map(|a| backing(a.key))
+            .filter(|b| *b == BackingId(7))
+            .count();
+        assert_eq!(declarations, 2, "once under each pipeline");
     }
 
     /// A record that binds nothing leaves the tables alone, so a draw with no
