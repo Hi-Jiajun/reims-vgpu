@@ -37,7 +37,7 @@
 //! variant precisely so a census can count how much ordering is being bought
 //! with ignorance.
 
-use crate::identity::ChannelId;
+use crate::identity::{ChannelId, ResourceId};
 
 /// The canonical identity of a piece of backing memory.
 ///
@@ -285,6 +285,77 @@ pub struct AccessIntent {
     /// The version this access will produce. Reserved at planning, committed at
     /// completion; `None` for a pure read.
     pub output_content_version: Option<ContentVersion>,
+}
+
+/// What an operation says it touches, before the resource is resolved.
+///
+/// An operation record names a *ref* and a region; it does not name a backing,
+/// a heap, or a content version. Those come from resolution, which needs the
+/// resource registry — a thing this module cannot and should not see. So the
+/// operation's own claim is this, and [`Participation::resolve`] is the single
+/// step that turns it into an [`AccessIntent`].
+///
+/// The split matters beyond tidiness: it is what makes "an operation declares
+/// its exact participation" checkable at the operation, where the record's
+/// fields are, rather than after a registry lookup has already had a chance to
+/// widen it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Participation {
+    pub resource: ResourceId,
+    pub extent: ParticipationExtent,
+    pub mode: AccessMode,
+    /// The API stages the record declares, as the wire carries them.
+    ///
+    /// Zero for a transfer: a copy record names no shader stage, and the
+    /// transfer stage a host needs is a translation an executor performs. A
+    /// non-zero value here always came from a record that carried one.
+    pub api_stages: u32,
+}
+
+/// How much of a resource an operation named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParticipationExtent {
+    /// An exact byte range.
+    Range(ByteRange),
+    /// Exact levels, slices and a plane.
+    Subresource(SubresourceRange),
+    /// The record named the resource and nothing narrower.
+    ///
+    /// Not the same as unknown participation: the resource *is* named, so this
+    /// still conflicts only with that resource's memory. It is the honest
+    /// answer for a record like `generateMipmapsForTexture:`, whose extent is
+    /// the texture's whole pyramid and whose level count the record does not
+    /// carry.
+    Whole,
+}
+
+impl Participation {
+    /// Attach the resolved backing, submission domain and content versions.
+    ///
+    /// The versions are the caller's because they are the content authority's:
+    /// this type knows the operation reads or writes, and the authority knows
+    /// which version that is.
+    #[must_use]
+    pub const fn resolve(
+        &self,
+        domain: ChannelId,
+        resource: ResourceKey,
+        input_content_version: Option<ContentVersion>,
+        output_content_version: Option<ContentVersion>,
+    ) -> AccessIntent {
+        AccessIntent {
+            domain,
+            key: match self.extent {
+                ParticipationExtent::Range(r) => AccessKey::Range(resource, r),
+                ParticipationExtent::Subresource(s) => AccessKey::Subresource(resource, s),
+                ParticipationExtent::Whole => AccessKey::Whole(resource),
+            },
+            mode: self.mode,
+            api_stages: self.api_stages,
+            input_content_version,
+            output_content_version,
+        }
+    }
 }
 
 /// Whether an earlier access and a later one require an ordering edge.

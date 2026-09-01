@@ -24,6 +24,8 @@
 //!   and "the old backend drops it" are not outcomes and cannot be spelled here.
 //! - [`packets`] — the same ledger for the FIFO packet classes, which are the
 //!   other half of what a guest sends and which the manifest cannot enumerate.
+//! - [`blit`] — which transfer a blit opcode names, which is its shape rather
+//!   than its closure.
 //! - [`extent`] — the guest API's three-dimensional extent, its mip-level
 //!   dimensions, and the byte arithmetic of a tightly-packed image.
 //! - [`segment`] — what a segment-type byte means: which encoder wrote it, and
@@ -40,6 +42,7 @@
 // must not reach is the host, not the heap.
 extern crate alloc;
 
+pub mod blit;
 pub mod closure;
 pub mod extent;
 pub mod packets;

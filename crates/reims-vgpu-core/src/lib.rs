@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod access;
+pub mod blit;
 pub mod content;
 pub mod depend;
 pub mod identity;
