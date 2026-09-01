@@ -97,7 +97,11 @@ pub fn classify(channel: Channel, opcode: u16) -> Option<PayloadClass> {
         (Root, 0x2d | 0x3a) => Query,
         (Child, 0x3b | 0x40) => Query,
 
-        // The three present forms.
+        // The three present forms. Enumerated rather than written as the
+        // range they happen to occupy: they are three named commands whose
+        // trailers differ, and a range would quietly adopt a fourth number if
+        // the dispatch table ever grew one between them.
+        #[allow(clippy::manual_range_patterns)]
         (Child, 0x06 | 0x07 | 0x08) => Present,
 
         // Display registration, cursor, channel lifetime, and the fence with no
