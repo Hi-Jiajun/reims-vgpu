@@ -20,6 +20,8 @@
 //!
 //! # The parts
 //!
+//! - [`layout`] — which layout each image subresource is in, and the explicit
+//!   transitions and ownership moves that get it to the next one.
 //! - [`memory`] — how host and device memory relate on the bound physical
 //!   device, and which memory type an allocation gets. A misclassification here
 //!   is a performance bug and never a correctness one: topology selects a
@@ -42,6 +44,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod barrier;
+pub mod layout;
 pub mod memory;
 pub mod pools;
 pub mod queues;
