@@ -458,6 +458,21 @@ pub enum ResolveRefusal {
     /// operation built from the packet alone would rebind nothing while
     /// reporting that it had.
     NeedsGuestTable { kind: LifecycleKind },
+    /// An `Invalidate` record asks for a content-authority transition this
+    /// device has no established meaning for.
+    ///
+    /// The record's four validity-op bytes are independent on the wire, and
+    /// exactly one combination has been established: clear hostValid together
+    /// with set guestValid, which is the guest saying it CPU-wrote the
+    /// resource. Anything else is a transition no capture has shown, and the
+    /// model has two honest answers — recover it, or refuse. Applying the
+    /// guest-write transition regardless is the third answer and it is a wrong
+    /// one: it moves authority the guest did not move, which is a stale draw or
+    /// a lost CPU write with a clean log.
+    ///
+    /// Carries the guest's raw dword, because the whole point of the refusal is
+    /// that someone reading the log can see which combination arrived.
+    UnestablishedValidityOps { object_ref: u32, ops: u32 },
 }
 
 impl ResolveRefusal {
@@ -474,6 +489,7 @@ impl ResolveRefusal {
             Self::NotAMapNotice { .. } => "lifecycle_not_a_map_notice",
             Self::ShortNotice(_) => fifo::ShortPayload::SLUG,
             Self::NeedsGuestTable { .. } => "lifecycle_needs_guest_table",
+            Self::UnestablishedValidityOps { .. } => "lifecycle_unestablished_validity_ops",
         }
     }
 }
@@ -508,7 +524,21 @@ pub fn resource_list(
     // alone. `resource_list_record_len` is the only thing that decides.
     let (task, refs) = if record_len == fifo::CHILD_INVALIDATE_RECORD_LEN {
         let cmd = fifo::decode_invalidate_resources(payload).map_err(ResolveRefusal::Payload)?;
-        let refs: Vec<u32> = cmd.records.iter().map(|r| r.object_id).collect();
+        // The quad beside each ref, checked rather than dropped. This is the
+        // one list command whose records carry a transition of their own, and
+        // the operation below states one transition for the whole packet — so
+        // a record asking for a different one has to refuse here, or the
+        // packet applies an authority move the guest did not ask for.
+        let mut refs = Vec::with_capacity(cmd.records.len());
+        for record in &cmd.records {
+            if !record.ops.is_guest_write() {
+                return Err(ResolveRefusal::UnestablishedValidityOps {
+                    object_ref: record.object_id,
+                    ops: record.flags,
+                });
+            }
+            refs.push(record.object_id);
+        }
         (cmd.task_id, refs)
     } else {
         let cmd = fifo::decode_synchronize_resources(payload).map_err(ResolveRefusal::Payload)?;
@@ -2599,12 +2629,27 @@ mod tests {
     /// A resource-list payload: `{task, count}` then `count` records of
     /// `record_len`, with the object ref in the first word of each.
     fn list_bytes(task: u32, refs: &[u32], record_len: u32) -> Vec<u8> {
+        list_bytes_with(task, refs, record_len, PAGEON_DWORD)
+    }
+
+    /// The guest-write quad, as `pageBacking` writes it.
+    const PAGEON_DWORD: u32 = 0x0100_0001;
+
+    /// [`list_bytes`], with the eight-byte record's validity quad stated.
+    ///
+    /// The quad is the record's, not the packet's, so a fixture that left it
+    /// zero was feeding a transition the guest never asks for.
+    fn list_bytes_with(task: u32, refs: &[u32], record_len: u32, ops: u32) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&task.to_le_bytes());
         out.extend_from_slice(&u32::try_from(refs.len()).expect("small").to_le_bytes());
         for r in refs {
             out.extend_from_slice(&r.to_le_bytes());
-            out.resize(out.len() + record_len as usize - 4, 0);
+            if record_len == 8 {
+                out.extend_from_slice(&ops.to_le_bytes());
+            } else {
+                out.resize(out.len() + record_len as usize - 4, 0);
+            }
         }
         out
     }
@@ -2671,6 +2716,59 @@ mod tests {
                 kind.name()
             );
         }
+    }
+
+    /// A record asking for a transition this device has not established refuses
+    /// the packet, naming the ref and the quad that arrived.
+    ///
+    /// The four validity-op bytes were decoded and dropped: the operation
+    /// states one transition for the whole packet and every record got it,
+    /// whatever it asked for. A quad of zeros asks for no move at all and a
+    /// packet of them would have marked every resource guest-written — a
+    /// device replica declared stale that nothing had written.
+    #[test]
+    fn an_invalidate_record_asking_for_an_unestablished_move_refuses() {
+        for ops in [0x0000_0000, 0x0000_0001, 0x0100_0000, 0x0001_0100] {
+            let bytes = list_bytes_with(7, &[11], 8, ops);
+            assert_eq!(
+                resource_list(LifecycleKind::Invalidate, &bytes, &Everything),
+                Err(ResolveRefusal::UnestablishedValidityOps {
+                    object_ref: 11,
+                    ops
+                }),
+                "{ops:#010x}"
+            );
+        }
+    }
+
+    /// One bad quad refuses the whole packet, for the reason one unresolvable
+    /// ref does: the list says a set of resources moved together, and applying
+    /// it to the ones that happened to be well formed claims the rest did not.
+    #[test]
+    fn one_unestablished_quad_refuses_the_whole_list() {
+        let mut bytes = list_bytes_with(7, &[11, 12], 8, PAGEON_DWORD);
+        let second_ops = bytes.len() - 4;
+        bytes[second_ops..].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            resource_list(LifecycleKind::Invalidate, &bytes, &Everything),
+            Err(ResolveRefusal::UnestablishedValidityOps {
+                object_ref: 12,
+                ops: 0
+            })
+        );
+    }
+
+    /// The refusal names the check that produced it.
+    #[test]
+    fn the_unestablished_quad_refusal_has_its_own_slug() {
+        assert_eq!(
+            ResolveRefusal::UnestablishedValidityOps {
+                object_ref: 11,
+                ops: 0
+            }
+            .slug(),
+            "lifecycle_unestablished_validity_ops"
+        );
     }
 
     /// The stride is the command's, and reading a list at the other command's

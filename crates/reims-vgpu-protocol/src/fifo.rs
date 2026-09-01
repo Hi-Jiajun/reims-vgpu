@@ -1008,6 +1008,29 @@ impl InvalidateValidityOps {
         clear_guest_valid: 0,
         set_guest_valid: 1,
     };
+
+    /// Whether this quad is the guest-write transition: the guest's pages
+    /// became the authoritative content and the host's copy stopped being one.
+    ///
+    /// **The only quad with an established meaning.** `pageBacking` writes
+    /// [`Self::PAGEON`] and writes nothing else, so that pairing — and only
+    /// that pairing — is a transition this device knows how to make. The four
+    /// fields are independent on the wire and a build that set a different
+    /// combination would be asking for something no capture has shown; a
+    /// reader that applied the guest-write transition to it anyway would be
+    /// moving content authority the guest did not move, which is a stale draw
+    /// or a lost CPU write rather than a wrong log line.
+    ///
+    /// So this is a question with a `false` answer rather than a classifier
+    /// with a default. What a caller does with `false` is the caller's, and in
+    /// this project it is a typed refusal.
+    #[must_use]
+    pub const fn is_guest_write(self) -> bool {
+        self.clear_host_valid != 0
+            && self.set_guest_valid != 0
+            && self.set_host_valid == 0
+            && self.clear_guest_valid == 0
+    }
 }
 
 /// One CmdInvalidateResources object record (RE: `pageBacking` second `getCommandBytes(8)`).
@@ -1257,6 +1280,27 @@ pub fn decode_synchronize_resources(
 mod tests {
     use super::*;
     use crate::endian::st32;
+
+    /// The guest-write transition is one exact quad, not "some bits set".
+    ///
+    /// The four fields are independent bytes, so a reader that tested any one
+    /// of them would accept three quads that ask for something else — and each
+    /// of those moves content authority in a direction no capture has shown.
+    #[test]
+    fn only_the_pageon_quad_is_the_guest_write_transition() {
+        assert!(InvalidateValidityOps::PAGEON.is_guest_write());
+        assert_eq!(InvalidateValidityOps::PAGEON.to_le_dword(), 0x0100_0001);
+        assert!(InvalidateValidityOps::from_le_dword(0x0100_0001).is_guest_write());
+
+        // Asks for nothing.
+        assert!(!InvalidateValidityOps::default().is_guest_write());
+        // Each half alone is not the pair.
+        assert!(!InvalidateValidityOps::from_le_dword(0x0000_0001).is_guest_write());
+        assert!(!InvalidateValidityOps::from_le_dword(0x0100_0000).is_guest_write());
+        // The opposite direction, and the pair with an extra op beside it.
+        assert!(!InvalidateValidityOps::from_le_dword(0x0001_0100).is_guest_write());
+        assert!(!InvalidateValidityOps::from_le_dword(0x0100_0101).is_guest_write());
+    }
 
     /// The raw first word is an id and a class bit, and both halves survive a
     /// round trip.
