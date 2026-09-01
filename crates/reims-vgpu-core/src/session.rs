@@ -71,9 +71,13 @@ pub enum Refusal {
         named: SessionGeneration,
         current: SessionGeneration,
     },
-    /// The packet is held for a pipeline its payload does not lease. Parking
-    /// on it waits for a compilation this work has no interest in.
-    UnleasedPipelineWait { pipeline: ResourceId },
+    /// The packet binds a pipeline it can never use: one this device refused
+    /// to build, or one this generation does not have.
+    ///
+    /// Refused rather than admitted with a wait, because the wait would never
+    /// resolve. Admitting it and withdrawing it later costs the guest the same
+    /// frame and costs this device a position it has to remember to take back.
+    PipelineUnusable(crate::pipeline::LeaseRefusal),
     /// The opcode declares one payload class and the decoded payload is
     /// another. Admitting it would order the packet as the wrong kind of work
     /// against a namespace that does not own what it names.
@@ -95,7 +99,7 @@ impl Refusal {
             Self::ChannelNotOpen { .. } => "ingress_channel_not_open",
             Self::ChannelAlreadyOpen { .. } => "ingress_channel_already_open",
             Self::PayloadMismatch { .. } => "ingress_payload_mismatch",
-            Self::UnleasedPipelineWait { .. } => "ingress_unleased_pipeline_wait",
+            Self::PipelineUnusable(refusal) => refusal.slug(),
             Self::GenerationClosed { .. } => "ingress_generation_closed",
         }
     }
@@ -157,13 +161,6 @@ pub struct Packet {
     /// The decoded work and everything it touches. Resolution is the caller's:
     /// it needs the namespaces, and this is the ordering plane.
     pub payload: Payload,
-    /// Pipelines this packet needs whose leases came back pending.
-    ///
-    /// Only the pending ones: a lease that was already ready is not a wait, and
-    /// passing it would hold the transaction for a compilation that has already
-    /// finished. Taking the leases is the caller's, because the pipeline table
-    /// lives beside this plane rather than in it.
-    pub pipeline_waits: Vec<ResourceId>,
 }
 
 /// What admitting a packet produced.
@@ -191,6 +188,14 @@ pub struct SessionModel {
     open_channels: BTreeSet<ChannelId>,
     channel_sequence: BTreeMap<ChannelId, ChannelSequence>,
     graph: DependencyGraph,
+    /// The pipeline objects this session's work binds.
+    ///
+    /// Held here rather than beside this plane, because the waits a transaction
+    /// is admitted with are the table's answer about that transaction's own
+    /// leases. A table on the other side of the boundary means a caller states
+    /// the waits, and a caller that states them can state ones the payload does
+    /// not lease or omit ones it does.
+    pipelines: crate::pipeline::PipelineTable,
     scheduler: Scheduler,
     publisher: Publisher,
     /// Which channel position each admitted transaction holds, so completion
@@ -211,6 +216,7 @@ impl SessionModel {
             open_channels: BTreeSet::new(),
             channel_sequence: BTreeMap::new(),
             graph: DependencyGraph::new(),
+            pipelines: crate::pipeline::PipelineTable::new(),
             scheduler: Scheduler::new(),
             publisher: Publisher::new(),
             position: BTreeMap::new(),
@@ -345,25 +351,27 @@ impl SessionModel {
             });
         }
 
-        // A pipeline this packet is held for has to be a pipeline this packet
-        // uses. The wait list is a *subset* of the payload's leases — the ones
-        // whose compilation had not finished when the lease table was asked —
-        // so a wait naming a pipeline the payload never leased is a caller that
-        // built the two lists from different places. Holding on it parks the
-        // transaction for a compilation it has no interest in, which the guest
-        // experiences as a frame that never arrives and nothing explains.
+        // The waits are the table's answer about this payload's own leases, not
+        // a list the caller brought. A caller that could state them could state
+        // ones the payload does not lease — parking the transaction for a
+        // compilation it has no interest in, which the guest experiences as a
+        // frame that never arrives — or omit ones it does, which runs a draw
+        // against a pipeline that is still being built.
         //
-        // Non-EXEC payloads lease nothing, so their wait list must be empty:
-        // only GPU work uses a pipeline.
-        if let Some(unleased) = packet.pipeline_waits.iter().copied().find(|wait| {
-            packet
-                .payload
-                .exec()
-                .is_none_or(|work| !work.pipeline_leases.contains(wait))
-        }) {
-            self.refusals += 1;
-            return Err(Refusal::UnleasedPipelineWait { pipeline: unleased });
-        }
+        // Non-EXEC payloads lease nothing, so they wait for nothing: only GPU
+        // work binds a pipeline.
+        let generation = self.generation;
+        let pipeline_waits = match packet.payload.exec() {
+            Some(work) => self.pipelines.waits_for(&work.pipeline_leases, generation),
+            None => Ok(Vec::new()),
+        };
+        let pipeline_waits = match pipeline_waits {
+            Ok(waits) => waits,
+            Err(refusal) => {
+                self.refusals += 1;
+                return Err(Refusal::PipelineUnusable(refusal));
+            }
+        };
 
         if !self.open_channels.contains(&packet.domain) {
             self.refusals += 1;
@@ -389,7 +397,7 @@ impl SessionModel {
             ingress,
             &hazard_waits,
             &packet.stamp_waits,
-            &packet.pipeline_waits,
+            &pipeline_waits,
             packet.completion,
         );
         Ok(Admitted {
@@ -554,6 +562,65 @@ impl SessionModel {
         }
     }
 
+    /// The pipeline objects this session's work binds, for the layer that
+    /// declares them and advances their compilation.
+    ///
+    /// Read and write, because declaring a pipeline and stepping it through
+    /// translation are the compiling layer's and not this plane's. What this
+    /// plane owns is the consequence, which is why the two steps that *have* a
+    /// consequence — a pipeline becoming usable and a pipeline becoming
+    /// impossible — are [`Self::pipeline_ready`] and [`Self::pipeline_refused`]
+    /// rather than calls on the table.
+    pub const fn pipelines(&mut self) -> &mut crate::pipeline::PipelineTable {
+        &mut self.pipelines
+    }
+
+    /// A pipeline finished building: record it, and release what was held for
+    /// it.
+    ///
+    /// **The two halves are one call because they are one fact.** The table
+    /// knew a pipeline had become `Ready` and the scheduler knew which
+    /// transactions were parked on it, and nothing carried one to the other —
+    /// so a transaction admitted with a pipeline wait was admitted into a wait
+    /// nothing could ever discharge. It holds its channel's publication head,
+    /// and every completion word behind it stops arriving.
+    ///
+    /// Returns whether the step was legal and taken. An illegal one is real: a
+    /// compile that finishes after the guest deleted the pipeline, which must
+    /// not resurrect it — and must not release work either, since that work
+    /// cannot be admitted against a retired pipeline in the first place.
+    pub fn pipeline_ready(&mut self, pipeline: ResourceId) -> bool {
+        if !self
+            .pipelines
+            .advance(pipeline, crate::pipeline::PipelineState::Ready)
+        {
+            return false;
+        }
+        self.scheduler.pipeline_ready(pipeline);
+        true
+    }
+
+    /// A pipeline will never build: record the reason, and name the
+    /// transactions that can therefore never be ready.
+    ///
+    /// They come back rather than being made ready or dropped. Made ready they
+    /// would execute against a pipeline that does not exist; dropped they would
+    /// hold their channel's publication head forever. The caller withdraws each
+    /// one — see [`Self::withdraw`] — and says why on its failure channel.
+    ///
+    /// Empty when the refusal was not a legal step, for
+    /// [`Self::pipeline_ready`]'s reason.
+    pub fn pipeline_refused(
+        &mut self,
+        pipeline: ResourceId,
+        reason: crate::pipeline::RefusalReason,
+    ) -> Vec<IngressOrdinal> {
+        if !self.pipelines.refuse(pipeline, reason) {
+            return Vec::new();
+        }
+        self.scheduler.pipeline_refused(pipeline)
+    }
+
     /// Transactions that have become ready since the last call.
     pub fn take_ready(&mut self) -> Vec<IngressOrdinal> {
         self.scheduler.take_ready()
@@ -612,7 +679,6 @@ mod tests {
             stamp_waits: Vec::new(),
             completion: None,
             payload: empty_payload(Channel::Child, opcode),
-            pipeline_waits: Vec::new(),
         }
     }
 
@@ -800,45 +866,161 @@ mod tests {
         );
     }
 
-    /// A pipeline wait is a subset of the payload's leases. The two lists were
-    /// built from different places — the leases as the records resolved, the
-    /// waits from whatever the lease table said was still compiling — and
-    /// nothing tied them together, so a wait for a pipeline the packet never
-    /// uses was representable. It parks the transaction for a compilation it
-    /// has no interest in, which the guest sees as a frame that never arrives.
+    /// A transaction's pipeline waits are the table's answer about its own
+    /// leases, and nothing else can state them.
+    ///
+    /// The two lists used to be built in different places — the leases as the
+    /// records resolved, the waits from whatever the caller asked the table —
+    /// and nothing tied them together, so a wait for a pipeline the packet
+    /// never binds was representable, as was a packet that bound one and waited
+    /// for nothing. The first parks the transaction for a compilation it has no
+    /// interest in; the second runs a draw against a pipeline still being
+    /// built.
     #[test]
-    fn a_packet_cannot_wait_for_a_pipeline_it_does_not_lease() {
+    fn a_transactions_pipeline_waits_are_the_pipelines_it_binds() {
         let mut s = session();
         let pipeline = ResourceId {
             slot: ObjectListRef(9),
             generation: SlotGeneration(1),
         };
-        let mut wrong = packet(0x37);
-        wrong.pipeline_waits = vec![pipeline];
-        let err = s.admit(&wrong).expect_err("it leases nothing");
-        assert_eq!(err, Refusal::UnleasedPipelineWait { pipeline });
-        assert_eq!(err.slug(), "ingress_unleased_pipeline_wait");
+        let gen = s.generation();
+        s.pipelines().declare(pipeline, gen);
 
-        // The same wait against a payload that does lease it is admitted, and
-        // held: the scheduler was told about the pipeline.
+        // Binding nothing waits for nothing, whatever the table holds.
+        assert!(s.admit(&packet(0x37)).expect("accepted").ready);
+
         let mut leased = packet(0x37);
         let Payload::Exec(work) = &mut leased.payload else {
             panic!("an EXEC");
         };
         work.pipeline_leases.push(pipeline);
-        leased.pipeline_waits = vec![pipeline];
         let admitted = s.admit(&leased).expect("accepted");
         assert!(!admitted.ready, "a pipeline still compiling holds the work");
-        assert_eq!(admitted.transaction.identity.ingress, IngressOrdinal(1));
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 1);
 
-        // And a packet that is not GPU work leases nothing, so it can wait for
-        // nothing: only an EXEC uses a pipeline.
-        let mut control = packet(0x1e);
-        control.pipeline_waits = vec![pipeline];
-        assert_eq!(
-            s.admit(&control),
-            Err(Refusal::UnleasedPipelineWait { pipeline })
+        // A packet that is not GPU work leases nothing, so it waits for
+        // nothing: only an EXEC binds a pipeline.
+        assert!(s.admit(&packet(0x1e)).expect("accepted").ready);
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 1);
+    }
+
+    /// A pipeline finishing releases the work that was held for it.
+    ///
+    /// The table knew the pipeline had become ready and the scheduler knew who
+    /// was parked on it, and nothing carried one to the other — so a
+    /// transaction admitted with a pipeline wait was admitted into a wait
+    /// nothing could discharge, holding its channel's publication head and
+    /// every completion word behind it.
+    #[test]
+    fn a_pipeline_finishing_releases_the_work_that_was_held_for_it() {
+        let mut s = session();
+        let pipeline = ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration(1),
+        };
+        let gen = s.generation();
+        s.pipelines().declare(pipeline, gen);
+        let mut leased = packet(0x37);
+        let Payload::Exec(work) = &mut leased.payload else {
+            panic!("an EXEC");
+        };
+        work.pipeline_leases.push(pipeline);
+        let admitted = s.admit(&leased).expect("accepted");
+        assert!(!admitted.ready);
+        assert!(s.take_ready().is_empty());
+
+        // The intermediate steps are the compiling layer's and release nothing.
+        for step in [
+            crate::pipeline::PipelineState::Translating,
+            crate::pipeline::PipelineState::Compiling,
+        ] {
+            s.pipelines().advance(pipeline, step);
+        }
+        assert!(
+            s.take_ready().is_empty(),
+            "a pipeline is not ready until it is"
         );
+
+        assert!(s.pipeline_ready(pipeline));
+        assert_eq!(s.take_ready(), vec![admitted.transaction.identity.ingress]);
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 0);
+
+        // A second arrival of the same news is not a legal step and releases
+        // nothing, which is what stops a late compile callback resurrecting a
+        // pipeline the guest deleted.
+        assert!(!s.pipeline_ready(pipeline));
+    }
+
+    /// A pipeline that will never build is refused at ingress once it is known,
+    /// and the work already admitted for it is named rather than dropped.
+    ///
+    /// Named because the two outcomes a caller must not take are worse: made
+    /// ready, the work executes against a pipeline that does not exist; dropped,
+    /// it holds its channel's publication head forever.
+    #[test]
+    fn a_pipeline_that_will_never_build_names_the_work_it_stranded() {
+        let mut s = session();
+        let pipeline = ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration(1),
+        };
+        let gen = s.generation();
+        s.pipelines().declare(pipeline, gen);
+        let mut leased = packet(0x37);
+        let Payload::Exec(work) = &mut leased.payload else {
+            panic!("an EXEC");
+        };
+        work.pipeline_leases.push(pipeline);
+        let admitted = s.admit(&leased).expect("accepted");
+
+        let reason = crate::pipeline::RefusalReason::CompilationFailed("out of registers");
+        assert_eq!(
+            s.pipeline_refused(pipeline, reason),
+            vec![admitted.transaction.identity.ingress]
+        );
+        // And the next packet binding it is refused at ingress rather than
+        // admitted into a wait that cannot resolve.
+        let err = s.admit(&leased).expect_err("it can never run");
+        assert_eq!(
+            err,
+            Refusal::PipelineUnusable(crate::pipeline::LeaseRefusal::Refused { pipeline, reason })
+        );
+        assert_eq!(err.slug(), "pipeline_compilation_failed");
+    }
+
+    /// Work binding a pipeline this session never declared is refused, and not
+    /// as the same failure as one that could not be built.
+    #[test]
+    fn work_binding_an_undeclared_pipeline_is_refused_as_absent() {
+        let mut s = session();
+        let pipeline = ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration(1),
+        };
+        let mut leased = packet(0x37);
+        let Payload::Exec(work) = &mut leased.payload else {
+            panic!("an EXEC");
+        };
+        work.pipeline_leases.push(pipeline);
+        let err = s.admit(&leased).expect_err("nothing declared it");
+        assert_eq!(
+            err,
+            Refusal::PipelineUnusable(crate::pipeline::LeaseRefusal::Absent { pipeline })
+        );
+        assert_eq!(err.slug(), "pipeline_absent");
+        // The refusal consumed no ordinal, like every other one here.
+        let gen = s.generation();
+        s.pipelines().declare(pipeline, gen);
+        for step in [
+            crate::pipeline::PipelineState::Translating,
+            crate::pipeline::PipelineState::Compiling,
+            crate::pipeline::PipelineState::Ready,
+        ] {
+            s.pipelines().advance(pipeline, step);
+        }
+        let ok = s.admit(&leased).expect("declared and built");
+        assert_eq!(ok.transaction.identity.ingress, IngressOrdinal(1));
+        assert!(ok.ready, "a pipeline already built is nothing to wait for");
     }
 
     /// The envelope has no access list of its own, so the accesses the

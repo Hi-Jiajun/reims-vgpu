@@ -247,7 +247,6 @@ fn drive(seed: u64, count: usize, channels: u32, queues: u32, policy: Policy) ->
                 }],
                 ..ExecWork::default()
             }),
-            pipeline_waits: Vec::new(),
         };
         let admitted = model.admit(&packet).expect("a well-formed EXEC");
         let ordinal = admitted.transaction.identity.ingress;
@@ -430,7 +429,6 @@ fn order(seed: u64, policy: Policy) -> Vec<u64> {
                 }],
                 ..ExecWork::default()
             }),
-            pipeline_waits: Vec::new(),
         };
         let ordinal = model
             .admit(&packet)
