@@ -551,8 +551,8 @@ mod tests {
                 },
                 accesses: Vec::new(),
             },
-            Some(PayloadClass::Query) => Payload::Query {
-                request: crate::query::QueryRequest {
+            Some(PayloadClass::Query) => Payload::Query(crate::transaction::QueryPayload::new(
+                crate::query::QueryRequest {
                     kind: crate::query::QueryKind::of(channel, opcode).expect("a query"),
                     destination: crate::query::ReplyDestination {
                         backing: BackingId(1),
@@ -563,8 +563,9 @@ mod tests {
                     },
                     reply: crate::query::ReplyShape::Fixed,
                 },
-                accesses: Vec::new(),
-            },
+                ChannelId(0),
+                None,
+            )),
             Some(PayloadClass::Present) => Payload::Present {
                 packet: crate::present::resolve(channel, opcode, &0u32.to_le_bytes())
                     .expect("a present with a trailer"),
@@ -590,8 +591,14 @@ mod tests {
         match &mut packet.payload {
             Payload::Exec(work) => work.accesses = accesses,
             Payload::ResourceLifecycle { accesses: a, .. }
-            | Payload::Query { accesses: a, .. }
             | Payload::Present { accesses: a, .. } => *a = accesses,
+            // A query's access is its reply window and is not the test's to
+            // choose — see `QueryPayload`.
+            Payload::Query(query) => assert_eq!(
+                accesses,
+                vec![*query.access()],
+                "a query touches its destination and nothing else"
+            ),
             Payload::Control(_) => {
                 assert!(accesses.is_empty(), "a control packet touches nothing");
             }

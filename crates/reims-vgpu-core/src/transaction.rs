@@ -26,9 +26,10 @@
 //! the closure ledger: every packet class the ledger has judged maps to exactly
 //! one payload, and every class it has *not* judged maps to none.
 
-use crate::access::AccessIntent;
+use crate::access::{AccessIntent, AccessKey, AccessMode, ResourceKey};
 use crate::control::ControlOp;
 use crate::exec::ExecWork;
+use crate::identity::ChannelId;
 use crate::identity::{CompletionStamp, StampWait, TransactionIdentity};
 use crate::lifecycle::LifecycleOp;
 use crate::present::PresentPacket;
@@ -173,10 +174,7 @@ pub enum Payload {
         accesses: Vec<AccessIntent>,
     },
     /// A question, and the write its answer will make.
-    Query {
-        request: QueryRequest,
-        accesses: Vec<AccessIntent>,
-    },
+    Query(QueryPayload),
     /// What the guest asked to show, and the frame reading it.
     Present {
         packet: PresentPacket,
@@ -190,6 +188,76 @@ pub enum Payload {
     Control(ControlOp),
 }
 
+/// A query and the one access it makes.
+///
+/// **The access is not a field beside the request; it is derived from it.** A
+/// query touches exactly one thing — the window its reply is written into — and
+/// that window is already named by [`QueryRequest::destination`]. Held as a
+/// `Vec<AccessIntent>` beside the request, as the other classes hold theirs, it
+/// was free to be empty or to name something else, and either is a real defect:
+/// an answer the dependency graph does not know about is content a later
+/// transfer may overwrite between the write and the guest's read, which is
+/// exactly what [`crate::query::ReplyWrite`]'s `#[must_use]` says.
+///
+/// So the fields are private and [`Self::new`] is the only way in. The
+/// alternative — a public pair and a test that they agree — is a rule someone
+/// has to remember at each construction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryPayload {
+    request: QueryRequest,
+    access: AccessIntent,
+}
+
+impl QueryPayload {
+    /// Build the payload for a query, deriving its access from its destination.
+    ///
+    /// `output` is the content version the write reserves, `None` when the
+    /// destination's content is not versioned. The mode is
+    /// [`AccessMode::Write`] and never read-modify-write: a reply is written
+    /// whole and this device reads nothing at the destination — a guest's
+    /// previous contents there are what it would see if no answer landed, which
+    /// is the failure this write exists to prevent, not an input to it.
+    #[must_use]
+    pub fn new(
+        request: QueryRequest,
+        domain: ChannelId,
+        output: Option<crate::access::ContentVersion>,
+    ) -> Self {
+        let destination = request.destination;
+        Self {
+            request,
+            access: AccessIntent {
+                domain,
+                key: AccessKey::Range(
+                    ResourceKey {
+                        backing: destination.backing,
+                        // A reply destination is a guest buffer the request
+                        // named, not a window of a heap this device placed.
+                        heap: None,
+                    },
+                    destination.bytes,
+                ),
+                mode: AccessMode::Write,
+                // A reply is written by the device, not by a pipeline stage.
+                api_stages: 0,
+                input_content_version: None,
+                output_content_version: output,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &QueryRequest {
+        &self.request
+    }
+
+    /// The write the answer will make. There is exactly one.
+    #[must_use]
+    pub const fn access(&self) -> &AccessIntent {
+        &self.access
+    }
+}
+
 impl Payload {
     /// Which class this is.
     #[must_use]
@@ -197,7 +265,7 @@ impl Payload {
         match self {
             Self::Exec(_) => PayloadClass::Exec,
             Self::ResourceLifecycle { .. } => PayloadClass::ResourceLifecycle,
-            Self::Query { .. } => PayloadClass::Query,
+            Self::Query(_) => PayloadClass::Query,
             Self::Present { .. } => PayloadClass::Present,
             Self::Control(_) => PayloadClass::Control,
         }
@@ -213,9 +281,8 @@ impl Payload {
     pub fn accesses(&self) -> &[AccessIntent] {
         match self {
             Self::Exec(work) => &work.accesses,
-            Self::ResourceLifecycle { accesses, .. }
-            | Self::Query { accesses, .. }
-            | Self::Present { accesses, .. } => accesses,
+            Self::ResourceLifecycle { accesses, .. } | Self::Present { accesses, .. } => accesses,
+            Self::Query(query) => std::slice::from_ref(query.access()),
             Self::Control(_) => &[],
         }
     }
@@ -287,6 +354,59 @@ impl DeviceTransaction {
 mod tests {
     use super::*;
     use reims_vgpu_protocol::packets::LEDGER;
+
+    /// A query's access is exactly the window its reply goes to.
+    ///
+    /// The one thing this class cannot get wrong any more. An answer the
+    /// dependency graph does not know about is content a later transfer may
+    /// overwrite between the write and the guest's read — and the guest is
+    /// blocked on the completion word, so it reads whatever is there the moment
+    /// the word advances.
+    #[test]
+    fn a_query_touches_its_reply_window_and_nothing_else() {
+        let destination = crate::query::ReplyDestination {
+            backing: crate::access::BackingId(9),
+            bytes: crate::access::ByteRange {
+                offset: 0x200,
+                length: 4096,
+            },
+        };
+        let payload = Payload::Query(QueryPayload::new(
+            crate::query::QueryRequest {
+                kind: crate::query::QueryKind::DeviceInfo,
+                destination,
+                reply: crate::query::ReplyShape::Fixed,
+            },
+            ChannelId(2),
+            Some(crate::access::ContentVersion(7)),
+        ));
+        let accesses = payload.accesses();
+        assert_eq!(accesses.len(), 1, "one window, not a list");
+        let access = accesses[0];
+        assert_eq!(
+            access.key,
+            AccessKey::Range(
+                ResourceKey {
+                    backing: destination.backing,
+                    heap: None,
+                },
+                destination.bytes,
+            ),
+            "the destination the request named, at byte precision"
+        );
+        assert_eq!(access.domain, ChannelId(2));
+        assert_eq!(
+            access.mode,
+            AccessMode::Write,
+            "a reply is written whole; the bytes already there are the failure \
+             this write prevents, not an input to it"
+        );
+        assert_eq!(
+            access.output_content_version,
+            Some(crate::access::ContentVersion(7))
+        );
+        assert_eq!(access.input_content_version, None);
+    }
 
     /// The claim the module docs make and cannot check by being read: the
     /// classification is total over everything the ledger has judged, and empty
