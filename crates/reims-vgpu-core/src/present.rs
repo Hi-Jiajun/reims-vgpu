@@ -208,6 +208,17 @@ pub enum Refusal {
     /// Not an error: the caller owes the guest this fact and owes the host
     /// nothing.
     Superseded { by: u64 },
+    /// A newer frame was queued ahead of an earlier one that has not been
+    /// drawn yet.
+    ///
+    /// Superseding relaxes *presentation* order; it says nothing about who owns
+    /// an image. A frame still in [`Phase::AcquirePending`] holds a claim this
+    /// stream handed out and the caller has not returned — it is being written
+    /// into right now — so dropping it would free the image under its writer and
+    /// hand the same one to the next acquire. That is the second claim on one
+    /// image that [`Ticket`] not being `Clone` exists to make unspellable, and
+    /// this stream must not create it either.
+    UndrawnFrameAhead { sequence: u64 },
     /// No swapchain has been configured, so there is nothing to acquire from.
     NotConfigured,
 }
@@ -221,6 +232,7 @@ impl Refusal {
             Self::WrongPhase { .. } => "present_wrong_phase",
             Self::OutOfOrder { .. } => "present_out_of_order",
             Self::Superseded { .. } => "present_superseded",
+            Self::UndrawnFrameAhead { .. } => "present_undrawn_frame_ahead",
             Self::NotConfigured => "present_not_configured",
         }
     }
@@ -521,13 +533,38 @@ impl PresentStream {
     ///
     /// Under [`Order::Superseding`] a newer frame may go first, and every
     /// earlier one still in flight is dropped and reported — the caller owes
-    /// the guest that fact.
+    /// the guest that fact. Every earlier one must already be drawn:
+    /// see [`Refusal::UndrawnFrameAhead`].
     ///
     /// # Errors
     ///
-    /// As [`Self::ready`], plus [`Refusal::OutOfOrder`] under FIFO.
+    /// As [`Self::ready`], plus [`Refusal::OutOfOrder`] under FIFO and
+    /// [`Refusal::UndrawnFrameAhead`] under superseding.
     pub fn queue(&mut self, ticket: &Ticket) -> Result<Vec<u64>, Refusal> {
         self.check_generation(ticket)?;
+        // **Everything that can refuse is decided before anything is dropped.**
+        // The supersede used to run first and the queuing frame's own phase was
+        // checked after it, so a `queue` of a frame that was not drawn yet
+        // dropped every earlier frame, freed their images, and then returned
+        // `WrongPhase` — discarding the `dropped` list. The caller was told
+        // only that its own phase was wrong, so it never reported those frames
+        // to the guest and never stopped drawing into images this stream had
+        // already handed to the next acquire.
+        let Some(at) = self
+            .in_flight
+            .iter()
+            .position(|f| f.sequence == ticket.sequence)
+        else {
+            return Err(Refusal::Superseded {
+                by: self.next_sequence,
+            });
+        };
+        if self.in_flight[at].phase != Phase::Ready {
+            return Err(Refusal::WrongPhase {
+                at: self.in_flight[at].phase,
+                expected: Phase::Ready,
+            });
+        }
         let head = self
             .in_flight
             .front()
@@ -542,6 +579,15 @@ impl PresentStream {
                     })
                 }
                 Order::Superseding => {
+                    if let Some(undrawn) = self
+                        .in_flight
+                        .iter()
+                        .find(|f| f.sequence < ticket.sequence && f.phase == Phase::AcquirePending)
+                    {
+                        return Err(Refusal::UndrawnFrameAhead {
+                            sequence: undrawn.sequence,
+                        });
+                    }
                     while let Some(front) = self.in_flight.front() {
                         if front.sequence >= ticket.sequence {
                             break;
@@ -553,7 +599,12 @@ impl PresentStream {
                 }
             }
         }
-        self.advance(ticket, Phase::Ready, Phase::Queued)?;
+        // Nothing can refuse from here, so the drops above are final.
+        self.in_flight
+            .iter_mut()
+            .find(|f| f.sequence == ticket.sequence)
+            .expect("found above and never dropped: it is not earlier than itself")
+            .phase = Phase::Queued;
         Ok(dropped)
     }
 
@@ -924,6 +975,15 @@ mod tests {
         let third = s.acquire().expect("an image");
         s.ready(&third).expect("acquired");
         assert_eq!(
+            s.queue(&third),
+            Err(Refusal::UndrawnFrameAhead {
+                sequence: first.sequence
+            }),
+            "an earlier frame is still being drawn into its image"
+        );
+        s.ready(&first).expect("acquired");
+        s.ready(&second).expect("acquired");
+        assert_eq!(
             s.queue(&third).expect("superseding"),
             vec![first.sequence, second.sequence],
             "the caller owes the guest these two"
@@ -936,6 +996,40 @@ mod tests {
         );
         s.complete(&third).expect("queued");
         assert_eq!(s.in_flight(), 0);
+    }
+
+    /// **A refused queue drops nothing.**
+    ///
+    /// The supersede used to run before the queuing frame's own phase was
+    /// checked, so a `queue` of a frame that was not drawn yet dropped every
+    /// earlier frame and freed their images — and then returned `WrongPhase`,
+    /// discarding the list of what it had dropped. The caller learned only that
+    /// its own phase was wrong, so it neither reported those frames to the
+    /// guest nor stopped drawing into images the next acquire could hand out.
+    #[test]
+    fn a_queue_that_refuses_supersedes_nothing() {
+        let mut s = PresentStream::new(Order::Superseding);
+        s.configure(3, 3);
+        let first = s.acquire().expect("an image");
+        let second = s.acquire().expect("an image");
+        let third = s.acquire().expect("an image");
+        s.ready(&first).expect("acquired");
+        s.ready(&second).expect("acquired");
+        // `third` is not drawn, so this cannot be queued at all.
+        assert_eq!(
+            s.queue(&third),
+            Err(Refusal::WrongPhase {
+                at: Phase::AcquirePending,
+                expected: Phase::Ready,
+            })
+        );
+        assert_eq!(s.in_flight(), 3, "nothing was dropped");
+        assert_eq!(s.census().1, 0, "and nothing was counted as superseded");
+        assert_eq!(s.phase(&first), Some(Phase::Ready));
+        assert_eq!(s.phase(&second), Some(Phase::Ready));
+        // The frames are still theirs to present, in order.
+        assert_eq!(s.queue(&first).expect("head"), Vec::<u64>::new());
+        s.complete(&first).expect("queued");
     }
 
     /// A replaced swapchain is retired against a timeline point, not destroyed.
@@ -1153,5 +1247,244 @@ mod tests {
         s.complete(&ticket).expect("shown");
         assert_eq!(s.wake().len(), 1);
         assert_eq!(s.census().2, 1);
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// **One image has one claim, and a superseded frame never keeps one.**
+    ///
+    /// The shadow is a per-image owner slot — `Option<sequence>` for each of
+    /// the returned images — which is the whole invariant and nothing else. It
+    /// has no queue, no phase machine and no order; a stream that handed an
+    /// image out while its slot was occupied, or freed one it had not handed
+    /// out, cannot agree with it.
+    ///
+    /// Driven over both orders, because the two differ in exactly the place
+    /// this can go wrong: a superseding queue releases images the caller
+    /// acquired and did not complete.
+    #[test]
+    fn one_image_has_one_claim_across_acquire_supersede_and_replace() {
+        let mut presented = 0usize;
+        let mut superseded = 0usize;
+        let mut parked_admissions = 0usize;
+        let mut woken = 0usize;
+        let mut undrawn_refusals = 0usize;
+        let mut replaces = 0usize;
+        let mut abandoned = 0usize;
+
+        for seed in 0..512u64 {
+            let mut rng = Rng::new(seed);
+            let order = if seed % 2 == 0 {
+                Order::Fifo
+            } else {
+                Order::Superseding
+            };
+            let mut s = PresentStream::new(order);
+            let mut images = (rng.below(3) + 1) as usize;
+            s.configure(images + 1, images);
+            // Shadow: who owns each image, and every ticket still held.
+            let mut owner: Vec<Option<u64>> = vec![None; images];
+            let mut tickets: Vec<Ticket> = Vec::new();
+            let mut ingress = 0u64;
+            // This stream's own tally; `presented` is the whole sweep's.
+            let mut presented_here = 0usize;
+
+            for _ in 0..64 {
+                match rng.below(24) {
+                    // Acquire directly.
+                    0..=4 => match s.acquire() {
+                        Ok(t) => {
+                            assert!(
+                                owner[t.image].is_none(),
+                                "seed {seed}: image {} handed out twice",
+                                t.image
+                            );
+                            owner[t.image] = Some(t.sequence);
+                            tickets.push(t);
+                        }
+                        Err(Refusal::NoFreeImage { images: n }) => {
+                            assert_eq!(n, images);
+                            assert_eq!(
+                                owner.iter().filter(|o| o.is_some()).count(),
+                                images,
+                                "seed {seed}: refused with a free image"
+                            );
+                        }
+                        Err(other) => panic!("seed {seed}: acquire refused as {other:?}"),
+                    },
+                    // Admit a present packet, which parks when nothing is free.
+                    5..=7 => {
+                        ingress += 1;
+                        let request = PresentRequest {
+                            ingress: IngressOrdinal(ingress),
+                            stamp: None,
+                        };
+                        match s.submit(request) {
+                            Admission::Acquired { ticket, .. } => {
+                                assert!(owner[ticket.image].is_none(), "seed {seed}");
+                                owner[ticket.image] = Some(ticket.sequence);
+                                tickets.push(ticket);
+                            }
+                            Admission::Parked { .. } => parked_admissions += 1,
+                            Admission::NotConfigured => panic!("seed {seed}: configured"),
+                        }
+                    }
+                    // Draw a frame.
+                    8..=12 => {
+                        if !tickets.is_empty() {
+                            let i = rng.below(tickets.len() as u64) as usize;
+                            let _ = s.ready(&tickets[i]);
+                        }
+                    }
+                    // Hand a frame to the presentation queue.
+                    13..=17 => {
+                        if tickets.is_empty() {
+                            continue;
+                        }
+                        let i = rng.below(tickets.len() as u64) as usize;
+                        match s.queue(&tickets[i]) {
+                            Ok(dropped) => {
+                                for d in &dropped {
+                                    let slot = owner
+                                        .iter_mut()
+                                        .find(|o| **o == Some(*d))
+                                        .expect("a dropped frame held an image");
+                                    *slot = None;
+                                }
+                                superseded += dropped.len();
+                            }
+                            Err(Refusal::UndrawnFrameAhead { .. }) => undrawn_refusals += 1,
+                            Err(
+                                Refusal::OutOfOrder { .. }
+                                | Refusal::WrongPhase { .. }
+                                | Refusal::Superseded { .. }
+                                | Refusal::StaleGeneration { .. },
+                            ) => {}
+                            Err(other) => panic!("seed {seed}: queue refused as {other:?}"),
+                        }
+                    }
+                    // The host showed a frame.
+                    18..=22 => {
+                        if tickets.is_empty() {
+                            continue;
+                        }
+                        let i = rng.below(tickets.len() as u64) as usize;
+                        match s.complete(&tickets[i]) {
+                            Ok(()) => {
+                                let seq = tickets[i].sequence;
+                                let slot = owner
+                                    .iter_mut()
+                                    .find(|o| **o == Some(seq))
+                                    .expect("a completed frame held an image");
+                                *slot = None;
+                                tickets.remove(i);
+                                presented += 1;
+                                presented_here += 1;
+                            }
+                            Err(
+                                Refusal::WrongPhase { .. }
+                                | Refusal::Superseded { .. }
+                                | Refusal::StaleGeneration { .. },
+                            ) => {}
+                            Err(other) => panic!("seed {seed}: complete refused as {other:?}"),
+                        }
+                    }
+                    // Resize: a whole new generation, and the old one deferred.
+                    _ => {
+                        let before = s.awaiting_retirement();
+                        images = (rng.below(3) + 1) as usize;
+                        let _ = s.replace(images + 1, images, at(rng.below(8) + 1));
+                        assert_eq!(s.awaiting_retirement(), before + 1, "seed {seed}");
+                        replaces += 1;
+                        owner = vec![None; images];
+                        tickets.clear();
+                    }
+                }
+
+                // Waking never hands out an occupied image either.
+                for (request, ticket) in s.wake() {
+                    assert!(
+                        owner[ticket.image].is_none(),
+                        "seed {seed}: wake handed out image {}",
+                        ticket.image
+                    );
+                    assert!(request.ingress.0 > 0);
+                    owner[ticket.image] = Some(ticket.sequence);
+                    tickets.push(ticket);
+                    woken += 1;
+                }
+
+                // The observers agree with the shadow after every step.
+                assert_eq!(
+                    s.in_flight(),
+                    owner.iter().filter(|o| o.is_some()).count(),
+                    "seed {seed}: in_flight"
+                );
+                assert!(
+                    s.in_flight() <= images,
+                    "seed {seed}: more frames in flight than images"
+                );
+                assert_eq!(s.images(), Some(images), "seed {seed}: images");
+                assert_eq!(s.census().0, presented_here, "seed {seed}: presented");
+            }
+
+            // Nothing may be dropped without being handed to somebody.
+            abandoned += s.abandon_parked().len();
+            assert_eq!(s.parked(), 0);
+            // The deferred swapchains all come back, and only once.
+            let mut generations: Vec<u64> = Vec::new();
+            for r in s.reached(at(u64::MAX)) {
+                assert!(
+                    !generations.contains(&r.generation.get()),
+                    "seed {seed}: {:?} retired twice",
+                    r.generation
+                );
+                generations.push(r.generation.get());
+            }
+            assert!(
+                generations.windows(2).all(|w| w[0] < w[1]),
+                "seed {seed}: retirements are not in generation order"
+            );
+            assert_eq!(
+                s.awaiting_retirement(),
+                0,
+                "seed {seed}: a swapchain leaked"
+            );
+        }
+
+        // Non-vacuity: every shape an assertion above depends on reaching.
+        assert!(presented > 800, "frames presented: {presented}");
+        assert!(superseded > 120, "frames superseded: {superseded}");
+        assert!(
+            undrawn_refusals > 100,
+            "supersedes refused for an undrawn frame ahead: {undrawn_refusals}"
+        );
+        assert!(
+            parked_admissions > 2_000,
+            "presents parked for an image: {parked_admissions}"
+        );
+        assert!(woken > 1_500, "parked presents woken: {woken}");
+        assert!(replaces > 1_000, "swapchain replacements: {replaces}");
+        assert!(abandoned > 800, "parked presents handed back: {abandoned}");
     }
 }
