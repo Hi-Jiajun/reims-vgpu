@@ -14,34 +14,47 @@ use crate::backend::vulkan::engine::{
     IndexType, SamplerCompareFunction, StencilOp, VisibilityResultMode,
 };
 
-/// `MTLCompareFunction` (SDK numeric values). Depth test, stencil test and
-/// sampler compare all carry this same Metal enum.
+/// `MTLCompareFunction`. Depth test, stencil test and sampler compare all carry
+/// this same Metal enum.
+///
+/// **Which ordinal means what is not decided here.** The contract owns that —
+/// [`CompareFunction::parse`](crate::protocol::sampler::CompareFunction::parse)
+/// is the single place a `MTLCompareFunction` word becomes a comparison — and
+/// this is the total correspondence from that answer onto the engine's own
+/// spelling. It used to be a second table of bare ordinals, which the compiler
+/// could not compare with the first: a contract corrected there would have left
+/// this one meaning what it meant before, and the test below would still have
+/// passed because it pinned this table against the same literals.
 pub fn compare_function(mtl: u32) -> Result<SamplerCompareFunction, TranslateReason> {
-    Ok(match mtl {
-        0 => SamplerCompareFunction::Never,
-        1 => SamplerCompareFunction::Less,
-        2 => SamplerCompareFunction::Equal,
-        3 => SamplerCompareFunction::LessEqual,
-        4 => SamplerCompareFunction::Greater,
-        5 => SamplerCompareFunction::NotEqual,
-        6 => SamplerCompareFunction::GreaterEqual,
-        7 => SamplerCompareFunction::Always,
-        other => return Err(TranslateReason::UnknownCompareFunction(other)),
+    use crate::protocol::sampler::CompareFunction as C;
+    let parsed = C::parse(mtl).ok_or(TranslateReason::UnknownCompareFunction(mtl))?;
+    Ok(match parsed {
+        C::Never => SamplerCompareFunction::Never,
+        C::Less => SamplerCompareFunction::Less,
+        C::Equal => SamplerCompareFunction::Equal,
+        C::LessEqual => SamplerCompareFunction::LessEqual,
+        C::Greater => SamplerCompareFunction::Greater,
+        C::NotEqual => SamplerCompareFunction::NotEqual,
+        C::GreaterEqual => SamplerCompareFunction::GreaterEqual,
+        C::Always => SamplerCompareFunction::Always,
     })
 }
 
 /// `MTLStencilOperation` (SDK numeric values).
+/// `MTLStencilOperation`, from the contract's parse for
+/// [`compare_function`]'s reason.
 pub fn stencil_operation(mtl: u32) -> Result<StencilOp, TranslateReason> {
-    Ok(match mtl {
-        0 => StencilOp::Keep,
-        1 => StencilOp::Zero,
-        2 => StencilOp::Replace,
-        3 => StencilOp::IncrementClamp,
-        4 => StencilOp::DecrementClamp,
-        5 => StencilOp::Invert,
-        6 => StencilOp::IncrementWrap,
-        7 => StencilOp::DecrementWrap,
-        other => return Err(TranslateReason::UnknownStencilOperation(other)),
+    use crate::protocol::depth_stencil::StencilOperation as O;
+    let parsed = O::parse(mtl).ok_or(TranslateReason::UnknownStencilOperation(mtl))?;
+    Ok(match parsed {
+        O::Keep => StencilOp::Keep,
+        O::Zero => StencilOp::Zero,
+        O::Replace => StencilOp::Replace,
+        O::IncrementClamp => StencilOp::IncrementClamp,
+        O::DecrementClamp => StencilOp::DecrementClamp,
+        O::Invert => StencilOp::Invert,
+        O::IncrementWrap => StencilOp::IncrementWrap,
+        O::DecrementWrap => StencilOp::DecrementWrap,
     })
 }
 
@@ -51,11 +64,14 @@ pub fn stencil_operation(mtl: u32) -> Result<StencilOp, TranslateReason> {
 /// Vulkan consume it; `None` therefore remains a classification here, and the
 /// caller turns it into `IndexLoadReason::TypeUnsupported`.
 pub fn index_type(mtl: u32) -> Option<IndexType> {
-    match mtl {
-        0 => Some(IndexType::U16),
-        1 => Some(IndexType::U32),
-        _ => None,
-    }
+    use crate::protocol::render::IndexType as Contract;
+    // The contract carries the ordinal at the width the wire does; a value that
+    // does not fit is not an index type by that fact alone, and narrowing it
+    // silently would let `0x1_0000` read as `Uint16`.
+    Some(match Contract::parse(u16::try_from(mtl).ok()?)? {
+        Contract::Uint16 => IndexType::U16,
+        Contract::Uint32 => IndexType::U32,
+    })
 }
 
 pub fn vk_index_type(index: IndexType) -> vk::IndexType {
@@ -139,6 +155,55 @@ mod tests {
             stencil_operation(8).unwrap_err(),
             TranslateReason::UnknownStencilOperation(8)
         );
+    }
+
+    /// **The two ordinal witnesses agree, over the whole domain.**
+    ///
+    /// The engine's `mtl_ordinal` is its declaration order and the contract's
+    /// `ordinal` is spelled from named `MTL_*` constants — two independent
+    /// statements of the same fact, and until these tables were one they could
+    /// drift with nothing failing. Sweeping the domain rather than the variant
+    /// list is what makes "admits exactly what the contract admits" a property
+    /// and not a list to keep in step.
+    #[test]
+    fn the_engine_spelling_carries_the_ordinal_the_contract_parsed() {
+        use crate::protocol::depth_stencil::StencilOperation;
+        use crate::protocol::sampler::CompareFunction;
+
+        for c in CompareFunction::ALL {
+            assert_eq!(
+                compare_function(c.ordinal()).unwrap().mtl_ordinal(),
+                c.ordinal(),
+                "{c:?} round-trips through a different ordinal"
+            );
+        }
+        for o in StencilOperation::ALL {
+            assert_eq!(
+                stencil_operation(o.ordinal()).unwrap().mtl_ordinal(),
+                o.ordinal(),
+                "{o:?} round-trips through a different ordinal"
+            );
+        }
+        for mtl in (0..=1024u32).chain([u32::MAX - 1, u32::MAX]) {
+            assert_eq!(
+                compare_function(mtl).is_ok(),
+                CompareFunction::parse(mtl).is_some(),
+                "compare {mtl}"
+            );
+            assert_eq!(
+                stencil_operation(mtl).is_ok(),
+                StencilOperation::parse(mtl).is_some(),
+                "stencil {mtl}"
+            );
+            assert_eq!(
+                index_type(mtl).is_some(),
+                u16::try_from(mtl)
+                    .ok()
+                    .and_then(crate::protocol::render::IndexType::parse)
+                    .is_some(),
+                "index {mtl}"
+            );
+        }
     }
 
     /// The exact wire order of `MTLCompareFunction`, value by value.
