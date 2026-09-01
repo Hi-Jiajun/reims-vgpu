@@ -36,9 +36,14 @@
 //! # What this does not own
 //!
 //! Where the bytes are ([`crate::content`]), when a native object dies
-//! ([`crate::retire`]), and what a host mapping is made of. A mapping here is
-//! only *whether one exists*, because "is this mapped" changes what a guest may
-//! do and "what it is mapped as" does not.
+//! ([`crate::retire`]), and whether a task's address space maps an address.
+//!
+//! A slot once carried a `mapped` flag, on the reading that the map and unmap
+//! packets name an object. They do not: both carry a task and a 64-bit
+//! interval of that task's GPU virtual address space and no object ref at all,
+//! which is what [`crate::lifecycle::map_notice`] now decodes. The flag was a
+//! per-object state with no command that could set it, and a name it would have
+//! been set for is whichever object shared the low half of an address.
 
 use crate::access::BackingId;
 use crate::identity::{ObjectListRef, ResourceId, SlotGeneration};
@@ -48,9 +53,7 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// Nothing has ever been declared in this slot.
-    NotDeclared {
-        slot: ObjectListRef,
-    },
+    NotDeclared { slot: ObjectListRef },
     /// The slot holds a different generation. The name is stale: whatever the
     /// caller meant was deleted and the slot reused.
     StaleGeneration {
@@ -59,22 +62,11 @@ pub enum Refusal {
         current: SlotGeneration,
     },
     /// The object is deleted. It may still be executing; it may not be named.
-    Deleted {
-        id: ResourceId,
-    },
+    Deleted { id: ResourceId },
     /// A slot that still holds a live object cannot be redeclared. A guest that
     /// wants the slot back deletes first, and a device that silently replaced
     /// would orphan work planned against the previous occupant.
-    SlotOccupied {
-        slot: ObjectListRef,
-    },
-    /// The object has no mapping to unmap, or already has one to map.
-    NotMapped {
-        id: ResourceId,
-    },
-    AlreadyMapped {
-        id: ResourceId,
-    },
+    SlotOccupied { slot: ObjectListRef },
 }
 
 impl Refusal {
@@ -85,8 +77,6 @@ impl Refusal {
             Self::StaleGeneration { .. } => "namespace_stale_generation",
             Self::Deleted { .. } => "namespace_deleted",
             Self::SlotOccupied { .. } => "namespace_slot_occupied",
-            Self::NotMapped { .. } => "namespace_not_mapped",
-            Self::AlreadyMapped { .. } => "namespace_already_mapped",
         }
     }
 }
@@ -134,7 +124,6 @@ struct Slot {
     generation: SlotGeneration,
     backing: BackingId,
     deleted: bool,
-    mapped: bool,
     /// Accepted uses of the *current* backing that have not retired.
     outstanding: usize,
 }
@@ -188,7 +177,6 @@ impl Namespace {
                 generation,
                 backing,
                 deleted: false,
-                mapped: false,
                 outstanding: 0,
             },
         );
@@ -290,7 +278,6 @@ impl Namespace {
         let lease = self.resolve(name)?;
         let slot = self.slots.get_mut(&name.slot).expect("just resolved");
         slot.deleted = true;
-        slot.mapped = false;
         let outstanding = slot.outstanding;
         slot.outstanding = 0;
         Ok(self.detach(lease.backing, outstanding))
@@ -331,44 +318,6 @@ impl Namespace {
             backing,
             outstanding,
         }
-    }
-
-    /// Give an object a host mapping.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::resolve`], plus [`Refusal::AlreadyMapped`]: two mappings of
-    /// one object are two answers to where its bytes are.
-    pub fn map(&mut self, name: ResourceId) -> Result<(), Refusal> {
-        self.resolve(name)?;
-        let slot = self.slots.get_mut(&name.slot).expect("just resolved");
-        if slot.mapped {
-            return Err(Refusal::AlreadyMapped { id: name });
-        }
-        slot.mapped = true;
-        Ok(())
-    }
-
-    /// Take a mapping away.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::resolve`], plus [`Refusal::NotMapped`].
-    pub fn unmap(&mut self, name: ResourceId) -> Result<(), Refusal> {
-        self.resolve(name)?;
-        let slot = self.slots.get_mut(&name.slot).expect("just resolved");
-        if !slot.mapped {
-            return Err(Refusal::NotMapped { id: name });
-        }
-        slot.mapped = false;
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn is_mapped(&self, name: ResourceId) -> bool {
-        self.slots
-            .get(&name.slot)
-            .is_some_and(|s| s.generation == name.generation && !s.deleted && s.mapped)
     }
 
     /// Accepted uses of a name's current backing that have not retired.
@@ -590,36 +539,6 @@ mod tests {
             (0, 1),
             "one refusal, and the probe was not one"
         );
-    }
-
-    #[test]
-    fn mapping_is_a_state_and_not_a_counter() {
-        let mut ns = Namespace::new();
-        let id = ns.declare(slot(1), backing(10)).expect("free slot");
-        assert!(!ns.is_mapped(id));
-        assert_eq!(ns.unmap(id), Err(Refusal::NotMapped { id }));
-        ns.map(id).expect("unmapped");
-        assert!(ns.is_mapped(id));
-        assert_eq!(
-            ns.map(id),
-            Err(Refusal::AlreadyMapped { id }),
-            "two mappings of one object are two answers to where its bytes are"
-        );
-        ns.unmap(id).expect("mapped");
-        assert!(!ns.is_mapped(id));
-    }
-
-    /// A delete takes the mapping with it, so a later declaration into the slot
-    /// does not inherit one.
-    #[test]
-    fn a_deleted_object_is_not_mapped() {
-        let mut ns = Namespace::new();
-        let id = ns.declare(slot(1), backing(10)).expect("free slot");
-        ns.map(id).expect("unmapped");
-        assert_eq!(ns.delete(id).expect("live").backing(), backing(10));
-        assert!(!ns.is_mapped(id));
-        let next = ns.declare(slot(1), backing(11)).expect("deleted, so free");
-        assert!(!ns.is_mapped(next));
     }
 
     /// No live identity carries the default generation, so a zeroed structure

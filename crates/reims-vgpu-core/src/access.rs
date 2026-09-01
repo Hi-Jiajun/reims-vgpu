@@ -99,6 +99,41 @@ impl ByteRange {
     }
 }
 
+/// A half-open interval of one task's GPU virtual address space.
+///
+/// **Not a [`ByteRange`], and the distinction is the point.** A `ByteRange` is
+/// an offset into one backing — a place inside content this device holds. A
+/// `GuestSpan` is an address in the guest's own translation space, which names
+/// whatever pages that space currently maps and names *different* pages once
+/// the guest remaps it. Adding one to the other, or resolving one where the
+/// other is expected, reads bytes at an offset that has no relationship to the
+/// address that was meant.
+///
+/// It is a name and never a pointer. Nothing in this crate follows it; the
+/// operations that carry one say *which interval the guest changed*, and the
+/// executor that owns translation is what turns it into pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GuestSpan {
+    pub base: u64,
+    pub length: u64,
+}
+
+impl GuestSpan {
+    /// Whether two intervals of the same task's space share an address.
+    ///
+    /// Zero length overlaps nothing, for [`ByteRange::overlaps`]'s reason: an
+    /// interval naming no address cannot name one in common with another.
+    #[must_use]
+    pub const fn overlaps(self, other: Self) -> bool {
+        if self.length == 0 || other.length == 0 {
+            return false;
+        }
+        let self_end = self.base.saturating_add(self.length);
+        let other_end = other.base.saturating_add(other.length);
+        self.base < other_end && other.base < self_end
+    }
+}
+
 /// A half-open window of an image's levels and slices.
 ///
 /// Plane is exact rather than a range: a plane is a separate memory layout, not

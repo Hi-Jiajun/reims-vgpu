@@ -4856,6 +4856,11 @@ fn every_short_control_packet_names_itself() {
         // Both FIFOs carry DEFINE_TASK2 and one function handles both, so the
         // root case above does not cover the child site.
         (CHILD_OP_DEFINE_TASK2, DEFINE_TASK_LEN),
+        // The map pair reaches the same handler and used to fall through a
+        // `plen >= 20` guard into the family's generic census line, which
+        // prints the first two words of a record it could not read.
+        (CHILD_OP_MAP_MEMORY2, crate::protocol::fifo::MAP_MEMORY_LEN),
+        (CHILD_OP_UNMAP_MEMORY, crate::protocol::fifo::MAP_MEMORY_LEN),
     ] {
         process_child_packet(&mut state, &mut host, 4, &short(opcode, need - 1));
     }
@@ -4880,6 +4885,8 @@ fn every_short_control_packet_names_itself() {
         "reason=cursor_show_short site=ch4",
         "reason=setup_shared_state_short site=ch4",
         "reason=define_task2_short site=ch4",
+        "reason=map_memory2_short site=ch4",
+        "reason=unmap_memory_short site=ch4",
     ] {
         assert!(
             log.contains(reason),

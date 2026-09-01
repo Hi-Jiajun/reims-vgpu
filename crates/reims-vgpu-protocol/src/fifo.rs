@@ -17,7 +17,7 @@
 //! reports each failure as a fault. Nothing here touches memory it was not
 //! handed.
 
-use crate::endian::{ld32, st16, st32};
+use crate::endian::{ld32, ld64, st16, st32};
 use alloc::string::{String, ToString as _};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -33,6 +33,59 @@ pub const CHILD_INVALIDATE_RECORD_LEN: u32 = 8;
 /// Per-object record on Synchronize: `{object_id u32}` only (no validity ops).
 pub const CHILD_SYNCHRONIZE_RECORD_LEN: u32 = 4;
 /// CmdReplacePhysical (`0x3c`): a fixed `{task_id, object_id}` pair, no list.
+/// `CmdMapMemory2` (`0x39`) and `CmdUnmapMemory` (`0x22`): the interval of one
+/// task's GPU virtual address space the guest has just changed.
+///
+/// **The command names an address range and no object.** The guest has already
+/// applied the interval to its own page table and this packet is the notice; a
+/// reader that took the second word for an object ref would resolve whatever
+/// object happened to share the low half of a virtual address.
+///
+/// The two opcodes carry the identical record — they differ only in which
+/// direction the guest moved — so the offsets are stated once and both decode
+/// through [`decode_map_memory`].
+pub const MAP_MEMORY_TASK_ID: usize = 0x00;
+/// The base of the interval. Eight bytes, and *not* four: a task's virtual
+/// address space is 64-bit and the high half is not padding.
+pub const MAP_MEMORY_GVA: usize = 0x04;
+/// The interval's length in bytes, also eight.
+pub const MAP_MEMORY_LENGTH: usize = MAP_MEMORY_GVA + 8;
+/// Bytes the record occupies, derived from its last field rather than written
+/// as a literal beside the offsets it has to agree with.
+pub const MAP_MEMORY_LEN: usize = MAP_MEMORY_LENGTH + 8;
+
+/// A map-or-unmap notice, decoded.
+///
+/// Carries no direction: which of the two opcodes arrived is the caller's, and
+/// putting it here would mean this decoder held a table of opcodes — see this
+/// module's rule against a second copy of the opcode space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapMemoryCommand {
+    pub task_id: u32,
+    /// The base of the interval, in the task's GPU virtual address space.
+    pub gva: u64,
+    pub length: u64,
+}
+
+/// Decode a map-or-unmap notice.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the record's three fields.
+pub fn decode_map_memory(payload: &[u8]) -> Result<MapMemoryCommand, ShortPayload> {
+    if payload.len() < MAP_MEMORY_LEN {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need: MAP_MEMORY_LEN,
+        });
+    }
+    Ok(MapMemoryCommand {
+        task_id: ld32(&payload[MAP_MEMORY_TASK_ID..]),
+        gva: ld64(&payload[MAP_MEMORY_GVA..]),
+        length: ld64(&payload[MAP_MEMORY_LENGTH..]),
+    })
+}
+
 pub const CHILD_REPLACE_PHYSICAL_TASK_ID: u32 = 0x00;
 pub const CHILD_REPLACE_PHYSICAL_OBJECT_ID: u32 = 0x04;
 pub const CHILD_REPLACE_PHYSICAL_LEN: u32 = 8;
@@ -708,6 +761,46 @@ pub fn decode_synchronize_resources(
 mod tests {
     use super::*;
     use crate::endian::st32;
+
+    /// The notice's three fields, and the two that are eight bytes wide.
+    ///
+    /// A reader that took the address for a `u32` would decode a base with its
+    /// high half discarded and then read the length from the middle of the
+    /// address — so a mapping high in the task's space would be reported as a
+    /// mapping low in it, of a nonsense length. Both halves are driven here.
+    #[test]
+    fn a_map_notice_is_a_task_and_a_sixty_four_bit_interval() {
+        let mut bytes = vec![0u8; MAP_MEMORY_LEN];
+        st32(&mut bytes[MAP_MEMORY_TASK_ID..], 3);
+        bytes[MAP_MEMORY_GVA..MAP_MEMORY_GVA + 8]
+            .copy_from_slice(&0x0000_7f12_3456_1000u64.to_le_bytes());
+        bytes[MAP_MEMORY_LENGTH..MAP_MEMORY_LENGTH + 8]
+            .copy_from_slice(&0x01c3_e000u64.to_le_bytes());
+        assert_eq!(
+            decode_map_memory(&bytes),
+            Ok(MapMemoryCommand {
+                task_id: 3,
+                gva: 0x0000_7f12_3456_1000,
+                length: 0x01c3_e000,
+            })
+        );
+    }
+
+    /// One byte short of the record is a refusal that names the floor, not a
+    /// notice with a zero-filled tail — a length read short is an interval this
+    /// device would retire the wrong pages for.
+    #[test]
+    fn a_map_notice_one_byte_short_is_refused_with_its_floor() {
+        let bytes = vec![0u8; MAP_MEMORY_LEN];
+        assert!(decode_map_memory(&bytes).is_ok());
+        assert_eq!(
+            decode_map_memory(&bytes[..MAP_MEMORY_LEN - 1]),
+            Err(ShortPayload {
+                plen: MAP_MEMORY_LEN - 1,
+                need: MAP_MEMORY_LEN,
+            })
+        );
+    }
 
     /// RE pageBacking: plen=16 = header + one 8-byte record; LE `01 00 00 01`
     /// = clear_host_valid + set_guest_valid (PVG validity-op bytes).

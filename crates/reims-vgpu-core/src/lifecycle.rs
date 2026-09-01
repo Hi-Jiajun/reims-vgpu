@@ -52,7 +52,7 @@
 //! been invalidated would have no way to describe the state it was left in.
 
 use crate::access::{
-    AccessIntent, AccessRefusal, AccessSource, BackingId, ByteRange, Participation,
+    AccessIntent, AccessRefusal, AccessSource, BackingId, ByteRange, GuestSpan, Participation,
     ParticipationExtent, ResourceKey,
 };
 use crate::content::{ContentLedger, Replica, Transfer};
@@ -207,13 +207,26 @@ pub enum LifecycleOp {
         task: TaskId,
         resource: ResourceId,
     },
+    /// The guest has given an interval of this task's GPU virtual address
+    /// space pages, and says so after it has already applied the change to its
+    /// own page table.
+    ///
+    /// **It names an address interval and no object.** The packet carries a
+    /// task, a 64-bit base and a 64-bit length, and the closure ledger reads
+    /// its opcode as establishing *a task GPU-VA mapping over guest pages* —
+    /// there is no object ref in it to resolve. A model that took it for a
+    /// per-object mapping would be asserting something the wire never says,
+    /// and the resource it named would be whichever one shared the low half of
+    /// an address.
     MapMemory {
         task: TaskId,
-        resource: ResourceId,
+        span: GuestSpan,
     },
+    /// The same interval, taken away. Arrives after the guest has removed the
+    /// translations, so the addresses in it no longer resolve.
     UnmapMemory {
         task: TaskId,
-        resource: ResourceId,
+        span: GuestSpan,
     },
     /// Re-point a resource at different guest pages.
     ReplacePhysical {
@@ -316,6 +329,28 @@ pub struct Effects {
     /// Copies offered for release, evaluated when the transfers above have
     /// executed. See the module docs for why this is not immediate.
     pub at_completion: Vec<DeferredDiscard>,
+    /// Address intervals whose translations the guest has changed under this
+    /// device.
+    pub remapped: Vec<Remap>,
+}
+
+/// An interval of a task's address space whose translations have changed.
+///
+/// An obligation and not a record: every resolution held over the interval was
+/// computed against pages the guest has since moved, so a cache that keeps one
+/// answers a later question with the wrong pages. This crate caches none, which
+/// is exactly why the obligation has to leave it named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Remap {
+    pub task: TaskId,
+    pub span: GuestSpan,
+    /// Whether the interval has pages behind it now.
+    ///
+    /// It does not decide the invalidation — both directions invalidate, since
+    /// the pages under a re-established mapping are new ones. It decides what
+    /// may be read *after*: an unmapped interval has no translation at all, and
+    /// a reader that treated the two alike would follow one the guest removed.
+    pub established: bool,
 }
 
 /// Why a lifecycle packet's bytes did not become an operation.
@@ -338,6 +373,13 @@ pub enum ResolveRefusal {
     /// Carries the guest's number, because the number is what a log line has to
     /// contain for anyone to find which object the guest thought it had.
     UnknownRef { object_ref: u32 },
+    /// The command is not a map-or-unmap notice, so there is no interval for
+    /// [`map_notice`] to read. [`NotAResourceList`](Self::NotAResourceList)'s
+    /// sibling, and a caller asking the wrong question rather than a malformed
+    /// packet.
+    NotAMapNotice { kind: LifecycleKind },
+    /// The notice's payload cannot hold its three fields.
+    ShortNotice(fifo::ShortPayload),
 }
 
 impl ResolveRefusal {
@@ -347,6 +389,8 @@ impl ResolveRefusal {
             Self::NotAResourceList { .. } => "lifecycle_not_a_resource_list",
             Self::Payload(inner) => inner.slug(),
             Self::UnknownRef { .. } => "lifecycle_unknown_ref",
+            Self::NotAMapNotice { .. } => "lifecycle_not_a_map_notice",
+            Self::ShortNotice(_) => fifo::ShortPayload::SLUG,
         }
     }
 }
@@ -410,6 +454,38 @@ pub fn resource_list(
         // and a fifth kind gaining a record length without gaining an arm here
         // must be a caller-visible refusal rather than a lost packet.
         other => return Err(ResolveRefusal::NotAResourceList { kind: other }),
+    })
+}
+
+/// Turn one map-or-unmap packet's payload into the operation it names.
+///
+/// **The join the resolver interface could not be the missing piece of.** Every
+/// other lifecycle command that needed a byte-to-operation path needed a
+/// [`crate::resolve::RefResolver`] to say which object a `u32` names; this pair
+/// takes none, because the packet carries no ref. The interval it carries is
+/// already total — a task, a base and a length — and there is nothing about it
+/// that device state could answer differently.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a kind that is not one of the two, or a payload too
+/// short to hold the interval. A short notice is refused rather than read with
+/// a zero-filled tail: a length read short retires the wrong pages, and a base
+/// read short names an address in the wrong half of the task's space.
+pub fn map_notice(kind: LifecycleKind, payload: &[u8]) -> Result<LifecycleOp, ResolveRefusal> {
+    if !matches!(kind, LifecycleKind::MapMemory | LifecycleKind::UnmapMemory) {
+        return Err(ResolveRefusal::NotAMapNotice { kind });
+    }
+    let notice = fifo::decode_map_memory(payload).map_err(ResolveRefusal::ShortNotice)?;
+    let task = TaskId(notice.task_id);
+    let span = GuestSpan {
+        base: notice.gva,
+        length: notice.length,
+    };
+    Ok(match kind {
+        LifecycleKind::UnmapMemory => LifecycleOp::UnmapMemory { task, span },
+        // `MapMemory`, and every other kind returned above.
+        _ => LifecycleOp::MapMemory { task, span },
     })
 }
 
@@ -757,10 +833,8 @@ impl Lifecycle {
             LifecycleOp::DeleteResource { task, resource } => {
                 self.delete_resource(*task, *resource)
             }
-            LifecycleOp::MapMemory { task, resource } => self.set_mapping(*task, *resource, true),
-            LifecycleOp::UnmapMemory { task, resource } => {
-                self.set_mapping(*task, *resource, false)
-            }
+            LifecycleOp::MapMemory { task, span } => self.remap(*task, *span, true),
+            LifecycleOp::UnmapMemory { task, span } => self.remap(*task, *span, false),
             LifecycleOp::ReplacePhysical {
                 task,
                 resource,
@@ -975,23 +1049,31 @@ impl Lifecycle {
         Ok(effects)
     }
 
-    fn set_mapping(
+    /// Record that a task's translations over `span` have changed.
+    ///
+    /// This crate holds nothing keyed by a guest address, so there is nothing
+    /// here to invalidate — the obligation belongs to whoever caches a
+    /// resolution, and it is stated as an effect rather than performed. A live
+    /// task is still required: an interval in a task that does not exist names
+    /// no address space, and accepting it would let a stale channel retire
+    /// another task's resolutions.
+    fn remap(
         &mut self,
         task: TaskId,
-        resource: ResourceId,
-        mapped: bool,
+        span: GuestSpan,
+        established: bool,
     ) -> Result<Effects, Refusal> {
-        let t = self
-            .tasks
-            .get_mut(&task)
-            .ok_or(Refusal::NoSuchTask { task })?;
-        let outcome = if mapped {
-            t.namespace.map(resource)
-        } else {
-            t.namespace.unmap(resource)
-        };
-        outcome.map_err(|refusal| Refusal::Namespace { task, refusal })?;
-        Ok(Effects::default())
+        if !self.tasks.contains_key(&task) {
+            return Err(Refusal::NoSuchTask { task });
+        }
+        Ok(Effects {
+            remapped: vec![Remap {
+                task,
+                span,
+                established,
+            }],
+            ..Effects::default()
+        })
     }
 
     fn replace_physical(
@@ -1573,21 +1655,146 @@ mod tests {
         ));
     }
 
+    /// The notice's fields as the packet carries them, and the direction the
+    /// opcode carries.
+    ///
+    /// The interval is the whole payload: a `u32` task and two `u64`s. Reading
+    /// the base as a `u32` — the shape the model asserted when it called this
+    /// command a per-object mapping — would put the length word inside the
+    /// address, so the high half is non-zero here.
     #[test]
-    fn mapping_is_declared_once_and_taken_away_once() {
-        let (mut l, id) = with_one_resource(256);
-        let map = LifecycleOp::MapMemory {
-            task: TASK,
-            resource: id,
+    fn a_map_notice_is_a_task_and_an_interval_and_a_direction() {
+        let mut payload = vec![0u8; fifo::MAP_MEMORY_LEN];
+        payload[fifo::MAP_MEMORY_TASK_ID..fifo::MAP_MEMORY_TASK_ID + 4]
+            .copy_from_slice(&TASK.0.to_le_bytes());
+        payload[fifo::MAP_MEMORY_GVA..fifo::MAP_MEMORY_GVA + 8]
+            .copy_from_slice(&0x0000_7f12_3456_1000u64.to_le_bytes());
+        payload[fifo::MAP_MEMORY_LENGTH..fifo::MAP_MEMORY_LENGTH + 8]
+            .copy_from_slice(&0x01c3_e000u64.to_le_bytes());
+        let span = GuestSpan {
+            base: 0x0000_7f12_3456_1000,
+            length: 0x01c3_e000,
         };
-        let unmap = LifecycleOp::UnmapMemory {
-            task: TASK,
-            resource: id,
+        assert_eq!(
+            map_notice(LifecycleKind::MapMemory, &payload),
+            Ok(LifecycleOp::MapMemory { task: TASK, span })
+        );
+        assert_eq!(
+            map_notice(LifecycleKind::UnmapMemory, &payload),
+            Ok(LifecycleOp::UnmapMemory { task: TASK, span }),
+            "the same record; the opcode is the whole difference"
+        );
+    }
+
+    /// Every other lifecycle kind refuses by name rather than reading this
+    /// record's offsets out of a payload that is not one.
+    #[test]
+    fn only_the_two_map_opcodes_carry_a_notice() {
+        let payload = vec![0u8; fifo::MAP_MEMORY_LEN];
+        for kind in [
+            LifecycleKind::DefineTask,
+            LifecycleKind::DeleteResource,
+            LifecycleKind::ReplacePhysical,
+            LifecycleKind::Invalidate,
+            LifecycleKind::DeleteBacking,
+        ] {
+            assert_eq!(
+                map_notice(kind, &payload),
+                Err(ResolveRefusal::NotAMapNotice { kind })
+            );
+        }
+    }
+
+    /// A notice too short to hold its interval refuses; it does not become an
+    /// interval with a zero-filled tail.
+    #[test]
+    fn a_short_notice_is_refused_and_not_zero_filled() {
+        let payload = vec![0u8; fifo::MAP_MEMORY_LEN - 1];
+        let refusal = map_notice(LifecycleKind::UnmapMemory, &payload)
+            .expect_err("one byte short of the interval");
+        assert_eq!(
+            refusal,
+            ResolveRefusal::ShortNotice(fifo::ShortPayload {
+                plen: fifo::MAP_MEMORY_LEN - 1,
+                need: fifo::MAP_MEMORY_LEN,
+            })
+        );
+        assert_eq!(refusal.slug(), fifo::ShortPayload::SLUG);
+    }
+
+    /// Both directions leave the same obligation, and it names the interval the
+    /// guest changed.
+    ///
+    /// The model holds nothing keyed by a guest address, so there is nothing
+    /// here to invalidate — which is exactly why the obligation has to leave
+    /// the crate named. A version that quietly returned no effects would be
+    /// indistinguishable from one that had already discharged it.
+    #[test]
+    fn a_remap_leaves_the_interval_as_an_obligation() {
+        let (mut l, _) = with_one_resource(256);
+        let span = GuestSpan {
+            base: 0x7f00_0000,
+            length: 0x4000,
         };
-        apply_inert(&mut l, &map);
-        assert!(matches!(l.apply(&map), Err(Refusal::Namespace { .. })));
-        apply_inert(&mut l, &unmap);
-        assert!(matches!(l.apply(&unmap), Err(Refusal::Namespace { .. })));
+        for (op, established) in [
+            (LifecycleOp::MapMemory { task: TASK, span }, true),
+            (LifecycleOp::UnmapMemory { task: TASK, span }, false),
+        ] {
+            let effects = l.apply(&op).expect("a live task");
+            assert_eq!(
+                effects.remapped,
+                vec![Remap {
+                    task: TASK,
+                    span,
+                    established,
+                }]
+            );
+            assert!(
+                effects.transfers.is_empty() && effects.teardowns.is_empty(),
+                "a translation change moves no bytes and retires no backing"
+            );
+        }
+    }
+
+    /// An interval in a task that does not exist names no address space.
+    #[test]
+    fn a_remap_of_a_dead_task_is_refused() {
+        let (mut l, _) = with_one_resource(256);
+        let task = TaskId(TASK.0 + 1);
+        assert_eq!(
+            l.apply(&LifecycleOp::MapMemory {
+                task,
+                span: GuestSpan {
+                    base: 0x1000,
+                    length: 0x1000,
+                },
+            }),
+            Err(Refusal::NoSuchTask { task })
+        );
+    }
+
+    /// Two intervals of one task's space overlap on an address, and a
+    /// zero-length one names none.
+    #[test]
+    fn an_empty_interval_overlaps_nothing_including_itself() {
+        let a = GuestSpan {
+            base: 0x1000,
+            length: 0x1000,
+        };
+        assert!(a.overlaps(GuestSpan {
+            base: 0x1fff,
+            length: 1
+        }));
+        assert!(!a.overlaps(GuestSpan {
+            base: 0x2000,
+            length: 1
+        }));
+        let empty = GuestSpan {
+            base: 0x1000,
+            length: 0,
+        };
+        assert!(!empty.overlaps(empty));
+        assert!(!a.overlaps(empty));
     }
 
     #[test]

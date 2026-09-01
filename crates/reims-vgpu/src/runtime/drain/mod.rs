@@ -3464,6 +3464,24 @@ impl MapFamily {
             Self::DeleteIOSurfaceBacking2 => "DeleteIOSurfaceBacking2",
         }
     }
+
+    /// The lowercase reason stem this command reports refusals under.
+    ///
+    /// Separate from [`Self::name`], which is the human column of the census
+    /// line: a `reason=` slug is grepped for and every other one in this file
+    /// is lowercase, so `reason=MapMemory2_short` would be the one nobody
+    /// finds. The map pair's stems were already written as two literals at the
+    /// view-retire site; this is that pair, extended to the family.
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::MapMemory2 => "map_memory2",
+            Self::UnmapMemory => "unmap_memory",
+            Self::InvalidateResources => "invalidate_resources",
+            Self::SynchronizeResources => "synchronize_resources",
+            Self::SynchronizeAndDiscardResources => "synchronize_and_discard_resources",
+            Self::DeleteIOSurfaceBacking2 => "delete_iosurface_backing2",
+        }
+    }
 }
 
 /// Record the page-table nodes `gva` descends through under `task_id`, and say
@@ -3667,10 +3685,31 @@ fn apply_map_family<H: HostMemory + HostOps>(
     //   task_id@0 u32, gva@4 u64, length@12 u64  (matches fifo MapMemoryCommand).
     let plen = packet.payload.len();
     let name = family.name();
-    if matches!(family, MapFamily::MapMemory2 | MapFamily::UnmapMemory) && plen >= 20 {
-        let task_id = crate::protocol::endian::ld32(&packet.payload[0..]);
-        let gva = crate::protocol::endian::ld64(&packet.payload[4..]);
-        let length = crate::protocol::endian::ld64(&packet.payload[12..]);
+    // The floor and the three offsets are the record's owner's. They were four
+    // literals here — a `20` beside a `0`, a `4` and a `12` — and the two
+    // eight-byte fields are exactly the shape a reader gets wrong: an address
+    // read as a `u32` puts the length word in the middle of the address.
+    let notice = match matches!(family, MapFamily::MapMemory2 | MapFamily::UnmapMemory)
+        .then(|| crate::protocol::fifo::decode_map_memory(&packet.payload))
+        .transpose()
+    {
+        Ok(notice) => notice,
+        // A notice too short to read is one whose interval this device does not
+        // know, and every response below is keyed on that interval: the bind
+        // resolutions and host views retired are exactly the ones overlapping
+        // it. Reported by name rather than falling through to the generic
+        // census line, which prints two words of a record it could not read.
+        Err(short) => {
+            note_short_payload(family.slug(), packet.opcode, Some(channel_id), &short);
+            return;
+        }
+    };
+    if let Some(crate::protocol::fifo::MapMemoryCommand {
+        task_id,
+        gva,
+        length,
+    }) = notice
+    {
         // Audit the interval against what this task already has live: a range
         // mapped twice or unmapped without a map is a disagreement the guest's
         // own teardown assertion will eventually find.
@@ -3796,12 +3835,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
             );
             let n =
                 crate::runtime::gva_view::retire_gva_views_overlapping(state, task_id, gva, length);
-            let op = if family == MapFamily::UnmapMemory {
-                "unmap_memory"
-            } else {
-                "map_memory2"
-            };
-            crate::runtime::gva_view::log_retire(op, task_id, gva, length, n);
+            crate::runtime::gva_view::log_retire(family.slug(), task_id, gva, length, n);
         }
         // Deferred GVA render-Store windows overlapping the notified
         // VA range land **cache-only**: on Unmap the PTEs are already
