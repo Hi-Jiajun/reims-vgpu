@@ -23,6 +23,7 @@
 //! is a failure nobody can act on.
 
 pub mod blit;
+pub mod resource_state;
 pub mod sync;
 
 use crate::closure::Rail;
@@ -55,6 +56,17 @@ pub enum DecodeRefusal {
     /// two the same way would make a deliberate refusal look like an open
     /// question and put it back on the work queue.
     RefusedByContract { rail: Rail, opcode: u32 },
+    /// The record carries bytes and its selector takes no argument.
+    ///
+    /// Only reachable for the records whose whole body is the opcode. Every
+    /// other record is a fixed body, and a longer buffer merely contains one —
+    /// there is nothing to refuse. Reporting this as [`Self::Short`] would say
+    /// the opposite of what happened.
+    UnexpectedPayload {
+        rail: Rail,
+        opcode: u32,
+        have: usize,
+    },
     /// A counted array does not fit the record that declares it.
     ///
     /// The count is the guest's, so this is an ordinary hostile-input case and
@@ -78,6 +90,7 @@ impl DecodeRefusal {
             Self::UnknownOpcode { .. } => "decode_opcode_unknown",
             Self::Unjudged { .. } => "decode_opcode_unjudged",
             Self::RefusedByContract { .. } => "decode_opcode_refused_by_contract",
+            Self::UnexpectedPayload { .. } => "decode_record_has_payload_and_takes_none",
             Self::CountOverruns { .. } => "decode_count_overruns_record",
         }
     }
@@ -89,6 +102,7 @@ impl DecodeRefusal {
             | Self::UnknownOpcode { rail, .. }
             | Self::Unjudged { rail, .. }
             | Self::RefusedByContract { rail, .. }
+            | Self::UnexpectedPayload { rail, .. }
             | Self::CountOverruns { rail, .. } => rail,
         }
     }
@@ -100,6 +114,7 @@ impl DecodeRefusal {
             | Self::UnknownOpcode { opcode, .. }
             | Self::Unjudged { opcode, .. }
             | Self::RefusedByContract { opcode, .. }
+            | Self::UnexpectedPayload { opcode, .. }
             | Self::CountOverruns { opcode, .. } => opcode,
         }
     }
@@ -167,6 +182,11 @@ mod tests {
             DecodeRefusal::RefusedByContract {
                 rail: Rail::Blit,
                 opcode: 1,
+            },
+            DecodeRefusal::UnexpectedPayload {
+                rail: Rail::Blit,
+                opcode: 1,
+                have: 4,
             },
             DecodeRefusal::CountOverruns {
                 rail: Rail::Blit,
