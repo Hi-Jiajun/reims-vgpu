@@ -1238,6 +1238,13 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
     // SAFETY: when Some, contig covers span_end.
     let base = contig.map(|(ptr, _)| unsafe { (ptr as *mut u8).add(base_off as usize) });
+    // The two halves of this writer, which is the whole of the Metal rail's
+    // `store_us` and which nothing has ever divided — `SurfaceWritePhase` is
+    // emitted by `write_bgra8_inner`, the writer the *other* rail's Store takes.
+    // They are named neutrally because this function is neutral; its other two
+    // callers (`exec`'s attachment clear and `draw`'s abandoned-chain recovery)
+    // are rare enough that a reading is about the Metal Store.
+    let span_rows = crate::runtime::chain_phase::CostSpan::new("surface_changed_rows_us");
     for y in 0..mh as usize {
         let src_off = y * rgba_stride as usize;
         let src_row = &rgba[src_off..src_off + rgba_stride as usize];
@@ -1341,9 +1348,16 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             );
         }
     }
+    drop(span_rows);
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
     // Host render-cache (Linux §8.5): full-frame BGRA from the Store rgba.
+    //
+    // A whole second conversion of the same frame, into a whole second
+    // allocation — and for a BGRA8 mapping it is byte for byte the conversion
+    // the row loop above already performed into `native`. Charged apart so the
+    // duplication has a number before it is removed.
+    let _span_cache = crate::runtime::chain_phase::CostSpan::new("surface_changed_cache_us");
     let mut cache = vec![0u8; need];
     for y in 0..mh as usize {
         let so = y * rgba_stride as usize;
