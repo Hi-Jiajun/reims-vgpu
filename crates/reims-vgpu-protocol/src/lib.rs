@@ -24,6 +24,8 @@
 //!   and "the old backend drops it" are not outcomes and cannot be spelled here.
 //! - [`packets`] — the same ledger for the FIFO packet classes, which are the
 //!   other half of what a guest sends and which the manifest cannot enumerate.
+//! - [`segment`] — what a segment-type byte means: which encoder wrote it, and
+//!   which rail its records are read on.
 //! - [`residency`] — what a `useResource`/`useHeap` declaration says, split so
 //!   that the half a per-draw binder owes nothing on cannot hide the half it
 //!   does.
@@ -34,3 +36,4 @@
 pub mod closure;
 pub mod packets;
 pub mod residency;
+pub mod segment;

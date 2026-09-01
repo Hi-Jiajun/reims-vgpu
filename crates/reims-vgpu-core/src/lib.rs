@@ -31,4 +31,5 @@ pub mod pipeline;
 pub mod range_set;
 pub mod ready;
 pub mod session;
+pub mod stream;
 pub mod transaction;
