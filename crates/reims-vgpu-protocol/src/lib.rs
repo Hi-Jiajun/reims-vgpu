@@ -54,6 +54,9 @@
 //!   does.
 //! - [`pixel_format`] — the format ordinals, what each one is made of, and the
 //!   conversions between a texel and the eight-bit colour the device carries.
+//! - [`texture_shape`] — what a texture declaration is: its type ordinal, the
+//!   dimensions that type uses, and the field pairs the guest API does not
+//!   admit.
 //! - [`mipmap`] — what a mipmap-generation request must satisfy before a
 //!   backend sees it, which is arithmetic over a format code and a size.
 //! - [`iosurface_pages`] — the mapper's descriptors and the page span a shared
@@ -115,5 +118,6 @@ pub mod resource_state;
 pub mod segment;
 pub mod storage_mode;
 pub mod sync;
+pub mod texture_shape;
 pub mod vertex_step;
 pub mod visibility;
