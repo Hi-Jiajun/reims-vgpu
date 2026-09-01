@@ -70,8 +70,8 @@ QEMU_BIN="${QEMU_BIN:-$QEMU_BIN_DEFAULT}"
 REIMS_VGPU_EFI_ROM_SCRIPT="$REPO_ROOT/crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh"
 AVPBOOTER="${AVPBOOTER:-/System/Library/Frameworks/Virtualization.framework/Resources/AVPBooter.vmapple2.bin}"
 
-RAM="${RAM:-8G}"
-CPUS="${CPUS:-4}"
+RAM="${RAM:-12G}"
+CPUS="${CPUS:-8}"
 SSH_PORT="${SSH_PORT:-2222}"
 TESTING_TIMEOUT="${TESTING_TIMEOUT:-420}" # 7-minute hard kill for testing boots
 # PIN the guest NIC MAC. Without a fixed MAC, QEMU assigns a random one each boot,

@@ -235,6 +235,7 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
             depth_qualifier: None,
             stencil_members: vec![],
             local_size: None,
+            max_work_group_size: None,
             kernel_dispatch: None,
             vertex_builtins: None,
             tessellation: None,

@@ -1120,6 +1120,7 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
         depth_qualifier: None,
         stencil_members: vec![],
         local_size: None,
+        max_work_group_size: None,
         kernel_dispatch: None,
         vertex_builtins: Some(VertexBuiltins {
             uses_vertex_index: true,
