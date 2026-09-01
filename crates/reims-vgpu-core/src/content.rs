@@ -210,17 +210,52 @@ impl ContentLedger {
             .union_with(&transfer.bytes);
     }
 
-    /// Discard a replica's copy without changing the content.
+    /// Discard a replica's copy of some bytes without changing the content.
     ///
     /// This is what a discard packet means: the bytes are still whatever they
     /// were, and this replica no longer holds them. The version does not
     /// advance, because nothing was written.
-    pub fn discard(&mut self, backing: BackingId, replica: Replica) {
+    ///
+    /// Region-scoped rather than whole-backing, because several resources share
+    /// one backing whenever they are placed in one heap, and discarding a
+    /// heap-placed resource's copy must not throw away its neighbours'.
+    pub fn discard(&mut self, backing: BackingId, bytes: ByteRange, replica: Replica) {
         if let Some(e) = self.backings.get_mut(&backing) {
             if let Some(set) = e.fresh.get_mut(&replica) {
-                set.clear();
+                set.remove(bytes);
             }
         }
+    }
+
+    /// The bytes of `range` that only `replica` holds.
+    ///
+    /// The question a discard has to ask before it takes a hint: content no
+    /// other replica is fresh for exists nowhere else, so dropping it is not a
+    /// memory saving but a loss of bytes the guest may still read.
+    #[must_use]
+    pub fn sole_authority(
+        &self,
+        backing: BackingId,
+        range: ByteRange,
+        replica: Replica,
+    ) -> RangeSet {
+        let mut out = RangeSet::new();
+        let Some(e) = self.backings.get(&backing) else {
+            return out;
+        };
+        if let Some(here) = e.fresh.get(&replica) {
+            for r in here.ranges() {
+                if let Some(overlap) = intersect(*r, range) {
+                    out.insert(overlap);
+                }
+            }
+        }
+        if let Some(elsewhere) = e.fresh.get(&replica.other()) {
+            for r in elsewhere.ranges() {
+                out.remove(*r);
+            }
+        }
+        out
     }
 
     /// Forget a backing entirely.
@@ -374,7 +409,7 @@ mod tests {
             .unwrap();
         c.record_transfer(&t);
         let version = c.version(B);
-        c.discard(B, Replica::DeviceOwned);
+        c.discard(B, r(0, 256), Replica::DeviceOwned);
         assert_eq!(c.version(B), version, "nothing was written");
         assert!(c.is_fresh(B, r(0, 256), Replica::GuestPages));
         assert!(c
@@ -411,5 +446,60 @@ mod tests {
             .transfer_for_read(B, r(0, 256), Replica::DeviceOwned)
             .is_none());
         assert_eq!(c.version(B), ContentVersion::default());
+    }
+    /// Two resources placed in one heap share a backing, so a discard has to
+    /// be about bytes. A whole-backing discard would throw away a neighbour's
+    /// copy and charge it for a transfer it did not earn.
+    #[test]
+    fn discarding_one_placement_leaves_its_neighbour_fresh() {
+        let mut c = ContentLedger::new();
+        c.declare(B, r(0, 512), Replica::GuestPages);
+        let t = c
+            .transfer_for_read(B, r(0, 512), Replica::DeviceOwned)
+            .unwrap();
+        c.record_transfer(&t);
+        c.discard(B, r(0, 256), Replica::DeviceOwned);
+        assert!(!c.is_fresh(B, r(0, 256), Replica::DeviceOwned));
+        assert!(c.is_fresh(B, r(256, 256), Replica::DeviceOwned));
+    }
+
+    /// The question a discard asks before taking a hint. Content only one
+    /// replica holds is not a spare copy.
+    #[test]
+    fn sole_authority_is_the_bytes_nowhere_else_holds() {
+        let mut c = ContentLedger::new();
+        c.declare(B, r(0, 512), Replica::GuestPages);
+        assert!(
+            c.sole_authority(B, r(0, 512), Replica::DeviceOwned)
+                .is_empty(),
+            "the device holds nothing yet"
+        );
+        assert_eq!(
+            c.sole_authority(B, r(0, 512), Replica::GuestPages).ranges(),
+            &[r(0, 512)],
+            "and the guest holds all of it alone"
+        );
+        let t = c
+            .transfer_for_read(B, r(0, 512), Replica::DeviceOwned)
+            .unwrap();
+        c.record_transfer(&t);
+        assert!(
+            c.sole_authority(B, r(0, 512), Replica::GuestPages)
+                .is_empty(),
+            "a copy is a second holder"
+        );
+        // A device write of part of it makes that part the device's alone.
+        c.write(B, r(128, 64), Replica::DeviceOwned);
+        assert_eq!(
+            c.sole_authority(B, r(0, 512), Replica::DeviceOwned)
+                .ranges(),
+            &[r(128, 64)]
+        );
+        assert_eq!(
+            c.sole_authority(B, r(0, 128), Replica::DeviceOwned)
+                .ranges(),
+            &[],
+            "and the question is bounded by the range asked about"
+        );
     }
 }

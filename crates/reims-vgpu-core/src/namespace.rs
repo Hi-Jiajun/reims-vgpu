@@ -380,6 +380,31 @@ impl Namespace {
             .map_or(0, |s| s.outstanding)
     }
 
+    /// Every live name, with its exact generation.
+    ///
+    /// The complete input a teardown needs, taken without releasing or
+    /// republishing anything: a teardown that discovered membership by asking
+    /// each value owner separately would have to trust that they agree, and a
+    /// teardown that released names as it found them could not refuse partway
+    /// through without having already destroyed some of them.
+    ///
+    /// Sorted by slot, so a caller's teardown order is a property of the
+    /// namespace and not of a hash seed.
+    #[must_use]
+    pub fn live_names(&self) -> Vec<ResourceId> {
+        let mut out: Vec<ResourceId> = self
+            .slots
+            .iter()
+            .filter(|(_, s)| !s.deleted)
+            .map(|(slot, s)| ResourceId {
+                slot: *slot,
+                generation: s.generation,
+            })
+            .collect();
+        out.sort_unstable_by_key(|id| id.slot.0);
+        out
+    }
+
     /// Backings detached from their slot and still held by accepted work.
     #[must_use]
     pub fn awaiting_teardown(&self) -> usize {

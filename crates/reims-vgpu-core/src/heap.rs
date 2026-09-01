@@ -257,6 +257,15 @@ impl Heaps {
         })
     }
 
+    /// The storage a live heap is over.
+    ///
+    /// # Errors
+    ///
+    /// If no live heap has this number.
+    pub fn backing_of(&self, heap: u64) -> Result<BackingId, Refusal> {
+        Ok(self.live(heap)?.backing)
+    }
+
     /// Place a resource in the heap.
     ///
     /// # Errors
@@ -398,6 +407,15 @@ impl Heaps {
     #[must_use]
     pub fn holds_storage(&self, backing: BackingId) -> bool {
         self.retiring.contains_key(&backing) || self.heaps.values().any(|h| h.backing == backing)
+    }
+
+    /// Every live heap number, sorted, so a teardown's order is a property of
+    /// the heaps and not of a hash seed.
+    #[must_use]
+    pub fn live_heaps(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = self.heaps.keys().copied().collect();
+        out.sort_unstable();
+        out
     }
 
     /// How many pieces of storage are outliving their heap number.

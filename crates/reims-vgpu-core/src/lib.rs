@@ -35,6 +35,7 @@ pub mod heap;
 pub mod icb;
 pub mod identity;
 pub mod interpret;
+pub mod lifecycle;
 pub mod namespace;
 pub mod operation;
 pub mod pass;
