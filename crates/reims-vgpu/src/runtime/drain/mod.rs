@@ -8,6 +8,7 @@ use crate::model::*;
 use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, UnimplementedCommand};
 use crate::observe::Emit;
 use crate::protocol::endian::{ld16, ld32, ld64, st16, st32};
+use crate::protocol::fifo::{decode_device_info, DeviceInfoForm};
 use crate::protocol::fifo::{
     display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
     DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
@@ -699,23 +700,32 @@ fn note_resource_list_decode_fail(
         .fail_once(u64::from(opcode));
 }
 
-/// A fixed-size FIFO payload the guest sent short.
+/// A fixed-size FIFO payload the guest sent short, reported the way
+/// [`packet_short`] reports one.
 ///
-/// Same shape and same latching as [`note_resource_list_decode_fail`]: the
-/// decline carries the two lengths, this adds the command that was expecting
-/// them, and the pair is emitted once per opcode because a guest that sends a
-/// malformed command sends it malformed every time.
+/// **The same line, deliberately.** Twelve arms report a short payload and ten
+/// of them still do it by calling `packet_short` with their own literal floor;
+/// a reader greps `reason=<command>_short`, and two arms emitting a different
+/// slug because their floor moved into a decoder would be a log split down a
+/// line nobody drew. What changed for those arms is which code owns the bound,
+/// not what the guest's operator sees.
+///
+/// (The `{op}_short` slugs are *computed*, so `reims-vgpu-observe`'s registry
+/// cannot see any of the twelve and the crate-wide "no two checks share a slug"
+/// claim excludes them. Fixing that is a change to all twelve at once, not to
+/// the two that happen to have decoders.)
 fn note_short_payload(
     op: &'static str,
-    opcode: u16,
-    channel_id: u32,
+    _opcode: u16,
+    channel: Option<u32>,
     short: &crate::protocol::fifo::ShortPayload,
 ) {
-    crate::observe::Emit::decline("packet_short", short)
-        .field("op", op)
-        .field("opcode", format!("{opcode:#x}"))
-        .field("ch", channel_id)
-        .fail_once(u64::from(opcode));
+    crate::observe::fail(format!(
+        "packet_short reason={op}_short site={} plen={} need={}",
+        packet_site(channel),
+        short.plen,
+        short.need
+    ));
 }
 
 fn note_display_txn_payload(
@@ -2259,46 +2269,48 @@ fn process_root_packet<H: HostMemory + HostOps>(
 ) {
     match packet.opcode {
         ROOT_OP_DEVICE_INFO_TAHOE => {
-            if !packet_short(
-                "device_info_tahoe",
-                None,
-                packet.payload.len(),
-                DEVICE_INFO_TAHOE_REPLY_PFN + 4,
-            ) {
-                let key_table_len = ld32(&packet.payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..]);
-                let count = ld32(&packet.payload[DEVICE_INFO_TAHOE_COUNT..]);
-                let pfn = ld32(&packet.payload[DEVICE_INFO_TAHOE_REPLY_PFN..]);
-                let _ = reply_device_info(
-                    host,
-                    key_table_len,
-                    count,
-                    pfn,
-                    state.page_shift,
-                    state.gfx.version,
-                );
+            // The offsets are the form's, and the form's are
+            // `reims_vgpu_protocol::fifo`'s. The two requests differ by one
+            // prepended word, so reading either at the other's offsets would
+            // take the count for a page frame and write the reply wherever
+            // that landed.
+            match decode_device_info(DeviceInfoForm::WithKeyLimit, &packet.payload) {
+                Ok(request) => {
+                    let _ = reply_device_info(
+                        host,
+                        request.key_table_len.unwrap_or(u32::MAX),
+                        request.pair_capacity,
+                        request.reply_pfn,
+                        state.page_shift,
+                        state.gfx.version,
+                    );
+                }
+                Err(short) => {
+                    note_short_payload("device_info_tahoe", packet.opcode, None, &short);
+                }
             }
         }
         ROOT_OP_DEVICE_INFO_MONTEREY => {
-            if !packet_short(
-                "device_info_monterey",
-                None,
-                packet.payload.len(),
-                DEVICE_INFO_MONTEREY_REPLY_PFN + 4,
-            ) {
-                let count = ld32(&packet.payload[DEVICE_INFO_MONTEREY_COUNT..]);
-                let pfn = ld32(&packet.payload[DEVICE_INFO_MONTEREY_REPLY_PFN..]);
-                // This record carries no parse ceiling — see
-                // `DEVICE_INFO_MONTEREY_COUNT` — so the reply names every key the
-                // table holds and the count alone bounds it, which is what this
-                // arm has always done.
-                let _ = reply_device_info(
-                    host,
-                    u32::MAX,
-                    count,
-                    pfn,
-                    state.page_shift,
-                    state.gfx.version,
-                );
+            match decode_device_info(DeviceInfoForm::WithoutKeyLimit, &packet.payload) {
+                Ok(request) => {
+                    let count = request.pair_capacity;
+                    let pfn = request.reply_pfn;
+                    // This record carries no parse ceiling — see
+                    // `DEVICE_INFO_MONTEREY_COUNT` — so the reply names every key the
+                    // table holds and the count alone bounds it, which is what this
+                    // arm has always done.
+                    let _ = reply_device_info(
+                        host,
+                        u32::MAX,
+                        count,
+                        pfn,
+                        state.page_shift,
+                        state.gfx.version,
+                    );
+                }
+                Err(short) => {
+                    note_short_payload("device_info_monterey", packet.opcode, None, &short);
+                }
             }
         }
         ROOT_OP_DEFINE_FIFO => {
@@ -4459,7 +4471,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     );
                 }
                 Err(short) => {
-                    note_short_payload("replace_physical", packet.opcode, channel_id, &short);
+                    note_short_payload("replace_physical", packet.opcode, Some(channel_id), &short);
                 }
             }
         }

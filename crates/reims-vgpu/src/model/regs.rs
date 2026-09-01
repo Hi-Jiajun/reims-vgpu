@@ -692,44 +692,12 @@ pub const CHILD_RING_PFN_ENTRY_LEN: u64 = 4;
 
 pub const DEVICE_INFO_REPLY_PAIR_LEN: usize = 8;
 
-/// How many arms the guest's key walker has, counting the terminator — so the
-/// reply may name every key **strictly below** this word.
-///
-/// **It is a table length, not a highest key**, and the difference is the whole
-/// reason it is spelled this way. The guest writes a literal, and the literal is
-/// `highest_key_it_parses + 1`: 18 against a walker whose jump table runs
-/// `case 0` (the terminator) through `case 17`. The sibling `CmdGetComputeInfo`
-/// carries the same field and writes 5 against a table of `case 0` through
-/// `case 4`. Read as a maximum, that 5 invents a key 5 that has no arm, no
-/// field and no meaning — the guest's walker sends it to the same skip arm as
-/// key 900.
-///
-/// Apple's own host writes the reply under `keyLimit > K`, which is this
-/// polarity exactly.
-///
-/// A separate word from [`DEVICE_INFO_TAHOE_COUNT`], bounding a different thing:
-/// this bounds *which* keys the reply may name, that one bounds *how many* pairs
-/// fit. A reply is correct only when it respects both.
-pub const DEVICE_INFO_TAHOE_KEY_TABLE_LEN: usize = 0x00;
-
-/// How many 8-byte pairs the guest's reply buffer holds — its allocation size in
-/// bytes, shifted right by three. One page, so 512 on a 4 KiB guest.
-///
-/// The guest re-reads this word from its own staging copy to bound the walk, so
-/// it is never the host's to widen. The walk ends at whichever comes first, this
-/// many pairs or a key of 0.
-pub const DEVICE_INFO_TAHOE_COUNT: usize = 0x04;
-pub const DEVICE_INFO_TAHOE_REPLY_PFN: usize = 0x08;
-
-/// The older request carries no parse ceiling — the record is the count and the
-/// PFN and nothing before them.
-///
-/// A `max_key` here would sit at these same two offsets, so reading one that is
-/// not there would take the count for a ceiling and the PFN for a count. Nothing
-/// this device has driven issues this opcode, and no disassembly of its builder
-/// has been read, so the reply is bounded by the count alone and by nothing else.
-pub const DEVICE_INFO_MONTEREY_COUNT: usize = 0x00;
-pub const DEVICE_INFO_MONTEREY_REPLY_PFN: usize = 0x04;
+// The two device-info request forms — which words each carries and where —
+// live in `reims_vgpu_protocol::fifo`'s `DeviceInfoForm`, with the recovered
+// reading of the key-table length and the pair capacity. They were here as four
+// offsets that only `process_root_packet` read, and the two forms' offsets
+// collide: reading either request at the other's takes the count for a page
+// frame.
 
 pub const DEFINE_TASK_RAW_ID: usize = 0x00;
 pub const DEFINE_TASK_LENGTH: usize = 0x04;
@@ -1430,7 +1398,8 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// removing values whose meaning is not established would be trading one guess
 /// for another. They are not *sent* to a guest that has not asked for them:
 /// every request carries the guest's own exclusive parse ceiling
-/// ([`DEVICE_INFO_TAHOE_KEY_TABLE_LEN`]), and `reply_device_info` names only the keys
+/// (`reims_vgpu_protocol::fifo::DeviceInfoRequest::key_table_len`), and
+/// `reply_device_info` names only the keys
 /// below it. So this table is the set this device *can* answer, and the guest
 /// picks the prefix of it that it understands.
 ///

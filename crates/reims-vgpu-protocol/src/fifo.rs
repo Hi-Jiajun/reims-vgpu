@@ -36,6 +36,120 @@ pub const CHILD_SYNCHRONIZE_RECORD_LEN: u32 = 4;
 pub const CHILD_REPLACE_PHYSICAL_TASK_ID: u32 = 0x00;
 pub const CHILD_REPLACE_PHYSICAL_OBJECT_ID: u32 = 0x04;
 pub const CHILD_REPLACE_PHYSICAL_LEN: u32 = 8;
+/// The two device-info request forms, and where each keeps its words.
+///
+/// The newer form carries a parse ceiling the older one does not, and it sits
+/// *before* the two words they share — so the two forms' counts and reply
+/// frames are at different offsets, and reading one form's request at the
+/// other's offsets takes the ceiling for a count and the count for a page
+/// frame. That is not a near miss: it would write the reply to whatever page
+/// the pair count happens to name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeviceInfoForm {
+    /// `[count][reply_pfn]`. No parse ceiling.
+    WithoutKeyLimit,
+    /// `[key_table_len][count][reply_pfn]`.
+    WithKeyLimit,
+}
+
+impl DeviceInfoForm {
+    /// Byte offset of the parse ceiling, for the form that carries one.
+    ///
+    /// The newer form prepends it, which is the entire difference between the
+    /// two shapes — so every other offset here is stated relative to that.
+    #[must_use]
+    pub const fn key_table_len_offset(self) -> Option<usize> {
+        match self {
+            Self::WithoutKeyLimit => None,
+            Self::WithKeyLimit => Some(0x00),
+        }
+    }
+
+    /// Byte offset of the pair capacity.
+    #[must_use]
+    pub const fn pair_capacity_offset(self) -> usize {
+        match self {
+            Self::WithoutKeyLimit => 0x00,
+            Self::WithKeyLimit => 0x04,
+        }
+    }
+
+    /// Byte offset of the reply page frame.
+    #[must_use]
+    pub const fn reply_pfn_offset(self) -> usize {
+        self.pair_capacity_offset() + 4
+    }
+
+    /// Bytes the request must carry.
+    #[must_use]
+    pub const fn request_len(self) -> usize {
+        self.reply_pfn_offset() + 4
+    }
+}
+
+/// A device-info request, decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceInfoRequest {
+    pub form: DeviceInfoForm,
+    /// How many eight-byte pairs the guest's reply buffer holds — its
+    /// allocation size in bytes, shifted right by three. One page, so 512 on a
+    /// 4 KiB guest.
+    ///
+    /// The guest re-reads this word from its own staging copy to bound the
+    /// walk, so it is never the host's to widen. The walk ends at whichever
+    /// comes first: this many pairs, or a key of zero.
+    pub pair_capacity: u32,
+    /// One past the highest key the guest's walker parses, when the form
+    /// carries one.
+    ///
+    /// **A table length, not a highest key**, so the reply may name every key
+    /// strictly *below* this word. The guest writes a literal: 18 against a
+    /// walker whose jump table runs the terminator through case 17, and the
+    /// sibling compute-info request writes 5 against a table of case 0 through
+    /// case 4. Read as a maximum, that 5 invents a key 5 with no arm, no field
+    /// and no meaning — the guest's own walker sends it to the same skip arm as
+    /// key 900. The reference host writes the reply under `keyLimit > K`, which
+    /// is this polarity exactly.
+    ///
+    /// A **separate** bound from [`Self::pair_capacity`]: this bounds *which*
+    /// keys the reply may name, that one bounds *how many* pairs fit. A reply
+    /// is correct only when it respects both.
+    ///
+    /// `None` for [`DeviceInfoForm::WithoutKeyLimit`], and that is a claim
+    /// rather than an absence. Nothing this device has driven issues that
+    /// older opcode and no disassembly of its builder has been read, so its
+    /// reply is bounded by the count alone. A ceiling read where there is none
+    /// would sit at that form's count offset, taking the count for a ceiling
+    /// and the reply frame for a count.
+    pub key_table_len: Option<u32>,
+    /// The page frame the reply is written to.
+    pub reply_pfn: u32,
+}
+
+/// Decode a device-info request.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the form's words.
+pub fn decode_device_info(
+    form: DeviceInfoForm,
+    payload: &[u8],
+) -> Result<DeviceInfoRequest, ShortPayload> {
+    let need = form.request_len();
+    if payload.len() < need {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need,
+        });
+    }
+    Ok(DeviceInfoRequest {
+        form,
+        key_table_len: form.key_table_len_offset().map(|at| ld32(&payload[at..])),
+        pair_capacity: ld32(&payload[form.pair_capacity_offset()..]),
+        reply_pfn: ld32(&payload[form.reply_pfn_offset()..]),
+    })
+}
+
 /// `CmdDefineFifo` / `CmdFreeFifo`: the channel id, and nothing else.
 ///
 /// One word, and it is the whole payload either command needs. Named rather
@@ -932,5 +1046,91 @@ mod tests {
             refused > 100,
             "only {refused} of 4096 payloads were refused"
         );
+    }
+
+    /// The two forms do not share offsets, and reading one at the other's is
+    /// not a near miss: the ceiling becomes the count and the count becomes the
+    /// page frame the reply is written to.
+    #[test]
+    fn the_two_device_info_forms_read_different_words() {
+        let mut bytes = Vec::new();
+        for word in [18u32, 512, 0xF00D, 0xDEAD] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        assert_eq!(
+            decode_device_info(DeviceInfoForm::WithKeyLimit, &bytes),
+            Ok(DeviceInfoRequest {
+                form: DeviceInfoForm::WithKeyLimit,
+                key_table_len: Some(18),
+                pair_capacity: 512,
+                reply_pfn: 0xF00D,
+            })
+        );
+        assert_eq!(
+            decode_device_info(DeviceInfoForm::WithoutKeyLimit, &bytes),
+            Ok(DeviceInfoRequest {
+                form: DeviceInfoForm::WithoutKeyLimit,
+                key_table_len: None,
+                pair_capacity: 18,
+                reply_pfn: 512,
+            }),
+            "the older form has no ceiling, so its count is word zero and its \
+             reply frame is word one"
+        );
+    }
+
+    /// The older form's ceiling is absent, not zero. Zero would be a walker
+    /// that parses no keys at all, which is a different statement from a form
+    /// that carries no ceiling.
+    #[test]
+    fn the_older_form_reports_no_key_limit_rather_than_a_zero_one() {
+        let bytes = alloc::vec![0xffu8; 16];
+        assert_eq!(
+            decode_device_info(DeviceInfoForm::WithoutKeyLimit, &bytes)
+                .expect("long enough")
+                .key_table_len,
+            None
+        );
+        assert_eq!(
+            decode_device_info(DeviceInfoForm::WithKeyLimit, &bytes)
+                .expect("long enough")
+                .key_table_len,
+            Some(0xffff_ffff)
+        );
+    }
+
+    /// Each form refuses at its own floor, one byte under.
+    #[test]
+    fn a_device_info_request_under_its_forms_length_is_refused() {
+        for form in [
+            DeviceInfoForm::WithoutKeyLimit,
+            DeviceInfoForm::WithKeyLimit,
+        ] {
+            let need = form.request_len();
+            let bytes = alloc::vec![0u8; need];
+            assert!(decode_device_info(form, &bytes).is_ok());
+            assert_eq!(
+                decode_device_info(form, &bytes[..need - 1]),
+                Err(ShortPayload {
+                    plen: need - 1,
+                    need
+                })
+            );
+        }
+        assert_eq!(DeviceInfoForm::WithoutKeyLimit.request_len(), 8);
+        assert_eq!(DeviceInfoForm::WithKeyLimit.request_len(), 12);
+        // Every word a form names is inside the request it declares, and no
+        // two of them share a slot.
+        for form in [
+            DeviceInfoForm::WithoutKeyLimit,
+            DeviceInfoForm::WithKeyLimit,
+        ] {
+            assert!(form.reply_pfn_offset() + 4 <= form.request_len());
+            assert_ne!(form.pair_capacity_offset(), form.reply_pfn_offset());
+            if let Some(at) = form.key_table_len_offset() {
+                assert_ne!(at, form.pair_capacity_offset());
+                assert_ne!(at, form.reply_pfn_offset());
+            }
+        }
     }
 }

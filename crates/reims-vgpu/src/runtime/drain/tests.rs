@@ -1,6 +1,12 @@
 use super::*;
 
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
+use crate::protocol::fifo::DeviceInfoForm;
+
+/// The two device-info request forms these tests build, named once so a test
+/// cannot pin an offset the decoder does not read.
+const TAHOE: DeviceInfoForm = DeviceInfoForm::WithKeyLimit;
+const MONTEREY: DeviceInfoForm = DeviceInfoForm::WithoutKeyLimit;
 
 /// I2's carve-out, asserted rather than trusted: a partial packet is the
 /// normal state of a ring whose producer is mid-write, so it must not reach
@@ -603,11 +609,11 @@ fn a_short_replace_physical_is_reported_and_not_acted_on() {
     let lines = cap.lines();
     let line = lines
         .iter()
-        .find(|l| l.contains("fifo_payload_short"))
+        .find(|l| l.contains("reason=replace_physical_short"))
         .unwrap_or_else(|| panic!("a short replace-physical said nothing: {lines:?}"));
     assert!(
-        line.contains("op=replace_physical") && line.contains("need=8") && line.contains("plen=7"),
-        "the line must name the command, what it needed and what it got: {line}"
+        line.contains("need=8") && line.contains("plen=7"),
+        "the line must say what it needed and what it got: {line}"
     );
     for plen in 0..7usize {
         process_child_packet(&mut state, &mut host, 2, &short(plen));
@@ -4366,10 +4372,15 @@ fn device_info_reply(max_key: u32, count: u32) -> Vec<(u32, u32)> {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
 
-    let mut payload = vec![0u8; DEVICE_INFO_TAHOE_REPLY_PFN + 4];
-    st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], max_key);
-    st32(&mut payload[DEVICE_INFO_TAHOE_COUNT..], count);
-    st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], REPLY_PFN);
+    let mut payload = vec![0u8; TAHOE.reply_pfn_offset() + 4];
+    st32(
+        &mut payload[TAHOE
+            .key_table_len_offset()
+            .expect("the newer form carries one")..],
+        max_key,
+    );
+    st32(&mut payload[TAHOE.pair_capacity_offset()..], count);
+    st32(&mut payload[TAHOE.reply_pfn_offset()..], REPLY_PFN);
     process_root_packet(
         &mut state,
         &mut host,
@@ -4617,10 +4628,10 @@ fn every_short_control_packet_names_itself() {
 
     let before_mask = state.active_child_mask;
     for (opcode, need) in [
-        (ROOT_OP_DEVICE_INFO_TAHOE, DEVICE_INFO_TAHOE_REPLY_PFN + 4),
+        (ROOT_OP_DEVICE_INFO_TAHOE, TAHOE.reply_pfn_offset() + 4),
         (
             ROOT_OP_DEVICE_INFO_MONTEREY,
-            DEVICE_INFO_MONTEREY_REPLY_PFN + 4,
+            MONTEREY.reply_pfn_offset() + 4,
         ),
         (ROOT_OP_DEFINE_FIFO, 4),
         (ROOT_OP_FREE_FIFO, 4),
