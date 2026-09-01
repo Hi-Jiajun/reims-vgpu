@@ -596,10 +596,15 @@ engine_counters! {
         /// near zero is a boot where consecutive draws never share a pipeline
         /// and this whole cache is inert.
         ///
-        /// `dynstate_stencil_held` is out of the *stencil* draws rather than all
-        /// of them — a draw with no stencil state asks nothing and counts
-        /// nowhere — so it is the one that does not belong to the same
-        /// denominator.
+        /// `dynstate_stencil_held` is the one that does not belong to the same
+        /// denominator, and what its denominator *is* depends on the host. A
+        /// draw is asked for a stencil reference exactly where its pipeline
+        /// declared `STENCIL_REFERENCE`, which is the stencil draws on a host
+        /// that bakes the depth-stencil state and every draw whose pass carries
+        /// depth on a host that supplies it per draw — because there the
+        /// stencil *test enable* is itself dynamic, so the reference is
+        /// declared whatever any one draw's state says. See
+        /// `reims_vgpu_vulkan::depth_stencil::DepthStencilPlan::states`.
         dynstate_pipeline_held,
         dynstate_viewport_held,
         dynstate_scissor_held,
