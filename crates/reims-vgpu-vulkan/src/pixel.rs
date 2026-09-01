@@ -37,11 +37,10 @@ use reims_vgpu_core::pixel_format::{
 
 /// Why a pixel-format translation did not happen.
 ///
-/// Three reasons, and they are three because they are three different bugs: a
-/// value no contract defines, a format this rail carries no guest byte layout
-/// for, and a format the contract says is not a colour attachment. A single
-/// "unsupported format" would put all three under one slug and make the fail
-/// log unable to say which.
+/// Four reasons, and they are four because they are four different bugs: a
+/// value no contract defines, and three roles that each narrow the defined set
+/// their own way. A single "unsupported format" would put them all under one
+/// slug and make the fail log unable to say which.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// Not a value the decode contract defines.
@@ -52,6 +51,10 @@ pub enum Refusal {
     NoSampledLayout(u16),
     /// Defined, and the contract does not make it a colour attachment.
     NoColorAttachmentFormat(u16),
+    /// Defined, and the contract's storage-image narrowing has no entry for it.
+    /// Every sRGB format lands here, which is why no downgrade is possible on
+    /// this rail — see [`storage_image`].
+    NoStorageImageFormat(u16),
 }
 
 impl Refusal {
@@ -61,6 +64,7 @@ impl Refusal {
             Self::UnknownPixelFormat(_) => "unknown_pixel_format",
             Self::NoSampledLayout(_) => "no_sampled_layout",
             Self::NoColorAttachmentFormat(_) => "no_color_attachment_format",
+            Self::NoStorageImageFormat(_) => "no_storage_image_format",
         }
     }
 
@@ -70,7 +74,8 @@ impl Refusal {
         match self {
             Self::UnknownPixelFormat(f)
             | Self::NoSampledLayout(f)
-            | Self::NoColorAttachmentFormat(f) => f,
+            | Self::NoColorAttachmentFormat(f)
+            | Self::NoStorageImageFormat(f) => f,
         }
     }
 }
@@ -835,10 +840,410 @@ pub fn has_identity_components(mtl: u16) -> bool {
         .unwrap_or(false)
 }
 
+/// Pixel formats the product compute path maps. Storage and sampled images
+/// share this type; access is carried separately by the request resource.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum StorageImageFormat {
+    #[default]
+    Rgba32Float,
+    Rgba16Float,
+    R16Float,
+    Rgba16Uint,
+    Rgba8Uint,
+    Rgba8Sint,
+    Rgba8Unorm,
+    Bgra8Unorm,
+    Rg16Float,
+    R8Unorm,
+    /// Metal `A8Unorm`: one byte, presenting `(0, 0, 0, a)`.
+    ///
+    /// Its own member rather than [`Self::R8Unorm`], which it shares a
+    /// `VkFormat` with, because the difference between them is not the format
+    /// but the component mapping its view needs — and
+    /// [`vk_component_mapping`] states the rule this follows: the
+    /// plan is a property of the *Metal* format, so a rail that has reduced a
+    /// format to a host one can no longer derive it. This enum is that
+    /// reduction, so the distinction has to survive it.
+    ///
+    /// Sampled only. `pixel_format::storage_selector` has no entry for
+    /// this format, and a Vulkan storage-image view must carry an identity
+    /// mapping, so a storage image of it is refused rather than built.
+    A8Unorm,
+    Rg8Unorm,
+    Rgba32Uint,
+    R32Uint,
+    R32Sint,
+    R32Float,
+    /// Packed three-channel shared-exponent float; sampled-image only on the
+    /// product path (`MTLPixelFormatRGB9E5Float`).
+    Rgb9e5Ufloat,
+    /// Single-channel sixteen-bit normalized; **sampled-image only**, for
+    /// `Rgb9e5Ufloat`'s reason and one more.
+    ///
+    /// This is the ten-bit biplanar video luma plane
+    /// (`MTLPixelFormatR16Unorm`). macOS 14 and macOS 15 each bind one to a
+    /// `DispatchThreadgroups` and lost the whole dispatch to
+    /// `sampled_format_unsupported` until it was named here.
+    ///
+    /// It must **not** reach a storage bind. Vulkan mandates `R16_UNORM` for
+    /// `SAMPLED_IMAGE` and `SAMPLED_IMAGE_FILTER_LINEAR` and does *not* mandate
+    /// it for `STORAGE_IMAGE`, so admitting it to a storage image would claim a
+    /// capability the host may not have — which is why it is reachable through
+    /// [`sampled_image`] and not through
+    /// [`storage_image`].
+    R16Unorm,
+    /// Two-channel sixteen-bit normalized; **sampled-image only**, and
+    /// [`Self::R16Unorm`]'s other half.
+    ///
+    /// A ten-bit biplanar video texture is two planes, and this is the chroma
+    /// one (`MTLPixelFormatRG16Unorm`) to that one's luma. A shader sampling such
+    /// a frame binds both planes, so admitting only the luma one still loses the
+    /// whole dispatch — the refusal moves to the other binding rather than going
+    /// away.
+    ///
+    /// `STORAGE_IMAGE` is no more mandatory for `R16G16_UNORM` than for
+    /// `R16_UNORM`, so it is reachable by the same single route for the same
+    /// reason.
+    Rg16Unorm,
+    /// Two-channel sixteen-bit **unsigned integer**; **sampled-image only**, on
+    /// [`Self::Rg16Unorm`]'s terms and for a different guest.
+    ///
+    /// `MTLPixelFormatRG16Uint`. A macos-15 guest renders into linear textures
+    /// of this format, so a shader that reads one back binds it here. It shares
+    /// its bytes with the normalized member above and nothing else: an integer
+    /// texel is a count, so it is neither blended as an attachment nor filtered
+    /// when sampled, and both of `DeviceCapabilitySnapshot`'s per-layout masks
+    /// skip it for that reason.
+    ///
+    /// `STORAGE_IMAGE` is not mandatory for `R16G16_UINT`, so it is reachable
+    /// by the same single route as the normalized members and for the same
+    /// reason.
+    Rg16Uint,
+    /// Four-channel sixteen-bit normalized; **sampled-image only**, the widest
+    /// member of the same family.
+    ///
+    /// `SAMPLED_IMAGE` with `SAMPLED_IMAGE_FILTER_LINEAR` is mandatory for
+    /// `R16G16B16A16_UNORM` and `STORAGE_IMAGE` is not, which is the whole of why
+    /// it sits here rather than in the storage selector.
+    Rgba16Unorm,
+    /// Ten bits per colour channel and two of alpha in one packed word, red in
+    /// the low bits (`MTLPixelFormatRGB10A2Unorm`); **sampled-image only**.
+    ///
+    /// Here for [`Self::R16Unorm`]'s reason: Vulkan mandates
+    /// `A2B10G10R10_UNORM_PACK32` for `SAMPLED_IMAGE` and
+    /// `SAMPLED_IMAGE_FILTER_LINEAR` and mandates nothing for `STORAGE_IMAGE`,
+    /// so it is reachable through `translate::pixel::sampled_image` and not
+    /// through [`storage_image`].
+    Rgb10a2Unorm,
+    /// [`Self::Rgb10a2Unorm`] with the colour channels the other way round in
+    /// the word (`MTLPixelFormatBGR10A2Unorm`); **sampled-image only**.
+    ///
+    /// One caveat its two neighbours do not carry:
+    /// `A2R10G10B10_UNORM_PACK32` is **not** in Vulkan's mandatory format
+    /// table at all, where `A2B10G10R10_UNORM_PACK32` and
+    /// `B10G11R11_UFLOAT_PACK32` are. A host without it fails image creation
+    /// and declines by name, which is the same work the guest lost when the
+    /// format was refused at decode — but a capability gate would say so before
+    /// the allocation rather than after it, and that gate is not written.
+    Bgr10a2Unorm,
+    /// Eleven bits of red and green, ten of blue, no alpha, in one packed word
+    /// (`MTLPixelFormatRG11B10Float`); **sampled-image only**, for
+    /// [`Self::Rgb10a2Unorm`]'s reason.
+    Rg11b10Float,
+}
+
+impl StorageImageFormat {
+    #[must_use]
+    pub fn vk_format(self) -> vk::Format {
+        vk_storage_image(self)
+    }
+
+    pub fn bytes_per_texel(self) -> usize {
+        match self {
+            Self::Rgba32Float | Self::Rgba32Uint => 16,
+            Self::Rgba16Float | Self::Rgba16Uint => 8,
+            Self::Rg16Float => 4,
+            Self::Rgba16Unorm => 8,
+            Self::Rg16Unorm | Self::Rg16Uint => 4,
+            Self::R16Float | Self::Rg8Unorm | Self::R16Unorm => 2,
+            Self::R8Unorm | Self::A8Unorm => 1,
+            Self::Rgba8Uint
+            | Self::Rgba8Sint
+            | Self::Rgba8Unorm
+            | Self::Bgra8Unorm
+            | Self::R32Uint
+            | Self::R32Sint
+            | Self::R32Float
+            | Self::Rgb9e5Ufloat
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm
+            | Self::Rg11b10Float => 4,
+        }
+    }
+}
+
+/// The host texel a guest format's own bytes already are, and how wide it is —
+/// or `None` for a format whose bytes no host texel reproduces verbatim.
+///
+/// This is the question a **byte copy** asks. A copy converts nothing, so the
+/// only thing that licenses one is that the bytes the guest declared and the
+/// bytes the image holds are the same texel; a rail that can answer this can
+/// hand the guest its pages directly, and one that cannot must read back and
+/// convert.
+///
+/// # Why this is not `pixel_format::store_texel_order`
+///
+/// Both guest-page writeback licences used to ask that function, and it is the
+/// **render Store's** table: its own doc states the membership rule as "a guest
+/// *render target* can declare it", and
+/// `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is` holds
+/// it to that by requiring every admitted format to have a `render_target_bpp`
+/// and a `sampled_class`. That is correct for a Store and wrong for a compute
+/// storage image, which the guest never renders into and the sampler never
+/// reads — so asking it was a render-target question about a destination that is
+/// not one, and the answer was `FormatNeedsConversion` for every 32-bit-per-
+/// channel plane. On a driven macos-13 boot that was all five remaining compute
+/// readbacks: four linear at `MTLPixelFormatRGBA32Float` and one mapper-ref-texture at
+/// `MTLPixelFormatRGBA32Uint` whose source image held `R32G32B32A32_UINT`, the
+/// very texel the guest had declared.
+///
+/// Widening the Store's table instead would have obliged this device to declare
+/// those formats renderable and samplable, which the guest never asked for and
+/// the contract does not say.
+///
+/// # Why this is a union and not a third table
+///
+/// Neither half is written here. A render target's answer is
+/// `store_texel_order` composed with [`vk_texel_layout`]; a storage image's is
+/// `storage_selector` composed with [`storage_image_from_selector`] and
+/// `StorageImageFormat::vk_format`. Both already existed, both are already the
+/// authority for their own rail, and a format either admits is a format that
+/// rail creates images at — so nothing new is claimed about any format, and a
+/// new arm in either table reaches this without being added twice.
+///
+/// The order does not matter, and `the_two_verbatim_texel_tables_never_disagree`
+/// is why: where both answer they must name the same format and the same width,
+/// which is the only way this can be a union rather than a precedence rule.
+pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
+    if let Some(layout) = pixel_format::store_texel_order(mtl) {
+        return Some((vk_texel_layout(layout), layout.bytes_per_texel()));
+    }
+    let storage = storage_image_from_selector(pixel_format::storage_selector(mtl)?);
+    Some((storage.vk_format(), storage.bytes_per_texel() as u32))
+}
+
+/// The engine's storage-image format for a contract
+/// [`pixel_format::StorageImageSelector`].
+///
+/// The selector is the compute rail's own narrowing of `MTLPixelFormat`, so
+/// this is a vocabulary-to-vocabulary step rather than a Metal decision — but
+/// it lives here for the same reason everything else does: it was previously
+/// spelled in `runtime/compute_exec/mod.rs`, where nothing could see that the two
+/// enums had to stay in step.
+///
+/// It is **total**, and that is the point. It used to take the selector's `u32`
+/// ordinal and match it with thirteen `s if s == S::X as u32` guard arms, which
+/// the compiler cannot check for coverage — so a new selector variant compiled
+/// fine here and declined at run time as a drift between two vocabularies that
+/// had not actually drifted. Taking the enum makes the arms exhaustive and the
+/// decline unnecessary: every selector the contract can produce has an engine
+/// format, and a new one cannot be added without this answering for it.
+pub fn storage_image_from_selector(
+    selector: pixel_format::StorageImageSelector,
+) -> StorageImageFormat {
+    use reims_vgpu_core::pixel_format::StorageImageSelector as S;
+    match selector {
+        S::Rgba8Uint => StorageImageFormat::Rgba8Uint,
+        S::Rgba8Sint => StorageImageFormat::Rgba8Sint,
+        S::Rgba16Uint => StorageImageFormat::Rgba16Uint,
+        S::Rgba16Float => StorageImageFormat::Rgba16Float,
+        S::Rgba32Float => StorageImageFormat::Rgba32Float,
+        S::Rgba8Unorm => StorageImageFormat::Rgba8Unorm,
+        S::Bgra8Unorm => StorageImageFormat::Bgra8Unorm,
+        S::R16Float => StorageImageFormat::R16Float,
+        S::Rg16Float => StorageImageFormat::Rg16Float,
+        S::R8Unorm => StorageImageFormat::R8Unorm,
+        S::Rg8Unorm => StorageImageFormat::Rg8Unorm,
+        S::Rgba32Uint => StorageImageFormat::Rgba32Uint,
+        S::R32Uint => StorageImageFormat::R32Uint,
+    }
+}
+
+/// The engine's storage-image format for a Metal pixel format.
+///
+/// Used by the compute rails for both storage bindings and sampled textures
+/// staged through the storage selector. The four single-channel-wide formats
+/// below never had a storage selector — the contract's selector enum has no
+/// ordinal for them — so they are answered directly rather than being declined
+/// by a narrowing they were never in.
+///
+/// # Why this rail keeps an enum where the others took a `VkFormat`
+///
+/// The colour-attachment and sampled rails resolve to a real `VkFormat` so an
+/// sRGB format is expressible on them. This one does not, and the reason is not
+/// inertia:
+///
+/// * **No sRGB format reaches it.** `pixel_format::storage_selector` has no
+///   sRGB arm, so an sRGB format declines here with
+///   [`Refusal::NoStorageImageFormat`] rather than downgrading — which
+///   is why `srgb_census` names six rails and none of them is this one. Widening
+///   the vocabulary would therefore make no colour space newly reachable.
+/// * **The shader side cannot name one either.** A storage image's view format
+///   must be class-compatible with the format the SPIR-V module declares, and
+///   the SPIR-V image-format operand has no sRGB member at all
+///   (`runtime::spirv_bind::ImageFormat`). Vulkan likewise does not apply the
+///   transfer function on an image store.
+/// * **Its consumer reasons about the enum by name.** The compute path picks a
+///   view format by comparing the guest surface's format class against the
+///   shader's declared one; expressed over `VkFormat` that reasoning would have
+///   to be spelled in `runtime/`, which is exactly the boundary
+///   `translate::gate` exists to keep closed.
+///
+/// A test below pins the first point, so if a future selector does admit an
+/// sRGB format this comment stops being true loudly rather than quietly.
+pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, Refusal> {
+    use reims_vgpu_core::pixel_format as pf;
+    // Validate the format against the one pixel table first, so an entirely
+    // unknown value declines as `unknown_pixel_format` rather than as a missing
+    // storage layout — those are different bugs and want different slugs.
+    translate(mtl)?;
+    match mtl {
+        pf::MTL_FORMAT_R32_UINT => return Ok(StorageImageFormat::R32Uint),
+        pf::MTL_FORMAT_R32_SINT => return Ok(StorageImageFormat::R32Sint),
+        pf::MTL_FORMAT_R32_FLOAT => return Ok(StorageImageFormat::R32Float),
+        pf::MTL_FORMAT_RGB9E5_FLOAT => return Ok(StorageImageFormat::Rgb9e5Ufloat),
+        _ => {}
+    }
+    let selector = pf::storage_selector(mtl).ok_or(Refusal::NoStorageImageFormat(mtl))?;
+    Ok(storage_image_from_selector(selector))
+}
+
+/// The compute path's admission for a **sampled** image bind.
+///
+/// [`storage_image`] answers the storage question, and the compute rail used to
+/// ask it for both roles — `mtl_to_engine_sampled` was a one-line wrapper over
+/// it. That is why macOS 14 and macOS 15 each lost a whole
+/// `DispatchThreadgroups` a boot to `sampled_format_unsupported` on
+/// `MTLPixelFormatR16Unorm`: the ten-bit biplanar video luma plane is
+/// sampleable everywhere and is not a storage format, so the storage table
+/// correctly refused a question it was never being asked.
+///
+/// The two questions are genuinely different and Vulkan says so. `R16_UNORM` is
+/// mandatory for `SAMPLED_IMAGE` with `SAMPLED_IMAGE_FILTER_LINEAR` and carries
+/// no mandatory `STORAGE_IMAGE` support; `E5B9G9R9_UFLOAT_PACK32` has no storage
+/// support at all. So this is a superset of [`storage_image`] rather than a copy
+/// of it, and the members it adds are exactly the ones marked sampled-only on
+/// [`StorageImageFormat`].
+///
+/// The graphics rail asks [`sampled_pixels`] instead, which answers a
+/// [`TexelLayout`] and is wider still. The two are not merged because the
+/// compute request carries a `StorageImageFormat` — see that type's doc for the
+/// end state that would let them be.
+///
+/// # The two rails are held to each other by a test
+///
+/// Admitting `R16_UNORM` alone left the *chroma* half of the same biplanar video
+/// texture refused, so the dispatch a shader makes of both planes was still lost
+/// — the refusal moved to the other binding. That is the failure mode of fixing
+/// a divergence one format at a time, so it is now a relation rather than a list:
+/// `a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one` sweeps
+/// every `u16` and requires everything [`sampled_pixels`] admits to be admitted
+/// here, against a named exception set that the test states the reason for.
+///
+/// The converse does not hold and must not: this rail carries the integer and
+/// packed formats a compute shader reads and [`sampled_pixels`] has no
+/// [`TexelLayout`] for, because that one answers a CPU-upload byte order.
+pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, Refusal> {
+    use reims_vgpu_core::pixel_format as pf;
+    // Sampled-only members first, then everything a storage image may be. The
+    // `translate` call keeps an entirely unknown value declining as
+    // `unknown_pixel_format` rather than as a missing layout, exactly as
+    // `storage_image` does for the same reason.
+    let sampled_only = match mtl {
+        // `(0, 0, 0, a)` in one byte. It has no storage selector and no Vulkan
+        // 1.2 format of its own, so it rides `R8_UNORM` with the mapping
+        // `storage_image_components` supplies — the same one the draw rail
+        // already binds it through.
+        pf::MTL_FORMAT_A8_UNORM => StorageImageFormat::A8Unorm,
+        pf::MTL_FORMAT_R16_UNORM => StorageImageFormat::R16Unorm,
+        pf::MTL_FORMAT_RG16_UNORM => StorageImageFormat::Rg16Unorm,
+        pf::MTL_FORMAT_RG16_UINT => StorageImageFormat::Rg16Uint,
+        pf::MTL_FORMAT_RGBA16_UNORM => StorageImageFormat::Rgba16Unorm,
+        pf::MTL_FORMAT_RGB10A2_UNORM => StorageImageFormat::Rgb10a2Unorm,
+        pf::MTL_FORMAT_BGR10A2_UNORM => StorageImageFormat::Bgr10a2Unorm,
+        pf::MTL_FORMAT_RG11B10_FLOAT => StorageImageFormat::Rg11b10Float,
+        _ => return storage_image(mtl),
+    };
+    translate(mtl)?;
+    Ok(sampled_only)
+}
+
+/// The Vulkan spelling of an engine storage/compute image format.
+pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
+    match format {
+        StorageImageFormat::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
+        StorageImageFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        StorageImageFormat::R16Float => vk::Format::R16_SFLOAT,
+        StorageImageFormat::Rgba16Uint => vk::Format::R16G16B16A16_UINT,
+        StorageImageFormat::Rgba8Uint => vk::Format::R8G8B8A8_UINT,
+        StorageImageFormat::Rgba8Sint => vk::Format::R8G8B8A8_SINT,
+        StorageImageFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        StorageImageFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        StorageImageFormat::Rg16Float => vk::Format::R16G16_SFLOAT,
+        StorageImageFormat::Rg16Uint => vk::Format::R16G16_UINT,
+        StorageImageFormat::R8Unorm => vk::Format::R8_UNORM,
+        // Shares `R8_UNORM` with `R8Unorm`; what separates them is the view
+        // component mapping, which `storage_image_components` answers.
+        StorageImageFormat::A8Unorm => vk::Format::R8_UNORM,
+        StorageImageFormat::Rg8Unorm => vk::Format::R8G8_UNORM,
+        StorageImageFormat::Rgba32Uint => vk::Format::R32G32B32A32_UINT,
+        StorageImageFormat::R32Uint => vk::Format::R32_UINT,
+        StorageImageFormat::R32Sint => vk::Format::R32_SINT,
+        StorageImageFormat::R32Float => vk::Format::R32_SFLOAT,
+        StorageImageFormat::Rgb9e5Ufloat => vk::Format::E5B9G9R9_UFLOAT_PACK32,
+        StorageImageFormat::R16Unorm => vk::Format::R16_UNORM,
+        StorageImageFormat::Rg16Unorm => vk::Format::R16G16_UNORM,
+        StorageImageFormat::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
+        StorageImageFormat::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
+        StorageImageFormat::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
+        StorageImageFormat::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
+    }
+}
+
+/// The view component mapping a sampled image of this engine format needs.
+///
+/// One member has a non-identity answer: [`StorageImageFormat::A8Unorm`], whose
+/// byte rides in `R8_UNORM` and has to be put back in alpha. Everything else is
+/// identity, because [`translate`] gives a non-identity plan to that Metal
+/// format alone.
+///
+/// This is the *reduced* end of the same fact [`translate`] states, so a test
+/// holds the two equal rather than letting this become a second opinion about
+/// where `A8Unorm`'s byte lives.
+///
+/// A **storage** image view must not take this: Vulkan requires an identity
+/// mapping on a storage-image view, and no format reaching that role has a
+/// non-identity plan — `storage_selector` has no entry for `A8Unorm`. The
+/// caller that builds views asserts that pairing rather than trusting it.
+pub fn storage_image_components(format: StorageImageFormat) -> SwizzlePlan {
+    match format {
+        StorageImageFormat::A8Unorm => ALPHA_IN_RED,
+        _ => pixel_format::swizzle_identity(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use reims_vgpu_core::pixel_format as p;
+
+    /// Every `MTLPixelFormat` the table accepts, ascending. `EXPECTED` is the
+    /// literal list and `expected_names_every_format_the_table_translates`
+    /// holds the two equal; sweeping the domain here means a format added to
+    /// the table reaches the rail-membership tests without a second edit.
+    fn translated() -> impl Iterator<Item = u16> {
+        (0..=u16::MAX).filter(|mtl| translate(*mtl).is_ok())
+    }
 
     /// [`vk_texel_layout`] names stored bytes and so never carries a transfer
     /// function.
@@ -1604,5 +2009,273 @@ mod tests {
             "translate accepts formats EXPECTED does not name (or the reverse), so they are \
              swept by no test in this module"
         );
+    }
+
+    /// [`verbatim_texel`] is a union of two tables, and a union is only well
+    /// defined where the overlap agrees. Every `MTLPixelFormat` both the render
+    /// Store's table and the compute rail's selector answer for must name the
+    /// same `vk::Format` and the same texel width — otherwise the function would
+    /// be a precedence rule dressed as a union, and which answer a guest plane
+    /// got would depend on the order of two `if let`s rather than on the format
+    /// it declared.
+    ///
+    /// The sweep is the whole `u16` space because neither table publishes its
+    /// membership as a list, and both are cheap total functions.
+    #[test]
+    fn the_two_verbatim_texel_tables_never_disagree() {
+        let mut overlap = 0usize;
+        for mtl in 0..=u16::MAX {
+            let (Some(layout), Some(selector)) =
+                (p::store_texel_order(mtl), p::storage_selector(mtl))
+            else {
+                continue;
+            };
+            overlap += 1;
+            let storage = storage_image_from_selector(selector);
+            assert_eq!(
+                vk_texel_layout(layout),
+                storage.vk_format(),
+                "format {mtl:#x} is two different host texels"
+            );
+            assert_eq!(
+                layout.bytes_per_texel(),
+                storage.bytes_per_texel() as u32,
+                "format {mtl:#x} is two different widths"
+            );
+            // And whichever half answered, the union answers the same thing.
+            assert_eq!(
+                verbatim_texel(mtl),
+                Some((storage.vk_format(), storage.bytes_per_texel() as u32)),
+                "format {mtl:#x}"
+            );
+        }
+        // A zero here would make the assertions above vacuous, and the tables do
+        // overlap: an 8-bit-per-channel plane is a legal render target and a
+        // legal storage image both.
+        assert!(overlap > 0, "the two tables share no format at all");
+    }
+
+    /// The two formats that were the entire remaining compute readback traffic
+    /// on a driven macos-13 boot are byte-copy destinations, and they are so for
+    /// the reason the contract gives rather than because they were listed here:
+    /// the compute rail creates storage images at exactly these texels, so an
+    /// image→buffer copy of one lands the bytes the guest declared.
+    ///
+    /// Neither is in the render Store's table, and neither should be — the guest
+    /// does not render into them and does not sample them.
+    #[test]
+    fn a_thirty_two_bit_per_channel_storage_plane_is_a_byte_copy_destination() {
+        assert_eq!(
+            verbatim_texel(p::MTL_FORMAT_RGBA32_UINT),
+            Some((vk::Format::R32G32B32A32_UINT, 16))
+        );
+        assert_eq!(
+            verbatim_texel(p::MTL_FORMAT_RGBA32_FLOAT),
+            Some((vk::Format::R32G32B32A32_SFLOAT, 16))
+        );
+        // And the union did not quietly widen the render rail's own table to get
+        // there: the Store still refuses both, which is what keeps
+        // `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is`
+        // an honest statement about render targets.
+        assert!(p::store_texel_order(p::MTL_FORMAT_RGBA32_UINT).is_none());
+        assert!(p::store_texel_order(p::MTL_FORMAT_RGBA32_FLOAT).is_none());
+    }
+
+    /// The storage rail *declines* sRGB rather than downgrading it, which is
+    /// why it keeps a layout enum where the colour and sampled rails now
+    /// resolve to a `VkFormat`.
+    ///
+    /// Pins the load-bearing half of that argument: widening this vocabulary
+    /// could not make a colour space newly reachable, because no sRGB format
+    /// gets through the contract's storage selector in the first place. If one
+    /// ever does, this fails and the decision is up for review — the rail would
+    /// then be silently dropping a transfer function with no census site
+    /// watching it.
+    #[test]
+    fn no_srgb_format_reaches_the_storage_rail() {
+        let mut checked = 0;
+        for mtl in translated() {
+            if !is_srgb(mtl) {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                storage_image(mtl).unwrap_err(),
+                Refusal::NoStorageImageFormat(mtl),
+                "MTL {mtl:#x} is sRGB and reached the storage rail"
+            );
+        }
+        assert!(checked >= 2, "the table lists no sRGB formats to check");
+
+        // …and nothing the rail *does* admit carries a transfer function, so
+        // `PixelFormat::vk` and `linear_vk` coincide for every one of them.
+        for mtl in translated() {
+            if storage_image(mtl).is_ok() {
+                let f = translate(mtl).unwrap();
+                assert_eq!(f.vk, f.linear_vk, "MTL {mtl:#x}");
+            }
+        }
+    }
+
+    /// A guest texture the graphics rail will sample is one the compute rail
+    /// will sample, for every `MTLPixelFormat` value there is.
+    ///
+    /// This is the relation two separate bugs were instances of. The same guest
+    /// texture, sampleable in a draw and refused in a dispatch, costs the whole
+    /// `DispatchThreadgroups` — and finding those one format at a time does not
+    /// converge: admitting `R16_UNORM` left the chroma half of the very same
+    /// biplanar video texture refused, so the loss simply moved to the shader's
+    /// other binding. Sweeping every `u16` is what makes the next one a failure
+    /// here rather than a lost frame on a rail nobody booted.
+    ///
+    /// The exceptions are listed rather than tolerated, because each is a real
+    /// decision this rail cannot yet express:
+    ///
+    /// `A8Unorm` used to head this list — it needs its channel plan, and a
+    /// [`StorageImageFormat`] carried no component mapping, so admitting it
+    /// would have sampled the single byte as **red**. It is admitted now
+    /// because the enum carries the distinction: [`StorageImageFormat::A8Unorm`]
+    /// is its own member sharing `R8_UNORM` with
+    /// [`StorageImageFormat::R8Unorm`], and [`storage_image_components`] is the
+    /// plan the sampled view binds.
+    ///
+    /// - The two `*_SRGB` orders would have to bind their linear sibling, which
+    ///   is the [`TranslateReason::SrgbDowngraded`] loss
+    ///   [`sampled_pixels`] hands its caller. This rail's `Result` has nowhere
+    ///   to record it, and
+    ///   [`storage_image`] refuses sRGB for the same reason with its own test
+    ///   pinning that. Admitting it silently here would break the symmetry the
+    ///   crate relies on, so it waits for the rail to gain a warning channel.
+    ///
+    /// - The **BC block-compressed families** cannot cross this rail at all,
+    ///   and that is structural rather than pending a channel. A
+    ///   [`StorageImageFormat`] is what a compute *storage* binding is created
+    ///   as, and Vulkan has no block-compressed storage-image format — a shader
+    ///   cannot write a block. The compute rail routes its sampled textures
+    ///   through that same selector, so a compressed texture sampled inside a
+    ///   dispatch is refused by name. Giving it a rail of its own means a
+    ///   compute sampled path that does not go through the storage selector,
+    ///   which is a change to that rail and not to this table.
+    ///
+    ///   Measured on the workload that brought the family in: Asphalt 8 samples
+    ///   its BC3 textures from **fragment** shaders only, so this refusal cost
+    ///   nothing there. A guest that samples one in a dispatch loses that
+    ///   dispatch's texture and says so.
+    ///
+    /// The converse is deliberately not asserted: this rail carries the integer
+    /// and packed formats a compute shader reads and [`sampled_pixels`] has no
+    /// [`TexelLayout`] for, because that one answers a CPU-upload byte order and
+    /// not a sampling capability.
+    #[test]
+    fn a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one() {
+        const EXCEPTIONS: &[(u16, &str)] = &[
+            (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
+            (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
+            (
+                p::MTL_FORMAT_BC1_RGBA,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC1_RGBA_SRGB,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC2_RGBA,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC2_RGBA_SRGB,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC3_RGBA,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC3_RGBA_SRGB,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC4_R_UNORM,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC4_R_SNORM,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC5_RG_UNORM,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC5_RG_SNORM,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC6H_RGB_FLOAT,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC6H_RGB_UFLOAT,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC7_RGBA_UNORM,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC7_RGBA_UNORM_SRGB,
+                "no block-compressed storage image exists",
+            ),
+        ];
+
+        let mut refused = Vec::new();
+        for mtl in 0..=u16::MAX {
+            if sampled_pixels(mtl).is_ok() && sampled_image(mtl).is_err() {
+                refused.push(mtl);
+            }
+        }
+        let expected: Vec<u16> = EXCEPTIONS.iter().map(|&(mtl, _)| mtl).collect();
+        assert_eq!(
+            refused, expected,
+            "a format the graphics rail samples must be sampleable in a dispatch \
+             or be one of the exceptions this test names"
+        );
+
+        // Each exception is refused for the reason claimed and not because the
+        // contract does not define it — an undefined value would satisfy the
+        // sweep above for the wrong reason.
+        for &(mtl, why) in EXCEPTIONS {
+            assert!(
+                translate(mtl).is_ok(),
+                "{mtl:#x} is a defined format ({why})"
+            );
+        }
+
+        // The ten-bit biplanar video planes travel together: a shader samples
+        // luma and chroma from one frame, so one admitted without the other is
+        // the whole dispatch lost anyway.
+        assert_eq!(
+            sampled_image(p::MTL_FORMAT_R16_UNORM),
+            Ok(StorageImageFormat::R16Unorm)
+        );
+        assert_eq!(
+            sampled_image(p::MTL_FORMAT_RG16_UNORM),
+            Ok(StorageImageFormat::Rg16Unorm)
+        );
+
+        // Sampled-only means sampled-only: none of the members this rail adds
+        // over the storage one may be reached as a storage image, because Vulkan
+        // mandates none of them for `STORAGE_IMAGE`.
+        for mtl in [
+            p::MTL_FORMAT_R16_UNORM,
+            p::MTL_FORMAT_RG16_UNORM,
+            p::MTL_FORMAT_RGBA16_UNORM,
+        ] {
+            assert!(
+                storage_image(mtl).is_err(),
+                "{mtl:#x} is sampled-only and must not be admitted as a storage image"
+            );
+        }
     }
 }
