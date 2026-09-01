@@ -31,6 +31,8 @@
 //!   makes a `VkQueue` have exactly one owner.
 //! - [`barrier`] — what a declared barrier becomes on this host, and which of
 //!   the guest's stages this host has no equivalent for.
+//! - [`placement`] — where a resource's bytes live, decided in one order from
+//!   the guest's declaration and this host's measured capabilities.
 //! - [`pools`] — one command pool per worker, and the rule that a command
 //!   buffer is recordable again only when the timeline says the GPU is done
 //!   with it.
@@ -46,6 +48,7 @@
 pub mod barrier;
 pub mod layout;
 pub mod memory;
+pub mod placement;
 pub mod pools;
 pub mod queues;
 pub mod timeline;

@@ -42,6 +42,8 @@
 //!   which directive, at which granularity.
 //! - [`info_reply`] — the key/value table an info query is answered with, and
 //!   the three separate bounds on how much of it may be written.
+//! - [`storage_mode`] — which storage mode a resource declares, and the one
+//!   thing this wire's use of it does not license.
 //! - [`render`] — which render-encoder record an opcode names, the eight draw
 //!   shapes behind its fourteen draw opcodes, and the stage no wire field
 //!   carries.
@@ -111,6 +113,7 @@ pub mod render;
 pub mod residency;
 pub mod resource_state;
 pub mod segment;
+pub mod storage_mode;
 pub mod sync;
 pub mod vertex_step;
 pub mod visibility;

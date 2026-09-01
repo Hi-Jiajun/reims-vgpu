@@ -53,6 +53,12 @@ pub mod resource_state;
 pub mod retire;
 pub mod schedule;
 pub mod session;
+/// The storage mode a resource declares, re-exported from the protocol layer.
+///
+/// A semantic input to placement and coherence, so the model carries it — and
+/// the executor that consumes it sees this crate rather than the protocol one.
+pub use reims_vgpu_protocol::storage_mode;
+
 pub mod stream;
 pub mod submit;
 pub mod sync;
