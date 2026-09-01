@@ -232,6 +232,34 @@ impl IngressOrdinal {
     }
 }
 
+/// Where one accepted packet sits, in every order the device keeps.
+///
+/// # Assigned once, by the one service that observes arrival
+///
+/// The four numbers are not independent: a packet's channel decides which
+/// sequence counter advances, and both are consumed under the same arrival that
+/// produced the ingress ordinal. Anything that could state them separately
+/// could state them inconsistently — a payload claiming ingress 7 inside an
+/// envelope that arrived at 8 is representable the moment two structures each
+/// carry their own copy, and no reader could say which one the dependency graph
+/// meant.
+///
+/// So identity is one value, and the service that observes FIFO arrival is the
+/// only thing that makes one. A builder resolving a packet's contents does not
+/// know where the packet sits and must not be able to say; it produces work,
+/// and admission stamps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TransactionIdentity {
+    /// The semantic lifetime this was accepted in.
+    pub session: SessionGeneration,
+    /// The submission ordering domain.
+    pub domain: ChannelId,
+    /// Position within that domain.
+    pub domain_sequence: ChannelSequence,
+    /// Position in the device's single arrival order.
+    pub ingress: IngressOrdinal,
+}
+
 /// Which of the guest's completion-stamp words a stamp names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StampSlot(pub u32);

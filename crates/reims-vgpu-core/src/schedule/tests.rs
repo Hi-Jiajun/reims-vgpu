@@ -8,7 +8,9 @@
 use super::*;
 use crate::access::{AccessIntent, AccessKey, AccessMode, ByteRange, ResourceKey, StubRegistry};
 use crate::exec::{ExecBuilder, ResolvedOperation};
-use crate::identity::{ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration};
+use crate::identity::{
+    ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration, TransactionIdentity,
+};
 use crate::prereq::Diagnosis;
 use crate::stream::{SegmentKind, SegmentLifetime};
 use crate::sync::{EventKind, EventOp, FenceKind, FenceOp};
@@ -20,13 +22,8 @@ fn res(slot: u32) -> ResourceId {
     }
 }
 
-fn builder(domain: u32, ingress: u64) -> ExecBuilder {
-    ExecBuilder::new(
-        SessionGeneration::FIRST,
-        ChannelId(domain),
-        ChannelSequence(ingress),
-        IngressOrdinal(ingress),
-    )
+fn builder(domain: u32, ingress: u64) -> crate::testing::At {
+    crate::testing::At::new(domain, ingress)
 }
 
 /// A whole-backing access. Writes are always whole here, which is what keeps
@@ -245,10 +242,11 @@ fn from_records(count: u64) -> Vec<ExecTransaction> {
                 &bytes,
                 &crate::testing::Everything,
                 &mut model.task_access(TASK, ChannelId(1)),
-                builder(1, n),
+                crate::exec::ExecBuilder::new(),
             )
-            .expect("a stream of records the ledger has judged");
-            tx.publication.stamp = Some(CompletionStamp {
+            .expect("a stream of records the ledger has judged")
+            .stamp(crate::testing::identity(1, n));
+            tx.work.publication.stamp = Some(CompletionStamp {
                 slot: StampSlot(1),
                 value: StampValue(u32::try_from(n).expect("small")),
             });
@@ -359,7 +357,7 @@ fn a_batch_built_from_records_schedules_the_way_a_declared_one_does() {
     // The point of the workload: every transaction's accesses came from its
     // records, and there are some.
     assert!(
-        batch.iter().all(|tx| !tx.accesses.is_empty()),
+        batch.iter().all(|tx| !tx.accesses().is_empty()),
         "a record named a resource and the transaction carries no access for it"
     );
     assert!(
@@ -555,15 +553,16 @@ fn transactions_out_of_ingress_order_are_refused_before_anything_else() {
 #[test]
 fn a_second_generation_in_one_batch_is_refused() {
     let first = builder(1, 1).finish().expect("frozen");
-    let mut second = ExecBuilder::new(
-        SessionGeneration::FIRST.next(),
-        ChannelId(1),
-        ChannelSequence(2),
-        IngressOrdinal(2),
-    );
+    let mut second = ExecBuilder::new();
     second.declare_access(whole(1, 1, AccessMode::Read));
+    let second = second.finish().expect("frozen").stamp(TransactionIdentity {
+        session: SessionGeneration::FIRST.next(),
+        domain: ChannelId(1),
+        domain_sequence: ChannelSequence(2),
+        ingress: IngressOrdinal(2),
+    });
     assert_eq!(
-        eligible(&[first, second.finish().expect("frozen")]),
+        eligible(&[first, second]),
         Err(Ineligible::MixedGeneration {
             expected: SessionGeneration::FIRST,
             found: SessionGeneration::FIRST.next(),

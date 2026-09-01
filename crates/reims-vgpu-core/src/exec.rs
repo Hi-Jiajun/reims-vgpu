@@ -39,7 +39,7 @@ use crate::compute::ComputeOp;
 use crate::icb::IcbOp;
 use crate::identity::{
     ChannelId, ChannelSequence, CompletionStamp, IngressOrdinal, ResourceId, SessionGeneration,
-    StampWait,
+    StampWait, TransactionIdentity,
 };
 use crate::operation::OperationClass;
 use crate::pass::PassDescriptor;
@@ -227,16 +227,18 @@ pub struct ExecArenas {
     pub scissors: Vec<ScissorRect>,
 }
 
-/// One accepted EXEC packet, resolved and frozen.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExecTransaction {
-    pub session: SessionGeneration,
-    /// The submission ordering domain. The same value as the device
-    /// transaction's channel, carried rather than looked up so a conflict test
-    /// never has to reach for the envelope.
-    pub domain: ChannelId,
-    pub domain_sequence: ChannelSequence,
-    pub ingress: IngressOrdinal,
+/// One EXEC packet's resolved contents, frozen, and not yet anywhere in
+/// particular.
+///
+/// **Deliberately carries no identity.** Resolving a packet's records is a
+/// function of the packet's bytes and the namespaces they name; it does not
+/// observe arrival, so it cannot know the packet's channel sequence or ingress
+/// ordinal, and being unable to *say* is what keeps a resolver from stating one
+/// that disagrees with the envelope's. [`Self::stamp`] pairs this with the
+/// [`TransactionIdentity`] that admission assigned, and is the only way to get
+/// an [`ExecTransaction`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExecWork {
     pub streams: Vec<ResolvedStream>,
     /// Everything this transaction touches, at the precision the records
     /// supplied.
@@ -247,7 +249,7 @@ pub struct ExecTransaction {
     pub arenas: ExecArenas,
 }
 
-impl ExecTransaction {
+impl ExecWork {
     /// Every record, in execution order.
     pub fn records(&self) -> impl Iterator<Item = &StreamRecord> {
         self.streams.iter().flat_map(|s| s.records.iter())
@@ -275,6 +277,15 @@ impl ExecTransaction {
         })
     }
 
+    /// Pair this work with where the packet carrying it arrived.
+    #[must_use]
+    pub fn stamp(self, identity: TransactionIdentity) -> ExecTransaction {
+        ExecTransaction {
+            identity,
+            work: self,
+        }
+    }
+
     /// How many records this packet carries.
     #[must_use]
     pub fn record_count(&self) -> usize {
@@ -292,6 +303,76 @@ impl ExecTransaction {
     }
 }
 
+/// One accepted EXEC packet: resolved contents, and where the packet sits.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecTransaction {
+    /// Assigned by admission, which is the only service that observes arrival.
+    /// The envelope's channel and channel sequence *are* these; the plan's
+    /// `submission_domain = DeviceTransaction.channel` is one value, not two
+    /// that agree.
+    pub identity: TransactionIdentity,
+    pub work: ExecWork,
+}
+
+impl ExecTransaction {
+    /// The semantic lifetime this was accepted in.
+    #[must_use]
+    pub const fn session(&self) -> SessionGeneration {
+        self.identity.session
+    }
+
+    /// The submission ordering domain.
+    #[must_use]
+    pub const fn domain(&self) -> ChannelId {
+        self.identity.domain
+    }
+
+    /// Position within that domain.
+    #[must_use]
+    pub const fn domain_sequence(&self) -> ChannelSequence {
+        self.identity.domain_sequence
+    }
+
+    /// Position in the device's single arrival order.
+    #[must_use]
+    pub const fn ingress(&self) -> IngressOrdinal {
+        self.identity.ingress
+    }
+
+    /// Everything this transaction touches.
+    #[must_use]
+    pub fn accesses(&self) -> &[AccessIntent] {
+        &self.work.accesses
+    }
+
+    /// Waits that are not hazard edges.
+    #[must_use]
+    pub fn prerequisites(&self) -> &[Prerequisite] {
+        &self.work.prerequisites
+    }
+    /// Every record, in execution order.
+    pub fn records(&self) -> impl Iterator<Item = &StreamRecord> {
+        self.work.records()
+    }
+
+    /// The content versions this transaction makes current.
+    pub fn published_versions(&self) -> impl Iterator<Item = VersionPublication> + '_ {
+        self.work.published_versions()
+    }
+
+    /// How many records this packet carries.
+    #[must_use]
+    pub fn record_count(&self) -> usize {
+        self.work.record_count()
+    }
+
+    /// Whether this transaction writes anything at all.
+    #[must_use]
+    pub fn writes_anything(&self) -> bool {
+        self.work.writes_anything()
+    }
+}
+
 /// Builds one [`ExecTransaction`], and refuses the shapes that cannot execute.
 ///
 /// It owns a [`StreamCursor`], so the segment/encoder rules are enforced here
@@ -301,10 +382,6 @@ impl ExecTransaction {
 #[derive(Debug)]
 pub struct ExecBuilder {
     cursor: StreamCursor,
-    session: SessionGeneration,
-    domain: ChannelId,
-    domain_sequence: ChannelSequence,
-    ingress: IngressOrdinal,
     streams: Vec<ResolvedStream>,
     open: Option<ResolvedStream>,
     accesses: Vec<AccessIntent>,
@@ -317,20 +394,20 @@ pub struct ExecBuilder {
     participation_scratch: Vec<Participation>,
 }
 
+impl Default for ExecBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExecBuilder {
+    /// A builder for a packet whose contents are not yet known and whose
+    /// position in the arrival order is not this layer's to know. See
+    /// [`ExecWork`].
     #[must_use]
-    pub fn new(
-        session: SessionGeneration,
-        domain: ChannelId,
-        domain_sequence: ChannelSequence,
-        ingress: IngressOrdinal,
-    ) -> Self {
+    pub fn new() -> Self {
         Self {
             cursor: StreamCursor::new(),
-            session,
-            domain,
-            domain_sequence,
-            ingress,
             streams: Vec::new(),
             open: None,
             accesses: Vec::new(),
@@ -528,18 +605,14 @@ impl ExecBuilder {
     ///
     /// Consumes the builder, so the value that comes out cannot be the one that
     /// was still being written to.
-    pub fn finish(mut self) -> Result<ExecTransaction, StreamRefusal> {
+    pub fn finish(mut self) -> Result<ExecWork, StreamRefusal> {
         // `finish` on the cursor is what refuses an encoder that never ended,
         // and an envelope that armed nothing.
         self.cursor.finish()?;
         debug_assert!(self.open.is_none(), "the cursor would have refused");
         self.streams.shrink_to_fit();
         self.accesses.shrink_to_fit();
-        Ok(ExecTransaction {
-            session: self.session,
-            domain: self.domain,
-            domain_sequence: self.domain_sequence,
-            ingress: self.ingress,
+        Ok(ExecWork {
             streams: core::mem::take(&mut self.streams),
             accesses: core::mem::take(&mut self.accesses),
             pipeline_leases: core::mem::take(&mut self.pipeline_leases),
@@ -641,12 +714,7 @@ mod tests {
     }
 
     fn builder() -> ExecBuilder {
-        ExecBuilder::new(
-            SessionGeneration::FIRST,
-            ChannelId(1),
-            ChannelSequence(7),
-            IngressOrdinal(42),
-        )
+        ExecBuilder::new()
     }
 
     fn a_blit() -> ResolvedOperation {
@@ -692,8 +760,30 @@ mod tests {
         let positions: Vec<_> = tx.records().map(|r| r.at).collect();
         assert_eq!(positions, vec![first, second, third]);
         assert!(positions.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(tx.ingress, IngressOrdinal(42));
-        assert_eq!(tx.domain, ChannelId(1));
+    }
+
+    /// The builder cannot say where its packet arrived, so the only way a
+    /// transaction gets an identity is by being stamped with one — and the
+    /// stamped value is exactly the one it was handed.
+    #[test]
+    fn work_carries_no_identity_until_it_is_stamped_with_one() {
+        let identity = TransactionIdentity {
+            session: SessionGeneration::FIRST,
+            domain: ChannelId(1),
+            domain_sequence: ChannelSequence(7),
+            ingress: IngressOrdinal(42),
+        };
+        let work = builder().finish().expect("frozen");
+        let tx = work.clone().stamp(identity);
+        assert_eq!(tx.identity, identity);
+        assert_eq!(tx.ingress(), IngressOrdinal(42));
+        assert_eq!(tx.domain(), ChannelId(1));
+        assert_eq!(tx.domain_sequence(), ChannelSequence(7));
+        assert_eq!(tx.session(), SessionGeneration::FIRST);
+        assert_eq!(
+            tx.work, work,
+            "stamping adds a position and changes nothing about the work"
+        );
     }
 
     /// The builder does not restate the stream rules; it is the cursor that

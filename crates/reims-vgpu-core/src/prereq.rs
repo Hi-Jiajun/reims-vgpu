@@ -192,7 +192,7 @@ impl WaitGraph {
     /// cross-packet consumer can observe.
     pub fn admit(&mut self, tx: &ExecTransaction) {
         let mut waits = Vec::new();
-        for prerequisite in &tx.prerequisites {
+        for prerequisite in tx.prerequisites() {
             match *prerequisite {
                 Prerequisite::Stamp(w) => waits.push(WaitPoint::Stamp {
                     slot: w.slot,
@@ -206,7 +206,7 @@ impl WaitGraph {
             }
         }
         let mut produces = Vec::new();
-        if let Some(stamp) = tx.publication.stamp {
+        if let Some(stamp) = tx.work.publication.stamp {
             produces.push(Production::Stamp {
                 slot: stamp.slot,
                 value: stamp.value,
@@ -223,7 +223,7 @@ impl WaitGraph {
             }
         }
         self.nodes.push(Node {
-            ordinal: tx.ingress,
+            ordinal: tx.ingress(),
             waits,
             produces,
         });
@@ -390,11 +390,7 @@ enum Colour {
 mod tests {
     use super::*;
     use crate::access::StubRegistry;
-    use crate::exec::ExecBuilder;
-    use crate::identity::{
-        ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SessionGeneration,
-        SlotGeneration, StampWait,
-    };
+    use crate::identity::{ChannelId, CompletionStamp, ObjectListRef, SlotGeneration, StampWait};
     use crate::stream::{SegmentKind, SegmentLifetime};
     use crate::sync::EventOp;
 
@@ -405,13 +401,8 @@ mod tests {
         }
     }
 
-    fn builder(ingress: u64) -> ExecBuilder {
-        ExecBuilder::new(
-            SessionGeneration::FIRST,
-            ChannelId(1),
-            ChannelSequence(ingress),
-            IngressOrdinal(ingress),
-        )
+    fn builder(ingress: u64) -> crate::testing::At {
+        crate::testing::At::new(1, ingress)
     }
 
     /// A packet that waits for `waits` (event, value) and signals `signals`.

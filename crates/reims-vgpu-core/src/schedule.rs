@@ -152,30 +152,32 @@ impl Ineligible {
 /// reported as that rather than as whatever the misordering made of its waits.
 pub fn eligible(batch: &[ExecTransaction]) -> Result<(), Ineligible> {
     for pair in batch.windows(2) {
-        if pair[1].ingress <= pair[0].ingress {
+        if pair[1].ingress() <= pair[0].ingress() {
             return Err(Ineligible::OutOfIngressOrder {
-                at: pair[1].ingress,
-                after: pair[0].ingress,
+                at: pair[1].ingress(),
+                after: pair[0].ingress(),
             });
         }
     }
     if let Some(first) = batch.first() {
         for tx in batch {
-            if tx.session != first.session {
+            if tx.session() != first.session() {
                 return Err(Ineligible::MixedGeneration {
-                    expected: first.session,
-                    found: tx.session,
+                    expected: first.session(),
+                    found: tx.session(),
                 });
             }
         }
     }
     for tx in batch {
         if let Some(Prerequisite::Fence { .. }) = tx
-            .prerequisites
+            .prerequisites()
             .iter()
             .find(|p| matches!(p, Prerequisite::Fence { .. }))
         {
-            return Err(Ineligible::FencePrerequisite { waiter: tx.ingress });
+            return Err(Ineligible::FencePrerequisite {
+                waiter: tx.ingress(),
+            });
         }
     }
 
@@ -235,8 +237,8 @@ fn version_races(batch: &[ExecTransaction]) -> Result<(), Ineligible> {
     let mut publishers: Vec<(IngressOrdinal, VersionPublication)> = Vec::new();
     let mut ordered: HashMap<IngressOrdinal, Vec<IngressOrdinal>> = HashMap::new();
     for tx in batch {
-        ordered.insert(tx.ingress, graph.admit(tx.ingress, &tx.accesses));
-        publishers.extend(tx.published_versions().map(|p| (tx.ingress, p)));
+        ordered.insert(tx.ingress(), graph.admit(tx.ingress(), tx.accesses()));
+        publishers.extend(tx.published_versions().map(|p| (tx.ingress(), p)));
     }
     // Reachability over hazard edges, which point backwards, so one pass in
     // ingress order settles it.
@@ -244,13 +246,13 @@ fn version_races(batch: &[ExecTransaction]) -> Result<(), Ineligible> {
         HashMap::new();
     for tx in batch {
         let mut set = std::collections::BTreeSet::new();
-        for earlier in &ordered[&tx.ingress] {
+        for earlier in &ordered[&tx.ingress()] {
             set.insert(*earlier);
             if let Some(theirs) = reaches.get(earlier) {
                 set.extend(theirs.iter().copied());
             }
         }
-        reaches.insert(tx.ingress, set);
+        reaches.insert(tx.ingress(), set);
     }
     for (at, (second, later)) in publishers.iter().enumerate() {
         for (first, earlier) in &publishers[..at] {
@@ -328,7 +330,7 @@ impl Run {
 fn positions(batch: &[ExecTransaction]) -> HashMap<(ChannelId, ChannelSequence), IngressOrdinal> {
     batch
         .iter()
-        .map(|tx| ((tx.domain, tx.domain_sequence), tx.ingress))
+        .map(|tx| ((tx.domain(), tx.domain_sequence()), tx.ingress()))
         .collect()
 }
 
@@ -371,18 +373,18 @@ pub fn serial(batch: &[ExecTransaction]) -> Run {
     let mut publisher = Publisher::new();
     let mut run = Run::default();
     for tx in batch {
-        publisher.admit(tx.domain, tx.domain_sequence);
+        publisher.admit(tx.domain(), tx.domain_sequence());
         let start = interpreter.trace().len();
         let owed = interpreter.complete(tx);
         run.spans
-            .push((tx.ingress, start..interpreter.trace().len()));
+            .push((tx.ingress(), start..interpreter.trace().len()));
         let released = match owed {
-            Ok(stamp) => publisher.complete(tx.domain, tx.domain_sequence, stamp),
+            Ok(stamp) => publisher.complete(tx.domain(), tx.domain_sequence(), stamp),
             // A refused position never publishes, and must not hold the ones
             // behind it.
-            Err(_) => publisher.withdraw(tx.domain, tx.domain_sequence),
+            Err(_) => publisher.withdraw(tx.domain(), tx.domain_sequence()),
         };
-        pay(released, tx.domain, &mut interpreter, None, &at, &mut run);
+        pay(released, tx.domain(), &mut interpreter, None, &at, &mut run);
         note_blocked(&publisher, &mut run);
     }
     run.trace = interpreter.trace().to_vec();
@@ -428,7 +430,7 @@ pub fn parallel_with(
     mut pick: impl FnMut(&[IngressOrdinal]) -> usize,
 ) -> Run {
     let by_ordinal: HashMap<IngressOrdinal, &ExecTransaction> =
-        batch.iter().map(|tx| (tx.ingress, tx)).collect();
+        batch.iter().map(|tx| (tx.ingress(), tx)).collect();
     let at = positions(batch);
 
     // Explicit event waits become ordinal prerequisites. Eligibility has
@@ -450,13 +452,13 @@ pub fn parallel_with(
     let mut publisher = Publisher::new();
     let mut pool: Vec<IngressOrdinal> = Vec::new();
     for tx in batch {
-        publisher.admit(tx.domain, tx.domain_sequence);
-        let mut prerequisites = graph.admit(tx.ingress, &tx.accesses);
-        prerequisites.extend(explicit.remove(&tx.ingress).unwrap_or_default());
+        publisher.admit(tx.domain(), tx.domain_sequence());
+        let mut prerequisites = graph.admit(tx.ingress(), tx.accesses());
+        prerequisites.extend(explicit.remove(&tx.ingress()).unwrap_or_default());
         prerequisites.sort_unstable();
         prerequisites.dedup();
         let stamp_waits: Vec<StampWait> = tx
-            .prerequisites
+            .prerequisites()
             .iter()
             .filter_map(|p| match p {
                 Prerequisite::Stamp(w) => Some(*w),
@@ -464,7 +466,7 @@ pub fn parallel_with(
             })
             .collect();
         scheduler.admit(
-            tx.ingress,
+            tx.ingress(),
             &prerequisites,
             &stamp_waits,
             // A batch is compared for schedule equivalence, and a pipeline that
@@ -472,7 +474,7 @@ pub fn parallel_with(
             // of the comparison would hold on the same transaction. Pipeline
             // readiness is tested where it lives, in `crate::ready`.
             &[],
-            tx.publication.stamp,
+            tx.work.publication.stamp,
         );
     }
 
@@ -500,10 +502,10 @@ pub fn parallel_with(
         // released then and not before.
         let scheduled = scheduler.complete(ordinal);
         graph.retire(ordinal);
-        let released = publisher.complete(tx.domain, tx.domain_sequence, scheduled);
+        let released = publisher.complete(tx.domain(), tx.domain_sequence(), scheduled);
         pay(
             released,
-            tx.domain,
+            tx.domain(),
             &mut interpreter,
             Some(&mut scheduler),
             &at,

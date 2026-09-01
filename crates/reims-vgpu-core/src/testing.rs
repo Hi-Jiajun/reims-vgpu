@@ -21,6 +21,60 @@
 use reims_vgpu_protocol::segment::{SegmentKind, SegmentLifetime};
 use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
 
+/// A builder paired with the identity a session would have stamped on it.
+///
+/// [`crate::exec::ExecBuilder`] cannot state where a packet arrived — that is
+/// the whole point of the split — so a test that wants a finished
+/// [`ExecTransaction`] has to choose an identity somewhere. Choosing it here,
+/// once, keeps every suite from re-deriving the pairing, and keeps the choice
+/// visible as a test's choice rather than something a builder did.
+pub(crate) struct At {
+    builder: crate::exec::ExecBuilder,
+    identity: crate::identity::TransactionIdentity,
+}
+
+impl At {
+    pub(crate) fn new(domain: u32, ingress: u64) -> Self {
+        Self {
+            builder: crate::exec::ExecBuilder::new(),
+            identity: identity(domain, ingress),
+        }
+    }
+
+    pub(crate) fn finish(
+        self,
+    ) -> Result<crate::exec::ExecTransaction, crate::stream::StreamRefusal> {
+        let identity = self.identity;
+        Ok(self.builder.finish()?.stamp(identity))
+    }
+}
+
+impl core::ops::Deref for At {
+    type Target = crate::exec::ExecBuilder;
+    fn deref(&self) -> &Self::Target {
+        &self.builder
+    }
+}
+
+impl core::ops::DerefMut for At {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.builder
+    }
+}
+
+/// The identity a first-generation session would stamp for `domain`/`ingress`.
+///
+/// Channel sequence tracks the ingress ordinal, which is what a single-channel
+/// arrival order produces; a suite that needs the two to differ states its own.
+pub(crate) fn identity(domain: u32, ingress: u64) -> crate::identity::TransactionIdentity {
+    crate::identity::TransactionIdentity {
+        session: crate::identity::SessionGeneration::FIRST,
+        domain: crate::identity::ChannelId(domain),
+        domain_sequence: crate::identity::ChannelSequence(ingress),
+        ingress: crate::identity::IngressOrdinal(ingress),
+    }
+}
+
 /// A resolver that answers every ref.
 ///
 /// Resolution is not what the suites using this are about: an unresolvable ref

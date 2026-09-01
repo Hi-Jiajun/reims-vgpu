@@ -242,12 +242,12 @@ impl Interpreter {
     /// The refusal, which is also appended to the trace: a guest that is
     /// refused observes the refusal.
     pub fn complete(&mut self, tx: &ExecTransaction) -> Result<Option<CompletionStamp>, Refusal> {
-        if tx.session != self.generation {
-            self.refuse(tx.ingress, Refusal::StaleGeneration);
+        if tx.session() != self.generation {
+            self.refuse(tx.ingress(), Refusal::StaleGeneration);
             return Err(Refusal::StaleGeneration);
         }
         if let Some(refusal) = self.unmet_prerequisite(tx) {
-            self.refuse(tx.ingress, refusal);
+            self.refuse(tx.ingress(), refusal);
             return Err(refusal);
         }
 
@@ -300,7 +300,7 @@ impl Interpreter {
             });
         }
         self.ran += 1;
-        Ok(tx.publication.stamp)
+        Ok(tx.work.publication.stamp)
     }
 
     /// Make a completion word readable, as ordered guest publication releases
@@ -332,7 +332,7 @@ impl Interpreter {
 
     /// The first prerequisite this transaction cannot meet, if any.
     fn unmet_prerequisite(&self, tx: &ExecTransaction) -> Option<Refusal> {
-        for prerequisite in &tx.prerequisites {
+        for prerequisite in tx.prerequisites() {
             let met = match *prerequisite {
                 Prerequisite::Stamp(wait) => self
                     .stamps
@@ -428,10 +428,7 @@ mod tests {
     use crate::access::{
         AccessIntent, AccessMode, BackingId, ByteRange, ResourceKey, StubRegistry,
     };
-    use crate::exec::ExecBuilder;
-    use crate::identity::{
-        ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration, StampWait,
-    };
+    use crate::identity::{ChannelId, CompletionStamp, ObjectListRef, SlotGeneration, StampWait};
     use crate::stream::{SegmentKind, SegmentLifetime};
     use crate::sync::EventOp;
 
@@ -442,13 +439,8 @@ mod tests {
         }
     }
 
-    fn builder(ingress: u64) -> ExecBuilder {
-        ExecBuilder::new(
-            SessionGeneration::FIRST,
-            ChannelId(1),
-            ChannelSequence(ingress),
-            IngressOrdinal(ingress),
-        )
+    fn builder(ingress: u64) -> crate::testing::At {
+        crate::testing::At::new(1, ingress)
     }
 
     fn signal(event: ResourceId, value: u64) -> ResolvedOperation {

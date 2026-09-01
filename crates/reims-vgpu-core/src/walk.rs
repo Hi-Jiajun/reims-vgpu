@@ -3,7 +3,7 @@
 //! # The link that was missing
 //!
 //! [`crate::exec::ExecBuilder`] takes `begin_segment`, `record`, `end_segment`
-//! and `finish`, in wire order, and produces the only [`ExecTransaction`] this
+//! and `finish`, in wire order, and produces the only [`ExecWork`] this
 //! crate can make. Every one of those calls had to come from somewhere, and
 //! until this module the only somewhere was a test calling them by hand. So the
 //! model could resolve a record and could place a record, and had no way to be
@@ -59,7 +59,7 @@
 //! same either way. That is the point of the split: a walker that knew when an
 //! encoder survives would be a second copy of the encoder state machine.
 
-use crate::exec::{ExecBuilder, ExecTransaction};
+use crate::exec::{ExecBuilder, ExecWork};
 use crate::resolve::{self, RefResolver, ResolveRefusal};
 use crate::stream::{ProtectionOptions, StreamRefusal};
 use reims_vgpu_protocol::decode::OpStream;
@@ -162,7 +162,7 @@ pub fn exec(
     resolver: &impl RefResolver,
     source: &mut impl crate::access::AccessSource,
     mut builder: ExecBuilder,
-) -> Result<ExecTransaction, WalkRefusal> {
+) -> Result<ExecWork, WalkRefusal> {
     for framed in SegmentStream::new(bytes)? {
         let framed = framed?;
         segment(&framed, resolver, source, &mut builder)?;
@@ -230,7 +230,7 @@ mod tests {
     use super::*;
     use crate::access::StubRegistry;
     use crate::exec::ExecArenas;
-    use crate::identity::{ChannelId, ChannelSequence, IngressOrdinal, SessionGeneration};
+    use crate::identity::ChannelId;
     use crate::testing::{generate_mipmaps, record, segment_bytes, segment_bytes_with, Everything};
     use reims_vgpu_protocol::segment::{
         SegmentKind, SegmentLifetime, SEGMENT_TYPE_PROTECTION_OPTIONS,
@@ -259,12 +259,7 @@ mod tests {
     };
 
     fn builder() -> ExecBuilder {
-        ExecBuilder::new(
-            SessionGeneration::FIRST,
-            DOMAIN,
-            ChannelSequence(1),
-            IngressOrdinal(1),
-        )
+        ExecBuilder::new()
     }
 
     fn line_width(width: f32) -> Vec<u8> {

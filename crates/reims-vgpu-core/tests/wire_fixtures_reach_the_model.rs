@@ -394,7 +394,6 @@ fn signature(verdict: Verdict) -> String {
 #[test]
 fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written() {
     use reims_vgpu_core::exec::ExecBuilder;
-    use reims_vgpu_core::identity::{ChannelSequence, IngressOrdinal, SessionGeneration};
     use reims_vgpu_protocol::segment::{SegmentKind, SegmentLifetime};
 
     let mut placed = 0usize;
@@ -415,12 +414,7 @@ fn every_record_apple_produced_is_one_the_model_can_place_where_it_was_written()
         // for the root, which `is_stream_rail` already excluded.
         let kind = SegmentKind::of_rail(rail).expect("a stream rail names a segment");
 
-        let mut builder = ExecBuilder::new(
-            SessionGeneration::FIRST,
-            DOMAIN,
-            ChannelSequence(placed as u64),
-            IngressOrdinal(placed as u64),
-        );
+        let mut builder = ExecBuilder::new();
         // The builder's own arenas, because a pass descriptor filed during
         // resolution is the one `ResolvedOperation::participations` reads back.
         let resolver = Recording::new();
@@ -658,7 +652,6 @@ fn a_record_never_participates_in_a_resource_it_did_not_name() {
 #[test]
 fn apples_own_segment_header_frames_apples_own_records() {
     use reims_vgpu_core::exec::ExecBuilder;
-    use reims_vgpu_core::identity::{ChannelSequence, IngressOrdinal, SessionGeneration};
     use reims_vgpu_core::walk;
     use reims_vgpu_protocol::segment::SegmentKind;
     use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
@@ -717,12 +710,7 @@ fn apples_own_segment_header_frames_apples_own_records() {
             &bytes,
             &resolver,
             &mut model.task_access(TASK, DOMAIN),
-            ExecBuilder::new(
-                SessionGeneration::FIRST,
-                DOMAIN,
-                ChannelSequence(walked as u64),
-                IngressOrdinal(walked as u64),
-            ),
+            ExecBuilder::new(),
         );
         if continues {
             assert_eq!(
