@@ -326,6 +326,18 @@ esac
 count_cell "support crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
   "-p reims-vgpu-contract -p reims-vgpu-config -p reims-vgpu-memory -p reims-vgpu-observe \
    -p reims-vgpu-paging -p reims-vgpu-wire"
+
+# The replacement crates. `reims-vgpu-core` is deliberately not a dependency of
+# `reims-vgpu` yet — the replacement stays reachable only from model tests until
+# production ingress switches — which means no arm above links it and nothing
+# here would compile it. A gate that skips the code under construction is a gate
+# that reports green on a tree that does not build, so it gets its own cell:
+# checked with --all-targets so its tests compile, and counted so a cfg or a
+# module move cannot empty it quietly.
+run_cell "replacement crates / $HOST_TRIPLE" "" "" "$WORKSPACE_DIR" \
+  "-p reims-vgpu-protocol -p reims-vgpu-core"
+count_cell "replacement crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
+  "-p reims-vgpu-protocol -p reims-vgpu-core"
 if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then
   run_cell "vulkan,host-window / $CROSS_TARGET" "$CROSS_TARGET" "$FEATURES_VULKAN"
   if [ "$COUNT_TESTS" -eq 1 ]; then
