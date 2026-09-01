@@ -47,6 +47,8 @@
 //! - [`pools`] — one command pool per worker, and the rule that a command
 //!   buffer is recordable again only when the timeline says the GPU is done
 //!   with it.
+//! - [`variant`] — the native pipelines one semantic pipeline turns into, who
+//!   is allowed to compile each, and why none of them is ever evicted.
 //! - [`timeline`] — which value a submission signals, and the bookkeeping that
 //!   keeps "reserved" and "reached" from being confused for each other.
 
@@ -68,3 +70,4 @@ pub mod placement;
 pub mod pools;
 pub mod queues;
 pub mod timeline;
+pub mod variant;
