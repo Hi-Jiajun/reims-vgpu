@@ -163,6 +163,27 @@ pub struct Packet {
     pub payload: Payload,
 }
 
+/// What a device loss ended.
+///
+/// The epoch and the work are one value because they are one event: an epoch
+/// that died without its stranded transactions being taken out is a set of
+/// channels that never publish again, and a list of stranded transactions
+/// without the epoch is a retirement queue that does not know what to abandon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "the guest is owed a typed reason for every packet the loss stranded"]
+pub struct DeviceLoss {
+    /// The incarnation that ended.
+    pub epoch: DeviceEpoch,
+    /// Transactions admitted into it that can never complete, in ingress order.
+    /// Already withdrawn from every plane; what is left is to name each one.
+    pub stranded: Vec<IngressOrdinal>,
+    /// Completion words the withdrawals released — work that had *already*
+    /// completed and was waiting behind a stranded position for its channel's
+    /// head. Those are not lost: the host delivered them before the device
+    /// died and the guest is owed them.
+    pub released: Vec<Release>,
+}
+
 /// What admitting a packet produced.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Admitted {
@@ -287,11 +308,34 @@ impl SessionModel {
     /// submitted in between is admitted into an incarnation that does not
     /// exist. Until [`SessionModel::recreate_device`] runs, admission refuses.
     ///
-    /// Returns the epoch that died, which is the identity the retirement queue
-    /// has to be told about.
-    pub fn device_lost(&mut self) -> DeviceEpoch {
+    /// Returns the epoch that died — the identity the retirement queue has to
+    /// be told about — and the work that died with it.
+    ///
+    /// **Every transaction admitted into that epoch is stranded.** Nothing will
+    /// complete them, because the thing that would is what was lost, and each
+    /// one holds a position in the publication order, the dependency graph and
+    /// the readiness service. Left there, the channel never publishes again and
+    /// every later transaction sharing a backing with one of them waits forever
+    /// — so they are withdrawn here rather than named and left for a caller to
+    /// remember, which is also the only thing that *can* withdraw them: the
+    /// positions are this model's and a caller cannot enumerate them.
+    ///
+    /// They still come back. The guest is owed a typed terminal fact for each
+    /// packet it will never see completed, and this model has no failure
+    /// channel to put one on.
+    pub fn device_lost(&mut self) -> DeviceLoss {
         self.device = DeviceState::Lost;
-        self.epoch
+        // Ingress order, so a report reads in the order the guest sent them.
+        let stranded: Vec<IngressOrdinal> = self.position.keys().copied().collect();
+        let mut released = Vec::new();
+        for ingress in &stranded {
+            released.extend(self.withdraw(*ingress));
+        }
+        DeviceLoss {
+            epoch: self.epoch,
+            stranded,
+            released,
+        }
     }
 
     /// Open the next host device incarnation after a loss.
@@ -1572,7 +1616,11 @@ mod tests {
 
         let after_reset = s.lifetime();
         let died = s.device_lost();
-        assert_eq!(died, after_reset.epoch, "the epoch that died is named");
+        assert_eq!(
+            died.epoch, after_reset.epoch,
+            "the epoch that died is named"
+        );
+        assert!(died.stranded.is_empty(), "nothing was admitted");
         assert_eq!(
             s.generation(),
             after_reset.session,
@@ -1581,8 +1629,104 @@ mod tests {
         assert_eq!(s.device_state(), DeviceState::Lost);
 
         let replacement = s.recreate_device().expect("lost, so replaceable");
-        assert_ne!(replacement, died);
+        assert_ne!(replacement, died.epoch);
         assert_eq!(s.generation(), after_reset.session);
+    }
+
+    /// A device loss takes every transaction admitted into it out of all three
+    /// planes, and names them.
+    ///
+    /// Nothing will complete them: the thing that would is what was lost. Left
+    /// in place, each one holds its channel's publication head forever and its
+    /// accesses keep ordering work admitted after the replacement device
+    /// arrives. They are withdrawn here rather than named and left for a caller
+    /// to remember, which is also the only place they *can* be withdrawn — the
+    /// positions are this model's and a caller cannot enumerate them.
+    #[test]
+    fn a_device_loss_strands_the_work_admitted_into_it_and_names_it() {
+        let mut s = session();
+        let mut first = touching(packet(0x37), vec![whole(1, AccessMode::Write)]);
+        first.completion = Some(CompletionStamp {
+            slot: StampSlot(0),
+            value: StampValue(1),
+        });
+        let mut second = touching(packet(0x37), vec![whole(1, AccessMode::Write)]);
+        second.completion = Some(CompletionStamp {
+            slot: StampSlot(0),
+            value: StampValue(2),
+        });
+        let a = s.admit(&first).expect("accepted");
+        let b = s.admit(&second).expect("accepted");
+        assert_eq!(s.scheduler().pending(), 2);
+
+        let loss = s.device_lost();
+        assert_eq!(loss.epoch, s.epoch());
+        assert_eq!(
+            loss.stranded,
+            vec![
+                a.transaction.identity.ingress,
+                b.transaction.identity.ingress
+            ],
+            "in ingress order, so a report reads in the order the guest sent them"
+        );
+        assert!(
+            loss.released.is_empty(),
+            "neither had completed, so no word was owed behind them"
+        );
+        assert_eq!(s.scheduler().pending(), 0);
+        assert_eq!(
+            s.scheduler().published_value(StampSlot(0)),
+            None,
+            "work that never ran publishes no word the guest could act on"
+        );
+
+        // And the replacement device starts clean: a writer of the same backing
+        // waits on nothing.
+        s.recreate_device().expect("lost");
+        let next = s.admit(&first).expect("accepted");
+        assert!(
+            next.hazard_waits.is_empty(),
+            "the dead epoch's accesses no longer order anything"
+        );
+        assert!(next.ready);
+    }
+
+    /// A completion the host delivered before the device died is still owed to
+    /// the guest, and a loss releases it.
+    ///
+    /// It was queued behind a position that is now stranded. Dropping it with
+    /// the stranded work would lose a completion that really happened.
+    #[test]
+    fn a_loss_releases_a_word_that_was_waiting_behind_the_work_it_stranded() {
+        let mut s = session();
+        let mut head = packet(0x37);
+        head.completion = Some(CompletionStamp {
+            slot: StampSlot(0),
+            value: StampValue(1),
+        });
+        let mut behind = packet(0x37);
+        behind.completion = Some(CompletionStamp {
+            slot: StampSlot(0),
+            value: StampValue(2),
+        });
+        let h = s.admit(&head).expect("accepted");
+        let b = s.admit(&behind).expect("accepted");
+        // The second finished; the first is still running when the device dies.
+        assert!(s.complete(b.transaction.identity.ingress).is_empty());
+
+        let loss = s.device_lost();
+        assert_eq!(loss.stranded, vec![h.transaction.identity.ingress]);
+        assert_eq!(
+            loss.released
+                .into_iter()
+                .map(|r| r.stamp)
+                .collect::<Vec<_>>(),
+            vec![behind.completion]
+        );
+        assert_eq!(
+            s.scheduler().published_value(StampSlot(0)),
+            Some(StampValue(2))
+        );
     }
 
     /// Work submitted between a loss and its replacement has nothing to run on
@@ -1590,7 +1734,7 @@ mod tests {
     #[test]
     fn a_lost_device_refuses_admission_until_it_is_replaced() {
         let mut s = session();
-        let epoch = s.device_lost();
+        let epoch = s.device_lost().epoch;
         assert_eq!(
             s.admit(&packet(0x37)),
             Err(Refusal::DeviceLost { epoch }),
@@ -1628,7 +1772,10 @@ mod tests {
             "and the submission the host is still executing must finish"
         );
 
-        s.device_lost();
+        assert!(
+            s.device_lost().stranded.is_empty(),
+            "this test admitted nothing"
+        );
         s.recreate_device().expect("lost");
         assert_eq!(lease.against(s.generation(), s.epoch()), Validity::Gone);
     }
@@ -1645,7 +1792,10 @@ mod tests {
         let admitted = b.admit(&packet(0x37)).expect("accepted");
 
         a.reset();
-        a.device_lost();
+        assert!(
+            a.device_lost().stranded.is_empty(),
+            "the other session's work is not this one's to strand"
+        );
         a.recreate_device().expect("lost");
 
         assert_eq!(b.lifetime(), untouched);
