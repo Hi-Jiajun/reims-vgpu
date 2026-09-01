@@ -8592,47 +8592,35 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
             pipeline_object: resolved.pipeline_object.clone(),
-            // Honor the guest's face-culling state, its winding, and its
-            // primitive type. All three come from `translate::raster`, and all
-            // three fall back to a Metal default when the guest bound nothing —
-            // but an out-of-contract *value* is a different thing from an unbound
-            // one, and it says its own name before falling back. Silently
-            // coercing here is how a guest that asked for lines got triangles
-            // with nothing in the log to say so.
-            cull_mode: raster_or_default(
-                req.cull_mode,
-                translate::raster::cull_mode,
-                crate::backend::vulkan::engine::CullMode::None,
-                req.pipeline_ref,
-                "cull_mode_unmapped",
-            ),
-            // MTLWinding: CounterClockwise == 1; Metal defaults to Clockwise.
-            front_face_ccw: raster_or_default(
-                req.front_facing,
-                translate::raster::front_face_ccw,
-                false,
-                req.pipeline_ref,
-                "winding_unmapped",
-            ),
-            // MTLTriangleFillMode / MTLDepthClipMode, both defaulting to 0.
-            // Unlike the two above, the non-default arm of each needs a device
-            // feature, so the engine may still decline the pipeline by name
-            // after this maps cleanly: the mapping says what the guest asked
-            // for, the capability check says whether the host can spell it.
-            fill_mode: raster_or_default(
-                req.fill_mode,
-                translate::raster::fill_mode,
-                crate::backend::vulkan::engine::FillMode::Fill,
-                req.pipeline_ref,
-                "fill_mode_unmapped",
-            ),
-            depth_clip: raster_or_default(
-                req.depth_clip_mode,
-                translate::raster::depth_clip_mode,
-                crate::backend::vulkan::engine::DepthClipMode::Clip,
-                req.pipeline_ref,
-                "depth_clip_mode_unmapped",
-            ),
+            // The four fixed-function encoder states, as the guest wrote
+            // them. `None` is the state it never set, which takes Metal's own
+            // default — and an out-of-contract *value* is a different thing
+            // from an unset one.
+            //
+            // It used to be the same thing here: an unrecognised ordinal
+            // logged a line and then took the default too, so a guest that
+            // asked for a wireframe got solid triangles. That substitution is
+            // gone. `reims_vgpu_vulkan::raster::plan` refuses the pipeline for
+            // the ordinal it cannot place, which is the answer this device
+            // gives for every other closed set the guest can write.
+            raster: reims_vgpu_vulkan::raster::GuestRasterState {
+                cull_mode: req.cull_mode.map_or(
+                    reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.cull_mode,
+                    u64::from,
+                ),
+                winding: req.front_facing.map_or(
+                    reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.winding,
+                    u64::from,
+                ),
+                depth_clip_mode: req.depth_clip_mode.map_or(
+                    reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.depth_clip_mode,
+                    u64::from,
+                ),
+                fill_mode: req.fill_mode.map_or(
+                    reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.fill_mode,
+                    u64::from,
+                ),
+            },
             first_vertex: req.first_vertex,
             // Passed through. `decode::render`'s `wire_instance_count` is where
             // a zero instance count is decided, and it is decided once — a
@@ -8641,12 +8629,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // everywhere while this path quietly kept the old answer.
             instance_count: Some(req.instance_count),
             // The ordinal is parsed by the layer that owns `MTLPrimitiveType`.
-            // The substitution on an out-of-contract value is unchanged and is
-            // still wrong for this one field — a primitive type is an argument
-            // to `drawPrimitives:` rather than a descriptor property left
-            // unset, so "Metal's default" does not exist for it — but it is
-            // `raster_or_default`'s shape and belongs to whichever change
-            // takes that helper's four callers together.
+            //
+            // The last caller of `raster_or_default`, and the one it was never
+            // right for: the four rasterizer states it also served are
+            // descriptor properties with genuine Metal defaults, and a
+            // primitive type is an argument to `drawPrimitives:` that every
+            // draw states. There is no unset state for it to default to, so
+            // the substitution below is a guess at what the guest meant.
+            // Removing it means giving `decode::render` somewhere to refuse,
+            // which is a decode-side change rather than this one.
             primitive_topology: raster_or_default(
                 Some(req.primitive_type),
                 |ordinal| {
@@ -13619,18 +13610,19 @@ pub(super) fn linux_m2v_draw_failure(
 pub(super) fn vulkan_fixed_state_gap(req: &DrawEncodeRequest) -> String {
     let mut gaps = Vec::new();
     // Cull mode and front-facing winding ARE honored by the Vulkan raster state
-    // (see the pipeline builder). Only an out-of-contract value is still a gap —
-    // those stay fail-visible rather than being coerced to a face that silently
-    // draws or drops geometry. What counts as out-of-contract is
-    // `translate::raster`'s answer, not a local bound: a second copy of the
-    // SDK's range here would silently disagree the moment one of them changed.
+    // (see the pipeline builder). Only an out-of-contract value is still a gap
+    // — and it is no longer coerced to a face that silently draws or drops
+    // geometry; the pipeline refuses it. What counts as out-of-contract is
+    // `reims_vgpu_vulkan::raster`'s answer, not a local bound: a second copy
+    // of the SDK's range here would silently disagree the moment one of them
+    // changed.
     if let Some(value) = req.cull_mode {
-        if translate::raster::cull_mode(value).is_err() {
+        if reims_vgpu_vulkan::raster::cull_mode(u64::from(value)).is_err() {
             gaps.push(format!("cull:{value}"));
         }
     }
     if let Some(value) = req.front_facing {
-        if translate::raster::front_face_ccw(value).is_err() {
+        if reims_vgpu_vulkan::raster::front_face(u64::from(value)).is_err() {
             gaps.push(format!("front:{value}"));
         }
     }

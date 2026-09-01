@@ -13,8 +13,8 @@ use super::counters::{CreateSite, EngineCounters};
 use super::digest::Digest128;
 use super::pools::{DeferredHandle, ResourcePools};
 use super::types::{
-    BlendKey, ColorWriteMask, CullMode, DepthClipMode, DrawError, FillMode, PrimitiveTopology,
-    SamplerStateKey, VertexAttributeFormat, VertexStepFunction,
+    BlendKey, ColorWriteMask, DrawError, PrimitiveTopology, SamplerStateKey, VertexAttributeFormat,
+    VertexStepFunction,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -609,22 +609,14 @@ pub(crate) struct PipelineKey {
     /// is a draw sampling an attachment it is writing with no feedback loop
     /// enabled — undefined behaviour, reported nowhere.
     pub feedback_colors: u8,
-    /// Face culling. `None` (the 2D UI default) keeps the raster state at
-    /// `CULL_NONE`, byte-identical to the pre-cull engine; the key still
-    /// participates in hashing so a later culled draw with the same shaders gets
-    /// its own pipeline rather than aliasing the no-cull one.
-    pub cull_mode: CullMode,
-    /// Metal front-facing winding (`true` = counter-clockwise), mapped to a
-    /// Vulkan `FrontFace` by [`crate::backend::vulkan::translate::raster::vk_front_face`].
-    pub front_face_ccw: bool,
-    /// Metal `MTLTriangleFillMode`, mapped to a `VkPolygonMode`. In the key
-    /// because Vulkan has no dynamic polygon mode below
-    /// `VK_EXT_extended_dynamic_state3`: a wireframe draw and a filled draw
-    /// sharing shaders need different pipelines.
-    pub fill_mode: FillMode,
-    /// Metal `MTLDepthClipMode`, mapped to `depthClampEnable`. In the key for
-    /// the same reason as [`Self::fill_mode`].
-    pub depth_clip: DepthClipMode,
+    /// The four fixed-function encoder states, as the guest's own ordinals.
+    ///
+    /// All four are `VkPipelineRasterizationStateCreateInfo` members below
+    /// `VK_EXT_extended_dynamic_state` and `…_state3`, so on this rail's
+    /// baseline two draws differing only in a cull mode need two pipelines and
+    /// the states are part of the key. They are held unparsed here for the
+    /// reason [`Self::blend`] is: one layer decides what an ordinal means.
+    pub raster: reims_vgpu_vulkan::raster::GuestRasterState,
     /// Depth-test pipeline state. Meaningful only when `pass.depth.is_some()`;
     /// otherwise all-default (test/write off) and no depth-stencil state is
     /// attached, so the color-only pipeline is byte-identical to the pre-depth
@@ -2184,6 +2176,36 @@ impl ObjectCaches {
         }
         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
 
+        // The four fixed-function encoder states, parsed and weighed against
+        // this device in one place. Two of them have a mode that is an
+        // optional Vulkan feature — `MTLDepthClipModeClamp` needs `depthClamp`
+        // and `MTLTriangleFillModeLines` needs `fillModeNonSolid` — and
+        // neither has a substitute: clipping where the guest asked to clamp
+        // throws away geometry it expected to keep, and filling where it asked
+        // for lines draws solid triangles over a wireframe. Both refuse by
+        // name, and both refuse only for the mode that needs the feature.
+        //
+        // The dynamic rungs are not taken here: this cache still keys a
+        // pipeline on all four states, so the cell reports no dynamic state
+        // and the plan bakes every member.
+        let raster_cell = reims_vgpu_vulkan::raster::RasterCell {
+            depth_clamp: ctx.features.depth_clamp,
+            fill_mode_non_solid: ctx.features.fill_mode_non_solid,
+            dynamic_cull_and_winding: false,
+            dynamic_polygon_mode: false,
+            dynamic_depth_clamp: false,
+        };
+        let raster_plan = match reims_vgpu_vulkan::raster::plan(key.raster, raster_cell) {
+            Ok(plan) => plan,
+            Err(refusal) => {
+                let reason = super::reason::DrawReason::Raster(refusal);
+                crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+                let err = DrawError::Unsupported(reason);
+                self.pipelines.insert_negative(key.clone(), err.clone());
+                return Err(err);
+            }
+        };
+
         // Every colour attachment, parsed once and planned once.
         //
         // Built here rather than beside the create-info below because both
@@ -2234,30 +2256,54 @@ impl ObjectCaches {
             }
         }
 
-        // `MTLTriangleFillModeLines` and `MTLDepthClipModeClamp` are the two
-        // rasterization states whose non-default arm Vulkan makes optional:
-        // `VK_POLYGON_MODE_LINE` needs `fillModeNonSolid` and
-        // `depthClampEnable` needs `depthClamp`, and naming either without its
-        // feature makes the pipeline invalid. Same shape as the two checks
-        // above — capability question, typed decline, cached negatively.
+        // Every colour attachment, parsed once and planned once.
         //
-        // Refused rather than rasterized the other way, because the other way
-        // is a whole pass rendered wrong with nothing to say so: a wireframe
-        // filled in, or the geometry a clamped pass wanted kept discarded at
-        // the near plane.
-        if key.fill_mode != FillMode::default() && !ctx.features.fill_mode_non_solid {
-            let reason = super::reason::DrawReason::FillModeNonSolidUnsupported;
-            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
-            let err = DrawError::Unsupported(reason);
-            self.pipelines.insert_negative(key.clone(), err.clone());
-            return Err(err);
-        }
-        if key.depth_clip != DepthClipMode::default() && !ctx.features.depth_clamp {
-            let reason = super::reason::DrawReason::DepthClampUnsupported;
-            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
-            let err = DrawError::Unsupported(reason);
-            self.pipelines.insert_negative(key.clone(), err.clone());
-            return Err(err);
+        // Built here rather than beside the create-info below because both
+        // things that can go wrong are refusals of the whole pipeline, and a
+        // refusal belongs with the other capability checks in this run: typed
+        // decline, cached negatively so a replay returns this exact reason.
+        //
+        // Every attachment participates, not just slot 0. The secondaries
+        // carry their own decoded blend, and both questions are asked of the
+        // set: a pipeline is invalid if *any* attachment names a `SRC1_*`
+        // factor without `dualSrcBlend`, and invalid if they *disagree*
+        // without `independentBlend` — which no single attachment can be
+        // blamed for, which is why the second check takes the list.
+        let blend_cell = reims_vgpu_vulkan::blend::BlendCell {
+            dual_source: ctx.features.dual_src_blend,
+            independent: ctx.features.independent_blend,
+        };
+        let mut blend_plans = Vec::with_capacity(1 + key.pass.secondary_count());
+        {
+            let refuse = |reason: super::reason::DrawReason| {
+                crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+                DrawError::Unsupported(reason)
+            };
+            for slot in 0..=key.pass.secondary_count() {
+                let blend = if slot == 0 {
+                    key.blend
+                } else {
+                    key.secondary_blend[slot - 1]
+                };
+                let attempt = color_attachment_state(blend, key.color_write_mask[slot])
+                    .map_err(|r| refuse(super::reason::DrawReason::BlendDeclaration(r)))
+                    .and_then(|state| {
+                        reims_vgpu_vulkan::blend::plan(&state, blend_cell)
+                            .map_err(|r| refuse(super::reason::DrawReason::BlendDevice(r)))
+                    });
+                match attempt {
+                    Ok(plan) => blend_plans.push(plan),
+                    Err(err) => {
+                        self.pipelines.insert_negative(key.clone(), err.clone());
+                        return Err(err);
+                    }
+                }
+            }
+            if let Err(r) = reims_vgpu_vulkan::blend::independent(&blend_plans, blend_cell) {
+                let err = refuse(super::reason::DrawReason::BlendDevice(r));
+                self.pipelines.insert_negative(key.clone(), err.clone());
+                return Err(err);
+            }
         }
 
         // Resolve every attribute against what this device accepts as a vertex
@@ -2460,6 +2506,12 @@ impl ObjectCaches {
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
+        // `DEPTH_BIAS`, and whichever rasterization members this host supplies
+        // per draw — none of them yet. Metal has no way to say "this pipeline
+        // cannot be biased", so the pipeline always enables biasing and always
+        // takes the three values dynamically; see
+        // `reims_vgpu_vulkan::raster`.
+        dynamic_states.extend(raster_plan.state.dynamic.states());
         if key.stencil.is_some() {
             dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
         }
@@ -2471,15 +2523,7 @@ impl ObjectCaches {
         let vp_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(key.viewport_slots)
             .scissor_count(key.viewport_slots);
-        // Cull mode, winding, fill mode and depth clip mode all come from the
-        // guest; the last two were refused above where the host cannot spell
-        // them, so reaching here means both are bindable.
-        let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(translate::raster::vk_polygon_mode(key.fill_mode))
-            .depth_clamp_enable(translate::raster::vk_depth_clamp_enable(key.depth_clip))
-            .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
-            .front_face(translate::raster::vk_front_face(key.front_face_ccw))
-            .line_width(1.0);
+        let raster = raster_plan.state.native();
         // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
         // so it reaches this device inside the serializer-object pipeline's own
         // compact-TLV block. The pass key carries that decoded count, and the

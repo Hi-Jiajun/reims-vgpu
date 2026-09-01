@@ -608,6 +608,10 @@ engine_counters! {
         /// the viewport and scissor pair and unlike `dynstate_stencil_held`:
         /// every encoder has a blend colour whether or not any factor reads it.
         dynstate_blend_constants_held,
+        /// The depth bias a draw did not re-record. One call per command
+        /// buffer and held for every draw after it, because the value this
+        /// device sets does not vary.
+        dynstate_depth_bias_held,
         /// Vertex-buffer binding slots requested by draws. This must equal
         /// `vertex_buffer_bind_emitted`; compare either with
         /// `vertex_buffer_bind_calls` to measure contiguous bulk encoding.

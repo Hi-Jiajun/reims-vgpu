@@ -10,7 +10,7 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BlendStateResource, BufferContent, CullMode, DepthState, DrawRequest, IndexType,
+    self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
     IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
@@ -518,15 +518,26 @@ fn cull_mode_honored_and_winding_correct() {
     let (v, f) = triangle_spirv();
     let (w, h) = (16u32, 16u32);
 
-    let variant = |cull: CullMode, ccw: bool| -> Option<bool> {
+    use reims_vgpu_vulkan::raster::{
+        GuestRasterState, MTL_CULL_MODE_BACK, MTL_CULL_MODE_FRONT, MTL_CULL_MODE_NONE,
+        MTL_WINDING_CLOCKWISE, MTL_WINDING_COUNTER_CLOCKWISE,
+    };
+    let variant = |cull: u64, ccw: bool| -> Option<bool> {
         let mut req = engine_req(&v, &f, w, h);
-        req.cull_mode = cull;
-        req.front_face_ccw = ccw;
+        req.raster = GuestRasterState {
+            cull_mode: cull,
+            winding: if ccw {
+                MTL_WINDING_COUNTER_CLOCKWISE
+            } else {
+                MTL_WINDING_CLOCKWISE
+            },
+            ..GuestRasterState::DEFAULT
+        };
         draw_or_skip("cull", &req).map(|px| triangle_covered(&px, w, h))
     };
 
     // cull=None must stay byte-identical to the no-cull path: full coverage.
-    let Some(none_cov) = variant(CullMode::None, false) else {
+    let Some(none_cov) = variant(MTL_CULL_MODE_NONE, false) else {
         return; // no GPU
     };
     assert!(
@@ -534,10 +545,10 @@ fn cull_mode_honored_and_winding_correct() {
         "cull=None must draw both faces (fullscreen coverage)"
     );
 
-    let back_cw = variant(CullMode::Back, false).unwrap();
-    let front_cw = variant(CullMode::Front, false).unwrap();
-    let back_ccw = variant(CullMode::Back, true).unwrap();
-    let front_ccw = variant(CullMode::Front, true).unwrap();
+    let back_cw = variant(MTL_CULL_MODE_BACK, false).unwrap();
+    let front_cw = variant(MTL_CULL_MODE_FRONT, false).unwrap();
+    let back_ccw = variant(MTL_CULL_MODE_BACK, true).unwrap();
+    let front_ccw = variant(MTL_CULL_MODE_FRONT, true).unwrap();
 
     // A single triangle presents one face to the viewer: culling Front and Back
     // are complementary — exactly one keeps it. If cull were ignored, both would

@@ -132,14 +132,6 @@ pub enum TranslateReason {
     UnknownCompareFunction(u32),
     /// `MTLStencilOperation` value outside the SDK enum.
     UnknownStencilOperation(u32),
-    /// `MTLCullMode` value outside the SDK enum.
-    UnknownCullMode(u32),
-    /// `MTLWinding` value outside the SDK enum.
-    UnknownWinding(u32),
-    /// `MTLTriangleFillMode` value outside the SDK enum.
-    UnknownFillMode(u32),
-    /// `MTLDepthClipMode` value outside the SDK enum.
-    UnknownDepthClipMode(u32),
     /// A texture-view swizzle selector outside the decoded contract's range.
     UnknownSwizzleSelector(u8),
     /// The device does not advertise the requested `VkFormat` as a vertex
@@ -195,10 +187,6 @@ impl crate::observe::Decline for TranslateReason {
             Self::VertexStepFunctionPerPatch(_) => "vertex_step_function_per_patch",
             Self::UnknownCompareFunction(_) => "unknown_compare_function",
             Self::UnknownStencilOperation(_) => "unknown_stencil_operation",
-            Self::UnknownCullMode(_) => "unknown_cull_mode",
-            Self::UnknownWinding(_) => "unknown_winding",
-            Self::UnknownFillMode(_) => "unknown_fill_mode",
-            Self::UnknownDepthClipMode(_) => "unknown_depth_clip_mode",
             Self::UnknownSwizzleSelector(_) => "unknown_swizzle_selector",
             Self::FormatNotVertexBuffer(_) => "format_not_vertex_buffer",
             Self::VertexFormatWidenReadAsFour(_) => "vertex_format_widen_read_as_four",
@@ -228,10 +216,6 @@ impl TranslateReason {
             | Self::VertexStepFunctionPerPatch(v)
             | Self::UnknownCompareFunction(v)
             | Self::UnknownStencilOperation(v)
-            | Self::UnknownCullMode(v)
-            | Self::UnknownWinding(v)
-            | Self::UnknownFillMode(v)
-            | Self::UnknownDepthClipMode(v)
             | Self::UnknownVisibilityResultMode(v) => v,
             Self::UnknownSwizzleSelector(v) => u32::from(v),
             Self::FormatNotVertexBuffer(v)
@@ -272,10 +256,6 @@ mod tests {
         TranslateReason::VertexStepFunctionPerPatch(0),
         TranslateReason::UnknownCompareFunction(0),
         TranslateReason::UnknownStencilOperation(0),
-        TranslateReason::UnknownCullMode(0),
-        TranslateReason::UnknownWinding(0),
-        TranslateReason::UnknownFillMode(0),
-        TranslateReason::UnknownDepthClipMode(0),
         TranslateReason::UnknownSwizzleSelector(0),
         TranslateReason::FormatNotVertexBuffer(0),
         TranslateReason::VertexFormatWidenReadAsFour(0),
@@ -308,15 +288,11 @@ mod tests {
                 TranslateReason::VertexStepFunctionPerPatch(_) => 7,
                 TranslateReason::UnknownCompareFunction(_) => 8,
                 TranslateReason::UnknownStencilOperation(_) => 9,
-                TranslateReason::UnknownCullMode(_) => 10,
-                TranslateReason::UnknownWinding(_) => 11,
-                TranslateReason::UnknownFillMode(_) => 12,
-                TranslateReason::UnknownDepthClipMode(_) => 13,
-                TranslateReason::UnknownSwizzleSelector(_) => 14,
-                TranslateReason::FormatNotVertexBuffer(_) => 15,
-                TranslateReason::VertexFormatWidenReadAsFour(_) => 16,
-                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 17,
-                TranslateReason::UnknownVisibilityResultMode(_) => 18,
+                TranslateReason::UnknownSwizzleSelector(_) => 10,
+                TranslateReason::FormatNotVertexBuffer(_) => 11,
+                TranslateReason::VertexFormatWidenReadAsFour(_) => 12,
+                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 13,
+                TranslateReason::UnknownVisibilityResultMode(_) => 14,
             }
         }
         let mut seen: Vec<usize> = ALL.iter().map(|r| index(*r)).collect();

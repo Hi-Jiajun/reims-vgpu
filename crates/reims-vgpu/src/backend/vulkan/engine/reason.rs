@@ -159,23 +159,17 @@ pub enum DrawReason {
     /// Delegates for the same reason as [`Self::SamplerDevice`]; the rail that
     /// owns the capability is the one that names the refusal.
     BlendDevice(reims_vgpu_vulkan::blend::Refusal),
-    /// The guest asked for `MTLTriangleFillModeLines` and this device does not
-    /// advertise `VkPhysicalDeviceFeatures::fillModeNonSolid`, so no pipeline
-    /// on it can name `VK_POLYGON_MODE_LINE`.
+    /// A fixed-function rasterizer state the guest set that this rail cannot
+    /// place: an ordinal outside a closed set, `MTLTriangleFillModeLines`
+    /// without `VkPhysicalDeviceFeatures::fillModeNonSolid`, or
+    /// `MTLDepthClipModeClamp` without `depthClamp`.
     ///
-    /// The alternative is rasterizing the wireframe filled, which is a whole
-    /// pass of wrong pixels the guest is never told about. Same reading as
-    /// [`Self::BlendDevice`]: optional core feature, asked for
-    /// at device creation, declined by name where the host says no.
-    FillModeNonSolidUnsupported,
-    /// The guest asked for `MTLDepthClipModeClamp` and this device does not
-    /// advertise `VkPhysicalDeviceFeatures::depthClamp`, so no pipeline on it
-    /// can set `depthClampEnable`.
-    ///
-    /// Clipping instead discards every fragment the guest asked to keep at the
-    /// near and far planes, which is missing geometry rather than shifted
-    /// geometry — the sibling of the fill-mode refusal above.
-    DepthClampUnsupported,
+    /// The two capability arms have no substitute and so are not degraded:
+    /// rasterizing a wireframe filled is a whole pass of wrong pixels, and
+    /// clipping where the guest asked to clamp discards geometry it expected
+    /// to keep at the near and far planes. Delegates its slug, like the
+    /// sampler and blend pairs.
+    Raster(reims_vgpu_vulkan::raster::Refusal),
     /// The primary colour attachment has no faithful Vulkan format on this
     /// backend. Carries the translation reason so the refusal keeps one name.
     ColorAttachmentFormat(TranslateReason),
@@ -367,8 +361,7 @@ impl crate::observe::Decline for DrawReason {
             Self::VertexStep(refusal) => refusal.slug(),
             Self::BlendDeclaration(refusal) => Decline::slug(refusal),
             Self::BlendDevice(refusal) => refusal.slug(),
-            Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
-            Self::DepthClampUnsupported => "depth_clamp_unsupported",
+            Self::Raster(refusal) => refusal.slug(),
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
@@ -521,6 +514,7 @@ impl std::fmt::Display for DrawReason {
             // printing it whole keeps one event to one reading.
             Self::BlendDevice(refusal) => write!(f, " {refusal}"),
             Self::VertexStep(refusal) => write!(f, " {refusal}"),
+            Self::Raster(refusal) => write!(f, " {refusal}"),
             // Same: the surface's answer is only actionable with what it
             // offered, which the rail's refusal spells.
             Self::SwapchainSurface(refusal) => write!(f, " {refusal}"),
@@ -761,8 +755,16 @@ mod tests {
             factor: reims_vgpu_core::blend::BlendFactor::Source1Color,
         }),
         DrawReason::BlendDevice(reims_vgpu_vulkan::blend::Refusal::NoIndependentBlend { slots: 2 }),
-        DrawReason::FillModeNonSolidUnsupported,
-        DrawReason::DepthClampUnsupported,
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::NoNonSolidFill),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::NoDepthClamp),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::UnknownOrdinal {
+            state: "cull_mode",
+            ordinal: 9,
+        }),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::OutOfRange {
+            field: "x",
+            value: 0,
+        }),
     ];
 
     /// The rule this enum exists to enforce: two checks sharing a slug means a

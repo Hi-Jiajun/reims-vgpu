@@ -3218,10 +3218,7 @@ pub(crate) unsafe fn execute_draw_inner(
             // Taken from the pass key this draw built, not from `pass`, which
             // erases it once feedback stops changing the render pass.
             feedback_colors: pass_key.feedback_colors,
-            cull_mode: req.cull_mode,
-            front_face_ccw: req.front_face_ccw,
-            fill_mode: req.fill_mode,
-            depth_clip: req.depth_clip,
+            raster: req.raster,
             depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
             depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
             depth_compare: req
@@ -5196,6 +5193,10 @@ pub(crate) unsafe fn execute_draw_inner(
     // encoder value, so one call per draw whatever the attachments declare,
     // held against the last one recorded.
     unsafe { pools.set_dynamic_blend_constants(&ctx.device, cb, counters, req.blend_color) };
+    // Every pipeline enables depth biasing and declares the state dynamic, so
+    // every draw must have been given values — see `set_dynamic_depth_bias`
+    // for why they are zero.
+    unsafe { pools.set_dynamic_depth_bias(&ctx.device, cb, counters) };
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
     // dynamic state; front/back set together because Metal's split refs are one

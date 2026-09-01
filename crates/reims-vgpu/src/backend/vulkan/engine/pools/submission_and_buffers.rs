@@ -1868,6 +1868,7 @@ impl ResourcePools {
         self.cb_graphics.scissors.clear();
         self.cb_graphics.stencil = None;
         self.cb_graphics.blend_constants = None;
+        self.cb_graphics.depth_bias_set = false;
         self.cb_graphics.push_layout = None;
         self.cb_graphics.push_bindings.clear();
     }
@@ -2241,6 +2242,7 @@ impl ResourcePools {
             g.scissors.clear();
             g.stencil = None;
             g.blend_constants = None;
+            g.depth_bias_set = false;
             g.push_layout = None;
             g.push_bindings.clear();
         }
@@ -2262,6 +2264,7 @@ impl ResourcePools {
         g.scissors.clear();
         g.stencil = None;
         g.blend_constants = None;
+        g.depth_bias_set = false;
         unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline) };
     }
 
@@ -2442,6 +2445,43 @@ impl ResourcePools {
             device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT, front);
             device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::BACK, back);
         }
+    }
+
+    /// Record `vkCmdSetDepthBias` unless this command buffer already carries it.
+    ///
+    /// Every graphics pipeline this engine builds sets `depthBiasEnable` —
+    /// Metal has no enable bit for it, so a pipeline that cleared it would
+    /// silently drop the bias of a guest that calls `setDepthBias:` — and a
+    /// pipeline that enables it and declares the state dynamic must be given
+    /// values before it draws, or the result is undefined rather than unbiased.
+    ///
+    /// The values are zero. The guest's own `setDepthBias:` is *not* translated
+    /// yet and is still counted as a gap by `vulkan_fixed_state_gap`: Metal's
+    /// constant is an absolute depth offset and Vulkan's
+    /// `depthBiasConstantFactor` is scaled by the format's minimum resolvable
+    /// difference, so passing the guest's number through would be wrong by a
+    /// factor this device has not recovered. Zero bias with the enable on
+    /// rasterizes identically to the enable off, so this costs nothing and
+    /// leaves the translation to whoever recovers that factor.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_depth_bias(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.depth_bias_set {
+            counters
+                .dynstate_depth_bias_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.depth_bias_set = true;
+        unsafe { device.cmd_set_depth_bias(cb, 0.0, 0.0, 0.0) };
     }
 
     /// Record `vkCmdSetBlendConstants` unless this command buffer already

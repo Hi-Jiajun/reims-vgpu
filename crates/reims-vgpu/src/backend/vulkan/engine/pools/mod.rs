@@ -847,6 +847,15 @@ pub(crate) struct CbGraphicsState {
     scissors: Vec<vk::Rect2D>,
     /// The front/back references last handed to `vkCmdSetStencilReference`.
     stencil: Option<(u32, u32)>,
+    /// Whether `vkCmdSetDepthBias` has been recorded into this command buffer.
+    ///
+    /// Not a value, because there is only one this device asks for: the
+    /// pipeline always enables biasing — Metal has no way to say a pipeline
+    /// cannot be biased — and the guest's own bias is not yet translated, so
+    /// the three values are always zero. What must not happen is the state
+    /// going *unset*, which is undefined for a pipeline that declares it
+    /// dynamic.
+    depth_bias_set: bool,
     /// The four floats last handed to `vkCmdSetBlendConstants`, by bit pattern.
     ///
     /// Compared as bits rather than as floats so the cache is a plain equality

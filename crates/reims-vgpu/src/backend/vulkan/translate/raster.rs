@@ -11,46 +11,8 @@ use ash::vk;
 
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::{
-    CullMode, DepthClipMode, FillMode, IndexType, SamplerCompareFunction, StencilOp,
-    VisibilityResultMode,
+    IndexType, SamplerCompareFunction, StencilOp, VisibilityResultMode,
 };
-
-/// `MTLCullMode` (SDK numeric values).
-pub fn cull_mode(mtl: u32) -> Result<CullMode, TranslateReason> {
-    Ok(match mtl {
-        0 => CullMode::None,
-        1 => CullMode::Front,
-        2 => CullMode::Back,
-        other => return Err(TranslateReason::UnknownCullMode(other)),
-    })
-}
-
-/// `MTLTriangleFillMode` (SDK numeric values).
-pub fn fill_mode(mtl: u32) -> Result<FillMode, TranslateReason> {
-    Ok(match mtl {
-        0 => FillMode::Fill,
-        1 => FillMode::Lines,
-        other => return Err(TranslateReason::UnknownFillMode(other)),
-    })
-}
-
-/// `MTLDepthClipMode` (SDK numeric values).
-pub fn depth_clip_mode(mtl: u32) -> Result<DepthClipMode, TranslateReason> {
-    Ok(match mtl {
-        0 => DepthClipMode::Clip,
-        1 => DepthClipMode::Clamp,
-        other => return Err(TranslateReason::UnknownDepthClipMode(other)),
-    })
-}
-
-/// `MTLWinding` → whether the front face is counter-clockwise.
-pub fn front_face_ccw(mtl: u32) -> Result<bool, TranslateReason> {
-    match mtl {
-        0 => Ok(false), // MTLWindingClockwise, Metal's default
-        1 => Ok(true),  // MTLWindingCounterClockwise
-        other => Err(TranslateReason::UnknownWinding(other)),
-    }
-}
 
 /// `MTLCompareFunction` (SDK numeric values). Depth test, stencil test and
 /// sampler compare all carry this same Metal enum.
@@ -139,84 +101,9 @@ pub fn vk_query_control_flags(mode: VisibilityResultMode) -> vk::QueryControlFla
     }
 }
 
-pub fn vk_cull_mode(mode: CullMode) -> vk::CullModeFlags {
-    match mode {
-        CullMode::None => vk::CullModeFlags::NONE,
-        CullMode::Front => vk::CullModeFlags::FRONT,
-        CullMode::Back => vk::CullModeFlags::BACK,
-    }
-}
-
-/// The polygon mode that rasterizes a Metal fill mode.
-///
-/// `LINE` requires `VkPhysicalDeviceFeatures::fillModeNonSolid`; the caller
-/// gates on it, because the alternative — quietly returning `FILL` — is the
-/// wireframe-rendered-solid bug this translation exists to prevent.
-pub fn vk_polygon_mode(mode: FillMode) -> vk::PolygonMode {
-    match mode {
-        FillMode::Fill => vk::PolygonMode::FILL,
-        FillMode::Lines => vk::PolygonMode::LINE,
-    }
-}
-
-/// Whether the pipeline sets `depthClampEnable`.
-///
-/// `true` requires `VkPhysicalDeviceFeatures::depthClamp`, gated at the caller
-/// for the same reason as [`vk_polygon_mode`].
-pub fn vk_depth_clamp_enable(mode: DepthClipMode) -> bool {
-    match mode {
-        DepthClipMode::Clip => false,
-        DepthClipMode::Clamp => true,
-    }
-}
-
-/// The Vulkan `FrontFace` that reproduces Metal front-face selection.
-///
-/// Metal evaluates winding in its window space (origin top-left, Y down) and its
-/// default front-facing winding is clockwise. This backend emulates Metal's Y-up
-/// NDC on Vulkan's Y-down NDC with a negative-height viewport, which makes the
-/// rasterized framebuffer image — and therefore the apparent triangle winding —
-/// match Metal's. The mapping is therefore direct: a Metal clockwise front is
-/// `FrontFace::CLOCKWISE`. Every draw on this rail is emitted Y-flipped (the
-/// guest is always Metal), so there is no un-flipped case in which the
-/// framebuffer would mirror and invert the effective winding. Verified on-GPU
-/// by the `cull_*` parity tests.
-pub fn vk_front_face(front_face_ccw: bool) -> vk::FrontFace {
-    if front_face_ccw {
-        vk::FrontFace::COUNTER_CLOCKWISE
-    } else {
-        vk::FrontFace::CLOCKWISE
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cull_flags_map_metal_modes() {
-        assert_eq!(vk_cull_mode(CullMode::None), vk::CullModeFlags::NONE);
-        assert_eq!(vk_cull_mode(CullMode::Front), vk::CullModeFlags::FRONT);
-        assert_eq!(vk_cull_mode(CullMode::Back), vk::CullModeFlags::BACK);
-    }
-
-    #[test]
-    fn front_face_matches_metal_under_yflip() {
-        // Every draw is emitted through a negative-height viewport, so the
-        // rasterized framebuffer winding matches Metal and the mapping is
-        // direct — Metal's clockwise default front maps to FrontFace::CLOCKWISE,
-        // CCW to CCW.
-        assert_eq!(
-            vk_front_face(false),
-            vk::FrontFace::CLOCKWISE,
-            "Metal CW front under Y-flip"
-        );
-        assert_eq!(
-            vk_front_face(true),
-            vk::FrontFace::COUNTER_CLOCKWISE,
-            "Metal CCW front under Y-flip"
-        );
-    }
 
     /// Every primitive type this device *advertises* has an arm here.
     ///
@@ -240,31 +127,6 @@ mod tests {
     /// by its own slug rather than a shared one.
     #[test]
     fn each_raster_enum_is_total_over_its_sdk_range() {
-        for mtl in 0..=2u32 {
-            assert!(cull_mode(mtl).is_ok(), "cull {mtl}");
-        }
-        assert_eq!(
-            cull_mode(3).unwrap_err(),
-            TranslateReason::UnknownCullMode(3)
-        );
-        for mtl in 0..=1u32 {
-            assert!(fill_mode(mtl).is_ok(), "fill {mtl}");
-            assert!(depth_clip_mode(mtl).is_ok(), "depth clip {mtl}");
-        }
-        assert_eq!(
-            fill_mode(2).unwrap_err(),
-            TranslateReason::UnknownFillMode(2)
-        );
-        assert_eq!(
-            depth_clip_mode(2).unwrap_err(),
-            TranslateReason::UnknownDepthClipMode(2)
-        );
-        assert!(!front_face_ccw(0).unwrap());
-        assert!(front_face_ccw(1).unwrap());
-        assert_eq!(
-            front_face_ccw(2).unwrap_err(),
-            TranslateReason::UnknownWinding(2)
-        );
         for mtl in 0..=7u32 {
             assert!(compare_function(mtl).is_ok(), "compare {mtl}");
             assert!(stencil_operation(mtl).is_ok(), "stencil {mtl}");
@@ -320,25 +182,6 @@ mod tests {
             stencil_operation(99).unwrap_err(),
             TranslateReason::UnknownStencilOperation(99)
         );
-    }
-
-    /// The two rasterization modes whose non-default arm needs a device
-    /// feature. Metal's default is 0 in both, and 0 must map to the spelling
-    /// that needs nothing — a table rotated here would make every draw in the
-    /// tree ask for a feature the host may not have.
-    #[test]
-    fn the_metal_default_raster_mode_needs_no_device_feature() {
-        assert_eq!(fill_mode(0), Ok(FillMode::Fill));
-        assert_eq!(vk_polygon_mode(FillMode::Fill), vk::PolygonMode::FILL);
-        assert_eq!(vk_polygon_mode(FillMode::Lines), vk::PolygonMode::LINE);
-        assert_eq!(depth_clip_mode(0), Ok(DepthClipMode::Clip));
-        assert!(!vk_depth_clamp_enable(DepthClipMode::Clip));
-        assert!(vk_depth_clamp_enable(DepthClipMode::Clamp));
-        // `Default` is what a draw that bound neither record carries, so it has
-        // to be the same answer as the Metal default rather than merely the
-        // first variant.
-        assert_eq!(FillMode::default(), FillMode::Fill);
-        assert_eq!(DepthClipMode::default(), DepthClipMode::Clip);
     }
 
     /// One Apple enum, spelled once here and once in

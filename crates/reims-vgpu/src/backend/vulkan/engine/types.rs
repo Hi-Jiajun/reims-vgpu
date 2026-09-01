@@ -215,47 +215,6 @@ pub enum VisibilityResultMode {
     Counting,
 }
 
-/// Face-culling mode (Metal `MTLCullMode`). The macOS 2D compositor issues no
-/// draw that binds a cull mode, so `None` (the default) keeps the whole UI path
-/// byte-identical to the pre-cull engine — the raster state stays `CULL_NONE`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
-pub enum CullMode {
-    #[default]
-    None,
-    Front,
-    Back,
-}
-
-/// Triangle rasterization mode (Metal `MTLTriangleFillMode`).
-///
-/// Metal has two: fill the interior, or rasterize the edges as lines. Vulkan
-/// spells the second as `VK_POLYGON_MODE_LINE`, which is gated on the
-/// `fillModeNonSolid` device feature — so unlike [`CullMode`] the non-default
-/// arm can be refused by the host, and `engine::caches` declines the pipeline
-/// rather than filling a wireframe.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
-pub enum FillMode {
-    #[default]
-    Fill,
-    Lines,
-}
-
-/// What happens to a fragment outside the depth range (Metal
-/// `MTLDepthClipMode`).
-///
-/// `Clip` discards it, which is Metal's default and Vulkan's unconditional
-/// behaviour with `depthClampEnable` clear. `Clamp` pins its depth to the near
-/// or far plane and keeps it — Vulkan's `depthClampEnable`, gated on the
-/// `depthClamp` device feature. A shadow-map or skybox pass that asked for
-/// `Clamp` and got `Clip` loses the geometry nearest the camera, so the absent
-/// feature is a refusal rather than a fallback.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
-pub enum DepthClipMode {
-    #[default]
-    Clip,
-    Clamp,
-}
-
 /// Per-draw depth-test state (Metal `MTLDepthStencilState` + depth attachment).
 /// When a `DrawRequest` carries `Some`, the engine attaches a depth buffer to
 /// the pass and enables the depth test; `None` (the default) means no depth
@@ -663,24 +622,18 @@ pub struct DrawRequest {
     /// is produced instead of silently discarded. Requires `target_identity`
     /// (the resident path); the pooled single-RT path never carries secondaries.
     pub secondary_targets: Vec<SecondaryColorTarget>,
-    /// Face culling (Metal `MTLCullMode`). `None` (default) draws both faces —
-    /// the 2D UI path. `Front`/`Back` reproduce Metal culling; which winding is
-    /// "front" is `front_face_ccw`, mapped to a Vulkan winding by
-    /// [`crate::backend::vulkan::translate::raster::vk_front_face`].
-    pub cull_mode: CullMode,
-    /// Metal front-facing winding: `true` = counter-clockwise (`MTLWinding`
-    /// CounterClockwise), `false` = the Metal default clockwise. Only affects
-    /// rasterization when `cull_mode` culls a face.
-    pub front_face_ccw: bool,
-    /// Triangle fill mode (Metal `setTriangleFillMode:`). `Fill` (the default)
-    /// is Metal's own and needs no device feature; `Lines` names
-    /// `VK_POLYGON_MODE_LINE` and is refused where `fillModeNonSolid` is not
-    /// advertised.
-    pub fill_mode: FillMode,
-    /// Depth clip mode (Metal `setDepthClipMode:`). `Clip` (the default) is
-    /// Metal's own; `Clamp` sets `depthClampEnable` and is refused where the
-    /// `depthClamp` feature is not advertised.
-    pub depth_clip: DepthClipMode,
+    /// The four fixed-function states a guest sets on the render command
+    /// encoder — `setCullMode:`, `setFrontFacingWinding:`,
+    /// `setTriangleFillMode:` and `setDepthClipMode: `— as the ordinals it
+    /// wrote, defaulting to Metal's own where it set nothing.
+    ///
+    /// One aggregate rather than four fields, because four raw states in a row
+    /// is a struct literal that compiles with two of them transposed. The
+    /// ordinals travel unparsed for the reason
+    /// [`BlendStateResource`]'s do; `reims_vgpu_vulkan::raster::plan` is the
+    /// one place that decides what they mean and whether this device can
+    /// serve them.
+    pub raster: reims_vgpu_vulkan::raster::GuestRasterState,
     /// Depth test + transient depth attachment. `None` (default) = no depth
     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
     /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).
@@ -2828,7 +2781,10 @@ mod tests {
             draw.primitive_topology,
             PrimitiveTopology(reims_vgpu_core::topology::PrimitiveType::Triangle)
         );
-        assert_eq!(draw.cull_mode, CullMode::None);
+        assert_eq!(
+            draw.raster,
+            reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT
+        );
         assert!(draw.target_identity.is_none());
         assert!(draw.depth.is_none());
         assert!(!draw.skip_readback);
