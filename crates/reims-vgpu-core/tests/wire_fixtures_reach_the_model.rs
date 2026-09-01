@@ -547,7 +547,7 @@ impl RefResolver for Recording {
     }
 }
 
-/// A draw declares the buffers Apple's own bind records named.
+/// A draw declares the memory Apple's own bind records named, and only that.
 ///
 /// **The one claim in this file that spans two records.** Everything above puts
 /// one captured record through the model and asks what it made of it. A bind
@@ -563,11 +563,45 @@ impl RefResolver for Recording {
 /// bind whatever the next entry's low word spells — which is a resource, so it
 /// resolves, and only a fixture that named a *known* ref can tell the two
 /// apart.
+///
+/// Samplers are the same shape and the opposite answer. A sampler bind's
+/// entries are a serializer ref exactly as a texture bind's are, and the *only*
+/// thing that says one contributes memory and the other does not is which
+/// opcode carried it. So the sampler fixtures run through the same join and are
+/// required to leave the draw declaring nothing.
 #[test]
-fn a_draw_declares_the_buffers_apples_own_bind_records_named() {
+fn a_draw_declares_the_memory_apples_own_bind_records_named() {
     use reims_vgpu_core::exec::ExecBuilder;
     use reims_vgpu_protocol::segment::{SegmentKind, SegmentLifetime};
-    use reims_vgpu_wire::ops::render::{is_buffer_bind, OPCODE_DRAW};
+    use reims_vgpu_wire::ops::render::{
+        is_buffer_bind, OPCODE_DRAW, OPCODE_SET_FRAGMENT_SAMPLER, OPCODE_SET_FRAGMENT_SAMPLER_LOD,
+        OPCODE_SET_FRAGMENT_TEXTURE, OPCODE_SET_VERTEX_SAMPLER, OPCODE_SET_VERTEX_SAMPLER_LOD,
+        OPCODE_SET_VERTEX_TEXTURE,
+    };
+
+    /// Whether a bind of this opcode puts memory in a draw's footprint.
+    ///
+    /// Buffers and textures do; samplers do not. Keyed on the opcode because
+    /// that is the only thing that distinguishes them — the entries are the
+    /// same layout.
+    fn binds_memory(opcode: u32) -> Option<bool> {
+        if is_buffer_bind(opcode)
+            || matches!(
+                opcode,
+                OPCODE_SET_VERTEX_TEXTURE | OPCODE_SET_FRAGMENT_TEXTURE
+            )
+        {
+            return Some(true);
+        }
+        matches!(
+            opcode,
+            OPCODE_SET_VERTEX_SAMPLER
+                | OPCODE_SET_FRAGMENT_SAMPLER
+                | OPCODE_SET_VERTEX_SAMPLER_LOD
+                | OPCODE_SET_FRAGMENT_SAMPLER_LOD
+        )
+        .then_some(false)
+    }
 
     let all = cases();
     let draw = all
@@ -578,14 +612,16 @@ fn a_draw_declares_the_buffers_apples_own_bind_records_named() {
         .expect("the capture has a non-indexed draw");
 
     let mut checked = 0usize;
+    let mut with_memory = 0usize;
+    let mut without_memory = 0usize;
     for case in &all {
         if case.rail != Rail::Render {
             continue;
         }
         let Ok(view) = op(&case.bytes, 0) else { continue };
-        if !is_buffer_bind(view.opcode()) {
+        let Some(binds_memory) = binds_memory(view.opcode()) else {
             continue;
-        }
+        };
 
         let mut builder = ExecBuilder::new();
         let resolver = Recording::new();
@@ -596,7 +632,7 @@ fn a_draw_declares_the_buffers_apples_own_bind_records_named() {
             resolver.seen().into_iter().filter(|r| *r != 0).collect();
         assert!(
             !named.is_empty(),
-            "{}: a buffer bind that resolved no ref",
+            "{}: a bind that resolved no ref",
             case.name
         );
         let draw_view = op(&draw.bytes, 0).expect("checked above");
@@ -634,17 +670,31 @@ fn a_draw_declares_the_buffers_apples_own_bind_records_named() {
                 | reims_vgpu_core::access::AccessKey::DomainOnly => None,
             })
             .collect();
+        let expected = if binds_memory {
+            named.clone()
+        } else {
+            std::collections::BTreeSet::new()
+        };
         assert_eq!(
-            declared, named,
+            declared, expected,
             "{}: the draw declared {declared:?} and the bind named {named:?}",
             case.name
         );
         checked += 1;
+        if binds_memory {
+            with_memory += 1;
+        } else {
+            without_memory += 1;
+        }
     }
-    println!("bind-then-draw fixtures checked: {checked}");
+    println!(
+        "bind-then-draw fixtures checked: {checked} \
+         ({with_memory} naming memory, {without_memory} not)"
+    );
     assert!(
-        checked > 0,
-        "no buffer-bind fixture reached the join; the test proved nothing"
+        with_memory > 0 && without_memory > 0,
+        "the join saw {with_memory} binds that name memory and {without_memory} \
+         that do not; both answers have to be reached or one of them is untested"
     );
 }
 
