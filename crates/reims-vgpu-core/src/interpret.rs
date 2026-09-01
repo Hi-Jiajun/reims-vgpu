@@ -88,6 +88,22 @@ pub enum Observation {
         ingress: IngressOrdinal,
         reason: Refusal,
     },
+    /// A transaction ran and its lifetime operation did not happen.
+    ///
+    /// **Not [`Self::Refused`], and the difference is the completion word.** A
+    /// refused transaction never runs and owes nothing; a declined operation
+    /// belongs to a transaction that ran and whose stamp is still owed in full
+    /// — the guest is waiting on it, and a lifetime event this device chose not
+    /// to act on is still an event the guest performed. Folding the two would
+    /// make the reference publish no stamp where the device publishes one,
+    /// which is a hang rather than a disagreement.
+    ///
+    /// Observable because it lands on the always-on failure channel, which is
+    /// the same reason [`Self::Refused`] is.
+    OperationDeclined {
+        ingress: IngressOrdinal,
+        reason: crate::lifecycle::Refusal,
+    },
 }
 
 /// Why the interpreter would not run a transaction.
@@ -135,7 +151,13 @@ pub struct Interpreter {
     /// than run: it names objects that no longer exist, and running it would be
     /// executing against whatever now occupies their slots.
     generation: SessionGeneration,
-    content: ContentLedger,
+    /// The semantic model the transactions act on.
+    ///
+    /// It owns the session's content authority, so the versions a completed
+    /// transaction publishes and the transfers a lifetime operation owes land
+    /// in one ledger. A second ledger beside it would be two answers to where
+    /// the current bytes are.
+    model: crate::lifecycle::Lifecycle,
     events: HashMap<ResourceId, u64>,
     fences: HashMap<ResourceId, u64>,
     stamps: HashMap<StampSlot, StampValue>,
@@ -148,7 +170,7 @@ impl Default for Interpreter {
     fn default() -> Self {
         Self {
             generation: SessionGeneration::FIRST,
-            content: ContentLedger::default(),
+            model: crate::lifecycle::Lifecycle::new(),
             events: HashMap::new(),
             fences: HashMap::new(),
             stamps: HashMap::new(),
@@ -188,8 +210,14 @@ impl Interpreter {
     }
 
     /// The content ledger, for a caller declaring backings before a run.
-    pub fn content_mut(&mut self) -> &mut ContentLedger {
-        &mut self.content
+    pub const fn content_mut(&mut self) -> &mut ContentLedger {
+        self.model.content_mut()
+    }
+
+    /// The model the transactions act on, for a caller setting up the tasks and
+    /// heaps a run needs.
+    pub const fn model_mut(&mut self) -> &mut crate::lifecycle::Lifecycle {
+        &mut self.model
     }
 
     #[must_use]
@@ -265,6 +293,27 @@ impl Interpreter {
             }
         }
 
+        // A lifetime operation acts on the model, and a model that declines it
+        // does not stop the transaction: the guest is waiting on the completion
+        // word and a lifetime event this device chose not to act on is still an
+        // event the guest performed. So the decline is observed and the run
+        // continues to its publication.
+        if let crate::transaction::Payload::ResourceLifecycle(lifecycle) = &tx.payload {
+            match self.model.apply(lifecycle.op()) {
+                Ok(effects) => {
+                    // Serial in the strongest sense: the transfers this
+                    // operation owes have executed by the time its completion
+                    // word could be read, so the content-authority changes it
+                    // deferred to that point are taken here.
+                    let _ = self.model.complete(&effects);
+                }
+                Err(reason) => self.trace.push(Observation::OperationDeclined {
+                    ingress: tx.identity.ingress,
+                    reason,
+                }),
+            }
+        }
+
         // The bytes land, and then the version that says they are current
         // becomes visible. Both come from the same list — the accesses — so a
         // version cannot be published for memory nothing wrote.
@@ -273,8 +322,8 @@ impl Interpreter {
             // reservation happened when the transaction was planned, and a
             // completion that took a fresh number here would beat every writer
             // that reserved after it and lose to none.
-            let beaten = written_bytes(&self.content, published.region).map(|bytes| {
-                self.content.materialize(
+            let beaten = written_bytes(self.model.content(), published.region).map(|bytes| {
+                self.model.content_mut().materialize(
                     published.backing,
                     bytes,
                     published.to,
@@ -451,6 +500,33 @@ mod tests {
             slot: ObjectListRef(slot),
             generation: SlotGeneration(1),
         }
+    }
+
+    /// Define task 1 and put `res(1)` in it on `backing`, so a lifetime
+    /// operation naming that resource actually applies.
+    ///
+    /// The interpreter runs lifetime operations against the model now, so a
+    /// synchronise of a resource nobody declared is a *declined* operation —
+    /// correctly, and not what the tests below are about.
+    fn declare_resource(interp: &mut Interpreter, backing: BackingId, length: u64) {
+        let model = interp.model_mut();
+        // A definition and a declaration owe nothing: no transfer, no teardown.
+        let _ = model
+            .apply(&crate::lifecycle::LifecycleOp::DefineTask {
+                task: crate::identity::TaskId(1),
+                kernel: false,
+            })
+            .expect("a fresh task");
+        let _ = model
+            .apply(&crate::lifecycle::LifecycleOp::CreateResource {
+                task: crate::identity::TaskId(1),
+                slot: ObjectListRef(1),
+                storage: crate::lifecycle::Storage::Dedicated {
+                    backing,
+                    extent: ByteRange { offset: 0, length },
+                },
+            })
+            .expect("a free slot");
     }
 
     fn builder(ingress: u64) -> crate::testing::At {
@@ -731,7 +807,7 @@ mod tests {
             Replica::GuestPages,
         );
         interp.run(&tx);
-        assert!(interp.content.is_fresh(
+        assert!(interp.model.content().is_fresh(
             BackingId(9),
             ByteRange {
                 offset: 0,
@@ -739,7 +815,7 @@ mod tests {
             },
             Replica::DeviceOwned
         ));
-        assert!(!interp.content.is_fresh(
+        assert!(!interp.model.content().is_fresh(
             BackingId(9),
             ByteRange {
                 offset: 0,
@@ -756,7 +832,7 @@ mod tests {
             heap: None,
         });
         assert_eq!(
-            written_bytes(&interp.content, whole),
+            written_bytes(interp.model.content(), whole),
             Some(ByteRange {
                 offset: 0,
                 length: 0x100
@@ -767,7 +843,7 @@ mod tests {
         // the guest never gave it.
         assert_eq!(
             written_bytes(
-                &interp.content,
+                interp.model.content(),
                 AccessKey::Whole(ResourceKey {
                     backing: BackingId(404),
                     heap: None
@@ -778,7 +854,7 @@ mod tests {
         // A subresource is the genuine unknown: its bytes need a layout.
         assert_eq!(
             written_bytes(
-                &interp.content,
+                interp.model.content(),
                 AccessKey::Subresource(
                     ResourceKey {
                         backing: BackingId(9),
@@ -1154,6 +1230,62 @@ mod tests {
         assert_eq!(interp.run(&waiter), Outcome::Ran);
     }
 
+    /// A lifetime operation the model declines still publishes its stamp.
+    ///
+    /// The device says so in as many words at the packet arms that handle these
+    /// commands: the guest is waiting on the completion word, and a lifetime
+    /// event this device chose not to act on is still an event the guest
+    /// performed. A reference that refused the transaction would publish no
+    /// stamp where the device publishes one, and the guest would wait forever
+    /// for a word that agreed with the reference.
+    #[test]
+    fn a_declined_operation_still_owes_its_completion_word() {
+        let mut interp = Interpreter::new();
+        // One access, for the one resource the operation names: an empty list
+        // is `AccessMismatch::Unaccessed` and cannot be built.
+        let mut tx = synchronize(
+            1,
+            vec![AccessIntent {
+                domain: ChannelId(1),
+                key: AccessKey::Whole(ResourceKey {
+                    backing: BackingId(9),
+                    heap: None,
+                }),
+                mode: AccessMode::Read,
+                api_stages: 0,
+                input_content_version: None,
+                output_content_version: None,
+            }],
+        );
+        let stamp = CompletionStamp {
+            slot: StampSlot(3),
+            value: StampValue(1),
+        };
+        tx.completion = Some(stamp);
+
+        // Nothing was ever declared, so the synchronise names a task the model
+        // does not have.
+        assert_eq!(interp.run(&tx), Outcome::Ran, "the transaction ran");
+        assert_eq!(
+            interp.trace(),
+            &[
+                Observation::OperationDeclined {
+                    ingress: tx.identity.ingress,
+                    reason: crate::lifecycle::Refusal::NoSuchTask {
+                        task: crate::identity::TaskId(1),
+                    },
+                },
+                Observation::StampPublished {
+                    slot: stamp.slot,
+                    value: stamp.value,
+                },
+            ],
+            "declined, and the word the guest is blocked on is still paid"
+        );
+        assert_eq!(interp.stamp(stamp.slot), Some(stamp.value));
+        assert_eq!(interp.census(), (1, 0), "ran, and was not refused");
+    }
+
     /// Content versions come from the accesses, and the accesses are the
     /// payload's whichever payload it is. A lifecycle synchronise writes bytes
     /// the guest reads back; a reference that only published an EXEC's versions
@@ -1169,6 +1301,7 @@ mod tests {
             },
             Replica::GuestPages,
         );
+        declare_resource(&mut interp, BackingId(9), 256);
         let region = AccessKey::Range(
             ResourceKey {
                 backing: BackingId(9),

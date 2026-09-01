@@ -579,6 +579,15 @@ pub enum Divergence {
         serial: Vec<(IngressOrdinal, Refusal)>,
         parallel: Vec<(IngressOrdinal, Refusal)>,
     },
+    /// A transaction's lifetime operation was declined in one run and not the
+    /// other. Its stamp is owed either way — see
+    /// [`crate::interpret::Observation::OperationDeclined`] — so this is a
+    /// divergence in what the model did, not in what the guest was told to
+    /// wait for.
+    Declined {
+        serial: Vec<(IngressOrdinal, crate::lifecycle::Refusal)>,
+        parallel: Vec<(IngressOrdinal, crate::lifecycle::Refusal)>,
+    },
     /// One transaction's publications were interrupted by another's.
     SplitPublication { ordinal: IngressOrdinal },
     /// A transaction published its completion stamp before its content
@@ -612,6 +621,7 @@ impl Divergence {
             Self::FenceUpdates { .. } => "diverge_fence_updates",
             Self::PublicationOrder { .. } => "diverge_publication_order",
             Self::Refusals { .. } => "diverge_refusals",
+            Self::Declined { .. } => "diverge_declined",
             Self::SplitPublication { .. } => "diverge_split_publication",
             Self::StampBeforeVersions { .. } => "diverge_stamp_before_versions",
             Self::ContentBeaten { .. } => "diverge_content_beaten",
@@ -726,6 +736,16 @@ pub fn equivalent(serial: &Run, parallel: &Run) -> Result<(), Divergence> {
         });
     }
 
+    let (mut declined_left, mut declined_right) = (left.declined.clone(), right.declined.clone());
+    declined_left.sort_by_key(|(o, _)| *o);
+    declined_right.sort_by_key(|(o, _)| *o);
+    if declined_left != declined_right {
+        return Err(Divergence::Declined {
+            serial: declined_left,
+            parallel: declined_right,
+        });
+    }
+
     let mut domains = serial.domains();
     domains.extend(parallel.domains());
     domains.sort_unstable();
@@ -766,7 +786,8 @@ fn monotone(run: &Run) -> Result<(), Divergence> {
             Observation::VersionPublished { .. }
             | Observation::VersionBeaten { .. }
             | Observation::FenceUpdated { .. }
-            | Observation::Refused { .. } => {}
+            | Observation::Refused { .. }
+            | Observation::OperationDeclined { .. } => {}
         }
     }
     Ok(())
@@ -822,6 +843,7 @@ struct Summary {
     events: BTreeMap<ResourceId, u64>,
     fences: BTreeMap<ResourceId, usize>,
     refusals: Vec<(IngressOrdinal, Refusal)>,
+    declined: Vec<(IngressOrdinal, crate::lifecycle::Refusal)>,
 }
 
 impl Summary {
@@ -868,6 +890,13 @@ impl Summary {
                         .push((version, landed));
                 }
                 Observation::Refused { ingress, reason } => out.refusals.push((ingress, reason)),
+                // Part of the outcome for the same reason a refusal is: it
+                // lands on the always-on failure channel, and a schedule under
+                // which an operation is declined and one under which it is not
+                // do not mean the same thing.
+                Observation::OperationDeclined { ingress, reason } => {
+                    out.declined.push((ingress, reason));
+                }
             }
         }
         out

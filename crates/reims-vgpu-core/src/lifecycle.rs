@@ -825,6 +825,23 @@ impl Lifecycle {
         &self.content
     }
 
+    /// The same authority, writable.
+    ///
+    /// **Not a second authority, and the distinction is what makes this
+    /// legitimate.** A lifecycle operation's own content effects go through
+    /// [`Self::apply`] and [`Self::complete`]; what this is for is the *other*
+    /// event that changes where current bytes are — a transaction's writes
+    /// landing at completion — which is not a lifecycle operation and has no
+    /// operation to go through. Both events belong to one ledger, which is
+    /// exactly the property a second ledger beside this one would break.
+    ///
+    /// [`crate::interpret::Interpreter`] is the caller: it holds this model and
+    /// materialises the versions a completed transaction published. A caller
+    /// that wanted to *declare* a backing before a run reaches the same way.
+    pub const fn content_mut(&mut self) -> &mut ContentLedger {
+        &mut self.content
+    }
+
     /// Declare a heap into a task.
     ///
     /// Not a [`LifecycleOp`]: the ledger judges heap-backed *texture* creation
