@@ -2274,6 +2274,9 @@ impl ObjectCaches {
         // on — `vert_spirv` is never read at all.
         let mut shader_inputs: Option<VertexInputWidths> = None;
         let mut attribute_formats = Vec::with_capacity(key.attrs.len());
+        let mut binding_rates = Vec::with_capacity(key.attrs.len());
+        let mut binding_divisors: Vec<Option<vk::VertexInputBindingDivisorDescriptionKHR>> =
+            Vec::with_capacity(key.attrs.len());
         for attr in &key.attrs {
             let binding =
                 match ctx
@@ -2315,12 +2318,39 @@ impl ObjectCaches {
                 );
             }
             attribute_formats.push(binding.format);
+            // Vulkan has `VERTEX` and `INSTANCE` and nothing else, so the two
+            // tessellation step functions have no rate here at all. They are
+            // declined before a request reaches the engine — the translation
+            // layer refuses them by name — and the arm is a refusal rather
+            // than a panic because "unreachable" is a claim about a call site
+            // and this one is reached from two.
             let divisor = match attr.step_function {
                 VertexStepFunction::Constant => Some(0),
                 VertexStepFunction::PerVertex => None,
                 VertexStepFunction::PerInstance if attr.step_rate == 1 => None,
                 VertexStepFunction::PerInstance => Some(attr.step_rate),
+                step
+                @ (VertexStepFunction::PerPatch | VertexStepFunction::PerPatchControlPoint) => {
+                    let reason = super::reason::DrawReason::VertexStep(
+                        reims_vgpu_vulkan::vertex::Refusal::TessellationStep { step },
+                    );
+                    crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+                    let err = DrawError::Unsupported(reason);
+                    self.pipelines.insert_negative(key.clone(), err.clone());
+                    return Err(err);
+                }
             };
+            binding_divisors.push(divisor.map(|divisor| {
+                vk::VertexInputBindingDivisorDescriptionKHR::default()
+                    .binding(attr.binding)
+                    .divisor(divisor)
+            }));
+            // The rate the binding is created with, from the layer that owns
+            // which step functions have one.
+            binding_rates.push(
+                reims_vgpu_vulkan::vertex::input_rate(attr.step_function)
+                    .unwrap_or(vk::VertexInputRate::VERTEX),
+            );
             if divisor == Some(0) && !ctx.vertex_divisor.zero_divisor {
                 let err =
                     DrawError::Unsupported(super::reason::DrawReason::ConstantVertexAttribute);
@@ -2361,33 +2391,24 @@ impl ObjectCaches {
                 .module(frag_module)
                 .name(&main_c),
         ];
+        // Both lists were rebuilt here from `key.attrs` with the step function
+        // matched a second and a third time. They are built once, in the loop
+        // that already refused every step function without a rate, so the two
+        // spellings cannot answer differently for one attribute.
         let vertex_binding_descs: Vec<_> = key
             .attrs
             .iter()
-            .map(|attribute| {
+            .zip(&binding_rates)
+            .map(|(attribute, rate)| {
                 vk::VertexInputBindingDescription::default()
                     .binding(attribute.binding)
                     .stride(attribute.stride)
-                    .input_rate(translate::vertex::vk_input_rate(attribute.step_function))
+                    .input_rate(*rate)
             })
             .collect();
-        let vertex_binding_divisors: Vec<_> = key
-            .attrs
-            .iter()
-            .filter_map(|attribute| {
-                let divisor = match attribute.step_function {
-                    VertexStepFunction::Constant => 0,
-                    VertexStepFunction::PerVertex => return None,
-                    VertexStepFunction::PerInstance if attribute.step_rate == 1 => return None,
-                    VertexStepFunction::PerInstance => attribute.step_rate,
-                };
-                Some(
-                    vk::VertexInputBindingDivisorDescriptionKHR::default()
-                        .binding(attribute.binding)
-                        .divisor(divisor),
-                )
-            })
-            .collect();
+        // A divisor of one is what Vulkan already does, so declaring it would
+        // pull in the extension structure for nothing.
+        let vertex_binding_divisors: Vec<_> = binding_divisors.iter().flatten().copied().collect();
         let vertex_attribute_descs: Vec<_> = key
             .attrs
             .iter()
@@ -3308,7 +3329,7 @@ mod object_cache_tests {
     #[test]
     fn vertex_format_widening_names_both_formats_and_attribute() {
         use crate::observe::Decline as _;
-        let narrow = translate::vertex::vertex_layout(VertexAttributeFormat::UChar3Normalized).vk;
+        let narrow = reims_vgpu_vulkan::vertex::format(VertexAttributeFormat::UChar3Normalized);
         let binding = translate::VertexFormatSupport::with_unsupported(&[narrow])
             .resolve(VertexAttributeFormat::UChar3Normalized, 12, 32, || {
                 crate::runtime::spirv_vertex_input::InputWidth::Components(3)

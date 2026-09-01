@@ -1699,7 +1699,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // Asking `rate == 0` alone declined that guest's draw outright, for a
         // field nothing downstream reads. `protocol::vertex_step` owns the pair.
         if !crate::protocol::vertex_step::step_rate_in_contract(
-            attribute.step_function.mtl_ordinal(),
+            attribute.step_function.ordinal(),
             attribute.step_rate,
         ) {
             return Err(DrawError::DrawValidation(
@@ -1708,7 +1708,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        let format_size = attribute.format.byte_size();
+        let format_size = attribute.format.bytes();
         if attribute.stride < format_size {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::VertexStrideTooSmall {
@@ -1760,6 +1760,13 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                         })
                     })? as usize
                 }
+                // A tessellation step function fetches from a patch this rail
+                // never assembles, so there is no last element for it and no
+                // byte range to bound. The pipeline that would have bound it
+                // is refused before a draw reaches here; treating it as one
+                // record keeps the bound below the tightest one that is
+                // definitely safe rather than inventing a wider span.
+                VertexStepFunction::PerPatch | VertexStepFunction::PerPatchControlPoint => 0,
             }
         };
         let required = (attribute.stride as usize)

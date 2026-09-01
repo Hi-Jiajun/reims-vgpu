@@ -67,7 +67,6 @@
 use ash::vk;
 
 use super::reason::TranslateReason;
-use super::vertex::{self, VertexLayout};
 use crate::backend::vulkan::engine::VertexAttributeFormat;
 use crate::runtime::spirv_vertex_input::InputWidth;
 
@@ -144,84 +143,73 @@ impl VertexFormatSupport {
         stride: u32,
         shader_width: impl FnOnce() -> InputWidth,
     ) -> Result<VertexBinding, TranslateReason> {
-        let layout = vertex::vertex_layout(format);
-        if self.accepts(layout.vk) {
+        let native = reims_vgpu_vulkan::vertex::format(format);
+        if self.accepts(native) {
             return Ok(VertexBinding {
-                format: layout.vk,
+                format: native,
                 widened_from: None,
             });
         }
-        let Some(wide) = widened(&layout) else {
-            return Err(TranslateReason::FormatNotVertexBuffer(layout.vk.as_raw()));
+        // The format with the same channel kind and order and one more
+        // channel, which is a geometric relation the owning type states —
+        // components `0..count` sit at identical byte offsets in both, because
+        // these layouts are component-packed. Four-channel and packed formats
+        // have none, so they refuse.
+        let Some(wider) = format.widened() else {
+            return Err(TranslateReason::FormatNotVertexBuffer(native.as_raw()));
         };
+        let wide = reims_vgpu_vulkan::vertex::format(wider);
         // The substitute must itself be accepted, and the wider read must stay
         // inside the vertex. A stride of 0 means "one element, tightly packed"
         // in Metal's stage-in encoding and leaves no room to widen into.
-        let fits = stride > 0 && offset.saturating_add(wide.bytes) <= stride;
-        if !self.accepts(wide.vk) || !fits {
-            return Err(TranslateReason::FormatNotVertexBuffer(layout.vk.as_raw()));
+        let fits = stride > 0 && offset.saturating_add(wider.bytes()) <= stride;
+        if !self.accepts(wide) || !fits {
+            return Err(TranslateReason::FormatNotVertexBuffer(native.as_raw()));
         }
         // Asked last, so the two cheap structural questions above answer first
         // and a module is walked only for an attribute that would really be
         // substituted.
-        match widening_is_invisible(shader_width()) {
+        match widening_is_invisible(shader_width(), format.components()) {
             Ok(()) => Ok(VertexBinding {
-                format: wide.vk,
-                widened_from: Some(layout.vk),
+                format: wide,
+                widened_from: Some(native),
             }),
-            Err(reason) => Err(reason(layout.vk.as_raw())),
+            Err(reason) => Err(reason(native.as_raw())),
         }
     }
 }
 
-/// Whether substituting a four-component format changes what the shader reads.
+/// Whether substituting the wider sibling changes what the shader reads.
 ///
 /// One home for the rule the module doc tabulates, so a second caller cannot
 /// write a fourth version of it. Returns the constructor of the refusal rather
 /// than the refusal itself because the payload — the format the guest asked for
 /// — belongs to the caller.
-fn widening_is_invisible(width: InputWidth) -> Result<(), fn(i32) -> TranslateReason> {
+///
+/// `guest_components` is how many channels the *declared* format supplies, and
+/// it is the whole comparison. It used to be the literal `3`, which was correct
+/// only because the sibling lookup was itself restricted to three-channel
+/// formats: with the relation stated geometrically by the owning type, a
+/// declined one-channel format widens too, and a shader reading two channels of
+/// it would then read a real second component where Vulkan had been defaulting
+/// a zero.
+fn widening_is_invisible(
+    width: InputWidth,
+    guest_components: u32,
+) -> Result<(), fn(i32) -> TranslateReason> {
     match width {
         // Vulkan discards components an attribute format supplies past the
-        // shader's declared width, so the oversupplied fourth is never read.
-        InputWidth::Components(n) if n <= 3 => Ok(()),
+        // shader's declared width, so what the substitute oversupplies is
+        // never read.
+        InputWidth::Components(n) if n <= guest_components => Ok(()),
         // The shader reads a component the guest's own format would have had
-        // Vulkan default to 1.0.
+        // Vulkan default for it.
         InputWidth::Components(_) => Err(TranslateReason::VertexFormatWidenReadAsFour),
         // The vertex descriptor describes an attribute this shader does not
         // declare. Nothing reads the substitute, so nothing can tell.
         InputWidth::Absent => Ok(()),
         InputWidth::Unreadable => Err(TranslateReason::VertexFormatWidenShaderUnreadable),
     }
-}
-
-/// The mandatory four-component sibling of a three-component vertex format.
-///
-/// `None` for anything else: two- and four-component formats are already
-/// mandatory, and the packed 32-bit formats have no wider sibling that keeps
-/// their bit layout.
-fn widened(layout: &VertexLayout) -> Option<VertexLayout> {
-    if layout.components != 3 {
-        return None;
-    }
-    let (vk, bytes) = match layout.vk {
-        vk::Format::R8G8B8_UINT => (vk::Format::R8G8B8A8_UINT, 4),
-        vk::Format::R8G8B8_UNORM => (vk::Format::R8G8B8A8_UNORM, 4),
-        vk::Format::R8G8B8_SNORM => (vk::Format::R8G8B8A8_SNORM, 4),
-        vk::Format::R16G16B16_UINT => (vk::Format::R16G16B16A16_UINT, 8),
-        vk::Format::R16G16B16_UNORM => (vk::Format::R16G16B16A16_UNORM, 8),
-        vk::Format::R16G16B16_SNORM => (vk::Format::R16G16B16A16_SNORM, 8),
-        vk::Format::R16G16B16_SFLOAT => (vk::Format::R16G16B16A16_SFLOAT, 8),
-        // R32G32B32_* are already mandatory, and the packed 32-bit
-        // three-component formats (B10G11R11, E5B9G9R9) occupy one word with no
-        // wider equivalent — widening either would change the bit layout.
-        _ => return None,
-    };
-    Some(VertexLayout {
-        vk,
-        bytes,
-        components: 4,
-    })
 }
 
 /// Every `VkFormat` a vertex attribute can resolve to, derived from the
@@ -233,25 +221,14 @@ fn emittable_formats() -> Vec<vk::Format> {
             out.push(f);
         }
     };
-    for format in ALL_ATTRIBUTE_FORMATS.iter() {
-        let layout = vertex::vertex_layout(*format);
-        push(layout.vk);
-        if let Some(wide) = widened(&layout) {
-            push(wide.vk);
+    for format in VertexAttributeFormat::ALL {
+        push(reims_vgpu_vulkan::vertex::format(format));
+        if let Some(wider) = format.widened() {
+            push(reims_vgpu_vulkan::vertex::format(wider));
         }
     }
     out
 }
-
-/// Every attribute format, reachable from the wire decode. Derived by walking
-/// the `MTLVertexFormat` range rather than restating the enum, so a new format
-/// joins the probe automatically.
-static ALL_ATTRIBUTE_FORMATS: std::sync::LazyLock<Vec<VertexAttributeFormat>> =
-    std::sync::LazyLock::new(|| {
-        (0..=64u32)
-            .filter_map(|m| vertex::attribute_format(m).ok())
-            .collect()
-    });
 
 #[cfg(test)]
 mod tests {
@@ -270,19 +247,19 @@ mod tests {
     #[test]
     fn the_probe_covers_every_emittable_format() {
         let probed = emittable_formats();
-        for format in ALL_ATTRIBUTE_FORMATS.iter() {
-            let layout = vertex::vertex_layout(*format);
-            assert!(probed.contains(&layout.vk), "{format:?} missing from probe");
-            if let Some(wide) = widened(&layout) {
+        for format in VertexAttributeFormat::ALL {
+            let native = reims_vgpu_vulkan::vertex::format(format);
+            assert!(probed.contains(&native), "{format:?} missing from probe");
+            if let Some(wider) = format.widened() {
                 assert!(
-                    probed.contains(&wide.vk),
+                    probed.contains(&reims_vgpu_vulkan::vertex::format(wider)),
                     "{format:?} widening target missing from probe"
                 );
             }
         }
         // 53 attribute formats collapse onto far fewer distinct Vulkan formats.
         assert!(probed.len() >= 30, "probed {}", probed.len());
-        assert_eq!(ALL_ATTRIBUTE_FORMATS.len(), 53);
+        assert_eq!(VertexAttributeFormat::ALL.len(), 53);
     }
 
     /// On a device that accepts everything — every host this project has run on
@@ -290,15 +267,26 @@ mod tests {
     #[test]
     fn a_permissive_device_widens_nothing() {
         let support = VertexFormatSupport::default();
-        for format in ALL_ATTRIBUTE_FORMATS.iter() {
+        for format in VertexAttributeFormat::ALL.iter() {
             let binding = support.resolve(*format, 0, 64, three).unwrap();
-            assert_eq!(binding.format, vertex::vk_format(*format), "{format:?}");
+            assert_eq!(
+                binding.format,
+                reims_vgpu_vulkan::vertex::format(*format),
+                "{format:?}"
+            );
             assert_eq!(binding.widened_from, None, "{format:?}");
         }
     }
 
     /// The nine three-component 8/16-bit attribute formats are exactly the ones
-    /// Vulkan does not require, and exactly the ones that can widen.
+    /// Vulkan does not require, and exactly the ones a real host widens.
+    ///
+    /// The sibling *relation* is wider than that and deliberately so: it is
+    /// geometry, stated by the owning type, and every format below four
+    /// channels has one. What makes these nine the widening set is that they
+    /// are the ones a device can decline — the rest are mandatory, so the
+    /// substitution is never reached for them. Asserted through `resolve`
+    /// rather than through the relation, because the relation is not the claim.
     #[test]
     fn the_nine_optional_three_component_formats_can_widen() {
         use VertexAttributeFormat as F;
@@ -314,16 +302,70 @@ mod tests {
             F::Half3,
         ];
         assert_eq!(optional.len(), 9);
-        let widenable: Vec<F> = ALL_ATTRIBUTE_FORMATS
-            .iter()
-            .copied()
-            .filter(|f| widened(&vertex::vertex_layout(*f)).is_some())
-            .collect();
-        assert_eq!(widenable, optional);
-        // The 32-bit three-component formats are mandatory, so they do not and
-        // need not widen.
+        for format in optional {
+            let declined =
+                VertexFormatSupport::with_unsupported(&[reims_vgpu_vulkan::vertex::format(format)]);
+            let binding = declined
+                .resolve(format, 0, 64, three)
+                .unwrap_or_else(|reason| panic!("{format:?} must widen, got {reason:?}"));
+            assert_eq!(
+                binding.widened_from,
+                Some(reims_vgpu_vulkan::vertex::format(format)),
+                "{format:?}"
+            );
+            assert_eq!(
+                binding.format,
+                reims_vgpu_vulkan::vertex::format(format.widened().expect("a wider sibling")),
+                "{format:?}"
+            );
+        }
+        // The 32-bit three-component formats are mandatory, so the
+        // substitution is never reached for them — asserted through what a
+        // real device answers rather than through the sibling relation, which
+        // is geometry and gives them one like it gives every format below four
+        // channels one.
         for f in [F::Float3, F::Int3, F::UInt3] {
-            assert!(widened(&vertex::vertex_layout(f)).is_none(), "{f:?}");
+            assert!(f.widened().is_some(), "{f:?}");
+            assert_eq!(
+                VertexFormatSupport::default()
+                    .resolve(f, 0, 64, three)
+                    .unwrap()
+                    .widened_from,
+                None
+            );
+        }
+    }
+
+    /// A shader may not read more channels than the guest's own format
+    /// supplies, whatever that format's channel count is.
+    ///
+    /// The rule was written as the literal `3`, which was right only while the
+    /// sibling lookup was itself restricted to three-channel formats. A
+    /// one-channel format widened under that rule would let a shader reading
+    /// two channels see a real second component where Vulkan had been
+    /// defaulting a zero — no refusal, no log line, a wrong vertex stream.
+    #[test]
+    fn a_shader_may_not_read_past_the_channels_the_guest_declared() {
+        use VertexAttributeFormat as F;
+        let two = || InputWidth::Components(2);
+        for (format, channels) in [(F::Half, 1u32), (F::Half2, 2), (F::Half3, 3)] {
+            let declined =
+                VertexFormatSupport::with_unsupported(&[reims_vgpu_vulkan::vertex::format(format)]);
+            let resolved = declined.resolve(format, 0, 64, two);
+            if channels >= 2 {
+                assert!(
+                    resolved.is_ok_and(|b| b.widened_from.is_some()),
+                    "{format:?} supplies {channels} and the shader reads two"
+                );
+            } else {
+                assert_eq!(
+                    resolved.unwrap_err(),
+                    TranslateReason::VertexFormatWidenReadAsFour(
+                        reims_vgpu_vulkan::vertex::format(format).as_raw()
+                    ),
+                    "{format:?} supplies one channel and the shader reads two"
+                );
+            }
         }
     }
 
@@ -494,7 +536,7 @@ mod tests {
         };
 
         let permissive = VertexFormatSupport::default();
-        for format in ALL_ATTRIBUTE_FORMATS.iter() {
+        for format in VertexAttributeFormat::ALL.iter() {
             permissive.resolve(*format, 0, 64, ask).unwrap();
         }
         assert_eq!(asked.get(), 0, "a permissive device consulted the shader");

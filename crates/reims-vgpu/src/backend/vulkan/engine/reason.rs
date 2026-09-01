@@ -179,6 +179,13 @@ pub enum DrawReason {
     /// The primary colour attachment has no faithful Vulkan format on this
     /// backend. Carries the translation reason so the refusal keeps one name.
     ColorAttachmentFormat(TranslateReason),
+    /// The guest's attribute names a step function that only means something
+    /// inside a tessellation pipeline, and this rail builds none.
+    ///
+    /// Recognised and declined for what it is, which is the distinction the
+    /// owning layer draws: reporting it as an unknown value would say the
+    /// stream was malformed when it was not.
+    VertexStep(reims_vgpu_vulkan::vertex::Refusal),
     /// The device declines this vertex attribute format and no portable
     /// substitute fits. Carries the translation-layer reason so the two log
     /// lines agree on why.
@@ -357,6 +364,7 @@ impl crate::observe::Decline for DrawReason {
             }
             Self::SamplerDeclaration(refusal) => Decline::slug(refusal),
             Self::SamplerDevice(refusal) => refusal.slug(),
+            Self::VertexStep(refusal) => refusal.slug(),
             Self::BlendDeclaration(refusal) => Decline::slug(refusal),
             Self::BlendDevice(refusal) => refusal.slug(),
             Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
@@ -512,6 +520,7 @@ impl std::fmt::Display for DrawReason {
             // The rail's own refusal already spells its slug and its fields;
             // printing it whole keeps one event to one reading.
             Self::BlendDevice(refusal) => write!(f, " {refusal}"),
+            Self::VertexStep(refusal) => write!(f, " {refusal}"),
             // Same: the surface's answer is only actionable with what it
             // offered, which the rail's refusal spells.
             Self::SwapchainSurface(refusal) => write!(f, " {refusal}"),
@@ -740,6 +749,9 @@ mod tests {
         ),
         DrawReason::SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal::NoOpaqueComposite {
             supported: ash::vk::CompositeAlphaFlagsKHR::empty(),
+        }),
+        DrawReason::VertexStep(reims_vgpu_vulkan::vertex::Refusal::TessellationStep {
+            step: reims_vgpu_core::vertex_step::StepFunction::PerPatch,
         }),
         DrawReason::BlendDeclaration(reims_vgpu_core::blend::BlendRefusal::UnknownOrdinal {
             field: "src_rgb",

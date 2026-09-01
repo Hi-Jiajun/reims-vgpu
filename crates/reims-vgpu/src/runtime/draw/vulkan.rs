@@ -6791,14 +6791,14 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
 pub(super) fn prepare_vertex_attribute_format(
     attribute: &crate::runtime::decode::resource::VertexAttribute,
 ) -> Result<crate::backend::vulkan::engine::VertexAttributeFormat, DrawPreparationDecline> {
-    translate::vertex::attribute_format(attribute.format).map_err(|reason| {
+    reims_vgpu_core::vertex_format::VertexFormat::parse(attribute.format).ok_or(
         DrawPreparationDecline::VertexAttributeFormat {
             location: attribute.location,
             buffer_index: attribute.buffer_index,
             raw_format: attribute.format,
-            reason,
-        }
-    })
+            reason: translate::reason::TranslateReason::UnknownVertexFormat(attribute.format),
+        },
+    )
 }
 
 pub(super) fn prepare_vertex_step_function(

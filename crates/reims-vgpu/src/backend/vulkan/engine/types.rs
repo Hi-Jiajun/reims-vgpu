@@ -964,107 +964,26 @@ pub struct IndexedDrawResource {
     pub content: BufferContent,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum VertexAttributeFormat {
-    UChar2,
-    UChar3,
-    UChar4,
-    Char2,
-    Char3,
-    Char4,
-    UChar2Normalized,
-    UChar3Normalized,
-    UChar4Normalized,
-    Char2Normalized,
-    Char3Normalized,
-    Char4Normalized,
-    UShort2,
-    UShort3,
-    UShort4,
-    Short2,
-    Short3,
-    Short4,
-    UShort2Normalized,
-    UShort3Normalized,
-    UShort4Normalized,
-    Short2Normalized,
-    Short3Normalized,
-    Short4Normalized,
-    Half2,
-    Half3,
-    Half4,
-    Float,
-    Float2,
-    Float3,
-    Float4,
-    Int,
-    Int2,
-    Int3,
-    Int4,
-    UInt,
-    UInt2,
-    UInt3,
-    UInt4,
-    Int1010102Normalized,
-    UInt1010102Normalized,
-    UChar4NormalizedBgra,
-    UChar,
-    Char,
-    UCharNormalized,
-    CharNormalized,
-    UShort,
-    Short,
-    UShortNormalized,
-    ShortNormalized,
-    Half,
-    FloatRg11B10,
-    FloatRgb9E5,
-}
+/// `MTLVertexFormat`, parsed.
+///
+/// [`reims_vgpu_core::vertex_format::VertexFormat`] under this crate's name for
+/// it. It used to be a second fifty-three-arm enumeration beside that one, with
+/// the byte size and the Vulkan spelling in a table of its own — and those two
+/// are the same fact stated twice, because a `Short3` occupies six bytes
+/// *because* it is three 16-bit components, which is also why it is
+/// `R16G16B16_UINT`. The owning layer states the size and the component count;
+/// [`reims_vgpu_vulkan::vertex::format`] states the spelling.
+pub use reims_vgpu_core::vertex_format::VertexFormat as VertexAttributeFormat;
 
-impl VertexAttributeFormat {
-    /// Deliberately no `vk_format()` here. An attribute's Vulkan format is not
-    /// a property of the attribute alone: Vulkan makes the three-component
-    /// 8/16-bit formats optional, so the bindable format depends on the device
-    /// and on whether the attribute's stride leaves room for a wider
-    /// substitute. Ask `translate::support::VertexFormatSupport::resolve`,
-    /// which answers both at once; `translate::vertex::vk_format` gives the
-    /// device-independent spelling for tables and tests.
-    ///
-    /// Bytes this attribute occupies in the guest's vertex buffer.
-    ///
-    /// Stated beside the Vulkan format in one table so the two cannot drift —
-    /// they are the same fact twice, and held apart they diverge into a stride
-    /// bug nobody is looking for.
-    pub fn byte_size(self) -> u32 {
-        translate::vertex::byte_size(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum VertexStepFunction {
-    Constant,
-    #[default]
-    PerVertex,
-    PerInstance,
-}
-
-impl VertexStepFunction {
-    /// The `MTLVertexStepFunction` ordinal this engine step came from.
-    ///
-    /// The inverse of [`translate::vertex::step_function`], which is where the
-    /// three accepted ordinals are chosen and where the round trip is pinned.
-    /// It exists so a rule stated over the *wire* value — the step/rate pair in
-    /// [`crate::protocol::vertex_step`] — can be asked on this side without a
-    /// second copy of the mapping.
-    pub fn mtl_ordinal(self) -> u32 {
-        use crate::protocol::vertex_step as step;
-        match self {
-            Self::Constant => step::MTL_VERTEX_STEP_FUNCTION_CONSTANT,
-            Self::PerVertex => step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
-            Self::PerInstance => step::MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE,
-        }
-    }
-}
+/// `MTLVertexStepFunction`, parsed.
+///
+/// All five of them, where this crate's own enumeration held three and the
+/// tessellation pair were refusals in the translation table. They are
+/// recognised values that this rail declines — see
+/// [`reims_vgpu_vulkan::vertex::input_rate`], which is where the decline
+/// happens now, because whether a step function has a `VkVertexInputRate` is a
+/// fact about Vulkan and not about `MTLVertexStepFunction`.
+pub use reims_vgpu_core::vertex_step::StepFunction as VertexStepFunction;
 
 #[derive(Debug)]
 pub struct VertexAttributeResource {
