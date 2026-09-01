@@ -27,9 +27,12 @@
 //! one payload, and every class it has *not* judged maps to none.
 
 use crate::access::AccessIntent;
-use crate::identity::{
-    ChannelId, ChannelSequence, CompletionStamp, IngressOrdinal, SessionGeneration, StampWait,
-};
+use crate::control::ControlOp;
+use crate::exec::ExecWork;
+use crate::identity::{CompletionStamp, StampWait, TransactionIdentity};
+use crate::lifecycle::LifecycleOp;
+use crate::present::PresentForm;
+use crate::query::QueryRequest;
 use reims_vgpu_protocol::closure::Closure;
 use reims_vgpu_protocol::packets::{find, Channel};
 
@@ -138,6 +141,95 @@ pub fn is_acknowledged_noop(channel: Channel, opcode: u16) -> bool {
     )
 }
 
+/// What a transaction carries, and what it touches.
+///
+/// # The class was a discriminant, and a discriminant executes nothing
+///
+/// [`PayloadClass`] answers "which kind of work is this" at ingress, before
+/// anything is decoded. It is not the work. A `DeviceTransaction` that carried
+/// only the class named a packet it could not describe: an executor holding one
+/// had to go back to the bytes, and every access the packet made had to be
+/// stated *beside* the class in a list nothing tied to it.
+///
+/// That "beside" is the defect. An envelope with its own `accesses` field and a
+/// payload with its own contents are two descriptions of one packet that can
+/// disagree — a delete whose envelope named a backing its op did not, an EXEC
+/// whose envelope listed accesses its records never made. Both were
+/// representable, and a hazard edge built from the wrong one is a race rather
+/// than a slowdown.
+///
+/// So the payload owns what it touches, and [`Self::accesses`] is the only way
+/// to ask. There is one list per transaction and the payload is holding it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Payload {
+    /// The GPU-work transaction. Its accesses are its records', collected by
+    /// [`crate::exec::ExecBuilder`] as they resolved; nothing else may add to
+    /// them.
+    Exec(ExecWork),
+    /// One lifetime operation, and the resources it touches as the namespace
+    /// that owns them resolved.
+    ResourceLifecycle {
+        op: LifecycleOp,
+        accesses: Vec<AccessIntent>,
+    },
+    /// A question, and the write its answer will make.
+    Query {
+        request: QueryRequest,
+        accesses: Vec<AccessIntent>,
+    },
+    /// Which of the three present commands, and the frame it reads.
+    Present {
+        form: PresentForm,
+        accesses: Vec<AccessIntent>,
+    },
+    /// A control operation. **No access list, and that is a contract claim
+    /// rather than an omission**: opening a channel, moving a cursor, acking a
+    /// display and doing nothing all touch no guest resource, so a control
+    /// packet that appeared to have one would be a decode error somewhere
+    /// upstream. Held to by `control_transactions_touch_no_resource`.
+    Control(ControlOp),
+}
+
+impl Payload {
+    /// Which class this is.
+    #[must_use]
+    pub const fn class(&self) -> PayloadClass {
+        match self {
+            Self::Exec(_) => PayloadClass::Exec,
+            Self::ResourceLifecycle { .. } => PayloadClass::ResourceLifecycle,
+            Self::Query { .. } => PayloadClass::Query,
+            Self::Present { .. } => PayloadClass::Present,
+            Self::Control(_) => PayloadClass::Control,
+        }
+    }
+
+    /// Everything this transaction touches, at the precision the contract
+    /// supplied.
+    ///
+    /// Empty is a claim — that the transaction touches no resource — and not an
+    /// absence of information; imprecision is
+    /// [`crate::access::AccessKey::DomainOnly`].
+    #[must_use]
+    pub fn accesses(&self) -> &[AccessIntent] {
+        match self {
+            Self::Exec(work) => &work.accesses,
+            Self::ResourceLifecycle { accesses, .. }
+            | Self::Query { accesses, .. }
+            | Self::Present { accesses, .. } => accesses,
+            Self::Control(_) => &[],
+        }
+    }
+
+    /// The EXEC work, for the executor that is the only reader entitled to it.
+    #[must_use]
+    pub const fn exec(&self) -> Option<&ExecWork> {
+        match self {
+            Self::Exec(work) => Some(work),
+            _ => None,
+        }
+    }
+}
+
 /// One accepted packet, with everything the model needs and nothing a host
 /// would.
 ///
@@ -148,16 +240,10 @@ pub fn is_acknowledged_noop(channel: Channel, opcode: u16) -> bool {
 /// [`Self::accesses`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeviceTransaction {
-    /// The semantic lifetime this was accepted in. A reset opens a new one and
-    /// does not invalidate this.
-    pub session: SessionGeneration,
-    /// The submission ordering domain.
-    pub channel: ChannelId,
-    /// Position within that domain.
-    pub channel_sequence: ChannelSequence,
-    /// Position in the device's single arrival order. Assigned once and never
-    /// re-derived; see [`crate::depend`] for what that buys.
-    pub ingress: IngressOrdinal,
+    /// Where this packet sits, in every order the device keeps. Assigned by
+    /// [`crate::session::SessionModel::admit`], which is the only service that
+    /// observes arrival — see [`TransactionIdentity`].
+    pub identity: TransactionIdentity,
     /// Points that must be published before this may begin. Decoded at ingress
     /// and before any packet side effect, because a packet that acted and then
     /// discovered it had to wait has already happened.
@@ -165,12 +251,36 @@ pub struct DeviceTransaction {
     /// What this publishes when its work has completed, if it publishes
     /// anything.
     pub completion: Option<CompletionStamp>,
-    pub payload: PayloadClass,
-    /// Everything this transaction touches, at the precision the contract
-    /// supplied. Empty is a claim — that the transaction touches no resource —
-    /// and not an absence of information; imprecision is
-    /// [`crate::access::AccessKey::DomainOnly`].
-    pub accesses: Vec<AccessIntent>,
+    /// The work, and everything it touches. There is no access list beside it;
+    /// see [`Payload`].
+    pub payload: Payload,
+}
+
+impl DeviceTransaction {
+    /// Everything this transaction touches.
+    #[must_use]
+    pub fn accesses(&self) -> &[AccessIntent] {
+        self.payload.accesses()
+    }
+
+    /// Which class of work this is.
+    #[must_use]
+    pub const fn class(&self) -> PayloadClass {
+        self.payload.class()
+    }
+
+    /// This transaction as the executor sees it, when it is GPU work.
+    ///
+    /// Derived, not stored. The identity is this envelope's and the work is
+    /// this envelope's payload, so there is no copy to keep in step — which is
+    /// the whole reason [`crate::exec::ExecTransaction`] borrows.
+    #[must_use]
+    pub const fn exec(&self) -> Option<crate::exec::ExecTransaction<'_>> {
+        match self.payload.exec() {
+            Some(work) => Some(work.stamp(self.identity)),
+            None => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -285,6 +395,7 @@ mod tests {
     fn every_judged_packet_reaches_a_class_and_a_meaning_within_it() {
         use crate::control::ControlKind;
         use crate::lifecycle::LifecycleKind;
+        use crate::present::PresentForm;
         use crate::query::QueryKind;
         let mut counts = [0usize; 5];
         for p in LEDGER {
@@ -296,10 +407,7 @@ mod tests {
                 PayloadClass::ResourceLifecycle => LifecycleKind::of(p.channel, p.opcode).is_some(),
                 PayloadClass::Query => QueryKind::of(p.channel, p.opcode).is_some(),
                 PayloadClass::Control => ControlKind::of(p.channel, p.opcode).is_some(),
-                // The present forms are enumerated in `classify` itself and
-                // their behavior is `crate::present`'s stream rather than a
-                // per-opcode meaning, so reaching the class is the whole claim.
-                PayloadClass::Present => true,
+                PayloadClass::Present => PresentForm::of(p.channel, p.opcode).is_some(),
             };
             assert!(
                 named,

@@ -49,11 +49,13 @@
 //! batches.
 
 use reims_vgpu_core::access::{AccessIntent, AccessKey, AccessMode, BackingId, ResourceKey};
+use reims_vgpu_core::exec::ExecWork;
 use reims_vgpu_core::identity::{
     ChannelId, CompletionStamp, IngressOrdinal, SessionId, StampSlot, StampValue, StampWait,
 };
 use reims_vgpu_core::session::{Packet, SessionModel};
 use reims_vgpu_core::submit::{Admission, PhysicalQueue, QueueMap, SubmitGate};
+use reims_vgpu_core::transaction::Payload;
 use reims_vgpu_protocol::packets::Channel;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -231,21 +233,24 @@ fn drive(seed: u64, count: usize, channels: u32, queues: u32, policy: Policy) ->
                 .into_iter()
                 .collect(),
             completion: spec.completion,
-            accesses: vec![AccessIntent {
-                key: AccessKey::Whole(ResourceKey {
-                    backing: BackingId(spec.backing),
-                    heap: None,
-                }),
-                mode: spec.mode,
-                domain: spec.channel,
-                api_stages: 0,
-                input_content_version: None,
-                output_content_version: None,
-            }],
+            payload: Payload::Exec(ExecWork {
+                accesses: vec![AccessIntent {
+                    key: AccessKey::Whole(ResourceKey {
+                        backing: BackingId(spec.backing),
+                        heap: None,
+                    }),
+                    mode: spec.mode,
+                    domain: spec.channel,
+                    api_stages: 0,
+                    input_content_version: None,
+                    output_content_version: None,
+                }],
+                ..ExecWork::default()
+            }),
             pipeline_waits: Vec::new(),
         };
         let admitted = model.admit(&packet).expect("a well-formed EXEC");
-        let ordinal = admitted.transaction.ingress;
+        let ordinal = admitted.transaction.identity.ingress;
         let producers: Vec<IngressOrdinal> = spec
             .wait
             .filter(|_| spec.forwarded)
@@ -411,23 +416,27 @@ fn order(seed: u64, policy: Policy) -> Vec<u64> {
                 .into_iter()
                 .collect(),
             completion: spec.completion,
-            accesses: vec![AccessIntent {
-                key: AccessKey::Whole(ResourceKey {
-                    backing: BackingId(spec.backing),
-                    heap: None,
-                }),
-                mode: spec.mode,
-                domain: spec.channel,
-                api_stages: 0,
-                input_content_version: None,
-                output_content_version: None,
-            }],
+            payload: Payload::Exec(ExecWork {
+                accesses: vec![AccessIntent {
+                    key: AccessKey::Whole(ResourceKey {
+                        backing: BackingId(spec.backing),
+                        heap: None,
+                    }),
+                    mode: spec.mode,
+                    domain: spec.channel,
+                    api_stages: 0,
+                    input_content_version: None,
+                    output_content_version: None,
+                }],
+                ..ExecWork::default()
+            }),
             pipeline_waits: Vec::new(),
         };
         let ordinal = model
             .admit(&packet)
             .expect("well-formed")
             .transaction
+            .identity
             .ingress;
         let producers: Vec<IngressOrdinal> = spec
             .wait

@@ -406,7 +406,11 @@ mod tests {
     }
 
     /// A packet that waits for `waits` (event, value) and signals `signals`.
-    fn packet(ingress: u64, waits: &[(u32, u64)], signals: &[(u32, u64)]) -> ExecTransaction {
+    fn packet(
+        ingress: u64,
+        waits: &[(u32, u64)],
+        signals: &[(u32, u64)],
+    ) -> crate::testing::Stamped {
         let mut b = builder(ingress);
         for &(event, value) in waits {
             b.require(Prerequisite::Event {
@@ -439,8 +443,8 @@ mod tests {
     #[test]
     fn a_wait_answered_by_a_later_packet_is_an_edge_that_points_forwards() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(1, &[(7, 4)], &[]));
-        g.admit(&packet(2, &[], &[(7, 4)]));
+        g.admit(&packet(1, &[(7, 4)], &[]).view());
+        g.admit(&packet(2, &[], &[(7, 4)]).view());
         assert_eq!(
             g.edges(),
             vec![(
@@ -459,8 +463,8 @@ mod tests {
     #[test]
     fn a_wait_no_admitted_packet_produces_is_unproduced() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(1, &[(7, 4)], &[]));
-        g.admit(&packet(2, &[], &[(7, 3)]));
+        g.admit(&packet(1, &[(7, 4)], &[]).view());
+        g.admit(&packet(2, &[], &[(7, 3)]).view());
         assert_eq!(
             g.diagnose(),
             vec![Diagnosis::Unproduced {
@@ -481,7 +485,7 @@ mod tests {
             event: res(7),
             value: 9,
         });
-        g.admit(&packet(1, &[(7, 4)], &[]));
+        g.admit(&packet(1, &[(7, 4)], &[]).view());
         assert!(g.edges().is_empty());
         assert!(g.diagnose().is_empty());
     }
@@ -490,8 +494,8 @@ mod tests {
     #[test]
     fn two_packets_waiting_on_each_other_are_a_cycle() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(1, &[(8, 1)], &[(7, 1)]));
-        g.admit(&packet(2, &[(7, 1)], &[(8, 1)]));
+        g.admit(&packet(1, &[(8, 1)], &[(7, 1)]).view());
+        g.admit(&packet(2, &[(7, 1)], &[(8, 1)]).view());
         let cycles: Vec<_> = g
             .diagnose()
             .into_iter()
@@ -507,7 +511,7 @@ mod tests {
     #[test]
     fn a_packet_waiting_for_its_own_signal_is_a_one_member_cycle() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(1, &[(7, 1)], &[(7, 1)]));
+        g.admit(&packet(1, &[(7, 1)], &[(7, 1)]).view());
         assert_eq!(
             g.diagnose(),
             vec![Diagnosis::Cycle {
@@ -525,9 +529,9 @@ mod tests {
     #[test]
     fn a_three_packet_wait_chain_is_not_a_cycle() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(1, &[(7, 1)], &[]));
-        g.admit(&packet(2, &[(8, 1)], &[(7, 1)]));
-        g.admit(&packet(3, &[], &[(8, 1)]));
+        g.admit(&packet(1, &[(7, 1)], &[]).view());
+        g.admit(&packet(2, &[(8, 1)], &[(7, 1)]).view());
+        g.admit(&packet(3, &[], &[(8, 1)]).view());
         assert!(g.diagnose().is_empty(), "a chain terminates");
     }
 
@@ -536,8 +540,8 @@ mod tests {
     #[test]
     fn retiring_a_producer_keeps_the_wait_it_answered_answered() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(2, &[], &[(7, 4)]));
-        g.admit(&packet(1, &[(7, 4)], &[]));
+        g.admit(&packet(2, &[], &[(7, 4)]).view());
+        g.admit(&packet(1, &[(7, 4)], &[]).view());
         g.retire(IngressOrdinal(2));
         assert_eq!(g.len(), 1);
         assert!(
@@ -563,7 +567,7 @@ mod tests {
             slot: StampSlot(2),
             value: StampValue(1),
         });
-        g.admit(&waiter);
+        g.admit(&waiter.view());
         assert!(
             g.diagnose().is_empty(),
             "1 follows u32::MAX on a wrapping timeline"
@@ -577,7 +581,7 @@ mod tests {
         b.require(Prerequisite::Fence { fence: res(3) });
         let tx = b.finish().expect("frozen");
         let mut g = WaitGraph::new();
-        g.admit(&tx);
+        g.admit(&tx.view());
         assert!(g.edges().is_empty());
         assert!(
             g.diagnose().is_empty(),
@@ -601,8 +605,8 @@ mod tests {
         let producer = producer.finish().expect("frozen");
 
         let mut g = WaitGraph::new();
-        g.admit(&waiter);
-        g.admit(&producer);
+        g.admit(&waiter.view());
+        g.admit(&producer.view());
         assert_eq!(g.edges().len(), 1);
         assert!(g.diagnose().is_empty());
     }

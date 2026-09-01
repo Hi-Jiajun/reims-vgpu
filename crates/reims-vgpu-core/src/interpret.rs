@@ -481,7 +481,10 @@ mod tests {
                 slot: StampSlot(3),
                 value: StampValue(value),
             });
-            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+            assert_eq!(
+                interp.run(&b.finish().expect("frozen").view()),
+                Outcome::Ran
+            );
         }
         assert_eq!(
             interp.trace(),
@@ -511,7 +514,10 @@ mod tests {
                 slot: StampSlot(3),
                 value: StampValue(value),
             });
-            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+            assert_eq!(
+                interp.run(&b.finish().expect("frozen").view()),
+                Outcome::Ran
+            );
         }
         assert_eq!(interp.trace().len(), 4, "every step advanced");
         assert_eq!(interp.stamp(StampSlot(3)), Some(StampValue(1)));
@@ -534,7 +540,7 @@ mod tests {
         let tx = b.finish().expect("frozen");
 
         let mut interp = Interpreter::new();
-        assert_eq!(interp.run(&tx), Outcome::Ran);
+        assert_eq!(interp.run(&tx.view()), Outcome::Ran);
         assert_eq!(
             interp.trace(),
             &[
@@ -573,14 +579,14 @@ mod tests {
 
         let mut early = Interpreter::new();
         assert_eq!(
-            early.run(&waiter),
+            early.run(&waiter.view()),
             Outcome::Refused(Refusal::UnmeetableWait),
             "nothing has published slot 1"
         );
 
         let mut ordered = Interpreter::new();
-        assert_eq!(ordered.run(&producer), Outcome::Ran);
-        assert_eq!(ordered.run(&waiter), Outcome::Ran);
+        assert_eq!(ordered.run(&producer.view()), Outcome::Ran);
+        assert_eq!(ordered.run(&waiter.view()), Outcome::Ran);
         assert_eq!(ordered.census(), (2, 0));
     }
 
@@ -604,7 +610,7 @@ mod tests {
         let tx = b.finish().expect("frozen");
 
         let mut interp = Interpreter::new();
-        interp.run(&tx);
+        interp.run(&tx.view());
         assert_eq!(
             interp.trace(),
             &[
@@ -639,7 +645,7 @@ mod tests {
         let producer = producer.finish().expect("frozen");
 
         let mut interp = Interpreter::new();
-        interp.run(&producer);
+        interp.run(&producer.view());
 
         for (value, expected) in [(4u64, Outcome::Ran), (5, Outcome::Ran)] {
             let mut b = builder(2);
@@ -647,7 +653,7 @@ mod tests {
                 event: res(4),
                 value,
             });
-            assert_eq!(interp.run(&b.finish().expect("frozen")), expected);
+            assert_eq!(interp.run(&b.finish().expect("frozen").view()), expected);
         }
         let mut b = builder(3);
         b.require(Prerequisite::Event {
@@ -655,7 +661,7 @@ mod tests {
             value: 6,
         });
         assert_eq!(
-            interp.run(&b.finish().expect("frozen")),
+            interp.run(&b.finish().expect("frozen").view()),
             Outcome::Refused(Refusal::UnmeetableWait)
         );
     }
@@ -683,7 +689,7 @@ mod tests {
             },
             Replica::GuestPages,
         );
-        interp.run(&tx);
+        interp.run(&tx.view());
         assert!(interp.content.is_fresh(
             BackingId(9),
             ByteRange {
@@ -761,7 +767,7 @@ mod tests {
         }));
         let tx = b.finish().expect("frozen");
         let mut interp = Interpreter::new();
-        interp.run(&tx);
+        interp.run(&tx.view());
         assert_eq!(
             interp.trace(),
             &[Observation::Refused {
@@ -780,7 +786,7 @@ mod tests {
         let mut interp = Interpreter::new();
         interp.reset();
         assert_eq!(
-            interp.run(&tx),
+            interp.run(&tx.view()),
             Outcome::Refused(Refusal::StaleGeneration),
             "the transaction was built in the first generation"
         );
@@ -803,7 +809,7 @@ mod tests {
         });
         let tx = b.finish().expect("frozen");
         let mut interp = Interpreter::new();
-        interp.run(&tx);
+        interp.run(&tx.view());
         interp.reset();
         assert_eq!(interp.stamp(StampSlot(2)), Some(StampValue(4)));
         assert_ne!(interp.generation(), SessionGeneration::FIRST);
@@ -833,8 +839,8 @@ mod tests {
         let tx = make();
         let mut a = Interpreter::new();
         let mut b = Interpreter::new();
-        a.run(&tx);
-        b.run(&make());
+        a.run(&tx.view());
+        b.run(&make().view());
         assert_eq!(a.trace(), b.trace());
     }
 
@@ -876,7 +882,10 @@ mod tests {
             for (n, access) in order.into_iter().enumerate() {
                 let mut b = builder(n as u64 + 1);
                 b.declare_access(access);
-                assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+                assert_eq!(
+                    interp.run(&b.finish().expect("frozen").view()),
+                    Outcome::Ran
+                );
             }
             assert!(
                 !interp
@@ -929,7 +938,10 @@ mod tests {
         for (n, access) in [newer, older].into_iter().enumerate() {
             let mut b = builder(n as u64 + 1);
             b.declare_access(access);
-            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+            assert_eq!(
+                interp.run(&b.finish().expect("frozen").view()),
+                Outcome::Ran
+            );
         }
         assert_eq!(
             interp.trace(),
@@ -977,7 +989,10 @@ mod tests {
         for (n, access) in [newer, straddling].into_iter().enumerate() {
             let mut b = builder(n as u64 + 1);
             b.declare_access(access);
-            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+            assert_eq!(
+                interp.run(&b.finish().expect("frozen").view()),
+                Outcome::Ran
+            );
         }
         assert_eq!(
             interp.trace()[1..],
@@ -1026,7 +1041,10 @@ mod tests {
             output_content_version: Some(ContentVersion(5)),
             ..write_access(9, 0, 0x100)
         });
-        assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+        assert_eq!(
+            interp.run(&b.finish().expect("frozen").view()),
+            Outcome::Ran
+        );
 
         let content = interp.content_mut();
         assert!(content.is_fresh(BackingId(9), extent, Replica::DeviceOwned));
@@ -1049,7 +1067,10 @@ mod tests {
             output_content_version: Some(ContentVersion(2)),
             ..write_access(9, 0, 0x40)
         });
-        assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
+        assert_eq!(
+            interp.run(&b.finish().expect("frozen").view()),
+            Outcome::Ran
+        );
         assert!(interp
             .trace()
             .iter()

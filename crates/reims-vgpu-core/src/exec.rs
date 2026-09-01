@@ -278,8 +278,13 @@ impl ExecWork {
     }
 
     /// Pair this work with where the packet carrying it arrived.
+    ///
+    /// Borrows rather than consuming, because the work belongs to the
+    /// [`crate::transaction::DeviceTransaction`] that carries it and an
+    /// executor that owned a second copy would be a second answer to "what does
+    /// this packet touch".
     #[must_use]
-    pub fn stamp(self, identity: TransactionIdentity) -> ExecTransaction {
+    pub const fn stamp(&self, identity: TransactionIdentity) -> ExecTransaction<'_> {
         ExecTransaction {
             identity,
             work: self,
@@ -303,18 +308,24 @@ impl ExecWork {
     }
 }
 
-/// One accepted EXEC packet: resolved contents, and where the packet sits.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExecTransaction {
+/// One accepted EXEC packet as an executor sees it: where the packet sits, and
+/// a borrow of what it resolved to.
+///
+/// **A view, not a container.** The work is the envelope's — see
+/// [`crate::transaction::Payload::Exec`] — and the identity is the envelope's
+/// too. Owning either would make an admitted EXEC representable twice, and two
+/// representations of one packet are two answers to "what does it touch". This
+/// is the derivation the plan writes as
+/// `submission_domain = DeviceTransaction.channel`, spelled as a borrow so
+/// there is nothing to keep in step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExecTransaction<'a> {
     /// Assigned by admission, which is the only service that observes arrival.
-    /// The envelope's channel and channel sequence *are* these; the plan's
-    /// `submission_domain = DeviceTransaction.channel` is one value, not two
-    /// that agree.
     pub identity: TransactionIdentity,
-    pub work: ExecWork,
+    pub work: &'a ExecWork,
 }
 
-impl ExecTransaction {
+impl ExecTransaction<'_> {
     /// The semantic lifetime this was accepted in.
     #[must_use]
     pub const fn session(&self) -> SessionGeneration {
@@ -774,14 +785,14 @@ mod tests {
             ingress: IngressOrdinal(42),
         };
         let work = builder().finish().expect("frozen");
-        let tx = work.clone().stamp(identity);
+        let tx = work.stamp(identity);
         assert_eq!(tx.identity, identity);
         assert_eq!(tx.ingress(), IngressOrdinal(42));
         assert_eq!(tx.domain(), ChannelId(1));
         assert_eq!(tx.domain_sequence(), ChannelSequence(7));
         assert_eq!(tx.session(), SessionGeneration::FIRST);
         assert_eq!(
-            tx.work, work,
+            *tx.work, work,
             "stamping adds a position and changes nothing about the work"
         );
     }

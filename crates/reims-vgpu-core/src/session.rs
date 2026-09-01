@@ -22,16 +22,15 @@
 //! behind a lease whose identity carries this session's generation, and the
 //! crate they live in is not this one.
 
-use crate::access::AccessIntent;
 use crate::depend::DependencyGraph;
 use crate::identity::{
     ChannelId, ChannelSequence, CompletionStamp, DeviceEpoch, IngressOrdinal, ResourceId,
-    SessionGeneration, SessionId, StampWait,
+    SessionGeneration, SessionId, StampWait, TransactionIdentity,
 };
 use crate::publish::{Publisher, Release, RetireRefusal};
 use crate::ready::Scheduler;
 use crate::retire::Lifetime;
-use crate::transaction::{classify, DeviceTransaction, PayloadClass};
+use crate::transaction::{classify, DeviceTransaction, Payload, PayloadClass};
 use reims_vgpu_protocol::packets::{find, Channel};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -71,6 +70,15 @@ pub enum Refusal {
         named: SessionGeneration,
         current: SessionGeneration,
     },
+    /// The opcode declares one payload class and the decoded payload is
+    /// another. Admitting it would order the packet as the wrong kind of work
+    /// against a namespace that does not own what it names.
+    PayloadMismatch {
+        channel: Channel,
+        opcode: u16,
+        declared: PayloadClass,
+        decoded: PayloadClass,
+    },
 }
 
 impl Refusal {
@@ -82,6 +90,7 @@ impl Refusal {
             Self::DeviceNotLost { .. } => "ingress_device_not_lost",
             Self::ChannelNotOpen { .. } => "ingress_channel_not_open",
             Self::ChannelAlreadyOpen { .. } => "ingress_channel_already_open",
+            Self::PayloadMismatch { .. } => "ingress_payload_mismatch",
             Self::GenerationClosed { .. } => "ingress_generation_closed",
         }
     }
@@ -100,6 +109,11 @@ pub enum DeviceState {
 }
 
 /// A packet as ingress receives it, before it is a transaction.
+///
+/// It carries no position. That is the point: the ordinal and the channel
+/// sequence are consumed under the arrival this call *is*, so a caller that
+/// could state them could state ones that never happened. [`SessionModel::admit`]
+/// assigns them and stamps the payload with them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Packet {
     pub channel: Channel,
@@ -110,9 +124,9 @@ pub struct Packet {
     pub opcode: u16,
     pub stamp_waits: Vec<StampWait>,
     pub completion: Option<CompletionStamp>,
-    /// What the packet touches, already resolved. Resolution is the caller's:
+    /// The decoded work and everything it touches. Resolution is the caller's:
     /// it needs the namespaces, and this is the ordering plane.
-    pub accesses: Vec<AccessIntent>,
+    pub payload: Payload,
     /// Pipelines this packet needs whose leases came back pending.
     ///
     /// Only the pending ones: a lease that was already ready is not a wait, and
@@ -279,7 +293,7 @@ impl SessionModel {
                 opcode: packet.opcode,
             });
         };
-        let Some(payload) = classify(packet.channel, packet.opcode) else {
+        let Some(class) = classify(packet.channel, packet.opcode) else {
             debug_assert!(judged.closure.blocks_cutover());
             self.refusals += 1;
             return Err(Refusal::UnestablishedContract {
@@ -287,6 +301,19 @@ impl SessionModel {
                 opcode: packet.opcode,
             });
         };
+        // The opcode says which class the packet is and the payload says which
+        // one it *became*. A decoder that resolved a delete into a present
+        // would be resolving it against a namespace that does not own it, and
+        // the transaction would then be ordered as the wrong kind of work.
+        if packet.payload.class() != class {
+            self.refusals += 1;
+            return Err(Refusal::PayloadMismatch {
+                channel: packet.channel,
+                opcode: packet.opcode,
+                declared: class,
+                decoded: packet.payload.class(),
+            });
+        }
 
         if !self.open_channels.contains(&packet.domain) {
             self.refusals += 1;
@@ -307,7 +334,7 @@ impl SessionModel {
         self.publisher.admit(packet.domain, sequence);
         self.position.insert(ingress, (packet.domain, sequence));
 
-        let hazard_waits = self.graph.admit(ingress, &packet.accesses);
+        let hazard_waits = self.graph.admit(ingress, packet.payload.accesses());
         let ready = self.scheduler.admit(
             ingress,
             &hazard_waits,
@@ -317,14 +344,15 @@ impl SessionModel {
         );
         Ok(Admitted {
             transaction: DeviceTransaction {
-                session: self.generation,
-                channel: packet.domain,
-                channel_sequence: sequence,
-                ingress,
+                identity: TransactionIdentity {
+                    session: self.generation,
+                    domain: packet.domain,
+                    domain_sequence: sequence,
+                    ingress,
+                },
                 stamp_waits: packet.stamp_waits.clone(),
                 completion: packet.completion,
-                payload,
-                accesses: packet.accesses.clone(),
+                payload: packet.payload.clone(),
             },
             hazard_waits,
             ready,
@@ -459,7 +487,7 @@ impl SessionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::{AccessKey, AccessMode, BackingId, ResourceKey};
+    use crate::access::{AccessIntent, AccessKey, AccessMode, BackingId, ResourceKey};
     use crate::identity::{StampSlot, StampValue};
     use crate::retire::Validity;
 
@@ -473,6 +501,11 @@ mod tests {
         s
     }
 
+    /// A packet whose payload is the one its opcode's class calls for, with
+    /// nothing in it. What is under test on this plane is ordering, not decode,
+    /// so the payload is the emptiest lawful member of the right class — and it
+    /// has to be the *right* class, because `admit` refuses a payload that
+    /// disagrees with the opcode.
     fn packet(opcode: u16) -> Packet {
         Packet {
             channel: Channel::Child,
@@ -480,9 +513,64 @@ mod tests {
             opcode,
             stamp_waits: Vec::new(),
             completion: None,
-            accesses: Vec::new(),
+            payload: empty_payload(Channel::Child, opcode),
             pipeline_waits: Vec::new(),
         }
+    }
+
+    fn empty_payload(channel: Channel, opcode: u16) -> Payload {
+        match classify(channel, opcode) {
+            Some(PayloadClass::Exec) => Payload::Exec(crate::exec::ExecWork::default()),
+            Some(PayloadClass::ResourceLifecycle) => Payload::ResourceLifecycle {
+                op: crate::lifecycle::LifecycleOp::DeleteTask {
+                    task: crate::identity::TaskId(1),
+                },
+                accesses: Vec::new(),
+            },
+            Some(PayloadClass::Query) => Payload::Query {
+                request: crate::query::QueryRequest {
+                    kind: crate::query::QueryKind::of(channel, opcode).expect("a query"),
+                    destination: crate::query::ReplyDestination {
+                        backing: BackingId(1),
+                        bytes: crate::access::ByteRange {
+                            offset: 0,
+                            length: 64,
+                        },
+                    },
+                },
+                accesses: Vec::new(),
+            },
+            Some(PayloadClass::Present) => Payload::Present {
+                form: crate::present::PresentForm::of(channel, opcode).expect("a present"),
+                accesses: Vec::new(),
+            },
+            // A packet the model refuses never reaches its payload, so the
+            // class it would have had is not a thing this can answer. `Nop` is
+            // the emptiest payload there is, and the refusal happens first.
+            Some(PayloadClass::Control) | None => {
+                Payload::Control(crate::control::ControlOp::Inert {
+                    kind: crate::control::ControlKind::of(channel, opcode)
+                        .unwrap_or(crate::control::ControlKind::Nop),
+                })
+            }
+        }
+    }
+
+    /// Give a packet's payload the accesses a test wants it to make.
+    ///
+    /// There is one list and the payload owns it, so this reaches into the
+    /// payload rather than setting a field beside it.
+    fn touching(mut packet: Packet, accesses: Vec<AccessIntent>) -> Packet {
+        match &mut packet.payload {
+            Payload::Exec(work) => work.accesses = accesses,
+            Payload::ResourceLifecycle { accesses: a, .. }
+            | Payload::Query { accesses: a, .. }
+            | Payload::Present { accesses: a, .. } => *a = accesses,
+            Payload::Control(_) => {
+                assert!(accesses.is_empty(), "a control packet touches nothing");
+            }
+        }
+        packet
     }
 
     fn whole(backing: u64, mode: AccessMode) -> AccessIntent {
@@ -506,14 +594,137 @@ mod tests {
         let mut s = session();
         let exec = s.admit(&packet(0x37)).expect("EXEC is accepted");
         let delete = s.admit(&packet(0x25)).expect("delete is accepted");
-        assert_eq!(exec.transaction.payload, PayloadClass::Exec);
-        assert_eq!(delete.transaction.payload, PayloadClass::ResourceLifecycle);
-        assert_eq!(exec.transaction.ingress, IngressOrdinal(1));
-        assert_eq!(delete.transaction.ingress, IngressOrdinal(2));
-        assert_eq!(exec.transaction.channel_sequence, ChannelSequence(1));
-        assert_eq!(delete.transaction.channel_sequence, ChannelSequence(2));
-        assert!(SessionModel::executes(exec.transaction.payload));
-        assert!(!SessionModel::executes(delete.transaction.payload));
+        assert_eq!(exec.transaction.class(), PayloadClass::Exec);
+        assert_eq!(delete.transaction.class(), PayloadClass::ResourceLifecycle);
+        assert_eq!(exec.transaction.identity.ingress, IngressOrdinal(1));
+        assert_eq!(delete.transaction.identity.ingress, IngressOrdinal(2));
+        assert_eq!(
+            exec.transaction.identity.domain_sequence,
+            ChannelSequence(1)
+        );
+        assert_eq!(
+            delete.transaction.identity.domain_sequence,
+            ChannelSequence(2)
+        );
+        assert!(SessionModel::executes(exec.transaction.class()));
+        assert!(!SessionModel::executes(delete.transaction.class()));
+    }
+
+    /// The opcode declares a class and the payload arrives as one. If they can
+    /// differ, they will: a decode that resolved a delete against the display's
+    /// namespace would produce a `Present` under opcode `0x25`, and the
+    /// transaction would then be ordered as a frame rather than a retirement.
+    /// So `admit` compares them, and refuses rather than trusting either.
+    #[test]
+    fn a_payload_that_is_not_its_opcodes_class_is_refused() {
+        let mut s = session();
+        let mut wrong = packet(0x25);
+        wrong.payload = Payload::Exec(crate::exec::ExecWork::default());
+        let err = s.admit(&wrong).expect_err("a delete is not an EXEC");
+        assert_eq!(
+            err,
+            Refusal::PayloadMismatch {
+                channel: Channel::Child,
+                opcode: 0x25,
+                declared: PayloadClass::ResourceLifecycle,
+                decoded: PayloadClass::Exec,
+            }
+        );
+        assert_eq!(err.slug(), "ingress_payload_mismatch");
+        // And it left no gap: the next packet takes position one.
+        let next = s.admit(&packet(0x37)).expect("accepted");
+        assert_eq!(next.transaction.identity.ingress, IngressOrdinal(1));
+        assert_eq!(
+            next.transaction.identity.domain_sequence,
+            ChannelSequence(1)
+        );
+    }
+
+    /// The envelope has no access list of its own, so the accesses the
+    /// dependency graph ordered against are the ones the payload is holding —
+    /// there is no second list for a caller to have filled differently.
+    #[test]
+    fn the_accesses_a_transaction_is_ordered_by_are_its_payloads() {
+        let mut s = session();
+        let w = s
+            .admit(&touching(packet(0x37), vec![whole(1, AccessMode::Write)]))
+            .expect("accepted");
+        assert_eq!(w.transaction.accesses(), &[whole(1, AccessMode::Write)]);
+        assert_eq!(
+            w.transaction.payload.exec().expect("an EXEC").accesses,
+            w.transaction.accesses(),
+            "the envelope's answer is the payload's, not a copy of it"
+        );
+        // A reader of the same backing is ordered behind it, which is only
+        // possible if the graph saw the payload's list.
+        let r = s
+            .admit(&touching(packet(0x37), vec![whole(1, AccessMode::Read)]))
+            .expect("accepted");
+        assert_eq!(r.hazard_waits, vec![w.transaction.identity.ingress]);
+    }
+
+    /// The executor's view of an admitted EXEC is derived from the envelope,
+    /// so its identity is the envelope's by construction rather than by
+    /// agreement. Before the split these were two stampings of one fact and a
+    /// resolver assigned one of them.
+    #[test]
+    fn the_executors_view_of_an_exec_carries_the_identity_admission_assigned() {
+        let mut s = session();
+        s.admit(&packet(0x37)).expect("accepted");
+        let second = s.admit(&packet(0x37)).expect("accepted").transaction;
+        let view = second.exec().expect("an EXEC");
+        assert_eq!(view.identity, second.identity);
+        assert_eq!(view.ingress(), IngressOrdinal(2));
+        assert_eq!(view.domain_sequence(), ChannelSequence(2));
+        assert_eq!(view.domain(), ChannelId(2));
+        assert!(
+            core::ptr::eq(view.work, second.payload.exec().expect("an EXEC")),
+            "the view borrows the envelope's work rather than copying it"
+        );
+        // And nothing else offers one.
+        assert!(s
+            .admit(&packet(0x25))
+            .expect("accepted")
+            .transaction
+            .exec()
+            .is_none());
+    }
+
+    /// [`Payload::Control`] has no access list, and that is a contract claim:
+    /// opening a channel, moving a cursor and doing nothing touch no guest
+    /// resource. A control packet with an access would be a decode error
+    /// upstream, and it is not representable here.
+    #[test]
+    fn control_transactions_touch_no_resource() {
+        let mut s = session();
+        let mut seen = 0;
+        for p in reims_vgpu_protocol::packets::LEDGER {
+            if classify(p.channel, p.opcode) != Some(PayloadClass::Control) {
+                continue;
+            }
+            let payload = empty_payload(p.channel, p.opcode);
+            assert_eq!(payload.class(), PayloadClass::Control);
+            assert!(
+                payload.accesses().is_empty(),
+                "{} {:#04x} ({}) is control and names a resource",
+                p.channel.name(),
+                p.opcode,
+                p.name
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 23, "the twenty-three control packets");
+        // And the graph agrees: a control packet creates no hazard edge against
+        // a writer of anything.
+        let w = s
+            .admit(&touching(packet(0x37), vec![whole(1, AccessMode::Write)]))
+            .expect("accepted");
+        let nop = s.admit(&packet(0x1e)).expect("CmdNOP is accepted");
+        assert!(
+            nop.hazard_waits.is_empty(),
+            "a control packet waits for nothing it does not touch"
+        );
+        assert!(w.transaction.accesses().len() == 1);
     }
 
     /// The refusal that keeps the rest of the model honest.
@@ -540,8 +751,11 @@ mod tests {
         s.admit(&packet(0x37)).expect("accepted");
         s.admit(&packet(0x3d)).expect_err("refused");
         let next = s.admit(&packet(0x37)).expect("accepted");
-        assert_eq!(next.transaction.ingress, IngressOrdinal(2));
-        assert_eq!(next.transaction.channel_sequence, ChannelSequence(2));
+        assert_eq!(next.transaction.identity.ingress, IngressOrdinal(2));
+        assert_eq!(
+            next.transaction.identity.domain_sequence,
+            ChannelSequence(2)
+        );
     }
 
     /// Channel sequences are per domain; the ingress ordinal is not.
@@ -557,37 +771,41 @@ mod tests {
         let third = s.admit(&a).expect("accepted");
         assert_eq!(
             [
-                first.transaction.ingress,
-                second.transaction.ingress,
-                third.transaction.ingress
+                first.transaction.identity.ingress,
+                second.transaction.identity.ingress,
+                third.transaction.identity.ingress
             ],
             [IngressOrdinal(1), IngressOrdinal(2), IngressOrdinal(3)]
         );
-        assert_eq!(second.transaction.channel_sequence, ChannelSequence(1));
-        assert_eq!(third.transaction.channel_sequence, ChannelSequence(2));
+        assert_eq!(
+            second.transaction.identity.domain_sequence,
+            ChannelSequence(1)
+        );
+        assert_eq!(
+            third.transaction.identity.domain_sequence,
+            ChannelSequence(2)
+        );
     }
 
     #[test]
     fn hazards_and_completion_travel_together() {
         let mut s = session();
-        let mut writer = packet(0x37);
-        writer.accesses = vec![whole(1, AccessMode::Write)];
+        let mut writer = touching(packet(0x37), vec![whole(1, AccessMode::Write)]);
         writer.completion = Some(CompletionStamp {
             slot: StampSlot(0),
             value: StampValue(1),
         });
-        let mut reader = packet(0x37);
-        reader.accesses = vec![whole(1, AccessMode::Read)];
+        let reader = touching(packet(0x37), vec![whole(1, AccessMode::Read)]);
 
         let w = s.admit(&writer).expect("accepted");
         assert!(w.ready);
         let r = s.admit(&reader).expect("accepted");
         assert!(!r.ready);
-        assert_eq!(r.hazard_waits, vec![w.transaction.ingress]);
-        assert_eq!(s.take_ready(), vec![w.transaction.ingress]);
+        assert_eq!(r.hazard_waits, vec![w.transaction.identity.ingress]);
+        assert_eq!(s.take_ready(), vec![w.transaction.identity.ingress]);
 
-        let released = s.complete(w.transaction.ingress);
-        assert_eq!(s.take_ready(), vec![r.transaction.ingress]);
+        let released = s.complete(w.transaction.identity.ingress);
+        assert_eq!(s.take_ready(), vec![r.transaction.identity.ingress]);
         assert_eq!(
             released,
             vec![Release {
@@ -602,10 +820,9 @@ mod tests {
             "and a packet waiting on that word may now run"
         );
         // And the completed transaction stops ordering later work.
-        let mut later = packet(0x37);
-        later.accesses = vec![whole(1, AccessMode::Write)];
+        let later = touching(packet(0x37), vec![whole(1, AccessMode::Write)]);
         let l = s.admit(&later).expect("accepted");
-        assert_eq!(l.hazard_waits, vec![r.transaction.ingress]);
+        assert_eq!(l.hazard_waits, vec![r.transaction.identity.ingress]);
     }
 
     /// Out-of-order completion is ordinary; out-of-order publication is not.
@@ -626,7 +843,7 @@ mod tests {
         let b = s.admit(&second).expect("accepted");
 
         assert!(
-            s.complete(b.transaction.ingress).is_empty(),
+            s.complete(b.transaction.identity.ingress).is_empty(),
             "the second position finished first and published nothing"
         );
         assert_eq!(
@@ -640,7 +857,7 @@ mod tests {
             "and the cost of holding it is counted"
         );
         assert_eq!(
-            s.complete(a.transaction.ingress)
+            s.complete(a.transaction.identity.ingress)
                 .into_iter()
                 .map(|r| r.stamp)
                 .collect::<Vec<_>>(),
@@ -661,9 +878,9 @@ mod tests {
         });
         let a = s.admit(&packet(0x37)).expect("accepted");
         let b = s.admit(&second).expect("accepted");
-        assert!(s.complete(b.transaction.ingress).is_empty());
+        assert!(s.complete(b.transaction.identity.ingress).is_empty());
         assert_eq!(
-            s.withdraw(a.transaction.ingress)
+            s.withdraw(a.transaction.identity.ingress)
                 .into_iter()
                 .map(|r| r.stamp)
                 .collect::<Vec<_>>(),
@@ -683,7 +900,7 @@ mod tests {
             s.retire_channel(ChannelId(2)),
             Err(RetireRefusal::LivePositions { outstanding: 1 })
         );
-        s.complete(a.transaction.ingress);
+        s.complete(a.transaction.identity.ingress);
         assert_eq!(s.retire_channel(ChannelId(2)), Ok(()));
         assert!(
             !s.channel_open(ChannelId(2)),
@@ -700,7 +917,10 @@ mod tests {
         // continuing the lifetime that just ended.
         s.open_channel(ChannelId(2)).expect("free again");
         let next = s.admit(&packet(0x37)).expect("accepted");
-        assert_eq!(next.transaction.channel_sequence, ChannelSequence(1));
+        assert_eq!(
+            next.transaction.identity.domain_sequence,
+            ChannelSequence(1)
+        );
     }
 
     /// A packet naming a domain no definition opened is refused at ingress.
@@ -721,11 +941,14 @@ mod tests {
         s.open_channel(ChannelId(2)).expect("fresh");
         let first = s.admit(&packet(0x37)).expect("accepted");
         assert_eq!(
-            first.transaction.ingress,
+            first.transaction.identity.ingress,
             IngressOrdinal::default().next(),
             "the refused packet consumed no ordinal"
         );
-        assert_eq!(first.transaction.channel_sequence, ChannelSequence(1));
+        assert_eq!(
+            first.transaction.identity.domain_sequence,
+            ChannelSequence(1)
+        );
     }
 
     /// Reopening a live channel would reset a publication order that still has
@@ -840,7 +1063,7 @@ mod tests {
         assert_eq!(b.device_state(), DeviceState::Live);
         assert_eq!(untouched.against(b.generation(), b.epoch()), Validity::Live);
         assert!(b.admit(&packet(0x37)).is_ok());
-        assert!(!b.complete(admitted.transaction.ingress).is_empty());
+        assert!(!b.complete(admitted.transaction.identity.ingress).is_empty());
     }
 
     /// A reset opens a new lifetime and does not throw away work that has not
@@ -849,8 +1072,7 @@ mod tests {
     #[test]
     fn a_reset_opens_a_generation_without_abandoning_accepted_work() {
         let mut s = session();
-        let mut writer = packet(0x37);
-        writer.accesses = vec![whole(1, AccessMode::Write)];
+        let writer = touching(packet(0x37), vec![whole(1, AccessMode::Write)]);
         let w = s.admit(&writer).expect("accepted");
         let before = s.generation();
         let after = s.reset();
@@ -858,11 +1080,10 @@ mod tests {
         assert_eq!(s.scheduler().pending(), 1);
         // Work accepted after the reset carries the new generation and still
         // orders against the old transaction, which has not completed.
-        let mut reader = packet(0x37);
-        reader.accesses = vec![whole(1, AccessMode::Read)];
+        let reader = touching(packet(0x37), vec![whole(1, AccessMode::Read)]);
         let r = s.admit(&reader).expect("accepted");
-        assert_eq!(r.transaction.session, after);
-        assert_eq!(r.hazard_waits, vec![w.transaction.ingress]);
+        assert_eq!(r.transaction.identity.session, after);
+        assert_eq!(r.hazard_waits, vec![w.transaction.identity.ingress]);
     }
 
     #[test]
@@ -880,7 +1101,7 @@ mod tests {
         let mut s = session();
         for opcode in [0x1e, 0x03, 0x32] {
             let t = s.admit(&packet(opcode)).expect("accepted");
-            assert_eq!(t.transaction.payload, PayloadClass::Control);
+            assert_eq!(t.transaction.class(), PayloadClass::Control);
             assert!(t.ready);
         }
     }

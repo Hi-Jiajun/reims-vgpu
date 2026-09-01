@@ -97,6 +97,21 @@ pub struct ReplyDestination {
     pub bytes: ByteRange,
 }
 
+/// The question a query packet asks, and where its answer goes.
+///
+/// The two travel together because neither is a query on its own: a kind with
+/// no destination is an answer with nowhere to be written, and a destination
+/// with no kind is a window with nothing to put in it. The guest blocks on the
+/// pair.
+///
+/// The completion stamp is deliberately *not* here — it is the envelope's, and
+/// [`PendingQuery`] takes it from there when the packet is admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryRequest {
+    pub kind: QueryKind,
+    pub destination: ReplyDestination,
+}
+
 /// The exact window the answer occupies.
 ///
 /// The caller records it as a write in the guest's replica: the answer is
@@ -169,14 +184,10 @@ pub struct CompletedQuery {
 }
 
 impl PendingQuery {
-    pub const fn new(
-        kind: QueryKind,
-        destination: ReplyDestination,
-        stamp: Option<CompletionStamp>,
-    ) -> Self {
+    pub const fn new(request: QueryRequest, stamp: Option<CompletionStamp>) -> Self {
         Self {
-            kind,
-            destination,
+            kind: request.kind,
+            destination: request.destination,
             stamp,
         }
     }
@@ -303,7 +314,13 @@ mod tests {
     }
 
     fn pending(length: u64) -> PendingQuery {
-        PendingQuery::new(QueryKind::ComputeInfo, destination(length), Some(stamp()))
+        PendingQuery::new(
+            QueryRequest {
+                kind: QueryKind::ComputeInfo,
+                destination: destination(length),
+            },
+            Some(stamp()),
+        )
     }
 
     /// The claim the module docs make and cannot check by being read.
@@ -375,9 +392,15 @@ mod tests {
 
     #[test]
     fn a_query_with_no_completion_word_publishes_nothing() {
-        let done = PendingQuery::new(QueryKind::DeviceInfo, destination(64), None)
-            .answer(8)
-            .expect("fits");
+        let done = PendingQuery::new(
+            QueryRequest {
+                kind: QueryKind::DeviceInfo,
+                destination: destination(64),
+            },
+            None,
+        )
+        .answer(8)
+        .expect("fits");
         assert_eq!(done.publication(), None);
     }
 

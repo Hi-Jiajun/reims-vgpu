@@ -49,8 +49,75 @@
 //! caller gets it back when that point is reached, never before.
 
 use crate::identity::{CompletionStamp, IngressOrdinal, TimelinePoint};
+use reims_vgpu_protocol::packets::Channel;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
+
+/// Which of the three present commands a packet is.
+///
+/// # Three commands, not one shape with a variant flag
+///
+/// They present the same frame to the same host window, and it is tempting to
+/// fold them. Their trailers say otherwise, and say it in a way that punishes a
+/// fold: the surface word sits at a *different slot* in each, op6 and op7 carry
+/// the same three fields in a different order, and op8 has no task field at all
+/// — the word where the other two keep one is unidentified. A single decoder
+/// with an opcode-keyed offset table is that fold with extra steps, and reading
+/// op8 at op6's slot presents whatever that unnamed word happens to be.
+///
+/// So the form travels with the payload. What each form's trailer *contains* is
+/// the decoder's, and where the frame goes is the display layer's; this crate
+/// is the layer that says which of the three the guest sent, exactly as
+/// [`crate::control::ControlOp::Display`] says which display command it is
+/// without owning a display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PresentForm {
+    /// The superseded form. Its trailer keeps the surface before the task.
+    Transaction2,
+    /// The current form. Task before surface, and a gamma table after both.
+    Transaction3,
+    /// The form that names a single mapping rather than serializing a
+    /// transaction, and therefore carries no task.
+    SwapMapping,
+}
+
+impl PresentForm {
+    /// The present command a packet is, or `None` if it is not a present.
+    ///
+    /// No guard against [`crate::transaction::classify`] here, unlike
+    /// [`crate::control::ControlKind::of`], because this enumerates three
+    /// numbers rather than ending in a catch-all: a guard would be a branch no
+    /// input can reach. What keeps the three in step with the ledger is
+    /// `every_present_packet_has_exactly_one_form`, which fails in both
+    /// directions.
+    #[must_use]
+    pub fn of(channel: Channel, opcode: u16) -> Option<Self> {
+        Some(match (channel, opcode) {
+            (Channel::Child, 0x06) => Self::Transaction2,
+            (Channel::Child, 0x07) => Self::Transaction3,
+            (Channel::Child, 0x08) => Self::SwapMapping,
+            _ => return None,
+        })
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Transaction2 => "display_transaction2",
+            Self::Transaction3 => "display_transaction3",
+            Self::SwapMapping => "display_swap_mapping",
+        }
+    }
+
+    /// Whether this form's trailer names the task that owns what it presents.
+    ///
+    /// `false` for [`Self::SwapMapping`], whose second word is unidentified.
+    /// A reader that assumed every present names a task would read that word.
+    #[must_use]
+    pub const fn names_a_task(self) -> bool {
+        matches!(self, Self::Transaction2 | Self::Transaction3)
+    }
+}
 
 /// One configuration of a surface's swapchain.
 ///
@@ -565,6 +632,51 @@ impl PresentStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transaction::{classify, PayloadClass};
+    use reims_vgpu_protocol::packets::LEDGER;
+
+    /// The claim every other payload class already makes about itself: the
+    /// class's vocabulary is exhaustive over what the ledger judged into it,
+    /// and empty over everything else. Present was the one class whose
+    /// `every_judged_packet_reaches_a_class_and_a_meaning_within_it` arm was a
+    /// hardcoded `true`, which is not a check.
+    #[test]
+    fn every_present_packet_has_exactly_one_form() {
+        let mut seen: Vec<PresentForm> = Vec::new();
+        for p in LEDGER {
+            let form = PresentForm::of(p.channel, p.opcode);
+            let is_present = classify(p.channel, p.opcode) == Some(PayloadClass::Present);
+            assert_eq!(
+                form.is_some(),
+                is_present,
+                "{} {:#04x} ({}) is classified {:?} and resolves to {:?}",
+                p.channel.name(),
+                p.opcode,
+                p.name,
+                classify(p.channel, p.opcode),
+                form
+            );
+            if let Some(form) = form {
+                assert!(
+                    !seen.contains(&form),
+                    "{} is two packets' form",
+                    form.name()
+                );
+                seen.push(form);
+            }
+        }
+        assert_eq!(seen.len(), 3, "the three present forms");
+    }
+
+    /// The distinction that costs a frame when it is lost: op8's second word is
+    /// not a task, and a decoder that read one there would present whatever it
+    /// found.
+    #[test]
+    fn only_the_transaction_forms_name_a_task() {
+        assert!(PresentForm::Transaction2.names_a_task());
+        assert!(PresentForm::Transaction3.names_a_task());
+        assert!(!PresentForm::SwapMapping.names_a_task());
+    }
 
     fn at(n: u64) -> TimelinePoint {
         TimelinePoint(n)

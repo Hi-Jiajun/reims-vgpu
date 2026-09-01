@@ -41,12 +41,36 @@ impl At {
         }
     }
 
-    pub(crate) fn finish(
-        self,
-    ) -> Result<crate::exec::ExecTransaction, crate::stream::StreamRefusal> {
-        let identity = self.identity;
-        Ok(self.builder.finish()?.stamp(identity))
+    pub(crate) fn finish(self) -> Result<Stamped, crate::stream::StreamRefusal> {
+        Ok(Stamped {
+            work: self.builder.finish()?,
+            identity: self.identity,
+        })
     }
+}
+
+/// Resolved work a test owns, and the identity it chose for it.
+///
+/// [`crate::exec::ExecTransaction`] borrows its work, because in production the
+/// work belongs to the device transaction carrying it. A test has no device
+/// transaction, so it needs somewhere for the work to live; this is that
+/// somewhere, and [`Self::view`] is the same derivation
+/// [`crate::transaction::DeviceTransaction::exec`] performs.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Stamped {
+    pub(crate) work: crate::exec::ExecWork,
+    pub(crate) identity: crate::identity::TransactionIdentity,
+}
+
+impl Stamped {
+    pub(crate) fn view(&self) -> crate::exec::ExecTransaction<'_> {
+        self.work.stamp(self.identity)
+    }
+}
+
+/// The batch a scheduler is handed, from the work a test owns.
+pub(crate) fn views(batch: &[Stamped]) -> Vec<crate::exec::ExecTransaction<'_>> {
+    batch.iter().map(Stamped::view).collect()
 }
 
 impl core::ops::Deref for At {
