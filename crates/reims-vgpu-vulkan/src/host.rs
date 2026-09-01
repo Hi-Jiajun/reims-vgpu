@@ -103,7 +103,7 @@ impl DeviceClass {
 }
 
 /// One enumerated device, judged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Candidate {
     /// Position in the enumeration, which is what breaks a rank tie.
     pub index: usize,
@@ -494,6 +494,9 @@ unsafe fn judge(
         dynamic_rendering: dynamic_rendering.dynamic_rendering == vk::TRUE,
         depth_clamp: core_features.depth_clamp == vk::TRUE,
         fill_mode_non_solid: core_features.fill_mode_non_solid == vk::TRUE,
+        sampler_anisotropy: core_features.sampler_anisotropy == vk::TRUE,
+        max_sampler_anisotropy: properties.limits.max_sampler_anisotropy,
+        sampler_mirror_clamp_to_edge: vulkan12.sampler_mirror_clamp_to_edge == vk::TRUE,
         mesh_shader: mesh.mesh_shader == vk::TRUE,
         descriptor_buffer: descriptor_buffer.descriptor_buffer == vk::TRUE,
         max_push_descriptors: push.max_push_descriptors,
@@ -529,6 +532,9 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            sampler_anisotropy: false,
+            max_sampler_anisotropy: 1.0,
+            sampler_mirror_clamp_to_edge: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,
@@ -750,6 +756,9 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            sampler_anisotropy: false,
+            max_sampler_anisotropy: 1.0,
+            sampler_mirror_clamp_to_edge: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,

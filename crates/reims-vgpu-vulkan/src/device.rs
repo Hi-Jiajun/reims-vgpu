@@ -73,6 +73,16 @@ pub struct Enabled {
     /// `VkDeviceCreateInfo::pEnabledFeatures`.
     pub depth_clamp: bool,
     pub fill_mode_non_solid: bool,
+    /// Also the 1.0 block. A sampler whose plan sets `anisotropyEnable` on a
+    /// device that never requested this feature is undefined behaviour, so the
+    /// census cell [`crate::sampler::plan`] reads and the feature requested
+    /// here are the same fact and are derived from the same place.
+    pub sampler_anisotropy: bool,
+    /// `VkPhysicalDeviceVulkan12Features::samplerMirrorClampToEdge`. A
+    /// promoted feature is still a feature: the address mode enumerant exists
+    /// in core 1.2 whether or not it was enabled, and using it unenabled is
+    /// exactly the failure the enumerant's presence hides.
+    pub sampler_mirror_clamp_to_edge: bool,
     /// Whether the promoted capabilities are asked for through
     /// `VkPhysicalDeviceVulkan13Features` rather than each extension's own
     /// structure.
@@ -96,6 +106,8 @@ impl Enabled {
             descriptor_buffer: census.descriptors().descriptor_buffer,
             depth_clamp: census.raster().depth_clamp,
             fill_mode_non_solid: census.raster().fill_mode_non_solid,
+            sampler_anisotropy: census.samplers().anisotropy,
+            sampler_mirror_clamp_to_edge: census.samplers().mirror_clamp_to_edge,
             core_promotions: census.api().at_least(1, 3),
         }
     }
@@ -185,7 +197,9 @@ impl DeviceEpoch {
         // Chained only where the capability was admitted, for the reason the
         // census module gives: a feature struct for something the driver never
         // reported is a question it has no answer to.
-        let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
+        let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
+            .timeline_semaphore(true)
+            .sampler_mirror_clamp_to_edge(enabled.sampler_mirror_clamp_to_edge);
         // The promoted pair, asked for through the version's own structure.
         // Chained only at 1.3 and above, where that structure is legal at all.
         let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default()
@@ -203,7 +217,8 @@ impl DeviceEpoch {
         // where it asked for lines — see [`crate::raster`].
         let core_features = vk::PhysicalDeviceFeatures::default()
             .depth_clamp(enabled.depth_clamp)
-            .fill_mode_non_solid(enabled.fill_mode_non_solid);
+            .fill_mode_non_solid(enabled.fill_mode_non_solid)
+            .sampler_anisotropy(enabled.sampler_anisotropy);
 
         let mut create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
@@ -360,6 +375,9 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            sampler_anisotropy: false,
+            max_sampler_anisotropy: 1.0,
+            sampler_mirror_clamp_to_edge: false,
             mesh_shader: features.1,
             descriptor_buffer: features.2,
             max_push_descriptors: 32,
@@ -495,6 +513,9 @@ mod tests {
                         dynamic_rendering: false,
                         depth_clamp: false,
                         fill_mode_non_solid: false,
+                        sampler_anisotropy: false,
+                        max_sampler_anisotropy: 1.0,
+                        sampler_mirror_clamp_to_edge: false,
                         mesh_shader: false,
                         descriptor_buffer: false,
                         max_push_descriptors: 0,
@@ -511,6 +532,49 @@ mod tests {
                 // raster planner would not see.
                 assert_eq!(census.raster().depth_clamp, depth_clamp);
                 assert_eq!(census.raster().fill_mode_non_solid, fill_mode_non_solid);
+            }
+        }
+    }
+
+    /// The two sampler features are on the same footing as the raster pair:
+    /// the census cell `sampler::plan` reads and the feature this module asks
+    /// for are one fact. A device that enabled neither and planned with a cell
+    /// that said both would be the undefined-behaviour case, and it is the one
+    /// this asserts cannot arise.
+    #[test]
+    fn the_sampler_features_are_enabled_exactly_when_reported() {
+        let memory = mem::apple_m3_max();
+        let families = families();
+        for anisotropy in [false, true] {
+            for mirror in [false, true] {
+                let census = Census::take(Reported {
+                    sampler_anisotropy: anisotropy,
+                    sampler_mirror_clamp_to_edge: mirror,
+                    ..Reported {
+                        api_version: vk::make_api_version(0, 1, 2, 0),
+                        extensions: &[extension::SWAPCHAIN],
+                        timeline_semaphore: true,
+                        synchronization2: false,
+                        dynamic_rendering: false,
+                        depth_clamp: false,
+                        fill_mode_non_solid: false,
+                        sampler_anisotropy: false,
+                        max_sampler_anisotropy: 16.0,
+                        sampler_mirror_clamp_to_edge: false,
+                        mesh_shader: false,
+                        descriptor_buffer: false,
+                        max_push_descriptors: 0,
+                        max_buffer_size: None,
+                        memory: &memory,
+                        queue_families: &families,
+                    }
+                })
+                .expect("admitted");
+                let enabled = Enabled::for_census(&census);
+                assert_eq!(enabled.sampler_anisotropy, anisotropy);
+                assert_eq!(enabled.sampler_mirror_clamp_to_edge, mirror);
+                assert_eq!(census.samplers().anisotropy, anisotropy);
+                assert_eq!(census.samplers().mirror_clamp_to_edge, mirror);
             }
         }
     }
@@ -601,6 +665,9 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            sampler_anisotropy: false,
+            max_sampler_anisotropy: 1.0,
+            sampler_mirror_clamp_to_edge: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,

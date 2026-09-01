@@ -129,6 +129,20 @@ pub struct Reported<'a> {
     pub depth_clamp: bool,
     /// `VkPhysicalDeviceFeatures::fillModeNonSolid`.
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::samplerAnisotropy`.
+    pub sampler_anisotropy: bool,
+    /// `VkPhysicalDeviceLimits::maxSamplerAnisotropy`.
+    ///
+    /// A limit rather than a feature, so it is always reported; it is only
+    /// *meaningful* where `sampler_anisotropy` is set, and the cell it lands
+    /// in says so.
+    pub max_sampler_anisotropy: f32,
+    /// `VkPhysicalDeviceVulkan12Features::samplerMirrorClampToEdge`.
+    ///
+    /// 1.2 is the baseline and promoted the extension, so the name is never
+    /// the question here — the feature bit is. Same shape as
+    /// `timeline_semaphore` above, and for the same reason.
+    pub sampler_mirror_clamp_to_edge: bool,
     /// `VkPhysicalDeviceMeshShaderFeaturesEXT::meshShader`.
     pub mesh_shader: bool,
     /// `VkPhysicalDeviceDescriptorBufferFeaturesEXT::descriptorBuffer`.
@@ -261,7 +275,10 @@ pub enum DescriptorBufferProbe {
 ///
 /// Immutable and `Copy`. Every accessor is a projection of what was taken; none
 /// asks the driver anything.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `Eq` is deliberately absent: [`crate::sampler::SamplerCell`] carries
+/// `maxSamplerAnisotropy`, which is an `f32`. Every other cell here is `Eq`,
+/// and a census still compares — it just compares by the rules a float has.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Census {
     api: ApiVersion,
     memory: MemoryProfile,
@@ -271,6 +288,7 @@ pub struct Census {
     passes: crate::pass::PassCell,
     raster: crate::raster::RasterCell,
     buffers: crate::buffer::BufferLimits,
+    samplers: crate::sampler::SamplerCell,
     host_pointer_import: bool,
     synchronization2: bool,
     can_present: bool,
@@ -340,6 +358,15 @@ impl Census {
             },
             buffers: crate::buffer::BufferLimits {
                 max_buffer_size: reported.max_buffer_size,
+            },
+            samplers: crate::sampler::SamplerCell {
+                mirror_clamp_to_edge: reported.sampler_mirror_clamp_to_edge,
+                anisotropy: reported.sampler_anisotropy,
+                // Carried as reported. The clamp a plan applies raises it to
+                // at least 1.0 at the point of use, which is where the guest's
+                // request is also known; substituting a floor here would hide
+                // a driver that reported less than one.
+                max_anisotropy: reported.max_sampler_anisotropy,
             },
             host_pointer_import: reported.has(extension::EXTERNAL_MEMORY_HOST),
             // 1.3 promoted it to core, so a 1.3 device has it whether or not it
@@ -433,6 +460,13 @@ impl Census {
         self.buffers
     }
 
+    /// The cell [`crate::sampler::plan`] translates an address mode and
+    /// clamps an anisotropy request against.
+    #[must_use]
+    pub const fn samplers(&self) -> crate::sampler::SamplerCell {
+        self.samplers
+    }
+
     /// The cell [`crate::placement`] decides a route from.
     #[must_use]
     pub const fn host_cell(&self) -> HostCell {
@@ -469,7 +503,8 @@ impl Census {
     pub fn report_line(&self) -> String {
         format!(
             "vk_census api={} topology={} signal={} import={} sync2={} mesh={} push={} \
-             push_max={} desc_buffer={} desc_qualified={} queue_family={} compute={}",
+             push_max={} desc_buffer={} desc_qualified={} queue_family={} compute={} \
+             mirror_clamp={} aniso={} aniso_max={}",
             self.api,
             self.memory.topology.slug(),
             self.memory.signal.slug(),
@@ -482,6 +517,9 @@ impl Census {
             self.descriptors.descriptor_buffer_qualified,
             self.queues.universal().index,
             self.queues.compute(),
+            self.samplers.mirror_clamp_to_edge,
+            self.samplers.anisotropy,
+            self.samplers.max_anisotropy,
         )
     }
 }
@@ -546,6 +584,9 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            sampler_anisotropy: false,
+            max_sampler_anisotropy: 1.0,
+            sampler_mirror_clamp_to_edge: false,
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,
@@ -777,6 +818,8 @@ mod tests {
             &families,
         );
         r.max_push_descriptors = 32;
+        r.sampler_anisotropy = true;
+        r.max_sampler_anisotropy = 16.0;
         let line = Census::take(r).expect("admitted").report_line();
 
         for fact in [
@@ -789,9 +832,101 @@ mod tests {
             "push_max=32",
             "desc_buffer=false",
             "desc_qualified=false",
+            "mirror_clamp=false",
+            "aniso=true",
+            "aniso_max=16",
         ] {
             assert!(line.contains(fact), "{fact} missing from {line}");
         }
+    }
+
+    /// The two facts a sampler plan reads reach it verbatim, and the limit is
+    /// carried rather than substituted.
+    ///
+    /// `maxSamplerAnisotropy` is a limit, so the driver always reports one; a
+    /// census that floored it at 1.0 would make a device claiming less than
+    /// one indistinguishable from a conformant one, and the clamp belongs
+    /// where the guest's request is also known.
+    #[test]
+    fn the_sampler_cell_carries_what_was_reported_and_gates_the_mode_that_needs_a_feature() {
+        use crate::sampler::{plan, Refusal};
+        use reims_vgpu_core::sampler::{
+            SamplerShape, MTL_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
+            MTL_SAMPLER_ADDRESS_MODE_REPEAT, MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK,
+            MTL_SAMPLER_MIN_MAG_FILTER_LINEAR, MTL_SAMPLER_MIP_FILTER_LINEAR,
+        };
+
+        let memory = mem::apple_m3_max();
+        let families = integrated_families();
+        let mut bare = reported(packed(1, 2), BASELINE, &memory, &families);
+        bare.max_sampler_anisotropy = 0.5;
+        let bare = Census::take(bare).expect("admitted");
+        assert!(!bare.samplers().anisotropy);
+        assert!(!bare.samplers().mirror_clamp_to_edge);
+        // Carried, not floored.
+        assert!((bare.samplers().max_anisotropy - 0.5).abs() < f32::EPSILON);
+
+        let mut rich = reported(packed(1, 2), BASELINE, &memory, &families);
+        rich.sampler_anisotropy = true;
+        rich.max_sampler_anisotropy = 4.0;
+        rich.sampler_mirror_clamp_to_edge = true;
+        let rich = Census::take(rich).expect("admitted");
+
+        let shape = |address: u32, anisotropy: u32| SamplerShape {
+            min_filter: MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+            mag_filter: MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+            mip_filter: MTL_SAMPLER_MIP_FILTER_LINEAR,
+            s_address: address,
+            t_address: MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+            r_address: MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+            max_anisotropy: anisotropy,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 8.0,
+            compare_function: 0,
+            compare_enabled: false,
+            border_color: MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK,
+            normalized_coordinates: true,
+        };
+        let checked = |address, anisotropy| {
+            shape(address, anisotropy)
+                .checked()
+                .expect("a declaration the guest API admits")
+        };
+
+        // The address mode is a core 1.2 enumerant whether or not the feature
+        // was enabled, so nothing but this cell stops it being used.
+        assert_eq!(
+            plan(
+                checked(MTL_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, 1),
+                bare.samplers()
+            ),
+            Err(Refusal::NoMirrorClampToEdge)
+        );
+        assert!(plan(
+            checked(MTL_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, 1),
+            rich.samplers()
+        )
+        .is_ok());
+
+        // The device's limit is the one a request is clamped against, and it
+        // arrived here through the census.
+        let over = plan(
+            checked(MTL_SAMPLER_ADDRESS_MODE_REPEAT, 16),
+            rich.samplers(),
+        )
+        .expect("a repeat sampler needs no feature");
+        assert!(over.anisotropy_enable);
+        assert!((over.max_anisotropy - 4.0).abs() < f32::EPSILON);
+
+        // And with the feature off it is not merely clamped, it is not asked
+        // for — enabling it unrequested is the undefined case.
+        let off = plan(
+            checked(MTL_SAMPLER_ADDRESS_MODE_REPEAT, 16),
+            bare.samplers(),
+        )
+        .expect("a repeat sampler needs no feature");
+        assert!(!off.anisotropy_enable);
+        assert!((off.max_anisotropy - 1.0).abs() < f32::EPSILON);
     }
 
     /// The rule a device creation gets refused for breaking: a capability that
