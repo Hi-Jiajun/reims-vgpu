@@ -231,7 +231,10 @@ mod tests {
     use crate::access::StubRegistry;
     use crate::exec::ExecArenas;
     use crate::identity::ChannelId;
-    use crate::testing::{generate_mipmaps, record, segment_bytes, segment_bytes_with, Everything};
+    use crate::testing::{
+        bind_vertex_buffers, draw_primitives, generate_mipmaps, record, segment_bytes,
+        segment_bytes_with, Everything,
+    };
     use reims_vgpu_protocol::segment::{
         SegmentKind, SegmentLifetime, SEGMENT_TYPE_PROTECTION_OPTIONS,
     };
@@ -273,6 +276,53 @@ mod tests {
             reims_vgpu_wire::ops::compute::OPCODE_MEMORY_BARRIER_SCOPE,
             &[1, 0, 0xaa, 0xaa],
         )
+    }
+
+    /// A draw declares the buffers the binds before it named — through decode,
+    /// resolution and the encoder, from bytes.
+    ///
+    /// `drawPrimitives:` names no memory of its own, so every access this
+    /// transaction carries came out of the encoder's binding tables. The whole
+    /// path had a gap here: the bind records resolved, the draw resolved, and
+    /// nothing joined the two.
+    #[test]
+    fn a_draw_declares_the_buffers_the_binds_before_it_named() {
+        let bytes = segment_bytes(
+            SegmentKind::Render.wire_type(),
+            &[
+                bind_vertex_buffers(0, &[5151, 6262]),
+                bind_vertex_buffers(7, &[7373]),
+                draw_primitives(),
+            ],
+        );
+        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
+            .expect("a well-framed stream");
+
+        let mut named: Vec<u64> = tx
+            .accesses
+            .iter()
+            .filter_map(|a| match a.key {
+                crate::access::AccessKey::Range(r, _)
+                | crate::access::AccessKey::Subresource(r, _)
+                | crate::access::AccessKey::Whole(r) => Some(r.backing.0),
+                crate::access::AccessKey::Heap(_) | crate::access::AccessKey::DomainOnly => None,
+            })
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, vec![5151, 6262, 7373]);
+    }
+
+    /// The same stream without the draw declares nothing: a bind writes a slot
+    /// and touches no memory.
+    #[test]
+    fn binds_with_no_draw_after_them_declare_nothing() {
+        let bytes = segment_bytes(
+            SegmentKind::Render.wire_type(),
+            &[bind_vertex_buffers(0, &[5151, 6262])],
+        );
+        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
+            .expect("a well-framed stream");
+        assert!(tx.accesses.is_empty());
     }
 
     /// The whole path, from bytes to a transaction whose accesses came from the

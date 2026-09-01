@@ -130,6 +130,35 @@ pub(crate) fn generate_mipmaps(texture: u32) -> Vec<u8> {
     )
 }
 
+/// `setVertexBuffers:offsets:withRange:`, binding `refs` at consecutive slots
+/// from `first`.
+///
+/// The head is `[first][count]` and each entry is a ref and a `u64` offset, so
+/// the entry stride is twelve rather than sixteen.
+pub(crate) fn bind_vertex_buffers(first: u32, refs: &[u32]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&first.to_le_bytes());
+    payload.extend_from_slice(&(refs.len() as u32).to_le_bytes());
+    for &buffer in refs {
+        payload.extend_from_slice(&buffer.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+    }
+    record(
+        reims_vgpu_wire::ops::render::OPCODE_SET_VERTEX_BUFFER,
+        &payload,
+    )
+}
+
+/// `drawPrimitives:vertexStart:vertexCount:`, the draw that names no memory of
+/// its own — so everything it declares came from the encoder's bound slots.
+pub(crate) fn draw_primitives() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&3u16.to_le_bytes());
+    record(reims_vgpu_wire::ops::render::OPCODE_DRAW, &payload)
+}
+
 /// `synchronizeResource:`, the other single-ref blit record, so a stream can
 /// name two resources without repeating one opcode.
 pub(crate) fn synchronize_resource(resource: u32) -> Vec<u8> {
