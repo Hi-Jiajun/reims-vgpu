@@ -164,7 +164,9 @@ pub const SERIALIZER_OBJECT_RENDER_PIPELINE: u32 = 0x0e;
 pub const SERIALIZER_OBJECT_ICB: u32 = w_icb::OPCODE_NEW_INDIRECT_COMMAND_BUFFER;
 /// End of the 16-byte serializer-object header, which is also where its first TLV
 /// starts — one boundary, so one name.
-pub const SERIALIZER_OBJECT_FIRST_TLVS: usize = 16;
+/// Where a serializer object's first TLV sits: immediately after the four-word
+/// header, so it is the header's length and not a second `16`.
+pub const SERIALIZER_OBJECT_FIRST_TLVS: usize = reims_vgpu_protocol::serializer_object::HEADER_LEN;
 /// Serialized ICB descriptor length (allocateOperationBytes 0x58).
 pub const ICB_DESC_LEN: usize = w_icb::NEW_INDIRECT_COMMAND_BUFFER_TOTAL_LEN as usize;
 /// Per-stage max bind counts are single bytes (PGSerializer create body).
@@ -3380,23 +3382,51 @@ fn report_tlv_shape(
     unknown.len()
 }
 
+/// The three refusal slugs a serializer-object subtype reports its header's
+/// failures under.
+///
+/// The header is one layout and its refusals are one set, but the slugs are
+/// per-subtype: a reader greps `res_render_pipeline_tag` to find records handed
+/// to the render decoder, and one shared `res_serializer_object_tag` would give
+/// no way to tell which decoder said it.
+struct HeaderSlugs {
+    short: &'static str,
+    tag: &'static str,
+    declared_len: &'static str,
+}
+
+/// Read a serializer object's header at the layout's owner and map its refusal
+/// to this subtype's slugs.
+fn serializer_object_header(
+    bytes: &[u8],
+    expected: u32,
+    slugs: HeaderSlugs,
+) -> Result<reims_vgpu_protocol::serializer_object::Header, DecodeStatus> {
+    use reims_vgpu_protocol::serializer_object::Refusal;
+    reims_vgpu_protocol::serializer_object::decode(bytes, expected).map_err(|refusal| match refusal
+    {
+        Refusal::Short { .. } => DecodeStatus::ErrShort(slugs.short),
+        Refusal::WrongType { .. } => DecodeStatus::ErrUnsupported(slugs.tag),
+        Refusal::DeclaredLength { .. } => DecodeStatus::ErrShort(slugs.declared_len),
+    })
+}
+
 pub fn decode_render_pipeline_descriptor(
     bytes: &[u8],
 ) -> Result<RenderPipelineDescriptor, DecodeStatus> {
-    if bytes.len() < TYPE7_MIN_LEN {
-        return Err(DecodeStatus::ErrShort("res_render_pipeline_short"));
-    }
-    let obj_type = ld32(&bytes[0..]);
-    let declared = ld32(&bytes[4..]) as usize;
-    if obj_type != SERIALIZER_OBJECT_RENDER_PIPELINE {
-        return Err(DecodeStatus::ErrUnsupported("res_render_pipeline_tag"));
-    }
-    if declared != bytes.len() || declared < TYPE7_MIN_LEN {
-        return Err(DecodeStatus::ErrShort("res_render_pipeline_declared_len"));
-    }
+    let header = serializer_object_header(
+        bytes,
+        SERIALIZER_OBJECT_RENDER_PIPELINE,
+        HeaderSlugs {
+            short: "res_render_pipeline_short",
+            tag: "res_render_pipeline_tag",
+            declared_len: "res_render_pipeline_declared_len",
+        },
+    )?;
+    let declared = header.declared as usize;
     let mut out = RenderPipelineDescriptor {
-        object_id: ld32(&bytes[8..]),
-        serialized_payload_len: ld32(&bytes[12..]),
+        object_id: header.object_id,
+        serialized_payload_len: header.serialized_payload_len,
         ..Default::default()
     };
     note_serializer_object_payload_len("render", out.serialized_payload_len, declared);
@@ -4458,8 +4488,6 @@ pub fn texture_view_opcode(bytes: &[u8]) -> Option<u32> {
     texture_view_header(bytes).map(|(opcode, _)| opcode)
 }
 
-const TYPE7_MIN_LEN: usize = 17;
-
 /// **Unused on the x86 PCI pathway.** A probe placed at the top of this function
 /// — before the length check, so a short record would also report — emitted
 /// nothing across a full interactive session. Mapper-ref-texture geometry on that pathway
@@ -4829,21 +4857,21 @@ pub fn parse_compute_stage_input_block(
 pub fn decode_compute_pipeline_descriptor(
     bytes: &[u8],
 ) -> Result<ComputePipelineDescriptor, DecodeStatus> {
-    if bytes.len() < TYPE7_MIN_LEN {
-        return Err(DecodeStatus::ErrShort("res_compute_pipeline_short"));
-    }
-    if ld32(&bytes[0..]) != SERIALIZER_OBJECT_COMPUTE_PIPELINE {
-        return Err(DecodeStatus::ErrUnsupported("res_compute_pipeline_tag"));
-    }
-    let declared = ld32(&bytes[4..]) as usize;
-    if declared != bytes.len() || declared < TYPE7_MIN_LEN {
-        return Err(DecodeStatus::ErrShort("res_compute_pipeline_declared_len"));
-    }
-    // The same four-word header its render sibling carries, so the same relation
-    // between its two lengths holds. Checked rather than stored: this descriptor
-    // has no consumer for the value, and the walks below bound themselves on the
+    let header = serializer_object_header(
+        bytes,
+        SERIALIZER_OBJECT_COMPUTE_PIPELINE,
+        HeaderSlugs {
+            short: "res_compute_pipeline_short",
+            tag: "res_compute_pipeline_tag",
+            declared_len: "res_compute_pipeline_declared_len",
+        },
+    )?;
+    let declared = header.declared as usize;
+    // The same four-word header its render sibling carries, and now literally
+    // the same read of it. Checked rather than stored: this descriptor has no
+    // consumer for the value, and the walks below bound themselves on the
     // declared length.
-    note_serializer_object_payload_len("compute", ld32(&bytes[12..]), declared);
+    note_serializer_object_payload_len("compute", header.serialized_payload_len, declared);
     let (fields, consumed) = decode_compact_tlv_record(bytes, SERIALIZER_OBJECT_FIRST_TLVS)?;
     note_pipeline_tlv_fields(
         "compute",

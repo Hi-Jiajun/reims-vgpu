@@ -137,6 +137,7 @@ pub mod residency;
 pub mod resource_state;
 pub mod sampler;
 pub mod segment;
+pub mod serializer_object;
 pub mod storage_mode;
 pub mod sync;
 pub mod texture_shape;
