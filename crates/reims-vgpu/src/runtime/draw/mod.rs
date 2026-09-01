@@ -3335,13 +3335,36 @@ pub(crate) fn published_surface_frame<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Result<PublishedFrame, NoPublishedFrame> {
-    if texture_ref == 0 || width == 0 || height == 0 {
+    if texture_ref == 0 {
         return Err(NoPublishedFrame::NotMapped);
     }
     let Some(mapping_id) = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
     else {
         return Err(NoPublishedFrame::NotMapped);
     };
+    published_mapping_frame(state, host, mapping_id, width, height)
+}
+
+/// [`published_surface_frame`] for a caller that has already resolved the
+/// mapping.
+///
+/// The half that asks the question, split from the half that finds the surface,
+/// because the sampled path resolves the mapping to read its *geometry* before
+/// it can name the window to ask about — and resolving a second time is a second
+/// lookup that could answer differently.
+///
+/// Takes `state` by shared reference, which is the statement that asking this
+/// changes nothing.
+pub(crate) fn published_mapping_frame<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> Result<PublishedFrame, NoPublishedFrame> {
+    if mapping_id == 0 || width == 0 || height == 0 {
+        return Err(NoPublishedFrame::NotMapped);
+    }
     let currency =
         crate::runtime::surface_currency::surface_currency(state, host, mapping_id, width, height);
     if !currency.serves(crate::runtime::surface_currency::CurrencyStandard::WatchedAndUnwritten) {

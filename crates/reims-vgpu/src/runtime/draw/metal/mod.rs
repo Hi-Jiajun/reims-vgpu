@@ -1796,7 +1796,102 @@ fn load_mapper_ref_texture_rgba<M: HostMemory + HostOps>(
     format_override: Option<u16>,
 ) -> Option<(u32, u32, Vec<u8>)> {
     let mapping_id = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)?;
+    if let Some(served) = sampled_from_published_surface(state, host, mapping_id, format_override) {
+        return Some(served);
+    }
     load_mapper_ref_texture_mapping_rgba(state, host, mapping_id, format_override)
+}
+
+/// A sampled read served from this device's own last publication of the surface,
+/// instead of from the surface's guest pages.
+///
+/// # Why this is the whole of the bar
+///
+/// This rail's sampled path had no cache rung at all: every bind walked the
+/// surface's pages and decoded every texel, from scratch, every draw. Measured
+/// on a driven macos-13 boot, `metal_sampled_load_us` was 100.0 % of
+/// `sampled_us` and `sampled_us` was 48 % of the whole chain — 2.15 MB a draw at
+/// **150 MB/s**, against 2.4 GB/s for `replace_region` pushing the identical
+/// bytes back out. The gap is the per-texel decode, not the copy.
+///
+/// The cache holds those same texels already, in BGRA, published by the Store
+/// that rendered them, and reaching them costs a refcount and a four-byte
+/// shuffle.
+///
+/// # Why the bytes are the same bytes
+///
+/// [`crate::runtime::draw::load_mapper_ref_texture_mapping_rgba`] keys on the
+/// mapping's *latched* geometry — which is what
+/// [`crate::runtime::surface_cache`] is keyed by — reads BGRA8 out of the
+/// mapping, and converts it to RGBA8. With no view format override that
+/// conversion is exactly a red/blue swap, so this arm and that one produce the
+/// same image or this one does not fire.
+///
+/// A format override is refused rather than reinterpreted: the override
+/// reinterprets the storage, and a cache entry records no such
+/// reinterpretation. Counted, so the size of what is being left on the table is
+/// visible rather than assumed.
+///
+/// # Which evidence standard, and why the strict one again
+///
+/// A stale sampled texture is less bad than a stale LOAD seed — nothing writes
+/// a sampled read back, so the next frame re-samples — but the frame it
+/// corrupts *is* written back by its pass's Store, so the error still reaches
+/// the guest's pages. And the rung below this one reads the guest's pages, so a
+/// refusal costs exactly what this path costs today.
+///
+/// Same door, same standard, one gate: widening is a decision to take once, on
+/// the counters, for both readers — not twice, differently, here.
+fn sampled_from_published_surface<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    mapping_id: u32,
+    format_override: Option<u16>,
+) -> Option<(u32, u32, Vec<u8>)> {
+    use crate::runtime::draw::NoPublishedFrame;
+    use crate::runtime::surface_currency::SurfaceCurrency;
+
+    if format_override.is_some() {
+        crate::runtime::drain::note_store_route("metal_sampled_surface_override");
+        return None;
+    }
+    let (w, h) = {
+        let m = state.mappings.get(&mapping_id)?;
+        if !m.has_geom || m.width == 0 || m.height == 0 {
+            // The read below latches the geometry as it goes, so the next bind
+            // of this surface reaches the door. Not a refusal of the frame.
+            crate::runtime::drain::note_store_route("metal_sampled_surface_ungeometried");
+            return None;
+        }
+        (m.width, m.height)
+    };
+    crate::runtime::drain::note_store_route("metal_sampled_surface_asked");
+    if let Err(decline) =
+        crate::runtime::draw::published_mapping_frame(state, host, mapping_id, w, h)
+    {
+        crate::runtime::drain::note_store_route(match decline {
+            NoPublishedFrame::Uncurrent(_, SurfaceCurrency::Unwritten(_)) => {
+                "metal_sampled_surface_unwatched"
+            }
+            NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WrotePixels(_)) => {
+                "metal_sampled_surface_repainted"
+            }
+            NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteUnknown) => {
+                "metal_sampled_surface_unknown"
+            }
+            NoPublishedFrame::Unpublished(_) => "metal_sampled_surface_empty",
+            // `serves` admits `WroteElsewhere` and the mapping and geometry were
+            // both checked above, so either arm here is a contradiction between
+            // this match and the gate rather than a guest behaviour.
+            NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteElsewhere)
+            | NoPublishedFrame::NotMapped => "metal_sampled_surface_impossible",
+        });
+        return None;
+    }
+    let bgra = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h)?;
+    crate::runtime::drain::note_store_route("metal_sampled_from_surface");
+    crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", bgra.len() as u64);
+    Some((w, h, swap_rb_channels(&bgra)))
 }
 
 /// normal-texture linear texture at mip `level`: strided guest rows → tight RGBA8.
@@ -1999,6 +2094,159 @@ mod tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::host::FakeHost;
+
+    /// A sampled read of a mapper-ref-texture surface is served from this
+    /// device's own published frame while the hypervisor's witness says the
+    /// guest has not repainted it, and from the surface's own pages otherwise.
+    ///
+    /// The rung this adds is the whole of the rail's largest bar: measured on a
+    /// driven macos-13 boot, `metal_sampled_load_us` was 100.0 % of
+    /// `sampled_us`, moving 2.15 MB a draw at 150 MB/s through a per-texel
+    /// decode of pages this device had just written itself.
+    ///
+    /// Three legs, and the middle one is the reason the strict evidence
+    /// standard is used here as well as on the LOAD seed: a rail whose
+    /// dirty-tracking witness never arms answers `NoStamp` to every ask, and
+    /// under the permissive standard this door would then hand every shader
+    /// whatever the cache held, forever.
+    #[test]
+    fn a_sampled_mapper_ref_texture_serves_a_published_frame_only_on_a_watched_clean_witness() {
+        use crate::contract::endian::{st16, st32};
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::model::PAGE_SHIFT_X86;
+        use crate::runtime::decode::resource::{
+            list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_MAPPER_REF_TEXTURE,
+        };
+        use crate::runtime::gva_mem;
+        use crate::runtime::host::{HostMemory, HostOps};
+
+        let (w, h) = (2u32, 2u32);
+        let (mid, texture_ref, task_id) = (71u32, 2u32, 1u32);
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+
+        let (dir_pfn, root_pfn) = (2u32, 3u32);
+        let (dir_gpa, root_gpa) = (
+            (dir_pfn as u64) << PAGE_SHIFT_X86,
+            (root_pfn as u64) << PAGE_SHIFT_X86,
+        );
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        let mut dir = [0u8; 8];
+        st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+        st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+        assert!(host.write_gpa(dir_gpa, &dir).is_ok());
+        for i in 0..3u32 {
+            let pfn = 4 + i;
+            host.map_range((pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn);
+            assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+        }
+        state.define_task(task_id, 0x1000, dir_pfn);
+        assert!(state.set_object_list(task_id, 0, 32));
+
+        const DESC_LEN: usize = 0x20;
+        let desc_gva = 0x1000u64;
+        let mut desc = vec![0u8; DESC_LEN];
+        st32(&mut desc[0..], mid);
+        st16(&mut desc[0x16..], MTL_FORMAT_BGRA8_UNORM);
+        st32(&mut desc[0x18..], w);
+        st32(&mut desc[0x1c..], h);
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[task_id],
+            desc_gva,
+            &desc,
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut list_entry,
+            u32::from(OBJECT_TYPE_MAPPER_REF_TEXTURE) | ((DESC_LEN as u32) << 8),
+        );
+        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[task_id],
+            list_object_entry_offset(texture_ref, 32).unwrap(),
+            &list_entry,
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+
+        let page_gpa = 6u64 << PAGE_SHIFT_X86;
+        assert!(state.map_surface(mid));
+        {
+            let m = state.mappings.get_mut(&mid).expect("mapped above");
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(6u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+        // What the surface's own pages hold, and what this device last
+        // published for it — different colours, so "served from the cache" and
+        // "read from the guest" are told apart by value and not by a counter.
+        assert!(host
+            .write_gpa(
+                page_gpa,
+                &[0x11u8, 0x22, 0x33, 0xff].repeat((w * h) as usize)
+            )
+            .is_ok());
+        const GUEST_RGBA: [u8; 4] = [0x33, 0x22, 0x11, 0xff];
+        crate::runtime::surface_cache::store(
+            &mut state,
+            mid,
+            w,
+            h,
+            [0xAAu8, 0xBB, 0xCC, 0xff].repeat((w * h) as usize),
+        );
+        const PUBLISHED_RGBA: [u8; 4] = [0xCC, 0xBB, 0xAA, 0xff];
+
+        // Unwatched: the witness has not been armed, so the strict standard
+        // refuses and the guest's pages answer.
+        let (gw, gh, rgba) = load_sampled_rgba(&mut state, &mut host, task_id, texture_ref)
+            .expect("the surface's own pages are always a sampled source");
+        assert_eq!((gw, gh), (w, h));
+        assert_eq!(
+            &rgba[..4],
+            &GUEST_RGBA,
+            "an unstamped surface has no witness to spend, and the cache must not be served"
+        );
+
+        // Watched and clean, which is what `mapping_write` leaves behind when it
+        // publishes: the device's own frame is the surface.
+        let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
+            .expect("FakeHost observes guest writes");
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
+        let (_, _, served) = load_sampled_rgba(&mut state, &mut host, task_id, texture_ref)
+            .expect("a published frame under a clean witness is the surface");
+        assert_eq!(
+            &served[..4],
+            &PUBLISHED_RGBA,
+            "with the witness clean the device's own publication is the surface, and the \
+             per-texel decode of the guest's pages is the cost this door exists to remove"
+        );
+
+        // Repainted by the guest CPU, with no device operation at all — this
+        // witness is the only thing that sees it.
+        host.guest_wrote_page(page_gpa);
+        let (_, _, repainted) = load_sampled_rgba(&mut state, &mut host, task_id, texture_ref)
+            .expect("a repainted surface still samples, from its own pages");
+        assert_eq!(
+            &repainted[..4],
+            &GUEST_RGBA,
+            "the cache is a frame the guest has since painted over"
+        );
+    }
 
     #[test]
     fn explicit_metal_sampler_and_depth_binds_return_typed_missing_entry_declines() {
