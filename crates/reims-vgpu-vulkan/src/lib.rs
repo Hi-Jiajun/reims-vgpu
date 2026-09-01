@@ -121,3 +121,96 @@ pub mod transfer;
 pub mod variant;
 pub mod vertex;
 pub mod view;
+
+/// The dependency list, read back and checked against the claim above it.
+///
+/// # Why a test and not a comment
+///
+/// This crate's doc says "only place" is a claim a module boundary cannot hold,
+/// and that the dependency list is what holds it instead. A list held only by a
+/// comment is one a convenient import silently retires — and the import this
+/// rail is most likely to reach for is the protocol crate, because every wire
+/// vocabulary it wants is *in* there and also re-exported through the semantic
+/// model. Reaching it directly compiles, passes every test here, and quietly
+/// makes this rail a second decoder.
+///
+/// So the manifest is parsed and compared. The parser is a dozen lines here
+/// rather than a shared helper elsewhere: a boundary test that had to depend on
+/// something to run would be adding an edge to the graph it exists to bound.
+#[cfg(test)]
+mod boundary {
+    /// Every crate named in one section of a manifest, in the order it lists
+    /// them. Not just the in-workspace ones — `ash` is as much a part of this
+    /// crate's claim as `reims-vgpu-core` is.
+    fn deps(manifest: &str, section: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                inside = trimmed == section;
+                continue;
+            }
+            if !inside || trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = trimmed.split('=').next().map(str::trim) {
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    fn manifest() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("a crate can read its own manifest")
+    }
+
+    /// `ash`, the semantic model, the refusal vocabulary, the operator
+    /// switches. That is the whole list, and it is asserted as a list rather
+    /// than as a set of prohibitions because the edge that breaks this is the
+    /// one nobody thought to prohibit.
+    #[test]
+    fn the_rail_sees_ash_the_model_the_refusals_and_the_switches() {
+        assert_eq!(
+            deps(&manifest(), "[dependencies]"),
+            vec![
+                "ash",
+                "reims-vgpu-core",
+                "reims-vgpu-observe",
+                "reims-vgpu-config",
+            ],
+            "this crate's dependency list is what makes \"the only place host \
+             capabilities become policy\" true"
+        );
+    }
+
+    /// And in particular not the protocol crate, which is the one edge that
+    /// would be easy to justify and would make this rail a second decoder.
+    ///
+    /// Its own test because the list above would catch it, and because a reader
+    /// who changes that list needs to meet this sentence rather than a diff.
+    #[test]
+    fn the_rail_never_reaches_the_decode_vocabulary_directly() {
+        let m = manifest();
+        for section in [
+            "[dependencies]",
+            "[dev-dependencies]",
+            "[build-dependencies]",
+        ] {
+            for d in deps(&m, section) {
+                assert!(
+                    !matches!(
+                        d.as_str(),
+                        "reims-vgpu-protocol" | "reims-vgpu-wire" | "reims-vgpu-memory"
+                    ),
+                    "{section} names {d}: a wire tag's meaning reaches this rail \
+                     through the semantic model or not at all, and guest-RAM \
+                     ownership does not reach it"
+                );
+            }
+        }
+    }
+}

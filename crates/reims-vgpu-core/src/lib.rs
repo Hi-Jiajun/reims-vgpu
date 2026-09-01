@@ -129,3 +129,88 @@ pub mod walk;
 /// Command-stream bytes for the suites that want the model driven from them.
 #[cfg(test)]
 mod testing;
+
+/// The dependency list, read back and checked against the claim above it.
+///
+/// # Why a test and not a comment
+///
+/// This crate's doc says its dependency list *is* the claim that it can see
+/// what a wire tag means and nothing about how a host produces it. A claim
+/// carried only by a comment is one a convenient import silently retires: a
+/// `reims-vgpu-vulkan` line added to `Cargo.toml` to reach one type compiles,
+/// passes every test in this crate, and leaves the doc above saying the
+/// opposite of what the crate is.
+///
+/// So the manifest is parsed and compared. The parser is deliberately a dozen
+/// lines here rather than a shared helper in another crate — a boundary test
+/// that had to depend on something to run would be adding an edge to the graph
+/// it exists to bound.
+///
+/// Dev- and build-dependencies are checked separately and not folded in. They
+/// are a different claim: a test may read the wire bytes and the shared fixture
+/// loader without the library being able to, and the split is the only thing
+/// that keeps "what the model can see" from quietly meaning "what the test
+/// binary links".
+#[cfg(test)]
+mod boundary {
+    /// The in-workspace crates named in one section of a manifest, in the order
+    /// the section lists them.
+    fn workspace_deps(manifest: &str, section: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                inside = trimmed == section;
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            if let Some(name) = trimmed.split('=').next().map(str::trim) {
+                if name.starts_with("reims-vgpu-") {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    fn manifest() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("a crate can read its own manifest")
+    }
+
+    /// The library sees the protocol layer and nothing else in this workspace.
+    ///
+    /// Named exhaustively rather than as a set of prohibitions, because the
+    /// failure this guards against is an edge nobody thought to prohibit.
+    #[test]
+    fn the_library_depends_on_the_protocol_layer_and_nothing_else() {
+        assert_eq!(
+            workspace_deps(&manifest(), "[dependencies]"),
+            vec!["reims-vgpu-protocol"],
+            "this crate's dependency list is its claim to be backend-neutral; \
+             a new edge here retires that claim silently"
+        );
+    }
+
+    /// And the test binary's extra edges are the ones the fixture suites need,
+    /// which the library still cannot reach.
+    #[test]
+    fn the_test_binary_reaches_the_capture_and_the_library_still_does_not() {
+        let m = manifest();
+        for section in ["[dev-dependencies]", "[build-dependencies]"] {
+            let deps = workspace_deps(&m, section);
+            for d in &deps {
+                assert!(
+                    matches!(d.as_str(), "reims-vgpu-testkit" | "reims-vgpu-wire"),
+                    "{section} names {d}: a suite may read the capture and the \
+                     bytes under it, and nothing else this crate is not allowed \
+                     to see"
+                );
+            }
+            assert!(!deps.is_empty(), "{section} names no in-workspace crate");
+        }
+    }
+}
