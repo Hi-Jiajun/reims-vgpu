@@ -665,7 +665,9 @@ fn a_draw_declares_the_memory_apples_own_bind_records_named() {
     let mut without_memory = 0usize;
     for case in &all {
         let rail = case.rail;
-        let Ok(view) = op(&case.bytes, 0) else { continue };
+        let Ok(view) = op(&case.bytes, 0) else {
+            continue;
+        };
         let Some(binds_memory) = binds_memory(rail, view.opcode()) else {
             continue;
         };
@@ -712,9 +714,7 @@ fn a_draw_declares_the_memory_apples_own_bind_records_named() {
             .filter_map(|a| match a.key {
                 reims_vgpu_core::access::AccessKey::Range(r, _)
                 | reims_vgpu_core::access::AccessKey::Subresource(r, _)
-                | reims_vgpu_core::access::AccessKey::Whole(r) => {
-                    u32::try_from(r.backing.0).ok()
-                }
+                | reims_vgpu_core::access::AccessKey::Whole(r) => u32::try_from(r.backing.0).ok(),
                 reims_vgpu_core::access::AccessKey::Heap(_)
                 | reims_vgpu_core::access::AccessKey::DomainOnly => None,
             })
@@ -744,6 +744,152 @@ fn a_draw_declares_the_memory_apples_own_bind_records_named() {
         with_memory > 0 && without_memory > 0,
         "the join saw {with_memory} binds that name memory and {without_memory} \
          that do not; both answers have to be reached or one of them is untested"
+    );
+}
+
+/// A rebind moves an offset and keeps the slot bound, in Apple's own records.
+///
+/// `setVertexBufferOffset:atIndex:` and its four siblings name **no buffer**:
+/// the slot keeps whatever it holds and only the offset — and, for the strided
+/// forms, the stride — changes. That makes them the one binding record whose
+/// correct handling is invisible to every test above. A model that treated one
+/// as a bind would read a buffer ref out of a word that holds an offset and
+/// rebind the slot to it; one that treated it as an unbind would leave the next
+/// draw declaring nothing. Both are a footprint that disagrees with the
+/// encoder, and both resolve without any refusal.
+///
+/// So: a real bind, then a real rebind, then a real draw, and the draw must
+/// still declare exactly what the bind named.
+#[test]
+fn a_rebind_apple_wrote_keeps_the_slot_the_bind_before_it_filled() {
+    use reims_vgpu_core::exec::ExecBuilder;
+    use reims_vgpu_protocol::segment::{SegmentKind, SegmentLifetime};
+    use reims_vgpu_wire::ops::compute;
+    use reims_vgpu_wire::ops::render::{
+        is_buffer_bind, OPCODE_DRAW, OPCODE_SET_FRAGMENT_BUFFER_OFFSET,
+        OPCODE_SET_VERTEX_BUFFER_OFFSET, OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE,
+    };
+
+    /// Whether this opcode moves an already-bound buffer's offset.
+    fn is_rebind(rail: Rail, opcode: u32) -> bool {
+        match rail {
+            Rail::Render => matches!(
+                opcode,
+                OPCODE_SET_VERTEX_BUFFER_OFFSET
+                    | OPCODE_SET_FRAGMENT_BUFFER_OFFSET
+                    | OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE
+            ),
+            Rail::Compute => matches!(
+                opcode,
+                compute::OPCODE_SET_BUFFER_OFFSET | compute::OPCODE_SET_BUFFER_OFFSET_STRIDE
+            ),
+            _ => false,
+        }
+    }
+
+    /// A buffer bind on the rail, whose slot a rebind can move.
+    fn is_bind(rail: Rail, opcode: u32) -> bool {
+        match rail {
+            Rail::Render => is_buffer_bind(opcode),
+            Rail::Compute => opcode == compute::OPCODE_SET_BUFFER,
+            _ => false,
+        }
+    }
+
+    let all = cases();
+    let mut checked = 0usize;
+    for rail in [Rail::Render, Rail::Compute] {
+        let kind = SegmentKind::of_rail(rail).expect("a stream rail names a segment");
+        let trigger_opcode = match rail {
+            Rail::Compute => compute::OPCODE_DISPATCH_THREADGROUPS,
+            _ => OPCODE_DRAW,
+        };
+        let trigger = all
+            .iter()
+            .find(|c| c.rail == rail && op(&c.bytes, 0).is_ok_and(|v| v.opcode() == trigger_opcode))
+            .expect("a direct draw or dispatch");
+        let bind = all
+            .iter()
+            .find(|c| c.rail == rail && op(&c.bytes, 0).is_ok_and(|v| is_bind(rail, v.opcode())))
+            .expect("a buffer bind");
+
+        for case in &all {
+            if case.rail != rail {
+                continue;
+            }
+            let Ok(view) = op(&case.bytes, 0) else {
+                continue;
+            };
+            if !is_rebind(rail, view.opcode()) {
+                continue;
+            }
+
+            let mut builder = ExecBuilder::new();
+            let resolver = Recording::new();
+            let bind_view = op(&bind.bytes, 0).expect("checked above");
+            let Ok(bound) = operation(rail, &bind_view, &resolver, builder.arenas_mut()) else {
+                continue;
+            };
+            let named: std::collections::BTreeSet<u32> =
+                resolver.seen().into_iter().filter(|r| *r != 0).collect();
+            assert!(!named.is_empty(), "{}: the bind named nothing", bind.name);
+            let Ok(rebind) = operation(rail, &view, &resolver, builder.arenas_mut()) else {
+                continue;
+            };
+            // The claim that makes the rest of this test mean something: a
+            // rebind resolves no ref of its own, so anything the draw declares
+            // after it came from the bind.
+            assert_eq!(
+                resolver
+                    .seen()
+                    .into_iter()
+                    .filter(|r| *r != 0)
+                    .collect::<std::collections::BTreeSet<u32>>(),
+                named,
+                "{}: a rebind resolved a ref, so it named a buffer",
+                case.name
+            );
+            let trigger_view = op(&trigger.bytes, 0).expect("checked above");
+            let drawn = operation(rail, &trigger_view, &resolver, builder.arenas_mut())
+                .expect("a draw or dispatch the ledger judged");
+
+            let mut model = registry_holding(&resolver.seen());
+            builder
+                .begin_segment(kind.wire_type(), SegmentLifetime::SELF_CONTAINED)
+                .expect("a segment of the rail's own kind");
+            for record in [bound, rebind, drawn] {
+                builder
+                    .record(record, &mut model.task_access(TASK, DOMAIN))
+                    .expect("a record Apple wrote");
+            }
+            builder.end_segment().expect("the segment ends");
+            let tx = builder.finish().expect("nothing left open");
+
+            let declared: std::collections::BTreeSet<u32> = tx
+                .accesses
+                .iter()
+                .filter_map(|a| match a.key {
+                    reims_vgpu_core::access::AccessKey::Range(r, _)
+                    | reims_vgpu_core::access::AccessKey::Subresource(r, _)
+                    | reims_vgpu_core::access::AccessKey::Whole(r) => {
+                        u32::try_from(r.backing.0).ok()
+                    }
+                    reims_vgpu_core::access::AccessKey::Heap(_)
+                    | reims_vgpu_core::access::AccessKey::DomainOnly => None,
+                })
+                .collect();
+            assert_eq!(
+                declared, named,
+                "{}: after the rebind the draw declared {declared:?} and the bind named {named:?}",
+                case.name
+            );
+            checked += 1;
+        }
+    }
+    println!("rebind fixtures checked: {checked}");
+    assert!(
+        checked > 0,
+        "no rebind fixture reached the join; the test proved nothing"
     );
 }
 
