@@ -289,14 +289,14 @@ fn independent_transactions_reach_many_completion_orders() {
 /// orders the ones that touch memory and the control commands float.
 fn mixed_classes() -> Vec<DeviceTransaction> {
     let mut batch = Vec::new();
-    for n in 1..=6u64 {
+    for n in 1..=7u64 {
         let identity = crate::testing::identity(1, n);
         let completion = Some(CompletionStamp {
             slot: StampSlot(1),
             value: StampValue(u32::try_from(n).expect("small")),
         });
         let accesses = vec![produces(1, 1, n)];
-        batch.push(match n % 3 {
+        batch.push(match n % 5 {
             0 => DeviceTransaction {
                 identity,
                 stamp_waits: Vec::new(),
@@ -315,7 +315,7 @@ fn mixed_classes() -> Vec<DeviceTransaction> {
                     payload: Payload::Exec(b.finish().expect("frozen")),
                 }
             }
-            _ => DeviceTransaction {
+            2 => DeviceTransaction {
                 identity,
                 stamp_waits: Vec::new(),
                 completion,
@@ -330,6 +330,67 @@ fn mixed_classes() -> Vec<DeviceTransaction> {
                     .expect("every access is for the one resource the op names"),
                 ),
             },
+            // A frame. Its accesses are reads, so it publishes no version and
+            // its whole contribution to the trace is which mapping it showed.
+            //
+            // **One present, deliberately.** Two presents on one domain read
+            // different surfaces and two reads compile no hazard edge, so
+            // nothing in this plane orders them — and the device's answer to
+            // that is `PresentStream`'s, which refuses an out-of-order queue
+            // rather than ordering the transactions. The interpreter has no
+            // stream (an image count is a host fact a guest cannot observe), so
+            // a batch with two presents reports a `Divergence::Presentation`
+            // that is this reference's silence rather than a scheduling defect.
+            // Recorded here rather than asserted, because asserting either
+            // answer would be choosing one.
+            3 => {
+                let packet = crate::present::PresentPacket {
+                    form: crate::present::PresentForm::SwapMapping,
+                    mapping: crate::identity::MappingId(u32::try_from(n).expect("small")),
+                    task: None,
+                };
+                DeviceTransaction {
+                    identity,
+                    stamp_waits: Vec::new(),
+                    completion,
+                    payload: Payload::Present(
+                        crate::transaction::PresentPayload::new(
+                            packet,
+                            vec![(packet.mapping, whole(1, 3, AccessMode::Read))],
+                        )
+                        .expect("one read of the packet's own target"),
+                    ),
+                }
+            }
+            // A question. This interpreter has no answer source, so every one
+            // of them stalls — which is the observation under test: a stalled
+            // query publishes its completion word and no content, and a
+            // schedule that lost either would be a guest reading a destination
+            // nothing wrote or blocking on a word that never came.
+            _ => {
+                let request = crate::query::resolve(
+                    crate::query::QueryKind::HeapTextureSizeAndAlign,
+                    crate::query::RequestWords::HeapTexture,
+                    crate::query::ReplyDestination {
+                        backing: BackingId(4),
+                        bytes: ByteRange {
+                            offset: 0,
+                            length: 4096,
+                        },
+                    },
+                )
+                .expect("its own layout");
+                DeviceTransaction {
+                    identity,
+                    stamp_waits: Vec::new(),
+                    completion,
+                    payload: Payload::Query(crate::transaction::QueryPayload::new(
+                        request,
+                        ChannelId(1),
+                        Some(ContentVersion(n)),
+                    )),
+                }
+            }
         });
     }
     batch
@@ -376,9 +437,20 @@ fn a_control_command_can_answer_an_execs_stamp_wait() {
 #[test]
 fn a_batch_of_mixed_classes_schedules_equivalently() {
     let batch = mixed_classes();
+    // All five classes, because the claim is about the envelope and an envelope
+    // that only two classes carry is not one.
+    let mut classes: Vec<PayloadClass> = batch.iter().map(DeviceTransaction::class).collect();
+    classes.sort_unstable();
+    classes.dedup();
     assert_eq!(
-        batch.iter().filter(|tx| tx.exec().is_some()).count(),
-        2,
+        classes,
+        vec![
+            PayloadClass::Exec,
+            PayloadClass::ResourceLifecycle,
+            PayloadClass::Query,
+            PayloadClass::Present,
+            PayloadClass::Control,
+        ],
         "the workload has to actually mix classes"
     );
     assert!(
@@ -389,13 +461,33 @@ fn a_batch_of_mixed_classes_schedules_equivalently() {
     );
     eligible(&batch).expect("a mixed batch is eligible");
     let reference = serial(&batch);
-    assert!(
-        reference
-            .trace
-            .iter()
-            .any(|o| matches!(o, crate::interpret::Observation::VersionPublished { .. })),
-        "a schedule trace with no version published tests only the stamps"
-    );
+    // Each of the three observation kinds only these classes can produce has to
+    // be in the reference trace, or the comparison below is checking stamps.
+    for (kind, present) in [
+        (
+            "a version published",
+            reference
+                .trace
+                .iter()
+                .any(|o| matches!(o, crate::interpret::Observation::VersionPublished { .. })),
+        ),
+        (
+            "a frame presented",
+            reference
+                .trace
+                .iter()
+                .any(|o| matches!(o, crate::interpret::Observation::FramePresented { .. })),
+        ),
+        (
+            "a query left unanswered",
+            reference
+                .trace
+                .iter()
+                .any(|o| matches!(o, crate::interpret::Observation::QueryUnanswered { .. })),
+        ),
+    ] {
+        assert!(present, "the reference trace has no {kind}");
+    }
     let mut orders = std::collections::BTreeSet::new();
     for seed in 0..64u64 {
         let run = parallel(&batch, seed);
