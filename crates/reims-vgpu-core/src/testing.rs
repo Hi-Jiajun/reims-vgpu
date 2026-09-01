@@ -196,6 +196,19 @@ pub(crate) fn segment_bytes_with(
 }
 
 /// A one-segment blit stream over the resources `refs` names.
+/// A one-segment render stream that binds `refs` and draws.
+///
+/// The draw is `drawPrimitives:vertexStart:vertexCount:`, which names no memory
+/// of its own — so every access the transaction carries came through the
+/// encoder's binding table, at [`crate::access::AccessMode::Unknown`], which is
+/// what an unreflected bound slot contributes and what conflicts with
+/// everything.
+pub(crate) fn render_stream(refs: &[u32]) -> Vec<u8> {
+    let mut records = vec![bind_vertex_buffers(0, refs)];
+    records.push(draw_primitives());
+    segment_bytes(SegmentKind::Render.wire_type(), &records)
+}
+
 pub(crate) fn blit_stream(refs: &[u32]) -> Vec<u8> {
     let records: Vec<Vec<u8>> = refs
         .iter()

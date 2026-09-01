@@ -260,6 +260,45 @@ fn from_records(count: u64) -> Vec<DeviceTransaction> {
         .collect()
 }
 
+/// The same, from render streams whose accesses are all
+/// [`AccessMode::Unknown`].
+///
+/// A different access shape from every other workload in this file, and the one
+/// a guest's render encoder actually produces. A bound slot contributes
+/// `Unknown` until a pipeline publishes what its shader does with it, and
+/// `Unknown` is the only mode that conflicts with a *reader* — so a batch of
+/// these compiles edges no `Read`/`Write` workload can, and the reference
+/// interpreter has to mean the same thing about them.
+fn from_render_records(count: u64) -> Vec<DeviceTransaction> {
+    const TASK: crate::identity::TaskId = crate::identity::TaskId(1);
+    const SLOTS: &[u32] = &[1, 2, 3, 10, 11];
+    let mut model = crate::testing::registry(TASK, SLOTS);
+    (1..=count)
+        .map(|n| {
+            let bytes = crate::testing::render_stream(&[
+                u32::try_from(n % 3).expect("small") + 1,
+                u32::try_from(n % 2).expect("small") + 10,
+            ]);
+            let work = crate::walk::exec(
+                &bytes,
+                &crate::testing::Everything,
+                &mut model.task_access(TASK, ChannelId(1)),
+                crate::exec::ExecBuilder::new(),
+            )
+            .expect("a stream of records the ledger has judged");
+            DeviceTransaction {
+                identity: crate::testing::identity(1, n),
+                stamp_waits: Vec::new(),
+                completion: Some(CompletionStamp {
+                    slot: StampSlot(1),
+                    value: StampValue(u32::try_from(n).expect("small")),
+                }),
+                payload: Payload::Exec(work),
+            }
+        })
+        .collect()
+}
+
 // ------------------------------------------------------------- the sweep
 
 /// The sweep is only meaningful if the seeds actually reach different
@@ -634,6 +673,64 @@ fn a_batch_built_from_records_schedules_the_way_a_declared_one_does() {
         orders.len() > 1,
         "the derived accesses admitted exactly one schedule, so the sweep \
          proved nothing about them"
+    );
+    assert_eq!(
+        parallel_with(&batch, |_| 0).order(),
+        reference.order(),
+        "taking the lowest ready ordinal every time must reproduce ingress order"
+    );
+}
+
+/// Seam 2's exit over the access shape a render encoder produces.
+///
+/// Every other workload in this file declares `Read` or `Write`. A guest's
+/// draw declares neither: what a bound slot contributes is the pipeline's
+/// answer, nothing has published one, and the honest answer until then is
+/// `Unknown` — the one mode that conflicts with a reader as well as a writer.
+///
+/// So this batch exercises edges the rest of the sweep cannot reach, and it
+/// exercises them through the whole path: framed bytes, decoded records, the
+/// encoder's binding table, and participations placed by the registry that owns
+/// the names.
+#[test]
+fn a_batch_of_draws_schedules_the_way_a_declared_one_does() {
+    let batch = from_render_records(12);
+    eligible(&batch).expect("one domain, judged records");
+    // The workload is only this workload if the accesses are the encoder's.
+    assert!(
+        batch.iter().all(|tx| !tx.accesses().is_empty()
+            && tx.accesses().iter().all(|a| a.mode == AccessMode::Unknown)),
+        "a draw's declared accesses are its bound slots, at Unknown"
+    );
+    assert!(
+        batch
+            .iter()
+            .any(|tx| crate::exec::published_versions(tx.accesses())
+                .next()
+                .is_some()),
+        "Unknown writes, so a draw publishes a version; without one the trace          has nothing a reordering could move"
+    );
+
+    let reference = serial(&batch);
+    let mut orders = std::collections::BTreeSet::new();
+    for seed in 0..32u64 {
+        let run = parallel(&batch, seed);
+        assert!(
+            run.stalled.is_empty(),
+            "seed {seed} stalled at {:?}",
+            run.stalled
+        );
+        assert_eq!(
+            run.order().len(),
+            batch.len(),
+            "seed {seed} left work unrun"
+        );
+        equivalent(&reference, &run).unwrap_or_else(|d| panic!("seed {seed} diverged: {d:?}"));
+        orders.insert(run.order());
+    }
+    assert!(
+        orders.len() > 1,
+        "the derived accesses admitted exactly one schedule, so the sweep          proved nothing about them"
     );
     assert_eq!(
         parallel_with(&batch, |_| 0).order(),
