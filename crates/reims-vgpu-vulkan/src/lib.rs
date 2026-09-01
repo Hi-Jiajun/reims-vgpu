@@ -67,6 +67,8 @@
 //!   is allowed to compile each, and why none of them is ever evicted.
 //! - [`resident`] — which native object a guest resource name resolves to,
 //!   and what becomes of the previous one when the guest reuses the name.
+//! - [`sampler`] — what a checked sampler declaration becomes here, and the
+//!   three things about it that are host capabilities.
 //! - [`staging`] — host-visible scratch memory, sub-allocated linearly and
 //!   returned only by the timeline.
 //! - [`submission`] — what happens to a timeline point between reserving it
@@ -105,6 +107,7 @@ pub mod raster;
 pub mod record;
 pub mod recording;
 pub mod resident;
+pub mod sampler;
 pub mod staging;
 pub mod submission;
 pub mod timeline;

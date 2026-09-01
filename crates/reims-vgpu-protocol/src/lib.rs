@@ -54,6 +54,8 @@
 //!   does.
 //! - [`pixel_format`] — the format ordinals, what each one is made of, and the
 //!   conversions between a texel and the eight-bit colour the device carries.
+//! - [`sampler`] — `MTLSamplerDescriptor`'s ordinals, and the combinations
+//!   the guest API itself does not admit.
 //! - [`texture_shape`] — what a texture declaration is: its type ordinal, the
 //!   dimensions that type uses, and the field pairs the guest API does not
 //!   admit.
@@ -115,6 +117,7 @@ pub mod pixel_format;
 pub mod render;
 pub mod residency;
 pub mod resource_state;
+pub mod sampler;
 pub mod segment;
 pub mod storage_mode;
 pub mod sync;

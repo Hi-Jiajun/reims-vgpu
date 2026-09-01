@@ -79,6 +79,13 @@ pub use reims_vgpu_protocol::pixel_format;
 /// turns one into a native image sees this crate rather than the protocol one.
 pub use reims_vgpu_protocol::texture_shape;
 
+/// The sampler state a guest declares, re-exported from the protocol layer.
+///
+/// Semantic: which filter, which addressing, which comparison — the same
+/// questions on either rail. The executor that turns one into a native sampler
+/// sees this crate rather than the protocol one.
+pub use reims_vgpu_protocol::sampler;
+
 pub mod stream;
 pub mod submit;
 pub mod sync;
