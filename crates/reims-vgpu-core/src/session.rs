@@ -1982,4 +1982,401 @@ mod tests {
             assert!(t.ready);
         }
     }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// Opcodes chosen so every admission outcome is reachable: three
+    /// established classes, one the ledger leaves unresolved, and one no
+    /// dispatch table names.
+    const OPCODES: [u16; 5] = [0x37, 0x25, 0x1e, 0x09, 0xfe];
+    const DOMAINS: [ChannelId; 3] = [ChannelId(2), ChannelId(3), ChannelId(4)];
+
+    /// **Ingress is the one place a packet becomes a transaction, and a refused
+    /// packet leaves no trace of having tried.**
+    ///
+    /// The shadow holds what ingress is *about* and nothing else: which
+    /// domains are open, the next ordinal, each domain's next sequence, and the
+    /// generation and device state. It has no publisher, no graph and no
+    /// readiness service, so it can state the refusal precedence and the "no
+    /// ordinal is consumed" rule without being able to express any of the
+    /// machinery those rules protect.
+    ///
+    /// After every step the three planes are checked to agree with each other
+    /// and with the shadow: a transaction holds a position in the publication
+    /// order, the dependency graph and the readiness service, and completing,
+    /// withdrawing or losing the device must take it out of all three.
+    #[test]
+    fn a_refused_packet_takes_no_position_and_an_admitted_one_takes_three() {
+        let mut admitted = 0usize;
+        let mut refused_unknown = 0usize;
+        let mut refused_unestablished = 0usize;
+        let mut refused_closed_channel = 0usize;
+        let mut refused_generation = 0usize;
+        let mut refused_device_lost = 0usize;
+        let mut completions = 0usize;
+        let mut withdrawals = 0usize;
+        let mut resets = 0usize;
+        let mut losses = 0usize;
+        let mut stranded_total = 0usize;
+        let mut channel_retires_refused = 0usize;
+
+        for seed in 0..384u64 {
+            let mut rng = Rng::new(seed);
+            let mut s = SessionModel::new(SessionId(1));
+            // Shadow.
+            let mut open: BTreeSet<ChannelId> = BTreeSet::new();
+            let mut sequence: BTreeMap<ChannelId, u64> = BTreeMap::new();
+            // Positions each domain has taken, and positions it has released.
+            // The publication order holds the difference, which is *not* the
+            // outstanding transactions: a transaction that completed behind an
+            // unfinished head has left the readiness service and still holds
+            // its position, which is the whole point of `publish`.
+            let mut taken: BTreeMap<ChannelId, usize> = BTreeMap::new();
+            let mut released: BTreeMap<ChannelId, usize> = BTreeMap::new();
+            let mut next_ingress = 1u64;
+            let mut generation = SessionGeneration::FIRST;
+            let mut live_device = true;
+            // Ingress ordinals admitted and not yet completed or withdrawn.
+            let mut outstanding: Vec<(IngressOrdinal, ChannelId)> = Vec::new();
+
+            for _ in 0..40 {
+                match rng.below(16) {
+                    // Open a domain.
+                    0..=1 => {
+                        let d = DOMAINS[rng.below(3) as usize];
+                        let already = open.contains(&d);
+                        match s.open_channel(d) {
+                            Ok(()) => {
+                                assert!(!already, "seed {seed}: reopened a live domain");
+                                open.insert(d);
+                            }
+                            Err(Refusal::ChannelAlreadyOpen { channel }) => {
+                                assert!(already);
+                                assert_eq!(channel, d);
+                            }
+                            Err(other) => panic!("seed {seed}: open refused as {other:?}"),
+                        }
+                    }
+                    // End a domain's publication lifetime.
+                    2 => {
+                        let d = DOMAINS[rng.below(3) as usize];
+                        let live = s.publisher().outstanding(d);
+                        match s.retire_channel(d) {
+                            Ok(()) => {
+                                assert_eq!(live, 0, "seed {seed}: retired a live channel");
+                                open.remove(&d);
+                                // The next lifetime starts at position one.
+                                sequence.remove(&d);
+                                taken.remove(&d);
+                                released.remove(&d);
+                            }
+                            Err(RetireRefusal::LivePositions { outstanding: n }) => {
+                                assert_eq!(n, live);
+                                assert!(n > 0);
+                                channel_retires_refused += 1;
+                            }
+                        }
+                    }
+                    // Admit a packet, which may be wrong in any of five ways.
+                    3..=9 => {
+                        let opcode = OPCODES[rng.below(OPCODES.len() as u64) as usize];
+                        let domain = DOMAINS[rng.below(3) as usize];
+                        let stale = rng.below(6) == 0;
+                        let mut p = packet(opcode);
+                        p.domain = domain;
+                        p.session = if stale { generation.next() } else { generation };
+                        p.payload = empty_payload(Channel::Child, opcode);
+
+                        let expected = expected_refusal(live_device, stale, opcode, domain, &open);
+                        let before_ingress = next_ingress;
+                        match s.admit(&p) {
+                            Ok(a) => {
+                                assert!(
+                                    expected.is_none(),
+                                    "seed {seed}: admitted what should refuse as {expected:?}"
+                                );
+                                assert_eq!(
+                                    a.transaction.identity.ingress,
+                                    IngressOrdinal(next_ingress),
+                                    "seed {seed}: ordinal"
+                                );
+                                next_ingress += 1;
+                                let seq = sequence.entry(domain).or_insert(0);
+                                *seq += 1;
+                                assert_eq!(
+                                    a.transaction.identity.domain_sequence,
+                                    ChannelSequence(*seq),
+                                    "seed {seed}: channel sequence"
+                                );
+                                assert_eq!(a.transaction.identity.session, generation);
+                                outstanding.push((IngressOrdinal(next_ingress - 1), domain));
+                                *taken.entry(domain).or_default() += 1;
+                                admitted += 1;
+                            }
+                            Err(refusal) => {
+                                let expected =
+                                    expected.expect("a refusal the shadow did not predict");
+                                assert_eq!(
+                                    std::mem::discriminant(&refusal),
+                                    std::mem::discriminant(&expected),
+                                    "seed {seed}: refused as {refusal:?}, expected {expected:?}"
+                                );
+                                // Nothing was consumed.
+                                assert_eq!(before_ingress, next_ingress);
+                                count_refusal(
+                                    refusal,
+                                    &mut refused_unknown,
+                                    &mut refused_unestablished,
+                                    &mut refused_closed_channel,
+                                    &mut refused_generation,
+                                    &mut refused_device_lost,
+                                );
+                            }
+                        }
+                    }
+                    // A transaction finished.
+                    10..=12 => {
+                        if outstanding.is_empty() {
+                            continue;
+                        }
+                        let i = rng.below(outstanding.len() as u64) as usize;
+                        let (ordinal, domain) = outstanding.swap_remove(i);
+                        let n = s.complete(ordinal).len();
+                        *released.entry(domain).or_default() += n;
+                        completions += 1;
+                    }
+                    // A transaction will never finish.
+                    13 => {
+                        if outstanding.is_empty() {
+                            continue;
+                        }
+                        let i = rng.below(outstanding.len() as u64) as usize;
+                        let (ordinal, domain) = outstanding.swap_remove(i);
+                        let n = s.withdraw(ordinal).len();
+                        // A withdrawal releases what was queued behind it and
+                        // does not publish its own position, so its own place
+                        // leaves the order too.
+                        *released.entry(domain).or_default() += n + 1;
+                        withdrawals += 1;
+                    }
+                    // The guest reset. The ordering plane is untouched.
+                    14 => {
+                        let before = s.scheduler().pending();
+                        generation = s.reset();
+                        assert_eq!(s.generation(), generation, "seed {seed}: reset generation");
+                        assert_eq!(
+                            s.scheduler().pending(),
+                            before,
+                            "seed {seed}: a reset dropped accepted work"
+                        );
+                        assert_eq!(
+                            s.epoch(),
+                            s.lifetime().epoch,
+                            "seed {seed}: a reset moved the device epoch"
+                        );
+                        resets += 1;
+                    }
+                    // The device died, or was replaced.
+                    _ => {
+                        if !live_device {
+                            let epoch = s.recreate_device().expect("it was lost");
+                            assert_eq!(s.epoch(), epoch);
+                            live_device = true;
+                        } else if rng.below(3) == 0 {
+                            let loss = s.device_lost();
+                            let mut expected: Vec<IngressOrdinal> =
+                                outstanding.iter().map(|(o, _)| *o).collect();
+                            expected.sort_unstable();
+                            let mut stranded = loss.stranded.clone();
+                            stranded.sort_unstable();
+                            assert_eq!(
+                                stranded, expected,
+                                "seed {seed}: the loss named the wrong work"
+                            );
+                            stranded_total += stranded.len();
+                            // A loss withdraws every position it holds, and
+                            // each withdrawal releases whatever was queued
+                            // behind it, so nothing is left in any order.
+                            for d in DOMAINS {
+                                let n = taken.get(&d).copied().unwrap_or(0);
+                                released.insert(d, n);
+                            }
+                            outstanding.clear();
+                            live_device = false;
+                            losses += 1;
+                            assert_eq!(
+                                s.scheduler().pending(),
+                                0,
+                                "seed {seed}: stranded work stayed in the readiness service"
+                            );
+                            assert_eq!(
+                                s.graph().live_accesses(),
+                                0,
+                                "seed {seed}: stranded accesses stayed in the graph"
+                            );
+                        } else {
+                            assert_eq!(
+                                s.recreate_device(),
+                                Err(Refusal::DeviceNotLost { epoch: s.epoch() }),
+                                "seed {seed}: a live device was replaced"
+                            );
+                        }
+                    }
+                }
+
+                // The three planes agree with each other and with the shadow.
+                assert_eq!(
+                    s.scheduler().pending(),
+                    outstanding.len(),
+                    "seed {seed}: readiness holds a different set"
+                );
+                for d in DOMAINS {
+                    let expected = taken.get(&d).copied().unwrap_or(0)
+                        - released.get(&d).copied().unwrap_or(0);
+                    assert_eq!(
+                        s.publisher().outstanding(d),
+                        expected,
+                        "seed {seed}: {d:?} publication order"
+                    );
+                }
+                for d in DOMAINS {
+                    assert_eq!(
+                        s.channel_open(d),
+                        open.contains(&d),
+                        "seed {seed}: {d:?} open"
+                    );
+                }
+                assert_eq!(
+                    s.device_state() == DeviceState::Live,
+                    live_device,
+                    "seed {seed}: device state"
+                );
+            }
+
+            // Everything comes out. A session that has drained holds nothing in
+            // any of the three planes.
+            for (ordinal, _) in std::mem::take(&mut outstanding) {
+                let _ = s.withdraw(ordinal);
+            }
+            assert_eq!(s.scheduler().pending(), 0, "seed {seed}");
+            assert_eq!(s.graph().live_accesses(), 0, "seed {seed}");
+            for d in DOMAINS {
+                assert_eq!(s.publisher().outstanding(d), 0, "seed {seed}: {d:?}");
+                if s.channel_open(d) {
+                    s.retire_channel(d).expect("drained");
+                }
+            }
+        }
+
+        // Non-vacuity: every shape an assertion above depends on reaching.
+        assert!(admitted > 900, "packets admitted: {admitted}");
+        assert!(completions > 400, "transactions completed: {completions}");
+        assert!(withdrawals > 120, "transactions withdrawn: {withdrawals}");
+        assert!(resets > 200, "guest resets: {resets}");
+        assert!(losses > 200, "device losses: {losses}");
+        assert!(
+            stranded_total > 80,
+            "work stranded by a loss: {stranded_total}"
+        );
+        assert!(
+            channel_retires_refused > 60,
+            "channel frees refused for live positions: {channel_retires_refused}"
+        );
+        assert!(refused_unknown > 700, "unknown opcode: {refused_unknown}");
+        assert!(
+            refused_unestablished > 700,
+            "unestablished contract: {refused_unestablished}"
+        );
+        assert!(
+            refused_closed_channel > 1_000,
+            "closed channel: {refused_closed_channel}"
+        );
+        assert!(
+            refused_generation > 700,
+            "closed generation: {refused_generation}"
+        );
+        assert!(
+            refused_device_lost > 900,
+            "device lost: {refused_device_lost}"
+        );
+    }
+
+    /// The refusal `admit` owes this packet, in the order it decides them.
+    ///
+    /// Stated here as a precedence list rather than derived from the model, so
+    /// a check that moved would show up as a disagreement about *which* reason
+    /// rather than only about whether there was one.
+    fn expected_refusal(
+        live_device: bool,
+        stale: bool,
+        opcode: u16,
+        domain: ChannelId,
+        open: &BTreeSet<ChannelId>,
+    ) -> Option<Refusal> {
+        if !live_device {
+            return Some(Refusal::DeviceLost {
+                epoch: DeviceEpoch::FIRST,
+            });
+        }
+        if stale {
+            return Some(Refusal::GenerationClosed {
+                named: SessionGeneration::FIRST,
+                current: SessionGeneration::FIRST,
+            });
+        }
+        if find(Channel::Child, opcode).is_none() {
+            return Some(Refusal::UnknownCommand {
+                channel: Channel::Child,
+                opcode,
+            });
+        }
+        if classify(Channel::Child, opcode).is_none() {
+            return Some(Refusal::UnestablishedContract {
+                channel: Channel::Child,
+                opcode,
+            });
+        }
+        if !open.contains(&domain) {
+            return Some(Refusal::ChannelNotOpen { channel: domain });
+        }
+        None
+    }
+
+    fn count_refusal(
+        refusal: Refusal,
+        unknown: &mut usize,
+        unestablished: &mut usize,
+        closed_channel: &mut usize,
+        generation: &mut usize,
+        device_lost: &mut usize,
+    ) {
+        match refusal {
+            Refusal::UnknownCommand { .. } => *unknown += 1,
+            Refusal::UnestablishedContract { .. } => *unestablished += 1,
+            Refusal::ChannelNotOpen { .. } => *closed_channel += 1,
+            Refusal::GenerationClosed { .. } => *generation += 1,
+            Refusal::DeviceLost { .. } => *device_lost += 1,
+            other => panic!("unexpected refusal {other:?}"),
+        }
+    }
 }
