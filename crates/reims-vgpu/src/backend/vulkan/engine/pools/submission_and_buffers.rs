@@ -34,14 +34,6 @@ pub(crate) struct ReadbackLease {
     pub slot_size: u64,
 }
 
-/// Whether the identity-only lookup runs, given what the environment said.
-///
-/// Split from the read below so the one thing left to get wrong is testable
-/// without an environment. [`crate::config::read`] has already folded every
-/// negative spelling into [`crate::config::Switch::Off`]; what remains is which
-/// states count as off, and `Unrecognized` must not — a mistyped value would
-/// otherwise narrow this device silently, which is the opposite of what a
-/// mistyped switch should do.
 /// Every operation class a pooled buffer slot can be bound as.
 ///
 /// One constant rather than a set each acquire assembles from a caller's
@@ -77,6 +69,14 @@ const POOL_SLOT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
         | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw(),
 );
 
+/// Whether the identity-only lookup runs, given what the environment said.
+///
+/// Split from the read below so the one thing left to get wrong is testable
+/// without an environment. [`crate::config::read`] has already folded every
+/// negative spelling into [`crate::config::Switch::Off`]; what remains is which
+/// states count as off, and `Unrecognized` must not — a mistyped value would
+/// otherwise narrow this device silently, which is the opposite of what a
+/// mistyped switch should do.
 const fn identity_lookup_on(switch: crate::config::Switch) -> bool {
     !matches!(switch, crate::config::Switch::Off)
 }
