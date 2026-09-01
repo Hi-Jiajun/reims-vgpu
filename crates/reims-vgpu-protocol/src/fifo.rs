@@ -150,6 +150,55 @@ pub fn decode_device_info(
     })
 }
 
+/// A compute-info request, decoded.
+///
+/// The device-info query's sibling, and *not* one of its forms: it names a task
+/// and a pipeline before the two bounds they share, and its reply destination
+/// is a full guest address rather than a page frame. Folding it into
+/// [`DeviceInfoForm`] would put a 64-bit address where a 32-bit frame number
+/// goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeInfoRequest {
+    /// The task word as the guest sent it. Resolving it is the caller's — the
+    /// wire carries a raw word and which task it names is device state.
+    pub raw_task: u32,
+    /// The pipeline whose limits are being asked about.
+    pub pipeline_ref: u32,
+    /// One past the highest key the guest's walker parses. The same reading as
+    /// [`DeviceInfoRequest::key_table_len`], including the polarity: the guest
+    /// writes 5 against a table of case 0 through case 4.
+    pub key_table_len: u32,
+    /// How many eight-byte pairs the reply buffer holds.
+    pub pair_capacity: u32,
+    /// Where the reply goes: a full guest address, not a page frame.
+    pub reply_gva: u64,
+}
+
+/// Bytes a compute-info request carries.
+pub const COMPUTE_INFO_REQUEST_LEN: usize = 24;
+
+/// Decode a compute-info request.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the request's six words.
+pub fn decode_compute_info(payload: &[u8]) -> Result<ComputeInfoRequest, ShortPayload> {
+    if payload.len() < COMPUTE_INFO_REQUEST_LEN {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need: COMPUTE_INFO_REQUEST_LEN,
+        });
+    }
+    Ok(ComputeInfoRequest {
+        raw_task: ld32(payload),
+        pipeline_ref: ld32(&payload[4..]),
+        key_table_len: ld32(&payload[8..]),
+        pair_capacity: ld32(&payload[12..]),
+        // Bounded by the length check above, so the two halves are there.
+        reply_gva: u64::from(ld32(&payload[16..])) | (u64::from(ld32(&payload[20..])) << 32),
+    })
+}
+
 /// `CmdDefineFifo` / `CmdFreeFifo`: the channel id, and nothing else.
 ///
 /// One word, and it is the whole payload either command needs. Named rather
@@ -1131,6 +1180,46 @@ mod tests {
                 assert_ne!(at, form.pair_capacity_offset());
                 assert_ne!(at, form.reply_pfn_offset());
             }
+        }
+    }
+
+    /// Every word of a compute-info request comes out of its own slot, and the
+    /// reply destination is a full 64-bit address rather than the low half of
+    /// one — the guest puts a `u64` there and a decoder that read four bytes
+    /// would answer into the bottom 4 GiB of wherever it pointed.
+    #[test]
+    fn a_compute_info_request_reads_six_words_and_a_full_address() {
+        let mut bytes = Vec::new();
+        for word in [7u32, 9, 5, 512] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+        assert_eq!(
+            decode_compute_info(&bytes),
+            Ok(ComputeInfoRequest {
+                raw_task: 7,
+                pipeline_ref: 9,
+                key_table_len: 5,
+                pair_capacity: 512,
+                reply_gva: 0x1234_5678_9abc_def0,
+            })
+        );
+    }
+
+    /// One byte under is refused, at exactly the length the request declares.
+    #[test]
+    fn a_compute_info_request_under_its_length_is_refused() {
+        let bytes = alloc::vec![0u8; COMPUTE_INFO_REQUEST_LEN];
+        assert!(decode_compute_info(&bytes).is_ok());
+        for plen in 0..COMPUTE_INFO_REQUEST_LEN {
+            assert_eq!(
+                decode_compute_info(&bytes[..plen]),
+                Err(ShortPayload {
+                    plen,
+                    need: COMPUTE_INFO_REQUEST_LEN
+                }),
+                "{plen}"
+            );
         }
     }
 }

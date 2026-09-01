@@ -4454,6 +4454,56 @@ fn the_device_info_reply_stops_below_the_guests_key_table_length() {
     );
 }
 
+/// A `CmdGetComputeInfo` too short to hold its request reports, and does not
+/// answer.
+///
+/// The arm carried its own literal floor and `reply_compute_info` carried the
+/// same one, so neither could be wrong without the other being wrong too — and
+/// no test built a request at all, so neither was ever exercised. The command
+/// is one the guest blocks on: `createComputePipeline` stalls until the reply
+/// lands, so a request this device cannot read has to say so.
+#[test]
+fn a_short_compute_info_request_is_reported_and_not_answered() {
+    use crate::protocol::fifo::COMPUTE_INFO_REQUEST_LEN;
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let short = |plen: usize| Packet {
+        opcode: CHILD_OP_GET_COMPUTE_INFO,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + plen as u32,
+        completion_stamp: 0,
+        // Non-zero, so a decoder that read past the end of a shorter payload
+        // would find a reply address rather than zero and try to use it.
+        payload: vec![0xffu8; plen],
+        next_head: 0,
+    };
+    // One byte under, alone in its own capture: the largest length a decoder
+    // that read what it could would still accept.
+    let cap = crate::observe::FailCapture::start();
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &short(COMPUTE_INFO_REQUEST_LEN - 1),
+    );
+    let lines = cap.lines();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("reason=get_compute_info_short"))
+        .unwrap_or_else(|| panic!("a short compute-info said nothing: {lines:?}"));
+    assert!(
+        line.contains("need=24") && line.contains("plen=23"),
+        "the line must say what it needed and what it got: {line}"
+    );
+    for plen in 0..COMPUTE_INFO_REQUEST_LEN - 1 {
+        process_child_packet(&mut state, &mut host, 4, &short(plen));
+    }
+    assert!(
+        host.actions.is_empty(),
+        "a request with nothing to read must not answer into guest memory"
+    );
+}
+
 /// `CmdGetComputeInfo` carries the same word and it means the same thing.
 ///
 /// Its guest sends 5 against a walker of `case 0` through `case 4`, so the reply

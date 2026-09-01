@@ -2088,16 +2088,15 @@ fn compute_info_caps() -> [(u32, u32); 3] {
 fn reply_compute_info<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
-    payload: &[u8],
+    request: &crate::protocol::fifo::ComputeInfoRequest,
 ) -> bool {
-    if payload.len() < 24 {
-        return false;
-    }
-    let raw_task = ld32(&payload[0..]);
-    let pipeline_ref = ld32(&payload[4..]);
-    let key_table_len = ld32(&payload[8..]);
-    let count = ld32(&payload[12..]);
-    let reply_gva = u64::from_le_bytes(payload[16..24].try_into().unwrap_or([0; 8]));
+    let crate::protocol::fifo::ComputeInfoRequest {
+        raw_task,
+        pipeline_ref,
+        key_table_len,
+        pair_capacity: count,
+        reply_gva,
+    } = *request;
     if reply_gva == 0 || count == 0 {
         crate::observe::fail(format!(
             "get_compute_info empty task={raw_task} pipe={pipeline_ref} key_table_len={key_table_len} count={count} gva={reply_gva:#x}"
@@ -4280,13 +4279,17 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // `present-frame-flush` is the recovered legacy name for the same wire
         // opcode, and it is wrong.
         CHILD_OP_GET_COMPUTE_INFO => {
-            if packet.payload.len() >= 24 {
-                let _ = reply_compute_info(state, host, &packet.payload);
-            } else {
-                crate::observe::fail(format!(
-                    "get_compute_info short ch={channel_id} len={}",
-                    packet.payload.len()
-                ));
+            // The floor is the decoder's, and it is the only one. This arm and
+            // `reply_compute_info` each carried their own literal `24`, so
+            // neither check could be wrong without the other being wrong too —
+            // and no test built a request at all, so neither was exercised.
+            match crate::protocol::fifo::decode_compute_info(&packet.payload) {
+                Ok(request) => {
+                    let _ = reply_compute_info(state, host, &request);
+                }
+                Err(short) => {
+                    note_short_payload("get_compute_info", packet.opcode, Some(channel_id), &short);
+                }
             }
         }
         CHILD_OP_CURSOR_SHOW => {
