@@ -99,6 +99,24 @@ classes, or guest rails. Vulkan 1.2 is the baseline; newer functionality require
 capability-gated fallback. Host-pointer import is optional, and guest-visible semantics must be the
 same on imported and copying paths.
 
+## Wire a finished subsystem immediately
+
+The replacement architecture is landing subsystem by subsystem, and each one **joins production in
+the commit that finishes it**. A subsystem that exists but is reachable only from its own tests has
+not been verified against a guest; a release that switches thirty of them at once has no bisect
+that can attribute a regression to one. So a subsystem is done when its legacy counterpart is gone
+or delegates to it — not when it compiles.
+
+What this does *not* license is two semantic models running at once. No per-packet feature switch
+choosing between executors, no shadow execution that mutates state twice, no adapter translating
+between an old model and a new one. A call site that *replaces* its own logic with a call into the
+owning crate creates no second model, and is the shape to reach for.
+
+Wire in order of how little state moves. A pure translation or plan module — a function of its
+inputs returning a value — wires first: the caller keeps its ownership and loses only its duplicate
+arithmetic, so a regression points at one table. Modules owning handles, caches, or submission
+lifetimes wire once the model that owns those lifetimes is in place, because they cannot be split.
+
 ## Working and verification
 
 Use a workflow proportionate to the change:
