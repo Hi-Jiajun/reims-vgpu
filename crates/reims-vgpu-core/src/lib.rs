@@ -37,6 +37,7 @@ pub mod operation;
 pub mod pass;
 pub mod pipeline;
 pub mod prereq;
+pub mod publish;
 pub mod range_set;
 pub mod ready;
 pub mod render;
