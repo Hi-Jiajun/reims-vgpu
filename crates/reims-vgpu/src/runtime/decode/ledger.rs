@@ -120,6 +120,28 @@ fn the_blit_decoder_recognises_every_blit_operation_the_ledger_records() {
     }
 }
 
+#[test]
+fn the_event_decoder_recognises_every_event_operation_the_ledger_records() {
+    use super::event::{decode, DecodeStatus};
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Event)
+        .filter_map(|o| o.opcode)
+    {
+        let refused_the_opcode = probe_records(op).all(|r| {
+            matches!(
+                decode(&r),
+                Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrRejectedOpcode)
+            )
+        });
+        assert!(
+            !refused_the_opcode,
+            "the closure ledger records event {op:#x} and this rail's decoder refuses the opcode \
+             itself under every payload length"
+        );
+    }
+}
+
 /// Recognising an opcode is not claiming it.
 ///
 /// The render decoder accepts a contiguous range and falls through to

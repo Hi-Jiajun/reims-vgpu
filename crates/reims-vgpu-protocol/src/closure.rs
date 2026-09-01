@@ -36,7 +36,7 @@
 //! When the manifest grows a selector, this ledger stops compiling its tests
 //! until someone records what the device does about it.
 //!
-//! The converse does not hold, and [`BASE_CLASS_OPS`] is why. `class_copyMethodList`
+//! The converse does not hold, and [`OFF_MANIFEST`] is why. `class_copyMethodList`
 //! reports the methods a class declares itself and does not walk superclasses,
 //! and the encoders share one. A selector declared only on that base class is
 //! callable on every encoder while being invisible to the manifest, so the
@@ -66,6 +66,9 @@ pub enum Rail {
     Compute,
     Blit,
     Info,
+    /// The event/synchronisation encoder. It has no manifest class — see
+    /// [`OFF_MANIFEST`] — so [`Rail::class`] has no name to return for it.
+    Event,
 }
 
 impl Rail {
@@ -78,6 +81,10 @@ impl Rail {
             Self::Compute => "PGSerializerComputeCommandEncoder",
             Self::Blit => "PGSerializerBlitCommandEncoder",
             Self::Info => "PGSerializerInfoCommandEncoder",
+            // No capture has driven this encoder, so the manifest has no class
+            // for it and `from_class` can never answer with it. The empty
+            // string is not a name it might collide with.
+            Self::Event => "",
         }
     }
 
@@ -88,10 +95,14 @@ impl Rail {
         Rail::Compute,
         Rail::Blit,
         Rail::Info,
+        Rail::Event,
     ];
 
     /// The rail a manifest class belongs to.
     pub fn from_class(class: &str) -> Option<Self> {
+        if class.is_empty() {
+            return None;
+        }
         Self::ALL.iter().copied().find(|r| r.class() == class)
     }
 }
@@ -162,23 +173,63 @@ pub struct Op {
     pub closure: Closure,
 }
 
-/// Opcodes the ledger carries that the manifest has no row for.
+/// Operations the ledger carries that the wire manifest has no row for, and
+/// why each one is real anyway.
 ///
-/// These are declared on the shared serializer encoder base class, which
-/// `class_copyMethodList` does not report for the derived encoder classes. The
-/// residency pair is the family that taught this: the `stages:`-qualified
-/// overrides are declared on the render encoder and visible, while the
-/// unqualified forms are inherited and invisible — so reading "the compute
-/// encoder does not declare residency" as "a compute encoder cannot receive a
-/// residency call" is an inference the hole invites, and this project already
-/// drew it once.
-pub const BASE_CLASS_OPS: &[(Rail, u32)] = &[
-    (Rail::Render, 0x0086),
-    (Rail::Render, 0x0087),
-    (Rail::Compute, 0x0086),
-    (Rail::Compute, 0x0087),
+/// The manifest enumerates selectors from the Objective-C runtime, which is
+/// what makes the row set a measurement rather than a curated list — so an
+/// exception has to be named one at a time or "absent from the manifest" stops
+/// meaning "does not exist". Two things put an operation here:
+///
+/// * **Inherited from the encoder base class.** `class_copyMethodList` reports
+///   the methods a class declares itself and does not walk superclasses, and
+///   the encoders share one. The residency pair is the family that taught this:
+///   the `stages:`-qualified overrides are declared on the render encoder and
+///   visible, while the unqualified forms are inherited and invisible — so
+///   reading "the compute encoder does not declare residency" as "a compute
+///   encoder cannot receive a residency call" is an inference the hole invites,
+///   and this project already drew it once.
+/// * **No capture has driven the encoder.** The manifest names what Apple's
+///   serializer was *observed* to emit, so an encoder class no oracle case has
+///   exercised has no rows at all — which is a hole the size of a whole rail,
+///   not of a selector.
+pub const OFF_MANIFEST: &[(Rail, u32, &str)] = &[
+    (
+        Rail::Render,
+        0x0086,
+        "useHeaps:count: is declared on the shared encoder base class",
+    ),
+    (
+        Rail::Render,
+        0x0087,
+        "useResources:count:usage: is declared on the shared encoder base class",
+    ),
+    (
+        Rail::Compute,
+        0x0086,
+        "useHeaps:count: is declared on the shared encoder base class",
+    ),
+    (
+        Rail::Compute,
+        0x0087,
+        "useResources:count:usage: is declared on the shared encoder base class",
+    ),
+    (
+        Rail::Event,
+        0x0190,
+        "the event encoder has no manifest class: no oracle case has driven it",
+    ),
+    (
+        Rail::Event,
+        0x0191,
+        "the event encoder has no manifest class: no oracle case has driven it",
+    ),
+    (
+        Rail::Event,
+        0x0192,
+        "the event encoder has no manifest class: no oracle case has driven it",
+    ),
 ];
-
 /// How many operations sit at each outcome.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
@@ -1805,6 +1856,31 @@ pub const LEDGER: &[Op] = &[
             question: "emits 0x1c6 or 0x1c7 through its command: argument; both are unanswered info queries",
         },
     },
+    Op {
+        rail: Rail::Event,
+        opcode: Some(0x0190),
+        selector: "waitForEvent:value:",
+        closure: Closure::Implemented {
+            evidence: "an event wait against the task's event generation; unmet leaves the packet pending rather than dropping it",
+        },
+    },
+    Op {
+        rail: Rail::Event,
+        opcode: Some(0x0191),
+        selector: "signalEvent:value:",
+        closure: Closure::Implemented {
+            evidence: "advances the task's event generation; a signal that does not advance it is a no-op by the API's own monotonic rule rather than by this device's choice",
+        },
+    },
+    Op {
+        rail: Rail::Event,
+        opcode: Some(0x0192),
+        selector: "waitForEvent:value:timeout:",
+        closure: Closure::Refused {
+            route: "event_wait_timeout_unsupported",
+            evidence: "a bounded wait needs a clock this device does not run against the guest's, so it is refused by name every time rather than executed as the unbounded wait it is not",
+        },
+    },
 ];
 
 /// The gates that make the ledger a measurement rather than a list.
@@ -1872,28 +1948,28 @@ mod tests {
     #[test]
     fn every_row_is_a_manifest_operation_or_a_named_base_class_one() {
         let manifest = manifest_opcodes();
-        let base: BTreeSet<_> = BASE_CLASS_OPS.iter().copied().collect();
+        let base: BTreeSet<_> = OFF_MANIFEST.iter().map(|(r, op, _)| (*r, *op)).collect();
         let stray: Vec<_> = ledger_opcodes()
             .into_iter()
             .filter(|k| !manifest.contains_key(k) && !base.contains(k))
             .collect();
         assert!(
             stray.is_empty(),
-            "ledger rows for operations the wire manifest does not record and BASE_CLASS_OPS does not name: {stray:#x?}"
+            "ledger rows for operations the wire manifest does not record and OFF_MANIFEST does not name: {stray:#x?}"
         );
     }
 
     #[test]
-    fn every_named_base_class_operation_has_a_row() {
+    fn every_named_off_manifest_operation_has_a_row() {
         let have = ledger_opcodes();
-        let missing: Vec<_> = BASE_CLASS_OPS
+        let missing: Vec<_> = OFF_MANIFEST
             .iter()
-            .copied()
+            .map(|(r, op, _)| (*r, *op))
             .filter(|k| !have.contains(k))
             .collect();
         assert!(
             missing.is_empty(),
-            "BASE_CLASS_OPS without a row: {missing:#x?}"
+            "OFF_MANIFEST without a row: {missing:#x?}"
         );
     }
 
