@@ -388,12 +388,13 @@ fn generate_via_box_filter(
         .checked_mul(height as usize)
         .and_then(|v| v.checked_mul(RGBA8_BPP as usize))
         .ok_or(MipmapStatus::Capacity)?;
+    let row_rail =
+        pixel_format::RowToRgba8::for_format(fmt).ok_or(MipmapStatus::UnsupportedFormat)?;
     let mut prev = vec![0u8; rgba_need];
     for y in 0..height {
         let src_off = (y as usize) * (tight0 as usize);
         let dst_off = (y as usize) * (width as usize) * 4;
-        if !pixel_format::convert_row_to_rgba8(
-            fmt,
+        if !row_rail.convert(
             &level0_native[src_off..src_off + tight0 as usize],
             width,
             &mut prev[dst_off..],

@@ -2663,11 +2663,13 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
             view.width,
             view.height,
         );
+        let Some(row_rail) = pixel_format::RowToRgba8::for_format(view.pixel_format) else {
+            return fail(RefTextureViewDecline::Convert { row: 0, bpp });
+        };
         for y in 0..view.height as usize {
             let src_off = y.saturating_mul(tight as usize);
             let dst_off = y.saturating_mul(rgba_stride as usize);
-            if !pixel_format::convert_row_to_rgba8(
-                view.pixel_format,
+            if !row_rail.convert(
                 &native[src_off..src_off + tight as usize],
                 view.width,
                 &mut rgba[dst_off..dst_off + rgba_stride as usize],
@@ -5085,10 +5087,10 @@ fn native_scratch_to_upload(
     // the general loader reported its own. Same key as the others, so a format
     // narrowed on both rails is two lines and not one.
     crate::runtime::draw::note_sampled_narrowing("linear_memo_narrowed", 0, sample_fmt, w, h);
+    let row_rail = pixel_format::RowToRgba8::for_format(sample_fmt)?;
     for row_index in 0..rows {
         let src = row_index.checked_mul(bpr)?;
-        if !pixel_format::convert_row_to_rgba8(
-            sample_fmt,
+        if !row_rail.convert(
             scratch.get(src..src + trow)?,
             w,
             &mut out[row_index * out_row..],
@@ -14443,14 +14445,15 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     }
     // First sight or the native bytes changed: convert BGRA→RGBA fresh.
     let mut rgba = vec![0u8; span];
-    let converted = (0..h as usize).all(|y| {
-        let off = y * (stride as usize);
-        pixel_format::convert_row_to_rgba8(
-            sample_fmt,
-            &scratch[off..off + (w as usize) * 4],
-            w,
-            &mut rgba[off..off + (w as usize) * 4],
-        )
+    let converted = pixel_format::RowToRgba8::for_format(sample_fmt).is_some_and(|row_rail| {
+        (0..h as usize).all(|y| {
+            let off = y * (stride as usize);
+            row_rail.convert(
+                &scratch[off..off + (w as usize) * 4],
+                w,
+                &mut rgba[off..off + (w as usize) * 4],
+            )
+        })
     });
     if !converted {
         state.mapper_ref_texture_memo_scratch = scratch;

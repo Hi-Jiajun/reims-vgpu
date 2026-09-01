@@ -12,7 +12,7 @@
 
 use crate::contract::iosurface_pages::{packed_span_estimate, sample_window_from_device_desc};
 use crate::contract::pixel_format::{
-    self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
+    self, convert_rgba8_to_row, RowToRgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
 use crate::model::{scanout_extent_ok, DeviceState, MappingEntry, MAX_SCANOUT_DIM};
 use crate::runtime::host::{HostMemory, HostOps};
@@ -876,7 +876,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 &src_row[..tight]
             } else {
                 if let Some(ref mut rgba_row) = rgba {
-                    if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row)
+                    if !RowToRgba8::Bgra8.convert(src_row, mw, rgba_row)
                         || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
                     {
                         return refuse(
@@ -958,7 +958,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                         &src_row[..tight]
                     } else {
                         if let Some(ref mut rgba_row) = rgba {
-                            if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row)
+                            if !RowToRgba8::Bgra8.convert(src_row, mw, rgba_row)
                                 || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
                             {
                                 return refuse(

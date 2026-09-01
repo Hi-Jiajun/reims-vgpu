@@ -1948,6 +1948,11 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return None;
     }
+    // Parsed once, above the row loop. This loop is this rail's sampled bar:
+    // `metal_sampled_load_us` was 100 % of `sampled_us` on a driven macos-13
+    // boot, and re-deciding the format ordinal per texel was most of it. See
+    // `pixel_format::RowToRgba8`.
+    let row_rail = pixel_format::RowToRgba8::for_format(sample_fmt)?;
     let mut rgba = vec![0u8; need_rgba];
     let mut row = vec![0u8; tight as usize];
     for y in 0..h {
@@ -1962,7 +1967,7 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
         )
         .ok()?;
         let dst_off = (y as usize) * (w as usize) * 4;
-        if !pixel_format::convert_row_to_rgba8(sample_fmt, &row, w, &mut rgba[dst_off..]) {
+        if !row_rail.convert(&row, w, &mut rgba[dst_off..]) {
             return None;
         }
     }

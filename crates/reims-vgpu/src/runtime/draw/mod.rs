@@ -1245,6 +1245,13 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
         return None;
     }
     note_sampled_narrowing("buftex_narrowed", texture_ref, fmt, w, h);
+    let Some(row_rail) = pixel_format::RowToRgba8::for_format(fmt) else {
+        crate::observe::fail(format!(
+            "buftex convert_unsupported ref={texture_ref} buf={} fmt={fmt:#x} {w}x{h}",
+            bt.buffer_ref
+        ));
+        return None;
+    };
     let row_pixels = w as usize;
     let dst_row = row_pixels.checked_mul(RGBA8_BPP as usize)?;
     let mut rgba = vec![0u8; dst_row.checked_mul(h as usize)?];
@@ -1253,7 +1260,7 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
     for y in 0..h as usize {
         let src = &raw[y * bpr..y * bpr + tight];
         let dst = &mut rgba[y * dst_row..(y + 1) * dst_row];
-        if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst) {
+        if !row_rail.convert(src, w, dst) {
             crate::observe::fail(format!(
                 "buftex convert_fail ref={texture_ref} buf={} fmt={fmt:#x} row={y} {w}x{h}",
                 bt.buffer_ref
@@ -1654,12 +1661,13 @@ fn load_mapper_ref_texture_mapping_rgba<M: HostMemory + HostOps>(
     {
         return None;
     }
+    let row_rail = pixel_format::RowToRgba8::for_format(sample_fmt)?;
     let mut rgba = vec![0u8; raw.len()];
     for y in 0..h as usize {
         let off = y * (stride as usize);
         let row = &raw[off..off + (w as usize) * 4];
         let dst = &mut rgba[off..off + (w as usize) * 4];
-        if !pixel_format::convert_row_to_rgba8(sample_fmt, row, w, dst) {
+        if !row_rail.convert(row, w, dst) {
             return None;
         }
     }

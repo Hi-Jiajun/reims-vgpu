@@ -1139,6 +1139,11 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         }
         return Ok((rgba, SampledByteFormat::from_source(fmt, sample_fmt)));
     }
+    // The ordinal is parsed once, above the row loop, and the parse *is* the
+    // format refusal — a format with no CPU arm declines here rather than after
+    // the allocation and the first guest read. See `pixel_format::RowToRgba8`.
+    let row_rail = pixel_format::RowToRgba8::for_format(sample_fmt)
+        .ok_or(R::RowConvertUnsupported { format: sample_fmt })?;
     let mut rgba = vec![0u8; need_rgba];
     let mut row = vec![0u8; tight as usize];
     let rows = storage_rows.checked_mul(planes).ok_or(R::SizeOverflow)?;
@@ -1158,7 +1163,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         .map_err(|_| R::PaddedRowUnreadable { row: row_index })?;
         crate::runtime::draw::note_sampled_narrowing(site.route(), 0, sample_fmt, w, h);
         let dst_off = (row_index as usize) * (w as usize) * 4;
-        if !pixel_format::convert_row_to_rgba8(sample_fmt, &row, w, &mut rgba[dst_off..]) {
+        if !row_rail.convert(&row, w, &mut rgba[dst_off..]) {
             return Err(R::RowConvertUnsupported { format: sample_fmt });
         }
     }
@@ -1245,12 +1250,15 @@ where
     // sampled rung is a texture the guest is about to read back through a
     // shader. One shared slug reported both as the same event.
     crate::runtime::draw::note_sampled_narrowing(site, 0, sample_format, width, height);
+    let row_rail =
+        pixel_format::RowToRgba8::for_format(sample_format).ok_or(R::RowConvertUnsupported {
+            format: sample_format,
+        })?;
     let mut rgba = vec![0u8; rgba_len];
     for y in 0..rows as usize {
         let src_off = y.checked_mul(tight as usize).ok_or(R::SizeOverflow)?;
         let dst_off = y.checked_mul(rgba_stride as usize).ok_or(R::SizeOverflow)?;
-        if !pixel_format::convert_row_to_rgba8(
-            sample_format,
+        if !row_rail.convert(
             &bytes[src_off..src_off + tight as usize],
             width,
             &mut rgba[dst_off..dst_off + rgba_stride as usize],
