@@ -864,24 +864,26 @@ impl Summary {
 ///
 /// Deliberately not a general random source: what a schedule sweep needs is
 /// that seed *n* names the same interleaving on every machine and every run,
-/// so a failure is a bug report rather than a rumour.
-struct Rng(u64);
+/// so a failure is a bug report rather than a rumour. The stream walk's hostile
+/// input sweep wants the same guarantee for the same reason, so it uses this
+/// one rather than growing a second xorshift with a different constant.
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    const fn new(seed: u64) -> Self {
+    pub(crate) const fn new(seed: u64) -> Self {
         // Any non-zero state; a zero seed is a legitimate thing for a caller
         // to pass and xorshift is stuck there.
         Self(seed ^ 0x9E37_79B9_7F4A_7C15)
     }
 
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         self.0
     }
 
-    fn below(&mut self, bound: usize) -> usize {
+    pub(crate) fn below(&mut self, bound: usize) -> usize {
         debug_assert!(bound > 0);
         usize::try_from(self.next() % bound as u64).unwrap_or(0)
     }

@@ -633,6 +633,123 @@ mod tests {
         assert_eq!(tx.accesses.len(), 2);
     }
 
+    /// A buffer the guest corrupted is refused by name, never read past, and
+    /// never panics.
+    ///
+    /// # Why a sweep and not more cases
+    ///
+    /// Every length, count and offset in a command stream is the guest's, and
+    /// this walk is the first thing that touches them. The named cases above
+    /// each cover one arrangement someone thought of; what they cannot cover is
+    /// the arithmetic between them — an offset added to a window base, a count
+    /// multiplied by an entry size, a subtraction that is only non-negative
+    /// because the length was checked two layers up. Those fail as a panic in a
+    /// debug build and as a wrong read in a release one, and the second is a
+    /// guest reading another guest's memory.
+    ///
+    /// So this takes a well-formed stream and breaks it: bit flips, corrupted
+    /// lengths, truncations, and buffers that were never a stream at all. The
+    /// claim is not that any particular one refuses — several of these mutations
+    /// produce perfectly valid streams — but that **every outcome is one of the
+    /// two the signature admits**, with a reason string when it is a refusal.
+    ///
+    /// The seeds are [`crate::schedule::Rng`]'s, so seed *n* is the same buffer
+    /// on every machine and a failure is a bug report rather than a rumour.
+    #[test]
+    fn a_corrupted_stream_is_refused_by_name_and_never_read_past() {
+        use crate::schedule::Rng;
+
+        // A stream with every shape the walk has an arm for: two encoders, a
+        // protection envelope, records with and without refs.
+        let well_formed = || {
+            let mut bytes = segment_bytes(
+                SegmentKind::Render.wire_type(),
+                &[line_width(2.5), line_width(1.0)],
+            );
+            let mut envelope = segment_bytes(SEGMENT_TYPE_PROTECTION_OPTIONS, &[]);
+            let at = envelope.len() - SEGMENT_HEADER_LEN;
+            envelope[at..at + 4].copy_from_slice(&((SEGMENT_HEADER_LEN + 8) as u32).to_le_bytes());
+            envelope.extend_from_slice(&0x44u64.to_le_bytes());
+            bytes.extend_from_slice(&envelope);
+            bytes.extend_from_slice(&segment_bytes(
+                SegmentKind::Blit.wire_type(),
+                &[generate_mipmaps(7), generate_mipmaps(9)],
+            ));
+            bytes
+        };
+        // The base stream is itself walkable, or the sweep is corrupting
+        // something that was already broken.
+        let base = well_formed();
+        exec(&base, &Everything, &mut StubRegistry(DOMAIN), builder())
+            .expect("the stream the sweep corrupts is one the walk accepts");
+
+        let mut walked = 0usize;
+        let mut refused = 0usize;
+        for seed in 0..2048u64 {
+            let mut rng = Rng::new(seed);
+            let mut bytes = match seed % 4 {
+                // A buffer that was never a stream.
+                0 => (0..rng.below(96) + 1)
+                    .map(|_| u8::try_from(rng.next() % 256).expect("masked"))
+                    .collect(),
+                // A truncation, which is what a short DMA looks like.
+                1 => {
+                    let mut b = well_formed();
+                    b.truncate(rng.below(b.len()));
+                    b
+                }
+                // Bit flips, one to four of them.
+                _ => {
+                    let mut b = well_formed();
+                    for _ in 0..=rng.below(4) {
+                        let at = rng.below(b.len());
+                        b[at] ^= 1u8 << (rng.next() % 8);
+                    }
+                    b
+                }
+            };
+            // And a trailing byte often enough to exercise the tail arms.
+            if rng.next().is_multiple_of(5) {
+                bytes.push(u8::try_from(rng.next() % 256).expect("masked"));
+            }
+
+            match exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder()) {
+                Ok(tx) => {
+                    // Whatever came out is a transaction the rest of the model
+                    // may rely on: its records are in a strictly ascending
+                    // order and its stream list agrees with its record count.
+                    let positions: Vec<_> = tx.records().map(|r| r.at).collect();
+                    assert!(
+                        positions.windows(2).all(|w| w[0] < w[1]),
+                        "seed {seed}: an accepted stream is out of order"
+                    );
+                    assert_eq!(
+                        positions.len(),
+                        tx.record_count(),
+                        "seed {seed}: the record count disagrees with the records"
+                    );
+                    walked += 1;
+                }
+                Err(refusal) => {
+                    assert!(
+                        !refusal.reason().is_empty(),
+                        "seed {seed}: a refusal with no name"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+        // Both outcomes have to happen, or the sweep is measuring one arm. A
+        // corruption that never refuses means the walk accepts anything; one
+        // that always refuses means the mutations are too coarse to be about
+        // this walk at all.
+        assert!(
+            walked > 0 && refused > 0,
+            "walked {walked}, refused {refused}"
+        );
+        println!("corrupted streams: {walked} walked, {refused} refused");
+    }
+
     /// Every refusal reason is distinct where this module owns it, and is the
     /// owner's own where it does not.
     #[test]
