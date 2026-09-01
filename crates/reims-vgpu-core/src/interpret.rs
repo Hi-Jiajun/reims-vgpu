@@ -125,6 +125,23 @@ pub enum Observation {
         ingress: IngressOrdinal,
         reason: crate::lifecycle::Refusal,
     },
+    /// A query ran and no answer was written to its destination.
+    ///
+    /// **The guest reads that destination either way**, which is what makes
+    /// this observable and what makes it different from every other
+    /// not-happening in this list. An unanswered query is not lost work the
+    /// guest can retry: it takes whatever the window already held and proceeds
+    /// on it, so a run that answered and a run that did not are two different
+    /// runs even though both published the same completion word.
+    ///
+    /// The stamp is still owed in full — see [`crate::query::PendingQuery`] —
+    /// because a query that neither answers nor completes is a hang, which is
+    /// strictly worse than a wrong value the guest can be told about.
+    QueryUnanswered {
+        ingress: IngressOrdinal,
+        kind: crate::query::QueryKind,
+        reason: crate::query::Stall,
+    },
 }
 
 /// Why the interpreter would not run a transaction.
@@ -179,6 +196,14 @@ pub struct Interpreter {
     /// in one ledger. A second ledger beside it would be two answers to where
     /// the current bytes are.
     model: crate::lifecycle::Lifecycle,
+    /// How long this device's answer to each question is.
+    ///
+    /// `None` is a device that answers nothing, and that is the default rather
+    /// than an oversight: this crate cannot see a host, so an interpreter
+    /// nobody handed an answer source to must stall every query rather than
+    /// invent a reply length and publish a version for bytes that were never
+    /// written.
+    answers: Option<Box<dyn crate::query::AnswerLength>>,
     events: HashMap<ResourceId, u64>,
     fences: HashMap<ResourceId, u64>,
     stamps: HashMap<StampSlot, StampValue>,
@@ -192,6 +217,7 @@ impl Default for Interpreter {
         Self {
             generation: SessionGeneration::FIRST,
             model: crate::lifecycle::Lifecycle::new(),
+            answers: None,
             events: HashMap::new(),
             fences: HashMap::new(),
             stamps: HashMap::new(),
@@ -239,6 +265,19 @@ impl Interpreter {
     /// heaps a run needs.
     pub const fn model_mut(&mut self) -> &mut crate::lifecycle::Lifecycle {
         &mut self.model
+    }
+
+    /// Install the source of answer lengths this run's queries are judged
+    /// against.
+    ///
+    /// Without one every query stalls, which is the honest default for a crate
+    /// that cannot see a host. A harness comparing this reference against a
+    /// real schedule installs the same source both sides answer from — the
+    /// point of the comparison is the ordering, and an interpreter with a
+    /// different idea of how long an answer is would report a divergence that
+    /// is its own.
+    pub fn answers_from(&mut self, answers: Box<dyn crate::query::AnswerLength>) {
+        self.answers = Some(answers);
     }
 
     #[must_use]
@@ -343,6 +382,43 @@ impl Interpreter {
                     ingress: tx.identity.ingress,
                     reason,
                 }),
+            }
+        }
+
+        // A query's only write is its answer, so whether the answer happened
+        // decides whether anything was written at all. Running it through
+        // `PendingQuery` is what makes that structural: there is no path from
+        // an admitted query to a published version that does not go through
+        // either `answer` or `unanswerable`, and the second one publishes no
+        // version while still handing back the stamp the guest is blocked on.
+        //
+        // Without this the reference published the destination's version for
+        // every query unconditionally — certifying, in the trace an
+        // implementation is checked against, that a reply nothing produced had
+        // landed.
+        if let crate::transaction::Payload::Query(query) = &tx.payload {
+            let request = *query.request();
+            let pending = crate::query::PendingQuery::new(request, tx.completion);
+            let completed = match self.answers.as_ref().and_then(|a| a.bytes(&request)) {
+                Some(len) => match pending.answer(len) {
+                    Ok(done) => done,
+                    // A reply that does not fit is not clamped: a partial one is
+                    // a reply, and the guest cannot tell it from a whole one. It
+                    // completes with the stall, like an answer that never was.
+                    Err((pending, stall)) => pending.unanswerable(stall),
+                },
+                None => pending.unanswerable(crate::query::Stall::NoAnswer),
+            };
+            if let Some(reason) = completed.stall() {
+                self.trace.push(Observation::QueryUnanswered {
+                    ingress: tx.identity.ingress,
+                    kind: completed.kind(),
+                    reason,
+                });
+                self.ran += 1;
+                // The stamp, and nothing else. This is the whole of the
+                // difference between a stalled query and an answered one.
+                return Ok(completed.publication());
             }
         }
 
@@ -634,6 +710,145 @@ mod tests {
             trace_of(0),
             "nothing to show is not the same as showing something"
         );
+    }
+
+    /// A device that answers every question with the same number of bytes.
+    ///
+    /// A length and nothing else, because that is the whole of what this crate
+    /// can be told: the values are the host's and the trace records that a
+    /// window reached a version, not what is in it.
+    #[derive(Debug)]
+    struct AnswersWith(u64);
+
+    impl crate::query::AnswerLength for AnswersWith {
+        fn bytes(&self, _request: &crate::query::QueryRequest) -> Option<u64> {
+            Some(self.0)
+        }
+    }
+
+    /// A heap-texture query writing its reply into `backing`, versioned so the
+    /// answer is something the trace can show landing.
+    fn query(ingress: u64, backing: BackingId, window: u64) -> DeviceTransaction {
+        let request = crate::query::resolve(
+            crate::query::QueryKind::HeapTextureSizeAndAlign,
+            crate::query::RequestWords::HeapTexture,
+            crate::query::ReplyDestination {
+                backing,
+                bytes: ByteRange {
+                    offset: 0,
+                    length: window,
+                },
+            },
+        )
+        .expect("its own layout");
+        DeviceTransaction {
+            identity: crate::testing::identity(1, ingress),
+            stamp_waits: Vec::new(),
+            completion: Some(CompletionStamp {
+                slot: StampSlot(1),
+                value: StampValue(ingress as u32),
+            }),
+            payload: crate::transaction::Payload::Query(crate::transaction::QueryPayload::new(
+                request,
+                ChannelId(1),
+                Some(ContentVersion(1)),
+            )),
+        }
+    }
+
+    fn ran_query(answers: Option<u64>, window: u64) -> Vec<Observation> {
+        let mut interp = Interpreter::new();
+        interp.content_mut().declare(
+            BackingId(9),
+            ByteRange {
+                offset: 0,
+                length: 4096,
+            },
+            Replica::GuestPages,
+        );
+        if let Some(len) = answers {
+            interp.answers_from(Box::new(AnswersWith(len)));
+        }
+        assert_eq!(interp.run(&query(1, BackingId(9), window)), Outcome::Ran);
+        interp.trace().to_vec()
+    }
+
+    /// An interpreter with no answer source publishes the stamp and no version.
+    ///
+    /// Both halves matter and they are the query contract's two obligations.
+    /// The stamp, because a guest blocked on a completion word it never
+    /// receives is a hang. No version, because the reference would otherwise
+    /// certify that a reply nothing produced had landed — and an implementation
+    /// checked against that trace would pass while writing nothing.
+    #[test]
+    fn a_query_with_no_answer_publishes_its_stamp_and_no_content() {
+        assert_eq!(
+            ran_query(None, 4096),
+            vec![
+                Observation::QueryUnanswered {
+                    ingress: IngressOrdinal(1),
+                    kind: crate::query::QueryKind::HeapTextureSizeAndAlign,
+                    reason: crate::query::Stall::NoAnswer,
+                },
+                Observation::StampPublished {
+                    slot: StampSlot(1),
+                    value: StampValue(1),
+                },
+            ]
+        );
+    }
+
+    /// An answer that fits publishes the destination's version, then the stamp
+    /// — in that order, because a guest that polls the word and then reads the
+    /// reply must not see the flag without the bytes.
+    #[test]
+    fn an_answered_query_publishes_its_reply_before_its_stamp() {
+        assert_eq!(
+            ran_query(Some(16), 4096),
+            vec![
+                Observation::VersionPublished {
+                    backing: BackingId(9),
+                    region: AccessKey::Range(
+                        ResourceKey {
+                            backing: BackingId(9),
+                            heap: None,
+                        },
+                        ByteRange {
+                            offset: 0,
+                            length: 4096,
+                        },
+                    ),
+                    version: ContentVersion(1),
+                },
+                Observation::StampPublished {
+                    slot: StampSlot(1),
+                    value: StampValue(1),
+                },
+            ]
+        );
+    }
+
+    /// An answer larger than the window it was given is a stall, not a
+    /// truncation — and the run that stalled is not the run that answered.
+    ///
+    /// A partial reply is a reply and the guest cannot tell it from a whole
+    /// one, so the only lawful outcome is to publish the word and name the
+    /// reason.
+    #[test]
+    fn a_reply_too_large_for_its_window_stalls_rather_than_being_clamped() {
+        let stalled = ran_query(Some(64), 16);
+        assert_eq!(
+            stalled[0],
+            Observation::QueryUnanswered {
+                ingress: IngressOrdinal(1),
+                kind: crate::query::QueryKind::HeapTextureSizeAndAlign,
+                reason: crate::query::Stall::ReplyTooLarge {
+                    needed: 64,
+                    available: 16,
+                },
+            }
+        );
+        assert_ne!(stalled, ran_query(Some(16), 16));
     }
 
     /// A lifecycle packet that synchronises a resource: no records, and an

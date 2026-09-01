@@ -131,9 +131,34 @@ pub enum ReplyShape {
     /// A run of `(key, value)` pairs, laid out by
     /// [`reims_vgpu_protocol::info_reply`].
     KeyValue(ReplyBounds),
-    /// A record of a fixed size the request does not bound. The destination's
-    /// own length is the only bound, which is why none is repeated here.
-    Fixed,
+    /// A record of a fixed size, which the request does not bound and the
+    /// question's own layout decides.
+    ///
+    /// The size is carried rather than left to the destination, because the
+    /// destination's length is not it: a guest that set aside a page for a
+    /// sixteen-byte answer named a window, not a reply. Without the number
+    /// here, "does the answer fit" has no left-hand side and every fixed reply
+    /// would be judged to fit whatever it was pointed at.
+    Fixed { bytes: u64 },
+}
+
+/// How many bytes this device's answer to a question occupies.
+///
+/// **The values are the host's and this crate cannot see a host — the length
+/// is all a serial reference needs.** What a guest observes of a reply is that
+/// a window's content reached a version, not what is in it, so a reference
+/// that knows how long the answer is can decide everything the ordering
+/// contract turns on: whether it fits, whether a version becomes current, and
+/// whether the stamp is all the guest gets.
+///
+/// A separate trait rather than a field on the request, for the reason
+/// [`crate::resolve::RefResolver`] is one: the request is the guest's and this
+/// is the device's, and a request that carried its own answer's length would be
+/// a guest deciding what this device can answer.
+pub trait AnswerLength: core::fmt::Debug {
+    /// The bytes an answer to `request` would write, or `None` when this
+    /// device has no answer for the question at all.
+    fn bytes(&self, request: &QueryRequest) -> Option<u64>;
 }
 
 /// The question a query packet asks, and where its answer goes.
@@ -213,7 +238,11 @@ pub fn resolve(
         (QueryKind::ComputeInfo, RequestWords::ComputeInfo(request)) => {
             ReplyShape::KeyValue(request.reply_bounds())
         }
-        (QueryKind::HeapTextureSizeAndAlign, RequestWords::HeapTexture) => ReplyShape::Fixed,
+        (QueryKind::HeapTextureSizeAndAlign, RequestWords::HeapTexture) => ReplyShape::Fixed {
+            // An `MTLSizeAndAlign`, whose length is the wire framing's and not
+            // restated here.
+            bytes: reims_vgpu_protocol::fifo::HEAP_TEXTURE_REPLY_LEN as u64,
+        },
         _ => return Err(ResolveRefusal::WrongLayout { kind }),
     };
     Ok(QueryRequest {
@@ -564,17 +593,26 @@ mod tests {
     }
 
     /// The heap-texture query's reply is a fixed record its request does not
-    /// bound, and saying so is not the same as saying its bounds are zero.
+    /// bound — and its length is the record's, not the destination's.
+    ///
+    /// The destination here is four pages, so a reply shape that took its
+    /// length from the window would say 16384. What the guest reads back is an
+    /// `MTLSizeAndAlign` either way.
     #[test]
-    fn the_heap_texture_query_carries_no_reply_bounds() {
+    fn the_heap_texture_querys_reply_is_its_records_length_not_its_windows() {
         let resolved = resolve(
             QueryKind::HeapTextureSizeAndAlign,
             RequestWords::HeapTexture,
-            destination(16),
+            destination(16384),
         )
         .expect("its own layout");
-        assert_eq!(resolved.reply, ReplyShape::Fixed);
-        assert_eq!(resolved.destination.bytes.length, 16);
+        assert_eq!(
+            resolved.reply,
+            ReplyShape::Fixed {
+                bytes: reims_vgpu_protocol::fifo::HEAP_TEXTURE_REPLY_LEN as u64
+            }
+        );
+        assert_eq!(resolved.destination.bytes.length, 16384);
     }
 
     #[test]
@@ -625,7 +663,7 @@ mod tests {
             QueryRequest {
                 kind: QueryKind::DeviceInfo,
                 destination: destination(64),
-                reply: ReplyShape::Fixed,
+                reply: ReplyShape::Fixed { bytes: 16 },
             },
             None,
         )

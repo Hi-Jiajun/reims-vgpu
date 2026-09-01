@@ -651,7 +651,7 @@ mod tests {
                             length: 64,
                         },
                     },
-                    reply: crate::query::ReplyShape::Fixed,
+                    reply: crate::query::ReplyShape::Fixed { bytes: 16 },
                 },
                 ChannelId(0),
                 None,

@@ -750,7 +750,7 @@ mod tests {
             crate::query::QueryRequest {
                 kind: crate::query::QueryKind::DeviceInfo,
                 destination,
-                reply: crate::query::ReplyShape::Fixed,
+                reply: crate::query::ReplyShape::Fixed { bytes: 16 },
             },
             ChannelId(2),
             Some(crate::access::ContentVersion(7)),

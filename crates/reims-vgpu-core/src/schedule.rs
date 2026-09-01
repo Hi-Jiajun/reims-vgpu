@@ -809,7 +809,8 @@ fn monotone(run: &Run) -> Result<(), Divergence> {
             | Observation::FenceUpdated { .. }
             | Observation::Refused { .. }
             | Observation::OperationDeclined { .. }
-            | Observation::FramePresented { .. } => {}
+            | Observation::FramePresented { .. }
+            | Observation::QueryUnanswered { .. } => {}
         }
     }
     Ok(())
@@ -870,6 +871,11 @@ struct Summary {
     /// presents have no ordering obligation to each other, so this is not one
     /// interleaved sequence.
     presented: BTreeMap<ChannelId, Vec<crate::identity::MappingId>>,
+    /// Queries that completed with no answer written. Part of the outcome
+    /// because the guest reads its destination either way: a schedule that
+    /// answered and one that stalled hand it different bytes while publishing
+    /// the same completion word.
+    unanswered: Vec<(IngressOrdinal, crate::query::QueryKind, crate::query::Stall)>,
 }
 
 impl Summary {
@@ -926,6 +932,11 @@ impl Summary {
                 Observation::FramePresented { domain, mapping } => {
                     out.presented.entry(domain).or_default().push(mapping);
                 }
+                Observation::QueryUnanswered {
+                    ingress,
+                    kind,
+                    reason,
+                } => out.unanswered.push((ingress, kind, reason)),
             }
         }
         out
