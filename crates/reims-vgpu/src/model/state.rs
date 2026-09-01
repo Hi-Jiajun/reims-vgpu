@@ -3004,7 +3004,7 @@ impl DeviceState {
         // surfaces, and a recycled id cannot inherit a predecessor's passes.
         // Through the trait, because the record belongs to whichever rail is
         // running and the model may not name one.
-        crate::backend::Backend::forget_plane_draws(&crate::backend::selected(), mapping_id);
+        crate::backend::Backend::forget_mapping(&crate::backend::selected(), mapping_id);
         // Prune the dense-frame seq: a recycled mapping id must not inherit a
         // stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);

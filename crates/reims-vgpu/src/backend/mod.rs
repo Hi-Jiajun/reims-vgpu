@@ -787,18 +787,22 @@ pub(crate) trait Backend: Copy {
     /// Free on a rail that builds no host ICB.
     fn forget_host_icbs(&self) {}
 
-    /// Drop whatever this rail remembers about draws into one plane, because
-    /// the mapping that named it is gone.
+    /// Drop everything this rail holds under one mapping id, because the
+    /// mapping that named it is gone.
     ///
     /// Called by the model from `forget_compositor_mapping`, at the one point
-    /// where a mapping id stops naming the surface it named. The record is
-    /// keyed by that id, so a rail that kept it and a recycled id would have
-    /// the next surface inherit its predecessor's passes — which is a wrong
-    /// reading of a live plane, not a stale counter.
+    /// where a mapping id stops naming the surface it named. Whatever a rail
+    /// keys by that id is stale from this moment and a recycled id would hand
+    /// the next surface its predecessor's state — a wrong reading of a live
+    /// plane on the census side, and a render target holding another surface's
+    /// pixels on the Metal rail's.
     ///
-    /// Free on a rail that keeps no such record, which is what
+    /// One method rather than one per kind, because there is one moment: a rail
+    /// that had to be told twice would eventually be told once.
+    ///
+    /// Free on a rail that keys nothing by a mapping id, which is what
     /// [`Self::plane_draw_witness`]'s empty string already says.
-    fn forget_plane_draws(&self, _mapping_id: u32) {}
+    fn forget_mapping(&self, _mapping_id: u32) {}
 
     /// The raster sample count the bound pipeline declares, when this rail has
     /// to make the attachment match it.
@@ -1648,12 +1652,12 @@ impl Backend for SelectedBackend {
         }
     }
 
-    fn forget_plane_draws(&self, mapping_id: u32) {
+    fn forget_mapping(&self, mapping_id: u32) {
         match self {
             #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.forget_plane_draws(mapping_id),
+            Self::Metal(b) => b.forget_mapping(mapping_id),
             #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.forget_plane_draws(mapping_id),
+            Self::Vulkan(b) => b.forget_mapping(mapping_id),
         }
     }
 

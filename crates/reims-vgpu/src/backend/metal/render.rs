@@ -1515,6 +1515,34 @@ fn configure_stencil_attachment(
     Ok(Some(texture))
 }
 
+/// How one colour attachment's texture is obtained, for an attachment this rail
+/// retains across draws.
+///
+/// Three states and no fourth, because the pair this replaces — a texture
+/// handle beside a "does it hold the prior content" flag — could say
+/// "no texture, and it holds the prior content", which is a pass loading
+/// whatever an uninitialised allocation contains.
+pub enum RetainedColorTexture {
+    /// The registry held none. One is created here and registered under the key,
+    /// and `seed_rgba8` is uploaded into it.
+    Absent,
+    /// The registry's texture, whose pixels are *not* this pass's prior content.
+    /// The allocation is reused and `seed_rgba8` is uploaded into it.
+    Allocation(Texture),
+    /// The registry's texture, already holding this pass's prior content.
+    /// Nothing is allocated and nothing is uploaded — which is the whole point
+    /// of retaining it.
+    Prior(Texture),
+}
+
+/// This rail's retention of one colour attachment's texture across draws.
+pub struct RetainedColorTarget {
+    /// Where the texture is put back, so the next draw into this attachment can
+    /// find it.
+    pub key: crate::backend::metal::resident::ResidentColorKey,
+    pub texture: RetainedColorTexture,
+}
+
 /// One color render target for MRT encode (host RGBA8 seed/readback by default).
 pub struct ColorRt<'a> {
     /// Metal color attachment index (`[[color(n)]]`).
@@ -1536,6 +1564,33 @@ pub struct ColorRt<'a> {
     /// Per-slot `MTLColorWriteMask` from the same section. `0xf` (all) is the
     /// value for an attachment whose entry omits the tag.
     pub write_mask: u32,
+    /// This rail's retention of the attachment's texture, when the attachment
+    /// has a stable identity to retain it under.
+    ///
+    /// `None` is an attachment with none — no mapping, so no surface to key on —
+    /// which gets a fresh texture per draw as every colour target used to.
+    pub retained: Option<RetainedColorTarget>,
+}
+
+impl ColorRt<'_> {
+    /// Whether this pass's prior content will be in the target when the pass
+    /// begins, from either of the two ways it can get there.
+    ///
+    /// This is what `MTLLoadActionLoad` needs to be honest, and it is one
+    /// question rather than two: a seed uploaded into the target and a retained
+    /// target that already holds the pixels are the same fact to the load
+    /// action, and asking only about the seed made a retained target's Load
+    /// silently degrade to a clear.
+    fn prior_content_present(&self) -> bool {
+        self.seed_rgba8.is_some()
+            || matches!(
+                self.retained,
+                Some(RetainedColorTarget {
+                    texture: RetainedColorTexture::Prior(_),
+                    ..
+                })
+            )
+    }
 }
 
 /// The occlusion query a draw is armed with, and the answer the pass recorded.
@@ -2001,20 +2056,49 @@ pub fn render_core_mrt(
     for (i, c) in colors.iter().enumerate() {
         let (slot, _fmt_u32, bpp, mtl_fmt) = color_meta[i];
         let span_alloc = crate::runtime::chain_phase::CostSpan::new("metal_rt_alloc_us");
-        let target_descriptor = TextureDescriptor::new();
-        target_descriptor.set_texture_type(MTLTextureType::D2);
-        target_descriptor.set_pixel_format(mtl_fmt);
-        target_descriptor.set_width(width as u64);
-        target_descriptor.set_height(height as u64);
-        target_descriptor.set_storage_mode(MTLStorageMode::Shared);
-        target_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-        let Some(target) =
-            crate::backend::metal::raw_metal::new_texture(device, &target_descriptor)
-        else {
-            return Status::execute("metal_render_color_target_alloc_failed")
-                .field("slot", slot)
-                .field("width", width)
-                .field("height", height);
+        // Three ways to reach a target, and only the first allocates. The
+        // retained arms are why this rail stopped paying an allocation and an
+        // 8 MB upload per draw per attachment; see
+        // [`crate::backend::metal::resident`] for the one claim that makes
+        // loading from a retained one safe.
+        let (target, holds_prior) = match &c.retained {
+            None => {
+                let target_descriptor = TextureDescriptor::new();
+                target_descriptor.set_texture_type(MTLTextureType::D2);
+                target_descriptor.set_pixel_format(mtl_fmt);
+                target_descriptor.set_width(width as u64);
+                target_descriptor.set_height(height as u64);
+                target_descriptor.set_storage_mode(MTLStorageMode::Shared);
+                target_descriptor
+                    .set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+                let Some(target) =
+                    crate::backend::metal::raw_metal::new_texture(device, &target_descriptor)
+                else {
+                    return Status::execute("metal_render_color_target_alloc_failed")
+                        .field("slot", slot)
+                        .field("width", width)
+                        .field("height", height);
+                };
+                (target, false)
+            }
+            Some(retained) => match &retained.texture {
+                RetainedColorTexture::Prior(texture) => (texture.clone(), true),
+                RetainedColorTexture::Allocation(texture) => (texture.clone(), false),
+                RetainedColorTexture::Absent => {
+                    let Some(target) = crate::backend::metal::resident::create(
+                        device,
+                        &retained.key,
+                        mtl_fmt,
+                        bpp,
+                    ) else {
+                        return Status::execute("metal_render_color_target_alloc_failed")
+                            .field("slot", slot)
+                            .field("width", width)
+                            .field("height", height);
+                    };
+                    (target, false)
+                }
+            },
         };
         drop(span_alloc);
         // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
@@ -2024,8 +2108,11 @@ pub fn render_core_mrt(
         // draw. This is the upload a resident colour target would remove
         // outright, and it is charged apart from the allocation because the two
         // have different fixes.
+        //
+        // Skipped outright for a retained target that already holds the pixels,
+        // which is the copy this rail exists to stop making.
         let _span_seed = crate::runtime::chain_phase::CostSpan::new("metal_rt_seed_us");
-        if let Some(seed) = c.seed_rgba8 {
+        if let Some(seed) = c.seed_rgba8.filter(|_| !holds_prior) {
             let region = MTLRegion {
                 origin: MTLOrigin { x: 0, y: 0, z: 0 },
                 size: MTLSize {
@@ -2053,7 +2140,7 @@ pub fn render_core_mrt(
         if let Some(ca) = pass.color_attachments().object_at(*slot as u64) {
             ca.set_texture(Some(target));
             // Ephemeral host RT: archive Load+seed / Clear invent.
-            let resolved = color_rt_load_action(c.load_action, c.seed_rgba8.is_some());
+            let resolved = color_rt_load_action(c.load_action, c.prior_content_present());
             let mtl_load = match resolved {
                 x if x == crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_LOAD => {
                     MTLLoadAction::Load

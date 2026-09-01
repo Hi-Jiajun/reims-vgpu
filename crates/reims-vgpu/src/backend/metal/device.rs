@@ -165,7 +165,17 @@ impl Backend for MetalBackend {
         // for "an idle one".
         if site == CensusSite::Levels {
             super::census::emit_object_cache_levels();
+            super::census::emit_resident_color_levels();
         }
+    }
+
+    /// This rail keys its retained colour render targets by mapping id, so a
+    /// mapping that stops naming its surface takes them with it. Correctness
+    /// does not depend on it — a retained target can only be loaded from under
+    /// the surface cache generation it was published at, and an entry that is
+    /// gone issues no generation — so this is about the bytes.
+    fn forget_mapping(&self, mapping_id: u32) {
+        super::resident::forget(mapping_id);
     }
 
     fn generate_mipmap_chain(

@@ -15,6 +15,7 @@
 
 use super::*;
 
+use crate::backend::metal::render::{RetainedColorTarget, RetainedColorTexture};
 use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
 use crate::runtime::chain_phase;
 
@@ -26,6 +27,130 @@ pub use icb::*;
 // parts, so they are not re-exported.
 mod depth_stencil;
 use depth_stencil::{seed_host_depth_stencil, DepthStencilAspect, HostAttachment};
+
+/// This rail's retention decision for one colour attachment, made before the
+/// seed is built and spent by the encode and then by the Store.
+///
+/// One value carries all three because the three questions are one: whether a
+/// texture already exists, whether its pixels are this pass's prior content, and
+/// which cache frame the Store must publish it as. Asked separately they drift —
+/// the hazard is a pass that skips the seed on one answer and publishes against
+/// another.
+struct ResidentPlan {
+    key: crate::backend::metal::resident::ResidentColorKey,
+    /// The retained texture, when this rail still held one. `None` is the first
+    /// draw into a surface, or one whose target the byte budget evicted.
+    texture: Option<::metal::Texture>,
+    /// Whether `texture`'s pixels already are this pass's prior content, so the
+    /// LOAD seed is a copy of bytes the texture holds.
+    ///
+    /// Only ever true when [`crate::runtime::draw::published_surface_frame`]
+    /// answered and the registry's generation matched it. Taking the texture
+    /// retired that claim, so this is the one and only reading of it.
+    holds_prior: bool,
+    /// The cache generation this plan was made against, and the comparison the
+    /// Store publishes on: a writeback that leaves this generation in place did
+    /// not refresh the cache, so the target's new pixels correspond to no frame
+    /// the cache holds and the claim must stay retired.
+    ///
+    /// `0` when there was no entry to compare against, which a refreshing
+    /// writeback then differs from as well.
+    asked_generation: u64,
+}
+
+/// Decide how this attachment's render target is obtained and retained.
+///
+/// Asked for every attachment with a mapping, whatever its load action: a Clear
+/// pass renders into a target too, and retaining that target is what makes the
+/// *next* pass's Load free.
+///
+/// An attachment [`crate::runtime::draw::published_surface_frame`] declines is
+/// still retained — the texture is reused as an allocation and the seed is
+/// uploaded into it as before. Only the content claim is refused, and the two
+/// are separate answers for exactly that reason.
+fn plan_resident_target<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c: &ColorRtRequest,
+    width: u32,
+    height: u32,
+) -> ResidentPlan {
+    use crate::backend::metal::resident::{self, ResidentColorKey};
+    use crate::runtime::draw::NoPublishedFrame;
+
+    let key = ResidentColorKey {
+        mapping_id: c.mapping_id,
+        width,
+        height,
+        // The word this rail hands the backend for every colour target: 0, its
+        // `RGBA8Unorm` writeback format. Spelled from the same place the
+        // `ColorRt` below is built from rather than resolved here, so the two
+        // cannot name different formats for one texture.
+        pixel_format: 0,
+    };
+    let generation = match crate::runtime::draw::published_surface_frame(
+        state,
+        host,
+        task_id,
+        c.texture_ref,
+        width,
+        height,
+    ) {
+        Ok(frame) => {
+            crate::runtime::drain::note_store_route("metal_resident_frame_current");
+            frame.generation
+        }
+        Err(decline) => {
+            crate::runtime::drain::note_store_route(match decline {
+                NoPublishedFrame::NotMapped => "metal_resident_frame_unmapped",
+                NoPublishedFrame::Uncurrent(..) => "metal_resident_frame_uncurrent",
+                NoPublishedFrame::Unpublished(_) => "metal_resident_frame_unpublished",
+            });
+            0
+        }
+    };
+    let taken = resident::take(&key, generation);
+    let holds_prior = taken.as_ref().is_some_and(|(_, current)| *current);
+    crate::runtime::drain::note_store_route(match (&taken, holds_prior) {
+        (None, _) => "metal_resident_absent",
+        (Some(_), true) => "metal_resident_holds_prior",
+        (Some(_), false) => "metal_resident_allocation_only",
+    });
+    ResidentPlan {
+        key,
+        texture: taken.map(|(texture, _)| texture),
+        holds_prior,
+        asked_generation: generation,
+    }
+}
+
+/// Give the retained target back its claim to be the surface, if — and only if
+/// — this Store actually refreshed the cache with the pixels it now holds.
+///
+/// The test is the generation moving. Every writer of `host_surfaces` takes a
+/// fresh one in the same breath as it changes the bytes, so a generation that
+/// did not move is a writeback that published nothing this target could be said
+/// to hold: the partial-store rail retires the entry outright rather than
+/// rebuilding it, and a `DontCare` slot never reaches here at all. Leaving the
+/// claim retired in those cases costs the next draw the upload it pays today.
+fn publish_resident_target(state: &DeviceState, plan: &ResidentPlan) {
+    let Some(generation) = crate::runtime::surface_cache::frame_generation(
+        state,
+        plan.key.mapping_id,
+        plan.key.width,
+        plan.key.height,
+    ) else {
+        crate::runtime::drain::note_store_route("metal_resident_store_unpublished");
+        return;
+    };
+    if generation == plan.asked_generation {
+        crate::runtime::drain::note_store_route("metal_resident_store_stale");
+        return;
+    }
+    crate::runtime::drain::note_store_route("metal_resident_store_published");
+    crate::backend::metal::resident::published(&plan.key, generation);
+}
 
 fn null_apv_buffer() -> crate::backend::metal::abi::ReimsVgpuBuffer {
     use crate::backend::metal::abi::ReimsVgpuBuffer;
@@ -713,13 +838,40 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // seed-and-write-back path the alias already fell through to on every
     // contract refusal (unaligned offset or row stride, span out of range, no
     // device), so this is a rung the rail has always had.
+    //
+    // The seed is skipped entirely for an attachment this rail already holds a
+    // render target for whose pixels are the frame the cache would have handed
+    // over. See [`crate::backend::metal::resident`]: that is not a new claim
+    // about content, it is "do not copy bytes into a texture that holds them".
+    let mut resident_plan: Vec<Option<ResidentPlan>> =
+        (0..color_list.len()).map(|_| None).collect();
     {
         let _seed_span = chain_phase::CostSpan::new("metal_seed_load_us");
         for (i, c) in color_list.iter().enumerate() {
             if c.mapping_id == 0 {
                 continue;
             }
+            // Asked for every attachment with a mapping, not only the ones that
+            // Load: a Clear pass renders into a target too, and retaining that
+            // target is what makes the *next* pass's Load free. The generation
+            // is read whatever the load action, because it is also what the
+            // Store publishes against.
+            resident_plan[i] = Some(plan_resident_target(
+                state,
+                host,
+                req.task_id,
+                c,
+                width,
+                height,
+            ));
             if c.load_action != MTL_LOAD_ACTION_LOAD || color_seeds[i].is_some() {
+                continue;
+            }
+            if resident_plan[i]
+                .as_ref()
+                .is_some_and(|plan| plan.holds_prior)
+            {
+                crate::runtime::drain::note_store_route("metal_seed_from_resident");
                 continue;
             }
             crate::runtime::drain::note_store_route("metal_seed_load_asked");
@@ -814,6 +966,22 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 .map(|a| a.write_mask)
                 .unwrap_or_default()
                 .bits(),
+            // Moved out of the plan rather than borrowed: the backend takes
+            // ownership of the handle for the pass, and a plan left behind
+            // holding a second one would keep an evicted texture alive past the
+            // registry that stopped counting its bytes.
+            // The handle moves and the plan stays: the Store below needs the
+            // key and the generation this plan was made against, and a second
+            // live handle here would keep an evicted texture alive past the
+            // registry that stopped counting its bytes.
+            retained: resident_plan[i].as_mut().map(|plan| RetainedColorTarget {
+                key: plan.key,
+                texture: match (plan.texture.take(), plan.holds_prior) {
+                    (None, _) => RetainedColorTexture::Absent,
+                    (Some(texture), true) => RetainedColorTexture::Prior(texture),
+                    (Some(texture), false) => RetainedColorTexture::Allocation(texture),
+                },
+            }),
         });
     }
 
@@ -997,6 +1165,9 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         };
         if wrote {
             any_write = true;
+            if let Some(plan) = resident_plan.get(i).and_then(|p| p.as_ref()) {
+                publish_resident_target(state, plan);
+            }
             // Early-boot logo+pill: paint mapper-ref-texture front before first DisplaySwap.
             if c.mapping_id != 0 {
                 crate::runtime::scanout::note_front_buffer_writeback(

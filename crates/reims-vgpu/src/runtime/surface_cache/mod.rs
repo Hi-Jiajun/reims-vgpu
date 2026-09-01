@@ -219,6 +219,31 @@ pub fn get_shared_with_gen(
     Some((get_shared(state, surface_id, width, height)?, host_gen))
 }
 
+/// The generation of the frame this cache would serve for `surface_id` at this
+/// geometry, without taking the frame.
+///
+/// The identity half of [`get_shared_with_gen`], for a caller that does not want
+/// the bytes. A rail that retains its own copy of a surface's pixels asks this
+/// to decide whether the copy it holds is still the frame the cache holds —
+/// `Some(g)` twice with the same `g` is a statement that the bytes have not
+/// moved, and every writer of this map takes a fresh
+/// [`DeviceState::next_sampled_content_generation`] in the same breath as it
+/// changes them.
+///
+/// `None` for a missing entry, a geometry mismatch, and the ceded shell
+/// [`cede_surface_to_resident`] leaves behind — the same three misses
+/// [`get_shared`] takes, delegated to the same reader so the two cannot
+/// disagree about what "this cache holds a frame" means.
+pub fn frame_generation(
+    state: &DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+) -> Option<u64> {
+    let (_, host_gen) = get_from_with_gen(&state.host_surfaces, &surface_id, width, height)?;
+    Some(host_gen)
+}
+
 /// Cede this mapping's cached frame to the engine resident a deferred mapper-ref-texture
 /// render Store just pinned: the entry keeps its geometry and its `host_gen`
 /// lineage, and holds no bytes.

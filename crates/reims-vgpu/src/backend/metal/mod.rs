@@ -35,6 +35,10 @@ pub(crate) mod mtl_enum;
 pub(crate) mod raw_metal;
 #[cfg(target_os = "macos")]
 pub(crate) mod render;
+/// Colour render targets this rail keeps alive across draws, and the one claim
+/// that makes loading from one safe. See the module doc.
+#[cfg(target_os = "macos")]
+pub(crate) mod resident;
 #[cfg(target_os = "macos")]
 pub(crate) mod runtime;
 #[cfg(target_os = "macos")]

@@ -619,7 +619,7 @@ impl Backend for VulkanBackend {
         draw::vulkan::read_plane_draw_ring(reader, mapping_id).to_string()
     }
 
-    fn forget_plane_draws(&self, mapping_id: u32) {
+    fn forget_mapping(&self, mapping_id: u32) {
         draw::vulkan::forget_plane_draw_ring(mapping_id);
     }
 

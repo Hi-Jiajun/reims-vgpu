@@ -3286,9 +3286,8 @@ fn seed_color_load<M: HostMemory + HostOps>(
     Some(rgba)
 }
 
-/// A colour LOAD seed taken from this device's own last publication of a
-/// mapper-ref-texture surface, when the hypervisor's witness says the guest has
-/// not repainted it since.
+/// This device's own last publication of a mapper-ref-texture surface, when the
+/// hypervisor's witness says the guest has not repainted it since.
 ///
 /// # Why this door takes the strict standard
 ///
@@ -3303,8 +3302,8 @@ fn seed_color_load<M: HostMemory + HostOps>(
 /// standard a rail that never stamps answers `NoStamp` to every ask, and this
 /// door would then serve whatever the cache holds, unconditionally — a
 /// compositing layer frozen on the last frame this device drew into it. Under
-/// the strict standard the same rail simply never serves, pays the guest read it
-/// pays today, and says so under `load_seed_color_surface_unwatched`.
+/// the strict standard the same rail simply never serves and pays the guest read
+/// it pays today.
 ///
 /// The miss is cheap and the wrong serve is not, which is the whole asymmetry.
 ///
@@ -3319,6 +3318,80 @@ fn seed_color_load<M: HostMemory + HostOps>(
 /// construction rather than by care: that rung takes `OBJECT_TYPE_TEXTURE_VIEW`
 /// and [`objects::resolve_mapper_ref_texture`] takes
 /// `OBJECT_TYPE_MAPPER_REF_TEXTURE`, and an object has one type.
+///
+/// # No census here
+///
+/// Two callers ask this and they ask it for different reasons — one wants the
+/// bytes, the other wants to know whether a render target it already holds is
+/// still the frame — so each names the outcome under its own keys. Pooling them
+/// into one counter would make the number unreadable for either, which is the
+/// same rule [`crate::runtime::mapper::mapping_guest_write_verdict`]'s own doc
+/// records for the verdict underneath it.
+pub(crate) fn published_surface_frame<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+) -> Result<PublishedFrame, NoPublishedFrame> {
+    if texture_ref == 0 || width == 0 || height == 0 {
+        return Err(NoPublishedFrame::NotMapped);
+    }
+    let Some(mapping_id) = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
+    else {
+        return Err(NoPublishedFrame::NotMapped);
+    };
+    let currency =
+        crate::runtime::surface_currency::surface_currency(state, host, mapping_id, width, height);
+    if !currency.serves(crate::runtime::surface_currency::CurrencyStandard::WatchedAndUnwritten) {
+        return Err(NoPublishedFrame::Uncurrent(mapping_id, currency));
+    }
+    let Some(generation) =
+        crate::runtime::surface_cache::frame_generation(state, mapping_id, width, height)
+    else {
+        return Err(NoPublishedFrame::Unpublished(mapping_id));
+    };
+    Ok(PublishedFrame {
+        mapping_id,
+        generation,
+    })
+}
+
+/// A mapper-ref-texture surface whose host-side frame is current, and which
+/// frame it is.
+///
+/// The generation is the point of carrying this as a struct rather than a bool:
+/// a rail that keeps its own copy of these pixels compares generations to decide
+/// whether its copy is still this one, and a caller that only wants the bytes
+/// ignores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublishedFrame {
+    pub mapping_id: u32,
+    /// [`crate::runtime::surface_cache`]'s `host_gen` for this frame. Never 0.
+    pub generation: u64,
+}
+
+/// Why [`published_surface_frame`] has nothing to offer.
+///
+/// The three are kept apart because they have different fixes and only the
+/// second is about the guest: "this attachment is not one of these surfaces",
+/// "the witness will not vouch for the copy", and "the witness is fine and this
+/// device has published nothing at this geometry yet".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NoPublishedFrame {
+    NotMapped,
+    Uncurrent(u32, crate::runtime::surface_currency::SurfaceCurrency),
+    Unpublished(u32),
+}
+
+/// A colour LOAD seed served from [`published_surface_frame`].
+///
+/// Both doors above this one in [`seed_color_load`] key on `target_gva`, and a
+/// mapper-ref-texture attachment has no address of its own — so on the Metal
+/// rail, whose colour targets are all mapper-ref-texture surfaces, they were
+/// closed by construction. One driven macos-13 boot asked the ref door 201 times
+/// and was refused 201 times.
 fn seed_from_published_surface<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3327,43 +3400,51 @@ fn seed_from_published_surface<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
-    use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, SurfaceCurrency};
+    use crate::runtime::surface_currency::SurfaceCurrency;
 
-    if texture_ref == 0 {
-        return None;
-    }
-    let mapping_id = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)?;
-    // The denominator. A door that served nothing because it was never reached
-    // and one that was reached and refused read identically at zero, and only
-    // the second says what the gate costs.
-    crate::runtime::drain::note_store_route("load_seed_color_surface_asked");
-    let currency = surface_currency(state, host, mapping_id, width, height);
-    if !currency.serves(CurrencyStandard::WatchedAndUnwritten) {
-        crate::runtime::drain::note_store_route(match currency {
-            // Split from the other refusals because it is the one that is not
-            // about the guest: it says this device's witness was never armed for
-            // these pages, and it is the counter that decides whether widening
-            // this door to the permissive standard is even a question.
-            SurfaceCurrency::Unwritten(_) => "load_seed_color_surface_unwatched",
-            SurfaceCurrency::WrotePixels(_) => "load_seed_color_surface_repainted",
-            SurfaceCurrency::WroteUnknown => "load_seed_color_surface_unknown",
-            // `serves` admits this under both standards, so reaching it here is
-            // a contradiction between the rule and this match rather than a
-            // guest behaviour.
-            SurfaceCurrency::WroteElsewhere => "load_seed_color_surface_impossible",
-        });
-        return None;
-    }
-    let Some(bgra) = crate::runtime::surface_cache::get_shared(state, mapping_id, width, height)
-    else {
-        // Current and empty: either this device has published nothing for the
-        // surface at this geometry yet, or the entry was ceded to a rail's
-        // resident and the frame lives there. Neither is a refusal of the
-        // witness, and naming it apart is what keeps the `unwatched` count
-        // readable.
-        crate::runtime::drain::note_store_route("load_seed_color_surface_empty");
-        return None;
+    let frame = match published_surface_frame(state, host, task_id, texture_ref, width, height) {
+        Ok(frame) => {
+            // The denominator. A door that served nothing because it was never
+            // reached and one that was reached and refused read identically at
+            // zero, and only the second says what the gate costs.
+            crate::runtime::drain::note_store_route("load_seed_color_surface_asked");
+            frame
+        }
+        Err(NoPublishedFrame::NotMapped) => return None,
+        Err(decline) => {
+            crate::runtime::drain::note_store_route("load_seed_color_surface_asked");
+            crate::runtime::drain::note_store_route(match decline {
+                // Split from the other refusals because it is the one that is
+                // not about the guest: it says this device's witness was never
+                // armed for these pages, and it is the counter that decides
+                // whether widening this door is even a question.
+                NoPublishedFrame::Uncurrent(_, SurfaceCurrency::Unwritten(_)) => {
+                    "load_seed_color_surface_unwatched"
+                }
+                NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WrotePixels(_)) => {
+                    "load_seed_color_surface_repainted"
+                }
+                NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteUnknown) => {
+                    "load_seed_color_surface_unknown"
+                }
+                // `serves` admits this under both standards, so reaching it here
+                // is a contradiction between the rule and this match rather than
+                // a guest behaviour.
+                NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteElsewhere) => {
+                    "load_seed_color_surface_impossible"
+                }
+                // Current and empty: either this device has published nothing
+                // for the surface at this geometry yet, or the entry was ceded
+                // to a rail's resident and the frame lives there. Neither is a
+                // refusal of the witness, and naming it apart is what keeps the
+                // `unwatched` count readable.
+                NoPublishedFrame::Unpublished(_) => "load_seed_color_surface_empty",
+                NoPublishedFrame::NotMapped => "load_seed_color_surface_impossible",
+            });
+            return None;
+        }
     };
+    let bgra = crate::runtime::surface_cache::get_shared(state, frame.mapping_id, width, height)?;
     crate::runtime::drain::note_store_route("load_seed_color_from_surface");
     Some(swap_rb_channels(&bgra))
 }
