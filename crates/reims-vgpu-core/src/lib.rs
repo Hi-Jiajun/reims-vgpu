@@ -29,6 +29,7 @@ pub mod compute;
 pub mod content;
 pub mod depend;
 pub mod encoder;
+pub mod exec;
 pub mod icb;
 pub mod identity;
 pub mod operation;
