@@ -874,6 +874,14 @@ pub(crate) struct CbGraphicsState {
     /// different, and collapsing them would re-record on the first draw of
     /// every command buffer on a baking host.
     topology: Option<Option<vk::PrimitiveTopology>>,
+    /// The depth-stencil state last handed to the eight `vkCmdSet*` commands
+    /// that carry it, on a host that supplies it per draw.
+    ///
+    /// The whole state rather than a field per command, so what is held is
+    /// exactly what was recorded and cannot describe half of one
+    /// `MTLDepthStencilState`. `Some(None)` is a host that bakes it and
+    /// recorded nothing; `None` is a command buffer no draw has reached yet.
+    depth_stencil: Option<Option<reims_vgpu_vulkan::depth_stencil::DynamicDepthStencil>>,
     /// The four floats last handed to `vkCmdSetBlendConstants`, by bit pattern.
     ///
     /// Compared as bits rather than as floats so the cache is a plain equality

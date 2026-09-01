@@ -242,6 +242,13 @@ pub struct DepthState {
     /// `false` disables the test (draw always passes) — used only when a bound
     /// depth-stencil is non-trivial in some *other* way (e.g. a write with
     /// compare Always); the plain trivial state never reaches here.
+    ///
+    /// **Not a pipeline dimension.** Metal has no depth-test enable, so a draw
+    /// that reaches the engine with this clear is exactly `compare = Always,
+    /// write = false`, which tests nothing and writes nothing under either
+    /// spelling — see `super::exec::depth_stencil_state`. It used to be a term
+    /// of the pipeline key, where it produced two byte-identical pipelines for
+    /// one state.
     pub test_enable: bool,
     pub write_enable: bool,
     /// Metal `MTLCompareFunction` — the same enum Metal uses for sampler

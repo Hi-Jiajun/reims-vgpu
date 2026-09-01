@@ -2621,6 +2621,49 @@ fn guest_store_footprint_to_record(
     (requested && guest_backed).then_some(footprint).flatten()
 }
 
+/// A draw's depth and stencil state, in the vocabulary of the layer that owns
+/// what it means.
+///
+/// The request's `test_enable` flag has no counterpart here and needs none.
+/// Metal has no depth-test enable — depth is always tested and "off" is
+/// `Always` with writes clear — so a draw that reaches this with `test_enable`
+/// false is exactly `compare = Always, write = false`, which tests nothing and
+/// writes nothing under either spelling. See
+/// [`reims_vgpu_vulkan::depth_stencil`] for why the rail then sets
+/// `depthTestEnable` unconditionally rather than carrying the flag.
+///
+/// A draw with no depth state at all projects to the inert declaration, which
+/// is what a pass with no depth attachment would ignore anyway.
+fn depth_stencil_state(
+    depth: Option<&super::types::DepthState>,
+) -> reims_vgpu_core::depth_stencil::DepthStencilState {
+    let face =
+        |ops: super::types::StencilFaceOps| reims_vgpu_core::depth_stencil::StencilFaceShape {
+            compare_function: ops.compare.mtl_ordinal(),
+            stencil_failure_operation: ops.fail_op.mtl_ordinal(),
+            depth_failure_operation: ops.depth_fail_op.mtl_ordinal(),
+            depth_stencil_pass_operation: ops.pass_op.mtl_ordinal(),
+            read_mask: ops.read_mask,
+            write_mask: ops.write_mask,
+        };
+    let stencil = depth.and_then(|d| d.stencil);
+    reims_vgpu_core::depth_stencil::DepthStencilShape {
+        depth_compare_function: depth
+            .map_or(super::types::SamplerCompareFunction::Always, |d| d.compare)
+            .mtl_ordinal(),
+        depth_write_enabled: depth.is_some_and(|d| d.write_enable),
+        // A draw carries both faces or neither: the decode layer already
+        // substituted a pass-through for a face the guest left disabled, so
+        // there is no third state for this to lose.
+        front_stencil_enabled: stencil.is_some(),
+        back_stencil_enabled: stencil.is_some(),
+        front: stencil.map_or_else(Default::default, |s| face(s.front)),
+        back: stencil.map_or_else(Default::default, |s| face(s.back)),
+    }
+    .checked()
+    .expect("every ordinal in a draw request was parsed from an enum on the way in")
+}
+
 pub(crate) unsafe fn execute_draw_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
@@ -3221,62 +3264,69 @@ pub(crate) unsafe fn execute_draw_inner(
         dynamic: ctx.features.extended_dynamic_state,
         unrestricted: ctx.features.dynamic_primitive_topology_unrestricted,
     };
+    // Computed once and used twice — as the pipeline key's pass term below and
+    // as the question the depth-stencil plan is asked. Two calls would be two
+    // copies of one value, and the second could drift from the first.
+    let pass_compatibility = pass_key.compatibility();
     let topology_key = reims_vgpu_vulkan::topology::key(req.primitive_topology.0, topology_cell);
+    // The guest's whole `MTLDepthStencilState`, under the same split. It is
+    // encoder state on Metal — `setDepthStencilState:` binds it between draws
+    // of one pipeline — and `extendedDynamicState` is what lets it stay that
+    // way here, so on a capable host every state the guest can bind is one
+    // pipeline instead of one each.
+    //
+    // The pass is asked as well as the host: Vulkan attaches no depth-stencil
+    // state to a pipeline whose subpass has no depth attachment, and a dynamic
+    // state declared for a structure nothing reads is one nothing would set.
+    let depth_stencil_plan = reims_vgpu_vulkan::depth_stencil::plan(
+        &depth_stencil_state(req.depth.as_ref()),
+        reims_vgpu_vulkan::depth_stencil::DepthStencilCell {
+            extended_dynamic_state: ctx.features.extended_dynamic_state,
+        },
+        pass_compatibility.has_depth(),
+    );
     let topology_dynamic =
         reims_vgpu_vulkan::topology::dynamic(req.primitive_topology.0, topology_cell);
-    let pipeline_key =
-        PipelineKey {
-            vert: vert_digest,
-            frag: frag_digest,
-            attrs: attr_keys,
-            topology: topology_key,
-            blend: req.blend.map(|b| b.key()),
-            secondary_blend: {
-                let mut per_slot = [None; MAX_SECONDARY_ATTACH];
-                for (slot, target) in req
-                    .secondary_targets
-                    .iter()
-                    .take(MAX_SECONDARY_ATTACH)
-                    .enumerate()
-                {
-                    per_slot[slot] = target.blend.map(|b| b.key());
-                }
-                per_slot
-            },
-            color_write_mask: {
-                let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
-                per_slot[0] = req.color_write_mask;
-                for (slot, target) in req
-                    .secondary_targets
-                    .iter()
-                    .take(MAX_SECONDARY_ATTACH)
-                    .enumerate()
-                {
-                    per_slot[slot + 1] = target.color_write_mask;
-                }
-                per_slot
-            },
-            pass: pass_key.compatibility(),
-            // Taken from the pass key this draw built, not from `pass`, which
-            // erases it once feedback stops changing the render pass.
-            feedback_colors: pass_key.feedback_colors,
-            raster: raster_plan.state,
-            depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
-            depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
-            depth_compare: req
-                .depth
-                .as_ref()
-                .map(|d| d.compare)
-                .unwrap_or(super::types::SamplerCompareFunction::Always),
-            stencil: req.depth.as_ref().and_then(|d| d.stencil).map(|s| {
-                super::caches::StencilKey {
-                    front: s.front,
-                    back: s.back,
-                }
-            }),
-            viewport_slots: slot_count_u32,
-            layout: layout_key.clone(),
-        };
+    let pipeline_key = PipelineKey {
+        vert: vert_digest,
+        frag: frag_digest,
+        attrs: attr_keys,
+        topology: topology_key,
+        blend: req.blend.map(|b| b.key()),
+        secondary_blend: {
+            let mut per_slot = [None; MAX_SECONDARY_ATTACH];
+            for (slot, target) in req
+                .secondary_targets
+                .iter()
+                .take(MAX_SECONDARY_ATTACH)
+                .enumerate()
+            {
+                per_slot[slot] = target.blend.map(|b| b.key());
+            }
+            per_slot
+        },
+        color_write_mask: {
+            let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
+            per_slot[0] = req.color_write_mask;
+            for (slot, target) in req
+                .secondary_targets
+                .iter()
+                .take(MAX_SECONDARY_ATTACH)
+                .enumerate()
+            {
+                per_slot[slot + 1] = target.color_write_mask;
+            }
+            per_slot
+        },
+        pass: pass_compatibility,
+        // Taken from the pass key this draw built, not from `pass`, which
+        // erases it once feedback stops changing the render pass.
+        feedback_colors: pass_key.feedback_colors,
+        raster: raster_plan.state,
+        depth_stencil: depth_stencil_plan.state,
+        viewport_slots: slot_count_u32,
+        layout: layout_key.clone(),
+    };
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
     // and already checks the negative entry for a key that failed to compile.
     phase.enter(super::draw_phase::Phase::PipelineCompile);
@@ -5249,20 +5299,30 @@ pub(crate) unsafe fn execute_draw_inner(
     // `PRIMITIVE_TOPOLOGY` dynamic under the same condition, so this is asked
     // whenever that is true and never otherwise.
     unsafe { pools.set_dynamic_topology(ctx, cb, counters, topology_dynamic) };
+    // The guest's depth-stencil state, on a host that supplies it per draw.
+    // `None` is a pipeline that baked it, and then this records nothing.
+    unsafe { pools.set_dynamic_depth_stencil(ctx, cb, counters, depth_stencil_plan.dynamic) };
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
-    // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
-    // dynamic state; front/back set together because Metal's split refs are one
-    // guest state and a cache that held half of it would be two.
-    if let Some(s) = req.depth.as_ref().and_then(|d| d.stencil) {
-        unsafe {
-            pools.set_dynamic_stencil_reference(
-                &ctx.device,
-                cb,
-                counters,
-                s.reference_front,
-                s.reference_back,
-            )
-        };
+    // — front/back set together because Metal's split refs are one guest state
+    // and a cache that held half of it would be two.
+    //
+    // Asked exactly where the pipeline declared `STENCIL_REFERENCE`, read off
+    // the same state the pipeline was keyed on rather than from the request:
+    // on the dynamic rung the stencil *test enable* is itself supplied per
+    // draw, so the reference is declared whatever this draw's state says and
+    // must be supplied whatever it says. A draw with no stencil state supplies
+    // zero, which is the reference Metal starts an encoder with.
+    if depth_stencil_plan
+        .state
+        .states()
+        .contains(&vk::DynamicState::STENCIL_REFERENCE)
+    {
+        let (front, back) = req
+            .depth
+            .as_ref()
+            .and_then(|d| d.stencil)
+            .map_or((0, 0), |s| (s.reference_front, s.reference_back));
+        unsafe { pools.set_dynamic_stencil_reference(&ctx.device, cb, counters, front, back) };
     }
 
     if push_descriptors {
@@ -8052,5 +8112,89 @@ mod depth_load_tests {
             content_ready: false,
         };
         assert!(!transient.honours_load(true));
+    }
+
+    /// Every state a draw request can hold is one the owning layer admits.
+    ///
+    /// [`depth_stencil_state`] ends in an `expect`, and this is the claim that
+    /// makes it a fact rather than a hope: a request carries decoded enums, so
+    /// its ordinals are exactly the declared ones and the parse on the other
+    /// side cannot refuse any of them. A sweep rather than a case, because the
+    /// way this breaks is a *new* variant added to one of the two enums
+    /// without a counterpart on the other side, which no single fixture would
+    /// notice.
+    ///
+    /// It reaches this projection from two call sites — the pipeline key and
+    /// the encoder half of the same plan — which is why the totality is proved
+    /// rather than an `unreachable!` claimed about one of them.
+    #[test]
+    fn every_state_a_draw_request_can_hold_is_one_the_owning_layer_admits() {
+        use super::super::types::{
+            DepthState, SamplerCompareFunction as C, StencilFaceOps, StencilOp as O, StencilState,
+        };
+        const COMPARES: [C; 8] = [
+            C::Never,
+            C::Less,
+            C::Equal,
+            C::LessEqual,
+            C::Greater,
+            C::NotEqual,
+            C::GreaterEqual,
+            C::Always,
+        ];
+        const OPS: [O; 8] = [
+            O::Keep,
+            O::Zero,
+            O::Replace,
+            O::IncrementClamp,
+            O::DecrementClamp,
+            O::Invert,
+            O::IncrementWrap,
+            O::DecrementWrap,
+        ];
+        // A draw with no depth state at all is admissible too, and is the one
+        // input that reaches none of the enums below.
+        assert!(!depth_stencil_state(None).stencil_engaged());
+
+        let mut checked = 0usize;
+        for compare in COMPARES {
+            for op in OPS {
+                let face = StencilFaceOps {
+                    compare,
+                    fail_op: op,
+                    depth_fail_op: op,
+                    pass_op: op,
+                    read_mask: 0xff,
+                    write_mask: 0xff,
+                };
+                for stencil in [
+                    None,
+                    Some(StencilState {
+                        front: face,
+                        back: face,
+                        reference_front: 0,
+                        reference_back: 0,
+                        clear_value: 0,
+                    }),
+                ] {
+                    let depth = DepthState {
+                        identity: None,
+                        test_enable: true,
+                        write_enable: false,
+                        compare,
+                        clear_value: 1.0,
+                        load: false,
+                        stencil,
+                    };
+                    // Would panic inside the projection if any ordinal were
+                    // outside the enum the owning layer parses.
+                    let state = depth_stencil_state(Some(&depth));
+                    assert_eq!(state.stencil_engaged(), stencil.is_some());
+                    assert_eq!(state.depth_compare().ordinal(), compare.mtl_ordinal());
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, COMPARES.len() * OPS.len() * 2);
     }
 }

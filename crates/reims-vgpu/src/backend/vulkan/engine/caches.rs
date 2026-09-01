@@ -639,18 +639,25 @@ pub(crate) struct PipelineKey {
     /// key rather than here, because the same call produces the encoder half.
     /// So this field cannot hold an ordinal nobody parsed.
     pub raster: reims_vgpu_vulkan::raster::RasterizationState,
-    /// Depth-test pipeline state. Meaningful only when `pass.depth.is_some()`;
-    /// otherwise all-default (test/write off) and no depth-stencil state is
-    /// attached, so the color-only pipeline is byte-identical to the pre-depth
-    /// engine. Metal `MTLCompareFunction` shares `SamplerCompareFunction`.
-    pub depth_test: bool,
-    pub depth_write: bool,
-    pub depth_compare: super::types::SamplerCompareFunction,
-    /// Front/back stencil op state. `Some` only when `pass.depth` carries a
-    /// stencil aspect; the reference value is *excluded* (dynamic state) so
-    /// distinct references reuse one pipeline. `None` keeps the depth-only /
-    /// no-depth pipelines byte-identical to the pre-stencil engine.
-    pub stencil: Option<StencilKey>,
+    /// The depth-stencil state this pipeline is built with — already
+    /// translated, already placed against this host and this pass.
+    ///
+    /// Four key terms before this: a test flag, a write flag, a compare
+    /// function and an optional stencil-op pair. They are one value now for the
+    /// reason [`Self::raster`] is: on a host with
+    /// `VK_EXT_extended_dynamic_state` the guest's whole
+    /// `MTLDepthStencilState` rides to the encoder and this carries a fixed
+    /// placeholder, so every depth-stencil state a guest can bind is one
+    /// pipeline. Four separate terms could not express that, because none of
+    /// them knows whether this device still bakes it.
+    ///
+    /// Meaningful only when `pass.has_depth()`; Vulkan attaches no
+    /// depth-stencil state to a pipeline whose subpass has no depth
+    /// attachment, and `reims_vgpu_vulkan::depth_stencil::plan` is told so and
+    /// makes nothing dynamic there. The reference value is excluded on both
+    /// rungs — it is a separate Metal encoder command — so distinct references
+    /// have always reused one pipeline.
+    pub depth_stencil: reims_vgpu_vulkan::depth_stencil::DepthStencilPlan,
     /// How many viewport/scissor slots the pipeline declares.
     ///
     /// In the key because `VkPipelineViewportStateCreateInfo::viewportCount` is
@@ -664,14 +671,6 @@ pub(crate) struct PipelineKey {
     /// decides it.
     pub viewport_slots: u32,
     pub layout: LayoutKey,
-}
-
-/// Front/back stencil op state baked into the pipeline (everything but the
-/// dynamic reference value). See [`super::types::StencilFaceOps`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct StencilKey {
-    pub front: super::types::StencilFaceOps,
-    pub back: super::types::StencilFaceOps,
 }
 
 /// Lc: compute pipeline cache key — SPIR-V content digest + entry name + layout
@@ -1403,45 +1402,6 @@ fn sampler_shape(key: &SamplerStateKey) -> reims_vgpu_core::sampler::SamplerShap
         border_color: key.border_color,
         normalized_coordinates: !key.unnormalized_coordinates,
     }
-}
-
-/// The pipeline key's depth and stencil terms, in the vocabulary of the layer
-/// that owns what they mean.
-///
-/// The key's `depth_test` flag has no counterpart here and needs none.
-/// Metal has no depth-test enable — depth is always tested and "off" is
-/// `Always` with writes clear — so the state that reaches this projection with
-/// `depth_test` false is exactly `compare = Always, write = false`, which
-/// tests nothing and writes nothing under either spelling. See
-/// [`reims_vgpu_vulkan::depth_stencil`] for why the rail then sets
-/// `depthTestEnable` unconditionally rather than carrying the flag.
-fn depth_stencil_state(
-    depth_compare: super::types::SamplerCompareFunction,
-    depth_write: bool,
-    stencil: Option<StencilKey>,
-) -> reims_vgpu_core::depth_stencil::DepthStencilState {
-    let face =
-        |ops: super::types::StencilFaceOps| reims_vgpu_core::depth_stencil::StencilFaceShape {
-            compare_function: ops.compare.mtl_ordinal(),
-            stencil_failure_operation: ops.fail_op.mtl_ordinal(),
-            depth_failure_operation: ops.depth_fail_op.mtl_ordinal(),
-            depth_stencil_pass_operation: ops.pass_op.mtl_ordinal(),
-            read_mask: ops.read_mask,
-            write_mask: ops.write_mask,
-        };
-    reims_vgpu_core::depth_stencil::DepthStencilShape {
-        depth_compare_function: depth_compare.mtl_ordinal(),
-        depth_write_enabled: depth_write,
-        // A key carries both faces or neither: the decode layer already
-        // substituted a pass-through for a face the guest left disabled, so
-        // there is no third state for this to lose.
-        front_stencil_enabled: stencil.is_some(),
-        back_stencil_enabled: stencil.is_some(),
-        front: stencil.map_or_else(Default::default, |s| face(s.front)),
-        back: stencil.map_or_else(Default::default, |s| face(s.back)),
-    }
-    .checked()
-    .expect("every ordinal in a pipeline key was parsed from an enum on the way in")
 }
 
 /// One colour attachment's blend terms, in the vocabulary of the layer that
@@ -2513,9 +2473,12 @@ impl ObjectCaches {
         // without declaring the state rasterizes the stand-in, and on a host
         // with no validation layers nothing says so.
         dynamic_states.extend_from_slice(input_asm_plan.states());
-        if key.stencil.is_some() {
-            dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
-        }
+        // The stencil reference, and on a host that supplies the whole
+        // `MTLDepthStencilState` per draw the eight states that go with it.
+        // Read off the key's own state rather than re-derived from the host,
+        // for the reason above: the placeholder and the list that replaces it
+        // are two readings of one decision.
+        dynamic_states.extend_from_slice(key.depth_stencil.states());
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         // Both counts are the key's one number: the viewports and scissors
@@ -2556,15 +2519,10 @@ impl ObjectCaches {
         // Depth-stencil state: attached ONLY when the pass carries a depth
         // attachment (Vulkan requires the pipeline's depth-stencil state to be
         // consistent with the subpass). Without it the color-only pipeline is
-        // byte-identical to the pre-depth engine. Stencil is enabled only when
-        // the bound state requested it (`key.stencil`); the reference field is
-        // left 0 here and supplied dynamically per draw.
-        let depth_stencil = reims_vgpu_vulkan::depth_stencil::plan(&depth_stencil_state(
-            key.depth_compare,
-            key.depth_write,
-            key.stencil,
-        ))
-        .native();
+        // byte-identical to the pre-depth engine. The reference field is left 0
+        // here and supplied dynamically per draw, and on a dynamic host so is
+        // everything else — see the key's own doc.
+        let depth_stencil = key.depth_stencil.native();
         let mut gpci = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vtx_input)
@@ -3244,66 +3202,6 @@ mod object_cache_tests {
                 ordinal: 99,
             }
         );
-    }
-
-    /// Every state a pipeline key can hold is one the owning layer admits.
-    ///
-    /// [`depth_stencil_state`] ends in an `expect`, and this is the claim that
-    /// makes it a fact rather than a hope: a key carries decoded enums, so its
-    /// ordinals are exactly the declared ones and the parse on the other side
-    /// cannot refuse any of them. A sweep rather than a case, because the way
-    /// this breaks is a *new* variant added to one of the two enums without a
-    /// counterpart on the other side, which no single fixture would notice.
-    #[test]
-    fn every_ordinal_a_pipeline_key_can_hold_is_one_the_owning_layer_admits() {
-        use super::super::types::{SamplerCompareFunction as C, StencilFaceOps, StencilOp as O};
-        const COMPARES: [C; 8] = [
-            C::Never,
-            C::Less,
-            C::Equal,
-            C::LessEqual,
-            C::Greater,
-            C::NotEqual,
-            C::GreaterEqual,
-            C::Always,
-        ];
-        const OPS: [O; 8] = [
-            O::Keep,
-            O::Zero,
-            O::Replace,
-            O::IncrementClamp,
-            O::DecrementClamp,
-            O::Invert,
-            O::IncrementWrap,
-            O::DecrementWrap,
-        ];
-        let mut checked = 0usize;
-        for compare in COMPARES {
-            for op in OPS {
-                let face = StencilFaceOps {
-                    compare,
-                    fail_op: op,
-                    depth_fail_op: op,
-                    pass_op: op,
-                    read_mask: 0xff,
-                    write_mask: 0xff,
-                };
-                for stencil in [
-                    None,
-                    Some(StencilKey {
-                        front: face,
-                        back: face,
-                    }),
-                ] {
-                    // Would panic inside the projection if any ordinal were
-                    // outside the enum the owning layer parses.
-                    let state = depth_stencil_state(compare, false, stencil);
-                    assert_eq!(state.stencil_engaged(), stencil.is_some());
-                    checked += 1;
-                }
-            }
-        }
-        assert_eq!(checked, COMPARES.len() * OPS.len() * 2);
     }
 
     /// The projection carries the guest's axes in the guest's order.

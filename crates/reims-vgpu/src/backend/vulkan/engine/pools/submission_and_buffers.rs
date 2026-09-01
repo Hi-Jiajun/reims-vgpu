@@ -1871,6 +1871,7 @@ impl ResourcePools {
         self.cb_graphics.depth_bias_set = false;
         self.cb_graphics.raster = None;
         self.cb_graphics.topology = None;
+        self.cb_graphics.depth_stencil = None;
         self.cb_graphics.push_layout = None;
         self.cb_graphics.push_bindings.clear();
     }
@@ -2533,6 +2534,76 @@ impl ResourcePools {
             }
             if let Some(clamp) = values.depth_clamp_enable {
                 unsafe { eds3.cmd_set_depth_clamp_enable(cb, clamp) };
+            }
+        }
+    }
+
+    /// Record the guest's whole `MTLDepthStencilState` unless this command
+    /// buffer already carries exactly it.
+    ///
+    /// `wanted` is `Some` exactly when the pipeline about to be bound holds
+    /// `reims_vgpu_vulkan::depth_stencil`'s placeholder — which is the same
+    /// condition that collapsed every guest depth-stencil state onto one cache
+    /// entry. A pipeline that declares these states and never receives them
+    /// draws undefined; a host that bakes the state asks nothing here and pays
+    /// one comparison.
+    ///
+    /// Eight commands and not nine: the reference is a separate Metal encoder
+    /// command with its own held value, and it is recorded on the baking rung
+    /// too.
+    ///
+    /// The masks go through `vkCmdSetStencilCompareMask` and
+    /// `vkCmdSetStencilWriteMask` rather than through `vkCmdSetStencilOp`,
+    /// which does not carry them. All three were dynamic in Vulkan 1.0, so
+    /// they need no loader — unlike the five that came with
+    /// `VK_EXT_extended_dynamic_state`, whose loader is `Some` on exactly the
+    /// devices whose feature bit put a `Some` in `wanted`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_depth_stencil(
+        &mut self,
+        ctx: &super::super::context::DeviceContext,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        wanted: Option<reims_vgpu_vulkan::depth_stencil::DynamicDepthStencil>,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.depth_stencil == Some(wanted) {
+            counters
+                .dynstate_depth_stencil_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.depth_stencil = Some(wanted);
+        let (Some(eds), Some(state)) = (ctx.extended_dynamic_state.as_ref(), wanted) else {
+            return;
+        };
+        unsafe {
+            eds.cmd_set_depth_test_enable(cb, state.depth_test_enable);
+            eds.cmd_set_depth_write_enable(cb, state.depth_write_enable);
+            eds.cmd_set_depth_compare_op(cb, state.depth_compare_op);
+            eds.cmd_set_depth_bounds_test_enable(cb, state.depth_bounds_test_enable);
+            eds.cmd_set_stencil_test_enable(cb, state.stencil_test_enable);
+        }
+        for (faces, face) in [
+            (vk::StencilFaceFlags::FRONT, state.front),
+            (vk::StencilFaceFlags::BACK, state.back),
+        ] {
+            unsafe {
+                eds.cmd_set_stencil_op(
+                    cb,
+                    faces,
+                    face.fail_op,
+                    face.pass_op,
+                    face.depth_fail_op,
+                    face.compare_op,
+                );
+                ctx.device
+                    .cmd_set_stencil_compare_mask(cb, faces, face.compare_mask);
+                ctx.device
+                    .cmd_set_stencil_write_mask(cb, faces, face.write_mask);
             }
         }
     }

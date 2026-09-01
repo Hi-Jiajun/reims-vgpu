@@ -776,6 +776,7 @@ mod tests {
             stencil_test_enable: false,
             front: depth_stencil::FacePlan::pass_through(),
             back: depth_stencil::FacePlan::pass_through(),
+            dynamic: false,
         }
     }
 
@@ -982,6 +983,7 @@ mod tests {
             stencil_test_enable: false,
             front: depth_stencil::FacePlan::pass_through(),
             back: depth_stencil::FacePlan::pass_through(),
+            dynamic: false,
         };
         assert_eq!(
             build(GraphicsKey {

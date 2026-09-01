@@ -301,6 +301,62 @@ fn the_primitive_types_collapse_onto_one_of_the_three_topology_rungs() {
     assert_fullscreen_fragment_color("topology_triangle", &px, 16, 16);
 }
 
+/// The depth compare function reaches the draw, and two draws that differ only
+/// in it may still be one pipeline.
+///
+/// `setDepthStencilState:` is a Metal encoder command, so a guest changes the
+/// whole depth-stencil state between draws of one pipeline. On a host with
+/// `VK_EXT_extended_dynamic_state` this device keeps it that way: the pipeline
+/// holds `reims_vgpu_vulkan::depth_stencil`'s placeholder — which tests
+/// nothing and writes nothing — and the guest's state rides to the encoder.
+///
+/// That collapse is invisible from a cache-hit count and catastrophic if the
+/// encoder half is missing: every draw would silently run the placeholder. So
+/// this asserts pixels. `Always` fills the target and `Never` rejects every
+/// fragment, and the two requests differ in nothing else — on a dynamic host
+/// they are the same pipeline, and a placeholder left unreplaced would fill the
+/// target both times.
+#[test]
+fn the_depth_compare_function_separates_two_draws_of_one_pipeline() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let depth = |compare| {
+        Some(DepthState {
+            identity: None,
+            test_enable: true,
+            write_enable: true,
+            compare,
+            clear_value: 1.0,
+            load: false,
+            stencil: None,
+        })
+    };
+
+    let mut req = engine_req(&v, &f, 16, 16);
+    req.depth = depth(SamplerCompareFunction::Always);
+    let Some(passed) = draw_or_skip("depth_always", &req) else {
+        return;
+    };
+    assert_fullscreen_fragment_color("depth_always", &passed, 16, 16);
+
+    req.depth = depth(SamplerCompareFunction::Never);
+    let rejected = draw_or_skip("depth_never", &req).expect("the first draw already found a GPU");
+    assert!(
+        rejected
+            .chunks_exact(4)
+            .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0),
+        "`Never` must reject every fragment; got {:?}",
+        &rejected[..16]
+    );
+
+    // And back, in the same session and against the same pipeline where this
+    // host has one, so the second state cannot have won by being the one that
+    // built it.
+    req.depth = depth(SamplerCompareFunction::Always);
+    let again = draw_or_skip("depth_always_again", &req).expect("a GPU was already found");
+    assert_eq!(again, passed, "returning to `Always` must fill the target");
+}
+
 #[test]
 fn multisample_resolve_preserves_subpixel_coverage() {
     let _g = engine_test_session();
