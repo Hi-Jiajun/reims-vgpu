@@ -33,7 +33,7 @@ use crate::ready::Scheduler;
 use crate::retire::Lifetime;
 use crate::transaction::{classify, DeviceTransaction, PayloadClass};
 use reims_vgpu_protocol::packets::{find, Channel};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Why a packet did not become a transaction.
 ///
@@ -54,6 +54,15 @@ pub enum Refusal {
     DeviceLost { epoch: DeviceEpoch },
     /// A replacement device was asked for while the current one is live.
     DeviceNotLost { epoch: DeviceEpoch },
+    /// The packet named a submission domain no channel definition opened.
+    /// Admitting it would give it an ordering position in a publication order
+    /// nothing will ever drain, which is a completion word the guest waits on
+    /// forever.
+    ChannelNotOpen { channel: ChannelId },
+    /// A channel definition named a domain that is already open. Silently
+    /// reopening would reset a publication order that still has positions in
+    /// it.
+    ChannelAlreadyOpen { channel: ChannelId },
     /// The packet arrived after the semantic lifetime it names was closed.
     /// Not an error in the guest: a reset races in-flight submissions, and the
     /// contract is that the closed generation stops accepting rather than that
@@ -71,6 +80,8 @@ impl Refusal {
             Self::UnestablishedContract { .. } => "ingress_unestablished_contract",
             Self::DeviceLost { .. } => "ingress_device_lost",
             Self::DeviceNotLost { .. } => "ingress_device_not_lost",
+            Self::ChannelNotOpen { .. } => "ingress_channel_not_open",
+            Self::ChannelAlreadyOpen { .. } => "ingress_channel_already_open",
             Self::GenerationClosed { .. } => "ingress_generation_closed",
         }
     }
@@ -122,6 +133,11 @@ pub struct SessionModel {
     epoch: DeviceEpoch,
     device: DeviceState,
     next_ingress: IngressOrdinal,
+    /// The domains a channel definition has opened. Separate from
+    /// `channel_sequence` because a channel that is open and has carried no
+    /// packet is a real state, and one that has carried packets and been freed
+    /// must stop being nameable even while its positions drain.
+    open_channels: BTreeSet<ChannelId>,
     channel_sequence: BTreeMap<ChannelId, ChannelSequence>,
     graph: DependencyGraph,
     scheduler: Scheduler,
@@ -141,6 +157,7 @@ impl SessionModel {
             epoch: DeviceEpoch::FIRST,
             device: DeviceState::Live,
             next_ingress: IngressOrdinal::default().next(),
+            open_channels: BTreeSet::new(),
             channel_sequence: BTreeMap::new(),
             graph: DependencyGraph::new(),
             scheduler: Scheduler::new(),
@@ -264,6 +281,13 @@ impl SessionModel {
             });
         };
 
+        if !self.open_channels.contains(&packet.domain) {
+            self.refusals += 1;
+            return Err(Refusal::ChannelNotOpen {
+                channel: packet.domain,
+            });
+        }
+
         let ingress = self.next_ingress;
         self.next_ingress = ingress.next();
         let sequence = self
@@ -355,14 +379,44 @@ impl SessionModel {
         &self.publisher
     }
 
-    /// End a channel's publication lifetime.
+    /// Open a submission domain, as a channel definition does.
+    ///
+    /// A domain has to be opened before anything may be admitted to it.
+    /// Creating it on first use instead would mean a packet naming a channel
+    /// the guest never defined gets an ordering position and a completion
+    /// obligation in a publication order nothing drains — and the guest waits
+    /// on that word forever. Which integer the root channel is, is not decided
+    /// here: the caller that opened the ring knows it and opens it like any
+    /// other.
     ///
     /// # Errors
     ///
-    /// If the channel still holds unreleased positions.
+    /// If the domain is already open.
+    pub fn open_channel(&mut self, domain: ChannelId) -> Result<(), Refusal> {
+        if !self.open_channels.insert(domain) {
+            self.refusals += 1;
+            return Err(Refusal::ChannelAlreadyOpen { channel: domain });
+        }
+        Ok(())
+    }
+
+    /// Whether a domain is open.
+    #[must_use]
+    pub fn channel_open(&self, domain: ChannelId) -> bool {
+        self.open_channels.contains(&domain)
+    }
+
+    /// End a channel's publication lifetime, as a channel free does.
+    ///
+    /// # Errors
+    ///
+    /// If the channel still holds unreleased positions. A free that dropped
+    /// them would drop the completion words the guest is waiting on, so the
+    /// caller drains first.
     pub fn retire_channel(&mut self, domain: ChannelId) -> Result<(), RetireRefusal> {
         self.publisher.retire(domain)?;
         self.channel_sequence.remove(&domain);
+        self.open_channels.remove(&domain);
         Ok(())
     }
 
@@ -401,6 +455,16 @@ mod tests {
     use crate::identity::{StampSlot, StampValue};
     use crate::retire::Validity;
 
+    /// A session with the two submission domains the tests use already open,
+    /// because opening them is a channel definition's job and not a thing under
+    /// test here. `channel_lifetime` tests the opening itself.
+    fn session() -> SessionModel {
+        let mut s = SessionModel::new(SessionId(1));
+        s.open_channel(ChannelId(2)).expect("fresh");
+        s.open_channel(ChannelId(3)).expect("fresh");
+        s
+    }
+
     fn packet(opcode: u16) -> Packet {
         Packet {
             channel: Channel::Child,
@@ -430,7 +494,7 @@ mod tests {
     /// what they carry.
     #[test]
     fn every_accepted_packet_gets_the_same_envelope() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         let exec = s.admit(&packet(0x37)).expect("EXEC is accepted");
         let delete = s.admit(&packet(0x25)).expect("delete is accepted");
         assert_eq!(exec.transaction.payload, PayloadClass::Exec);
@@ -446,7 +510,7 @@ mod tests {
     /// The refusal that keeps the rest of the model honest.
     #[test]
     fn a_command_with_no_established_contract_never_becomes_a_transaction() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         // CmdDelay: judged, unresolved.
         let err = s.admit(&packet(0x3d)).expect_err("unresolved is refused");
         assert!(matches!(err, Refusal::UnestablishedContract { .. }));
@@ -463,7 +527,7 @@ mod tests {
     /// has to explain a hole that means nothing.
     #[test]
     fn a_refusal_consumes_no_ordinal_and_no_sequence() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         s.admit(&packet(0x37)).expect("accepted");
         s.admit(&packet(0x3d)).expect_err("refused");
         let next = s.admit(&packet(0x37)).expect("accepted");
@@ -474,7 +538,7 @@ mod tests {
     /// Channel sequences are per domain; the ingress ordinal is not.
     #[test]
     fn two_domains_keep_separate_sequences_in_one_arrival_order() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         let mut a = packet(0x37);
         a.domain = ChannelId(2);
         let mut b = packet(0x37);
@@ -496,7 +560,7 @@ mod tests {
 
     #[test]
     fn hazards_and_completion_travel_together() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         let mut writer = packet(0x37);
         writer.accesses = vec![whole(1, AccessMode::Write)];
         writer.completion = Some(CompletionStamp {
@@ -538,7 +602,7 @@ mod tests {
     /// Out-of-order completion is ordinary; out-of-order publication is not.
     #[test]
     fn a_channel_publishes_in_its_own_order_however_the_work_finishes() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         let mut first = packet(0x37);
         first.completion = Some(CompletionStamp {
             slot: StampSlot(0),
@@ -580,7 +644,7 @@ mod tests {
     /// again.
     #[test]
     fn withdrawing_a_head_releases_what_was_queued_behind_it() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         let mut second = packet(0x37);
         second.completion = Some(CompletionStamp {
             slot: StampSlot(0),
@@ -604,7 +668,7 @@ mod tests {
 
     #[test]
     fn a_channel_with_unpublished_work_cannot_end_its_lifetime() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         let a = s.admit(&packet(0x37)).expect("accepted");
         assert_eq!(
             s.retire_channel(ChannelId(2)),
@@ -612,17 +676,67 @@ mod tests {
         );
         s.complete(a.transaction.ingress);
         assert_eq!(s.retire_channel(ChannelId(2)), Ok(()));
+        assert!(
+            !s.channel_open(ChannelId(2)),
+            "a freed channel stops being nameable"
+        );
+        assert_eq!(
+            s.admit(&packet(0x37)),
+            Err(Refusal::ChannelNotOpen {
+                channel: ChannelId(2)
+            }),
+            "and a packet naming it is refused rather than reopening it"
+        );
         // A later definition of the channel starts at position one rather than
         // continuing the lifetime that just ended.
+        s.open_channel(ChannelId(2)).expect("free again");
         let next = s.admit(&packet(0x37)).expect("accepted");
         assert_eq!(next.transaction.channel_sequence, ChannelSequence(1));
+    }
+
+    /// A packet naming a domain no definition opened is refused at ingress.
+    /// Creating the domain on first use instead would give the packet an
+    /// ordering position and a completion obligation in a publication order
+    /// nothing drains, and the guest waits on that word forever.
+    #[test]
+    fn a_packet_on_an_undefined_channel_is_refused_and_consumes_nothing() {
+        let mut s = SessionModel::new(SessionId(1));
+        let before = s.refusals();
+        assert_eq!(
+            s.admit(&packet(0x37)),
+            Err(Refusal::ChannelNotOpen {
+                channel: ChannelId(2)
+            })
+        );
+        assert_eq!(s.refusals(), before + 1);
+        s.open_channel(ChannelId(2)).expect("fresh");
+        let first = s.admit(&packet(0x37)).expect("accepted");
+        assert_eq!(
+            first.transaction.ingress,
+            IngressOrdinal::default().next(),
+            "the refused packet consumed no ordinal"
+        );
+        assert_eq!(first.transaction.channel_sequence, ChannelSequence(1));
+    }
+
+    /// Reopening a live channel would reset a publication order that still has
+    /// positions in it.
+    #[test]
+    fn a_channel_is_defined_once() {
+        let mut s = session();
+        assert_eq!(
+            s.open_channel(ChannelId(2)),
+            Err(Refusal::ChannelAlreadyOpen {
+                channel: ChannelId(2)
+            })
+        );
     }
 
     /// The two transitions are independent, which is the whole reason they are
     /// two identities.
     #[test]
     fn a_guest_reset_and_a_device_loss_move_different_lifetimes() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         let start = s.lifetime();
 
         s.reset();
@@ -654,7 +768,7 @@ mod tests {
     /// and must be told so, not admitted into an incarnation that is gone.
     #[test]
     fn a_lost_device_refuses_admission_until_it_is_replaced() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         let epoch = s.device_lost();
         assert_eq!(
             s.admit(&packet(0x37)),
@@ -669,7 +783,7 @@ mod tests {
 
     #[test]
     fn a_live_device_cannot_be_replaced() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         assert_eq!(
             s.recreate_device(),
             Err(Refusal::DeviceNotLost { epoch: s.epoch() }),
@@ -681,7 +795,7 @@ mod tests {
     /// A lease issued before either transition is judged on both, separately.
     #[test]
     fn a_lease_from_before_both_transitions_is_judged_on_both() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         let lease = s.lifetime();
         assert_eq!(lease.against(s.generation(), s.epoch()), Validity::Live);
 
@@ -703,8 +817,9 @@ mod tests {
     /// here rather than in a guest.
     #[test]
     fn one_sessions_reset_or_loss_cannot_reach_another_session() {
-        let mut a = SessionModel::new(SessionId(1));
+        let mut a = session();
         let mut b = SessionModel::new(SessionId(2));
+        b.open_channel(ChannelId(2)).expect("fresh");
         let untouched = b.lifetime();
         let admitted = b.admit(&packet(0x37)).expect("accepted");
 
@@ -724,7 +839,7 @@ mod tests {
     /// host is still going to deliver.
     #[test]
     fn a_reset_opens_a_generation_without_abandoning_accepted_work() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         let mut writer = packet(0x37);
         writer.accesses = vec![whole(1, AccessMode::Write)];
         let w = s.admit(&writer).expect("accepted");
@@ -753,7 +868,7 @@ mod tests {
     /// something has to order that.
     #[test]
     fn the_acknowledged_noops_are_transactions_like_any_other() {
-        let mut s = SessionModel::new(SessionId(1));
+        let mut s = session();
         for opcode in [0x1e, 0x03, 0x32] {
             let t = s.admit(&packet(opcode)).expect("accepted");
             assert_eq!(t.transaction.payload, PayloadClass::Control);
