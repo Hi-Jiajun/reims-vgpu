@@ -150,15 +150,22 @@ impl QueueOwner {
 }
 
 /// Which family this rail submits to, and what else the host offered.
-#[derive(Debug, PartialEq, Eq)]
-pub struct QueuePlan {
+///
+/// Split from [`QueuePlan`] because the two have different lifetimes and
+/// different rules. This is an immutable measurement of the device and may be
+/// held in the capability catalog ([`crate::census::Census`]) alongside every
+/// other reported fact; the plan adds the mutable ledger of which `VkQueue`
+/// values have an owner, which belongs to a device epoch and must not be
+/// process-global. Folding them together would put per-epoch ownership state
+/// into a catalog the architecture requires to be immutable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueChoice {
     universal: Family,
     dedicated_transfer: Option<Family>,
     family_count: usize,
-    claimed: BTreeSet<(u32, u32)>,
 }
 
-impl QueuePlan {
+impl QueueChoice {
     /// Choose a family from what the device reports.
     ///
     /// Prefers a family that carries both `GRAPHICS` and `COMPUTE`, so a draw
@@ -171,7 +178,7 @@ impl QueuePlan {
     /// # Errors
     ///
     /// If no family draws.
-    pub fn choose(families: &[Family]) -> Result<Self, Decline> {
+    pub fn from_families(families: &[Family]) -> Result<Self, Decline> {
         let universal = families
             .iter()
             .find(|f| f.graphics() && f.compute())
@@ -186,8 +193,71 @@ impl QueuePlan {
             // for the measurement that decided it.
             dedicated_transfer: families.iter().copied().find(|f| f.transfer_only()),
             family_count: families.len(),
-            claimed: BTreeSet::new(),
         })
+    }
+
+    #[must_use]
+    pub const fn universal(self) -> Family {
+        self.universal
+    }
+
+    #[must_use]
+    pub fn compute(self) -> bool {
+        self.universal.compute()
+    }
+
+    #[must_use]
+    pub const fn dedicated_transfer(self) -> Option<Family> {
+        self.dedicated_transfer
+    }
+
+    #[must_use]
+    pub const fn family_count(self) -> usize {
+        self.family_count
+    }
+}
+
+/// The chosen family plus the ledger of which of its queues have an owner.
+///
+/// One per device epoch. See [`QueueChoice`] for why the ledger is not in the
+/// catalog.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QueuePlan {
+    universal: Family,
+    dedicated_transfer: Option<Family>,
+    family_count: usize,
+    claimed: BTreeSet<(u32, u32)>,
+}
+
+impl QueuePlan {
+    /// Choose a family from what the device reports, and start an empty ledger.
+    ///
+    /// # Errors
+    ///
+    /// If no family draws.
+    pub fn choose(families: &[Family]) -> Result<Self, Decline> {
+        Ok(Self::adopt(QueueChoice::from_families(families)?))
+    }
+
+    /// Start a ledger against a choice the catalog already made.
+    #[must_use]
+    pub fn adopt(choice: QueueChoice) -> Self {
+        Self {
+            universal: choice.universal,
+            dedicated_transfer: choice.dedicated_transfer,
+            family_count: choice.family_count,
+            claimed: BTreeSet::new(),
+        }
+    }
+
+    /// The measurement this plan was started from, with no ownership state.
+    #[must_use]
+    pub const fn choice(&self) -> QueueChoice {
+        QueueChoice {
+            universal: self.universal,
+            dedicated_transfer: self.dedicated_transfer,
+            family_count: self.family_count,
+        }
     }
 
     /// The family every submission goes to.

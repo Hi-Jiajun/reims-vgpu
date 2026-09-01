@@ -22,6 +22,9 @@
 //!
 //! - [`bindings`] — what a draw has to re-emit, and far more often what it
 //!   does not.
+//! - [`census`] — what this physical device offers, taken once, and the floor
+//!   it has to clear to be used at all. Every capability gate below reads from
+//!   it, and it holds no device name for one to branch on.
 //! - [`descriptor`] — which mechanism carries a draw's descriptors on this
 //!   host, and what one emission is therefore allowed to write.
 //! - [`layout`] — which layout each image subresource is in, and the explicit
@@ -51,6 +54,7 @@
 
 pub mod barrier;
 pub mod bindings;
+pub mod census;
 pub mod descriptor;
 pub mod layout;
 pub mod memory;
