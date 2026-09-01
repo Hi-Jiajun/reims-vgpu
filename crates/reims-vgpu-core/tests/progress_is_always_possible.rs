@@ -51,8 +51,10 @@
 use reims_vgpu_core::access::{AccessIntent, AccessKey, AccessMode, BackingId, ResourceKey};
 use reims_vgpu_core::exec::ExecWork;
 use reims_vgpu_core::identity::{
-    ChannelId, CompletionStamp, IngressOrdinal, SessionId, StampSlot, StampValue, StampWait,
+    ChannelId, CompletionStamp, IngressOrdinal, ObjectListRef, ResourceId, SessionId,
+    SlotGeneration, StampSlot, StampValue, StampWait,
 };
+use reims_vgpu_core::pipeline::PipelineState;
 use reims_vgpu_core::session::{Packet, SessionModel};
 use reims_vgpu_core::submit::{Admission, PhysicalQueue, QueueMap, SubmitGate};
 use reims_vgpu_core::transaction::Payload;
@@ -101,6 +103,14 @@ impl Rng {
     }
 }
 
+/// The identity a generated pipeline number resolves to.
+fn pipeline_id(n: u32) -> ResourceId {
+    ResourceId {
+        slot: ObjectListRef(n),
+        generation: SlotGeneration(1),
+    }
+}
+
 /// One generated transaction, before it is admitted.
 struct Spec {
     channel: ChannelId,
@@ -120,7 +130,21 @@ struct Spec {
     /// state in which submitting it first can strand it on a shared path.
     forwarded: bool,
     completion: Option<CompletionStamp>,
+    /// A pipeline this transaction binds, if it binds one.
+    ///
+    /// A fourth wait class, and the only one whose release does not come from
+    /// another transaction: a compilation finishes on its own schedule, and the
+    /// batch cannot make it happen by running anything. So a state whose only
+    /// enabled action is "finish a compilation" is a state the other three wait
+    /// classes cannot produce.
+    pipeline: Option<u32>,
 }
+
+/// How many distinct pipelines a batch's transactions may bind.
+///
+/// Small, so several transactions share one and a single compilation releases
+/// more than one waiter.
+const PIPELINES: u32 = 3;
 
 /// A batch whose every wait points backwards, so nothing the guest wrote is a
 /// cycle.
@@ -167,6 +191,11 @@ fn batch(seed: u64, count: usize, channels: u32) -> Vec<Spec> {
         } else {
             None
         };
+        // A third of them bind a pipeline. Not all, because a batch in which
+        // every transaction waits on a compilation would make the pipeline
+        // action the only one for its whole first phase and stop exercising the
+        // interleaving between the other three.
+        let pipeline = (rng.below(3) == 0).then(|| rng.below(PIPELINES as usize) as u32);
         specs.push(Spec {
             channel,
             backing,
@@ -174,6 +203,7 @@ fn batch(seed: u64, count: usize, channels: u32) -> Vec<Spec> {
             wait,
             forwarded,
             completion,
+            pipeline,
         });
     }
     specs
@@ -192,6 +222,12 @@ struct Exercised {
     /// States where a channel was holding a finished position behind an
     /// unfinished one.
     publication_blocked: usize,
+    /// States where finishing a compilation was the only enabled action.
+    ///
+    /// The states the fourth wait class exists to reach: no transaction could
+    /// be submitted and none could be completed, and the batch was not stuck —
+    /// it was waiting for something no transaction produces.
+    only_compilable: usize,
 }
 
 impl Exercised {
@@ -199,6 +235,7 @@ impl Exercised {
         self.gate_holds += other.gate_holds;
         self.only_completable += other.only_completable;
         self.publication_blocked += other.publication_blocked;
+        self.only_compilable += other.only_compilable;
     }
 }
 
@@ -253,6 +290,20 @@ fn drive_withdrawing(
     }
     let mut gate = SubmitGate::new(map);
 
+    // Every pipeline a spec names, declared and stepped as far as the compiling
+    // layer takes it on its own. The last step is the driver's action below, so
+    // a transaction binding one is admitted with a wait that only that action
+    // can discharge.
+    let mut compiling: BTreeSet<u32> = specs.iter().filter_map(|s| s.pipeline).collect();
+    let generation = model.generation();
+    for id in &compiling {
+        let pipeline = pipeline_id(*id);
+        assert!(model.pipelines().declare(pipeline, generation));
+        for step in [PipelineState::Translating, PipelineState::Compiling] {
+            assert!(model.pipelines().advance(pipeline, step));
+        }
+    }
+
     let mut ordinals: Vec<IngressOrdinal> = Vec::with_capacity(count);
     let mut of_ordinal: BTreeMap<IngressOrdinal, usize> = BTreeMap::new();
     for (i, spec) in specs.iter().enumerate() {
@@ -281,6 +332,7 @@ fn drive_withdrawing(
                     input_content_version: None,
                     output_content_version: None,
                 }],
+                pipeline_leases: spec.pipeline.map(pipeline_id).into_iter().collect(),
                 ..ExecWork::default()
             }),
         };
@@ -334,12 +386,15 @@ fn drive_withdrawing(
         if submittable.is_empty() && !completable.is_empty() {
             exercised.only_completable += 1;
         }
+        if submittable.is_empty() && completable.is_empty() && !compiling.is_empty() {
+            exercised.only_compilable += 1;
+        }
         if !model.publisher().blocked().is_empty() {
             exercised.publication_blocked += 1;
         }
 
         assert!(
-            !submittable.is_empty() || !completable.is_empty(),
+            !submittable.is_empty() || !completable.is_empty() || !compiling.is_empty(),
             "seed {seed} policy {policy:?} step {step}: work remains and \
              nothing is enabled. ready={} submitted={} completed={}/{count} \
              withdrawn={} blocked={:?} gate_holds={}",
@@ -350,6 +405,25 @@ fn drive_withdrawing(
             model.publisher().blocked(),
             gate.holds()
         );
+
+        // A compilation finishing is not something the batch produces, so it
+        // is available whenever one is outstanding. Taking it only when nothing
+        // else is enabled would make every state trivially progressive and stop
+        // testing whether a compilation *releases* anything; taking it
+        // sometimes when other actions exist is what builds the backlog.
+        if !compiling.is_empty()
+            && (submittable.is_empty() && completable.is_empty() || rng.below(3) == 0)
+        {
+            let ids: Vec<u32> = compiling.iter().copied().collect();
+            let indices: Vec<usize> = (0..ids.len()).collect();
+            let chosen = ids[policy.pick(&indices, &mut rng)];
+            assert!(
+                model.pipeline_ready(pipeline_id(chosen)),
+                "a compiling pipeline may become ready"
+            );
+            compiling.remove(&chosen);
+            continue;
+        }
 
         // Prefer whichever the policy can act on, and when both are available
         // let the interleaving decide — a driver that always completed before
@@ -422,6 +496,10 @@ fn a_batch_always_has_something_it_can_do() {
         total.publication_blocked > 0,
         "no channel ever held a finished position behind an unfinished one"
     );
+    assert!(
+        total.only_compilable > 0,
+        "no state had a compilation as its only enabled action, so a          `pipeline_ready` that released nothing would have passed"
+    );
 }
 
 /// The same claim, with one transaction withdrawn before anything runs.
@@ -451,6 +529,7 @@ fn a_batch_with_a_withdrawn_transaction_still_finishes() {
     assert!(total.gate_holds > 0);
     assert!(total.only_completable > 0);
     assert!(total.publication_blocked > 0);
+    assert!(total.only_compilable > 0);
 }
 
 /// The sweep is only worth running if the interleavings actually differ. A
