@@ -29,6 +29,8 @@
 //!   census admitted, and the identity every handle made from it carries.
 //! - [`descriptor`] — which mechanism carries a draw's descriptors on this
 //!   host, and what one emission is therefore allowed to write.
+//! - [`frames`] — swapchain frame slots, and the binary semaphores that a
+//!   failed frame leaves with a signal outstanding on them.
 //! - [`host`] — the instance, the physical device this rail bound, and the
 //!   only Vulkan state the architecture allows to be process-global.
 //! - [`layout`] — which layout each image subresource is in, and the explicit
@@ -63,6 +65,7 @@ pub mod bindings;
 pub mod census;
 pub mod descriptor;
 pub mod device;
+pub mod frames;
 pub mod host;
 pub mod layout;
 pub mod memory;
