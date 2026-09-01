@@ -45,9 +45,12 @@ pub use reims_vgpu_wire::op::Op;
 pub use reims_vgpu_wire::ops::render::{
     BufferBind, BufferStrideBind, RefBind, SamplerLodBind, ScissorRect, Viewport,
 };
-pub use reims_vgpu_wire::{F32le, U32le, U64le};
+pub use reims_vgpu_wire::{F32le, F64le, U16le, U32le, U64le};
 
-pub use reims_vgpu_wire::ops::render_pass::RenderPassBody;
+pub use reims_vgpu_wire::ops::render_pass::{
+    AttachmentPrefix, ColorAttachmentBody, DepthAttachmentBody, RenderPassBody,
+    StencilAttachmentBody,
+};
 
 /// Why a record could not be lifted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

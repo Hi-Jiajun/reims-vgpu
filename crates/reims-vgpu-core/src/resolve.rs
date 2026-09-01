@@ -38,6 +38,14 @@ use crate::compute::{ComputeExtent, ComputeOp, ComputeOrigin, DispatchOp};
 use crate::exec::ExecArenas;
 use crate::icb::{CommandRange, IcbOp};
 use crate::identity::ResourceId;
+use crate::pass::{
+    Attachment, AttachmentSlot, LoadAction, PassDescriptor, RenderTargetExtent, StoreAction,
+    VisibilityResultBuffer,
+};
+use crate::render::{
+    DrawOp, FloatBits, IndexSource, Instancing, PassDescriptorSlot, PrimitiveType, RenderOp,
+    ScissorRect, StateSpan, Viewport,
+};
 use crate::resource_state::{ResourceStateOp, ResourceStateTarget, SliceLevel};
 use crate::sync::{BarrierOp, BarrierTarget, EventOp, FenceOp, ResourceSpan};
 use reims_vgpu_protocol::decode::blit::{
@@ -48,11 +56,16 @@ use reims_vgpu_protocol::decode::compute::{
     ComputeRecord, DispatchRecord, Extent as RecordExtent, IndirectRef as ComputeIndirect,
 };
 use reims_vgpu_protocol::decode::icb::IcbRecord;
+use reims_vgpu_protocol::decode::render::{
+    DrawRecord, IndexRef as RecordIndexRef, IndirectRef as RenderIndirect,
+    Instancing as RecordInstancing, RenderRecord,
+};
 use reims_vgpu_protocol::decode::residency::ResidencyRecord;
 use reims_vgpu_protocol::decode::resource_state::{RecordTarget, ResourceStateRecord};
 use reims_vgpu_protocol::decode::sync::{BarrierRecord, EventRecord, FenceRecord, SyncRecord};
 use reims_vgpu_protocol::decode::{
-    BufferBind, BufferStrideBind, DecodeRefusal, RefBind, SamplerLodBind,
+    AttachmentPrefix, BufferBind, BufferStrideBind, DecodeRefusal, RefBind, RenderPassBody,
+    SamplerLodBind, ScissorRect as WireScissorRect, Viewport as WireViewport,
 };
 
 /// What a guest ref names right now.
@@ -76,6 +89,15 @@ pub enum ResolveRefusal {
     /// Carries the guest's number, because the number is what a log line has to
     /// contain for anyone to find which object the guest thought it had.
     UnknownRef { object_ref: u32 },
+    /// A field's value names nothing the API defines.
+    ///
+    /// Distinct from the decoder's refusal of the same shape: this one is
+    /// raised by resolution, on a field the decoder carried verbatim because
+    /// what the value *means* is a model question. The pass descriptor's store
+    /// action is the case — the record shape represents four of them, and a
+    /// fifth folded onto its nearest neighbour is either a discarded frame or a
+    /// resolve that never happens.
+    UndefinedOrdinal { field: &'static str, value: u32 },
     /// A counted list is longer than an arena window can name.
     ///
     /// A window is two `u32`, so a transaction cannot hold more than `u32::MAX`
@@ -92,6 +114,7 @@ impl ResolveRefusal {
         match self {
             Self::Decode(inner) => inner.reason(),
             Self::UnknownRef { .. } => "resolve_ref_names_no_object",
+            Self::UndefinedOrdinal { .. } => "resolve_field_ordinal_undefined",
             Self::ArenaOverflow { .. } => "resolve_list_exceeds_arena_window",
         }
     }
@@ -669,6 +692,316 @@ pub fn compute(
     })
 }
 
+/// Resolve a viewport arena window.
+///
+/// The wire's viewport is six `f64` and the model's is six bit patterns. The
+/// conversion is a `to_bits`, and it is here rather than in the model's type
+/// because the model's reason for holding bits is comparison: a state table has
+/// to answer "is this the viewport that is already set", and a NaN depth bound
+/// must stay equal to itself.
+fn append_viewports(
+    arenas: &mut ExecArenas,
+    ports: &[WireViewport],
+) -> Result<StateSpan, ResolveRefusal> {
+    let (start, len) = window(arenas.viewports.len(), ports.len())?;
+    arenas.viewports.reserve(ports.len());
+    for port in ports {
+        arenas.viewports.push(Viewport {
+            origin_x_bits: port.origin_x.get().to_bits(),
+            origin_y_bits: port.origin_y.get().to_bits(),
+            width_bits: port.width.get().to_bits(),
+            height_bits: port.height.get().to_bits(),
+            z_near_bits: port.znear.get().to_bits(),
+            z_far_bits: port.zfar.get().to_bits(),
+        });
+    }
+    Ok(StateSpan { start, len })
+}
+
+/// Resolve a scissor arena window. Integers on both sides; nothing to convert
+/// but the endianness the view already handled.
+fn append_scissors(
+    arenas: &mut ExecArenas,
+    rects: &[WireScissorRect],
+) -> Result<StateSpan, ResolveRefusal> {
+    let (start, len) = window(arenas.scissors.len(), rects.len())?;
+    arenas.scissors.reserve(rects.len());
+    for rect in rects {
+        arenas.scissors.push(ScissorRect {
+            x: rect.x.get(),
+            y: rect.y.get(),
+            width: rect.width.get(),
+            height: rect.height.get(),
+        });
+    }
+    Ok(StateSpan { start, len })
+}
+
+/// Resolve one attachment slot out of its wire prefix.
+///
+/// An unattached slot is one whose texture ref is zero — the record is a fixed
+/// shape and carries all eight colour slots whether the guest filled them or
+/// not, so "absent" is spelled the same way an unbound slot is. A store action
+/// outside the four the record shape represents refuses rather than folding
+/// onto a neighbour: guessed wrong it is either a discarded frame or a resolve
+/// that never happens.
+fn attachment(
+    resolver: &impl RefResolver,
+    slot: AttachmentSlot,
+    prefix: &AttachmentPrefix,
+    clear_bits: [u64; 4],
+) -> Result<Attachment, ResolveRefusal> {
+    let raw_store = prefix.store_action.get();
+    let store = StoreAction::parse(raw_store).ok_or(ResolveRefusal::UndefinedOrdinal {
+        field: "store_action",
+        value: u32::from(raw_store),
+    })?;
+    Ok(Attachment {
+        slot,
+        texture: bound(resolver, prefix.texture_ref.get())?,
+        level: prefix.level.get(),
+        slice: prefix.slice.get(),
+        depth_plane: prefix.depth_plane.get(),
+        resolve_texture: bound(resolver, prefix.resolve_texture_ref.get())?,
+        resolve_level: prefix.resolve_level.get(),
+        resolve_slice: prefix.resolve_slice.get(),
+        resolve_depth_plane: prefix.resolve_depth_plane.get(),
+        load: LoadAction::from_declared(prefix.load_action.get()),
+        store,
+        clear_bits,
+    })
+}
+
+/// Resolve a render-pass descriptor.
+///
+/// Every slot is resolved, attached or not. The record carries eight colour
+/// slots as a fixed shape, and a model that skipped the empty ones would have
+/// to invent them again for anything that iterates slots by index.
+pub fn pass_descriptor(
+    body: &RenderPassBody,
+    resolver: &impl RefResolver,
+) -> Result<PassDescriptor, ResolveRefusal> {
+    let mut descriptor = PassDescriptor::empty();
+    for (index, wire) in body.color.iter().enumerate() {
+        descriptor.color[index] = attachment(
+            resolver,
+            AttachmentSlot::Color(index as u8),
+            &wire.prefix,
+            wire.clear_color_bits.map(|bits| bits.get()),
+        )?;
+    }
+    descriptor.depth = attachment(
+        resolver,
+        AttachmentSlot::Depth,
+        &body.depth.prefix,
+        [body.depth.clear_depth_bits.get(), 0, 0, 0],
+    )?;
+    descriptor.stencil = attachment(
+        resolver,
+        AttachmentSlot::Stencil,
+        &body.stencil.prefix,
+        [u64::from(body.stencil.clear_stencil.get()), 0, 0, 0],
+    )?;
+    descriptor.visibility_result_buffer = bound(resolver, body.visibility_result_buffer_ref.get())?
+        .map(|buffer| VisibilityResultBuffer { buffer });
+    descriptor.extent = RenderTargetExtent {
+        width: body.render_target_width.get(),
+        height: body.render_target_height.get(),
+        array_length: body.render_target_array_length.get(),
+    };
+    Ok(descriptor)
+}
+
+/// Resolve a render record.
+pub fn render(
+    record: &RenderRecord<'_>,
+    resolver: &impl RefResolver,
+    arenas: &mut ExecArenas,
+) -> Result<RenderOp, ResolveRefusal> {
+    Ok(match *record {
+        RenderRecord::Draw(d) => RenderOp::Draw(draw(&d, resolver)?),
+        RenderRecord::BindBuffers {
+            stage,
+            first,
+            entries,
+        } => RenderOp::BindBuffers {
+            stage,
+            first,
+            entries: append_buffer_binds(arenas, resolver, entries)?,
+        },
+        RenderRecord::BindBuffersWithStride { first, entries } => RenderOp::BindBuffersWithStride {
+            first,
+            entries: append_stride_binds(arenas, resolver, entries)?,
+        },
+        RenderRecord::BindTextures {
+            stage,
+            first,
+            entries,
+        } => RenderOp::BindTextures {
+            stage,
+            first,
+            entries: append_object_binds(arenas, resolver, entries)?,
+        },
+        RenderRecord::BindSamplers {
+            stage,
+            first,
+            entries,
+        } => RenderOp::BindSamplers {
+            stage,
+            first,
+            entries: append_object_binds(arenas, resolver, entries)?,
+        },
+        RenderRecord::BindSamplersWithLod {
+            stage,
+            first,
+            entries,
+        } => RenderOp::BindSamplersWithLod {
+            stage,
+            first,
+            entries: append_sampler_lod_binds(arenas, resolver, entries)?,
+        },
+        RenderRecord::RebindBufferOffset {
+            stage,
+            index,
+            offset,
+            stride,
+        } => RenderOp::RebindBufferOffset {
+            stage,
+            index,
+            offset,
+            stride,
+        },
+        RenderRecord::SetPipeline { pipeline_ref } => RenderOp::SetPipeline {
+            pipeline: one(resolver, pipeline_ref)?,
+        },
+        RenderRecord::SetDepthStencilState { state_ref } => RenderOp::SetDepthStencilState {
+            state: one(resolver, state_ref)?,
+        },
+        RenderRecord::WriteDescriptor { descriptor } => {
+            let resolved = pass_descriptor(descriptor, resolver)?;
+            let slot = u32::try_from(arenas.pass_descriptors.len())
+                .map_err(|_| ResolveRefusal::ArenaOverflow { wanted: 1 })?;
+            arenas.pass_descriptors.push(resolved);
+            RenderOp::WriteDescriptor {
+                descriptor: PassDescriptorSlot(slot),
+            }
+        }
+        RenderRecord::SetViewports(ports) => {
+            RenderOp::SetViewports(append_viewports(arenas, ports)?)
+        }
+        RenderRecord::SetScissorRects(rects) => {
+            RenderOp::SetScissorRects(append_scissors(arenas, rects)?)
+        }
+        RenderRecord::SetCullMode(mode) => RenderOp::SetCullMode(mode),
+        RenderRecord::SetFrontFacingWinding(mode) => RenderOp::SetFrontFacingWinding(mode),
+        RenderRecord::SetDepthClipMode(mode) => RenderOp::SetDepthClipMode(mode),
+        RenderRecord::SetTriangleFillMode(mode) => RenderOp::SetTriangleFillMode(mode),
+        RenderRecord::SetDepthBias {
+            bias_bits,
+            slope_scale_bits,
+            clamp_bits,
+        } => RenderOp::SetDepthBias {
+            bias: FloatBits(bias_bits),
+            slope_scale: FloatBits(slope_scale_bits),
+            clamp: FloatBits(clamp_bits),
+        },
+        RenderRecord::SetBlendColor {
+            red_bits,
+            green_bits,
+            blue_bits,
+            alpha_bits,
+        } => RenderOp::SetBlendColor {
+            red: FloatBits(red_bits),
+            green: FloatBits(green_bits),
+            blue: FloatBits(blue_bits),
+            alpha: FloatBits(alpha_bits),
+        },
+        RenderRecord::SetStencilReference { front, back } => {
+            RenderOp::SetStencilReference { front, back }
+        }
+        RenderRecord::SetStoreAction { target, action } => {
+            RenderOp::SetStoreAction { target, action }
+        }
+        RenderRecord::SetVisibilityResultMode { mode, offset } => {
+            RenderOp::SetVisibilityResultMode { mode, offset }
+        }
+    })
+}
+
+fn index_source(
+    resolver: &impl RefResolver,
+    index: RecordIndexRef,
+) -> Result<IndexSource, ResolveRefusal> {
+    Ok(IndexSource {
+        buffer: one(resolver, index.buffer_ref)?,
+        offset: index.offset,
+        index_type: index.index_type,
+    })
+}
+
+fn draw_arguments(
+    resolver: &impl RefResolver,
+    arguments: RenderIndirect,
+) -> Result<IndirectSource, ResolveRefusal> {
+    Ok(IndirectSource {
+        buffer: one(resolver, arguments.buffer_ref)?,
+        offset: arguments.offset,
+    })
+}
+
+fn instancing(i: RecordInstancing) -> Instancing {
+    Instancing {
+        count: i.count,
+        base: i.base,
+    }
+}
+
+/// Resolve a draw record.
+pub fn draw(record: &DrawRecord, resolver: &impl RefResolver) -> Result<DrawOp, ResolveRefusal> {
+    Ok(match *record {
+        DrawRecord::Primitives {
+            primitive,
+            vertex_start,
+            vertex_count,
+            instances,
+        } => DrawOp::Primitives {
+            primitive: PrimitiveType(primitive),
+            vertex_start,
+            vertex_count,
+            instances: instancing(instances),
+        },
+        DrawRecord::Indexed {
+            primitive,
+            index,
+            index_count,
+            instances,
+            base_vertex,
+        } => DrawOp::Indexed {
+            primitive: PrimitiveType(primitive),
+            index: index_source(resolver, index)?,
+            index_count,
+            instances: instancing(instances),
+            base_vertex,
+        },
+        DrawRecord::PrimitivesIndirect {
+            primitive,
+            arguments,
+        } => DrawOp::PrimitivesIndirect {
+            primitive: PrimitiveType(primitive),
+            arguments: draw_arguments(resolver, arguments)?,
+        },
+        DrawRecord::IndexedIndirect {
+            primitive,
+            index,
+            arguments,
+        } => DrawOp::IndexedIndirect {
+            primitive: PrimitiveType(primitive),
+            index: index_source(resolver, index)?,
+            arguments: draw_arguments(resolver, arguments)?,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +1009,82 @@ mod tests {
     use reims_vgpu_protocol::closure::Rail;
     use reims_vgpu_protocol::residency::RenderStages;
     use reims_vgpu_protocol::sync::{BarrierScope, EventKind, FenceKind};
+
+    use reims_vgpu_protocol::decode::{U16le, U32le, U64le};
+    use reims_vgpu_protocol::render::{IndexType, ShaderStage};
+
+    fn u16le(v: u16) -> U16le {
+        U16le::new(v)
+    }
+
+    fn u32le(v: u32) -> U32le {
+        U32le::new(v)
+    }
+
+    fn u64le(v: u64) -> U64le {
+        U64le::new(v)
+    }
+
+    fn wire_viewport(
+        origin_x: f64,
+        origin_y: f64,
+        width: f64,
+        height: f64,
+        znear: f64,
+        zfar: f64,
+    ) -> WireViewport {
+        WireViewport {
+            origin_x: reims_vgpu_protocol::decode::F64le::new(origin_x),
+            origin_y: reims_vgpu_protocol::decode::F64le::new(origin_y),
+            width: reims_vgpu_protocol::decode::F64le::new(width),
+            height: reims_vgpu_protocol::decode::F64le::new(height),
+            znear: reims_vgpu_protocol::decode::F64le::new(znear),
+            zfar: reims_vgpu_protocol::decode::F64le::new(zfar),
+        }
+    }
+
+    /// A pass descriptor body with nothing attached, which is what the guest
+    /// sends before it fills any slot in.
+    fn pass_body() -> RenderPassBody {
+        fn prefix() -> AttachmentPrefix {
+            AttachmentPrefix {
+                texture_ref: u32le(0),
+                resolve_texture_ref: u32le(0),
+                level: u16le(0),
+                slice: u16le(0),
+                depth_plane: u16le(0),
+                resolve_level: u16le(0),
+                resolve_slice: u16le(0),
+                resolve_depth_plane: u16le(0),
+                load_action: u16le(0),
+                store_action: u16le(0),
+                store_action_options: u16le(0),
+                unwritten_above_store_action_options: [0; 2],
+            }
+        }
+        RenderPassBody {
+            depth: reims_vgpu_protocol::decode::DepthAttachmentBody {
+                prefix: prefix(),
+                clear_depth_bits: u64le(0),
+                resolve_filter: u16le(0),
+                unwritten_above_resolve_filter: [0; 2],
+            },
+            stencil: reims_vgpu_protocol::decode::StencilAttachmentBody {
+                prefix: prefix(),
+                clear_stencil: u32le(0),
+                resolve_filter: u16le(0),
+                unwritten_above_resolve_filter: [0; 2],
+            },
+            color: core::array::from_fn(|_| reims_vgpu_protocol::decode::ColorAttachmentBody {
+                prefix: prefix(),
+                clear_color_bits: [u64le(0); 4],
+            }),
+            visibility_result_buffer_ref: u32le(0),
+            render_target_array_length: u64le(0),
+            render_target_width: u64le(0),
+            render_target_height: u64le(0),
+        }
+    }
 
     /// A resolver over a fixed set of live refs.
     struct Live(Vec<u32>);
@@ -1092,6 +1501,183 @@ mod tests {
         // The SPI form's argument encoding is not established, so the read has
         // no extent and the caller widens rather than guessing one.
         assert_eq!(extent, None);
+    }
+
+    /// A pass descriptor resolves every slot, attached or not. The record is a
+    /// fixed shape carrying eight colour slots, and a model that skipped the
+    /// empty ones would have to invent them again for anything iterating slots
+    /// by index.
+    #[test]
+    fn a_pass_descriptor_resolves_all_ten_slots_and_an_unfilled_one_is_unattached() {
+        let live = Live(vec![4242, 4343, 5151]);
+        let mut body = pass_body();
+        body.color[0].prefix.texture_ref = u32le(4242);
+        body.color[0].prefix.store_action = u16le(1);
+        body.color[0].clear_color_bits = [0.25f64, 0.5, 0.75, 1.0].map(|v| u64le(v.to_bits()));
+        body.depth.prefix.texture_ref = u32le(4343);
+        body.visibility_result_buffer_ref = u32le(5151);
+        body.render_target_width = u64le(0x1234);
+        body.render_target_height = u64le(0x5678);
+
+        let descriptor = pass_descriptor(&body, &live).expect("resolved");
+        assert_eq!(descriptor.color[0].texture, Some(id(4242)));
+        assert_eq!(
+            descriptor.color[0].clear_color(),
+            Some([0.25, 0.5, 0.75, 1.0])
+        );
+        assert_eq!(descriptor.color[0].store, StoreAction::Store);
+        assert_eq!(descriptor.depth.texture, Some(id(4343)));
+        assert_eq!(descriptor.color[1].texture, None);
+        assert_eq!(descriptor.attachments().count(), 10);
+        assert_eq!(descriptor.attached().count(), 2);
+        assert_eq!(
+            descriptor.visibility_result_buffer,
+            Some(VisibilityResultBuffer { buffer: id(5151) })
+        );
+        assert_eq!(descriptor.extent.width, 0x1234);
+        assert_eq!(descriptor.extent.height, 0x5678);
+    }
+
+    /// A store action outside the four the record shape represents refuses.
+    /// Folded onto a neighbour it is either a discarded frame or a resolve that
+    /// never happens, and neither is a thing to guess at.
+    #[test]
+    fn an_undefined_store_action_refuses_rather_than_folding() {
+        let live = Live(vec![4242]);
+        let mut body = pass_body();
+        body.color[0].prefix.texture_ref = u32le(4242);
+        body.color[0].prefix.store_action = u16le(9);
+        assert_eq!(
+            pass_descriptor(&body, &live),
+            Err(ResolveRefusal::UndefinedOrdinal {
+                field: "store_action",
+                value: 9,
+            })
+        );
+    }
+
+    /// The visibility buffer lives on the pass and nowhere else, so a pass
+    /// without one resolves to `None` rather than to a resource named zero.
+    #[test]
+    fn a_pass_without_a_visibility_buffer_names_no_resource() {
+        let live = Live(Vec::new());
+        let body = pass_body();
+        let descriptor = pass_descriptor(&body, &live).expect("resolved");
+        assert_eq!(descriptor.visibility_result_buffer, None);
+    }
+
+    /// A viewport's doubles become bit patterns, and a NaN depth bound survives
+    /// as itself. That is what a state table needs to answer "already set".
+    #[test]
+    fn a_viewport_becomes_bits_and_a_nan_bound_stays_equal_to_itself() {
+        let live = Live(Vec::new());
+        let mut arenas = ExecArenas::default();
+        let ports = [wire_viewport(1.0, 2.0, 3.0, 4.0, f64::NAN, 1.0)];
+        let record = RenderRecord::SetViewports(&ports);
+        let RenderOp::SetViewports(span) = render(&record, &live, &mut arenas).expect("resolved")
+        else {
+            panic!("not viewports");
+        };
+        let port = arenas.viewports[span.range()][0];
+        assert_eq!(port.origin_x_bits, 1.0f64.to_bits());
+        assert_eq!(port.z_near_bits, f64::NAN.to_bits());
+        assert_eq!(port, port);
+    }
+
+    /// An indexed draw resolves its index buffer and an indirect one its
+    /// argument buffer; a plain draw resolves neither and needs nothing live.
+    #[test]
+    fn a_draw_resolves_exactly_the_buffers_its_record_names() {
+        let live = Live(vec![5151, 5252]);
+        let plain = DrawRecord::Primitives {
+            primitive: 3,
+            vertex_start: 0,
+            vertex_count: 3,
+            instances: RecordInstancing::default(),
+        };
+        let resolved = draw(&plain, &Live(Vec::new())).expect("resolved");
+        assert_eq!(resolved.index_read(), None);
+        assert_eq!(resolved.indirect_read(), None);
+
+        let indexed = DrawRecord::IndexedIndirect {
+            primitive: 3,
+            index: RecordIndexRef {
+                buffer_ref: 5151,
+                offset: 0x100,
+                index_type: IndexType::Uint32,
+            },
+            arguments: RenderIndirect {
+                buffer_ref: 5252,
+                offset: 0x200,
+            },
+        };
+        let resolved = draw(&indexed, &live).expect("resolved");
+        let (source, range) = resolved.index_read().expect("indexed");
+        assert_eq!(source.buffer, id(5151));
+        // The count is in the argument buffer, so the range is not established
+        // and the caller widens rather than inventing one.
+        assert_eq!(range, None);
+        let (arguments, bytes) = resolved.indirect_read().expect("indirect");
+        assert_eq!(arguments.buffer, id(5252));
+        assert_eq!(bytes, crate::render::DRAW_INDEXED_INDIRECT_ARGS_BYTES);
+    }
+
+    /// Both stages' binds land in one arena and keep the stage they were sent
+    /// on. The stage is the operation's, so two stages' windows can interleave
+    /// without either losing which table it fills.
+    #[test]
+    fn the_two_stages_share_an_arena_and_keep_their_stages() {
+        let live = Live(vec![4242]);
+        let mut arenas = ExecArenas::default();
+        let entries = [RefBind {
+            object_ref: u32le(4242),
+        }];
+        let mut spans = Vec::new();
+        for stage in [ShaderStage::Vertex, ShaderStage::Fragment] {
+            let record = RenderRecord::BindTextures {
+                stage,
+                first: 0,
+                entries: &entries,
+            };
+            let RenderOp::BindTextures {
+                stage: got,
+                entries: span,
+                ..
+            } = render(&record, &live, &mut arenas).expect("resolved")
+            else {
+                panic!("not a texture bind");
+            };
+            assert_eq!(got, stage);
+            spans.push(span);
+        }
+        assert_ne!(spans[0].start, spans[1].start);
+        assert_eq!(arenas.object_bindings.len(), 2);
+    }
+
+    /// A pass descriptor goes to the descriptor arena and the operation names a
+    /// slot. The descriptor is 592 bytes on the wire, and a record carrying it
+    /// by value would make every eight-byte operation that size.
+    #[test]
+    fn a_pass_descriptor_goes_to_the_arena_and_the_operation_names_a_slot() {
+        let live = Live(Vec::new());
+        let mut arenas = ExecArenas::default();
+        let body = pass_body();
+        let record = RenderRecord::WriteDescriptor { descriptor: &body };
+        let RenderOp::WriteDescriptor { descriptor } =
+            render(&record, &live, &mut arenas).expect("resolved")
+        else {
+            panic!("not a descriptor");
+        };
+        assert_eq!(descriptor, PassDescriptorSlot(0));
+        assert_eq!(arenas.pass_descriptors.len(), 1);
+
+        let second = render(&record, &live, &mut arenas).expect("resolved");
+        assert_eq!(
+            second,
+            RenderOp::WriteDescriptor {
+                descriptor: PassDescriptorSlot(1)
+            }
+        );
     }
 
     /// Every refusal reason is distinct, and a decode refusal keeps its own.
