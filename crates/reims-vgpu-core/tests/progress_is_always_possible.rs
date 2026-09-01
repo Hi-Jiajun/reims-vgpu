@@ -222,6 +222,7 @@ fn drive(seed: u64, count: usize, channels: u32, queues: u32, policy: Policy) ->
     let mut of_ordinal: BTreeMap<IngressOrdinal, usize> = BTreeMap::new();
     for (i, spec) in specs.iter().enumerate() {
         let packet = Packet {
+            session: model.generation(),
             channel: Channel::Child,
             domain: spec.channel,
             // The EXEC: the packet class that carries accesses.
@@ -405,6 +406,7 @@ fn order(seed: u64, policy: Policy) -> Vec<u64> {
     let mut ordinals: Vec<IngressOrdinal> = Vec::new();
     for spec in &specs {
         let packet = Packet {
+            session: model.generation(),
             channel: Channel::Child,
             domain: spec.channel,
             opcode: 0x37,

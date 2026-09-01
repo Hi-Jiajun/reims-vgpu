@@ -155,6 +155,20 @@ pub struct Packet {
     /// table; this says which ordering domain, and the root channel is one
     /// domain like any other.
     pub domain: ChannelId,
+    /// The semantic lifetime this packet was **read under**.
+    ///
+    /// Not the one it will be admitted into: a reset races the drain, so a
+    /// packet that left the ring before the reset and reaches ingress after it
+    /// names a lifetime that has closed. Nothing else can tell — the guest's
+    /// packet carries no generation, and by the time this model sees it, its own
+    /// generation has already moved — so the reader states the one it was
+    /// holding when it took the bytes, which is the one fact the reader has and
+    /// this plane does not.
+    ///
+    /// See [`Refusal::GenerationClosed`], and
+    /// [`crate::interpret::Refusal::StaleGeneration`], which is the serial
+    /// reference's spelling of the same rule.
+    pub session: SessionGeneration,
     pub opcode: u16,
     pub stamp_waits: Vec<StampWait>,
     pub completion: Option<CompletionStamp>,
@@ -365,6 +379,16 @@ impl SessionModel {
         if self.device == DeviceState::Lost {
             self.refusals += 1;
             return Err(Refusal::DeviceLost { epoch: self.epoch });
+        }
+        // Before the packet's own contract is judged, because this is not about
+        // the packet: it is a lifetime question, and the objects the packet
+        // names no longer exist whatever its opcode says.
+        if packet.session != self.generation {
+            self.refusals += 1;
+            return Err(Refusal::GenerationClosed {
+                named: packet.session,
+                current: self.generation,
+            });
         }
         let Some(judged) = find(packet.channel, packet.opcode) else {
             self.refusals += 1;
@@ -740,6 +764,8 @@ mod tests {
         Packet {
             channel: Channel::Child,
             domain: ChannelId(2),
+            // The tests here drive one lifetime; `reset` has its own.
+            session: SessionGeneration::FIRST,
             opcode,
             stamp_waits: Vec::new(),
             completion: None,
@@ -1819,10 +1845,50 @@ mod tests {
         assert_eq!(s.scheduler().pending(), 1);
         // Work accepted after the reset carries the new generation and still
         // orders against the old transaction, which has not completed.
-        let reader = touching(packet(0x37), vec![whole(1, AccessMode::Read)]);
+        let mut reader = touching(packet(0x37), vec![whole(1, AccessMode::Read)]);
+        reader.session = after;
         let r = s.admit(&reader).expect("accepted");
         assert_eq!(r.transaction.identity.session, after);
         assert_eq!(r.hazard_waits, vec![w.transaction.identity.ingress]);
+    }
+
+    /// A packet read under a lifetime that has since closed is refused, and the
+    /// refusal names both generations.
+    ///
+    /// A reset races the drain: a packet that left the ring before it and
+    /// reaches ingress after names objects that no longer exist. Nothing else
+    /// can tell — the guest's bytes carry no generation, and by the time this
+    /// plane sees the packet its own generation has already moved — which is
+    /// why the reader states the one it was holding.
+    ///
+    /// Not the same event as the reset itself: work already *admitted* is
+    /// untouched, which is the test above.
+    #[test]
+    fn a_packet_read_before_a_reset_is_refused_after_it() {
+        let mut s = session();
+        let stale = packet(0x37);
+        let closed = s.generation();
+        let current = s.reset();
+        let err = s.admit(&stale).expect_err("its lifetime is over");
+        assert_eq!(
+            err,
+            Refusal::GenerationClosed {
+                named: closed,
+                current,
+            }
+        );
+        assert_eq!(err.slug(), "ingress_generation_closed");
+        // And it consumed nothing, like every other refusal here.
+        let mut fresh = packet(0x37);
+        fresh.session = current;
+        assert_eq!(
+            s.admit(&fresh)
+                .expect("accepted")
+                .transaction
+                .identity
+                .ingress,
+            IngressOrdinal(1)
+        );
     }
 
     #[test]
