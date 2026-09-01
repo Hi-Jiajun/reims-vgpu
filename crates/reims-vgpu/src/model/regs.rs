@@ -690,7 +690,12 @@ pub const CHILD_REG_STAMP_INDEX: u64 = 0x0c;
 pub const CHILD_REG_BASE_PFN: u64 = 0x10;
 pub const CHILD_RING_PFN_ENTRY_LEN: u64 = 4;
 
-pub const DEVICE_INFO_REPLY_PAIR_LEN: usize = 8;
+/// Bytes in one `(key, value)` pair of an info-query reply.
+///
+/// Derived rather than written: the layout is
+/// [`reims_vgpu_protocol::info_reply`]'s, and a second literal here is a number
+/// that can disagree with the encoder that produces the bytes.
+pub const DEVICE_INFO_REPLY_PAIR_LEN: usize = crate::protocol::info_reply::PAIR_LEN;
 
 // The two device-info request forms — which words each carries and where —
 // live in `reims_vgpu_protocol::fifo`'s `DeviceInfoForm`, with the recovered

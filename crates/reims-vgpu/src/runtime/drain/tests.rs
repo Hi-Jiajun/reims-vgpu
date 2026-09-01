@@ -4604,6 +4604,159 @@ fn a_device_info_reply_cut_short_by_the_guests_count_names_the_keys_it_lost() {
     );
 }
 
+/// Send a compute-info request under a live task and read the reply page back.
+///
+/// Returns `(pairs_the_guest_would_parse, the_byte_after_the_reply)`. The
+/// second is the point: the guest's walker stops at the zero pair, so a reply
+/// that ran one pair long would be invisible to a reader that only checks the
+/// pairs.
+#[cfg(test)]
+fn compute_info_reply(key_table_len: u32, count: u32) -> (Vec<(u32, u32)>, u8) {
+    use crate::runtime::host::FakeHost;
+    /// Inside the first data page the task fixture maps, and non-zero because
+    /// `reply_gva == 0` is the request's own "nothing to answer into".
+    const REPLY_GVA: u64 = 0x100;
+    const POISON: u8 = 0xa5;
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    crate::runtime::gva_mem::define_task_pages_arm64e(&mut host, &mut state, 0x40, 1);
+    let data_gpa = 0x40u64 << PAGE_SHIFT_ARM64E;
+    let poison = vec![POISON; PAGE_SIZE_ARM64E as usize];
+    host.write_gpa(data_gpa, &poison).expect("data page");
+
+    let mut payload = vec![0u8; crate::protocol::fifo::COMPUTE_INFO_REQUEST_LEN];
+    st32(&mut payload[0..], 1); // the task the fixture defined
+    st32(&mut payload[4..], 7); // a pipeline ref; the reply does not read it
+    st32(&mut payload[8..], key_table_len);
+    st32(&mut payload[12..], count);
+    st32(&mut payload[16..], REPLY_GVA as u32);
+    assert_eq!(
+        process_child_packet(
+            &mut state,
+            &mut host,
+            4,
+            &Packet {
+                opcode: CHILD_OP_GET_COMPUTE_INFO,
+                stamp_waits: Vec::new(),
+                total_size: PACKET_HEADER_LEN + payload.len() as u32,
+                completion_stamp: 0,
+                payload,
+                next_head: 0,
+            },
+        ),
+        ChildPacketDisposition::Complete,
+        "the guest blocks on this stamp"
+    );
+
+    let at = data_gpa + REPLY_GVA;
+    let mut out = Vec::new();
+    let mut pairs = 0u64;
+    while pairs < u64::from(count) {
+        let mut pair = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
+        host.read_gpa(at + pairs * DEVICE_INFO_REPLY_PAIR_LEN as u64, &mut pair)
+            .expect("reply page is readable");
+        let key = ld32(&pair[0..4]);
+        if key == 0 {
+            break;
+        }
+        out.push((key, ld32(&pair[4..8])));
+        pairs += 1;
+    }
+    // One byte past everything the reply could legitimately have written: the
+    // answers, plus the stop word when there was room and reason for one.
+    let terminated = out.len() < count as usize;
+    let span = (out.len() + usize::from(terminated)) * DEVICE_INFO_REPLY_PAIR_LEN;
+    let mut after = [0u8; 1];
+    host.read_gpa(at + span as u64, &mut after)
+        .expect("reply page is readable");
+    (out, after[0])
+}
+
+/// The compute-info reply, driven end to end: what the guest reads back, the
+/// stop word it walks to, and the byte past it that must still be untouched.
+///
+/// Every other test of this command asserts on `compute_info_caps()` — the
+/// table, not the reply. The reply was built by a hand-rolled loop that applied
+/// the guest's parse ceiling and its pair count as its own two conditions and
+/// wrote one pair per guest-memory call, and nothing drove it. It now goes
+/// through the same encoder as its device-info twin, which is exactly the kind
+/// of change a table-only test cannot see.
+#[test]
+fn the_compute_info_reply_stops_at_the_terminator_and_writes_nothing_past_it() {
+    const POISON: u8 = 0xa5;
+    let answers = compute_info_caps();
+    let ceiling = COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY + 1;
+
+    // A page of pair slots, as a live guest sends: every answer fits, and the
+    // guest asked for more than it got, so it gets the stop word.
+    let (pairs, after) = compute_info_reply(ceiling, 512);
+    assert_eq!(
+        pairs,
+        answers.to_vec(),
+        "the reply is the table, in table order"
+    );
+    assert_eq!(
+        after, POISON,
+        "the stop word is the last thing written; the slot after it is the \
+         guest's"
+    );
+
+    // The ceiling is exclusive, and one arm shorter drops the last answer
+    // rather than keeping it.
+    let (short_ceiling, _) = compute_info_reply(COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY, 512);
+    assert_eq!(short_ceiling, answers[..2].to_vec());
+
+    // A guest that says it will consume exactly as many pairs as there are
+    // answers needs no stop word, and must not be written one.
+    let (exact, after_exact) = compute_info_reply(ceiling, answers.len() as u32);
+    assert_eq!(exact, answers.to_vec());
+    assert_eq!(
+        after_exact, POISON,
+        "a full reply carries no terminator, so the pair after the last answer \
+         is untouched"
+    );
+}
+
+/// A compute-info reply its guest's own count cut short names the keys it lost.
+///
+/// The sibling device-info reply has said so since the loss was found to be
+/// silent there; this one broke out of its loop and said nothing. Each key it
+/// drops is a compute limit the guest then sizes dispatches without, and the
+/// command is issued once per pipeline creation with no larger re-ask.
+#[test]
+fn a_compute_info_reply_cut_short_by_the_guests_count_names_the_keys_it_lost() {
+    const ASKED: u32 = 2;
+    let answers = compute_info_caps();
+    let (pairs, _) = compute_info_reply(COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY + 1, ASKED);
+    assert_eq!(pairs.len(), ASKED as usize, "a two-pair ask carries two");
+
+    let dropped: Vec<u32> = answers
+        .iter()
+        .map(|&(key, _)| key)
+        .skip(ASKED as usize)
+        .collect();
+    assert!(
+        !dropped.is_empty(),
+        "a two-pair ask must drop an answer, or this proves nothing"
+    );
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let line = log
+        .lines()
+        .rfind(|l| {
+            l.contains("get_compute_info truncated") && l.contains(&format!("count={ASKED}"))
+        })
+        .expect("a truncated compute-info reply names itself and the count that bound it");
+    assert!(
+        line.contains(&format!("wrote={ASKED}")),
+        "and how many pairs it managed: {line}"
+    );
+    assert!(
+        line.contains(&format!("dropped={dropped:?}")),
+        "and every key it could not carry: {line}"
+    );
+}
+
 /// `CmdGetComputeInfo` answers the keys the guest asked about, and its
 /// threadgroup limits are the host's rather than a fixed pair.
 ///

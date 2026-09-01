@@ -48,6 +48,22 @@ pub struct ReplyBounds {
     pub count: u32,
 }
 
+impl ReplyBounds {
+    /// Whether the guest's own parser has an arm for `key`.
+    ///
+    /// The one place the exclusivity of [`Self::key_table_len`] is spelled.
+    /// It was spelled three times before — once inside [`encode`] and once in
+    /// each of the two reply builders that answer these queries — and the three
+    /// had to agree about a polarity whose whole hazard is that both readings
+    /// look right. A caller that needs to know *which* answers the guest
+    /// reaches, in order to census the ones it does not, asks here rather than
+    /// writing the comparison a fourth time.
+    #[must_use]
+    pub const fn parses(self, key: u32) -> bool {
+        key < self.key_table_len
+    }
+}
+
 /// What [`encode`] wrote, and what it could not.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[must_use = "a dropped answer is a capability the guest never learns about"]
@@ -76,7 +92,7 @@ pub fn encode(bounds: ReplyBounds, answers: &[(u32, u32)], out: &mut [u8]) -> Wr
     for &(key, value) in answers {
         // The guest's table is exclusive; a key at or above it is discarded on
         // arrival, so answering it would spend a slot for nothing.
-        if key >= bounds.key_table_len {
+        if !bounds.parses(key) {
             continue;
         }
         parsed = parsed.saturating_add(1);

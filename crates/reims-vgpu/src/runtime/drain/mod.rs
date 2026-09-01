@@ -13,6 +13,7 @@ use crate::protocol::fifo::{
     display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
     DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
 };
+use crate::protocol::info_reply::{self, ReplyBounds};
 use crate::protocol::iosurface_pages::{
     MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP, MAPPER_REQUEST_MAPPING_ID, MAPPER_REQUEST_TYPE,
     MAPPER_REQUEST_UNMAP,
@@ -1841,10 +1842,14 @@ fn reply_device_info<H: HostMemory + HostOps>(
     // reduction of what the device can do — a key the guest discards on arrival
     // buys nothing, and the slot it occupies is one fewer for a key the guest
     // *does* have an arm for, on a reply that is only ever asked for once.
+    let bounds = ReplyBounds {
+        key_table_len,
+        count,
+    };
     let caps: Vec<(u32, u32)> = served
         .iter()
         .copied()
-        .filter(|&(key, _)| key < key_table_len)
+        .filter(|&(key, _)| bounds.parses(key))
         .collect();
     let above_ceiling = served.len() - caps.len();
     // The mirror of `above_ceiling`, and the direction that can cost guest work.
@@ -1935,10 +1940,17 @@ fn reply_device_info<H: HostMemory + HostOps>(
         u8::from(limits.native_fp16),
         derived.join(" ")
     ));
-    let n = (caps.len() as u32).min(count).min(max_pairs);
-    // When guest asks for more than one page of pairs, still write at most a
-    // page of caps + optional sentinel only if room remains.
-    let write_sentinel = n < count && n.saturating_add(1) <= max_pairs;
+    // The reply is built once, in the layout's owner, and written once.
+    //
+    // Three bounds decide it — the guest's parse ceiling, the pair count it
+    // sent, and the page the reply lands in — and this arm used to apply them
+    // as its own `min` chain while the sibling compute-info reply applied two
+    // of the three as its own loop conditions. The staging page is the
+    // destination bound made explicit: a buffer exactly as large as the page
+    // cannot overrun it, so there is no arithmetic left that could.
+    let mut reply = vec![0u8; page_size];
+    let written = info_reply::encode(bounds, &served, &mut reply);
+    let n = written.pairs;
     if count > max_pairs {
         crate::observe::fail(format!(
             "device_info cap reason=reply_page count={count} max_pairs={max_pairs} page={page_size:#x}"
@@ -1952,34 +1964,17 @@ fn reply_device_info<H: HostMemory + HostOps>(
     // never emits this: the guest's buffer is a whole page, 512 pairs against a
     // table of a few dozen. A firing *is* the bug, which is the only reason a
     // line that has never been seen is worth carrying.
-    if (n as usize) < caps.len() {
+    if written.dropped > 0 {
         let dropped: Vec<u32> = caps[n as usize..].iter().map(|&(key, _)| key).collect();
         crate::observe::fail(format!(
             "device_info truncated reason=reply_pairs_exhausted key_table_len={key_table_len} count={count} max_pairs={max_pairs} wrote={n} have={} dropped={dropped:?}",
             caps.len()
         ));
     }
-    for i in 0..n {
-        let (key, value) = caps[i as usize];
-        let mut pair = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
-        st32(&mut pair[0..4], key);
-        st32(&mut pair[4..8], value);
-        gpa_map::write_bytes(
-            host,
-            gpa + (i as u64) * DEVICE_INFO_REPLY_PAIR_LEN as u64,
-            &pair,
-            page_size,
-        )?;
-    }
-    if write_sentinel {
-        let sentinel = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
-        gpa_map::write_bytes(
-            host,
-            gpa + (n as u64) * DEVICE_INFO_REPLY_PAIR_LEN as u64,
-            &sentinel,
-            page_size,
-        )?;
-    }
+    // `written.bytes` covers the pairs and the terminator if one was needed, so
+    // nothing past the reply is disturbed — the same span the pair-at-a-time
+    // loop used to cover, in one write instead of one per key.
+    gpa_map::write_bytes(host, gpa, &reply[..written.bytes], page_size)?;
     Ok(())
 }
 
@@ -2023,6 +2018,13 @@ const COMPUTE_INFO_KEY_SUPPORTS_ICB: u32 = 2;
 
 const COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
 const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
+
+/// How many keys [`compute_info_caps`] answers.
+///
+/// Named because it sizes the reply's staging buffer, and a buffer sized one
+/// short of the table would silently drop the last answer rather than fail to
+/// compile.
+const COMPUTE_INFO_ANSWERS: usize = 3;
 
 /// What this host answers for a compute pipeline's threadgroup limits.
 ///
@@ -2069,7 +2071,7 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// open question rather than a known cost. What is established is that the 0 is
 /// wrong for any kernel that declares threadgroup memory, and that only
 /// reflection can make it right.
-fn compute_info_caps() -> [(u32, u32); 3] {
+fn compute_info_caps() -> [(u32, u32); COMPUTE_INFO_ANSWERS] {
     let (max_total_threads, thread_execution_width) =
         crate::backend::selected().compute_threadgroup_limits();
     [
@@ -2111,55 +2113,58 @@ fn reply_compute_info<H: HostMemory + HostOps>(
         ));
         return false;
     };
-    let mut wrote = 0u32;
-    for (key, value) in compute_info_caps() {
-        // Exclusive, like its device-info twin: the guest writes
-        // `highest_key_it_parses + 1` here, and its parser's own table stops one
-        // below. It sends 5 against a table whose arms are keys 1..=4, so an
-        // inclusive read would spend a pair slot on a key 5 that guest discards.
-        // See `DEVICE_INFO_TAHOE_KEY_TABLE_LEN`, which carries the argument for both.
-        if key >= key_table_len {
-            continue;
-        }
-        if wrote >= count {
-            break;
-        }
-        let mut pair = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
-        st32(&mut pair[0..4], key);
-        st32(&mut pair[4..8], value);
-        let off = (wrote as u64) * DEVICE_INFO_REPLY_PAIR_LEN as u64;
-        if crate::runtime::gva_mem::write_task_gva_product_within(
-            state,
-            host,
-            task_id,
-            reply_gva + off,
-            &pair,
-            // One reply pair at a fixed offset, not a row loop: the span is
-            // re-derived from `wrote` rather than from a destination that can
-            // move, and the packet being retired is what authorises it.
-            None,
-        )
-        .is_err()
-        {
-            crate::observe::fail(format!(
-                "get_compute_info write_fail task={task_id} gva={reply_gva:#x} wrote={wrote}"
-            ));
-            return false;
-        }
-        wrote += 1;
+    let served = compute_info_caps();
+    // The staging buffer is every answer plus the terminator, and that is the
+    // only bound available here.
+    //
+    // Unlike its device-info twin this request carries **no reply length**: the
+    // guest sends a pair count and an address, and nothing on the wire says how
+    // large the buffer at that address is. So the destination cannot bound the
+    // encode, and `count` — a guest word — must not: sizing the staging buffer
+    // from it would let a request asking for 2^32 pairs allocate 32 GiB. What
+    // this device could ever write is `served.len()` pairs and one stop word,
+    // so that is the buffer, and the encoder's own capacity rule turns the
+    // guest's count into the terminator decision it already owns.
+    let mut reply = [0u8; (COMPUTE_INFO_ANSWERS + 1) * info_reply::PAIR_LEN];
+    let bounds = ReplyBounds {
+        key_table_len,
+        count,
+    };
+    let written = info_reply::encode(bounds, &served, &mut reply);
+    let wrote = written.pairs;
+    // An answer this device has and the guest's own count could not carry. It
+    // cannot fire on a healthy guest — the count a live guest sends is a page
+    // of pair slots against three answers — so a firing is the request being
+    // wrong, and the three keys are named because each one is a compute limit
+    // the guest then sizes dispatches without.
+    if written.dropped > 0 {
+        let dropped: Vec<u32> = served
+            .iter()
+            .filter(|&&(key, _)| bounds.parses(key))
+            .map(|&(key, _)| key)
+            .skip(wrote as usize)
+            .collect();
+        crate::observe::fail(format!(
+            "get_compute_info truncated reason=reply_pairs_exhausted task={task_id} pipe={pipeline_ref} key_table_len={key_table_len} count={count} wrote={wrote} dropped={dropped:?}"
+        ));
     }
-    if wrote < count {
-        let sentinel = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
-        let off = (wrote as u64) * DEVICE_INFO_REPLY_PAIR_LEN as u64;
-        let _ = crate::runtime::gva_mem::write_task_gva_product_within(
-            state,
-            host,
-            task_id,
-            reply_gva + off,
-            &sentinel,
-            // The terminating pair of the same reply, on the same authority.
-            None,
-        );
+    if crate::runtime::gva_mem::write_task_gva_product_within(
+        state,
+        host,
+        task_id,
+        reply_gva,
+        &reply[..written.bytes],
+        // The whole reply at the address the request named, not a row loop: the
+        // span is the encoder's byte count and the packet being retired is what
+        // authorises it.
+        None,
+    )
+    .is_err()
+    {
+        crate::observe::fail(format!(
+            "get_compute_info write_fail task={task_id} gva={reply_gva:#x} wrote={wrote}"
+        ));
+        return false;
     }
     // Success census — the reply landed. Route to `off()` so it stays always-on
     // in the log but leaves the curated real-error view clean; the genuine
