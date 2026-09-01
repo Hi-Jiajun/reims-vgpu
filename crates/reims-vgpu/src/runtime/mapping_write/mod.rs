@@ -1293,9 +1293,19 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // is not that path's problem.
     let store_rail = pixel_format::Rgba8ToRow::for_format(format);
     let span_rows = crate::runtime::chain_phase::CostSpan::new("surface_changed_rows_us");
+    // The three things inside `surface_changed_rows_us`, which was 90 % of the
+    // Metal rail's `store_us` and had nothing dividing it. Accumulated in
+    // locals and emitted once per flush rather than through
+    // `chain_phase::CostSpan` per row, for two reasons `sampled_phase`'s doc
+    // records: a `CostSpan` truncates to microseconds and a row's convert is
+    // ~0.15 us at the rates `pixel_format::Rgba8ToRow` reaches, so every part
+    // but the landing write would report as free; and a per-row commit would be
+    // `mh` atomic map lookups a flush where three suffice.
+    let (mut convert_ns, mut diff_ns, mut land_ns) = (0u64, 0u64, 0u64);
     for y in 0..mh as usize {
         let src_off = y * rgba_stride as usize;
         let src_row = &rgba[src_off..src_off + rgba_stride as usize];
+        let row_started = std::time::Instant::now();
         if !cache_rows_are_native
             && !store_rail.is_some_and(|rail| rail.convert(src_row, mw, &mut native))
         {
@@ -1329,17 +1339,27 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
         } else {
             None
         };
-        if let Some(srow) = seed_row {
-            if srow == native {
-                continue;
-            }
+        convert_ns += row_started.elapsed().as_nanos() as u64;
+        let diff_started = std::time::Instant::now();
+        let row_unchanged = seed_row.is_some_and(|srow| srow == native);
+        diff_ns += diff_started.elapsed().as_nanos() as u64;
+        if row_unchanged {
+            continue;
         }
         let row_moff = base_off.saturating_add((y as u64).saturating_mul(bpr));
         if let Some(base) = base {
             let dst = unsafe { base.add(y.saturating_mul(bpr_usize)) };
             if let Some(seed) = seed_row {
-                // Changed spans only within the row.
-                for run in ChangedRuns::new(&native[..tight], &seed[..tight]) {
+                // Changed spans only within the row. The scan and the copy are
+                // charged apart because they are the two candidate answers for
+                // this bar and they have opposite fixes.
+                let mut runs = ChangedRuns::new(&native[..tight], &seed[..tight]);
+                loop {
+                    let scan_started = std::time::Instant::now();
+                    let run = runs.next();
+                    diff_ns += scan_started.elapsed().as_nanos() as u64;
+                    let Some(run) = run else { break };
+                    let land_started = std::time::Instant::now();
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             native.as_ptr().add(run.start),
@@ -1347,22 +1367,33 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                             run.len(),
                         );
                     }
+                    land_ns += land_started.elapsed().as_nanos() as u64;
                 }
             } else {
+                let land_started = std::time::Instant::now();
                 unsafe {
                     std::ptr::copy_nonoverlapping(native.as_ptr(), dst, tight);
                 }
+                land_ns += land_started.elapsed().as_nanos() as u64;
             }
         } else if let Some(seed) = seed_row {
-            for run in ChangedRuns::new(&native[..tight], &seed[..tight]) {
-                if !mapper::write_mapping_bytes(
+            let mut runs = ChangedRuns::new(&native[..tight], &seed[..tight]);
+            loop {
+                let scan_started = std::time::Instant::now();
+                let run = runs.next();
+                diff_ns += scan_started.elapsed().as_nanos() as u64;
+                let Some(run) = run else { break };
+                let land_started = std::time::Instant::now();
+                let landed = mapper::write_mapping_bytes(
                     state,
                     host,
                     mapping_id,
                     row_moff.saturating_add(run.start as u64),
                     &native[run.clone()],
                     &vouched,
-                ) {
+                );
+                land_ns += land_started.elapsed().as_nanos() as u64;
+                if !landed {
                     return refuse(
                         mapping_id,
                         SurfaceWriteRefusal::MapperWrite {
@@ -1372,18 +1403,61 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                     );
                 }
             }
-        } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, native, &vouched)
-        {
-            return refuse(
-                mapping_id,
-                SurfaceWriteRefusal::MapperWrite {
-                    lo: row_moff,
-                    len: native.len(),
-                },
-            );
+        } else {
+            let land_started = std::time::Instant::now();
+            let landed =
+                mapper::write_mapping_bytes(state, host, mapping_id, row_moff, native, &vouched);
+            land_ns += land_started.elapsed().as_nanos() as u64;
+            if !landed {
+                return refuse(
+                    mapping_id,
+                    SurfaceWriteRefusal::MapperWrite {
+                        lo: row_moff,
+                        len: native.len(),
+                    },
+                );
+            }
         }
     }
     drop(span_rows);
+    // Three counters a flush, not `mh` of them. Nanoseconds, so a part that is
+    // sub-microsecond per row is not reported as free; divide by 1000 against
+    // `surface_changed_rows_us` by hand.
+    crate::runtime::drain::note_store_route_n("surface_row_convert_ns", convert_ns);
+    crate::runtime::drain::note_store_route_n("surface_row_diff_ns", diff_ns);
+    crate::runtime::drain::note_store_route_n("surface_row_land_ns", land_ns);
+    // The denominators. A microsecond total answers "how long"; it cannot
+    // answer "per what", and the three parts above have different per-whats.
+    crate::runtime::drain::note_store_route("surface_row_flushes");
+    crate::runtime::drain::note_store_route_n("surface_row_rows", mh as u64);
+    crate::runtime::drain::note_store_route_n(
+        "surface_row_dst_bytes",
+        (mh as u64).saturating_mul(tight as u64),
+    );
+    // Which format the rows are converted *to*. The rate the convert reaches
+    // has no meaning without it: this rail's arms differ by 40x and by a factor
+    // of two in destination width, and the census cannot say which arm ran.
+    if crate::observe::first_sight("surface_row_native_format", u64::from(format)) {
+        crate::observe::fail(format!(
+            "surface_row_native_format format={format:#x} tight={tight} \
+             rgba_stride={rgba_stride} cache_is_native={cache_rows_are_native} \
+             mapping={mapping_id}"
+        ));
+    }
+    crate::runtime::drain::note_store_route_n(
+        "surface_row_src_bytes",
+        (mh as u64).saturating_mul(rgba_stride as u64),
+    );
+    crate::runtime::drain::note_store_route(if cache_rows_are_native {
+        "surface_row_cache_is_native"
+    } else {
+        "surface_row_converts_frame"
+    });
+    crate::runtime::drain::note_store_route(if seed_rgba.is_some() {
+        "surface_row_has_seed"
+    } else {
+        "surface_row_no_seed"
+    });
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
     // Host render-cache (Linux §8.5): the frame built above, published now that
