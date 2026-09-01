@@ -8,6 +8,10 @@ use crate::model::*;
 use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, UnimplementedCommand};
 use crate::observe::Emit;
 use crate::protocol::endian::{ld16, ld32, ld64, st16, st32};
+use crate::protocol::fifo::{
+    display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
+    DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
+};
 use crate::protocol::iosurface_pages::{
     MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP, MAPPER_REQUEST_MAPPING_ID, MAPPER_REQUEST_TYPE,
     MAPPER_REQUEST_UNMAP,
@@ -15,10 +19,6 @@ use crate::protocol::iosurface_pages::{
 use crate::protocol::packets::Channel as WireChannel;
 use crate::protocol::present::{
     self, trailer as present_trailer, PresentForm, Trailer as PresentTrailer,
-};
-use crate::runtime::decode::fifo::{
-    display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
-    DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
 };
 use crate::runtime::gpa_map;
 use crate::runtime::heap_query::QueryError;
@@ -690,7 +690,7 @@ fn note_resource_list_decode_fail(
     op: &'static str,
     opcode: u16,
     channel_id: u32,
-    error: crate::runtime::decode::fifo::ResourceListDecodeError,
+    error: crate::protocol::fifo::ResourceListDecodeError,
 ) {
     crate::observe::Emit::decline("map_family", &error)
         .field("op", op)
@@ -3812,9 +3812,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // through the same consumer: this producer's records are 8 bytes
         // and that one's are 24, but the quad is one contract and must
         // not acquire two meanings.
-        use crate::runtime::decode::fifo::{
-            decode_invalidate_resources, CHILD_INVALIDATE_PAGEON_FLAGS,
-        };
+        use crate::protocol::fifo::{decode_invalidate_resources, CHILD_INVALIDATE_PAGEON_FLAGS};
         use crate::runtime::resource_validity::{apply, ValiditySite};
         match decode_invalidate_resources(&packet.payload) {
             Ok(cmd) => {
@@ -3916,7 +3914,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // host does instead. A boot where this arm starts firing is a
         // boot where the deferral described there has a real land point,
         // so the count is worth watching rather than assuming zero.
-        use crate::runtime::decode::fifo::decode_synchronize_resources;
+        use crate::protocol::fifo::decode_synchronize_resources;
         match decode_synchronize_resources(&packet.payload) {
             Ok(cmd) => {
                 // Synchronization is resource-scoped. Apple batches the named
@@ -4402,11 +4400,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 "replace_physical",
                 Some(channel_id),
                 packet.payload.len(),
-                crate::runtime::decode::fifo::CHILD_REPLACE_PHYSICAL_LEN as usize,
+                crate::protocol::fifo::CHILD_REPLACE_PHYSICAL_LEN as usize,
             ) {
-                if let Some(cmd) =
-                    crate::runtime::decode::fifo::decode_replace_physical(&packet.payload)
-                {
+                if let Some(cmd) = crate::protocol::fifo::decode_replace_physical(&packet.payload) {
                     // The GPA behind this resource changes here. The command is
                     // scoped to one task-local resource id, so unrelated
                     // resources on the same task keep both their authoritative
@@ -4502,7 +4498,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // the guest and this device disagree about the record layout, which the
         // two commands that *do* act on it share.
         CHILD_OP_DISCARD_RESOURCES => {
-            use crate::runtime::decode::fifo::decode_synchronize_resources;
+            use crate::protocol::fifo::decode_synchronize_resources;
             match decode_synchronize_resources(&packet.payload) {
                 Ok(cmd) => {
                     let discarded = crate::runtime::writeback_debt::discard_gva_resources(

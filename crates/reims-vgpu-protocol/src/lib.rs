@@ -34,6 +34,9 @@
 //!   on them.
 //! - [`extent`] — the guest API's three-dimensional extent, its mip-level
 //!   dimensions, and the byte arithmetic of a tightly-packed image.
+//! - [`fifo`] — the FIFO packet payload layouts: the resource-list, invalidate,
+//!   synchronize and replace-physical records, the `EXEC_INDIRECT2` header and
+//!   its per-resource table, and the display descriptor's timing entries.
 //! - [`sync`] — which opcode is a fence, an event or a barrier, on which rail,
 //!   and what a barrier's scope word names.
 //! - [`segment`] — what a segment-type byte means: which encoder wrote it and
@@ -118,6 +121,7 @@ pub mod dispatch;
 pub mod draw;
 pub mod endian;
 pub mod extent;
+pub mod fifo;
 pub mod fnv;
 pub mod gva;
 pub mod gva_resolve;

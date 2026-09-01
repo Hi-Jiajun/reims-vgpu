@@ -3574,7 +3574,7 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
 fn invalidate_resources_bumps_mapping_content_generation() {
     use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
     use crate::protocol::endian::st32;
-    use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
+    use crate::protocol::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -5696,7 +5696,7 @@ fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
 /// reached the shared decoder.
 #[test]
 fn the_discarding_commands_share_the_synchronize_record_layout() {
-    use crate::runtime::decode::fifo::ResourceListDecodeError;
+    use crate::protocol::fifo::ResourceListDecodeError;
     let mut host = FakeHost::new();
     // One record: header plus a single four-byte object id.
     let mut good = vec![0u8; 12];
@@ -5777,7 +5777,7 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
 #[test]
 fn each_map_family_command_takes_its_own_branch() {
     use crate::protocol::endian::st32;
-    use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
+    use crate::protocol::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
 
     const MAPPING: u32 = 0x2a;
 

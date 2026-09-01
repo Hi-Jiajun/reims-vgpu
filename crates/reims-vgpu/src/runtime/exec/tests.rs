@@ -116,7 +116,7 @@ fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
 /// too, so the assertion names the object id.
 #[test]
 fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
-    use crate::runtime::decode::fifo::{
+    use crate::protocol::fifo::{
         CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_TAIL, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
     };
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
