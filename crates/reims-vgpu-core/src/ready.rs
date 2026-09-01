@@ -53,8 +53,21 @@ struct Pending {
     /// Earlier transactions this one must not overtake. Counted rather than
     /// listed: the list is the dependents index, held in the other direction.
     remaining_hazards: usize,
-    /// Stamp points that must be published before this may begin.
+    /// Stamp points that must be published before this may begin. Shrinks as
+    /// they are published.
     stamp_waits: Vec<StampWait>,
+    /// The distinct slots this transaction was registered under in
+    /// `waiters_by_slot`, which [`Scheduler::stamp_waits`] shrinks and this
+    /// does not.
+    ///
+    /// The index cannot be cleaned from `stamp_waits`, because by the time a
+    /// transaction is discharged that list is empty and no longer names the
+    /// slots it was filed under. Without this, a transaction waiting on two
+    /// slots was removed from the set of whichever slot happened to satisfy it
+    /// last and left in every other — so those sets grew with the session's
+    /// whole history and every publish on one scanned entries for transactions
+    /// that completed long ago.
+    registered_slots: Vec<StampSlot>,
     /// Pipelines that must become usable before this may begin.
     pipeline_waits: Vec<ResourceId>,
     /// What this transaction publishes when it completes.
@@ -140,12 +153,16 @@ impl Scheduler {
                 .insert(ordinal);
         }
         let ready = live.is_empty() && unmet.is_empty() && pipeline_waits.is_empty();
+        let mut registered_slots: Vec<StampSlot> = unmet.iter().map(|w| w.slot).collect();
+        registered_slots.sort_unstable();
+        registered_slots.dedup();
         self.pending.insert(
             ordinal,
             Pending {
                 remaining_hazards: live.len(),
                 stamp_waits: unmet,
                 pipeline_waits: pipeline_waits.to_vec(),
+                registered_slots,
                 completion,
             },
         );
@@ -194,14 +211,18 @@ impl Scheduler {
             .remove(&ordinal)
             .expect("completing a transaction that is not pending");
         self.ready.remove(&ordinal);
-        for w in &done.stamp_waits {
-            if let Some(set) = self.waiters_by_slot.get_mut(&w.slot) {
-                set.remove(&ordinal);
-            }
-        }
+        // Every slot it was filed under, not the ones it is still waiting on:
+        // a transaction discharged by publication has an empty `stamp_waits`
+        // and its index entries would otherwise stay for the rest of the
+        // session.
+        self.unregister_slots(ordinal, &done.registered_slots);
         for pipeline in &done.pipeline_waits {
-            if let Some(set) = self.waiters_by_pipeline.get_mut(pipeline) {
-                set.remove(&ordinal);
+            let Some(set) = self.waiters_by_pipeline.get_mut(pipeline) else {
+                continue;
+            };
+            set.remove(&ordinal);
+            if set.is_empty() {
+                self.waiters_by_pipeline.remove(pipeline);
             }
         }
         for dep in self.dependents.remove(&ordinal).unwrap_or_default() {
@@ -230,6 +251,7 @@ impl Scheduler {
         let Some(waiters) = self.waiters_by_slot.get(&stamp.slot).cloned() else {
             return;
         };
+        let mut discharged: Vec<(IngressOrdinal, Vec<StampSlot>)> = Vec::new();
         for w in waiters {
             let Some(p) = self.pending.get_mut(&w) else {
                 continue;
@@ -237,12 +259,32 @@ impl Scheduler {
             p.stamp_waits
                 .retain(|wait| wait.slot != stamp.slot || !wait.satisfied_by(published));
             if p.stamp_waits.is_empty() {
+                let slots = p.registered_slots.clone();
                 if p.is_ready() {
                     self.ready.insert(w);
                 }
-                if let Some(set) = self.waiters_by_slot.get_mut(&stamp.slot) {
-                    set.remove(&w);
-                }
+                discharged.push((w, slots));
+            }
+        }
+        // Out of *every* slot it was filed under. Removing it from this one
+        // alone left it in the others for the rest of the session, so those
+        // sets grew with the history and each publish scanned transactions that
+        // had long since completed.
+        for (w, slots) in discharged {
+            self.unregister_slots(w, &slots);
+        }
+    }
+
+    /// Take a transaction out of the slot index it was filed under, and drop a
+    /// slot's set when nothing waits on it any more.
+    fn unregister_slots(&mut self, ordinal: IngressOrdinal, slots: &[StampSlot]) {
+        for slot in slots {
+            let Some(set) = self.waiters_by_slot.get_mut(slot) else {
+                continue;
+            };
+            set.remove(&ordinal);
+            if set.is_empty() {
+                self.waiters_by_slot.remove(slot);
             }
         }
     }
@@ -364,6 +406,47 @@ mod tests {
             slot: crate::identity::ObjectListRef(slot),
             generation: crate::identity::SlotGeneration::default().next(),
         }
+    }
+
+    /// **The waiter index holds only live waiters.**
+    ///
+    /// It is a `HashMap<StampSlot, BTreeSet<_>>` whose whole purpose, in its
+    /// own words, is that "publishing does not scan". A transaction waiting on
+    /// two slots was filed under both and taken out of only the one that
+    /// happened to satisfy it last — because by then its `stamp_waits` was
+    /// empty and no longer named where it had been filed. So the other slot's
+    /// set grew by one per transaction for the life of the session, and every
+    /// publish on it walked every transaction that had ever waited there.
+    ///
+    /// A timeline slot is published every frame, so this is unbounded in both
+    /// memory and per-publish cost.
+    #[test]
+    fn the_waiter_index_does_not_grow_with_transactions_that_have_finished() {
+        let mut s = Scheduler::new();
+        for n in 1..=50u64 {
+            let value = n as u32;
+            assert!(!s.admit(ord(n), &[], &[wait(1, value), wait(2, value)], &[], None));
+            s.publish(stamp(1, value));
+            s.publish(stamp(2, value));
+            assert_eq!(s.take_ready(), vec![ord(n)], "both waits are discharged");
+            assert_eq!(s.complete(ord(n)), None);
+        }
+        assert_eq!(s.pending(), 0);
+        assert!(
+            s.waiters_by_slot.is_empty(),
+            "the index still holds {:?}",
+            s.waiters_by_slot
+        );
+    }
+
+    /// The same, for a transaction that completes while it is still waiting.
+    #[test]
+    fn a_withdrawn_waiter_leaves_no_index_entry_behind() {
+        let mut s = Scheduler::new();
+        assert!(!s.admit(ord(1), &[], &[wait(1, 5), wait(2, 5)], &[pipe(3)], None));
+        assert_eq!(s.complete(ord(1)), None);
+        assert!(s.waiters_by_slot.is_empty(), "slots");
+        assert!(s.waiters_by_pipeline.is_empty(), "pipelines");
     }
 
     #[test]
@@ -624,5 +707,300 @@ mod tests {
         s.pipeline_ready(pipe(4));
         assert!(s.take_ready().is_empty());
         assert_eq!(s.pipeline_refused(pipe(4)), vec![]);
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// One pending transaction as the shadow holds it: its ordinal, and the
+    /// three kinds of prerequisite it has not met yet.
+    type Waiting = (
+        IngressOrdinal,
+        Vec<IngressOrdinal>,
+        Vec<StampWait>,
+        Vec<ResourceId>,
+    );
+
+    /// Tiny pools, so slots and pipelines are shared constantly and one
+    /// publication discharges several waiters at once.
+    const SLOTS: u64 = 3;
+    const PIPES: u64 = 3;
+
+    /// **Readiness is a function of what is outstanding, and the indexes hold
+    /// exactly the live waiters.**
+    ///
+    /// The shadow is a flat list of pending transactions with their unmet
+    /// prerequisites and a published map — no indexes at all. Every readiness
+    /// answer is recomputed from it, so an index that discharged a transaction
+    /// early, missed one, or kept an entry for one that had finished cannot
+    /// agree.
+    ///
+    /// The last of those is the one the indexes existed to get right and did
+    /// not: they are what makes publishing cost its waiters rather than the
+    /// session's history, so the sweep asserts their exact contents after every
+    /// step rather than only the readiness they produce.
+    #[test]
+    fn the_indexes_hold_exactly_the_transactions_still_waiting() {
+        let mut admitted = 0usize;
+        let mut ready_at_once = 0usize;
+        let mut discharged_by_publish = 0usize;
+        let mut discharged_by_pipeline = 0usize;
+        let mut discharged_by_hazard = 0usize;
+        let mut refused_pipelines = 0usize;
+
+        for seed in 0..384u64 {
+            let mut rng = Rng::new(seed);
+            let mut s = Scheduler::new();
+            // Shadow: what is pending, and what has been published.
+            let mut pending: Vec<Waiting> = Vec::new();
+            let mut published: BTreeMap<StampSlot, StampValue> = BTreeMap::new();
+            let mut taken: Vec<IngressOrdinal> = Vec::new();
+            let mut next = 1u64;
+
+            for _ in 0..48 {
+                match rng.below(10) {
+                    // Admit, with prerequisites drawn from what exists.
+                    0..=3 => {
+                        let ordinal = ord(next);
+                        next += 1;
+                        let hazards: Vec<IngressOrdinal> = if pending.is_empty() {
+                            Vec::new()
+                        } else {
+                            (0..rng.below(3))
+                                .map(|_| pending[rng.below(pending.len() as u64) as usize].0)
+                                .collect()
+                        };
+                        let stamps: Vec<StampWait> = (0..rng.below(3))
+                            .map(|_| wait(rng.below(SLOTS) as u32 + 1, rng.below(4) as u32 + 1))
+                            .collect();
+                        let pipes: Vec<ResourceId> = (0..rng.below(3))
+                            .map(|_| pipe(rng.below(PIPES) as u32 + 1))
+                            .collect();
+                        let got = s.admit(ordinal, &hazards, &stamps, &pipes, None);
+
+                        // The shadow keeps only the prerequisites that are not
+                        // already discharged, which is the same rule stated
+                        // without an index.
+                        let live_hazards: Vec<IngressOrdinal> = hazards
+                            .iter()
+                            .copied()
+                            .filter(|h| pending.iter().any(|(o, ..)| o == h))
+                            .collect();
+                        let unmet: Vec<StampWait> = stamps
+                            .iter()
+                            .copied()
+                            .filter(|w| !published.get(&w.slot).is_some_and(|v| w.satisfied_by(*v)))
+                            .collect();
+                        let expected =
+                            live_hazards.is_empty() && unmet.is_empty() && pipes.is_empty();
+                        assert_eq!(got, expected, "seed {seed}: admit readiness");
+                        if expected {
+                            ready_at_once += 1;
+                            taken.push(ordinal);
+                        }
+                        pending.push((ordinal, live_hazards, unmet, pipes));
+                        admitted += 1;
+                    }
+                    // Publish a stamp value the guest or a completion wrote.
+                    4..=5 => {
+                        let st = stamp(rng.below(SLOTS) as u32 + 1, rng.below(6) as u32 + 1);
+                        s.publish(st);
+                        let at = published
+                            .entry(st.slot)
+                            .and_modify(|v| *v = v.later(st.value))
+                            .or_insert(st.value);
+                        let at = *at;
+                        for (ordinal, hz, waits, pipes) in &mut pending {
+                            let was = waits.is_empty();
+                            waits.retain(|w| w.slot != st.slot || !w.satisfied_by(at));
+                            if !was && waits.is_empty() && hz.is_empty() && pipes.is_empty() {
+                                taken.push(*ordinal);
+                                discharged_by_publish += 1;
+                            }
+                        }
+                    }
+                    // A pipeline became usable.
+                    6..=7 => {
+                        let id = pipe(rng.below(PIPES) as u32 + 1);
+                        s.pipeline_ready(id);
+                        for (ordinal, hz, waits, pipes) in &mut pending {
+                            let was = pipes.is_empty();
+                            pipes.retain(|p| *p != id);
+                            if !was && pipes.is_empty() && hz.is_empty() && waits.is_empty() {
+                                taken.push(*ordinal);
+                                discharged_by_pipeline += 1;
+                            }
+                        }
+                    }
+                    // A pipeline will never build.
+                    8 => {
+                        let id = pipe(rng.below(PIPES) as u32 + 1);
+                        let mut expected: Vec<IngressOrdinal> = pending
+                            .iter()
+                            .filter(|(_, _, _, pipes)| pipes.contains(&id))
+                            .map(|(o, ..)| *o)
+                            .collect();
+                        let mut got = s.pipeline_refused(id);
+                        expected.sort_unstable();
+                        got.sort_unstable();
+                        assert_eq!(got, expected, "seed {seed}: pipeline_refused");
+                        refused_pipelines += got.len();
+                        // The caller withdraws them; here that is a completion
+                        // with the stamp dropped, which is what `withdraw` does.
+                        for ordinal in got {
+                            complete_shadow(
+                                &mut s,
+                                &mut pending,
+                                &mut taken,
+                                ordinal,
+                                &mut discharged_by_hazard,
+                            );
+                        }
+                    }
+                    // A transaction finished.
+                    _ => {
+                        if pending.is_empty() {
+                            continue;
+                        }
+                        let ordinal = pending[rng.below(pending.len() as u64) as usize].0;
+                        complete_shadow(
+                            &mut s,
+                            &mut pending,
+                            &mut taken,
+                            ordinal,
+                            &mut discharged_by_hazard,
+                        );
+                    }
+                }
+
+                // The ready set is exactly what the shadow says has no unmet
+                // prerequisite and has not been taken yet.
+                let mut expected_ready: Vec<IngressOrdinal> = taken
+                    .iter()
+                    .copied()
+                    .filter(|o| pending.iter().any(|(p, ..)| p == o))
+                    .collect();
+                expected_ready.sort_unstable();
+                expected_ready.dedup();
+                let mut got = s.take_ready();
+                got.sort_unstable();
+                assert_eq!(got, expected_ready, "seed {seed}: ready set");
+                taken.retain(|o| !expected_ready.contains(o));
+
+                // The indexes hold exactly the live waiters, and no empty set.
+                assert_eq!(s.pending(), pending.len(), "seed {seed}: pending");
+                for (slot, set) in &s.waiters_by_slot {
+                    assert!(!set.is_empty(), "seed {seed}: an empty slot set was kept");
+                    for w in set {
+                        assert!(
+                            pending.iter().any(|(o, ..)| o == w),
+                            "seed {seed}: slot {slot:?} holds finished {w:?}"
+                        );
+                    }
+                }
+                for (id, set) in &s.waiters_by_pipeline {
+                    assert!(!set.is_empty(), "seed {seed}: an empty pipeline set");
+                    for w in set {
+                        assert!(
+                            pending.iter().any(|(o, ..)| o == w),
+                            "seed {seed}: pipeline {id:?} holds finished {w:?}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    s.waiting_on_pipelines(),
+                    pending
+                        .iter()
+                        .filter(|(_, _, _, pipes)| !pipes.is_empty())
+                        .count(),
+                    "seed {seed}: waiting_on_pipelines"
+                );
+            }
+
+            // Nothing survives the last transaction leaving.
+            let remaining: Vec<IngressOrdinal> = pending.iter().map(|(o, ..)| *o).collect();
+            for ordinal in remaining {
+                complete_shadow(
+                    &mut s,
+                    &mut pending,
+                    &mut taken,
+                    ordinal,
+                    &mut discharged_by_hazard,
+                );
+            }
+            assert_eq!(s.pending(), 0, "seed {seed}");
+            assert!(
+                s.waiters_by_slot.is_empty(),
+                "seed {seed}: slot index leaked"
+            );
+            assert!(
+                s.waiters_by_pipeline.is_empty(),
+                "seed {seed}: pipeline index leaked"
+            );
+            assert!(s.dependents.is_empty(), "seed {seed}: dependents leaked");
+        }
+
+        // Non-vacuity: every shape an assertion above depends on reaching.
+        assert!(admitted > 5_000, "transactions admitted: {admitted}");
+        assert!(ready_at_once > 400, "ready on admission: {ready_at_once}");
+        assert!(
+            discharged_by_publish > 200,
+            "discharged by a publication: {discharged_by_publish}"
+        );
+        assert!(
+            discharged_by_pipeline > 400,
+            "discharged by a compilation: {discharged_by_pipeline}"
+        );
+        assert!(
+            discharged_by_hazard > 1_000,
+            "discharged by an earlier transaction finishing: {discharged_by_hazard}"
+        );
+        assert!(
+            refused_pipelines > 800,
+            "transactions named by a refused pipeline: {refused_pipelines}"
+        );
+    }
+
+    /// Complete one transaction in both the scheduler and the shadow, and
+    /// release whatever was waiting on it.
+    fn complete_shadow(
+        s: &mut Scheduler,
+        pending: &mut Vec<Waiting>,
+        taken: &mut Vec<IngressOrdinal>,
+        ordinal: IngressOrdinal,
+        discharged_by_hazard: &mut usize,
+    ) {
+        if !pending.iter().any(|(o, ..)| *o == ordinal) {
+            return;
+        }
+        let _ = s.complete(ordinal);
+        pending.retain(|(o, ..)| *o != ordinal);
+        for (other, hz, waits, pipes) in pending.iter_mut() {
+            let was = hz.is_empty();
+            hz.retain(|h| *h != ordinal);
+            if !was && hz.is_empty() && waits.is_empty() && pipes.is_empty() {
+                taken.push(*other);
+                *discharged_by_hazard += 1;
+            }
+        }
     }
 }
