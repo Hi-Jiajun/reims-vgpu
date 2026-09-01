@@ -17,3 +17,11 @@ name = "reims_vgpu_core"
 # What a decoded wire tag means, and the closure ledger that says which
 # operations the model has to be able to represent at all.
 reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }
+
+# Only the fixture test reads these. The library has no dependencies beyond the
+# protocol crate, which is the claim its dependency list is there to make.
+[dev-dependencies]
+serde_json = "1"
+# The fixture test reads segment headers, which carry no opcode and so have no
+# path through the model. Only the test depends on this.
+reims-vgpu-wire = { path = "../reims-vgpu-wire" }

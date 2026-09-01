@@ -1175,6 +1175,8 @@ name = "reims-vgpu-core"
 version = "0.1.0"
 dependencies = [
  "reims-vgpu-protocol",
+ "reims-vgpu-wire",
+ "serde_json",
 ]
 
 [[package]]
