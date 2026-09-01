@@ -33,6 +33,147 @@ pub const CHILD_INVALIDATE_RECORD_LEN: u32 = 8;
 /// Per-object record on Synchronize: `{object_id u32}` only (no validity ops).
 pub const CHILD_SYNCHRONIZE_RECORD_LEN: u32 = 4;
 /// CmdReplacePhysical (`0x3c`): a fixed `{task_id, object_id}` pair, no list.
+/// `CmdDefineTask2`: the identity, extent and page-table root of one task.
+///
+/// The first word is **not** a task id. It is `(task_id << 1) | is_kernel_task`,
+/// and the guest's kernel-task and user-task registrations differ only in that
+/// low bit — the kernel task's own id is `0`, so a raw word of `0x1` is the
+/// kernel task and not user task 1. Reading the word as an id indexes every
+/// slot at twice its number.
+pub const DEFINE_TASK_RAW_ID: usize = 0x00;
+/// The task's address-space length. Eight bytes: the next field is at `0x0c`,
+/// and a reader taking the low half truncates the length of any task spanning
+/// 4 GiB or more.
+pub const DEFINE_TASK_LENGTH: usize = 0x04;
+/// The page-table directory's page frame.
+pub const DEFINE_TASK_DIRECTORY_PFN: usize = DEFINE_TASK_LENGTH + 8;
+/// Bytes the command carries, derived from its last field.
+pub const DEFINE_TASK_LEN: usize = DEFINE_TASK_DIRECTORY_PFN + 4;
+/// Bits the raw word is shifted by to recover the task id.
+pub const DEFINE_TASK_ID_SHIFT: u32 = 1;
+
+/// The identity a `DefineTask2` registers: a slot, and the class that owns it.
+///
+/// Total in the raw word — both halves are decoded, so nothing about the word
+/// is left unaccounted for and neither half can be read as the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefineTaskId {
+    pub task_id: u32,
+    /// Whether the guest registered this as its kernel task.
+    pub kernel: bool,
+}
+
+impl DefineTaskId {
+    /// Split a raw first word into its two halves.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self {
+            task_id: raw >> DEFINE_TASK_ID_SHIFT,
+            kernel: raw & 1 != 0,
+        }
+    }
+
+    /// The word a guest sends for this identity.
+    ///
+    /// The inverse of [`Self::from_raw`], so a test can build a request the way
+    /// the guest builds it rather than shifting by hand and getting the
+    /// polarity of the low bit from the same place the decoder does.
+    #[must_use]
+    pub const fn to_raw(self) -> u32 {
+        (self.task_id << DEFINE_TASK_ID_SHIFT) | (self.kernel as u32)
+    }
+}
+
+/// A task definition, decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefineTaskCommand {
+    pub id: DefineTaskId,
+    pub length: u64,
+    pub directory_pfn: u32,
+}
+
+/// Decode a task definition.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the command's four fields.
+pub fn decode_define_task(payload: &[u8]) -> Result<DefineTaskCommand, ShortPayload> {
+    if payload.len() < DEFINE_TASK_LEN {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need: DEFINE_TASK_LEN,
+        });
+    }
+    Ok(DefineTaskCommand {
+        id: DefineTaskId::from_raw(ld32(&payload[DEFINE_TASK_RAW_ID..])),
+        length: ld64(&payload[DEFINE_TASK_LENGTH..]),
+        directory_pfn: ld32(&payload[DEFINE_TASK_DIRECTORY_PFN..]),
+    })
+}
+
+/// `CmdDeleteTask`: the task slot, and nothing else.
+///
+/// A plain id, **not** the doubled word [`DEFINE_TASK_RAW_ID`] carries — the
+/// same asymmetry the other resource-list commands have.
+pub const DELETE_TASK_ID: usize = 0x00;
+pub const DELETE_TASK_LEN: usize = 4;
+
+/// Decode a task deletion.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the id. Typed rather than
+/// defaulted to zero: task `0` is the kernel task, so a payload too short to
+/// read that used to name the one slot whose teardown costs the most.
+pub fn decode_delete_task(payload: &[u8]) -> Result<u32, ShortPayload> {
+    if payload.len() < DELETE_TASK_LEN {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need: DELETE_TASK_LEN,
+        });
+    }
+    Ok(ld32(&payload[DELETE_TASK_ID..]))
+}
+
+/// `CmdSetObjectList`: where a task's object list lives and how long it is.
+pub const SET_OBJECT_LIST_TASK_ID: usize = 0x00;
+pub const SET_OBJECT_LIST_PFN: usize = 0x04;
+pub const SET_OBJECT_LIST_COUNT: usize = SET_OBJECT_LIST_PFN + 4;
+/// Bytes the command carries, derived from its last field. Only a payload
+/// *below* this is refused — a longer one is accepted and its tail ignored,
+/// which is what a wider field (a 64-bit page address, a byte length beside a
+/// count) would look like from here.
+pub const SET_OBJECT_LIST_LEN: usize = SET_OBJECT_LIST_COUNT + 4;
+
+/// An object-list bind, decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetObjectListCommand {
+    pub task_id: u32,
+    /// The page frame the list starts at.
+    pub pfn: u32,
+    /// How many entries it holds.
+    pub count: u32,
+}
+
+/// Decode an object-list bind.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the command's three words.
+pub fn decode_set_object_list(payload: &[u8]) -> Result<SetObjectListCommand, ShortPayload> {
+    if payload.len() < SET_OBJECT_LIST_LEN {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need: SET_OBJECT_LIST_LEN,
+        });
+    }
+    Ok(SetObjectListCommand {
+        task_id: ld32(&payload[SET_OBJECT_LIST_TASK_ID..]),
+        pfn: ld32(&payload[SET_OBJECT_LIST_PFN..]),
+        count: ld32(&payload[SET_OBJECT_LIST_COUNT..]),
+    })
+}
+
 /// `CmdMapMemory2` (`0x39`) and `CmdUnmapMemory` (`0x22`): the interval of one
 /// task's GPU virtual address space the guest has just changed.
 ///
@@ -761,6 +902,115 @@ pub fn decode_synchronize_resources(
 mod tests {
     use super::*;
     use crate::endian::st32;
+
+    /// The raw first word is an id and a class bit, and both halves survive a
+    /// round trip.
+    ///
+    /// The kernel task's own id is `0`, so `0x1` is the kernel task and not
+    /// user task 1 — the one pair a reader that ignores the low bit gets
+    /// exactly backwards.
+    #[test]
+    fn a_define_task_word_is_an_id_and_a_class_bit() {
+        assert_eq!(
+            DefineTaskId::from_raw(0x1),
+            DefineTaskId {
+                task_id: 0,
+                kernel: true
+            },
+            "the kernel task's id is zero"
+        );
+        assert_eq!(
+            DefineTaskId::from_raw(0x2),
+            DefineTaskId {
+                task_id: 1,
+                kernel: false
+            },
+            "user task 1 sends two"
+        );
+        for task_id in [0u32, 1, 3, 0x7fff_ffff] {
+            for kernel in [false, true] {
+                let id = DefineTaskId { task_id, kernel };
+                assert_eq!(DefineTaskId::from_raw(id.to_raw()), id);
+            }
+        }
+    }
+
+    /// The definition's four fields, including the length that is eight bytes
+    /// wide and sat between two `u32`s.
+    #[test]
+    fn a_task_definition_carries_a_sixty_four_bit_extent() {
+        let mut bytes = vec![0u8; DEFINE_TASK_LEN];
+        st32(
+            &mut bytes[DEFINE_TASK_RAW_ID..],
+            DefineTaskId {
+                task_id: 5,
+                kernel: false,
+            }
+            .to_raw(),
+        );
+        bytes[DEFINE_TASK_LENGTH..DEFINE_TASK_LENGTH + 8]
+            .copy_from_slice(&0x0000_0004_0000_0000u64.to_le_bytes());
+        st32(&mut bytes[DEFINE_TASK_DIRECTORY_PFN..], 0x2a);
+        assert_eq!(
+            decode_define_task(&bytes),
+            Ok(DefineTaskCommand {
+                id: DefineTaskId {
+                    task_id: 5,
+                    kernel: false
+                },
+                length: 0x0000_0004_0000_0000,
+                directory_pfn: 0x2a,
+            }),
+            "a task spanning 16 GiB keeps its high half"
+        );
+        assert_eq!(
+            decode_define_task(&bytes[..DEFINE_TASK_LEN - 1]),
+            Err(ShortPayload {
+                plen: DEFINE_TASK_LEN - 1,
+                need: DEFINE_TASK_LEN,
+            })
+        );
+    }
+
+    /// A delete names a task, and a payload too short to hold one is refused
+    /// rather than read as task `0` — which is the kernel task.
+    #[test]
+    fn a_short_delete_task_does_not_name_the_kernel_task() {
+        assert_eq!(decode_delete_task(&7u32.to_le_bytes()), Ok(7));
+        assert_eq!(
+            decode_delete_task(&[0u8; DELETE_TASK_LEN - 1]),
+            Err(ShortPayload {
+                plen: DELETE_TASK_LEN - 1,
+                need: DELETE_TASK_LEN,
+            })
+        );
+    }
+
+    /// Three words, and a longer payload is accepted with its tail ignored.
+    #[test]
+    fn an_object_list_bind_is_three_words_and_tolerates_a_longer_payload() {
+        let mut bytes = vec![0u8; SET_OBJECT_LIST_LEN + 8];
+        st32(&mut bytes[SET_OBJECT_LIST_TASK_ID..], 2);
+        st32(&mut bytes[SET_OBJECT_LIST_PFN..], 0x310);
+        st32(&mut bytes[SET_OBJECT_LIST_COUNT..], 64);
+        let expected = SetObjectListCommand {
+            task_id: 2,
+            pfn: 0x310,
+            count: 64,
+        };
+        assert_eq!(decode_set_object_list(&bytes), Ok(expected));
+        assert_eq!(
+            decode_set_object_list(&bytes[..SET_OBJECT_LIST_LEN]),
+            Ok(expected)
+        );
+        assert_eq!(
+            decode_set_object_list(&bytes[..SET_OBJECT_LIST_LEN - 1]),
+            Err(ShortPayload {
+                plen: SET_OBJECT_LIST_LEN - 1,
+                need: SET_OBJECT_LIST_LEN,
+            })
+        );
+    }
 
     /// The notice's three fields, and the two that are eight bytes wide.
     ///

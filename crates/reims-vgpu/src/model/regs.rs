@@ -704,16 +704,10 @@ pub const DEVICE_INFO_REPLY_PAIR_LEN: usize = crate::protocol::info_reply::PAIR_
 // collide: reading either request at the other's takes the count for a page
 // frame.
 
-pub const DEFINE_TASK_RAW_ID: usize = 0x00;
-pub const DEFINE_TASK_LENGTH: usize = 0x04;
-pub const DEFINE_TASK_DIRECTORY_PFN: usize = 0x0c;
-pub const DEFINE_TASK_LEN: usize = 16;
-pub const DEFINE_TASK_ID_SHIFT: u32 = 1;
-
-pub const SET_OBJECT_LIST_TASK_ID: usize = 0x00;
-pub const SET_OBJECT_LIST_PFN: usize = 0x04;
-pub const SET_OBJECT_LIST_COUNT: usize = 0x08;
-pub const SET_OBJECT_LIST_LEN: usize = 12;
+// `CmdDefineTask2`'s four fields — including the doubled first word carrying the
+// task id and the kernel-task bit — and `CmdSetObjectList`'s three live in
+// `reims_vgpu_protocol::fifo`, with the floors derived from the last field
+// rather than written as literals beside the offsets they have to agree with.
 
 // `CmdDisplaySwapMapping`'s trailer offsets moved to
 // `reims_vgpu_protocol::present` with the other two forms' — see the note above

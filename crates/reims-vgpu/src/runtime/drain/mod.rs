@@ -7,7 +7,7 @@ use crate::backend::{Backend as _, RetainedObject};
 use crate::model::*;
 use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, UnimplementedCommand};
 use crate::observe::Emit;
-use crate::protocol::endian::{ld16, ld32, ld64, st16, st32};
+use crate::protocol::endian::{ld16, ld32, st16, st32};
 use crate::protocol::fifo::{decode_device_info, DeviceInfoForm};
 use crate::protocol::fifo::{
     display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
@@ -436,10 +436,15 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
 }
 
 fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
-    let task_id = if payload.len() >= 4 {
-        ld32(&payload[0..])
-    } else {
-        0
+    // A payload too short to hold an id used to default to `0`, which is the
+    // **kernel task** — so a truncated delete retired the resolutions of the
+    // one slot whose teardown costs the most, and did it silently.
+    let task_id = match crate::protocol::fifo::decode_delete_task(payload) {
+        Ok(task_id) => task_id,
+        Err(short) => {
+            note_short_payload("delete_task", channel, &short);
+            return;
+        }
     };
     // The task's GVA space goes with it, so every bind resolution keyed on it
     // names bytes that are no longer this task's. Here rather than at the two
@@ -488,17 +493,17 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
 /// lifecycle packet the guest re-sends, and the reading wanted is which distinct
 /// triples a boot produces, not how often.
 fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
-    if packet_short(
-        "set_object_list",
-        channel,
-        payload.len(),
-        SET_OBJECT_LIST_LEN,
-    ) {
-        return;
-    }
-    let task_id = ld32(&payload[SET_OBJECT_LIST_TASK_ID..]);
-    let pfn = ld32(&payload[SET_OBJECT_LIST_PFN..]);
-    let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
+    let crate::protocol::fifo::SetObjectListCommand {
+        task_id,
+        pfn,
+        count,
+    } = match crate::protocol::fifo::decode_set_object_list(payload) {
+        Ok(command) => command,
+        Err(short) => {
+            note_short_payload("set_object_list", channel, &short);
+            return;
+        }
+    };
     // A new object list changes the construction input for references this
     // device has not constructed yet. Exact-window buffer resolutions are not
     // object states and therefore retire here. Typed objects already
@@ -531,19 +536,22 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     payload: &[u8],
     channel: Option<u32>,
 ) {
-    if packet_short("define_task2", channel, payload.len(), DEFINE_TASK_LEN) {
-        return;
-    }
-    let raw_id = ld32(&payload[DEFINE_TASK_RAW_ID..]);
-    let length = define_task_length(payload);
-    let dir = ld32(&payload[DEFINE_TASK_DIRECTORY_PFN..]);
-    // `raw_id` is `(task_id << 1) | is_kernel_task`: the guest's kernel-task and
-    // user-task registrations differ only in that low bit, and the kernel task's
-    // own id is 0, so `0x1` is the kernel task and not user task 1. Both halves
-    // are decoded — the id to index the slot, the flag so the log says which
-    // class registered rather than leaving the bit unaccounted for.
-    let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
-    let kernel_task = raw_id & 1 != 0;
+    // The floor, the four offsets and the split of the first word are the
+    // command's owner's. Both halves of that word are decoded — the id to index
+    // the slot, the class bit so the log says which of the two registered
+    // rather than leaving it unaccounted for.
+    let command = match crate::protocol::fifo::decode_define_task(payload) {
+        Ok(command) => command,
+        Err(short) => {
+            note_short_payload("define_task2", channel, &short);
+            return;
+        }
+    };
+    let raw_id = command.id.to_raw();
+    let length = command.length;
+    let dir = command.directory_pfn;
+    let task_id = command.id.task_id;
+    let kernel_task = command.id.kernel;
     // The page-table root is replaced here, so every GVA this task resolved
     // through the old one may translate elsewhere now. Keyed on the shifted
     // `task_id`, not `raw_id` — the registry is keyed the way the draw path
@@ -569,20 +577,6 @@ fn apply_define_task2<H: HostMemory + HostOps>(
         kernel_task as u8,
         state.page_shift
     ));
-}
-
-/// The task's address-space length from a `DefineTask2` payload.
-///
-/// The field is 64 bits wide, and the payload layout says so: it sits at
-/// `DEFINE_TASK_LENGTH` (0x04) and the next field, `DEFINE_TASK_DIRECTORY_PFN`,
-/// is at 0x0c — eight bytes later. Callers must have already checked
-/// `payload.len() >= DEFINE_TASK_LEN` (16), which covers the whole field.
-///
-/// The root and child arms decode the same wire field, and read it the same
-/// way here. The child arm used to take only the low 32 bits, which truncated
-/// the length of any task spanning 4 GiB or more.
-fn define_task_length(payload: &[u8]) -> u64 {
-    ld64(&payload[DEFINE_TASK_LENGTH..])
 }
 
 /// Alarm for a display-transaction payload longer than its command declares.
@@ -715,9 +709,14 @@ fn note_resource_list_decode_fail(
 /// cannot see any of the twelve and the crate-wide "no two checks share a slug"
 /// claim excludes them. Fixing that is a change to all twelve at once, not to
 /// the two that happen to have decoders.)
+/// Report a payload too short for the command it claims to be.
+///
+/// Takes no opcode. It used to, and no arm ever read it: the reason stem `op`
+/// already names the command, and an unused parameter is one every call site
+/// has to fill with something a compiler cannot check — three of them would
+/// have had to invent a zero.
 fn note_short_payload(
     op: &'static str,
-    _opcode: u16,
     channel: Option<u32>,
     short: &crate::protocol::fifo::ShortPayload,
 ) {
@@ -2290,7 +2289,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
                     );
                 }
                 Err(short) => {
-                    note_short_payload("device_info_tahoe", packet.opcode, None, &short);
+                    note_short_payload("device_info_tahoe", None, &short);
                 }
             }
         }
@@ -2313,7 +2312,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
                     );
                 }
                 Err(short) => {
-                    note_short_payload("device_info_monterey", packet.opcode, None, &short);
+                    note_short_payload("device_info_monterey", None, &short);
                 }
             }
         }
@@ -3700,7 +3699,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // it. Reported by name rather than falling through to the generic
         // census line, which prints two words of a record it could not read.
         Err(short) => {
-            note_short_payload(family.slug(), packet.opcode, Some(channel_id), &short);
+            note_short_payload(family.slug(), Some(channel_id), &short);
             return;
         }
     };
@@ -4327,7 +4326,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     let _ = reply_compute_info(state, host, &request);
                 }
                 Err(short) => {
-                    note_short_payload("get_compute_info", packet.opcode, Some(channel_id), &short);
+                    note_short_payload("get_compute_info", Some(channel_id), &short);
                 }
             }
         }
@@ -4513,7 +4512,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     );
                 }
                 Err(short) => {
-                    note_short_payload("replace_physical", packet.opcode, Some(channel_id), &short);
+                    note_short_payload("replace_physical", Some(channel_id), &short);
                 }
             }
         }
