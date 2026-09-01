@@ -29,10 +29,14 @@
 //! only in whether the counts are 16 or 64 bits. That is an encoding, so the
 //! payload carries `u64` and does not remember which form arrived;
 //! [`reims_vgpu_protocol::render::RenderKind`] is where a census that cares
-//! asks. `base_vertex` is the exception the wire forces: it is signed and
-//! **truncated** to 16 bits by Apple's serializer in every form, so a value
-//! below `i16::MIN` is lost upstream of this device and the model carries what
-//! arrived.
+//! asks. `base_vertex` is the exception the wire forces: it is signed, and the
+//! two encodings **disagree about what survives**. The compact form truncates
+//! it to 16 bits — Apple's serializer does that, upstream of this device, so
+//! `-70000` arrives as `0xee90` and the value is already lost. The wide form
+//! sign-extends it to the full width and `-70000` arrives intact. So the
+//! payload carries `i64`: it is the width at which both forms are
+//! representable, and a model that carried the narrow one would take a loss
+//! the wire did not.
 
 use crate::access::{AccessMode, ByteRange};
 use crate::bind::{BindSpan, IndirectSource};
@@ -133,8 +137,14 @@ pub enum DrawOp {
         index: IndexSource,
         index_count: u64,
         instances: Instancing,
-        /// Signed, and truncated to 16 bits upstream of this device.
-        base_vertex: i16,
+        /// Signed, and carried at the width the wide encoding preserves.
+        ///
+        /// Not `i16`. The compact encoding's value is truncated to 16 bits by
+        /// Apple's serializer before this device sees it, but the wide one is
+        /// sign-extended and carries the guest's whole value — so narrowing
+        /// here would discard, on the encoding that kept it, exactly what the
+        /// other encoding lost.
+        base_vertex: i64,
     },
     /// A non-indexed draw whose counts come from a buffer.
     PrimitivesIndirect {
@@ -599,6 +609,27 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), DrawShape::ALL.len());
+    }
+
+    /// A base vertex the compact encoding could not have held survives the
+    /// model. The wide encoding sign-extends it, so `-70000` is a value a guest
+    /// can actually send, and an `i16` payload would have turned it into
+    /// `0xee90` — the same loss the *other* encoding takes, applied to the one
+    /// that did not.
+    #[test]
+    fn a_base_vertex_below_the_compact_encodings_range_is_carried_whole() {
+        let draw = DrawOp::Indexed {
+            primitive: PrimitiveType(3),
+            index: index(IndexType::Uint16),
+            index_count: 6,
+            instances: Instancing::default(),
+            base_vertex: -70_000,
+        };
+        let DrawOp::Indexed { base_vertex, .. } = draw else {
+            panic!("indexed");
+        };
+        assert_eq!(base_vertex, -70_000);
+        assert!(base_vertex < i64::from(i16::MIN));
     }
 
     /// The index range is exact and scales with the index width.
