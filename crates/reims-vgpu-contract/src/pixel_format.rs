@@ -2141,7 +2141,7 @@ pub fn apply_swizzle_rgba8(plan: &SwizzlePlan, in_rgba: [u8; 4]) -> [u8; 4] {
 }
 
 pub fn f64_to_unorm8(value: f64) -> u8 {
-    if !matches!(value.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
+    if !matches!(value.partial_cmp(&0.0), Some(core::cmp::Ordering::Greater)) {
         UNORM8_MIN
     } else if value >= 1.0 {
         UNORM8_MAX
@@ -2337,10 +2337,11 @@ fn solid_image8(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
     img
 }
 
-pub fn f16_to_f32(half_bits: u16) -> f32 {
-    let sign = (u32::from(half_bits & F16_SIGN_MASK)) << F16_F32_SIGN_SHIFT;
-    let exp = (u32::from(half_bits) >> F16_EXP_SHIFT) & F16_EXP_MASK;
-    let mut mant = u32::from(half_bits) & F16_MANT_MASK;
+#[must_use]
+pub const fn f16_to_f32(half_bits: u16) -> f32 {
+    let sign = ((half_bits & F16_SIGN_MASK) as u32) << F16_F32_SIGN_SHIFT;
+    let exp = (half_bits as u32 >> F16_EXP_SHIFT) & F16_EXP_MASK;
+    let mut mant = half_bits as u32 & F16_MANT_MASK;
     let bits = if exp == 0 {
         if mant == 0 {
             sign
@@ -2363,29 +2364,42 @@ pub fn f16_to_f32(half_bits: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-fn build_f16_to_unorm8_lut() -> Box<[u8; 65536]> {
-    let mut lut = Box::new([0u8; 65536]);
-    for i in 0..=u16::MAX {
-        let f = f16_to_f32(i);
-        lut[i as usize] = if !matches!(f.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
+/// Every half-float's unorm8, built once by the compiler.
+///
+/// 64 KiB of `.rodata`. It used to be a `OnceLock<Box<[u8; 65536]>>` filled on
+/// first use, which cost an atomic acquire on every texel-conversion call, a
+/// heap allocation the size of the table, and a `std` dependency in a layer
+/// that must not have one. A table whose contents are a pure function of
+/// nothing is a constant, and a constant is what it is now — strictly less work
+/// at run time and no initialisation order to be wrong about.
+static F16_TO_UNORM8: [u8; 65536] = build_f16_to_unorm8_lut();
+
+const fn build_f16_to_unorm8_lut() -> [u8; 65536] {
+    let mut lut = [0u8; 65536];
+    let mut i = 0usize;
+    while i < 65536 {
+        let f = f16_to_f32(i as u16);
+        // Spelled out rather than matched on `partial_cmp`, which is not
+        // const. Identical: a NaN is not greater than zero either way, and
+        // that incomparability is the only reason the ordering was named.
+        lut[i] = if f.is_nan() || f <= 0.0 {
             UNORM8_MIN
         } else if f >= 1.0 {
             UNORM8_MAX
         } else {
-            (f * f32::from(UNORM8_MAX) + 0.5) as u8
+            (f * UNORM8_MAX as f32 + 0.5) as u8
         };
+        i += 1;
     }
     lut
 }
 
-fn f16_to_unorm8_lut() -> &'static [u8; 65536] {
-    use std::sync::OnceLock;
-    static LUT: OnceLock<Box<[u8; 65536]>> = OnceLock::new();
-    LUT.get_or_init(build_f16_to_unorm8_lut)
+const fn f16_to_unorm8_lut() -> &'static [u8; 65536] {
+    &F16_TO_UNORM8
 }
 
-fn unorm8_to_f16_slow(value: u8) -> u16 {
-    let f = f32::from(value) / f32::from(UNORM8_MAX);
+const fn unorm8_to_f16_slow(value: u8) -> u16 {
+    let f = value as f32 / UNORM8_MAX as f32;
     let x = f.to_bits();
     let sign = ((x >> F16_F32_SIGN_SHIFT) as u16) & F16_SIGN_MASK;
     let e = ((x >> F32_EXP_SHIFT) & F32_EXP_MASK) as i32 - F32_EXP_BIAS + F16_EXP_BIAS;
@@ -2417,16 +2431,21 @@ fn unorm8_to_f16_slow(value: u8) -> u16 {
     h
 }
 
-fn unorm8_to_f16_lut() -> &'static [u16; 256] {
-    use std::sync::OnceLock;
-    static LUT: OnceLock<[u16; 256]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut lut = [0u16; 256];
-        for i in 0..=UNORM8_MAX {
-            lut[i as usize] = unorm8_to_f16_slow(i);
-        }
-        lut
-    })
+/// The same, the other way, and for the same reason.
+static UNORM8_TO_F16: [u16; 256] = build_unorm8_to_f16_lut();
+
+const fn build_unorm8_to_f16_lut() -> [u16; 256] {
+    let mut lut = [0u16; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        lut[i] = unorm8_to_f16_slow(i as u8);
+        i += 1;
+    }
+    lut
+}
+
+const fn unorm8_to_f16_lut() -> &'static [u16; 256] {
+    &UNORM8_TO_F16
 }
 
 /// Bit position of each channel in `MTLPixelFormatBGR10A2Unorm`'s texel word.
@@ -5585,6 +5604,45 @@ mod rgba8_to_row_tests {
             assert!(convert_rgba8_to_row(format, &src, 64, &mut a));
             assert!(rail.convert(&src, 64, &mut b));
             assert_eq!(a, b, "{format:#x} ({rail:?})");
+        }
+    }
+}
+
+#[cfg(test)]
+mod compile_time_tables {
+    use super::*;
+
+    /// The tables are built by the compiler now, so the thing worth checking is
+    /// that constant evaluation and run-time evaluation of the same float
+    /// arithmetic agree. If they ever did not, every texel this device narrows
+    /// would be off by one somewhere and nothing else would say so.
+    #[test]
+    fn the_half_float_table_is_what_the_arithmetic_produces_at_run_time() {
+        for i in 0..=u16::MAX {
+            let f = f16_to_f32(i);
+            let expected = if !matches!(f.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
+                UNORM8_MIN
+            } else if f >= 1.0 {
+                UNORM8_MAX
+            } else {
+                (f * f32::from(UNORM8_MAX) + 0.5) as u8
+            };
+            assert_eq!(F16_TO_UNORM8[i as usize], expected, "half {i:#06x}");
+        }
+    }
+
+    /// And the two tables are each other's inverse over the range that has one,
+    /// which checks the second table against the first rather than against the
+    /// function that built it.
+    #[test]
+    fn every_unorm8_returns_through_the_half_float_it_becomes() {
+        for value in 0..=u8::MAX {
+            let half = UNORM8_TO_F16[usize::from(value)];
+            assert_eq!(
+                F16_TO_UNORM8[usize::from(half)],
+                value,
+                "{value} -> half {half:#06x} -> back"
+            );
         }
     }
 }
