@@ -7,6 +7,7 @@ use ash::vk;
 
 use crate::backend::vulkan::translate;
 pub use crate::runtime::decode::resource::ColorWriteMask;
+use reims_vgpu_core::sampler;
 
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1232,62 +1233,16 @@ pub enum SampledByteOrigin {
     LinearTexture,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerFilter {
-    #[default]
-    Nearest,
-    Linear,
-}
-
-impl SamplerFilter {
-    pub(crate) fn vk(self) -> vk::Filter {
-        translate::sampler::vk_filter(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerMipFilter {
-    #[default]
-    NotMipmapped,
-    Nearest,
-    Linear,
-}
-
-impl SamplerMipFilter {
-    pub(crate) fn vk(self) -> vk::SamplerMipmapMode {
-        translate::sampler::vk_mipmap_mode(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerAddressMode {
-    #[default]
-    ClampToEdge,
-    MirrorClampToEdge,
-    Repeat,
-    MirrorRepeat,
-    ClampToZero,
-    ClampToBorderColor,
-}
-
-impl SamplerAddressMode {
-    pub(crate) fn vk(self) -> vk::SamplerAddressMode {
-        translate::sampler::vk_address_mode(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerBorderColor {
-    #[default]
-    TransparentBlack,
-    OpaqueBlack,
-    OpaqueWhite,
-}
-
-// Deliberately no `vk()` here. A sampler's border colour is not a property of
-// the declared colour alone: Metal's `ClampToZero` address mode forces
-// transparent black whatever the descriptor says, so the two must be decided
-// together — see `translate::sampler::vk_border_color_with_clamp_to_zero`.
+// A sampler's filters, mip filter, address modes and border colour are not
+// spelled as engine enums. They travel as the guest's own `MTLSampler*`
+// ordinals to `reims_vgpu_core::sampler::SamplerShape`, whose `checked()` is
+// the one parse and the one place a declaration is admitted or refused. A
+// second set of names here would be a second table to keep in step with it,
+// and the one thing the two could disagree about is which ordinal means what.
+//
+// `SamplerCompareFunction` below is the exception, and not because samplers
+// are special: `MTLCompareFunction` is also the depth test and the stencil
+// test, which are decoded on a different path and have their own owner.
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum SamplerCompareFunction {
@@ -1306,18 +1261,32 @@ impl SamplerCompareFunction {
     pub(crate) fn vk(self) -> vk::CompareOp {
         translate::raster::vk_compare_op(self)
     }
+
+    /// The `MTLCompareFunction` ordinal this was decoded from.
+    ///
+    /// Declaration order is the ABI order, asserted against the wire in
+    /// `translate::raster`'s own tests, so the discriminant is the ordinal and
+    /// a second table would be a second thing to keep in step with it.
+    pub(crate) fn mtl_ordinal(self) -> u32 {
+        self as u32
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct SamplerResource {
     pub binding: u32,
-    pub min_filter: SamplerFilter,
-    pub mag_filter: SamplerFilter,
-    pub mip_filter: SamplerMipFilter,
-    pub address_mode_u: SamplerAddressMode,
-    pub address_mode_v: SamplerAddressMode,
-    pub address_mode_w: SamplerAddressMode,
-    pub border_color: SamplerBorderColor,
+    /// `MTLSamplerMinMagFilter`, as the guest wrote it. See the note above
+    /// [`SamplerCompareFunction`] for why these are ordinals.
+    pub min_filter: u32,
+    pub mag_filter: u32,
+    /// `MTLSamplerMipFilter`.
+    pub mip_filter: u32,
+    /// `MTLSamplerAddressMode`, one per axis.
+    pub address_mode_u: u32,
+    pub address_mode_v: u32,
+    pub address_mode_w: u32,
+    /// `MTLSamplerBorderColor`.
+    pub border_color: u32,
     pub compare_function: SamplerCompareFunction,
     pub lod_min: u32, // f32 bits for Hash
     pub lod_max: u32,
@@ -1329,13 +1298,13 @@ impl SamplerResource {
     pub fn normalized_default(binding: u32) -> Self {
         Self {
             binding,
-            min_filter: SamplerFilter::Linear,
-            mag_filter: SamplerFilter::Linear,
-            mip_filter: SamplerMipFilter::NotMipmapped,
-            address_mode_u: SamplerAddressMode::ClampToEdge,
-            address_mode_v: SamplerAddressMode::ClampToEdge,
-            address_mode_w: SamplerAddressMode::ClampToEdge,
-            border_color: SamplerBorderColor::TransparentBlack,
+            min_filter: sampler::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+            mag_filter: sampler::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+            mip_filter: sampler::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+            address_mode_u: sampler::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            address_mode_v: sampler::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            address_mode_w: sampler::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            border_color: sampler::MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK,
             compare_function: SamplerCompareFunction::Never,
             lod_min: 0.0f32.to_bits(),
             lod_max: f32::MAX.to_bits(),
@@ -1373,13 +1342,13 @@ impl SamplerResource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct SamplerStateKey {
-    pub min_filter: SamplerFilter,
-    pub mag_filter: SamplerFilter,
-    pub mip_filter: SamplerMipFilter,
-    pub address_mode_u: SamplerAddressMode,
-    pub address_mode_v: SamplerAddressMode,
-    pub address_mode_w: SamplerAddressMode,
-    pub border_color: SamplerBorderColor,
+    pub min_filter: u32,
+    pub mag_filter: u32,
+    pub mip_filter: u32,
+    pub address_mode_u: u32,
+    pub address_mode_v: u32,
+    pub address_mode_w: u32,
+    pub border_color: u32,
     pub compare_function: SamplerCompareFunction,
     pub lod_min: u32,
     pub lod_max: u32,
@@ -2775,7 +2744,7 @@ mod tests {
         assert_eq!(first.lod_min_f32(), 0.0);
         assert_eq!(first.lod_max_f32(), f32::MAX);
 
-        rebound.address_mode_v = SamplerAddressMode::Repeat;
+        rebound.address_mode_v = sampler::MTL_SAMPLER_ADDRESS_MODE_REPEAT;
         assert_ne!(first.state_key(), rebound.state_key());
     }
 

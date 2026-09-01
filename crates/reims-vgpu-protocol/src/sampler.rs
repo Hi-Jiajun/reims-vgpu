@@ -378,6 +378,8 @@ pub struct SamplerState {
     compare: Option<CompareFunction>,
     border_color: BorderColor,
     normalized_coordinates: bool,
+    /// Whether the unnormalized conformance below changed anything.
+    unnormalized_conformed: bool,
 }
 
 fn parsed<T>(field: &'static str, ordinal: u32, value: Option<T>) -> Result<T, SamplerRefusal> {
@@ -449,38 +451,7 @@ impl SamplerShape {
             });
         }
 
-        if !self.normalized_coordinates {
-            // The restricted mode. Each of these is a rule both APIs place on
-            // it, checked once here so two backends cannot each discover a
-            // different subset.
-            if min_filter != mag_filter {
-                return Err(SamplerRefusal::UnnormalizedRestriction { field: "filter" });
-            }
-            if mip_filter == MipFilter::Linear {
-                return Err(SamplerRefusal::UnnormalizedRestriction {
-                    field: "mip_filter",
-                });
-            }
-            if self.max_anisotropy > 1 {
-                return Err(SamplerRefusal::UnnormalizedRestriction {
-                    field: "max_anisotropy",
-                });
-            }
-            if compare.is_some() {
-                return Err(SamplerRefusal::UnnormalizedRestriction {
-                    field: "compare_function",
-                });
-            }
-            // By index, so the refusal names the axis that broke the rule and
-            // not the first axis that happens to hold the same mode.
-            for (mode, field) in address.iter().zip(["s_address", "t_address", "r_address"]) {
-                if !mode.allows_unnormalized() {
-                    return Err(SamplerRefusal::UnnormalizedRestriction { field });
-                }
-            }
-        }
-
-        Ok(SamplerState {
+        let mut state = SamplerState {
             min_filter,
             mag_filter,
             mip_filter,
@@ -493,11 +464,81 @@ impl SamplerShape {
             compare,
             border_color,
             normalized_coordinates: self.normalized_coordinates,
-        })
+            unnormalized_conformed: false,
+        };
+        if !self.normalized_coordinates {
+            state = state.conform_unnormalized()?;
+        }
+        Ok(state)
     }
 }
 
 impl SamplerState {
+    /// Bring an unnormalized-coordinate declaration inside the restriction
+    /// both APIs place on one.
+    ///
+    /// # Why this conforms where it could refuse
+    ///
+    /// Metal and Vulkan agree on the restriction — same filter for min and
+    /// mag, no mip chain, no anisotropy, no comparison, and only clamping
+    /// address modes — and both state it as a requirement on the caller rather
+    /// than as something the API checks. So a declaration that breaks it is a
+    /// guest that already left the documented region, and what Metal's own
+    /// driver did with it is not knowable from the declaration.
+    ///
+    /// Between dropping the guest's work and binding the nearest sampler that
+    /// is legal in both APIs, the second loses nothing: every field this
+    /// changes is one an unnormalized sampler cannot consult. A mip level is
+    /// never selected because there is no derivative to select it with, an
+    /// anisotropy ratio needs the same derivative, and a repeat has no period
+    /// to repeat over. The declared values are unreadable, not overridden.
+    ///
+    /// The comparison is the exception and stays a refusal: it changes *what
+    /// the shader reads* — a comparison result instead of a texel — and there
+    /// is no nearby sampler that reads the same thing. Silently dropping it
+    /// would hand the shader a value of the wrong kind.
+    ///
+    /// # Errors
+    ///
+    /// [`SamplerRefusal::UnnormalizedRestriction`] naming `compare_function`.
+    fn conform_unnormalized(self) -> Result<Self, SamplerRefusal> {
+        if self.compare.is_some() {
+            return Err(SamplerRefusal::UnnormalizedRestriction {
+                field: "compare_function",
+            });
+        }
+        let mut conformed = self;
+        // Mag rather than min: a pixel-coordinate sampler is reading at or
+        // above 1:1 in every use this rail has seen, and magnification is the
+        // filter that decides what that reads.
+        conformed.min_filter = self.mag_filter;
+        conformed.mip_filter = MipFilter::NotMipmapped;
+        conformed.max_anisotropy = 1;
+        conformed.lod_min_clamp = 0.0;
+        conformed.lod_max_clamp = 0.0;
+        for mode in &mut conformed.address {
+            if !mode.allows_unnormalized() {
+                *mode = AddressMode::ClampToEdge;
+            }
+        }
+        // Read before the flag is set, so the comparison is over the declared
+        // fields and never over the flag itself.
+        let changed = conformed != self;
+        conformed.unnormalized_conformed = changed;
+        Ok(conformed)
+    }
+
+    /// Whether this declaration was an unnormalized one that had to be
+    /// conformed, and is therefore not exactly what the guest wrote.
+    ///
+    /// A backend reports it rather than deciding on it: every field the
+    /// conformance touched is one the sampler cannot consult, so there is no
+    /// behaviour to branch on — only a population worth counting.
+    #[must_use]
+    pub const fn unnormalized_conformed(self) -> bool {
+        self.unnormalized_conformed
+    }
+
     #[must_use]
     pub const fn min_filter(self) -> Filter {
         self.min_filter
@@ -602,6 +643,9 @@ mod tests {
             t_address: MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
             r_address: MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
             normalized_coordinates: false,
+            // Zero, not the base's 1000: an unnormalized sampler selects no
+            // level, so a clamp that admits one is itself a thing to conform.
+            lod_max_clamp: 0.0,
             ..base()
         }
     }
@@ -773,10 +817,13 @@ mod tests {
     }
 
     #[test]
-    fn the_unnormalized_mode_refuses_each_restriction_by_the_field_that_broke_it() {
-        assert!(unnormalized().checked().is_ok(), "the base is valid");
+    fn every_unnormalized_restriction_but_the_comparison_is_conformed_away() {
+        let base = unnormalized().checked().expect("the base is valid");
+        assert!(!base.unnormalized_conformed(), "nothing to conform");
 
-        for (shape, field) in [
+        // Each declaration breaks one rule, and each comes back as the nearest
+        // sampler both APIs admit rather than as a lost draw.
+        for (shape, what) in [
             (
                 SamplerShape {
                     min_filter: MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
@@ -800,25 +847,96 @@ mod tests {
             ),
             (
                 SamplerShape {
-                    compare_enabled: true,
-                    compare_function: MTL_COMPARE_FUNCTION_LESS,
-                    ..unnormalized()
-                },
-                "compare_function",
-            ),
-            (
-                SamplerShape {
                     t_address: MTL_SAMPLER_ADDRESS_MODE_REPEAT,
                     ..unnormalized()
                 },
                 "t_address",
             ),
+            (
+                SamplerShape {
+                    lod_min_clamp: 1.0,
+                    lod_max_clamp: 4.0,
+                    ..unnormalized()
+                },
+                "lod_clamp",
+            ),
         ] {
-            assert_eq!(
-                shape.checked(),
-                Err(SamplerRefusal::UnnormalizedRestriction { field }),
-                "{field}"
-            );
+            let state = shape.checked().unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            assert!(state.unnormalized_conformed(), "{what} was conformed");
+            // The conformed value is the same one in every case: an
+            // unnormalized sampler has exactly one legal shape per filter.
+            assert_eq!(state.min_filter(), state.mag_filter(), "{what}");
+            assert_eq!(state.mip_filter(), MipFilter::NotMipmapped, "{what}");
+            assert_eq!(state.max_anisotropy(), 1, "{what}");
+            assert_eq!(state.lod_clamp(), (0.0, 0.0), "{what}");
+            for mode in state.address() {
+                assert!(mode.allows_unnormalized(), "{what}: {mode:?}");
+            }
+        }
+    }
+
+    /// The one restriction that is not conformed away, because conforming it
+    /// would hand the shader a texel where it asked for a comparison.
+    #[test]
+    fn an_unnormalized_comparison_is_a_refusal_and_not_a_conformance() {
+        assert_eq!(
+            SamplerShape {
+                compare_enabled: true,
+                compare_function: MTL_COMPARE_FUNCTION_LESS,
+                ..unnormalized()
+            }
+            .checked(),
+            Err(SamplerRefusal::UnnormalizedRestriction {
+                field: "compare_function"
+            })
+        );
+    }
+
+    /// Conforming reports itself only when it changed something. A guest that
+    /// already wrote a legal unnormalized sampler is not counted as repaired.
+    #[test]
+    fn a_conformance_that_changed_nothing_does_not_report_itself() {
+        for min_mag in [
+            MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+            MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+        ] {
+            let state = SamplerShape {
+                min_filter: min_mag,
+                mag_filter: min_mag,
+                ..unnormalized()
+            }
+            .checked()
+            .expect("a legal unnormalized sampler");
+            assert!(!state.unnormalized_conformed());
+        }
+    }
+
+    /// Magnification decides, so a mismatched pair conforms *to mag* and never
+    /// to min. Both directions, because a table that took `min` would pass a
+    /// test that only checked the two ended up equal.
+    #[test]
+    fn a_mismatched_filter_pair_conforms_to_the_magnifying_one() {
+        for (min, mag, expected) in [
+            (
+                MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+                MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+                Filter::Linear,
+            ),
+            (
+                MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+                MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+                Filter::Nearest,
+            ),
+        ] {
+            let state = SamplerShape {
+                min_filter: min,
+                mag_filter: mag,
+                ..unnormalized()
+            }
+            .checked()
+            .expect("a conformable sampler");
+            assert_eq!(state.min_filter(), expected);
+            assert_eq!(state.mag_filter(), expected);
         }
     }
 
@@ -839,18 +957,28 @@ mod tests {
         assert!(state.normalized_coordinates());
     }
 
+    /// The conformance is per axis and does not disturb the axes that were
+    /// already legal — including the border modes, which are legal here and
+    /// carry a meaning `ClampToEdge` does not.
     #[test]
-    fn the_refusal_names_the_axis_that_broke_the_rule_and_not_a_twin() {
-        // Two axes hold `ClampToEdge` and the third holds the offending mode.
-        // A search by value rather than by position would name the first.
-        let shape = SamplerShape {
+    fn conforming_one_axis_leaves_the_others_as_the_guest_wrote_them() {
+        let state = SamplerShape {
+            s_address: MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO,
+            t_address: MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR,
             r_address: MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT,
             ..unnormalized()
-        };
+        }
+        .checked()
+        .expect("two legal axes and one that conforms");
         assert_eq!(
-            shape.checked(),
-            Err(SamplerRefusal::UnnormalizedRestriction { field: "r_address" })
+            state.address(),
+            [
+                AddressMode::ClampToZero,
+                AddressMode::ClampToBorderColor,
+                AddressMode::ClampToEdge,
+            ]
         );
+        assert!(state.unnormalized_conformed());
     }
 
     #[test]

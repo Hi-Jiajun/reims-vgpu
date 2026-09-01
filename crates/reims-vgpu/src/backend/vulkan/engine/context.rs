@@ -720,6 +720,20 @@ mod storage_buffer_alignment_tests {
 unsafe impl Send for DeviceContext {}
 
 impl DeviceContext {
+    /// What this device offers for the parts of a sampler that are not
+    /// mappings, as the rail that plans one asks for them.
+    ///
+    /// Projected rather than stored: the three facts already live on this
+    /// context because device creation read them there, and a second copy is
+    /// a second thing that can be stale by the time a sampler is planned.
+    pub(crate) fn sampler_cell(&self) -> reims_vgpu_vulkan::sampler::SamplerCell {
+        reims_vgpu_vulkan::sampler::SamplerCell {
+            mirror_clamp_to_edge: self.features.mirror_clamp_to_edge.is_available(),
+            anisotropy: self.sampler_anisotropy,
+            max_anisotropy: self.max_sampler_anisotropy,
+        }
+    }
+
     pub(crate) unsafe fn create() -> Result<Self, DrawError> {
         let entry = ash::Entry::load().map_err(|e| {
             DrawError::Init(InitDecline::LoadVulkanLoader {

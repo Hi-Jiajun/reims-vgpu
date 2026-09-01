@@ -121,34 +121,20 @@ pub enum DrawReason {
         requested: usize,
         cap: usize,
     },
-    /// The device does not advertise `samplerAnisotropy` and the guest sampler
-    /// asked for it.
-    SamplerAnisotropyUnsupported,
-    /// The guest sampler uses `MTLSamplerAddressModeMirrorClampToEdge` and this
-    /// device offers neither the Vulkan 1.2 `samplerMirrorClampToEdge` feature
-    /// nor `VK_KHR_sampler_mirror_clamp_to_edge`.
+    /// The guest's sampler declaration is not one the guest API admits — an
+    /// ordinal outside an enum, an inverted level-of-detail clamp, or the one
+    /// unnormalized-coordinate restriction that cannot be conformed away.
     ///
-    /// Binding it anyway is what this crate used to do — the translation table
-    /// emitted `MIRROR_CLAMP_TO_EDGE` and nothing ever requested the feature,
-    /// so the sampler was created with a mode the device had not been asked
-    /// for. That is undefined behaviour a validation layer catches on someone
-    /// else's GPU; declining by name is the honest answer.
-    SamplerMirrorClampToEdgeUnsupported,
-    /// The guest sampler asks for pixel (unnormalized) coordinates **and** a
-    /// depth-compare function, and Vulkan forbids the pair outright
-    /// (`VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01077`: `compareEnable`
-    /// must be `VK_FALSE`).
+    /// Delegates its slug, like [`Self::ColorAttachmentFormat`] below: the
+    /// protocol layer already named the field that broke, and a second slug
+    /// here would make two log lines disagree about one event.
+    SamplerDeclaration(reims_vgpu_core::sampler::SamplerRefusal),
+    /// The declaration is admissible and *this device* cannot serve it — a
+    /// mode that is a Vulkan feature, or two border colours on one sampler.
     ///
-    /// Every other constraint an unnormalized sampler carries is conformed
-    /// silently by [`super::caches::ObjectCaches::get_or_create_sampler`],
-    /// because under Vulkan's own rules such a sampler may only be reached by an
-    /// explicit-LOD, non-minifying sample — so forcing `minFilter = magFilter`,
-    /// `mipmapMode = NEAREST`, `minLod = maxLod = 0` and anisotropy off changes
-    /// no result the guest can observe. A compare function is not in that class:
-    /// dropping it returns the sampled value instead of the comparison, which is
-    /// a different picture. So this one is a refusal by name rather than a
-    /// repair.
-    SamplerUnnormalizedCompare,
+    /// Delegates for the same reason as the variant above; the rail that owns
+    /// the capability is the one that names the refusal.
+    SamplerDevice(reims_vgpu_vulkan::sampler::Refusal),
     /// The guest pipeline names one of `MTLBlendFactor`'s four dual-source
     /// factors (`Source1Color` .. `OneMinusSource1Alpha`, 15-18) and this device
     /// does not advertise `VkPhysicalDeviceFeatures::dualSrcBlend`.
@@ -353,9 +339,8 @@ impl crate::observe::Decline for DrawReason {
             Self::MultisampleResolveShapeUnsupported { .. } => {
                 "multisample_resolve_shape_unsupported"
             }
-            Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
-            Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
-            Self::SamplerUnnormalizedCompare => "sampler_unnormalized_compare",
+            Self::SamplerDeclaration(refusal) => Decline::slug(refusal),
+            Self::SamplerDevice(refusal) => refusal.slug(),
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
             Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
             Self::DepthClampUnsupported => "depth_clamp_unsupported",
@@ -660,9 +645,11 @@ mod tests {
             color_input: false,
         },
         DrawReason::VisibilityResultMode(TranslateReason::UnknownVisibilityResultMode(0)),
-        DrawReason::SamplerAnisotropyUnsupported,
-        DrawReason::SamplerMirrorClampToEdgeUnsupported,
-        DrawReason::SamplerUnnormalizedCompare,
+        DrawReason::SamplerDeclaration(reims_vgpu_core::sampler::SamplerRefusal::BadLodClamp {
+            min_bits: 0,
+            max_bits: 0,
+        }),
+        DrawReason::SamplerDevice(reims_vgpu_vulkan::sampler::Refusal::NoMirrorClampToEdge),
         DrawReason::ConstantVertexAttribute,
         DrawReason::InstanceRateDivisorUnsupported { step_rate: 0 },
         DrawReason::InstanceRateDivisorOverLimit {

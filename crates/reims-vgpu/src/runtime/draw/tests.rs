@@ -765,14 +765,11 @@ fn frag_unbound_scan_reports_only_missing_standard_kinds() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn reflected_static_sampler_maps_exact_state_and_rejects_unimplemented_modes() {
-    use crate::backend::vulkan::engine::{
-        SamplerAddressMode as EngineAddress, SamplerFilter as EngineFilter,
-        SamplerMipFilter as EngineMip,
-    };
     use metal2vulkan::reflect::{
         SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerCoordinates,
         SamplerFilter, SamplerMipFilter, SamplerReduction, StaticSamplerState,
     };
+    use reims_vgpu_core::sampler as mtl;
 
     let mut state = StaticSamplerState {
         min_filter: SamplerFilter::Linear,
@@ -794,12 +791,21 @@ fn reflected_static_sampler_maps_exact_state_and_rejects_unimplemented_modes() {
     let mapped =
         reflected_static_sampler_resource("fragment", 65, state).expect("supported sampler");
     assert_eq!(mapped.binding, 65);
-    assert_eq!(mapped.min_filter, EngineFilter::Linear);
-    assert_eq!(mapped.mag_filter, EngineFilter::Linear);
-    assert_eq!(mapped.mip_filter, EngineMip::NotMipmapped);
-    assert_eq!(mapped.address_mode_u, EngineAddress::ClampToEdge);
-    assert_eq!(mapped.address_mode_v, EngineAddress::ClampToEdge);
-    assert_eq!(mapped.address_mode_w, EngineAddress::ClampToEdge);
+    assert_eq!(mapped.min_filter, mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR);
+    assert_eq!(mapped.mag_filter, mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR);
+    assert_eq!(mapped.mip_filter, mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED);
+    assert_eq!(
+        mapped.address_mode_u,
+        mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+    );
+    assert_eq!(
+        mapped.address_mode_v,
+        mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+    );
+    assert_eq!(
+        mapped.address_mode_w,
+        mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+    );
     assert_eq!(mapped.lod_min_f32(), 0.0);
     assert_eq!(mapped.lod_max_f32(), 65504.0);
     assert!(!mapped.unnormalized_coordinates);
@@ -810,8 +816,8 @@ fn reflected_static_sampler_maps_exact_state_and_rejects_unimplemented_modes() {
     state.address_mode_t = SamplerAddressMode::Repeat;
     state.address_mode_r = SamplerAddressMode::Repeat;
     let repeat = reflected_static_sampler_resource("fragment", 66, state).expect("repeat sampler");
-    assert_eq!(repeat.min_filter, EngineFilter::Nearest);
-    assert_eq!(repeat.address_mode_u, EngineAddress::Repeat);
+    assert_eq!(repeat.min_filter, mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST);
+    assert_eq!(repeat.address_mode_u, mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT);
 
     state.min_filter = SamplerFilter::Bicubic;
     assert_eq!(
@@ -2626,12 +2632,11 @@ fn vertex_attribute_preparation_returns_exact_declines() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn vulkan_sampler_preserves_guest_coordinate_and_filter_state() {
-    use crate::backend::vulkan::engine::{
-        SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-        SamplerMipFilter,
-    };
+    use crate::backend::vulkan::engine::SamplerCompareFunction;
     use crate::runtime::decode::resource::SamplerDescriptor;
 
+    // Every field a different ordinal, so a projection that crossed two of them
+    // could not pass by both happening to hold the same value.
     let decoded = SamplerDescriptor {
         min_filter: 0,
         mag_filter: 1,
@@ -2651,39 +2656,44 @@ fn vulkan_sampler_preserves_guest_coordinate_and_filter_state() {
     let sampler = vulkan_sampler_resource(5, 67, &decoded).expect("supported sampler");
 
     assert_eq!(sampler.binding, 67);
-    assert_eq!(sampler.min_filter, SamplerFilter::Nearest);
-    assert_eq!(sampler.mag_filter, SamplerFilter::Linear);
-    assert_eq!(sampler.mip_filter, SamplerMipFilter::Linear);
-    assert_eq!(sampler.address_mode_u, SamplerAddressMode::Repeat);
-    assert_eq!(sampler.address_mode_v, SamplerAddressMode::MirrorRepeat);
-    assert_eq!(
-        sampler.address_mode_w,
-        SamplerAddressMode::ClampToBorderColor
-    );
-    assert_eq!(sampler.border_color, SamplerBorderColor::OpaqueWhite);
+    // The ordinals travel unchanged: this path no longer decodes them, so what
+    // it must not do is *alter* them. `reims_vgpu_core::sampler` owns what they
+    // mean, and its own tests own that.
+    assert_eq!(sampler.min_filter, 0);
+    assert_eq!(sampler.mag_filter, 1);
+    assert_eq!(sampler.mip_filter, 2);
+    assert_eq!(sampler.address_mode_u, 2);
+    assert_eq!(sampler.address_mode_v, 3);
+    assert_eq!(sampler.address_mode_w, 5);
+    assert_eq!(sampler.border_color, 2);
     assert_eq!(sampler.compare_function, SamplerCompareFunction::LessEqual);
     assert_eq!(sampler.lod_min, 1.25f32.to_bits());
     assert_eq!(sampler.lod_max, 7.5f32.to_bits());
     assert_eq!(sampler.max_anisotropy, 4);
     assert!(sampler.unnormalized_coordinates);
 
-    let mut bad = decoded;
-    bad.min_filter = 9;
-    let min = vulkan_sampler_resource(5, 67, &bad).expect_err("unknown min filter");
-    assert_eq!(min.slug(), "draw_prepare_sampler_min_filter_translation");
+    // An ordinal outside `MTLSamplerMinMagFilter` is no longer refused here.
+    // It reaches the sampler cache and is refused by the layer that owns the
+    // enum, which is the only layer that knows where the enum ends.
+    let mut wild = decoded;
+    wild.min_filter = 9;
     assert_eq!(
-        min.fields(),
-        vec![
-            ("sampler_ref", "5".into()),
-            ("binding", "67".into()),
-            ("value", "9".into()),
-        ]
+        vulkan_sampler_resource(5, 67, &wild)
+            .expect("an unknown filter is not this layer's refusal")
+            .min_filter,
+        9
     );
 
-    bad.min_filter = 0;
-    bad.mag_filter = 9;
-    let mag = vulkan_sampler_resource(5, 67, &bad).expect_err("unknown mag filter");
-    assert_eq!(mag.slug(), "draw_prepare_sampler_mag_filter_translation");
+    // `MTLCompareFunction` is the exception and still decodes here, because it
+    // is also the depth and stencil test and has an owner of its own.
+    wild.min_filter = 0;
+    wild.compare_function = 9;
+    assert_eq!(
+        vulkan_sampler_resource(5, 67, &wild)
+            .expect_err("an unknown compare function")
+            .slug(),
+        "draw_prepare_sampler_compare_function_translation"
+    );
 }
 
 /// qemu-shim Store policy: Clear/DontCare/force_full full-write; Load+seed

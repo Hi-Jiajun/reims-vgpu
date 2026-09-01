@@ -146,14 +146,6 @@ pub enum TranslateReason {
     UnknownFillMode(u32),
     /// `MTLDepthClipMode` value outside the SDK enum.
     UnknownDepthClipMode(u32),
-    /// `MTLSamplerMinMagFilter` value outside the SDK enum.
-    UnknownSamplerFilter(u32),
-    /// `MTLSamplerMipFilter` value outside the SDK enum.
-    UnknownSamplerMipFilter(u32),
-    /// `MTLSamplerAddressMode` value outside the SDK enum.
-    UnknownSamplerAddressMode(u32),
-    /// `MTLSamplerBorderColor` value outside the SDK enum.
-    UnknownSamplerBorderColor(u32),
     /// A texture-view swizzle selector outside the decoded contract's range.
     UnknownSwizzleSelector(u8),
     /// The device does not advertise the requested `VkFormat` as a vertex
@@ -216,10 +208,6 @@ impl crate::observe::Decline for TranslateReason {
             Self::UnknownWinding(_) => "unknown_winding",
             Self::UnknownFillMode(_) => "unknown_fill_mode",
             Self::UnknownDepthClipMode(_) => "unknown_depth_clip_mode",
-            Self::UnknownSamplerFilter(_) => "unknown_sampler_filter",
-            Self::UnknownSamplerMipFilter(_) => "unknown_sampler_mip_filter",
-            Self::UnknownSamplerAddressMode(_) => "unknown_sampler_address_mode",
-            Self::UnknownSamplerBorderColor(_) => "unknown_sampler_border_color",
             Self::UnknownSwizzleSelector(_) => "unknown_swizzle_selector",
             Self::FormatNotVertexBuffer(_) => "format_not_vertex_buffer",
             Self::VertexFormatWidenReadAsFour(_) => "vertex_format_widen_read_as_four",
@@ -256,10 +244,6 @@ impl TranslateReason {
             | Self::UnknownWinding(v)
             | Self::UnknownFillMode(v)
             | Self::UnknownDepthClipMode(v)
-            | Self::UnknownSamplerFilter(v)
-            | Self::UnknownSamplerMipFilter(v)
-            | Self::UnknownSamplerAddressMode(v)
-            | Self::UnknownSamplerBorderColor(v)
             | Self::UnknownVisibilityResultMode(v) => v,
             Self::UnknownSwizzleSelector(v) => u32::from(v),
             Self::FormatNotVertexBuffer(v)
@@ -307,10 +291,6 @@ mod tests {
         TranslateReason::UnknownWinding(0),
         TranslateReason::UnknownFillMode(0),
         TranslateReason::UnknownDepthClipMode(0),
-        TranslateReason::UnknownSamplerFilter(0),
-        TranslateReason::UnknownSamplerMipFilter(0),
-        TranslateReason::UnknownSamplerAddressMode(0),
-        TranslateReason::UnknownSamplerBorderColor(0),
         TranslateReason::UnknownSwizzleSelector(0),
         TranslateReason::FormatNotVertexBuffer(0),
         TranslateReason::VertexFormatWidenReadAsFour(0),
@@ -350,15 +330,11 @@ mod tests {
                 TranslateReason::UnknownWinding(_) => 14,
                 TranslateReason::UnknownFillMode(_) => 15,
                 TranslateReason::UnknownDepthClipMode(_) => 16,
-                TranslateReason::UnknownSamplerFilter(_) => 17,
-                TranslateReason::UnknownSamplerMipFilter(_) => 18,
-                TranslateReason::UnknownSamplerAddressMode(_) => 19,
-                TranslateReason::UnknownSamplerBorderColor(_) => 20,
-                TranslateReason::UnknownSwizzleSelector(_) => 21,
-                TranslateReason::FormatNotVertexBuffer(_) => 22,
-                TranslateReason::VertexFormatWidenReadAsFour(_) => 23,
-                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 24,
-                TranslateReason::UnknownVisibilityResultMode(_) => 25,
+                TranslateReason::UnknownSwizzleSelector(_) => 17,
+                TranslateReason::FormatNotVertexBuffer(_) => 18,
+                TranslateReason::VertexFormatWidenReadAsFour(_) => 19,
+                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 20,
+                TranslateReason::UnknownVisibilityResultMode(_) => 21,
             }
         }
         let mut seen: Vec<usize> = ALL.iter().map(|r| index(*r)).collect();

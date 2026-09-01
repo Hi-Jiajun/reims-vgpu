@@ -9367,29 +9367,33 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.samplers.iter().collect();
         smp_by_binding.sort_unstable_by_key(|s| s.binding);
         for (slot, smp) in sampler_notes.iter_mut().zip(smp_by_binding.iter()) {
-            use crate::backend::vulkan::engine::{
-                SamplerAddressMode as A, SamplerFilter as F, SamplerMipFilter as M,
+            // The ordinals as the guest wrote them, parsed here rather than
+            // carried pre-parsed: `?` is then a real reading — an ordinal
+            // outside the enum — and not a shape this trail cannot express.
+            use reims_vgpu_core::sampler::{AddressMode as A, Filter as F, MipFilter as M};
+            let filter = |ordinal: u32| match F::parse(ordinal) {
+                Some(F::Nearest) => b'N',
+                Some(F::Linear) => b'L',
+                None => b'?',
             };
-            let filter = |f: F| match f {
-                F::Nearest => b'N',
-                F::Linear => b'L',
-            };
-            let address = |a: A| match a {
-                A::ClampToEdge => b'e',
-                A::MirrorClampToEdge => b'E',
-                A::Repeat => b'r',
-                A::MirrorRepeat => b'R',
-                A::ClampToZero => b'z',
-                A::ClampToBorderColor => b'b',
+            let address = |ordinal: u32| match A::parse(ordinal) {
+                Some(A::ClampToEdge) => b'e',
+                Some(A::MirrorClampToEdge) => b'E',
+                Some(A::Repeat) => b'r',
+                Some(A::MirrorRepeat) => b'R',
+                Some(A::ClampToZero) => b'z',
+                Some(A::ClampToBorderColor) => b'b',
+                None => b'?',
             };
             *slot = crate::runtime::gpu_hang_trail::SamplerNote {
                 binding: smp.binding,
                 min_filter: filter(smp.min_filter),
                 mag_filter: filter(smp.mag_filter),
-                mip_filter: match smp.mip_filter {
-                    M::NotMipmapped => b'n',
-                    M::Nearest => b'N',
-                    M::Linear => b'L',
+                mip_filter: match M::parse(smp.mip_filter) {
+                    Some(M::NotMipmapped) => b'n',
+                    Some(M::Nearest) => b'N',
+                    Some(M::Linear) => b'L',
+                    None => b'?',
                 },
                 address_u: address(smp.address_mode_u),
                 address_v: address(smp.address_mode_v),
@@ -13812,57 +13816,19 @@ pub(super) fn vulkan_sampler_resource(
 ) -> Result<crate::backend::vulkan::engine::SamplerResource, DrawPreparationDecline> {
     use crate::backend::vulkan::engine::SamplerResource;
 
+    // The ordinals travel as the guest wrote them. `SamplerShape::checked` in
+    // `reims_vgpu_core::sampler` is the one parse and the one refusal, so a
+    // second decode here would be a second table saying which ordinal means
+    // what — and the two could disagree.
     Ok(SamplerResource {
         binding,
-        min_filter: translate::sampler::filter(sampler.min_filter).map_err(|reason| {
-            DrawPreparationDecline::SamplerMinFilterTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        mag_filter: translate::sampler::filter(sampler.mag_filter).map_err(|reason| {
-            DrawPreparationDecline::SamplerMagFilterTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        mip_filter: translate::sampler::mip_filter(sampler.mip_filter).map_err(|reason| {
-            DrawPreparationDecline::SamplerMipFilterTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        address_mode_u: translate::sampler::address_mode(sampler.s_address).map_err(|reason| {
-            DrawPreparationDecline::SamplerAddressSTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        address_mode_v: translate::sampler::address_mode(sampler.t_address).map_err(|reason| {
-            DrawPreparationDecline::SamplerAddressTTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        address_mode_w: translate::sampler::address_mode(sampler.r_address).map_err(|reason| {
-            DrawPreparationDecline::SamplerAddressRTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        border_color: translate::sampler::border_color(sampler.border_color).map_err(|reason| {
-            DrawPreparationDecline::SamplerBorderColorTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
+        min_filter: sampler.min_filter,
+        mag_filter: sampler.mag_filter,
+        mip_filter: sampler.mip_filter,
+        address_mode_u: sampler.s_address,
+        address_mode_v: sampler.t_address,
+        address_mode_w: sampler.r_address,
+        border_color: sampler.border_color,
         // Metal reuses `MTLCompareFunction` for depth, stencil and sampler
         // compare, so this is `raster`'s table rather than `sampler`'s — one
         // Metal enum, one home.
@@ -13885,15 +13851,16 @@ pub fn reflected_static_sampler_resource(
     binding: u32,
     sampler: metal2vulkan::reflect::StaticSamplerState,
 ) -> Result<crate::backend::vulkan::engine::SamplerResource, DrawPreparationDecline> {
-    use crate::backend::vulkan::engine::{
-        SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-        SamplerMipFilter, SamplerResource,
-    };
+    use crate::backend::vulkan::engine::{SamplerCompareFunction, SamplerResource};
+    // The reflected state becomes the same `MTLSampler*` ordinals a guest
+    // descriptor carries, so both routes into `SamplerResource` reach the one
+    // parse in `reims_vgpu_core::sampler` rather than each carrying its own.
     use metal2vulkan::reflect::{
         SamplerAddressMode as ReflectedAddress, SamplerBorderColor as ReflectedBorder,
         SamplerCompareFunction as ReflectedCompare, SamplerCoordinates,
         SamplerFilter as ReflectedFilter, SamplerMipFilter as ReflectedMip, SamplerReduction,
     };
+    use reims_vgpu_core::sampler as mtl;
 
     if sampler.reduction != SamplerReduction::WeightedAverage {
         return Err(DrawPreparationDecline::StaticSamplerReductionUnsupported {
@@ -13912,8 +13879,8 @@ pub fn reflected_static_sampler_resource(
         });
     }
     let filter = |filter, min| match filter {
-        ReflectedFilter::Nearest => Ok(SamplerFilter::Nearest),
-        ReflectedFilter::Linear => Ok(SamplerFilter::Linear),
+        ReflectedFilter::Nearest => Ok(mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST),
+        ReflectedFilter::Linear => Ok(mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR),
         ReflectedFilter::Bicubic if min => {
             Err(DrawPreparationDecline::StaticSamplerMinFilterUnsupported { stage, binding })
         }
@@ -13922,21 +13889,21 @@ pub fn reflected_static_sampler_resource(
         }
     };
     let mip_filter = match sampler.mip_filter {
-        ReflectedMip::None => SamplerMipFilter::NotMipmapped,
-        ReflectedMip::Nearest => SamplerMipFilter::Nearest,
-        ReflectedMip::Linear => SamplerMipFilter::Linear,
+        ReflectedMip::None => mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        ReflectedMip::Nearest => mtl::MTL_SAMPLER_MIP_FILTER_NEAREST,
+        ReflectedMip::Linear => mtl::MTL_SAMPLER_MIP_FILTER_LINEAR,
     };
     let address = |address| match address {
-        ReflectedAddress::ClampToZero => SamplerAddressMode::ClampToZero,
-        ReflectedAddress::ClampToEdge => SamplerAddressMode::ClampToEdge,
-        ReflectedAddress::Repeat => SamplerAddressMode::Repeat,
-        ReflectedAddress::MirroredRepeat => SamplerAddressMode::MirrorRepeat,
-        ReflectedAddress::ClampToBorder => SamplerAddressMode::ClampToBorderColor,
+        ReflectedAddress::ClampToZero => mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO,
+        ReflectedAddress::ClampToEdge => mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        ReflectedAddress::Repeat => mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+        ReflectedAddress::MirroredRepeat => mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT,
+        ReflectedAddress::ClampToBorder => mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR,
     };
     let border_color = match sampler.border_color {
-        ReflectedBorder::TransparentBlack => SamplerBorderColor::TransparentBlack,
-        ReflectedBorder::OpaqueBlack => SamplerBorderColor::OpaqueBlack,
-        ReflectedBorder::OpaqueWhite => SamplerBorderColor::OpaqueWhite,
+        ReflectedBorder::TransparentBlack => mtl::MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK,
+        ReflectedBorder::OpaqueBlack => mtl::MTL_SAMPLER_BORDER_COLOR_OPAQUE_BLACK,
+        ReflectedBorder::OpaqueWhite => mtl::MTL_SAMPLER_BORDER_COLOR_OPAQUE_WHITE,
     };
     let compare_function = match sampler.compare_function {
         ReflectedCompare::None | ReflectedCompare::Never => SamplerCompareFunction::Never,

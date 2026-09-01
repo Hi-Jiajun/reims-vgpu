@@ -1363,68 +1363,32 @@ fn pass_exit_scope_narrow() -> bool {
     })
 }
 
-/// The guest's sampler request, made legal for `vkCreateSampler`.
+/// The guest's sampler declaration, in the vocabulary of the layer that owns
+/// what a wire tag means.
 ///
-/// # Why this exists
-///
-/// Metal lets `coord::pixel` sit beside any filter, any address mode, any
-/// anisotropy and any compare function. Vulkan makes six of those combinations
-/// **invalid usage** — undefined behaviour inside the driver, not an error code
-/// this device gets to see. Only the LOD pair was honoured here, so a guest
-/// sampler with pixel coordinates and, say, `address::repeat` or a linear mip
-/// filter built an invalid `VkSampler` on every host and every rail.
-///
-/// # Why conforming is correct for five of the six, and not a silent degradation
-///
-/// Vulkan also forbids an unnormalized sampler being reached by any
-/// implicit-LOD, `Proj` or `Dref` instruction
-/// (`VUID-vkCmdDispatch-None-08610`). What is left can only sample at an
-/// explicit level 0 with no derivatives, so each of these five changes nothing
-/// the guest can observe:
-///
-/// - `-01072` `minFilter == magFilter` — no minification path exists, so
-///   `magFilter` is the filter that ever applies;
-/// - `-01073` `mipmapMode == NEAREST` and `-01074` `minLod == maxLod == 0` —
-///   only level 0 is reachable (the LOD pair is forced by the caller);
-/// - `-01076` `anisotropyEnable == VK_FALSE` — anisotropy is computed from
-///   derivatives such a sample cannot carry;
-/// - `-01075` `addressModeU`/`V` must clamp — Metal restricts `coord::pixel` to
-///   `clamp_to_edge`/`clamp_to_zero` itself, so any other mode is a descriptor
-///   Metal would not have honoured either.
-///
-/// `addressModeW` is left alone on purpose: `-01075` names U and V only, because
-/// an unnormalized sampler may only read a 2D view.
-///
-/// The sixth is `compareEnable`, and it is **not** in that class — dropping the
-/// compare returns the sampled value instead of the comparison, which is a
-/// different picture. That one is returned as a typed refusal.
-///
-/// A normalized sampler is returned unchanged; every branch here is gated on
-/// `unnormalized_coordinates`.
-fn vulkan_conformed_sampler(
-    key: &SamplerStateKey,
-) -> Result<SamplerStateKey, super::reason::DrawReason> {
-    use super::types::{SamplerAddressMode as A, SamplerCompareFunction, SamplerMipFilter};
-    if !key.unnormalized_coordinates {
-        return Ok(*key);
+/// `key` is the guest's request and stays the cache index, so the cache and the
+/// negative cache still answer for what was asked for; this is a projection of
+/// it and is never written back.
+fn sampler_shape(key: &SamplerStateKey) -> reims_vgpu_core::sampler::SamplerShape {
+    reims_vgpu_core::sampler::SamplerShape {
+        min_filter: key.min_filter,
+        mag_filter: key.mag_filter,
+        mip_filter: key.mip_filter,
+        s_address: key.address_mode_u,
+        t_address: key.address_mode_v,
+        r_address: key.address_mode_w,
+        max_anisotropy: key.max_anisotropy,
+        lod_min_clamp: f32::from_bits(key.lod_min),
+        lod_max_clamp: f32::from_bits(key.lod_max),
+        compare_function: key.compare_function.mtl_ordinal(),
+        // Metal's descriptor has no separate flag and this key does not either:
+        // a sampler that compares with `Never` and one that does not compare
+        // are indistinguishable by the time they reach here, and `Never` is
+        // Metal's own default for the field.
+        compare_enabled: key.compare_function != super::types::SamplerCompareFunction::Never,
+        border_color: key.border_color,
+        normalized_coordinates: !key.unnormalized_coordinates,
     }
-    if key.compare_function != SamplerCompareFunction::Never {
-        return Err(super::reason::DrawReason::SamplerUnnormalizedCompare);
-    }
-    let clamped = |mode: A| match mode {
-        A::ClampToEdge | A::ClampToZero | A::ClampToBorderColor => mode,
-        _ => A::ClampToEdge,
-    };
-    Ok(SamplerStateKey {
-        min_filter: key.mag_filter,
-        mip_filter: SamplerMipFilter::Nearest,
-        address_mode_u: clamped(key.address_mode_u),
-        address_mode_v: clamped(key.address_mode_v),
-        max_anisotropy: 1,
-        lod_min: 0.0f32.to_bits(),
-        lod_max: 0.0f32.to_bits(),
-        ..*key
-    })
 }
 
 impl ObjectCaches {
@@ -2025,74 +1989,44 @@ impl ObjectCaches {
             return Ok(s);
         }
         counters.sampler_misses.fetch_add(1, Ordering::Relaxed);
-        // Everything below is built from the *conformed* key, never from `key`
-        // itself; `key` stays the guest's request so the cache and the negative
-        // cache still index what was asked for.
-        let conformed = match vulkan_conformed_sampler(key) {
-            Ok(k) => k,
-            Err(reason) => {
-                crate::observe::Emit::decline("vk_engine_sampler", &reason)
-                    .field("compare_function", format!("{:?}", key.compare_function))
-                    .fail();
-                let err = DrawError::Unsupported(reason);
+        let shape = sampler_shape(key);
+        let state = match shape.checked() {
+            Ok(state) => state,
+            Err(refusal) => {
+                crate::observe::Emit::decline("vk_engine_sampler", &refusal).fail();
+                let err =
+                    DrawError::Unsupported(super::reason::DrawReason::SamplerDeclaration(refusal));
                 self.samplers.insert_negative(*key, err.clone());
                 return Err(err);
             }
         };
-        // One line per distinct unnormalized sampler this boot creates — the
-        // cache is what bounds it, so a workload with three such samplers logs
-        // three lines however many million binds it does.
+        // One line per distinct conformed sampler this boot creates — the cache
+        // is what bounds it, so a workload with three of them logs three lines
+        // however many million binds it does.
         //
         // # What this is measuring, and why it is not a decline
         //
-        // `VUID-vkCmdDispatch-None-08610`/`-08611` forbid an unnormalized sampler
-        // being *used* by an implicit-LOD, `Proj`, `Dref`, `Bias` or `Offset`
-        // sample, and `-08611` is the one violation a driven macos-11 boot under
-        // the Khronos validation layer still reports after every other one here
-        // was fixed. That is a property of the SPIR-V instruction, so this device
-        // cannot repair it — but it can say which samplers are candidates.
-        //
-        // `metal2vulkan` already emulates pixel-coordinate sampling in-shader
-        // rather than emitting `OpImageSample`, on three arms — a per-tap
-        // fetch-and-lerp for linear, a bicubic one, and a plain fetch for
-        // integer/nearest/arrayed. **All three of its predicates require
-        // `min_filter == mag_filter`**, so a pixel-coordinate sampler with
-        // *mixed* filters matches none of them and falls through to a real
-        // `OpImageSample` against the unnormalized sampler. `min_mag_differed`
-        // is therefore the field to read: a boot that logs it has the shape that
-        // produces the VUID, and a boot that never does has ruled it out.
-        // Logged for *every* unnormalized sampler and not only the conformed
-        // ones, so a boot's line count is the population and the `conformed`
-        // field splits it. Reading only the conformed ones would miss exactly
-        // the samplers the translator handles correctly, which is the control.
+        // `VUID-vkCmdDispatch-None-08610`/`-08611` forbid an unnormalized
+        // sampler being *used* by an implicit-LOD, `Proj`, `Dref`, `Bias` or
+        // `Offset` sample, and `-08611` is the one violation a driven macos-11
+        // boot under the Khronos validation layer still reports after every
+        // other one here was fixed. That is a property of the SPIR-V
+        // instruction, so this device cannot repair it — but it can say which
+        // samplers are candidates.
         //
         // # The VUID is real and it is **not** what hangs this GPU
         //
-        // Both halves are measured, and the second one is why this stayed a
-        // census rather than becoming a repair. A driven macos-11 boot logs
-        // `min_mag_differed=false` on every unnormalized sampler it creates, so
-        // the mixed-filter shape above is not how this workload reaches the
-        // VUID — a *dynamically* bound `MTLSamplerState` is, because
-        // `metal2vulkan` intercepts only samplers whose state it knows at
-        // translate time and a runtime-bound one is invisible to it.
-        //
-        // A probe then forced `unnormalized_coordinates` false here, which makes
-        // `-08611` unreachable by construction: Maps froze anyway, with the same
-        // two device recreates. So the violation is a passenger. Do not spend
-        // another boot treating it as the hang, and do not read a future
-        // `sampler_unnormalized` line as one — it says a sampler exists, not
-        // that a frame was lost.
-        //
-        // Repairing it properly still needs the offset folded into the
-        // coordinate, which is exact only for an unnormalized sampler and so
-        // needs the normalization known at translate time. That is a
-        // `metal2vulkan` input this device does not currently supply.
-        if key.unnormalized_coordinates {
+        // A probe forced `unnormalized_coordinates` false here, which makes
+        // `-08611` unreachable by construction: the workload froze anyway, with
+        // the same two device recreates. So the violation is a passenger. Do not
+        // read a future `sampler_unnormalized` line as a lost frame — it says a
+        // sampler exists whose declaration was brought inside the restriction
+        // both APIs place on it, and nothing about what was drawn with it.
+        if state.unnormalized_conformed() {
             crate::observe::off(format!(
-                "sampler_unnormalized min_mag_differed={} conformed={} \
-                 min={:?} mag={:?} mip={:?} address_u={:?} address_v={:?} aniso={}",
+                "sampler_unnormalized min_mag_differed={} \
+                 min={} mag={} mip={} address_u={} address_v={} aniso={}",
                 key.min_filter != key.mag_filter,
-                conformed != *key,
                 key.min_filter,
                 key.mag_filter,
                 key.mip_filter,
@@ -2101,96 +2035,26 @@ impl ObjectCaches {
                 key.max_anisotropy,
             ));
         }
-        let not_mipmapped = conformed.mip_filter == super::types::SamplerMipFilter::NotMipmapped;
-        let (min_lod, max_lod) = if conformed.unnormalized_coordinates || not_mipmapped {
-            (0.0, 0.0)
-        } else {
-            (
-                f32::from_bits(conformed.lod_min),
-                f32::from_bits(conformed.lod_max),
-            )
+        let plan = match reims_vgpu_vulkan::sampler::plan(state, ctx.sampler_cell()) {
+            Ok(plan) => plan,
+            Err(refusal) => {
+                // Fail-visible here, at the check, and exactly once per sampler
+                // key: the negative cache means a replay returns without
+                // reaching this line, and the returned `DrawError` reaches the
+                // log only if some caller happens to render it.
+                crate::observe::Emit::decline("vk_engine_sampler", &refusal).fail();
+                // The negative cache stores the typed `DrawError`, so a replay
+                // returns this exact decline — slug and all — not a re-rendered
+                // `Vulkan(String)` that would drop the reason to
+                // `vk_engine_vk_untyped`.
+                let err = DrawError::Unsupported(super::reason::DrawReason::SamplerDevice(refusal));
+                self.samplers.insert_negative(*key, err.clone());
+                return Err(err);
+            }
         };
-        let unnorm = conformed.unnormalized_coordinates;
-        let mag_filter = conformed.mag_filter;
-        let min_filter = conformed.min_filter;
-        let mip_filter = conformed.mip_filter;
-        let address_mode_u = conformed.address_mode_u;
-        let address_mode_v = conformed.address_mode_v;
-        let max_anisotropy_req = conformed.max_anisotropy;
-        let compare_function = conformed.compare_function;
-        // `address_mode_w` is deliberately not clamped: `-01075` names U and V
-        // only, because an unnormalized sampler may only read a 2D view.
-        let address_uses_zero = [address_mode_u, address_mode_v, conformed.address_mode_w]
-            .contains(&super::types::SamplerAddressMode::ClampToZero);
-        if max_anisotropy_req > 1 && !ctx.sampler_anisotropy {
-            let reason = super::reason::DrawReason::SamplerAnisotropyUnsupported;
-            // Fail-visible here, at the check, and exactly once per sampler key:
-            // the negative cache means a replay returns without reaching this
-            // line, and the returned `DrawError` reaches the log only if some
-            // caller happens to render it. A capability the host GPU lacks is
-            // precisely the class says must
-            // never surface as a silently different sampler.
-            crate::observe::Emit::decline("vk_engine_sampler", &reason)
-                .field("max_anisotropy", max_anisotropy_req)
-                .fail();
-            // The negative cache stores the typed `DrawError`, so a replay
-            // returns this exact decline — slug and all — not a re-rendered
-            // `Vulkan(String)` that would drop the reason to `vk_engine_vk_untyped`.
-            let err = DrawError::Unsupported(reason);
-            self.samplers.insert_negative(*key, err.clone());
-            return Err(err);
-        }
-        // `MTLSamplerAddressModeMirrorClampToEdge` translates to
-        // `MIRROR_CLAMP_TO_EDGE`, which needs either the Vulkan 1.2 feature or
-        // `VK_KHR_sampler_mirror_clamp_to_edge`. Until this check existed the
-        // mode was bound with neither requested — the sampler was created with
-        // something the device had not been asked for. Same shape as the
-        // anisotropy check above: capability question, typed decline, cached.
-        //
-        // Read against the conformed modes, not the requested ones: an
-        // unnormalized sampler's U and V are already clamped above, so declining
-        // there would refuse a mode this device is not going to bind.
-        let uses_mirror_clamp = [address_mode_u, address_mode_v, conformed.address_mode_w]
-            .contains(&super::types::SamplerAddressMode::MirrorClampToEdge);
-        if uses_mirror_clamp && !ctx.features.mirror_clamp_to_edge.is_available() {
-            let reason = super::reason::DrawReason::SamplerMirrorClampToEdgeUnsupported;
-            crate::observe::Emit::decline("vk_engine_sampler", &reason)
-                .field("address_u", format!("{address_mode_u:?}"))
-                .field("address_v", format!("{address_mode_v:?}"))
-                .field("address_w", format!("{:?}", conformed.address_mode_w))
-                .fail();
-            let err = DrawError::Unsupported(reason);
-            self.samplers.insert_negative(*key, err.clone());
-            return Err(err);
-        }
-        // Not floored here: every producer of this key either writes a literal
-        // 1 (the reflected static sampler) or carries a decoded
-        // `SamplerDescriptor`, which `decode_sampler_descriptor` already floors.
-        let max_anisotropy = (max_anisotropy_req as f32).min(ctx.max_sampler_anisotropy);
         let sampler = ctx
             .device
-            .create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(mag_filter.vk())
-                    .min_filter(min_filter.vk())
-                    .mipmap_mode(mip_filter.vk())
-                    .address_mode_u(address_mode_u.vk())
-                    .address_mode_v(address_mode_v.vk())
-                    .address_mode_w(conformed.address_mode_w.vk())
-                    .mip_lod_bias(0.0)
-                    .anisotropy_enable(max_anisotropy_req > 1)
-                    .max_anisotropy(max_anisotropy)
-                    .compare_enable(compare_function != super::types::SamplerCompareFunction::Never)
-                    .compare_op(compare_function.vk())
-                    .min_lod(min_lod)
-                    .max_lod(max_lod)
-                    .border_color(translate::sampler::vk_border_color_with_clamp_to_zero(
-                        conformed.border_color,
-                        address_uses_zero,
-                    ))
-                    .unnormalized_coordinates(unnorm),
-                None,
-            )
+            .create_sampler(&plan.create_info(), None)
             .map_err(|e| {
                 let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateSampler, e));
                 self.samplers.insert_negative(*key, err.clone());
@@ -3111,19 +2975,16 @@ mod object_cache_tests {
     }
 
     fn unnormalized_key() -> SamplerStateKey {
-        use super::super::types::{
-            SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-            SamplerMipFilter,
-        };
+        use reims_vgpu_core::sampler as mtl;
         SamplerStateKey {
-            min_filter: SamplerFilter::Nearest,
-            mag_filter: SamplerFilter::Linear,
-            mip_filter: SamplerMipFilter::Linear,
-            address_mode_u: SamplerAddressMode::Repeat,
-            address_mode_v: SamplerAddressMode::MirrorRepeat,
-            address_mode_w: SamplerAddressMode::Repeat,
-            border_color: SamplerBorderColor::TransparentBlack,
-            compare_function: SamplerCompareFunction::Never,
+            min_filter: mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+            mag_filter: mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+            mip_filter: mtl::MTL_SAMPLER_MIP_FILTER_LINEAR,
+            address_mode_u: mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+            address_mode_v: mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT,
+            address_mode_w: mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+            border_color: mtl::MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK,
+            compare_function: super::super::types::SamplerCompareFunction::Never,
             lod_min: 1.0f32.to_bits(),
             lod_max: 8.0f32.to_bits(),
             max_anisotropy: 16,
@@ -3131,66 +2992,104 @@ mod object_cache_tests {
         }
     }
 
-    /// Every constraint `vkCreateSampler` puts on `unnormalizedCoordinates`, on a
-    /// key that violates all of them at once. Without the conform this builds a
-    /// sampler whose behaviour is undefined rather than wrong, so there is no
-    /// error code and no log line to notice it by.
+    /// Every constraint `vkCreateSampler` puts on `unnormalizedCoordinates`, on
+    /// a key that violates all of them at once.
+    ///
+    /// This site owns neither the conformance nor the Vulkan spelling any more
+    /// — `reims_vgpu_core::sampler` conforms the declaration and
+    /// `reims_vgpu_vulkan::sampler` plans it, and each has its own tests. What
+    /// it owns is the *join*: that the key this cache is indexed by reaches
+    /// those two as the declaration the guest actually wrote. A projection that
+    /// silently swapped two axes would pass every test on either side of it.
     #[test]
-    fn an_unnormalized_sampler_is_conformed_on_every_constraint_vulkan_states() {
-        use super::super::types::{SamplerAddressMode, SamplerFilter, SamplerMipFilter};
-        let got = vulkan_conformed_sampler(&unnormalized_key()).expect("no compare function");
-        // -01072: minFilter == magFilter, and it is magFilter that survives.
-        assert_eq!(got.min_filter, SamplerFilter::Linear);
-        assert_eq!(got.mag_filter, SamplerFilter::Linear);
-        // -01073
-        assert_eq!(got.mip_filter, SamplerMipFilter::Nearest);
-        // -01074
-        assert_eq!(f32::from_bits(got.lod_min), 0.0);
-        assert_eq!(f32::from_bits(got.lod_max), 0.0);
-        // -01075, U and V only.
-        assert_eq!(got.address_mode_u, SamplerAddressMode::ClampToEdge);
-        assert_eq!(got.address_mode_v, SamplerAddressMode::ClampToEdge);
-        assert_eq!(got.address_mode_w, SamplerAddressMode::Repeat);
-        // -01076
-        assert_eq!(got.max_anisotropy, 1);
-        assert!(got.unnormalized_coordinates);
+    fn the_key_reaches_the_owning_layers_as_a_plannable_sampler() {
+        let plan = reims_vgpu_vulkan::sampler::plan(
+            sampler_shape(&unnormalized_key())
+                .checked()
+                .expect("an unnormalized declaration is conformed, not refused"),
+            reims_vgpu_vulkan::sampler::SamplerCell {
+                mirror_clamp_to_edge: true,
+                anisotropy: true,
+                max_anisotropy: 16.0,
+            },
+        )
+        .expect("a plannable sampler");
+        assert!(plan.unnormalized_coordinates);
+        // -01072, and it is magFilter that survives.
+        assert_eq!(plan.min_filter, ash::vk::Filter::LINEAR);
+        assert_eq!(plan.mag_filter, ash::vk::Filter::LINEAR);
+        // -01073, -01074, -01076.
+        assert_eq!(plan.mipmap_mode, ash::vk::SamplerMipmapMode::NEAREST);
+        assert_eq!((plan.min_lod, plan.max_lod), (0.0, 0.0));
+        assert!(!plan.anisotropy_enable);
+        // -01075, U and V.
+        assert_eq!(plan.address[0], ash::vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        assert_eq!(plan.address[1], ash::vk::SamplerAddressMode::CLAMP_TO_EDGE);
     }
 
-    /// A clamping mode the guest chose deliberately is kept, so the conform
-    /// cannot be read as "unnormalized means clamp-to-edge".
+    /// The projection carries the guest's axes in the guest's order.
+    ///
+    /// Three distinct modes, because a swap of two axes is the failure this
+    /// catches and a key whose axes agree could not show one.
     #[test]
-    fn a_conformed_unnormalized_sampler_keeps_a_clamp_mode_that_was_already_legal() {
-        use super::super::types::SamplerAddressMode;
+    fn the_projection_carries_each_axis_to_the_field_that_means_it() {
+        use reims_vgpu_core::sampler as mtl;
         let mut key = unnormalized_key();
-        key.address_mode_u = SamplerAddressMode::ClampToZero;
-        key.address_mode_v = SamplerAddressMode::ClampToBorderColor;
-        let got = vulkan_conformed_sampler(&key).expect("no compare function");
-        assert_eq!(got.address_mode_u, SamplerAddressMode::ClampToZero);
-        assert_eq!(got.address_mode_v, SamplerAddressMode::ClampToBorderColor);
+        key.unnormalized_coordinates = false;
+        key.address_mode_u = mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT;
+        key.address_mode_v = mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT;
+        key.address_mode_w = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        let shape = sampler_shape(&key);
+        assert_eq!(shape.s_address, mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT);
+        assert_eq!(shape.t_address, mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT);
+        assert_eq!(shape.r_address, mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        assert!(shape.normalized_coordinates);
+        assert_eq!(shape.min_filter, key.min_filter);
+        assert_eq!(shape.mag_filter, key.mag_filter);
+        assert_eq!(shape.lod_min_clamp, 1.0);
+        assert_eq!(shape.lod_max_clamp, 8.0);
+    }
+
+    /// This key has no separate "compares" flag and the protocol shape does, so
+    /// the projection has to supply one. `Never` is Metal's default for a
+    /// sampler that does not compare, and it is the only value that may mean
+    /// "off" — every other function is a comparison the guest asked for.
+    #[test]
+    fn a_comparison_is_enabled_for_every_function_except_metals_default() {
+        use super::super::types::SamplerCompareFunction as C;
+        for function in [
+            C::Never,
+            C::Less,
+            C::Equal,
+            C::LessEqual,
+            C::Greater,
+            C::NotEqual,
+            C::GreaterEqual,
+            C::Always,
+        ] {
+            let mut key = unnormalized_key();
+            key.unnormalized_coordinates = false;
+            key.compare_function = function;
+            let shape = sampler_shape(&key);
+            assert_eq!(shape.compare_enabled, function != C::Never, "{function:?}");
+            assert_eq!(shape.compare_function, function.mtl_ordinal());
+        }
     }
 
     /// `-01077` is the one constraint that is not observationally neutral, so it
-    /// is a named refusal and not a repair.
+    /// stays a named refusal and never becomes a repair.
     #[test]
     fn an_unnormalized_sampler_with_a_compare_function_is_refused_by_name() {
-        use super::super::types::SamplerCompareFunction;
         use crate::observe::Decline as _;
         let mut key = unnormalized_key();
-        key.compare_function = SamplerCompareFunction::LessEqual;
-        let reason = vulkan_conformed_sampler(&key).expect_err("compare is refused");
-        assert_eq!(reason.slug(), "sampler_unnormalized_compare");
-    }
-
-    /// The conform is gated on the unnormalized bit and touches nothing else — a
-    /// normalized sampler with mips, anisotropy, repeat addressing and a compare
-    /// function is what the great majority of guest binds are.
-    #[test]
-    fn a_normalized_sampler_passes_through_the_conform_untouched() {
-        use super::super::types::SamplerCompareFunction;
-        let mut key = unnormalized_key();
-        key.unnormalized_coordinates = false;
-        key.compare_function = SamplerCompareFunction::Less;
-        assert_eq!(vulkan_conformed_sampler(&key).expect("normalized"), key);
+        key.compare_function = super::super::types::SamplerCompareFunction::LessEqual;
+        let refusal = sampler_shape(&key)
+            .checked()
+            .expect_err("a comparison under pixel coordinates is refused");
+        assert_eq!(
+            super::super::reason::DrawReason::SamplerDeclaration(refusal).slug(),
+            "sampler_unnormalized_restriction"
+        );
     }
 
     #[test]

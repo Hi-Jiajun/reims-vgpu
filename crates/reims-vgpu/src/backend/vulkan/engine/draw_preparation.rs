@@ -192,41 +192,6 @@ pub enum DrawPreparationDecline {
         tag: Option<u32>,
         declared_len: Option<u32>,
     },
-    SamplerMinFilterTranslation {
-        sampler_ref: u32,
-        binding: u32,
-        reason: TranslateReason,
-    },
-    SamplerMagFilterTranslation {
-        sampler_ref: u32,
-        binding: u32,
-        reason: TranslateReason,
-    },
-    SamplerMipFilterTranslation {
-        sampler_ref: u32,
-        binding: u32,
-        reason: TranslateReason,
-    },
-    SamplerAddressSTranslation {
-        sampler_ref: u32,
-        binding: u32,
-        reason: TranslateReason,
-    },
-    SamplerAddressTTranslation {
-        sampler_ref: u32,
-        binding: u32,
-        reason: TranslateReason,
-    },
-    SamplerAddressRTranslation {
-        sampler_ref: u32,
-        binding: u32,
-        reason: TranslateReason,
-    },
-    SamplerBorderColorTranslation {
-        sampler_ref: u32,
-        binding: u32,
-        reason: TranslateReason,
-    },
     SamplerCompareFunctionTranslation {
         sampler_ref: u32,
         binding: u32,
@@ -349,21 +314,6 @@ impl Decline for DrawPreparationDecline {
             }
             Self::SamplerDescriptorUnsupported { .. } => {
                 "draw_prepare_sampler_descriptor_unsupported"
-            }
-            Self::SamplerMinFilterTranslation { .. } => {
-                "draw_prepare_sampler_min_filter_translation"
-            }
-            Self::SamplerMagFilterTranslation { .. } => {
-                "draw_prepare_sampler_mag_filter_translation"
-            }
-            Self::SamplerMipFilterTranslation { .. } => {
-                "draw_prepare_sampler_mip_filter_translation"
-            }
-            Self::SamplerAddressSTranslation { .. } => "draw_prepare_sampler_address_s_translation",
-            Self::SamplerAddressTTranslation { .. } => "draw_prepare_sampler_address_t_translation",
-            Self::SamplerAddressRTranslation { .. } => "draw_prepare_sampler_address_r_translation",
-            Self::SamplerBorderColorTranslation { .. } => {
-                "draw_prepare_sampler_border_color_translation"
             }
             Self::SamplerCompareFunctionTranslation { .. } => {
                 "draw_prepare_sampler_compare_function_translation"
@@ -661,42 +611,7 @@ impl Decline for DrawPreparationDecline {
                 ("binding", binding.to_string()),
                 ("object_type", object_type.to_string()),
             ],
-            Self::SamplerMinFilterTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-            | Self::SamplerMagFilterTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-            | Self::SamplerMipFilterTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-            | Self::SamplerAddressSTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-            | Self::SamplerAddressTTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-            | Self::SamplerAddressRTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-            | Self::SamplerBorderColorTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-            | Self::SamplerCompareFunctionTranslation {
+            Self::SamplerCompareFunctionTranslation {
                 sampler_ref,
                 binding,
                 reason,
@@ -913,41 +828,6 @@ mod tests {
                 tag: Some(9),
                 declared_len: Some(32),
             },
-            DrawPreparationDecline::SamplerMinFilterTranslation {
-                sampler_ref: 5,
-                binding: 64,
-                reason: TranslateReason::UnknownSamplerFilter(9),
-            },
-            DrawPreparationDecline::SamplerMagFilterTranslation {
-                sampler_ref: 5,
-                binding: 64,
-                reason: TranslateReason::UnknownSamplerFilter(9),
-            },
-            DrawPreparationDecline::SamplerMipFilterTranslation {
-                sampler_ref: 5,
-                binding: 64,
-                reason: TranslateReason::UnknownSamplerMipFilter(9),
-            },
-            DrawPreparationDecline::SamplerAddressSTranslation {
-                sampler_ref: 5,
-                binding: 64,
-                reason: TranslateReason::UnknownSamplerAddressMode(9),
-            },
-            DrawPreparationDecline::SamplerAddressTTranslation {
-                sampler_ref: 5,
-                binding: 64,
-                reason: TranslateReason::UnknownSamplerAddressMode(9),
-            },
-            DrawPreparationDecline::SamplerAddressRTranslation {
-                sampler_ref: 5,
-                binding: 64,
-                reason: TranslateReason::UnknownSamplerAddressMode(9),
-            },
-            DrawPreparationDecline::SamplerBorderColorTranslation {
-                sampler_ref: 5,
-                binding: 64,
-                reason: TranslateReason::UnknownSamplerBorderColor(9),
-            },
             DrawPreparationDecline::SamplerCompareFunctionTranslation {
                 sampler_ref: 5,
                 binding: 64,
@@ -995,7 +875,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 43, "the draw-preparation reason census moved");
+        assert_eq!(before, 36, "the draw-preparation reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-preparation slug");
     }
 

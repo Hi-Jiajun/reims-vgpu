@@ -74,6 +74,24 @@ impl Refusal {
     }
 }
 
+/// The always-on failure channel's view of a refusal.
+///
+/// Implemented here rather than at the call site, so the slug and the values
+/// behind it travel with the refusal: a consumer that had to spell them would
+/// be a second account of one event, and a second consumer a third.
+impl reims_vgpu_observe::Decline for Refusal {
+    fn slug(&self) -> &'static str {
+        (*self).slug()
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::TwoBorders { declared } => vec![("declared", declared.name().to_string())],
+            Self::NoMirrorClampToEdge => Vec::new(),
+        }
+    }
+}
+
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -598,6 +616,82 @@ mod tests {
         assert!(!plan.anisotropy_enable);
         assert!(!plan.compare_enable);
         assert_eq!(plan.min_filter, plan.mag_filter);
+    }
+
+    /// Every unnormalized declaration the protocol layer admits plans to a
+    /// sampler Vulkan will create.
+    ///
+    /// A sweep rather than a case, because the six restrictions
+    /// `VkSamplerCreateInfo` places on `unnormalizedCoordinates` are checked
+    /// by the driver and not by this type: one declaration that reaches
+    /// `vkCreateSampler` breaking any of them is an invalid call. The protocol
+    /// layer conforms the declaration and this asserts the conformance is the
+    /// one Vulkan asks for — the two are stated in different vocabularies, so
+    /// agreement between them is not something either side can assume.
+    ///
+    /// Every axis mode, both filters and every mip filter, against a device
+    /// that offers everything — the permissive cell, because a capability that
+    /// refuses is a refusal and this is about the declarations that plan.
+    #[test]
+    fn every_unnormalized_declaration_that_plans_satisfies_the_vulkan_rules() {
+        let modes = [
+            MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            MTL_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
+            MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+            MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT,
+            MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO,
+        ];
+        let mut planned_count = 0usize;
+        for s_address in modes {
+            for t_address in modes {
+                for min_filter in [
+                    MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+                    MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+                ] {
+                    for mip_filter in [
+                        MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+                        MTL_SAMPLER_MIP_FILTER_NEAREST,
+                        MTL_SAMPLER_MIP_FILTER_LINEAR,
+                    ] {
+                        let plan = planned(
+                            SamplerShape {
+                                min_filter,
+                                mag_filter: MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+                                mip_filter,
+                                s_address,
+                                t_address,
+                                r_address: MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+                                max_anisotropy: 16,
+                                lod_min_clamp: 1.0,
+                                lod_max_clamp: 9.0,
+                                normalized_coordinates: false,
+                                ..shape()
+                            },
+                            all(),
+                        )
+                        .expect("an unnormalized declaration the protocol admits");
+                        planned_count += 1;
+                        // `-01072`, `-01073`, `-01074`, `-01076`, `-01077`.
+                        assert_eq!(plan.min_filter, plan.mag_filter);
+                        assert_eq!(plan.mipmap_mode, vk::SamplerMipmapMode::NEAREST);
+                        assert_eq!((plan.min_lod, plan.max_lod), (0.0, 0.0));
+                        assert!(!plan.anisotropy_enable);
+                        assert!(!plan.compare_enable);
+                        // `-01075`, which names U and V and not W: an
+                        // unnormalized sampler reads a 2D view, so the third
+                        // axis is never consulted and is not restricted.
+                        for axis in &plan.address[..2] {
+                            assert!(
+                                *axis == vk::SamplerAddressMode::CLAMP_TO_EDGE
+                                    || *axis == vk::SamplerAddressMode::CLAMP_TO_BORDER,
+                                "address {axis:?} is not one -01075 allows"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(planned_count, modes.len() * modes.len() * 2 * 3);
     }
 
     #[test]

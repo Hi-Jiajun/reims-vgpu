@@ -1147,6 +1147,7 @@ dependencies = [
  "parking_lot",
  "raw-window-handle",
  "reims-vgpu-config",
+ "reims-vgpu-core",
  "reims-vgpu-memory",
  "reims-vgpu-observe",
  "reims-vgpu-paging",
