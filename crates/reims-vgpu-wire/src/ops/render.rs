@@ -1221,10 +1221,10 @@ pub const OPCODE_USE_HEAP: u32 = 0x1b;
 /// `useHeaps:count:` / `useResources:count:usage:` are declared on the encoder
 /// base class and inherited by every encoder including this one; they emit
 /// `0x86` / `0x87`, with a four-byte and an eight-byte head respectively, and
-/// this module has no view for either. `runtime::decode::compute` does decode
-/// them; see the inheritance caveat in [`crate::manifest`] for why the coverage
-/// instrument cannot see the selectors behind them, and why a reader checking
-/// only the render encoder's own method list concludes they have none.
+/// are [`UseHeapsNoStages`] and [`UseResourcesNoStages`] below. See the
+/// inheritance caveat in [`crate::manifest`] for why the coverage instrument
+/// cannot see the selectors behind them, and why a reader checking only the
+/// render encoder's own method list concludes they have none.
 #[repr(C)]
 #[derive(Debug)]
 pub struct UseHeap {

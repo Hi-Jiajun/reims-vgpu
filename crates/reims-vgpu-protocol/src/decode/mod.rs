@@ -25,6 +25,7 @@
 pub mod blit;
 pub mod compute;
 pub mod render;
+pub mod residency;
 pub mod resource_state;
 pub mod sync;
 
