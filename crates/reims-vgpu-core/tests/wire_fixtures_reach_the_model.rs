@@ -583,8 +583,8 @@ fn a_draw_declares_the_memory_apples_own_bind_records_named() {
     use reims_vgpu_protocol::segment::{SegmentKind, SegmentLifetime};
     use reims_vgpu_wire::ops::render::{
         is_buffer_bind, OPCODE_DRAW, OPCODE_SET_FRAGMENT_SAMPLER, OPCODE_SET_FRAGMENT_SAMPLER_LOD,
-        OPCODE_SET_FRAGMENT_TEXTURE, OPCODE_SET_VERTEX_SAMPLER, OPCODE_SET_VERTEX_SAMPLER_LOD,
-        OPCODE_SET_VERTEX_TEXTURE,
+        OPCODE_SET_FRAGMENT_TEXTURE, OPCODE_SET_VERTEX_BUFFER_STRIDE, OPCODE_SET_VERTEX_SAMPLER,
+        OPCODE_SET_VERTEX_SAMPLER_LOD, OPCODE_SET_VERTEX_TEXTURE,
     };
 
     /// Whether a bind of this opcode puts memory in a draw's footprint.
@@ -596,10 +596,17 @@ fn a_draw_declares_the_memory_apples_own_bind_records_named() {
         use reims_vgpu_wire::ops::compute;
         match rail {
             Rail::Render => {
+                // The strided vertex bind is a buffer bind that
+                // `is_buffer_bind` does not answer for: it is a different
+                // opcode with a different entry layout, and it is the only
+                // record whose stage is fixed by the API rather than by the
+                // opcode pair.
                 if is_buffer_bind(opcode)
                     || matches!(
                         opcode,
-                        OPCODE_SET_VERTEX_TEXTURE | OPCODE_SET_FRAGMENT_TEXTURE
+                        OPCODE_SET_VERTEX_TEXTURE
+                            | OPCODE_SET_FRAGMENT_TEXTURE
+                            | OPCODE_SET_VERTEX_BUFFER_STRIDE
                     )
                 {
                     return Some(true);
