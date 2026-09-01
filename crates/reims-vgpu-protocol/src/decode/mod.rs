@@ -41,7 +41,7 @@ use crate::closure::Rail;
 /// the wire comes through the layer that assigned the meaning. An element type
 /// is a layout with no meaning of its own; which table it fills and what a slot
 /// means is decided by the record carrying it, and that decision is made here.
-pub use reims_vgpu_wire::op::{op, Op, OP_HEADER_LEN};
+pub use reims_vgpu_wire::op::{op, Op, OpStream, OP_HEADER_LEN};
 pub use reims_vgpu_wire::ops::render::{
     BufferBind, BufferStrideBind, RefBind, SamplerLodBind, ScissorRect, Viewport,
 };

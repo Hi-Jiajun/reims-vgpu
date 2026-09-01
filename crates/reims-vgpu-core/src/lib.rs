@@ -124,3 +124,4 @@ pub mod stream;
 pub mod submit;
 pub mod sync;
 pub mod transaction;
+pub mod walk;

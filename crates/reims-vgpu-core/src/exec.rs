@@ -355,14 +355,34 @@ impl ExecBuilder {
         self.cursor.protection_envelope(options)
     }
 
-    /// Open an encoder.
+    /// Open an encoder, named by the type byte in its segment header.
     pub fn begin_segment(&mut self, wire_type: u8, flag: bool) -> Result<(), StreamRefusal> {
         let (_, begin) = self.cursor.begin(wire_type, flag)?;
+        self.opened(begin);
+        Ok(())
+    }
+
+    /// Open an encoder whose kind is already established.
+    ///
+    /// A stream walker cannot cut a segment's window without knowing which
+    /// family the segment is, so by the time it gets here the type byte has
+    /// been parsed. Handing back the byte for this to parse again is the
+    /// "resolve twice" shape the replacement exists to remove.
+    pub fn begin_encoder(
+        &mut self,
+        kind: reims_vgpu_protocol::segment::SegmentKind,
+        flag: bool,
+    ) -> Result<(), StreamRefusal> {
+        let (_, begin) = self.cursor.begin_kind(kind, flag)?;
+        self.opened(begin);
+        Ok(())
+    }
+
+    fn opened(&mut self, begin: crate::stream::SegmentBegin) {
         self.open = Some(ResolvedStream {
             begin,
             records: Vec::new(),
         });
-        Ok(())
     }
 
     /// Record one resolved operation inside the open encoder, and declare

@@ -244,7 +244,13 @@ impl StreamCursor {
         Ok(())
     }
 
-    /// A segment header opened an encoder.
+    /// A segment header opened an encoder, named by its type byte.
+    ///
+    /// The parse and the state machine are separate entry points because a
+    /// caller that has already been told which encoder this is — a stream
+    /// walker, which cannot cut a segment's window without knowing — would
+    /// otherwise have to re-encode the kind into a byte for this to parse it
+    /// back. See [`Self::begin_kind`].
     pub fn begin(
         &mut self,
         wire_type: u8,
@@ -258,6 +264,15 @@ impl StreamCursor {
                 return Err(StreamRefusal::UnknownSegmentType(wire_type))
             }
         };
+        self.begin_kind(kind, flag)
+    }
+
+    /// A segment header opened an encoder whose kind is already established.
+    pub fn begin_kind(
+        &mut self,
+        kind: SegmentKind,
+        flag: bool,
+    ) -> Result<(StreamPosition, SegmentBegin), StreamRefusal> {
         if let Phase::Open { kind, .. } = self.phase {
             return Err(StreamRefusal::EncoderStillOpen(kind));
         }

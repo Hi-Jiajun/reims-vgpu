@@ -624,3 +624,222 @@ fn a_record_never_participates_in_a_resource_it_did_not_name() {
         "no fixture named any memory; the aggregation reached nothing"
     );
 }
+
+/// Apple's own segment header frames Apple's own records, and the model walks
+/// the result.
+///
+/// The test above puts each record through `ExecBuilder` by calling
+/// `begin_segment`, `record` and `end_segment` by hand. Hand-driving those three
+/// is exactly what production cannot do: it is handed *bytes*, and something has
+/// to find the segments in them. [`walk::exec`] is that something, and this is
+/// the only test that gives it bytes the serializer produced.
+///
+/// # What is synthesized, and why only that
+///
+/// One field. A segment header's `length` is written by `-endEncoding`, after
+/// the records, so a capture taken at `-beginSegment:` necessarily reads zero
+/// there — every header fixture does. Filling it in is supplying the one thing
+/// the capture cannot contain; the other seven bytes are Apple's, including the
+/// eighth the serializer never writes, which is left exactly as captured
+/// precisely so that a walk which read it as a field would answer differently.
+///
+/// The records are Apple's, unmodified, in the encoder class that emitted them.
+///
+/// # The claim
+///
+/// Every record of a rail that resolves on its own is still there after a walk
+/// of the whole segment. That is not implied by the per-record test: a walk
+/// carries state across records — the cursor's position, the arenas a resolver
+/// files into, the accumulating access list — and a record that resolves alone
+/// can still be lost to a walk that misplaces the next segment boundary or
+/// hands the resolver an arena it then discards.
+///
+/// # The classes whose only captured header asks to continue something
+///
+/// `beginSegment:1` writes the continuation bit, and that is what the render,
+/// compute and info cases were driven with — the oracle picked an argument
+/// before the bit's meaning was recovered. Those headers are not valid stream
+/// prefixes, and the model refuses a spanning encoder on purpose, so they are
+/// required to *refuse* here rather than being dropped from the sweep. Clearing
+/// the bit to walk them anyway would be synthesizing the field whose meaning is
+/// the thing at issue.
+#[test]
+fn apples_own_segment_header_frames_apples_own_records() {
+    use reims_vgpu_core::exec::ExecBuilder;
+    use reims_vgpu_core::identity::{ChannelSequence, IngressOrdinal, SessionGeneration};
+    use reims_vgpu_core::walk;
+    use reims_vgpu_protocol::segment::SegmentKind;
+    use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
+
+    let headers = captured_headers();
+    let mut walked = 0usize;
+    let mut refused_spanning = 0usize;
+    let mut records_placed = 0usize;
+    let mut accesses = 0usize;
+
+    for &kind in SegmentKind::ALL {
+        let Some(header) = headers.get(&kind) else {
+            continue;
+        };
+        // Every record of this rail that resolves standing alone. Ones the
+        // ledger declines are left out: this test is about the walk, and a
+        // stream carrying an unjudged opcode refuses as a whole by design.
+        let body: Vec<Vec<u8>> = cases()
+            .into_iter()
+            .filter(|case| case.rail == kind.rail())
+            .filter(|case| matches!(read(case.rail, &case.bytes), Verdict::Resolved(_)))
+            .map(|case| case.bytes)
+            .collect();
+        if body.is_empty() {
+            continue;
+        }
+
+        let continues = reims_vgpu_wire::ops::segment::segment_header(header)
+            .expect("a captured header parses")
+            .begin_flag
+            != 0;
+        let mut bytes = header.clone();
+        let length = SEGMENT_HEADER_LEN + body.iter().map(Vec::len).sum::<usize>();
+        // The one field `-endEncoding` fills in, and the only byte this test
+        // writes.
+        bytes[..4].copy_from_slice(&(length as u32).to_le_bytes());
+        for record in &body {
+            bytes.extend_from_slice(record);
+        }
+
+        // One resolver for the whole walk, so the registry below holds every
+        // name the segment's records between them ask for.
+        let resolver = Recording::new();
+        for record in &body {
+            let Ok(view) = op(record, 0) else { continue };
+            let _ = operation(
+                kind.rail(),
+                &view,
+                &resolver,
+                &mut reims_vgpu_core::exec::ExecArenas::default(),
+            );
+        }
+        let mut model = registry_holding(&resolver.seen());
+
+        let outcome = walk::exec(
+            &bytes,
+            &resolver,
+            &mut model.task_access(TASK, DOMAIN),
+            ExecBuilder::new(
+                SessionGeneration::FIRST,
+                DOMAIN,
+                ChannelSequence(walked as u64),
+                IngressOrdinal(walked as u64),
+            ),
+        );
+        if continues {
+            assert_eq!(
+                outcome.err().map(|r| r.reason()),
+                Some("walk_encoder_spans_segments"),
+                "{}: a header asking to continue an encoder was walked anyway",
+                kind.name()
+            );
+            refused_spanning += 1;
+            continue;
+        }
+        let tx = outcome.unwrap_or_else(|refusal| {
+            panic!(
+                "{}: a segment of {} records the model resolves did not walk: {} at {:?}",
+                kind.name(),
+                body.len(),
+                refusal.reason(),
+                refusal.site()
+            )
+        });
+
+        assert_eq!(
+            tx.streams.len(),
+            1,
+            "{}: one segment produced more than one encoder",
+            kind.name()
+        );
+        assert_eq!(
+            tx.record_count(),
+            body.len(),
+            "{}: the walk lost records the per-record path keeps",
+            kind.name()
+        );
+        for access in &tx.accesses {
+            assert_eq!(
+                access.domain,
+                DOMAIN,
+                "{}: an access landed in another submission domain",
+                kind.name()
+            );
+        }
+        println!(
+            "walked: {} x{} records, {} accesses",
+            kind.name(),
+            tx.record_count(),
+            tx.accesses.len()
+        );
+        records_placed += tx.record_count();
+        accesses += tx.accesses.len();
+        walked += 1;
+    }
+
+    println!(
+        "segments walked: {walked}, records: {records_placed}, accesses: {accesses}, \
+         headers refused for continuation: {refused_spanning}"
+    );
+    assert!(walked > 0, "no captured segment header reached the walk");
+    assert!(
+        refused_spanning > 0,
+        "no captured header exercised the spanning-encoder refusal"
+    );
+    assert!(
+        accesses > 0,
+        "the walk derived no access at all; the chain from bytes to a hazard edge is broken"
+    );
+}
+
+/// The segment header each encoder class wrote, as captured.
+///
+/// A header is told from an envelope payload by the measured written mask, the
+/// same way [`every_boundary_record_apple_wrote_names_a_segment_the_model_has`]
+/// tells them apart: a header allocates eight bytes and writes seven, and the
+/// payload writes all eight. Headers whose continuation bit is set are left out
+/// — see the caller.
+fn captured_headers(
+) -> std::collections::BTreeMap<reims_vgpu_protocol::segment::SegmentKind, Vec<u8>> {
+    use reims_vgpu_protocol::segment::{segment_role, SegmentRole};
+    let json = fixtures();
+    let mut out = std::collections::BTreeMap::new();
+    for case in json["cases"].as_array().expect("cases is an array") {
+        let selector = case["selector"].as_str().expect("selector");
+        if !is_boundary(selector) {
+            continue;
+        }
+        let mask = unhex(case["written_mask"].as_str().expect("written_mask"));
+        if mask.iter().all(|&byte| byte == 0xff) {
+            continue;
+        }
+        let bytes = unhex(case["buffer"].as_str().expect("buffer"));
+        let header = reims_vgpu_wire::ops::segment::segment_header(&bytes)
+            .expect("a captured header parses");
+        if let Some(SegmentRole::Encoder(kind)) = segment_role(header.segment_type) {
+            // A header that does not ask to continue anything is preferred, and
+            // one that does is kept only where the class captured nothing else
+            // — see the caller, which walks the first and requires a refusal
+            // from the second.
+            match out.entry(kind) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(bytes);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let held = reims_vgpu_wire::ops::segment::segment_header(slot.get())
+                        .expect("a captured header parses");
+                    if held.begin_flag != 0 && header.begin_flag == 0 {
+                        slot.insert(bytes);
+                    }
+                }
+            }
+        }
+    }
+    out
+}

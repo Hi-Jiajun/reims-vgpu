@@ -49,8 +49,14 @@ use crate::closure::Rail;
 use reims_vgpu_wire::ops::segment::{
     protection_options_envelope, segment_header, PROTECTION_OPTIONS_ENVELOPE_LEN,
     SEGMENT_HEADER_LEN, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_INFO,
-    SEGMENT_TYPE_PROTECTION_OPTIONS, SEGMENT_TYPE_RENDER,
+    SEGMENT_TYPE_RENDER,
 };
+
+/// The segment type that introduces a protection-options envelope.
+///
+/// Wire's, re-exported: an envelope has no [`SegmentKind`], so it is the one
+/// role whose byte a caller cannot reach through [`SegmentKind::wire_type`].
+pub use reims_vgpu_wire::ops::segment::SEGMENT_TYPE_PROTECTION_OPTIONS;
 
 /// The event encoder's segment type.
 ///
@@ -243,16 +249,20 @@ pub struct FramedSegment<'a> {
     /// Whether this segment's records continue the encoder the previous
     /// segment left open.
     ///
-    /// The `BOOL` first argument of `-beginSegment:protectionOptions:`, read as
-    /// set or clear rather than kept as a byte: the wire carries a `BOOL` and a
-    /// guest that wrote `2` means the same thing by it as one that wrote `1`.
-    /// This module locates the bit and does not honour it; whether an encoder
-    /// may span two segments is a question for whoever holds encoder state.
+    /// The `BOOL` first argument of `-beginSegment:protectionOptions:`, which
+    /// the serializer writes at `+5` of the header that call opens. Read as set
+    /// or clear rather than kept as a byte: the wire carries a `BOOL`, and a
+    /// guest that writes `2` means by it what one that writes `1` means.
     pub continues_previous: bool,
     /// Whether the encoder outlives this segment, so the next one may continue
     /// it.
     ///
-    /// The other half of the same pair, from the header byte after the type.
+    /// The other half of the same edge, and the reason both halves are
+    /// surfaced. The serializer does not write this into the header it is
+    /// opening: it reaches *back* and marks `+6` of the **preceding** header,
+    /// so a continuation is relational state between two headers and one
+    /// non-zero byte cannot be read for its direction. The oracle's
+    /// continuation case drives both ends together for that reason.
     pub continues_into_next: bool,
     pub body: SegmentBody<'a>,
 }
