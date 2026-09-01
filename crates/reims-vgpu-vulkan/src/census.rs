@@ -182,6 +182,49 @@ impl std::fmt::Display for Floor {
     }
 }
 
+/// Which extension names this rail has to ask for at device creation.
+///
+/// Separate from the capabilities themselves, because a capability and the
+/// route it arrived by are different facts. Push descriptors are core in 1.4
+/// and `synchronization2` is core in 1.3: on such a device the capability is
+/// present and the extension may not be enumerated at all, so a device
+/// creation that requested it by name would be refused for asking about
+/// something the driver never offered.
+///
+/// So each field here means "enumerated, wanted, and not already core at this
+/// device's version" — which is exactly the list `ppEnabledExtensionNames`
+/// takes, and nothing else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceExtensions {
+    pub swapchain: bool,
+    pub push_descriptor: bool,
+    pub descriptor_buffer: bool,
+    pub mesh_shader: bool,
+    pub external_memory_host: bool,
+    pub synchronization2: bool,
+}
+
+impl DeviceExtensions {
+    /// The names, in a stable order.
+    #[must_use]
+    pub fn names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for (wanted, name) in [
+            (self.swapchain, extension::SWAPCHAIN),
+            (self.push_descriptor, extension::PUSH_DESCRIPTOR),
+            (self.descriptor_buffer, extension::DESCRIPTOR_BUFFER),
+            (self.mesh_shader, extension::MESH_SHADER),
+            (self.external_memory_host, extension::EXTERNAL_MEMORY_HOST),
+            (self.synchronization2, extension::SYNCHRONIZATION_2),
+        ] {
+            if wanted {
+                names.push(name);
+            }
+        }
+        names
+    }
+}
+
 /// Whether descriptor buffers have been qualified on this host.
 ///
 /// The architecture asks for descriptor buffers where the driver reports
@@ -213,6 +256,7 @@ pub struct Census {
     host_pointer_import: bool,
     synchronization2: bool,
     can_present: bool,
+    extensions: DeviceExtensions,
 }
 
 impl Census {
@@ -273,6 +317,19 @@ impl Census {
             synchronization2: api.at_least(1, 3)
                 || (reported.has(extension::SYNCHRONIZATION_2) && reported.synchronization2),
             can_present: true,
+            // Enumerated, wanted, and not already core here. A capability that
+            // arrived through core is used through core and never re-requested
+            // by a name the driver may not have offered.
+            extensions: DeviceExtensions {
+                swapchain: true,
+                push_descriptor: reported.has(extension::PUSH_DESCRIPTOR) && !api.at_least(1, 4),
+                descriptor_buffer,
+                mesh_shader,
+                external_memory_host: reported.has(extension::EXTERNAL_MEMORY_HOST),
+                synchronization2: reported.has(extension::SYNCHRONIZATION_2)
+                    && reported.synchronization2
+                    && !api.at_least(1, 3),
+            },
         })
     }
 
@@ -342,6 +399,12 @@ impl Census {
     #[must_use]
     pub const fn can_present(&self) -> bool {
         self.can_present
+    }
+
+    /// The extension names device creation has to ask for.
+    #[must_use]
+    pub const fn extensions(&self) -> DeviceExtensions {
+        self.extensions
     }
 
     /// One line naming every fact a decision here is allowed to read.
@@ -672,6 +735,80 @@ mod tests {
         ] {
             assert!(line.contains(fact), "{fact} missing from {line}");
         }
+    }
+
+    /// The rule a device creation gets refused for breaking: a capability that
+    /// is core at this version is used through core and never asked for by a
+    /// name the driver may not have enumerated.
+    #[test]
+    fn a_promoted_capability_is_never_requested_as_an_extension() {
+        let memory = mem::intel_igpu();
+        let families = integrated_families();
+        let all = &[
+            extension::SWAPCHAIN,
+            extension::PUSH_DESCRIPTOR,
+            extension::SYNCHRONIZATION_2,
+        ];
+
+        // Below both promotions: both names are requested.
+        let mut r = reported(packed(1, 2), all, &memory, &families);
+        r.synchronization2 = true;
+        let below = Census::take(r).expect("admitted").extensions();
+        assert!(below.push_descriptor);
+        assert!(below.synchronization2);
+
+        // 1.3 promoted synchronization2; 1.4 promoted push descriptors.
+        r.api_version = packed(1, 3);
+        let at13 = Census::take(r).expect("admitted").extensions();
+        assert!(at13.push_descriptor, "not core until 1.4");
+        assert!(!at13.synchronization2, "core at 1.3");
+
+        r.api_version = packed(1, 4);
+        let at14 = Census::take(r).expect("admitted").extensions();
+        assert!(!at14.push_descriptor, "core at 1.4");
+        assert!(!at14.synchronization2);
+
+        // And the capabilities themselves are still there — only the request
+        // route changed.
+        let census = Census::take(r).expect("admitted");
+        assert!(census.descriptors().push_descriptor);
+        assert!(census.synchronization2());
+    }
+
+    /// Nothing reaches the extension list that the capability side refused.
+    #[test]
+    fn an_unadmitted_capability_is_never_in_the_extension_list() {
+        let memory = mem::intel_igpu();
+        let families = integrated_families();
+        let mut r = reported(
+            packed(1, 2),
+            &[
+                extension::SWAPCHAIN,
+                extension::MESH_SHADER,
+                extension::DESCRIPTOR_BUFFER,
+            ],
+            &memory,
+            &families,
+        );
+        // Enumerated with the features off, which is not a capability.
+        r.mesh_shader = false;
+        r.descriptor_buffer = false;
+        let extensions = Census::take(r).expect("admitted").extensions();
+        assert!(!extensions.mesh_shader);
+        assert!(!extensions.descriptor_buffer);
+        assert_eq!(extensions.names(), vec![extension::SWAPCHAIN]);
+
+        r.mesh_shader = true;
+        r.descriptor_buffer = true;
+        let names = Census::take(r).expect("admitted").extensions().names();
+        assert_eq!(
+            names,
+            vec![
+                extension::SWAPCHAIN,
+                extension::DESCRIPTOR_BUFFER,
+                extension::MESH_SHADER,
+            ]
+        );
     }
 
     #[test]
