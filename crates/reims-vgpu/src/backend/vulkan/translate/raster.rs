@@ -118,32 +118,6 @@ pub fn vk_topology(topology: PrimitiveTopology) -> vk::PrimitiveTopology {
     }
 }
 
-pub fn vk_compare_op(compare: SamplerCompareFunction) -> vk::CompareOp {
-    match compare {
-        SamplerCompareFunction::Never => vk::CompareOp::NEVER,
-        SamplerCompareFunction::Less => vk::CompareOp::LESS,
-        SamplerCompareFunction::Equal => vk::CompareOp::EQUAL,
-        SamplerCompareFunction::LessEqual => vk::CompareOp::LESS_OR_EQUAL,
-        SamplerCompareFunction::Greater => vk::CompareOp::GREATER,
-        SamplerCompareFunction::NotEqual => vk::CompareOp::NOT_EQUAL,
-        SamplerCompareFunction::GreaterEqual => vk::CompareOp::GREATER_OR_EQUAL,
-        SamplerCompareFunction::Always => vk::CompareOp::ALWAYS,
-    }
-}
-
-pub fn vk_stencil_op(op: StencilOp) -> vk::StencilOp {
-    match op {
-        StencilOp::Keep => vk::StencilOp::KEEP,
-        StencilOp::Zero => vk::StencilOp::ZERO,
-        StencilOp::Replace => vk::StencilOp::REPLACE,
-        StencilOp::IncrementClamp => vk::StencilOp::INCREMENT_AND_CLAMP,
-        StencilOp::DecrementClamp => vk::StencilOp::DECREMENT_AND_CLAMP,
-        StencilOp::Invert => vk::StencilOp::INVERT,
-        StencilOp::IncrementWrap => vk::StencilOp::INCREMENT_AND_WRAP,
-        StencilOp::DecrementWrap => vk::StencilOp::DECREMENT_AND_WRAP,
-    }
-}
-
 pub fn vk_index_type(index: IndexType) -> vk::IndexType {
     match index {
         IndexType::U16 => vk::IndexType::UINT16,
@@ -377,49 +351,14 @@ mod tests {
         );
     }
 
-    /// The compare and stencil spellings must be injective. These are the
-    /// enums whose Metal and Vulkan orderings *nearly* agree, which is exactly
-    /// where a transcription slip hides: swapping LESS_OR_EQUAL and GREATER
-    /// still renders, just wrongly.
-    #[test]
-    fn compare_and_stencil_spellings_are_injective() {
-        let mut ops: Vec<i32> = (0..=7)
-            .map(|m| vk_compare_op(compare_function(m).unwrap()).as_raw())
-            .collect();
-        ops.sort_unstable();
-        let before = ops.len();
-        ops.dedup();
-        assert_eq!(before, ops.len());
-
-        let mut stencil: Vec<i32> = (0..=7)
-            .map(|m| vk_stencil_op(stencil_operation(m).unwrap()).as_raw())
-            .collect();
-        stencil.sort_unstable();
-        let before = stencil.len();
-        stencil.dedup();
-        assert_eq!(before, stencil.len());
-    }
-
     /// Spot-check the arms whose Metal and Vulkan names differ, so a
     /// "the orderings match, just cast it" refactor cannot pass.
+    ///
+    /// The compare and stencil spellings used to be checked here too. They are
+    /// `reims_vgpu_vulkan::depth_stencil`'s now — it holds the only copy — and
+    /// both the injectivity sweep and the differing-name arms went with them.
     #[test]
     fn the_arms_whose_names_differ_are_spelled_out() {
-        assert_eq!(
-            vk_compare_op(compare_function(3).unwrap()),
-            vk::CompareOp::LESS_OR_EQUAL
-        );
-        assert_eq!(
-            vk_compare_op(compare_function(6).unwrap()),
-            vk::CompareOp::GREATER_OR_EQUAL
-        );
-        assert_eq!(
-            vk_stencil_op(stencil_operation(3).unwrap()),
-            vk::StencilOp::INCREMENT_AND_CLAMP
-        );
-        assert_eq!(
-            vk_stencil_op(stencil_operation(7).unwrap()),
-            vk::StencilOp::DECREMENT_AND_WRAP
-        );
         // Metal's strip primitives are 2 and 4, not 4 and 5.
         assert_eq!(
             vk_topology(primitive_topology(2).unwrap()),

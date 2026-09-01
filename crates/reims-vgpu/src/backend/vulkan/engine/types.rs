@@ -318,8 +318,15 @@ pub enum StencilOp {
 }
 
 impl StencilOp {
-    pub(crate) fn vk(self) -> vk::StencilOp {
-        translate::raster::vk_stencil_op(self)
+    /// The `MTLStencilOperation` ordinal this was decoded from.
+    ///
+    /// Declaration order is the ABI order, asserted against the wire in
+    /// `translate::raster`'s own tests, so the discriminant is the ordinal.
+    /// The Vulkan spelling is not here: `reims_vgpu_vulkan::depth_stencil`
+    /// owns it, and a second copy of a total mapping is a second thing that
+    /// can come to disagree with the first.
+    pub(crate) fn mtl_ordinal(self) -> u32 {
+        self as u32
     }
 }
 
@@ -1258,10 +1265,6 @@ pub enum SamplerCompareFunction {
 }
 
 impl SamplerCompareFunction {
-    pub(crate) fn vk(self) -> vk::CompareOp {
-        translate::raster::vk_compare_op(self)
-    }
-
     /// The `MTLCompareFunction` ordinal this was decoded from.
     ///
     /// Declaration order is the ABI order, asserted against the wire in

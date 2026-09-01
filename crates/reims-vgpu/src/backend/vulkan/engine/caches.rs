@@ -1391,6 +1391,45 @@ fn sampler_shape(key: &SamplerStateKey) -> reims_vgpu_core::sampler::SamplerShap
     }
 }
 
+/// The pipeline key's depth and stencil terms, in the vocabulary of the layer
+/// that owns what they mean.
+///
+/// The key's `depth_test` flag has no counterpart here and needs none.
+/// Metal has no depth-test enable — depth is always tested and "off" is
+/// `Always` with writes clear — so the state that reaches this projection with
+/// `depth_test` false is exactly `compare = Always, write = false`, which
+/// tests nothing and writes nothing under either spelling. See
+/// [`reims_vgpu_vulkan::depth_stencil`] for why the rail then sets
+/// `depthTestEnable` unconditionally rather than carrying the flag.
+fn depth_stencil_state(
+    depth_compare: super::types::SamplerCompareFunction,
+    depth_write: bool,
+    stencil: Option<StencilKey>,
+) -> reims_vgpu_core::depth_stencil::DepthStencilState {
+    let face =
+        |ops: super::types::StencilFaceOps| reims_vgpu_core::depth_stencil::StencilFaceShape {
+            compare_function: ops.compare.mtl_ordinal(),
+            stencil_failure_operation: ops.fail_op.mtl_ordinal(),
+            depth_failure_operation: ops.depth_fail_op.mtl_ordinal(),
+            depth_stencil_pass_operation: ops.pass_op.mtl_ordinal(),
+            read_mask: ops.read_mask,
+            write_mask: ops.write_mask,
+        };
+    reims_vgpu_core::depth_stencil::DepthStencilShape {
+        depth_compare_function: depth_compare.mtl_ordinal(),
+        depth_write_enabled: depth_write,
+        // A key carries both faces or neither: the decode layer already
+        // substituted a pass-through for a face the guest left disabled, so
+        // there is no third state for this to lose.
+        front_stencil_enabled: stencil.is_some(),
+        back_stencil_enabled: stencil.is_some(),
+        front: stencil.map_or_else(Default::default, |s| face(s.front)),
+        back: stencil.map_or_else(Default::default, |s| face(s.back)),
+    }
+    .checked()
+    .expect("every ordinal in a pipeline key was parsed from an enum on the way in")
+}
+
 impl ObjectCaches {
     pub(crate) fn new() -> Self {
         Self {
@@ -2408,27 +2447,12 @@ impl ObjectCaches {
         // byte-identical to the pre-depth engine. Stencil is enabled only when
         // the bound state requested it (`key.stencil`); the reference field is
         // left 0 here and supplied dynamically per draw.
-        let stencil_face = |ops: super::types::StencilFaceOps| {
-            vk::StencilOpState::default()
-                .fail_op(ops.fail_op.vk())
-                .pass_op(ops.pass_op.vk())
-                .depth_fail_op(ops.depth_fail_op.vk())
-                .compare_op(ops.compare.vk())
-                .compare_mask(ops.read_mask)
-                .write_mask(ops.write_mask)
-                .reference(0)
-        };
-        let mut depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(key.depth_test)
-            .depth_write_enable(key.depth_write)
-            .depth_compare_op(key.depth_compare.vk())
-            .depth_bounds_test_enable(false)
-            .stencil_test_enable(key.stencil.is_some());
-        if let Some(s) = key.stencil {
-            depth_stencil = depth_stencil
-                .front(stencil_face(s.front))
-                .back(stencil_face(s.back));
-        }
+        let depth_stencil = reims_vgpu_vulkan::depth_stencil::plan(&depth_stencil_state(
+            key.depth_compare,
+            key.depth_write,
+            key.stencil,
+        ))
+        .native();
         let mut gpci = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vtx_input)
@@ -3025,6 +3049,66 @@ mod object_cache_tests {
         // -01075, U and V.
         assert_eq!(plan.address[0], ash::vk::SamplerAddressMode::CLAMP_TO_EDGE);
         assert_eq!(plan.address[1], ash::vk::SamplerAddressMode::CLAMP_TO_EDGE);
+    }
+
+    /// Every state a pipeline key can hold is one the owning layer admits.
+    ///
+    /// [`depth_stencil_state`] ends in an `expect`, and this is the claim that
+    /// makes it a fact rather than a hope: a key carries decoded enums, so its
+    /// ordinals are exactly the declared ones and the parse on the other side
+    /// cannot refuse any of them. A sweep rather than a case, because the way
+    /// this breaks is a *new* variant added to one of the two enums without a
+    /// counterpart on the other side, which no single fixture would notice.
+    #[test]
+    fn every_ordinal_a_pipeline_key_can_hold_is_one_the_owning_layer_admits() {
+        use super::super::types::{SamplerCompareFunction as C, StencilFaceOps, StencilOp as O};
+        const COMPARES: [C; 8] = [
+            C::Never,
+            C::Less,
+            C::Equal,
+            C::LessEqual,
+            C::Greater,
+            C::NotEqual,
+            C::GreaterEqual,
+            C::Always,
+        ];
+        const OPS: [O; 8] = [
+            O::Keep,
+            O::Zero,
+            O::Replace,
+            O::IncrementClamp,
+            O::DecrementClamp,
+            O::Invert,
+            O::IncrementWrap,
+            O::DecrementWrap,
+        ];
+        let mut checked = 0usize;
+        for compare in COMPARES {
+            for op in OPS {
+                let face = StencilFaceOps {
+                    compare,
+                    fail_op: op,
+                    depth_fail_op: op,
+                    pass_op: op,
+                    read_mask: 0xff,
+                    write_mask: 0xff,
+                };
+                for stencil in [
+                    None,
+                    Some(StencilKey {
+                        front: face,
+                        back: face,
+                    }),
+                ] {
+                    // Would panic inside the projection if any ordinal were
+                    // outside the enum the owning layer parses.
+                    let state = depth_stencil_state(compare, false, stencil);
+                    assert_eq!(state.stencil_engaged(), stencil.is_some());
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, COMPARES.len() * OPS.len() * 2);
     }
 
     /// The projection carries the guest's axes in the guest's order.
