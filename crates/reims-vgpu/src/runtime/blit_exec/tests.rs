@@ -1377,7 +1377,8 @@ fn texture_view_level_base_on_mapper_ref_texture_rejected() {
 /// wrong `texel_offset` reads the right number of bytes from the wrong place.
 #[test]
 fn a_compressed_level_addresses_blocks_in_both_axes() {
-    use crate::contract::pixel_format::{self as pf, BlockGeometry};
+    use crate::contract::pixel_format::{self as pf};
+    use reims_vgpu_protocol::extent::BlockGeometry;
     // A 64x64 BC3 level as a guest sends it: 16 block columns of 16 bytes, and
     // 16 block rows, so one image is 4096 bytes and not 16384.
     let bc3 = LinearTextureLevel {
@@ -1457,7 +1458,7 @@ fn texel_offset_math() {
         height: 4,
         depth: 1,
         bpp: 4,
-        block: crate::contract::pixel_format::BlockGeometry {
+        block: reims_vgpu_protocol::extent::BlockGeometry {
             width: 1,
             height: 1,
             bytes: 4,
@@ -1637,7 +1638,7 @@ fn an_unmeasurable_copy_region_refuses_rather_than_writing_unbounded() {
         height: 1,
         depth: 1,
         bpp: 4,
-        block: crate::contract::pixel_format::BlockGeometry {
+        block: reims_vgpu_protocol::extent::BlockGeometry {
             width: 1,
             height: 1,
             bytes: 4,

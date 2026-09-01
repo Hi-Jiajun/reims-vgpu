@@ -927,11 +927,11 @@ pub fn resident_color(bgra: bool) -> vk::Format {
 /// sRGB spellings fold through [`storage_format`] onto the allocation they share
 /// with their linear sibling. That fold is what covers the four `BC*_SRGB_BLOCK`
 /// formats, which a sampled bind of an sRGB compressed texture is created as.
-pub fn vk_block_geometry(format: vk::Format) -> Option<pixel_format::BlockGeometry> {
+pub fn vk_block_geometry(format: vk::Format) -> Option<reims_vgpu_protocol::extent::BlockGeometry> {
     if let Some(layout) = texel_layout_of(storage_format(format)) {
         return Some(layout.block());
     }
-    Some(pixel_format::BlockGeometry {
+    Some(reims_vgpu_protocol::extent::BlockGeometry {
         width: 1,
         height: 1,
         bytes: bytes_per_texel(format)?,

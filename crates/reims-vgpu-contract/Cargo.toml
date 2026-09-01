@@ -15,6 +15,9 @@ name = "reims_vgpu_contract"
 [dependencies]
 # Zero-copy views over the wire format.
 reims-vgpu-wire = { path = "../reims-vgpu-wire" }
+# The extents and packed-image arithmetic that used to live here, and the rest
+# of this crate's contents as they move across.
+reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }
 # The guest page-table walk, whose statuses this crate names on the fail channel.
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }
 # `Decline` and `Refusal`, so a contract check can name its own refusal without

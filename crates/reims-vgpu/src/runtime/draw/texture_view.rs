@@ -477,7 +477,7 @@ impl std::fmt::Display for ViewSampleRefusal {
 /// Pick the sample format for a texture-view over base storage.
 ///
 /// Metal texture views require the view format to be storage-compatible with the
-/// base. Compatibility is compared as a whole [`pixel_format::BlockGeometry`] —
+/// base. Compatibility is compared as a whole [`reims_vgpu_protocol::extent::BlockGeometry`] —
 /// the grid *and* the bytes — rather than as a bytes-per-texel, because a
 /// block-compressed format has no bytes-per-texel at all and comparing two
 /// `None`s would have admitted a `BC1`-as-`BC3` reinterpretation while refusing

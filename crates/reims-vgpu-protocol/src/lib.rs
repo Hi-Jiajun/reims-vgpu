@@ -24,6 +24,8 @@
 //!   and "the old backend drops it" are not outcomes and cannot be spelled here.
 //! - [`packets`] — the same ledger for the FIFO packet classes, which are the
 //!   other half of what a guest sends and which the manifest cannot enumerate.
+//! - [`extent`] — the guest API's three-dimensional extent, its mip-level
+//!   dimensions, and the byte arithmetic of a tightly-packed image.
 //! - [`segment`] — what a segment-type byte means: which encoder wrote it, and
 //!   which rail its records are read on.
 //! - [`residency`] — what a `useResource`/`useHeap` declaration says, split so
@@ -33,7 +35,13 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+// `extent::tight_pyramid_spans` returns one span per mip level, a count the
+// caller does not know in advance. `alloc` is still `no_std`; what this crate
+// must not reach is the host, not the heap.
+extern crate alloc;
+
 pub mod closure;
+pub mod extent;
 pub mod packets;
 pub mod residency;
 pub mod segment;

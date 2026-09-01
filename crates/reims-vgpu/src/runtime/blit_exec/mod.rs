@@ -325,7 +325,7 @@ pub(crate) struct LinearTextureLevel {
     /// below. A compressed copy is an uncompressed copy of the block image, and
     /// converting once at the top is what lets that be true rather than
     /// threading a grid through every helper.
-    block: pixel_format::BlockGeometry,
+    block: reims_vgpu_protocol::extent::BlockGeometry,
     pixel_format: u16,
 }
 
@@ -391,13 +391,13 @@ impl TextureBacking {
         }
     }
     /// The storage grid one [`Self::bpp`] unit covers.
-    fn block(&self) -> pixel_format::BlockGeometry {
+    fn block(&self) -> reims_vgpu_protocol::extent::BlockGeometry {
         match self {
             TextureBacking::Linear(t) => t.block,
             // A mapper-ref-texture IOSurface is never block-compressed: its resolve takes
             // `bytes_per_pixel`, which has no answer for a compressed format, so
             // such a surface is refused as `t11_fmt_bpp` long before here.
-            TextureBacking::MapperRefTexture(t) => pixel_format::BlockGeometry {
+            TextureBacking::MapperRefTexture(t) => reims_vgpu_protocol::extent::BlockGeometry {
                 width: 1,
                 height: 1,
                 bytes: t.bpp,

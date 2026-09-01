@@ -415,7 +415,6 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     use crate::backend::metal::runtime::new_buffer_from_host;
     use crate::backend::metal::samplers::make_explicit_sampler;
     use crate::backend::metal::util::valid_buffer_binding;
-    use crate::contract::extent::tight_image_bytes;
     use crate::runtime::compute_exec::metal::{
         nested_job_from_icb_resources, split_staged_textures, stage_buffer,
     };
@@ -427,6 +426,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
         MTLRegion, MTLResourceUsage, MTLStorageMode, MTLTextureType, MTLTextureUsage,
         TextureDescriptor,
     };
+    use reims_vgpu_protocol::extent::tight_image_bytes;
 
     // Pipeline when inheritPipelineState — not recorded into the ICB slot.
     if desc.inherit_pipeline_state() {

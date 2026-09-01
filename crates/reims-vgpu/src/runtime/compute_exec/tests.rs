@@ -3128,7 +3128,6 @@ fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
 #[test]
 fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::extent::mip_extent;
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN,
@@ -3137,6 +3136,7 @@ fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET,
         TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
     };
+    use reims_vgpu_protocol::extent::mip_extent;
 
     const BASE: u32 = 8;
     const LEVELS: u32 = 4; // 8, 4, 2, 1
@@ -3231,7 +3231,7 @@ fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
         "every level the descriptor declares is staged"
     );
     let spans =
-        crate::contract::extent::tight_pyramid_spans(BASE, BASE, LEVELS, BPP as usize).unwrap();
+        reims_vgpu_protocol::extent::tight_pyramid_spans(BASE, BASE, LEVELS, BPP as usize).unwrap();
     let want_len = spans.last().map(|l| l.offset + l.len).unwrap();
     assert_eq!(
         staged.bytes.len(),

@@ -1833,7 +1833,7 @@ pub struct ComputeSampledImageResource {
     pub width: u32,
     pub height: u32,
     /// Levels `bytes` carries, base first, tightly packed by
-    /// [`crate::contract::extent::tight_pyramid_spans`] — `1` for every
+    /// [`reims_vgpu_protocol::extent::tight_pyramid_spans`] — `1` for every
     /// binding but a guest mip chain sampled by an explicit LOD.
     pub mip_levels: u32,
     /// Where this binding's texels come from.
@@ -1853,7 +1853,7 @@ pub struct ComputeSampledImageResource {
 pub enum ComputeSampledSource {
     /// Host bytes uploaded into a pooled transient: every level the binding
     /// declares, base first, tightly packed by
-    /// [`crate::contract::extent::tight_pyramid_spans`].
+    /// [`reims_vgpu_protocol::extent::tight_pyramid_spans`].
     Bytes(Vec<u8>),
     /// A device-local copy from the named resident storage image into a pooled
     /// transient (copy-on-sample: the transient never aliases the live

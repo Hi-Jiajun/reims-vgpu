@@ -32,6 +32,59 @@ pub struct Extent3 {
     pub z: u32,
 }
 
+/// The texel grid one addressable unit of storage covers, and its size.
+///
+/// Uncompressed formats have a 1x1 block whose `bytes` is their bytes-per-pixel,
+/// so this is not a second vocabulary for them — it is the same number with the
+/// grid stated. That is what lets a row-bytes expression cover both families
+/// instead of branching, and what the format table's
+/// `a_block_geometry_agrees_with_the_texel_table` holds honest.
+///
+/// It sits with the extents rather than with the format table because it is
+/// texel geometry: which grid a unit of storage covers is the same kind of fact
+/// as how big a mip level is, and the format table is what *answers* it for a
+/// given format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockGeometry {
+    /// Texels a block spans horizontally.
+    pub width: u32,
+    /// Texels a block spans vertically.
+    pub height: u32,
+    /// Bytes one block occupies.
+    pub bytes: u32,
+}
+
+impl BlockGeometry {
+    /// Blocks needed to cover `texels` along one axis, rounding up.
+    ///
+    /// The rounding is the contract and not a convenience: a 2x2 BC3 mip level
+    /// still occupies one whole 16-byte block, so a caller that divided down
+    /// would read four bytes of a level and none of the tail of a pyramid.
+    pub const fn blocks_for(divisor: u32, texels: u32) -> u32 {
+        if divisor == 0 {
+            return 0;
+        }
+        texels.div_ceil(divisor)
+    }
+
+    /// Blocks in one row of a `texels`-wide image.
+    pub const fn blocks_across(self, texels: u32) -> u32 {
+        Self::blocks_for(self.width, texels)
+    }
+
+    /// Rows of blocks in a `texels`-tall image — what a row loop over this
+    /// format must count, rather than the texel height.
+    pub const fn block_rows(self, texels: u32) -> u32 {
+        Self::blocks_for(self.height, texels)
+    }
+
+    /// Whether this describes a compressed format, i.e. a block wider or taller
+    /// than one texel.
+    pub const fn is_compressed(self) -> bool {
+        self.width > 1 || self.height > 1
+    }
+}
+
 /// Metal's dimension for mip `level` of an axis whose level-0 size is `base`.
 ///
 /// Each level halves and floors, and the chain stops at 1 rather than reaching
@@ -72,8 +125,8 @@ pub fn mip_extent(base: u32, level: u32) -> u32 {
 /// with no row alignment.
 ///
 /// "Tight" is the whole contract. Anything the guest has told us a pitch for
-/// must not come through here — [`crate::iosurface_pages::packed_span_estimate`]
-/// is the row-aligned estimate for sizing a page table, and the two differ by
+/// must not come through here — the format layer's `packed_span_estimate` is
+/// the row-aligned estimate for sizing a page table, and the two differ by
 /// exactly the alignment slack. Mixing them up reads short.
 ///
 /// Zero on either axis, or a zero pixel size, returns `None` rather than 0. The
@@ -140,7 +193,7 @@ pub fn tight_layered_block_bytes(
     width: u32,
     height: u32,
     layers: u32,
-    block: crate::pixel_format::BlockGeometry,
+    block: BlockGeometry,
 ) -> Option<usize> {
     if layers == 0 || width == 0 || height == 0 || block.bytes == 0 {
         return None;
@@ -166,8 +219,8 @@ pub fn tight_layered_block_bytes(
 /// They did. `runtime::draw::metal_icb` sized an ICB colour attachment's
 /// staging from the *guest* attachment's bytes-per-pixel while creating a
 /// BGRA8Unorm texture and passing `width * 4` as the stride, so for any format
-/// narrower than four bytes ([`crate::pixel_format::R8_BPP`],
-/// [`crate::pixel_format::RG8_BPP`]) Metal read past the end of the
+/// narrower than four bytes (the one- and two-byte formats) Metal read past the
+/// end of the
 /// buffer and copied whatever followed it on the host heap into a render target
 /// the guest reads back. The writeback half of that same function computed the
 /// length correctly, ten lines away. One quantity, two derivations, and only
@@ -213,11 +266,11 @@ pub fn tight_pyramid_spans(
     height: u32,
     levels: u32,
     bytes_per_pixel: usize,
-) -> Option<Vec<MipLevelSpan>> {
+) -> Option<alloc::vec::Vec<MipLevelSpan>> {
     if levels == 0 {
         return None;
     }
-    let mut spans = Vec::with_capacity(levels as usize);
+    let mut spans = alloc::vec::Vec::with_capacity(levels as usize);
     let mut offset: usize = 0;
     for level in 0..levels {
         let w = mip_extent(width, level);
@@ -250,7 +303,12 @@ pub fn tight_pyramid_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pixel_format::{R8_BPP, RG8_BPP, RGBA8_BPP};
+    // The three byte widths these cases need, spelled here rather than
+    // imported: the format table that names them lives above this crate, and
+    // this arithmetic takes a byte count rather than a format.
+    const R8_BPP: u32 = 1;
+    const RG8_BPP: u32 = 2;
+    const RGBA8_BPP: u32 = 4;
 
     /// The pyramid's byte layout and its level extents come from one call, so a
     /// producer and a consumer of the same staged upload cannot disagree about
@@ -258,7 +316,7 @@ mod tests {
     #[test]
     fn a_packed_pyramid_places_each_level_after_the_one_above_it() {
         let spans = tight_pyramid_spans(64, 64, 7, RGBA8_BPP as usize).expect("7 levels of 64x64");
-        let dims: Vec<(u32, u32)> = spans.iter().map(|s| (s.width, s.height)).collect();
+        let dims: alloc::vec::Vec<(u32, u32)> = spans.iter().map(|s| (s.width, s.height)).collect();
         assert_eq!(
             dims,
             vec![(64, 64), (32, 32), (16, 16), (8, 8), (4, 4), (2, 2), (1, 1)]
@@ -297,7 +355,7 @@ mod tests {
             spans
                 .iter()
                 .map(|s| (s.width, s.height))
-                .collect::<Vec<_>>(),
+                .collect::<alloc::vec::Vec<_>>(),
             vec![(5, 1), (2, 1), (1, 1), (1, 1)]
         );
     }

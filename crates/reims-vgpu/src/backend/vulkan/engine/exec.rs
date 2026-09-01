@@ -1515,7 +1515,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // third factor that overflows. A refusal rather than a clamp, because
         // this length is what the next line compares the buffer against and a
         // wrapped one would let a short buffer match.
-        let Some(expected) = crate::contract::extent::tight_image_bytes(
+        let Some(expected) = reims_vgpu_protocol::extent::tight_image_bytes(
             req.width,
             req.height,
             crate::contract::pixel_format::RGBA8_BPP as usize,
@@ -1891,7 +1891,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // Four factors, so the widening the operands already carry is not
         // enough — see the target-seed check above for why two of them exhaust
         // a u64 on their own. `contract::extent` owns the checked form.
-        let Some(expected) = crate::contract::extent::tight_layered_block_bytes(
+        let Some(expected) = reims_vgpu_protocol::extent::tight_layered_block_bytes(
             image.width,
             image.height,
             image.layers,

@@ -119,8 +119,8 @@ pub fn generate_mipmaps_filtered(
 
     let mut out = Vec::with_capacity(levels as usize);
     for level in 0..levels {
-        let w = crate::contract::extent::mip_extent(width, level);
-        let h = crate::contract::extent::mip_extent(height, level);
+        let w = reims_vgpu_protocol::extent::mip_extent(width, level);
+        let h = reims_vgpu_protocol::extent::mip_extent(height, level);
         // Both factors are u32, so their product always fits in u64.
         let bpr = (w as u64) * (bpp as u64);
         let need = bpr

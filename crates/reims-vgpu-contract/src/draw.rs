@@ -37,7 +37,7 @@ pub const fn primitive_type_executable(mtl: u32) -> bool {
 /// What a `drawPrimitives` / `drawIndexedPrimitives` record asks for, as one
 /// value.
 ///
-/// Its own type for the same reason [`super::extent::Extent3`] is: the hazard is
+/// Its own type for the same reason [`reims_vgpu_protocol::extent::Extent3`] is: the hazard is
 /// at the call boundary, not at construction. These five were decoded into a
 /// struct and then destructured back into loose `u32`s to cross two of them —
 /// `draw::mrt_draw_request` took `(vertex_count, instance_count,

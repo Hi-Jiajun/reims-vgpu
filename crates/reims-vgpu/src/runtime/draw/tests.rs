@@ -612,7 +612,7 @@ fn linear_volume_gather_carries_every_depth_plane() {
     };
     let (span, row_length) = strided_level_extent(
         &layout,
-        pixel_format::BlockGeometry {
+        reims_vgpu_protocol::extent::BlockGeometry {
             width: 1,
             height: 1,
             bytes: 4,

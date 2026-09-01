@@ -1,6 +1,7 @@
 //! Metal pixel-format helpers (port of `host/utils/reims-vgpu-pixel-format`).
 
 use crate::endian::{ld16, st16};
+use reims_vgpu_protocol::extent::BlockGeometry;
 
 pub const COMPONENT_COUNT: usize = 4;
 pub const COMPONENT_R: usize = 0;
@@ -227,54 +228,6 @@ const _: () = assert!(
         && BC_BLOCK_SIDE * BC_BLOCK_SIDE == 16
         && BC_BLOCK_BYTES_8 * 2 == BC_BLOCK_SIDE * BC_BLOCK_SIDE
 );
-
-/// The texel grid one addressable unit of storage covers, and its size.
-///
-/// Uncompressed formats have a 1x1 block whose `bytes` is [`bytes_per_pixel`],
-/// so this is not a second vocabulary for them — it is the same number with the
-/// grid stated. That is what lets [`tight_row_bytes`] be one expression for
-/// both families instead of a branch, and what
-/// `a_block_geometry_agrees_with_the_texel_table` holds honest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockGeometry {
-    /// Texels a block spans horizontally.
-    pub width: u32,
-    /// Texels a block spans vertically.
-    pub height: u32,
-    /// Bytes one block occupies.
-    pub bytes: u32,
-}
-
-impl BlockGeometry {
-    /// Blocks needed to cover `texels` along one axis, rounding up.
-    ///
-    /// The rounding is the contract and not a convenience: a 2x2 BC3 mip level
-    /// still occupies one whole 16-byte block, so a caller that divided down
-    /// would read four bytes of a level and none of the tail of a pyramid.
-    pub const fn blocks_for(divisor: u32, texels: u32) -> u32 {
-        if divisor == 0 {
-            return 0;
-        }
-        texels.div_ceil(divisor)
-    }
-
-    /// Blocks in one row of a `texels`-wide image.
-    pub const fn blocks_across(self, texels: u32) -> u32 {
-        Self::blocks_for(self.width, texels)
-    }
-
-    /// Rows of blocks in a `texels`-tall image — what a row loop over this
-    /// format must count, rather than the texel height.
-    pub const fn block_rows(self, texels: u32) -> u32 {
-        Self::blocks_for(self.height, texels)
-    }
-
-    /// Whether this describes a compressed format, i.e. a block wider or taller
-    /// than one texel.
-    pub const fn is_compressed(self) -> bool {
-        self.width > 1 || self.height > 1
-    }
-}
 
 /// Bytes one BC block of `format` occupies, or `None` if it is not a BC format.
 ///
@@ -2220,7 +2173,7 @@ pub fn f64_to_unorm8(value: f64) -> u8 {
 /// The fill therefore walks the buffer instead of counting texels. A
 /// `chunks_exact_mut` cannot describe a different image from the one that was
 /// allocated, where a second expression always can — the rule
-/// [`crate::extent::tight_image_layout`] states for a length and its
+/// [`reims_vgpu_protocol::extent::tight_image_layout`] states for a length and its
 /// stride, one level down.
 ///
 /// Here rather than in either caller because it is arithmetic both rails need

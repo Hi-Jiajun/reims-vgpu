@@ -820,10 +820,10 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         }
         // The texture below is BGRA8Unorm, so its staging length and the row
         // stride `replace_region` is given must come from one place — see
-        // `contract::extent::tight_image_layout`, which carries what happened
+        // `reims_vgpu_protocol::extent::tight_image_layout`, which carries what happened
         // when they did not.
         let Some((row_bytes, nbytes)) =
-            crate::contract::extent::tight_image_layout(width, height, RGBA8_BPP)
+            reims_vgpu_protocol::extent::tight_image_layout(width, height, RGBA8_BPP)
         else {
             return EncodeStatus::BadArgs("icb_color_target_degenerate_geometry");
         };
@@ -913,7 +913,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     // Same one derivation as the seed side above, so the two halves of this
     // function cannot disagree about the layout of the buffer they share.
     let Some((stride, need)) =
-        crate::contract::extent::tight_image_layout(width, height, RGBA8_BPP)
+        reims_vgpu_protocol::extent::tight_image_layout(width, height, RGBA8_BPP)
     else {
         return EncodeStatus::BadArgs("icb_color_target_degenerate_geometry");
     };

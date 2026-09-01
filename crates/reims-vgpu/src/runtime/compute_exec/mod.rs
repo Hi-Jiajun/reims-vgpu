@@ -1429,7 +1429,7 @@ pub(crate) struct StagedTexture<R: RailStage> {
     pub width: u32,
     pub height: u32,
     /// How many mip levels `bytes` carries, base first, packed tightly by
-    /// [`crate::contract::extent::tight_pyramid_spans`].
+    /// [`reims_vgpu_protocol::extent::tight_pyramid_spans`].
     ///
     /// `1` on every rail but the normal-texture linear one, and `1` there too for a
     /// storage binding or a view that already names a level: a compute write
@@ -2490,7 +2490,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             texture_ref,
         ));
     }
-    let Some(pyramid) = crate::contract::extent::tight_pyramid_spans(
+    let Some(pyramid) = reims_vgpu_protocol::extent::tight_pyramid_spans(
         w,
         h,
         level_sources.len() as u32,
@@ -2529,7 +2529,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     // per-level read cannot drift from each other — and so a level's cache key
     // is that level's own rows and extent rather than the base's.
     let level_window = |source: &LinearLevelSource,
-                        span: &crate::contract::extent::MipLevelSpan| {
+                        span: &reims_vgpu_protocol::extent::MipLevelSpan| {
         crate::runtime::surface_cache::LinearWindow {
             task_id,
             texture_ref: stage_ref,
@@ -2785,7 +2785,7 @@ struct LinearLevelSource {
 /// reported by name rather than left to read as a texture that simply has fewer
 /// levels.
 ///
-/// Extents are checked against [`crate::contract::extent::mip_extent`] because
+/// Extents are checked against [`reims_vgpu_protocol::extent::mip_extent`] because
 /// the packed layout is derived from the base geometry alone; a level whose
 /// declared extent disagrees would be read at one size and copied at another.
 fn linear_extra_levels(
@@ -2799,8 +2799,8 @@ fn linear_extra_levels(
     let declared = tex.mipmap_level_count.max(1);
     let mut out = Vec::new();
     for level in 1..declared {
-        let want_w = crate::contract::extent::mip_extent(base_width, level);
-        let want_h = crate::contract::extent::mip_extent(base_height, level);
+        let want_w = reims_vgpu_protocol::extent::mip_extent(base_width, level);
+        let want_h = reims_vgpu_protocol::extent::mip_extent(base_height, level);
         let refuse = |reason: &str, detail: String| {
             crate::observe::fail(format!(
                 "compute_stage_tex mip_truncated reason={reason} ref={texture_ref} level={level}                  staged={} declared={declared} want={want_w}x{want_h} {detail}",
@@ -3328,11 +3328,11 @@ fn u32_dim(v: u64) -> Result<u32, ComputeStatus> {
 
 /// The dispatch extents, narrowed from the wire's `u64` by [`u32_dim`].
 ///
-/// The type is [`crate::contract::extent::Extent3`], which both this decoder
+/// The type is [`reims_vgpu_protocol::extent::Extent3`], which both this decoder
 /// and the Metal backend it dispatches through now name. It used to be private
 /// here, which protected construction and stopped at the backend call — see its
 /// doc for why that was the wrong half of the journey to protect.
-use crate::contract::extent::Extent3;
+use reims_vgpu_protocol::extent::Extent3;
 
 // The two rails. Named rather than re-exported flat: each owns a dispatch
 // executor with the same neutral signature, and this module reaches whichever

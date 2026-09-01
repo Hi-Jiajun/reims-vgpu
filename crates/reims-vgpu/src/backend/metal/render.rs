@@ -21,11 +21,11 @@ use crate::backend::metal::util::{
     Status,
 };
 use crate::backend::render_pso_key::{RenderPsoKey, RenderPsoLookup};
-use crate::contract::extent::tight_image_bytes;
 use crate::contract::vertex_step::{step_rate_in_contract, MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE};
 use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
 use foreign_types::ForeignType;
 use metal::*;
+use reims_vgpu_protocol::extent::tight_image_bytes;
 use std::ptr;
 
 struct AttrBufferSlot {

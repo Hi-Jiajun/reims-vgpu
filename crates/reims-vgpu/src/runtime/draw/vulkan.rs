@@ -3484,7 +3484,7 @@ pub(super) fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Optio
 /// busy.
 pub(super) fn strided_level_extent(
     layout: &crate::runtime::decode::resource::TextureLevelLayout,
-    block: pixel_format::BlockGeometry,
+    block: reims_vgpu_protocol::extent::BlockGeometry,
 ) -> Option<(u64, u32)> {
     let bytes = u64::from(block.bytes);
     let bpr = layout.row_stride;
