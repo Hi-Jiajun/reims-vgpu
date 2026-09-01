@@ -34,6 +34,7 @@ pub mod executor;
 pub mod icb;
 pub mod identity;
 pub mod interpret;
+pub mod namespace;
 pub mod operation;
 pub mod pass;
 pub mod pipeline;
