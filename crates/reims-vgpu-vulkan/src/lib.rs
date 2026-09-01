@@ -27,6 +27,9 @@
 //!   may branch on topology in a way the guest can observe.
 //! - [`queues`] — which queue family this rail submits to, and the value that
 //!   makes a `VkQueue` have exactly one owner.
+//! - [`pools`] — one command pool per worker, and the rule that a command
+//!   buffer is recordable again only when the timeline says the GPU is done
+//!   with it.
 //! - [`timeline`] — which value a submission signals, and the bookkeeping that
 //!   keeps "reserved" and "reached" from being confused for each other.
 
@@ -37,5 +40,6 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod memory;
+pub mod pools;
 pub mod queues;
 pub mod timeline;
