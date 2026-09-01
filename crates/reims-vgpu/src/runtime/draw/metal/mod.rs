@@ -15,7 +15,9 @@
 
 use super::*;
 
+use crate::backend::metal::render::{RetainedColorTarget, RetainedColorTexture};
 use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+use crate::runtime::chain_phase;
 
 // The Metal ICB execute half of this rail.
 pub mod icb;
@@ -25,6 +27,121 @@ pub use icb::*;
 // parts, so they are not re-exported.
 mod depth_stencil;
 use depth_stencil::{seed_host_depth_stencil, DepthStencilAspect, HostAttachment};
+
+/// This rail's retention decision for one colour attachment, made before the
+/// seed is built and spent by the encode and then by the Store.
+///
+/// One value carries all three because the three questions are one: whether a
+/// texture already exists, whether its pixels are this pass's prior content, and
+/// which cache frame the Store must publish it as. Asked separately they drift —
+/// the hazard is a pass that skips the seed on one answer and publishes against
+/// another.
+struct ResidentPlan {
+    key: crate::backend::metal::resident::ResidentColorKey,
+    /// The retained texture, when this rail still held one. `None` is the first
+    /// draw into a surface, or one whose target the byte budget evicted.
+    texture: Option<::metal::Texture>,
+    /// Whether `texture`'s pixels already are this pass's prior content, so the
+    /// LOAD seed is a copy of bytes the texture holds.
+    ///
+    /// Only ever true when [`crate::runtime::draw::published_surface_frame`]
+    /// answered and the registry's generation matched it. Taking the texture
+    /// retired that claim, so this is the one and only reading of it.
+    holds_prior: bool,
+    /// The cache generation this plan was made against, and the comparison the
+    /// Store publishes on: a writeback that leaves this generation in place did
+    /// not refresh the cache, so the target's new pixels correspond to no frame
+    /// the cache holds and the claim must stay retired.
+    ///
+    /// `0` when there was no entry to compare against, which a refreshing
+    /// writeback then differs from as well.
+    asked_generation: u64,
+}
+
+/// Decide how this attachment's render target is obtained and retained.
+///
+/// Asked for every attachment with a mapping, whatever its load action: a Clear
+/// pass renders into a target too, and retaining that target is what makes the
+/// *next* pass's Load free.
+///
+/// An attachment [`crate::runtime::draw::published_surface_frame`] declines is
+/// still retained — the texture is reused as an allocation and the seed is
+/// uploaded into it as before. Only the content claim is refused, and the two
+/// are separate answers for exactly that reason.
+fn plan_resident_target<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c: &ColorRtRequest,
+    width: u32,
+    height: u32,
+) -> ResidentPlan {
+    use crate::backend::metal::resident::{self, ResidentColorKey};
+    use crate::runtime::draw::NoPublishedFrame;
+
+    let key = ResidentColorKey::for_surface(c.mapping_id, width, height);
+    let generation = match crate::runtime::draw::published_surface_frame(
+        state,
+        host,
+        task_id,
+        c.texture_ref,
+        width,
+        height,
+    ) {
+        Ok(frame) => {
+            crate::runtime::drain::note_store_route("metal_resident_frame_current");
+            frame.generation
+        }
+        Err(decline) => {
+            crate::runtime::drain::note_store_route(match decline {
+                NoPublishedFrame::NotMapped => "metal_resident_frame_unmapped",
+                NoPublishedFrame::Uncurrent(..) => "metal_resident_frame_uncurrent",
+                NoPublishedFrame::Unpublished(_) => "metal_resident_frame_unpublished",
+            });
+            0
+        }
+    };
+    let taken = resident::take(&key, generation);
+    let holds_prior = taken.as_ref().is_some_and(|(_, current)| *current);
+    crate::runtime::drain::note_store_route(match (&taken, holds_prior) {
+        (None, _) => "metal_resident_absent",
+        (Some(_), true) => "metal_resident_holds_prior",
+        (Some(_), false) => "metal_resident_allocation_only",
+    });
+    ResidentPlan {
+        key,
+        texture: taken.map(|(texture, _)| texture),
+        holds_prior,
+        asked_generation: generation,
+    }
+}
+
+/// Give the retained target back its claim to be the surface, if — and only if
+/// — this Store actually refreshed the cache with the pixels it now holds.
+///
+/// The test is the generation moving. Every writer of `host_surfaces` takes a
+/// fresh one in the same breath as it changes the bytes, so a generation that
+/// did not move is a writeback that published nothing this target could be said
+/// to hold: the partial-store rail retires the entry outright rather than
+/// rebuilding it, and a `DontCare` slot never reaches here at all. Leaving the
+/// claim retired in those cases costs the next draw the upload it pays today.
+fn publish_resident_target(state: &DeviceState, plan: &ResidentPlan) {
+    let Some(generation) = crate::runtime::surface_cache::frame_generation(
+        state,
+        plan.key.mapping_id,
+        plan.key.width,
+        plan.key.height,
+    ) else {
+        crate::runtime::drain::note_store_route("metal_resident_store_unpublished");
+        return;
+    };
+    if generation == plan.asked_generation {
+        crate::runtime::drain::note_store_route("metal_resident_store_stale");
+        return;
+    }
+    crate::runtime::drain::note_store_route("metal_resident_store_published");
+    crate::backend::metal::resident::published(&plan.key, generation);
+}
 
 fn null_apv_buffer() -> crate::backend::metal::abi::ReimsVgpuBuffer {
     use crate::backend::metal::abi::ReimsVgpuBuffer;
@@ -76,6 +193,11 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     use crate::backend::metal::render::{render_core_mrt, ColorRt, VisibilityQuery};
     use crate::backend::metal::util::ErrOut;
 
+    // Opened before the first refusal check, so a chain that declines is charged
+    // to whichever phase was open rather than vanishing from the division. See
+    // `chain_phase`'s doc on early returns.
+    let _phase = chain_phase::ChainTimer::start();
+    chain_phase::enter(chain_phase::Phase::Prep);
     if req.colors.is_empty() {
         return (EncodeStatus::BadArgs("draw_mtl_no_color_target"), None);
     }
@@ -136,6 +258,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // writeback: `render_core_mrt` below submits and waits, and the guest keeps
     // running on its own vCPUs across that. Indexed by attachment because MRT
     // stores every color target, not just slot 0.
+    chain_phase::enter(chain_phase::Phase::PrepPages);
     let sync_store_pages: Vec<Option<StoreTargetPages>> = if writeback_guest {
         color_list
             .iter()
@@ -153,6 +276,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         return (EncodeStatus::BadArgs("draw_mtl_no_vertices"), None);
     }
 
+    chain_phase::enter(chain_phase::Phase::PipelineDesc);
     let Some(pipeline) = load_render_pipeline(state, host, req.task_id, req.pipeline_ref) else {
         crate::observe::fail(format!(
             "metal_draw MissingPipeline pipe={}",
@@ -163,6 +287,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             None,
         );
     };
+    chain_phase::enter(chain_phase::Phase::PipelineMtlb);
     let Some(vert) = load_mtlb(
         state,
         host,
@@ -196,6 +321,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // Materialize buffer backs (storage first, then ReimsVgpuBuffer views).
     // Archive apple-pv-gpu-exec: a non-zero bound buffer that does not resolve
     // sets all_binds_ok=false and gates the draw (never feeds garbage geometry).
+    chain_phase::enter(chain_phase::Phase::Binds);
     let mut vtx_storage: Vec<Vec<u8>> = Vec::new();
     let mut frag_storage: Vec<Vec<u8>> = Vec::new();
     let mut vtx_bind_idx: Vec<u32> = Vec::new();
@@ -341,8 +467,15 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     }
     // Archive apple-pv-gpu-exec: a bound texture that does not resolve gates the
     // draw (never samples black/garbage). Same for vertex-stage textures.
+    chain_phase::enter(chain_phase::Phase::Sampled);
+    // `sampled_us` is this rail's largest bar and, unlike the Vulkan rail's, has
+    // never been divided — `runtime::sampled_phase` splits the other rail's.
+    // Two spans and two magnitudes, because a bar this size has two candidate
+    // shapes and they have opposite fixes: many small binds (per-bind overhead)
+    // and few large ones (byte movement).
     let mut vtx_tex_items: Vec<TexItem> = Vec::new();
     let mut frag_tex_items: Vec<TexItem> = Vec::new();
+    let span_sampled = chain_phase::CostSpan::new("metal_sampled_load_us");
     for t in req.vertex_textures.iter() {
         if t.texture_ref == 0 {
             continue;
@@ -358,6 +491,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 None,
             );
         };
+        crate::runtime::drain::note_store_route("metal_sampled_binds");
+        crate::runtime::drain::note_store_route_n("metal_sampled_bytes", rgba.len() as u64);
         vtx_tex_items.push(TexItem {
             index: t.index,
             w,
@@ -380,6 +515,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 None,
             );
         };
+        crate::runtime::drain::note_store_route("metal_sampled_binds");
+        crate::runtime::drain::note_store_route_n("metal_sampled_bytes", rgba.len() as u64);
         frag_tex_items.push(TexItem {
             index: t.index,
             w,
@@ -387,6 +524,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             rgba,
         });
     }
+    drop(span_sampled);
     let vtx_imgs: Vec<ReimsVgpuSampledImage> = vtx_tex_items
         .iter()
         .map(|it| {
@@ -427,6 +565,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // Samplers: serializer-object subtype 0x03 when present. A nonzero ref is an explicit
     // guest bind; if it cannot be resolved, keep the correct fallback but make
     // the degradation visible with the exact resolver reason.
+    let span_samplers = chain_phase::CostSpan::new("metal_sampled_smp_us");
     let mut vtx_samps: Vec<ReimsVgpuSampler> = Vec::new();
     let mut frag_samps: Vec<ReimsVgpuSampler> = Vec::new();
     for s in req.vertex_samplers.iter() {
@@ -461,6 +600,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             frag_samps.push(with_bind_lod_clamp(sampler, s.lod_clamp));
         }
     }
+    drop(span_samplers);
 
     // Both lists were built exactly one entry long from an `Option`, while the
     // backend ABI beneath them has always taken a slice and `apply_viewports`
@@ -468,6 +608,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // was the field above; the count these carry is now the guest's own, and
     // the backend refuses a count past `REIMS_VGPU_BACKEND_MAX_VIEWPORTS`
     // rather than truncating it.
+    chain_phase::enter(chain_phase::Phase::Assemble);
     let viewports: Vec<ReimsVgpuViewport> = req
         .viewports
         .iter()
@@ -563,6 +704,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let depth_bias_opt = depth_bias_state.as_ref();
 
     // Serializer-object depth-stencil object + optional stencil reference.
+    chain_phase::enter(chain_phase::Phase::AssembleDepth);
     let depth_stencil_state = if req.depth_stencil_ref != 0 {
         match load_depth_stencil_state(state, host, req.task_id, req.depth_stencil_ref) {
             Ok(depth_stencil) => Some(depth_stencil),
@@ -584,6 +726,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let stencil_ref_opt = stencil_ref_state.as_ref();
 
     // Host-side depth/stencil attachment buffers (guest LOAD / clear seed, STORE writeback).
+    chain_phase::enter(chain_phase::Phase::Assemble);
     let mut depth_attach_api: Option<ReimsVgpuDepthAttachment> = None;
     let depth_storage = req.depth_attach.as_ref().and_then(|da| {
         let mut seeded = seed_host_depth_stencil(
@@ -674,7 +817,15 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let need = (width as usize)
         .saturating_mul(height as usize)
         .saturating_mul(RGBA8_BPP as usize);
-    let mut color_outs: Vec<Vec<u8>> = (0..color_list.len()).map(|_| vec![0u8; need]).collect();
+    chain_phase::enter(chain_phase::Phase::Seed);
+    // The two halves of this rail's `seed_us`, which a driven macos-13 boot put
+    // at 4.79 ms a draw — the largest bar on the rail. They are counters beside
+    // the bar rather than a finer cut of it, so the bar keeps comparing across
+    // boots; see [`chain_phase::CostSpan`].
+    let mut color_outs: Vec<Vec<u8>> = {
+        let _outs = chain_phase::CostSpan::new("metal_seed_outs_us");
+        (0..color_list.len()).map(|_| vec![0u8; need]).collect()
+    };
 
     // For indexed draws, pass index_count as vertex_count for the early gate.
     let vertex_count = if is_indexed {
@@ -691,11 +842,43 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // seed-and-write-back path the alias already fell through to on every
     // contract refusal (unaligned offset or row stride, span out of range, no
     // device), so this is a rung the rail has always had.
-    for (i, c) in color_list.iter().enumerate() {
-        if c.mapping_id == 0 {
-            continue;
-        }
-        if c.load_action == MTL_LOAD_ACTION_LOAD && color_seeds[i].is_none() {
+    //
+    // The seed is skipped entirely for an attachment this rail already holds a
+    // render target for whose pixels are the frame the cache would have handed
+    // over. See [`crate::backend::metal::resident`]: that is not a new claim
+    // about content, it is "do not copy bytes into a texture that holds them".
+    let mut resident_plan: Vec<Option<ResidentPlan>> =
+        (0..color_list.len()).map(|_| None).collect();
+    {
+        let _seed_span = chain_phase::CostSpan::new("metal_seed_load_us");
+        for (i, c) in color_list.iter().enumerate() {
+            if c.mapping_id == 0 {
+                continue;
+            }
+            // Asked for every attachment with a mapping, not only the ones that
+            // Load: a Clear pass renders into a target too, and retaining that
+            // target is what makes the *next* pass's Load free. The generation
+            // is read whatever the load action, because it is also what the
+            // Store publishes against.
+            resident_plan[i] = Some(plan_resident_target(
+                state,
+                host,
+                req.task_id,
+                c,
+                width,
+                height,
+            ));
+            if c.load_action != MTL_LOAD_ACTION_LOAD || color_seeds[i].is_some() {
+                continue;
+            }
+            if resident_plan[i]
+                .as_ref()
+                .is_some_and(|plan| plan.holds_prior)
+            {
+                crate::runtime::drain::note_store_route("metal_seed_from_resident");
+                continue;
+            }
+            crate::runtime::drain::note_store_route("metal_seed_load_asked");
             color_seeds[i] =
                 seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);
             if color_seeds[i].is_none() {
@@ -715,6 +898,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     }
 
     // Build ColorRt views with raw pointers into seeds/outs (disjoint mut slices).
+    chain_phase::enter(chain_phase::Phase::Assemble);
     let mut color_rts: Vec<ColorRt<'_>> = Vec::with_capacity(color_list.len());
     for (i, c) in color_list.iter().enumerate() {
         // Every target encodes host RGBA8 for writeback conversion.
@@ -762,9 +946,17 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     None
                 }
             });
+        // What this rail is about to do to the guest's declaration, counted
+        // before it does it. `pixel_format: 0` below is `RGBA8Unorm` for every
+        // target whatever the destination declared, and until this call there
+        // was nothing on the always-on channel to say when that quantised a
+        // wider one. See `runtime::draw::ColorTargetNarrowing`.
+        crate::runtime::draw::note_store_narrowing(c.format, width, height);
         color_rts.push(ColorRt {
             slot: c.slot,
-            // Host RT: 0 = RGBA8Unorm (writeback conversion path).
+            // Host RT: 0 = RGBA8Unorm (writeback conversion path). The one
+            // place this rail decides a colour target's format; the narrowing
+            // it can cause is named and counted directly above.
             pixel_format: 0,
             seed_rgba8: color_seeds[i].as_deref(),
             out_rgba8: Some(out),
@@ -786,6 +978,22 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 .map(|a| a.write_mask)
                 .unwrap_or_default()
                 .bits(),
+            // Moved out of the plan rather than borrowed: the backend takes
+            // ownership of the handle for the pass, and a plan left behind
+            // holding a second one would keep an evicted texture alive past the
+            // registry that stopped counting its bytes.
+            // The handle moves and the plan stays: the Store below needs the
+            // key and the generation this plan was made against, and a second
+            // live handle here would keep an evicted texture alive past the
+            // registry that stopped counting its bytes.
+            retained: resident_plan[i].as_mut().map(|plan| RetainedColorTarget {
+                key: plan.key,
+                texture: match (plan.texture.take(), plan.holds_prior) {
+                    (None, _) => RetainedColorTexture::Absent,
+                    (Some(texture), true) => RetainedColorTexture::Prior(texture),
+                    (Some(texture), false) => RetainedColorTexture::Allocation(texture),
+                },
+            }),
         });
     }
 
@@ -798,6 +1006,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         mode: arming.mode,
         samples: None,
     });
+    chain_phase::enter(chain_phase::Phase::Engine);
     let st = render_core_mrt(
         &vert,
         &frag,
@@ -832,6 +1041,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         visibility.as_mut(),
         err,
     );
+    chain_phase::enter(chain_phase::Phase::Store);
     // Read before the status is matched, the way `runtime::exec` reads the
     // field it lands in: the backend only fills `samples` on a pass that ran to
     // completion, so a refusal leaves the query unanswered and says so.
@@ -852,7 +1062,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         &depth_stencil_state,
     );
     if !st.is_ok() {
-        return (EncodeStatus::MetalBackend(st), None);
+        return (EncodeStatus::RailRefused(st), None);
     }
 
     // Convert each color RT RGBA8 → guest format and writeback (mapper-ref-texture mapping
@@ -861,7 +1071,13 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut any_write = false;
     if !writeback_guest {
         // Still log + early paint latch only when storing; chain returns RGBA.
-        return (EncodeStatus::Ok, color_outs.first().cloned());
+        // Moved out rather than cloned: `color_outs` is this call's own storage
+        // and dies with the frame, so a clone was a second full-frame
+        // allocation and copy for a buffer nothing else would read.
+        return (
+            EncodeStatus::Ok,
+            std::mem::take(&mut color_outs).into_iter().next(),
+        );
     }
     for (i, c) in color_list.iter().enumerate() {
         if c.store_action == MTL_STORE_ACTION_DONT_CARE {
@@ -906,6 +1122,20 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     },
                 )
             } else {
+                // The host copy of this frame is worth its 12.6 ms a flush
+                // only when nothing else holds the frame. This rail's own
+                // resident render target holds exactly `out_rgba` — it is the
+                // texture the pass rendered into and the readback came out of —
+                // and `publish_resident_target` below stamps it as this
+                // mapping's published frame the moment the write lands. So when
+                // there is a plan, the copy is a second one and the two readers
+                // that want it take
+                // `backend::metal::resident::read_published_bgra8` instead.
+                //
+                // Keyed on the plan and not on `holds_prior`: `holds_prior` is
+                // about the *prior* frame and is false on the very draw that
+                // creates the target, which is precisely a draw whose Store does
+                // publish a resident.
                 mapping_write::write_rgba8_image_changed(
                     state,
                     host,
@@ -914,6 +1144,11 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     seed_for_store,
                     width,
                     height,
+                    if resident_plan.get(i).is_some_and(Option::is_some) {
+                        mapping_write::FramePublication::RailResident
+                    } else {
+                        mapping_write::FramePublication::HostCache
+                    },
                 )
             }
         } else if c.target_gva != 0 {
@@ -961,6 +1196,9 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         };
         if wrote {
             any_write = true;
+            if let Some(plan) = resident_plan.get(i).and_then(|p| p.as_ref()) {
+                publish_resident_target(state, plan);
+            }
             // Early-boot logo+pill: paint mapper-ref-texture front before first DisplaySwap.
             if c.mapping_id != 0 {
                 crate::runtime::scanout::note_front_buffer_writeback(
@@ -997,7 +1235,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     {
         seeded.store_back(state, host, (width, height));
     }
-    let color0_rgba = color_outs.first().cloned();
+    // Moved, not cloned; see the early return above.
+    let color0_rgba = std::mem::take(&mut color_outs).into_iter().next();
     (EncodeStatus::Ok, color0_rgba)
 }
 
@@ -1575,7 +1814,118 @@ fn load_mapper_ref_texture_rgba<M: HostMemory + HostOps>(
     format_override: Option<u16>,
 ) -> Option<(u32, u32, Vec<u8>)> {
     let mapping_id = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)?;
+    if let Some(served) = sampled_from_published_surface(state, host, mapping_id, format_override) {
+        return Some(served);
+    }
     load_mapper_ref_texture_mapping_rgba(state, host, mapping_id, format_override)
+}
+
+/// A sampled read served from this device's own last publication of the surface,
+/// instead of from the surface's guest pages.
+///
+/// # Why this is the whole of the bar
+///
+/// This rail's sampled path had no cache rung at all: every bind walked the
+/// surface's pages and decoded every texel, from scratch, every draw. Measured
+/// on a driven macos-13 boot, `metal_sampled_load_us` was 100.0 % of
+/// `sampled_us` and `sampled_us` was 48 % of the whole chain — 2.15 MB a draw at
+/// **150 MB/s**, against 2.4 GB/s for `replace_region` pushing the identical
+/// bytes back out. The gap is the per-texel decode, not the copy.
+///
+/// The cache holds those same texels already, in BGRA, published by the Store
+/// that rendered them, and reaching them costs a refcount and a four-byte
+/// shuffle.
+///
+/// # Why the bytes are the same bytes
+///
+/// [`crate::runtime::draw::load_mapper_ref_texture_mapping_rgba`] keys on the
+/// mapping's *latched* geometry — which is what
+/// [`crate::runtime::surface_cache`] is keyed by — reads BGRA8 out of the
+/// mapping, and converts it to RGBA8. With no view format override that
+/// conversion is exactly a red/blue swap, so this arm and that one produce the
+/// same image or this one does not fire.
+///
+/// A format override is refused rather than reinterpreted: the override
+/// reinterprets the storage, and a cache entry records no such
+/// reinterpretation. Counted, so the size of what is being left on the table is
+/// visible rather than assumed.
+///
+/// # Which evidence standard, and why the strict one again
+///
+/// A stale sampled texture is less bad than a stale LOAD seed — nothing writes
+/// a sampled read back, so the next frame re-samples — but the frame it
+/// corrupts *is* written back by its pass's Store, so the error still reaches
+/// the guest's pages. And the rung below this one reads the guest's pages, so a
+/// refusal costs exactly what this path costs today.
+///
+/// Same door, same standard, one gate: widening is a decision to take once, on
+/// the counters, for both readers — not twice, differently, here.
+fn sampled_from_published_surface<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    mapping_id: u32,
+    format_override: Option<u16>,
+) -> Option<(u32, u32, Vec<u8>)> {
+    use crate::runtime::draw::NoPublishedFrame;
+    use crate::runtime::surface_currency::SurfaceCurrency;
+
+    if format_override.is_some() {
+        crate::runtime::drain::note_store_route("metal_sampled_surface_override");
+        return None;
+    }
+    let (w, h) = {
+        let m = state.mappings.get(&mapping_id)?;
+        if !m.has_geom || m.width == 0 || m.height == 0 {
+            // The read below latches the geometry as it goes, so the next bind
+            // of this surface reaches the door. Not a refusal of the frame.
+            crate::runtime::drain::note_store_route("metal_sampled_surface_ungeometried");
+            return None;
+        }
+        (m.width, m.height)
+    };
+    crate::runtime::drain::note_store_route("metal_sampled_surface_asked");
+    let published =
+        match crate::runtime::draw::published_mapping_frame(state, host, mapping_id, w, h) {
+            Ok(frame) => frame,
+            Err(decline) => {
+                crate::runtime::drain::note_store_route(match decline {
+                    NoPublishedFrame::Uncurrent(_, SurfaceCurrency::Unwritten(_)) => {
+                        "metal_sampled_surface_unwatched"
+                    }
+                    NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WrotePixels(_)) => {
+                        "metal_sampled_surface_repainted"
+                    }
+                    NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteUnknown) => {
+                        "metal_sampled_surface_unknown"
+                    }
+                    NoPublishedFrame::Unpublished(_) => "metal_sampled_surface_empty",
+                    // `serves` admits `WroteElsewhere` and the mapping and geometry were
+                    // both checked above, so either arm here is a contradiction between
+                    // this match and the gate rather than a guest behaviour.
+                    NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteElsewhere)
+                    | NoPublishedFrame::NotMapped => "metal_sampled_surface_impossible",
+                });
+                return None;
+            }
+        };
+    // Two sources for one frame, in the order of what they cost. The cache hands
+    // over an `Arc` and a whole-frame channel exchange; the resident hands over a
+    // GPU readback and no exchange. Which one holds the frame is decided by the
+    // Store that published it — see `mapping_write::FramePublication` — and both
+    // are gated on the *same* generation the door above just read, so neither can
+    // serve a frame the other has superseded.
+    if let Some(bgra) = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h) {
+        crate::runtime::drain::note_store_route("metal_sampled_from_surface");
+        crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", bgra.len() as u64);
+        return Some((w, h, swap_rb_channels(&bgra)));
+    }
+    let rgba = crate::backend::metal::resident::read_published_rgba8(
+        &crate::backend::metal::resident::ResidentColorKey::for_surface(mapping_id, w, h),
+        published.generation,
+    )?;
+    crate::runtime::drain::note_store_route("metal_sampled_from_resident");
+    crate::runtime::drain::note_store_route_n("metal_sampled_surface_bytes", rgba.len() as u64);
+    Some((w, h, rgba))
 }
 
 /// normal-texture linear texture at mip `level`: strided guest rows → tight RGBA8.
@@ -1632,6 +1982,11 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return None;
     }
+    // Parsed once, above the row loop. This loop is this rail's sampled bar:
+    // `metal_sampled_load_us` was 100 % of `sampled_us` on a driven macos-13
+    // boot, and re-deciding the format ordinal per texel was most of it. See
+    // `pixel_format::RowToRgba8`.
+    let row_rail = pixel_format::RowToRgba8::for_format(sample_fmt)?;
     let mut rgba = vec![0u8; need_rgba];
     let mut row = vec![0u8; tight as usize];
     for y in 0..h {
@@ -1646,7 +2001,7 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
         )
         .ok()?;
         let dst_off = (y as usize) * (w as usize) * 4;
-        if !pixel_format::convert_row_to_rgba8(sample_fmt, &row, w, &mut rgba[dst_off..]) {
+        if !row_rail.convert(&row, w, &mut rgba[dst_off..]) {
             return None;
         }
     }
@@ -1739,6 +2094,9 @@ fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
         return false;
     }
     let tight = (rect_w as usize).saturating_mul(bpp as usize);
+    let Some(store_rail) = pixel_format::Rgba8ToRow::for_format(format) else {
+        return false;
+    };
     let mut raw = vec![0u8; tight.saturating_mul(rect_h as usize)];
     let mut guest_row = vec![0u8; tight];
     for dy in 0..rect_h as usize {
@@ -1746,7 +2104,7 @@ fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
         let src = &rgba[y * rgba_row + (origin_x as usize) * 4
             ..y * rgba_row + (origin_x as usize) * 4 + (rect_w as usize) * 4];
         // Guest store is native format; convert from tight RGBA8 (same as full write_gva path).
-        if !pixel_format::convert_rgba8_to_row(format, src, rect_w, &mut guest_row) {
+        if !store_rail.convert(src, rect_w, &mut guest_row) {
             return false;
         }
         raw[dy * tight..dy * tight + tight].copy_from_slice(&guest_row);
@@ -1778,6 +2136,159 @@ mod tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::host::FakeHost;
+
+    /// A sampled read of a mapper-ref-texture surface is served from this
+    /// device's own published frame while the hypervisor's witness says the
+    /// guest has not repainted it, and from the surface's own pages otherwise.
+    ///
+    /// The rung this adds is the whole of the rail's largest bar: measured on a
+    /// driven macos-13 boot, `metal_sampled_load_us` was 100.0 % of
+    /// `sampled_us`, moving 2.15 MB a draw at 150 MB/s through a per-texel
+    /// decode of pages this device had just written itself.
+    ///
+    /// Three legs, and the middle one is the reason the strict evidence
+    /// standard is used here as well as on the LOAD seed: a rail whose
+    /// dirty-tracking witness never arms answers `NoStamp` to every ask, and
+    /// under the permissive standard this door would then hand every shader
+    /// whatever the cache held, forever.
+    #[test]
+    fn a_sampled_mapper_ref_texture_serves_a_published_frame_only_on_a_watched_clean_witness() {
+        use crate::contract::endian::{st16, st32};
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::model::PAGE_SHIFT_X86;
+        use crate::runtime::decode::resource::{
+            list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_MAPPER_REF_TEXTURE,
+        };
+        use crate::runtime::gva_mem;
+        use crate::runtime::host::{HostMemory, HostOps};
+
+        let (w, h) = (2u32, 2u32);
+        let (mid, texture_ref, task_id) = (71u32, 2u32, 1u32);
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+
+        let (dir_pfn, root_pfn) = (2u32, 3u32);
+        let (dir_gpa, root_gpa) = (
+            (dir_pfn as u64) << PAGE_SHIFT_X86,
+            (root_pfn as u64) << PAGE_SHIFT_X86,
+        );
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        let mut dir = [0u8; 8];
+        st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+        st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+        assert!(host.write_gpa(dir_gpa, &dir).is_ok());
+        for i in 0..3u32 {
+            let pfn = 4 + i;
+            host.map_range((pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn);
+            assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+        }
+        state.define_task(task_id, 0x1000, dir_pfn);
+        assert!(state.set_object_list(task_id, 0, 32));
+
+        const DESC_LEN: usize = 0x20;
+        let desc_gva = 0x1000u64;
+        let mut desc = vec![0u8; DESC_LEN];
+        st32(&mut desc[0..], mid);
+        st16(&mut desc[0x16..], MTL_FORMAT_BGRA8_UNORM);
+        st32(&mut desc[0x18..], w);
+        st32(&mut desc[0x1c..], h);
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[task_id],
+            desc_gva,
+            &desc,
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut list_entry,
+            u32::from(OBJECT_TYPE_MAPPER_REF_TEXTURE) | ((DESC_LEN as u32) << 8),
+        );
+        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[task_id],
+            list_object_entry_offset(texture_ref, 32).unwrap(),
+            &list_entry,
+            PAGE_SHIFT_X86
+        )
+        .is_ok());
+
+        let page_gpa = 6u64 << PAGE_SHIFT_X86;
+        assert!(state.map_surface(mid));
+        {
+            let m = state.mappings.get_mut(&mid).expect("mapped above");
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(6u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+        // What the surface's own pages hold, and what this device last
+        // published for it — different colours, so "served from the cache" and
+        // "read from the guest" are told apart by value and not by a counter.
+        assert!(host
+            .write_gpa(
+                page_gpa,
+                &[0x11u8, 0x22, 0x33, 0xff].repeat((w * h) as usize)
+            )
+            .is_ok());
+        const GUEST_RGBA: [u8; 4] = [0x33, 0x22, 0x11, 0xff];
+        crate::runtime::surface_cache::store(
+            &mut state,
+            mid,
+            w,
+            h,
+            [0xAAu8, 0xBB, 0xCC, 0xff].repeat((w * h) as usize),
+        );
+        const PUBLISHED_RGBA: [u8; 4] = [0xCC, 0xBB, 0xAA, 0xff];
+
+        // Unwatched: the witness has not been armed, so the strict standard
+        // refuses and the guest's pages answer.
+        let (gw, gh, rgba) = load_sampled_rgba(&mut state, &mut host, task_id, texture_ref)
+            .expect("the surface's own pages are always a sampled source");
+        assert_eq!((gw, gh), (w, h));
+        assert_eq!(
+            &rgba[..4],
+            &GUEST_RGBA,
+            "an unstamped surface has no witness to spend, and the cache must not be served"
+        );
+
+        // Watched and clean, which is what `mapping_write` leaves behind when it
+        // publishes: the device's own frame is the surface.
+        let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
+            .expect("FakeHost observes guest writes");
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
+        let (_, _, served) = load_sampled_rgba(&mut state, &mut host, task_id, texture_ref)
+            .expect("a published frame under a clean witness is the surface");
+        assert_eq!(
+            &served[..4],
+            &PUBLISHED_RGBA,
+            "with the witness clean the device's own publication is the surface, and the \
+             per-texel decode of the guest's pages is the cost this door exists to remove"
+        );
+
+        // Repainted by the guest CPU, with no device operation at all — this
+        // witness is the only thing that sees it.
+        host.guest_wrote_page(page_gpa);
+        let (_, _, repainted) = load_sampled_rgba(&mut state, &mut host, task_id, texture_ref)
+            .expect("a repainted surface still samples, from its own pages");
+        assert_eq!(
+            &repainted[..4],
+            &GUEST_RGBA,
+            "the cache is a frame the guest has since painted over"
+        );
+    }
 
     #[test]
     fn explicit_metal_sampler_and_depth_binds_return_typed_missing_entry_declines() {

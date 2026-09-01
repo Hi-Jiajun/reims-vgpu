@@ -135,7 +135,7 @@ for arm in $ARMS; do
   [ "$dock" = yes ] || { say "$tag: no desktop"; printf '%s\tNO-DESKTOP\t-\n' "$tag" >>"$RESULTS"; continue; }
   sleep 8
 
-  QMP_SOCK="$REPO/vm/disks/run/qmp.sock" timeout 700 \
+  QMP_SOCK="$("$REPO/scripts/qmp/qmp.py" sock)" timeout 700 \
     "$REPO/scripts/app-sweep-probe/app-sweep-probe.sh" --rail "$RAIL" \
     --seconds "$SECONDS_PER_APP" --torture-seconds 30 \
     --keep "$OUT/$tag-work" >"$OUT/$tag-probe.log" 2>&1

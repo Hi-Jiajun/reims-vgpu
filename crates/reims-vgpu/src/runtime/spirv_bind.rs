@@ -3883,6 +3883,7 @@ mod more_tests {
             depth_qualifier: None,
             stencil_members: vec![],
             local_size: (stage == ShaderStage::Kernel).then_some([1, 1, 1]),
+            max_work_group_size: None,
             vertex_builtins: None,
             tessellation: None,
             imageblock_layouts: vec![],

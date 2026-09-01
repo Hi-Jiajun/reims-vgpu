@@ -304,7 +304,7 @@ pub struct ShaderVariant {
     ///
     /// Twelve interleaved driven macos-13 sustained-animation boots, two pinned
     /// binaries differing only by this and by
-    /// [`crate::runtime::pipeline_resolve::VertexBindPlan`], scored over the
+    /// [`crate::backend::vulkan::pipeline_resolve::VertexBindPlan`], scored over the
     /// fast population. Per draw, median over busy census windows, then mean and
     /// range across boots:
     ///
@@ -1378,6 +1378,7 @@ mod tests {
                 depth_qualifier: None,
                 stencil_members: vec![],
                 local_size: (stage == ShaderStage::Kernel).then_some([1, 1, 1]),
+                max_work_group_size: None,
                 vertex_builtins: None,
                 tessellation: None,
                 imageblock_layouts: vec![],
@@ -1447,6 +1448,7 @@ mod tests {
                 depth_qualifier: None,
                 stencil_members: vec![],
                 local_size: (reflected_stage == ShaderStage::Kernel).then_some([1, 1, 1]),
+                max_work_group_size: None,
                 vertex_builtins: None,
                 tessellation: None,
                 imageblock_layouts: vec![],

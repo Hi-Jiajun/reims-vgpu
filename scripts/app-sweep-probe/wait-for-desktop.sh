@@ -142,7 +142,7 @@ crashes_since_boot() {
   rm -f "$ref"
 }
 qmp() {
-  QMP_SOCK="${QMP_SOCK:-$REPO/vm/disks/run/qmp.sock}" \
+  QMP_SOCK="${QMP_SOCK:-$("$REPO/scripts/qmp/qmp.py" sock)}" \
     timeout 30 "$REPO/scripts/qmp/qmp.py" "$@" >/dev/null 2>&1
 }
 

@@ -76,12 +76,13 @@ use crate::runtime::host_writes::HostWriteVerdict;
 use crate::runtime::mapper::GuestWriteVerdict;
 use std::collections::BTreeMap;
 
-/// Which GVA render target a witness entry is about: the engine registry's own
-/// identity for it, spelled without the backend type so `DeviceState` stays
-/// backend-neutral.
+/// Which GVA render target a witness entry is about: the guest span the rail's
+/// resident stands for, spelled without the rail's own type so `DeviceState`
+/// stays backend-neutral.
 ///
-/// [`GvaTargetKey::of`] is the only constructor that a product path may use, so
-/// the two spellings cannot drift into naming different targets.
+/// `Backend::gva_witness_key` is the only constructor a product path may use,
+/// so the arm site and the payment site cannot drift into naming different
+/// targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct GvaTargetKey {
     pub gva: u64,
@@ -95,49 +96,13 @@ pub struct GvaTargetKey {
     /// Channel order of the resident this key was taken from.
     ///
     /// It is an order and not the resident's whole format because this key
-    /// names a **guest span**, and every format the identity can hold today
-    /// maps onto one of the two orders one-for-one. That stops being true the
-    /// moment a render target may be wider than eight bits per channel: RGBA8
-    /// and half-float RGBA are one order and two residents, and they would
-    /// share a key here. Whoever widens
-    /// [`crate::backend::vulkan::engine::TargetIdentity::resident_format`]'s
-    /// range widens this with it.
+    /// names a **guest span**, and every format a rail's resident can hold
+    /// today maps onto one of the two orders one-for-one. That stops being true
+    /// the moment a render target may be wider than eight bits per channel:
+    /// RGBA8 and half-float RGBA are one order and two residents, and they
+    /// would share a key here. Whoever widens the range a rail's resident
+    /// format may take widens this with it.
     pub bgra: bool,
-}
-
-impl GvaTargetKey {
-    /// The key for a `TargetIdentity::Gva`, or `None` for any other identity
-    /// kind or an unusable generation.
-    ///
-    /// The task is deliberately not in the key. Two tasks colliding here would
-    /// need identical resolved page sets at the same address and extent, which
-    /// is the same physical memory — the same target by every test this device
-    /// applies to it.
-    #[cfg(feature = "backend-vulkan")]
-    pub fn of(identity: &crate::backend::vulkan::engine::TargetIdentity) -> Option<Self> {
-        match *identity {
-            crate::backend::vulkan::engine::TargetIdentity::Gva {
-                gva,
-                width,
-                height,
-                generation,
-                format: _,
-            } if generation != 0 && gva != 0 => Some(Self {
-                gva,
-                generation,
-                width,
-                height,
-                // Asked of the identity rather than spelled here. A channel
-                // order is one question with one owner, and a second
-                // hand-written copy of it is the divergence that put an
-                // R/B-exchanged frame in guest memory once already — see
-                // `engine::ResidentReadSnapshot::bgra`. The pattern still names
-                // the field so a new one cannot be added without meeting it.
-                bgra: identity.is_bgra(),
-            }),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -301,8 +266,8 @@ pub fn note_store<H: HostOps>(
 /// Forget every target whose pages this task owned, handing back their tokens.
 ///
 /// A task teardown takes its page tables with it, so nothing in it names
-/// anything any more. There is no task in the key — see [`GvaTargetKey::of`] —
-/// so this takes the page list instead: an entry every one of whose pages the
+/// anything any more. There is no task in the key — see [`GvaTargetKey`] — so
+/// this takes the page list instead: an entry every one of whose pages the
 /// caller names as gone is gone. Called with the task's retired page set.
 pub fn retire_pages(state: &mut DeviceState, gone: &[u64]) {
     if gone.is_empty() {

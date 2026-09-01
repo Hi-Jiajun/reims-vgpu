@@ -38,9 +38,9 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::backend::vulkan::engine::DrawPreparationDecline;
-use crate::model::DeviceState;
+use crate::model::{DeviceState, RailDeviceState, TaskReferenceStates};
 use crate::runtime::decode::resource::RenderPipelineDescriptor;
-use crate::runtime::drain::note_store_route;
+use crate::runtime::drain::{note_store_route, note_store_route_n};
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::m2v_cache::CachedShader;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
@@ -151,6 +151,50 @@ impl VertexBindPlan {
     }
 }
 
+/// Per-task render pipeline states, keyed by the pipeline API's reference
+/// space. A state owns its decoded descriptor, translated functions and derived
+/// bind plan exactly as one native pipeline state owns its construction.
+pub type TaskRenderPipelineStates = TaskReferenceStates<ResolvedRenderPipeline>;
+
+/// What this rail retains for one device's lifetime.
+///
+/// One table today. It is a struct rather than the table itself so a second
+/// retention on this rail joins it here instead of claiming the device's single
+/// [`RailDeviceState`] slot for itself.
+#[derive(Debug, Default)]
+pub struct VulkanDeviceState {
+    pub render_pipelines: TaskRenderPipelineStates,
+}
+
+impl RailDeviceState for VulkanDeviceState {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    /// The guest's task teardown ends every reference this rail holds under it.
+    /// Reported under this rail's own name, which is the one the boot logs have
+    /// carried since the retention replaced a process-global memo.
+    fn delete_task(&self, task_id: u32) {
+        note_store_route_n(
+            "pipeline_state_task_deleted",
+            self.render_pipelines.delete_task(task_id) as u64,
+        );
+    }
+}
+
+/// This rail's retained pipeline states for `state`'s device.
+///
+/// `None` is the ablation, not a failure: [`DeviceState::rail_state`] answers
+/// it only when another rail's type already holds the slot, and every caller
+/// here already implements "reconstruct instead of retrieving" for
+/// `REIMS_VGPU_PIPELINE_MEMO=off`. So the unreachable case degrades to the
+/// slower path this module was measured against, never to a wrong pipeline.
+pub(crate) fn retained(state: &DeviceState) -> Option<&TaskRenderPipelineStates> {
+    state
+        .rail_state::<VulkanDeviceState>()
+        .map(|rail| &rail.render_pipelines)
+}
+
 /// Everything a draw chain needs from its pipeline ref, resolved once.
 ///
 /// The registry owns this structure behind one `Arc`, so a hit acquires only
@@ -191,6 +235,7 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
             depth_qualifier: None,
             stencil_members: vec![],
             local_size: None,
+            max_work_group_size: None,
             kernel_dispatch: None,
             vertex_builtins: None,
             tessellation: None,
@@ -272,10 +317,7 @@ pub fn translations_ready<M: HostMemory + HostOps>(
     if !memo_enabled() {
         return false;
     }
-    if !state
-        .task_render_pipeline_states
-        .contains(task_id, pipeline_ref)
-    {
+    if !retained(state).is_some_and(|states| states.contains(task_id, pipeline_ref)) {
         note_store_route("preflight_memo_absent");
         return false;
     }
@@ -299,7 +341,11 @@ pub fn resolve<M: HostMemory + HostOps>(
         return resolve_uncached(state, host, task_id, pipeline_ref).map(Arc::new);
     }
 
-    if let Some(resolved) = state.task_render_pipeline_states.get(task_id, pipeline_ref) {
+    let Some(states) = retained(state) else {
+        note_store_route("pipe_memo_off");
+        return resolve_uncached(state, host, task_id, pipeline_ref).map(Arc::new);
+    };
+    if let Some(resolved) = states.get(task_id, pipeline_ref) {
         note_store_route("pipe_memo_hit");
         return Ok(resolved);
     }
@@ -307,10 +353,7 @@ pub fn resolve<M: HostMemory + HostOps>(
 
     let mut resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
     resolved.pipeline_object = Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new());
-    let resolved = Arc::new(resolved);
-    Ok(state
-        .task_render_pipeline_states
-        .register(task_id, pipeline_ref, resolved))
+    Ok(states.register(task_id, pipeline_ref, Arc::new(resolved)))
 }
 
 /// The sample count an attachment bound with this pipeline must carry.
@@ -329,7 +372,7 @@ pub fn attachment_sample_count<M: HostMemory + HostOps>(
     pipeline_ref: u32,
 ) -> Option<u32> {
     if memo_enabled() {
-        if let Some(resolved) = state.task_render_pipeline_states.get(task_id, pipeline_ref) {
+        if let Some(resolved) = retained(state).and_then(|s| s.get(task_id, pipeline_ref)) {
             return Some(resolved.desc.raster_sample_count.max(1));
         }
     }
@@ -430,6 +473,14 @@ mod tests {
     use super::*;
     use crate::runtime::decode::resource::VertexAttribute;
 
+    /// This rail's retained table, which is what these tests are about. Named
+    /// rather than asked of `selected()`: the retention belongs to this rail
+    /// and the assertions would mean something else on a build that latched
+    /// the other one.
+    fn pipelines(state: &DeviceState) -> &TaskRenderPipelineStates {
+        retained(state).expect("this rail owns the device's rail-state slot")
+    }
+
     /// An empty retained registry must answer **not ready**, and that direction
     /// is the whole safety of asking it.
     ///
@@ -463,9 +514,7 @@ mod tests {
 
         let mut state = DeviceState::new(DeviceId(1), 12);
         state.define_task(3, 1 << 20, 7);
-        let first = state
-            .task_render_pipeline_states
-            .register(3, 9, retained_pipeline_for_test());
+        let first = pipelines(&state).register(3, 9, retained_pipeline_for_test());
         let first_id = first
             .pipeline_object
             .as_ref()
@@ -473,22 +522,16 @@ mod tests {
             .id();
 
         assert!(state.set_object_list(3, 11, 64));
-        assert!(Arc::ptr_eq(
-            &first,
-            &state.task_render_pipeline_states.get(3, 9).unwrap()
-        ));
-        assert!(state.task_render_pipeline_states.delete(3, 9));
-        assert!(!state.task_render_pipeline_states.contains(3, 9));
+        assert!(Arc::ptr_eq(&first, &pipelines(&state).get(3, 9).unwrap()));
+        assert!(pipelines(&state).delete(3, 9));
+        assert!(!pipelines(&state).contains(3, 9));
         assert_eq!(
             Arc::strong_count(&first),
             1,
             "the encoder owner remains valid"
         );
 
-        let replacement =
-            state
-                .task_render_pipeline_states
-                .register(3, 9, retained_pipeline_for_test());
+        let replacement = pipelines(&state).register(3, 9, retained_pipeline_for_test());
         assert_ne!(
             replacement
                 .pipeline_object
@@ -500,15 +543,13 @@ mod tests {
         );
         state.define_task(3, 1 << 20, 8);
         assert!(
-            !state.task_render_pipeline_states.contains(3, 9),
+            !pipelines(&state).contains(3, 9),
             "task redefinition ends the old task namespace"
         );
 
-        state
-            .task_render_pipeline_states
-            .register(3, 9, retained_pipeline_for_test());
+        pipelines(&state).register(3, 9, retained_pipeline_for_test());
         assert!(state.delete_task(3));
-        assert!(!state.task_render_pipeline_states.contains(3, 9));
+        assert!(!pipelines(&state).contains(3, 9));
     }
 
     /// The two sets [`VertexBindPlan`] carries used to be rebuilt inside the

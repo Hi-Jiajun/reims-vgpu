@@ -394,6 +394,28 @@ fn swap_rb_channels(src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// [`swap_rb_channels`] for a frame the caller already owns: one read-modify-write
+/// pass, no allocation.
+///
+/// # Why the pair and not just the allocating one
+///
+/// Both directions of this exchange exist because both call shapes exist. A
+/// reader handed an `Arc` or a borrowed cache slice cannot write through it and
+/// needs the fresh `Vec`; a reader that has just *produced* the frame — a
+/// resident readback, which is the shape both rails' capture and seed paths
+/// take — owns it, and making it allocate a second full frame to reorder four
+/// bytes at a time is a whole 8 MB of copy per present for nothing.
+///
+/// The exchange is its own inverse, so this serves both directions, and a
+/// trailing partial pixel is left as it is — the same tail rule
+/// [`swap_rb_channels`] follows, stated once so the two cannot drift.
+#[inline]
+pub(crate) fn swap_rb_channels_in_place(frame: &mut [u8]) {
+    for px in frame.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+}
+
 /// One slot of a render encoder's vertex or fragment buffer table.
 ///
 /// The stage is not a field. A bind lives in `vertex_buffers` or in
@@ -670,8 +692,9 @@ fn degrade_log_first(pipeline_ref: u32, slug: &'static str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeStatus {
     Ok,
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    MetalBackend(crate::backend::metal::error::Status),
+    /// A rail refused with structure. See [`crate::runtime::compute_exec::ComputeStatus::RailRefused`]
+    /// — its twin, and the same reason for being neutral and ungated.
+    RailRefused(crate::backend::refusal::RailRefusal),
     MissingPipeline(&'static str),
     MissingMtlb(&'static str),
     MetalFailed(&'static str),
@@ -693,8 +716,7 @@ impl crate::observe::Refusal for EncodeStatus {
             // The only non-refusal, and the reason this is a `Refusal` rather
             // than a `Decline`: `Emit::refusal` cannot render a line for it.
             Self::Ok => None,
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            Self::MetalBackend(status) => status.refusal(),
+            Self::RailRefused(refusal) => refusal.refusal(),
             Self::MissingPipeline(slug)
             | Self::MissingMtlb(slug)
             | Self::MetalFailed(slug)
@@ -709,9 +731,8 @@ impl crate::observe::Refusal for EncodeStatus {
         // The class beside the reason: which recovery path the caller took is
         // not derivable from the slug, and a reader correlating a dropped draw
         // with a black frame needs both.
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        if let Self::MetalBackend(status) = self {
-            let mut fields = crate::observe::Refusal::fields(status);
+        if let Self::RailRefused(refusal) = self {
+            let mut fields = crate::observe::Refusal::fields(refusal);
             fields.push(("recovery", "metal_failed".to_string()));
             return fields;
         }
@@ -725,9 +746,10 @@ impl EncodeStatus {
     pub fn class(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            Self::MetalBackend(status) => {
-                if status.is_args() {
+            // The two names the boot logs have carried since this was
+            // `MetalBackend`; see `ComputeStatus::class`.
+            Self::RailRefused(refusal) => {
+                if refusal.is_args() {
                     "metal_args"
                 } else {
                     "metal_execute"
@@ -1177,6 +1199,107 @@ pub(crate) fn note_sampled_narrowing(
     ));
 }
 
+/// What rendering a Store's colour target at `RGBA8Unorm` does to the format
+/// the guest declared for its destination.
+///
+/// # Why this exists at all
+///
+/// The Metal rail creates **every** colour render target as `RGBA8Unorm`. The
+/// destination mapping's declared format is available at the same call site and
+/// is not forwarded: `ColorRt::pixel_format` is a literal `0`, which
+/// `backend::metal::render` reads as "the writeback format". That is a policy,
+/// and until this type it was a constant with a comment.
+///
+/// It is not a harmless one. A driven macos-13 boot reports the window server's
+/// main compositing surface as `MTLPixelFormatRGBA16Float`, so the guest's
+/// half-float frame is rendered into an eight-bit attachment, read back as
+/// unorm8, and expanded again to half-float on the way into the guest's pages —
+/// where it arrives with 256 levels per channel and everything above 1.0 gone.
+///
+/// The Vulkan rail had exactly this defect and fixed it;
+/// `backend::vulkan::present_identity::surface_identity`'s doc states the
+/// finding in its own words: *"Ignoring the declaration renders a guest's
+/// half-float compositing into an eight-bit image and quantizes it with nothing
+/// to say so — the loss is invisible because every rail downstream still works,
+/// which is how the same bug survived in the `Gva` namespace until a counter on
+/// an unrelated gate exposed it."*
+///
+/// "With nothing to say so" is the part this type changes. `AGENTS.md` requires
+/// degraded guest work to produce a typed reason on the always-on failure
+/// channel, and the store direction had none — [`note_sampled_narrowing`] is
+/// the load direction's and has no counterpart. Naming the decision does not
+/// fix it; it makes the size of it countable, and it gives the fix one place to
+/// happen.
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColorTargetNarrowing {
+    /// The guest declared an eight-bit colour order, so an `RGBA8Unorm`
+    /// attachment carries it exactly and the writeback conversion is a channel
+    /// permutation.
+    None,
+    /// The guest declared a store layout this rail does not render in. Carries
+    /// it, because "half-float" and "ten-bit packed" and "integer" are three
+    /// different losses and a single slug would report them as one.
+    Quantised(pixel_format::TexelLayout),
+    /// The guest's declaration has no store layout in this contract at all, so
+    /// what is lost cannot be named — only that the rail chose for it.
+    Undeclared,
+}
+
+/// Read the declaration for a Store destination.
+///
+/// Asked of the **guest's** declared format, which is the only place the width
+/// it wanted is still known: past the attachment every texel is four unorm8
+/// bytes and nothing downstream can tell a narrowed target from a native one.
+/// That is [`pixel_format::narrows_to_unorm8`]'s argument one stage earlier in
+/// the pipeline.
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+pub(crate) fn color_target_narrowing(declared_format: u16) -> ColorTargetNarrowing {
+    use pixel_format::TexelLayout;
+    match pixel_format::store_texel_order(declared_format) {
+        // The two eight-bit colour orders. `RGBA8Unorm` holds either exactly;
+        // which of the two the guest picked changes the byte order of the
+        // writeback and not what survives it.
+        Some(TexelLayout::Rgba8 | TexelLayout::Bgra8) => ColorTargetNarrowing::None,
+        Some(layout) => ColorTargetNarrowing::Quantised(layout),
+        None => ColorTargetNarrowing::Undeclared,
+    }
+}
+
+/// Count, and describe once, a colour target this rail rendered narrower than
+/// the guest declared.
+///
+/// The store-direction mirror of [`note_sampled_narrowing`], and deduped the
+/// same way and for the same measured reason: per (format, extent), because a
+/// boot narrowing one surface and a boot narrowing a dozen of one format print
+/// the same single line otherwise.
+///
+/// The count is unconditional and the line is once, so a reader gets the size of
+/// the loss from the census and its shape from the log.
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+pub(crate) fn note_store_narrowing(declared_format: u16, w: u32, h: u32) {
+    let (slug, detail) = match color_target_narrowing(declared_format) {
+        ColorTargetNarrowing::None => return,
+        ColorTargetNarrowing::Quantised(layout) => (
+            "store_target_narrowed",
+            format!("declared={layout:?} lost=clamp_to_unit_and_256_levels"),
+        ),
+        ColorTargetNarrowing::Undeclared => (
+            "store_target_undeclared",
+            "declared=none lost=unnameable".to_string(),
+        ),
+    };
+    crate::runtime::drain::note_store_route(slug);
+    let key = u64::from(declared_format) | (u64::from(w) << 16) | (u64::from(h) << 40);
+    if !crate::observe::first_sight(slug, key) {
+        return;
+    }
+    crate::observe::fail(format!(
+        "store_target_narrowed reason={slug} fmt={declared_format:#x} {w}x{h} \
+         rendered=rgba8unorm {detail}"
+    ));
+}
+
 /// Load an opcode-9 buffer-backed texture as tight RGBA8 (width, height, bytes).
 ///
 /// The sampled bytes are the source MTLBuffer's guest storage read at `offset`
@@ -1245,6 +1368,13 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
         return None;
     }
     note_sampled_narrowing("buftex_narrowed", texture_ref, fmt, w, h);
+    let Some(row_rail) = pixel_format::RowToRgba8::for_format(fmt) else {
+        crate::observe::fail(format!(
+            "buftex convert_unsupported ref={texture_ref} buf={} fmt={fmt:#x} {w}x{h}",
+            bt.buffer_ref
+        ));
+        return None;
+    };
     let row_pixels = w as usize;
     let dst_row = row_pixels.checked_mul(RGBA8_BPP as usize)?;
     let mut rgba = vec![0u8; dst_row.checked_mul(h as usize)?];
@@ -1253,7 +1383,7 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
     for y in 0..h as usize {
         let src = &raw[y * bpr..y * bpr + tight];
         let dst = &mut rgba[y * dst_row..(y + 1) * dst_row];
-        if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst) {
+        if !row_rail.convert(src, w, dst) {
             crate::observe::fail(format!(
                 "buftex convert_fail ref={texture_ref} buf={} fmt={fmt:#x} row={y} {w}x{h}",
                 bt.buffer_ref
@@ -1654,12 +1784,13 @@ fn load_mapper_ref_texture_mapping_rgba<M: HostMemory + HostOps>(
     {
         return None;
     }
+    let row_rail = pixel_format::RowToRgba8::for_format(sample_fmt)?;
     let mut rgba = vec![0u8; raw.len()];
     for y in 0..h as usize {
         let off = y * (stride as usize);
         let row = &raw[off..off + (w as usize) * 4];
         let dst = &mut rgba[off..off + (w as usize) * 4];
-        if !pixel_format::convert_row_to_rgba8(sample_fmt, row, w, dst) {
+        if !row_rail.convert(row, w, dst) {
             return None;
         }
     }
@@ -1843,7 +1974,16 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
          cause={} mid={mapping_id} {w}x{h} fmt={fmt:#x}",
         cause.tag()
     ));
-    let wrote = mapping_write::write_rgba8_image_changed(state, host, mapping_id, rgba, None, w, h);
+    let wrote = mapping_write::write_rgba8_image_changed(
+        state,
+        host,
+        mapping_id,
+        rgba,
+        None,
+        w,
+        h,
+        mapping_write::FramePublication::HostCache,
+    );
     if wrote {
         publish_surface_store(state, host, mapping_id, w, h, fmt);
     }
@@ -2797,6 +2937,11 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
         FrameRows::Rgba8(_) => vec![0u8; tight as usize],
         FrameRows::Native(_) => Vec::new(),
     };
+    // One parse for both arms below — the mapped-span walk and the fragmented
+    // per-row one convert the same frame at the same format. A `Native` frame
+    // converts nothing, so an unsupported format is not its problem and the
+    // parse stays lazy. See `pixel_format::Rgba8ToRow`.
+    let row_rail = pixel_format::Rgba8ToRow::for_format(format);
     // Guest writes resolve through a fresh PT walk at write time — never a
     // cached view (stale-view heap-corruption class; see
     // `gva_view::write_span_within`) —
@@ -2811,12 +2956,9 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
             let at = y * src_stride;
             let out_row: &[u8] = match frame {
                 FrameRows::Rgba8(rgba) => {
-                    if !pixel_format::convert_rgba8_to_row(
-                        format,
-                        &rgba[at..at + src_stride],
-                        width,
-                        &mut row,
-                    ) {
+                    if !row_rail
+                        .is_some_and(|r| r.convert(&rgba[at..at + src_stride], width, &mut row))
+                    {
                         res = Err(MemError::BadArgs);
                         break;
                     }
@@ -2857,12 +2999,8 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
         let at = y * src_stride;
         let out_row: &[u8] = match frame {
             FrameRows::Rgba8(rgba) => {
-                if !pixel_format::convert_rgba8_to_row(
-                    format,
-                    &rgba[at..at + src_stride],
-                    width,
-                    &mut row,
-                ) {
+                if !row_rail.is_some_and(|r| r.convert(&rgba[at..at + src_stride], width, &mut row))
+                {
                     return Err(MemError::BadArgs);
                 }
                 &row
@@ -2959,6 +3097,11 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
     if rgba.len() < need {
         return false;
     }
+    // One parse for both arms below, as in the whole-frame writer above: this
+    // rect lands in the guest's pages at one format however the span maps.
+    let Some(row_rail) = pixel_format::Rgba8ToRow::for_format(format) else {
+        return false;
+    };
     let x_bytes = (origin_x as u64).saturating_mul(bpp as u64);
     let mut row = vec![0u8; tight_rect as usize];
     let mut src_rgba = vec![0u8; (rect_w as usize) * (RGBA8_BPP as usize)];
@@ -2976,7 +3119,7 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
             let src_full = &rgba[y * rgba_row + (origin_x as usize) * 4
                 ..y * rgba_row + (origin_x as usize) * 4 + (rect_w as usize) * 4];
             src_rgba.copy_from_slice(src_full);
-            if !pixel_format::convert_rgba8_to_row(format, &src_rgba, rect_w, &mut row) {
+            if !row_rail.convert(&src_rgba, rect_w, &mut row) {
                 ok = false;
                 break;
             }
@@ -3000,7 +3143,7 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
         let src_full = &rgba[y * rgba_row + (origin_x as usize) * 4
             ..y * rgba_row + (origin_x as usize) * 4 + (rect_w as usize) * 4];
         src_rgba.copy_from_slice(src_full);
-        if !pixel_format::convert_rgba8_to_row(format, &src_rgba, rect_w, &mut row) {
+        if !row_rail.convert(&src_rgba, rect_w, &mut row) {
             return false;
         }
         let row_gva = gva
@@ -3234,6 +3377,27 @@ fn seed_color_load<M: HostMemory + HostOps>(
         if let Some(bgra) = cached {
             return Some(swap_rb_channels(bgra));
         }
+        // The third door, and the only one a target with no address of its own
+        // can reach. Both doors above are keyed on `target_gva`, so a rail whose
+        // colour attachments are mapper-ref-texture surfaces rather than GVA
+        // allocations — which is every colour target on the Metal rail — closed
+        // them by construction: one driven macos-13 Metal boot asked the ref
+        // door 201 times, was refused 201 times, and paid the full guest read
+        // for every colour LOAD in the boot. That read is the largest single
+        // cost on that rail's per-draw chain (`chain_phase`'s `seed_us`, 6.09 ms
+        // a draw over 831 draws, of which 99 % is this).
+        //
+        // Keyed on the mapping, which is the identity a mapper-ref-texture
+        // surface actually has. The entry is written by the neutral
+        // `mapping_write`, which both rails' writebacks go through and which
+        // stamps the guest-write witness in the same breath — so `Clean` here
+        // means "no guest store since this device published these pixels", and
+        // the copy is exactly the attachment's prior content.
+        if let Some(seed) =
+            seed_from_published_surface(state, host, task_id, texture_ref, width, height)
+        {
+            return Some(seed);
+        }
     }
     // normal-texture (or texture-view base) linear GVA → convert to RGBA8.
     //
@@ -3262,6 +3426,218 @@ fn seed_color_load<M: HostMemory + HostOps>(
         NativeUploads::NONE,
         crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
     )?;
+    Some(rgba)
+}
+
+/// This device's own last publication of a mapper-ref-texture surface, when the
+/// hypervisor's witness says the guest has not repainted it since.
+///
+/// # Why this door takes the strict standard
+///
+/// A LOAD seed is the attachment's *prior content*: the pass composites onto it
+/// and the matching Store publishes the composite back over the surface's guest
+/// pages. So a stale serve is not a frame that the next rung corrects — it is a
+/// frame that becomes the surface, and the frame after loads what this one
+/// stored. There is no rung under this one that reads the entry again.
+///
+/// [`CurrencyStandard::WatchedAndUnwritten`] is what makes that safe on a
+/// pathway whose dirty-tracking witness may never arm. Under the permissive
+/// standard a rail that never stamps answers `NoStamp` to every ask, and this
+/// door would then serve whatever the cache holds, unconditionally — a
+/// compositing layer frozen on the last frame this device drew into it. Under
+/// the strict standard the same rail simply never serves and pays the guest read
+/// it pays today.
+///
+/// The miss is cheap and the wrong serve is not, which is the whole asymmetry.
+///
+/// # What it does not cover
+///
+/// Only a *direct* mapper-ref-texture reference. A texture view onto a
+/// mapper-ref-texture base resolves through `load_sampled_rgba_static`'s view
+/// rung and is not asked about here, because the view's format override can
+/// reinterpret the storage and the cache entry records no such reinterpretation.
+///
+/// The order against `load_sampled_rgba_static`'s own first rung is safe by
+/// construction rather than by care: that rung takes `OBJECT_TYPE_TEXTURE_VIEW`
+/// and [`objects::resolve_mapper_ref_texture`] takes
+/// `OBJECT_TYPE_MAPPER_REF_TEXTURE`, and an object has one type.
+///
+/// # No census here
+///
+/// Two callers ask this and they ask it for different reasons — one wants the
+/// bytes, the other wants to know whether a render target it already holds is
+/// still the frame — so each names the outcome under its own keys. Pooling them
+/// into one counter would make the number unreadable for either, which is the
+/// same rule [`crate::runtime::mapper::mapping_guest_write_verdict`]'s own doc
+/// records for the verdict underneath it.
+pub(crate) fn published_surface_frame<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+) -> Result<PublishedFrame, NoPublishedFrame> {
+    if texture_ref == 0 {
+        return Err(NoPublishedFrame::NotMapped);
+    }
+    let Some(mapping_id) = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
+    else {
+        return Err(NoPublishedFrame::NotMapped);
+    };
+    published_mapping_frame(state, host, mapping_id, width, height)
+}
+
+/// [`published_surface_frame`] for a caller that has already resolved the
+/// mapping.
+///
+/// The half that asks the question, split from the half that finds the surface,
+/// because the sampled path resolves the mapping to read its *geometry* before
+/// it can name the window to ask about — and resolving a second time is a second
+/// lookup that could answer differently.
+///
+/// Takes `state` by shared reference, which is the statement that asking this
+/// changes nothing.
+pub(crate) fn published_mapping_frame<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> Result<PublishedFrame, NoPublishedFrame> {
+    if mapping_id == 0 || width == 0 || height == 0 {
+        return Err(NoPublishedFrame::NotMapped);
+    }
+    let currency =
+        crate::runtime::surface_currency::surface_currency(state, host, mapping_id, width, height);
+    if !currency.serves(crate::runtime::surface_currency::CurrencyStandard::WatchedAndUnwritten) {
+        return Err(NoPublishedFrame::Uncurrent(mapping_id, currency));
+    }
+    let Some(generation) =
+        crate::runtime::surface_cache::frame_generation(state, mapping_id, width, height)
+    else {
+        return Err(NoPublishedFrame::Unpublished(mapping_id));
+    };
+    Ok(PublishedFrame {
+        mapping_id,
+        generation,
+    })
+}
+
+/// A mapper-ref-texture surface whose host-side frame is current, and which
+/// frame it is.
+///
+/// The generation is the point of carrying this as a struct rather than a bool:
+/// a rail that keeps its own copy of these pixels compares generations to decide
+/// whether its copy is still this one, and a caller that only wants the bytes
+/// ignores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublishedFrame {
+    pub mapping_id: u32,
+    /// [`crate::runtime::surface_cache`]'s `host_gen` for this frame. Never 0.
+    pub generation: u64,
+}
+
+/// Why [`published_surface_frame`] has nothing to offer.
+///
+/// The three are kept apart because they have different fixes and only the
+/// second is about the guest: "this attachment is not one of these surfaces",
+/// "the witness will not vouch for the copy", and "the witness is fine and this
+/// device has published nothing at this geometry yet".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NoPublishedFrame {
+    NotMapped,
+    Uncurrent(u32, crate::runtime::surface_currency::SurfaceCurrency),
+    Unpublished(u32),
+}
+
+/// A colour LOAD seed served from [`published_surface_frame`].
+///
+/// Both doors above this one in [`seed_color_load`] key on `target_gva`, and a
+/// mapper-ref-texture attachment has no address of its own — so on the Metal
+/// rail, whose colour targets are all mapper-ref-texture surfaces, they were
+/// closed by construction. One driven macos-13 boot asked the ref door 201 times
+/// and was refused 201 times.
+fn seed_from_published_surface<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    use crate::runtime::surface_currency::SurfaceCurrency;
+
+    let frame = match published_surface_frame(state, host, task_id, texture_ref, width, height) {
+        Ok(frame) => {
+            // The denominator. A door that served nothing because it was never
+            // reached and one that was reached and refused read identically at
+            // zero, and only the second says what the gate costs.
+            crate::runtime::drain::note_store_route("load_seed_color_surface_asked");
+            frame
+        }
+        Err(NoPublishedFrame::NotMapped) => return None,
+        Err(decline) => {
+            crate::runtime::drain::note_store_route("load_seed_color_surface_asked");
+            crate::runtime::drain::note_store_route(match decline {
+                // Split from the other refusals because it is the one that is
+                // not about the guest: it says this device's witness was never
+                // armed for these pages, and it is the counter that decides
+                // whether widening this door is even a question.
+                NoPublishedFrame::Uncurrent(_, SurfaceCurrency::Unwritten(_)) => {
+                    "load_seed_color_surface_unwatched"
+                }
+                NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WrotePixels(_)) => {
+                    "load_seed_color_surface_repainted"
+                }
+                NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteUnknown) => {
+                    "load_seed_color_surface_unknown"
+                }
+                // `serves` admits this under both standards, so reaching it here
+                // is a contradiction between the rule and this match rather than
+                // a guest behaviour.
+                NoPublishedFrame::Uncurrent(_, SurfaceCurrency::WroteElsewhere) => {
+                    "load_seed_color_surface_impossible"
+                }
+                // Current, and this device has published nothing for the
+                // surface at this geometry yet. Not a refusal of the witness,
+                // and naming it apart is what keeps the `unwatched` count
+                // readable. A frame ceded to a rail's resident no longer lands
+                // here — `frame_generation` names it, and the two sources below
+                // are what decide whether its bytes can be produced.
+                NoPublishedFrame::Unpublished(_) => "load_seed_color_surface_empty",
+                NoPublishedFrame::NotMapped => "load_seed_color_surface_impossible",
+            });
+            return None;
+        }
+    };
+    // Two sources for one frame, and the door above has already said which frame
+    // it is. The host cache holds the bytes unless the Store that published them
+    // ceded to the running rail's resident
+    // ([`crate::runtime::mapping_write::FramePublication`]), in which case the
+    // rail is asked for the same generation.
+    //
+    // Falling through silently is what this must not do. A missing colour LOAD
+    // seed leaves every texel the pass does not itself draw undefined — a
+    // rectangle of a compositing layer going blank until something redraws the
+    // whole of it — so both misses are named.
+    if let Some(bgra) =
+        crate::runtime::surface_cache::get_shared(state, frame.mapping_id, width, height)
+    {
+        crate::runtime::drain::note_store_route("load_seed_color_from_surface");
+        return Some(swap_rb_channels(&bgra));
+    }
+    let Some(rgba) = crate::backend::selected().published_frame_rgba8(
+        state,
+        frame.mapping_id,
+        width,
+        height,
+        frame.generation,
+    ) else {
+        crate::runtime::drain::note_store_route("load_seed_color_surface_unheld");
+        return None;
+    };
+    crate::runtime::drain::note_store_route("load_seed_color_from_resident");
     Some(rgba)
 }
 

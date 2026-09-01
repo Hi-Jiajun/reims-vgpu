@@ -18,10 +18,10 @@ pub use state::{
     BackingWalk, ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault,
     FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView,
     HostLinearTexture, HostSurface, MapperCapture, MappingEntry, PacketFault, PresentBacking,
-    PresentState, RenderFlushWitness, ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource,
-    TaskResourceLifetimeRef, TaskSamplerState, TaskTable, UnimplementedCommand, FENCE_DOMAIN_BLIT,
-    FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
-    GVA_EVICTION_WITNESS_KEYS,
+    PresentState, RailDeviceState, RailResourceState, RenderFlushWitness, ResourceValidity,
+    SurfaceWriteKind, TaskEntry, TaskReferenceStates, TaskResource, TaskResourceLifetimeRef,
+    TaskSamplerState, TaskTable, UnimplementedCommand, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
+    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
 };
 
 use crate::backend::Backend;
@@ -202,19 +202,14 @@ mod tests {
         // The sampled-cache witness arms tokens of its own against window page
         // sets that no `MappingEntry` names, so a sweep that only walked
         // mappings would miss this one.
-        #[cfg(feature = "backend-vulkan")]
         let witness_token = {
             let token = h.track_guest_writes(&[0x3000], page).unwrap();
             d.state.gather_witness.arm_token_for_test(token);
             token
         };
-        #[cfg(feature = "backend-vulkan")]
         assert_ne!(witness_token, mapping_token);
 
-        #[cfg(feature = "backend-vulkan")]
         assert_eq!(h.tracked_guest_write_sets(), 2);
-        #[cfg(not(feature = "backend-vulkan"))]
-        assert_eq!(h.tracked_guest_write_sets(), 1);
 
         assert_eq!(d.reset_with_host(&mut h), 0);
         assert_eq!(

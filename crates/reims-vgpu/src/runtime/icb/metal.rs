@@ -128,7 +128,7 @@ fn icb_cache() -> &'static parking_lot::Mutex<HashMap<(u32, u32), HostIcbEntry>>
 /// registry beside it: one entry point clears both, because a registry entry
 /// outliving its host object would name a descriptor no
 /// `MTLIndirectCommandBuffer` was built from.
-pub(super) fn clear_host_icb_cache() {
+pub(crate) fn clear_host_icb_cache() {
     icb_cache().lock().clear();
 }
 
@@ -1119,7 +1119,7 @@ pub(crate) fn new_icb_compute_pso(
 /// When the ICB was created with `inheritPipelineState` / `inheritBuffers`, those
 /// resources are **not** recorded into the slot — the parent compute encoder
 /// supplies them at `executeCommandsInBuffer` (see
-/// [`crate::runtime::compute_session::ComputeSession::encode_icb`]).
+/// [`crate::backend::compute_session::ComputeSession::encode_icb`]).
 pub fn fill_compute_command<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,

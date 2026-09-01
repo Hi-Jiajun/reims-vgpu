@@ -8,12 +8,13 @@
 //! put one name on two functions in two modules — so a `grep` for it reported
 //! two producers and the arm a reader landed on was arbitrary.
 
+use crate::backend::compute_session::ComputeSession;
 use crate::backend::metal::runtime::system_device;
 use crate::backend::{Backend, CensusSite, MipmapGeneration, Rail};
 use crate::contract::mipmap::MetalMipmapError;
 use crate::model::{DeviceInfoLimits, DeviceState};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
-use crate::runtime::compute_session::{self, ComputeSession};
+use crate::runtime::compute_session;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
 use crate::runtime::host::{HostMemory, HostOps};
@@ -60,8 +61,51 @@ impl Backend for MetalBackend {
         Rail::Metal.name()
     }
 
+    fn present_resident_carries(
+        &self,
+        state: &DeviceState,
+        mapping: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<bool> {
+        crate::runtime::scanout::metal::present_resident_carries(state, mapping, width, height)
+    }
+
+    fn try_capture_from_resident(
+        &self,
+        state: &mut DeviceState,
+        buf: &mut Vec<u8>,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        crate::runtime::scanout::metal::try_capture_from_resident(
+            state, buf, mapping_id, width, height,
+        )
+    }
+
+    fn published_frame_rgba8(
+        &self,
+        _state: &DeviceState,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+        generation: u64,
+    ) -> Option<Vec<u8>> {
+        crate::backend::metal::resident::read_published_rgba8(
+            &crate::backend::metal::resident::ResidentColorKey::for_surface(
+                mapping_id, width, height,
+            ),
+            generation,
+        )
+    }
+
     fn reset(&self) {
         crate::runtime::icb::clear_icb_cache();
+    }
+
+    fn forget_host_icbs(&self) {
+        crate::runtime::icb::metal::clear_host_icb_cache();
     }
 
     fn encode_draw_chain<M: HostMemory + HostOps>(
@@ -159,8 +203,18 @@ impl Backend for MetalBackend {
         // absent rather than zeroed, so a reader cannot mistake "no such engine"
         // for "an idle one".
         if site == CensusSite::Levels {
-            crate::runtime::drain::census::metal::emit_object_cache_levels();
+            super::census::emit_object_cache_levels();
+            super::census::emit_resident_color_levels();
         }
+    }
+
+    /// This rail keys its retained colour render targets by mapping id, so a
+    /// mapping that stops naming its surface takes them with it. Correctness
+    /// does not depend on it — a retained target can only be loaded from under
+    /// the surface cache generation it was published at, and an entry that is
+    /// gone issues no generation — so this is about the bytes.
+    fn forget_mapping(&self, mapping_id: u32) {
+        super::resident::forget(mapping_id);
     }
 
     fn generate_mipmap_chain(

@@ -4145,6 +4145,7 @@ fn apply_clear<M: HostMemory + HostOps>(
             None,
             c0.width,
             c0.height,
+            mapping_write::FramePublication::HostCache,
         ),
         ClearImageEncoding::Native => mapping_write::write_native_image(
             state,

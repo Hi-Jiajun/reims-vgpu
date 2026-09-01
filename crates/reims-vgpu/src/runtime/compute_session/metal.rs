@@ -736,7 +736,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     (err_buf.as_mut_ptr(), err_buf.len()),
                 ) {
                     Ok(u) => u,
-                    Err(st) => return Err(ComputeStatus::MetalBackend(st)),
+                    Err(st) => return Err(ComputeStatus::RailRefused(st)),
                 };
                 let mut staged_tex = Vec::new();
                 for t in &acc.textures {

@@ -912,7 +912,7 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     // Store, so the shortcut is worth less there and the rails stay easier to
     // tell apart. The frame is in the guest's pages either way; what a missing
     // stamp costs is a re-read, never a wrong image.
-    if let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(identity) {
+    if let Some(key) = crate::backend::vulkan::gva_witness_key(identity) {
         crate::runtime::gva_store_witness::note_store(state, host, key, gpas);
     }
     Ok(extent)

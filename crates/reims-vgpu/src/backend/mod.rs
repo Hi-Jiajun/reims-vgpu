@@ -113,15 +113,31 @@ pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
+/// The encoder one rail holds open across a compute segment — the one type
+/// besides [`SelectedBackend`] whose shape is neutral and whose contents are a
+/// rail's.
+pub mod compute_session;
+
+/// The host driver's answer to the guest's `heapTextureSizeAndAlign` contract.
+/// A host capability, deliberately neither a rail decision nor a rail's module.
+pub mod heap_placement;
+
+/// How this device says no, with the check that said it — the payload the
+/// neutral status vocabularies carry in their `RailRefused` variant.
+pub mod refusal;
+
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus, ResidentServe};
-use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::{GuestRamImport, ImportId};
+use crate::runtime::gva_store_witness::GvaTargetKey;
 use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::resident_target::ResidentTarget;
+use crate::runtime::writeback_debt::GvaWritebackDebt;
+pub(crate) use compute_session::ComputeSession;
 use std::sync::Arc;
 
 /// How a rail's own completion thread announces a finished stamp back to the
@@ -168,7 +184,7 @@ pub type StampAnnounce = Arc<dyn Fn(u32) + Send + Sync>;
 /// rails, and its delete is handled where it is decoded; the kinds no rail owns
 /// a registry for stay fail-visible as unimplemented, which is what says the
 /// contract gap is still open. These two are the ones exactly one rail keeps a
-/// table for — [`crate::runtime::pipeline_resolve`] and the Vulkan draw rail —
+/// table for — [`crate::backend::vulkan::pipeline_resolve`] and the Vulkan draw rail —
 /// while the other resolves them out of the guest's object list on every use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetainedObject {
@@ -548,6 +564,37 @@ pub(crate) trait Backend: Copy {
         false
     }
 
+    /// The mapping's published frame, read out of whatever resident this rail
+    /// holds for it, as tight RGBA8.
+    ///
+    /// The counterpart to [`Self::try_capture_from_resident`] for the *seed*
+    /// readers rather than the console: a colour LOAD seed and a sampled bind
+    /// both want the frame this device last published for a surface, and after
+    /// a Store cedes it ([`crate::runtime::mapping_write::FramePublication`])
+    /// the host cache no longer holds it.
+    ///
+    /// `generation` is what
+    /// [`crate::runtime::surface_cache::frame_generation`] named for this
+    /// mapping, and the caller must already have passed the seed door's
+    /// currency standard — this method does not re-derive either. A rail is
+    /// free to ignore it when its own resident identity already carries the
+    /// same evidence.
+    ///
+    /// `None` on a rail with no resident to ask, and equally on one whose
+    /// resident does not hold this frame. Both are lawful steady-state answers:
+    /// every caller falls through to the guest's own pages, which is the source
+    /// that was always behind this one.
+    fn published_frame_rgba8(
+        &self,
+        _state: &DeviceState,
+        _mapping_id: u32,
+        _width: u32,
+        _height: u32,
+        _generation: u64,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Retire whatever this rail retains for a guest object the guest has just
     /// declared dead.
     ///
@@ -759,6 +806,35 @@ pub(crate) trait Backend: Copy {
         String::new()
     }
 
+    /// Drop every host indirect-command buffer this rail built from a recorded
+    /// ICB descriptor.
+    ///
+    /// The rail half of [`crate::runtime::icb::clear_icb_cache`], which clears
+    /// the neutral registry in the same call. The two are one entry point on
+    /// purpose: a registry entry outliving its host object would name a
+    /// descriptor nothing was built from, and a host object outliving its
+    /// registry entry is host GPU memory nothing will ever ask for again.
+    ///
+    /// Free on a rail that builds no host ICB.
+    fn forget_host_icbs(&self) {}
+
+    /// Drop everything this rail holds under one mapping id, because the
+    /// mapping that named it is gone.
+    ///
+    /// Called by the model from `forget_compositor_mapping`, at the one point
+    /// where a mapping id stops naming the surface it named. Whatever a rail
+    /// keys by that id is stale from this moment and a recycled id would hand
+    /// the next surface its predecessor's state — a wrong reading of a live
+    /// plane on the census side, and a render target holding another surface's
+    /// pixels on the Metal rail's.
+    ///
+    /// One method rather than one per kind, because there is one moment: a rail
+    /// that had to be told twice would eventually be told once.
+    ///
+    /// Free on a rail that keys nothing by a mapping id, which is what
+    /// [`Self::plane_draw_witness`]'s empty string already says.
+    fn forget_mapping(&self, _mapping_id: u32) {}
+
     /// The raster sample count the bound pipeline declares, when this rail has
     /// to make the attachment match it.
     ///
@@ -905,6 +981,96 @@ pub(crate) trait Backend: Copy {
         _pixel_format: u16,
     ) -> Option<ResidentServe> {
         None
+    }
+
+    /// Move the resident a writeback debt was armed against into one
+    /// mapper-ref-texture mapping's guest pages, and release this rail's hold on
+    /// that resident.
+    ///
+    /// The hold is released either way: a payment the rail cannot make still
+    /// ends the resident's `gpu_only_content` claim, because the alternative is
+    /// an image nothing will ever ask for again holding memory until the device
+    /// resets. `false` says the guest's pages did not get the pixels, so the
+    /// ledger can name the debt that was lost; the rail has already reported
+    /// *why* on the failure channel.
+    ///
+    /// A rail that arms no writeback debt never sees one, which is why the
+    /// default refuses rather than being unreachable: `ledger::pay` is neutral
+    /// and would rather report a lost frame than not compile.
+    fn pay_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _mapping_id: u32,
+        _target: &ResidentTarget,
+        _width: u32,
+        _height: u32,
+    ) -> bool {
+        false
+    }
+
+    /// Release this rail's hold on a resident whose frame the guest superseded,
+    /// without writing it anywhere.
+    ///
+    /// The guest wrote the pages itself, so the frame is not owed any more; the
+    /// resident is only still alive because the debt was keeping it so.
+    fn abandon_resident(&self, _target: &ResidentTarget) {}
+
+    /// This rail's name for the resident holding one deferred GVA frame.
+    ///
+    /// Derived rather than carried, unlike [`Backend::pay_surface_writeback`]'s
+    /// target — [`crate::runtime::writeback_debt::GvaWindow`] records why the
+    /// two differ and why the derivation is sound here.
+    ///
+    /// `None` from a rail that keeps no GVA resident. The ledger reads it as
+    /// "this debt cannot exist on this arm" rather than as a lost frame, which
+    /// is what it is: only a rail that answers here can arm one.
+    fn gva_resident(&self, _debt: &GvaWritebackDebt) -> Option<ResidentTarget> {
+        None
+    }
+
+    /// The guest-write witness key for one deferred GVA frame's resident.
+    ///
+    /// The key is guest coordinates plus the resident's channel order, and the
+    /// order is the rail's answer — which is the whole of why this is a trait
+    /// method and not arithmetic in the ledger. A second hand-written copy of
+    /// that resolution put an R/B-exchanged frame in guest memory once already.
+    ///
+    /// `None` withdraws the deferral: without a witness the ledger cannot say
+    /// what the guest CPU wrote into the plane afterwards, and a frame it
+    /// cannot merge is a frame it must not defer.
+    fn gva_witness_key(&self, _debt: &GvaWritebackDebt) -> Option<GvaTargetKey> {
+        None
+    }
+
+    /// Move a deferred GVA frame out of `target` and into the guest pages
+    /// `pages` names, and release this rail's hold on that resident.
+    ///
+    /// `skip` is the plane-relative bytes the guest CPU owns and this store may
+    /// not overwrite; a non-empty one costs the rail its GPU-direct arm. See
+    /// `writeback_debt::pay_gva`, which is the only caller and resolves it from
+    /// the hypervisor's per-page report.
+    ///
+    /// The hold is released either way, for [`Backend::pay_surface_writeback`]'s
+    /// reason: an image nothing will ask for again must not hold memory to the
+    /// next device reset. The rail reports *why* a payment was lost on the
+    /// failure channel, so there is nothing for the neutral ledger to add and
+    /// nothing for it to return.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the store's own parameters, plus the bytes its owner may not overwrite"
+    )]
+    fn pay_gva_writeback<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _task_id: u32,
+        _target: &ResidentTarget,
+        _c0: &crate::runtime::draw::ColorRtRequest,
+        _texture_ref: u32,
+        _pages: &crate::runtime::draw::StoreTargetPages,
+        _skip: crate::runtime::mapping_write::SkipRanges<'_>,
+    ) {
     }
 }
 
@@ -1483,6 +1649,24 @@ impl Backend for SelectedBackend {
         }
     }
 
+    fn published_frame_rgba8(
+        &self,
+        state: &DeviceState,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+        generation: u64,
+    ) -> Option<Vec<u8>> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.published_frame_rgba8(state, mapping_id, width, height, generation),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => {
+                b.published_frame_rgba8(state, mapping_id, width, height, generation)
+            }
+        }
+    }
+
     fn order_completion_stamp<M: HostMemory + HostOps>(
         &self,
         state: &DeviceState,
@@ -1514,6 +1698,24 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.plane_draw_witness(reader, mapping_id),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.plane_draw_witness(reader, mapping_id),
+        }
+    }
+
+    fn forget_mapping(&self, mapping_id: u32) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.forget_mapping(mapping_id),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.forget_mapping(mapping_id),
+        }
+    }
+
+    fn forget_host_icbs(&self) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.forget_host_icbs(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.forget_host_icbs(),
         }
     }
 
@@ -1608,6 +1810,77 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.resident_serve(key, mirror_generation, is_storage, pixel_format),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.resident_serve(key, mirror_generation, is_storage, pixel_format),
+        }
+    }
+
+    fn pay_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        mapping_id: u32,
+        target: &ResidentTarget,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => {
+                b.pay_surface_writeback(state, host, mapping_id, target, width, height)
+            }
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => {
+                b.pay_surface_writeback(state, host, mapping_id, target, width, height)
+            }
+        }
+    }
+
+    fn abandon_resident(&self, target: &ResidentTarget) {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => b.abandon_resident(target),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.abandon_resident(target),
+        }
+    }
+
+    fn gva_resident(&self, debt: &GvaWritebackDebt) -> Option<ResidentTarget> {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => b.gva_resident(debt),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.gva_resident(debt),
+        }
+    }
+
+    fn gva_witness_key(&self, debt: &GvaWritebackDebt) -> Option<GvaTargetKey> {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => b.gva_witness_key(debt),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.gva_witness_key(debt),
+        }
+    }
+
+    fn pay_gva_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        target: &ResidentTarget,
+        c0: &crate::runtime::draw::ColorRtRequest,
+        texture_ref: u32,
+        pages: &crate::runtime::draw::StoreTargetPages,
+        skip: crate::runtime::mapping_write::SkipRanges<'_>,
+    ) {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => {
+                b.pay_gva_writeback(state, host, task_id, target, c0, texture_ref, pages, skip)
+            }
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => {
+                b.pay_gva_writeback(state, host, task_id, target, c0, texture_ref, pages, skip)
+            }
         }
     }
 }

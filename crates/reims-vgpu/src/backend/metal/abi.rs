@@ -17,11 +17,6 @@
 
 use core::mem::offset_of;
 
-pub const REIMS_VGPU_OK: i32 = 0;
-pub const REIMS_VGPU_ERR_ARGS: i32 = 1;
-pub const REIMS_VGPU_ERR_TRANSLATE: i32 = 2;
-pub const REIMS_VGPU_ERR_EXECUTE: i32 = 3;
-
 // The two binding-band bases this backend encodes (class, index) into. They are
 // the device's bands, not the archived header's: the sampler base moved up so
 // the texture band could be Metal's whole 128-entry argument table. `const`

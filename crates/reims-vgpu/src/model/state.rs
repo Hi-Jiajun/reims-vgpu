@@ -4,8 +4,7 @@ use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
 use crate::runtime::decode::resource::{
     DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry, SamplerDescriptor,
 };
-#[cfg(feature = "backend-vulkan")]
-use std::collections::HashMap;
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -589,19 +588,12 @@ pub struct TaskResource {
     /// Direct backend objects keep only a weak reference, so deletion—not an
     /// arbitrary idle timeout—makes them reclaimable.
     lifetime: Arc<TaskResourceLifetime>,
-    /// Engine objects retained for this serialized resource lifetime.
+    /// What the running rail retains for exactly this resource's lifetime, in
+    /// the rail's own vocabulary. See [`RailResourceState`].
     ///
-    /// The lease owns its resident pin and allocation classification. Its
-    /// Each identity includes the mapping generation. A resource may own
-    /// several child identities concurrently; page recycling replaces only the
-    /// matching identity instead of overwriting an unrelated child lease.
-    #[cfg(feature = "backend-vulkan")]
-    resident_targets: Mutex<
-        HashMap<
-            crate::backend::vulkan::engine::TargetIdentity,
-            crate::backend::vulkan::engine::ResidentResourceLease,
-        >,
-    >,
+    /// The model owns the slot and the drop; it does not own — and cannot name
+    /// — the contents.
+    rail: Mutex<Option<Box<dyn Any + Send + Sync>>>,
 }
 
 impl TaskResource {
@@ -612,8 +604,7 @@ impl TaskResource {
             decoded: OnceLock::new(),
             mapper_ref_texture_mapping: OnceLock::new(),
             lifetime: Arc::new(TaskResourceLifetime::new()),
-            #[cfg(feature = "backend-vulkan")]
-            resident_targets: Mutex::new(HashMap::new()),
+            rail: Mutex::new(None),
         }
     }
 
@@ -642,57 +633,77 @@ impl TaskResource {
         *self.mapper_ref_texture_mapping.get_or_init(|| mapping_id)
     }
 
-    /// Retain and classify the engine target named by this resource.
+    /// The running rail's own state for this resource, created empty on first
+    /// ask, borrowed for the length of `f`.
     ///
-    /// Warm binds read the resource-owned lease without entering the engine.
-    /// A changed identity or engine epoch releases the old lease and resolves
-    /// a new one; execution remains the authority for mutable content state.
-    #[cfg(feature = "backend-vulkan")]
-    pub fn resident_target_backing(
-        &self,
-        identity: &crate::backend::vulkan::engine::TargetIdentity,
-    ) -> crate::backend::vulkan::engine::ResidentContentBacking {
-        self.resident_target_backing_with(identity, |identity| {
-            crate::backend::vulkan::engine::retain_resident_resource(identity)
-        })
-    }
-
-    #[cfg(feature = "backend-vulkan")]
-    fn resident_target_backing_with(
-        &self,
-        identity: &crate::backend::vulkan::engine::TargetIdentity,
-        retain: impl FnOnce(
-            &crate::backend::vulkan::engine::TargetIdentity,
-        ) -> Option<crate::backend::vulkan::engine::ResidentResourceLease>,
-    ) -> crate::backend::vulkan::engine::ResidentContentBacking {
-        use crate::backend::vulkan::engine::ResidentContentBacking;
-
+    /// `None` means the slot is already held by a *different* rail's type.
+    /// [`crate::backend::select`] latches one rail per process, so no live
+    /// build can reach it; it is an answer rather than a panic because the one
+    /// caller that asks already has a lawful "nothing retained" reply and a
+    /// caught panic at a `reims_vgpu_qemu_*` entry point is a dead device.
+    pub fn with_rail_state<T, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R>
+    where
+        T: RailResourceState,
+    {
         let mut held = self
-            .resident_targets
+            .rail
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(lease) = held.get(identity).filter(|lease| lease.matches(identity)) {
-            return lease.backing();
-        }
-        // An engine reset invalidates the lease under this exact identity, but
-        // another identity is another child resource, not a replacement. A
-        // texture can own several views/surfaces concurrently.
-        held.remove(identity);
-        let acquired = retain(identity);
-        let backing = acquired
-            .as_ref()
-            .map(|lease| lease.backing())
-            .unwrap_or(ResidentContentBacking::NotReady);
-        if let Some(lease) = acquired {
-            held.insert(identity.clone(), lease);
-        }
-        crate::runtime::drain::note_store_route(if backing != ResidentContentBacking::NotReady {
-            "resident_resource_acquired"
-        } else {
-            "resident_resource_unavailable"
-        });
-        backing
+        let slot = held.get_or_insert_with(|| Box::<T>::default() as Box<dyn Any + Send + Sync>);
+        Some(f(slot.downcast_mut::<T>()?))
     }
+}
+
+/// State one rail retains for exactly one serialized resource's lifetime.
+///
+/// # Why the model may not name it
+///
+/// A rail's per-resource retention pins host GPU memory, and the guest ends
+/// that lifetime explicitly by deleting the resource. Keeping it *in*
+/// [`TaskResource`] is what makes the release deterministic — `AGENTS.md`'s rule
+/// that resource state representing guest work follows the contract-owned guest
+/// lifetime, rather than being swept on a timer — and it is what lets a warm
+/// bind read the retention back without entering the rail at all.
+///
+/// But *what* is retained is the rail's own vocabulary. The Vulkan rail retains
+/// a lease keyed by an engine target identity; Metal retains nothing of the
+/// kind and the words mean nothing to it. Spelling those types here made
+/// `model` depend on `backend::vulkan`, which closed a cycle — `model` →
+/// `backend::vulkan` → `runtime` → `model` — and, on the both-rails build where
+/// the `cfg` that used to hide the field is on, put one rail's private table in
+/// the other's reach with nothing but convention keeping it out.
+///
+/// So the model owns the slot and the drop, and the rail owns the contents.
+/// A rail reaches its own state through [`TaskResource::with_rail_state`], which
+/// it can only call for a type it can name.
+pub trait RailResourceState: Any + Default + Send + Sync {}
+
+/// State the running rail keeps for exactly one device's lifetime, in the
+/// rail's own vocabulary.
+///
+/// # Why the model may not name it
+///
+/// [`RailResourceState`] states the rule for one resource; this is the same
+/// rule one scope up. The Vulkan rail retains, per `(task, pipeline_ref)`, a
+/// resolved pipeline holding two translated SPIR-V shaders and an engine
+/// pipeline-object identity. Metal retains nothing of the kind. Spelling that
+/// type in [`DeviceState`] made `model` depend on `backend::vulkan` — the same
+/// cycle — and left the struct with two shapes across a feature boundary.
+///
+/// # What the model still owns
+///
+/// The slot, the drop, and *when* a lifetime ends. Task teardown is a guest
+/// event the model decodes, so the model tells the rail about it through
+/// [`Self::delete_task`]; what a task's references mean, and what dropping them
+/// costs, is the rail's. The rail reports its own count under its own census
+/// name, because a name the model chose would describe a table it cannot see.
+pub trait RailDeviceState: Any + Send + Sync + std::fmt::Debug {
+    /// This state as `Any`, so the rail that installed it can read it back.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Drop everything held under one task's reference namespaces, reporting
+    /// what went under this rail's own census names.
+    fn delete_task(&self, task_id: u32);
 }
 
 static NEXT_TASK_RESOURCE_LIFETIME: std::sync::atomic::AtomicU64 =
@@ -730,127 +741,6 @@ impl TaskResourceLifetimeRef {
 
     pub fn is_live(&self) -> bool {
         self.live.strong_count() != 0
-    }
-}
-
-#[cfg(all(test, feature = "backend-vulkan"))]
-mod task_resource_resident_tests {
-    use super::*;
-    use crate::backend::vulkan::engine::{
-        ResidentContentBacking, ResidentResourceLease, TargetIdentity,
-    };
-    use std::cell::Cell;
-
-    fn identity(generation: u64) -> TargetIdentity {
-        TargetIdentity::Surface {
-            id: 9,
-            width: 64,
-            height: 32,
-            generation,
-            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
-        }
-    }
-
-    #[test]
-    fn a_resource_retains_each_child_identity_until_the_resource_ends() {
-        let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
-        let first = identity(1);
-        let acquisitions = Cell::new(0_u32);
-        let acquired_before =
-            crate::runtime::drain::census::store_route_count("resident_resource_acquired");
-
-        let backing = resource.resident_target_backing_with(&first, |identity| {
-            acquisitions.set(acquisitions.get() + 1);
-            Some(ResidentResourceLease::test_new(
-                identity.clone(),
-                ResidentContentBacking::GuestAllocation,
-            ))
-        });
-        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
-        assert_eq!(acquisitions.get(), 1);
-        assert_eq!(
-            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
-            acquired_before + 1
-        );
-
-        let backing = resource.resident_target_backing_with(&first, |_| {
-            panic!("a warm bind must not reacquire its live resource")
-        });
-        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
-        assert_eq!(
-            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
-            acquired_before + 1,
-            "a warm bind must not be counted as another acquisition"
-        );
-
-        crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
-        let backing = resource.resident_target_backing_with(&first, |identity| {
-            acquisitions.set(acquisitions.get() + 1);
-            Some(ResidentResourceLease::test_new(
-                identity.clone(),
-                ResidentContentBacking::DeviceAllocation,
-            ))
-        });
-        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
-        assert_eq!(acquisitions.get(), 2, "an engine reset reacquires once");
-
-        let replacement = identity(2);
-        let backing = resource.resident_target_backing_with(&replacement, |identity| {
-            acquisitions.set(acquisitions.get() + 1);
-            Some(ResidentResourceLease::test_new(
-                identity.clone(),
-                ResidentContentBacking::GuestAllocation,
-            ))
-        });
-        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
-        assert_eq!(
-            acquisitions.get(),
-            3,
-            "a new mapping generation reacquires once"
-        );
-
-        assert_eq!(
-            resource.resident_target_backing_with(&first, |_| {
-                panic!("adding a child identity must not evict the first child")
-            }),
-            ResidentContentBacking::DeviceAllocation
-        );
-        assert_eq!(
-            acquisitions.get(),
-            3,
-            "both child identities remain retained"
-        );
-        assert_eq!(
-            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
-            acquired_before + 3
-        );
-
-        // The synthetic leases have no registry pins behind them. Make the
-        // final drop stale so it exercises the reset-safe no-op release.
-        crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
-    }
-
-    #[test]
-    fn an_unavailable_target_is_counted_and_retried() {
-        let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
-        let unavailable_before =
-            crate::runtime::drain::census::store_route_count("resident_resource_unavailable");
-        let attempts = Cell::new(0_u32);
-
-        for _ in 0..2 {
-            assert_eq!(
-                resource.resident_target_backing_with(&identity(1), |_| {
-                    attempts.set(attempts.get() + 1);
-                    None
-                }),
-                ResidentContentBacking::NotReady
-            );
-        }
-        assert_eq!(attempts.get(), 2, "an absent target must remain retryable");
-        assert_eq!(
-            crate::runtime::drain::census::store_route_count("resident_resource_unavailable"),
-            unavailable_before + 2
-        );
     }
 }
 
@@ -995,13 +885,6 @@ impl<T> TaskReferenceStates<T> {
 /// Per-task sampler objects, keyed by the sampler API's reference space.
 pub type TaskSamplerStates = TaskReferenceStates<TaskSamplerState>;
 
-/// Per-task render pipeline states, keyed by the pipeline API's reference
-/// space. A state owns its decoded descriptor, translated functions and derived
-/// bind plan exactly as one native pipeline state owns its construction.
-#[cfg(feature = "backend-vulkan")]
-pub type TaskRenderPipelineStates =
-    TaskReferenceStates<crate::runtime::pipeline_resolve::ResolvedRenderPipeline>;
-
 /// Per-task depth-stencil states, keyed by that API's reference space.
 ///
 /// A depth-stencil state is an immutable object with its own explicit delete
@@ -1021,9 +904,100 @@ pub type TaskRenderPipelineStates =
 /// one changed**. The guest publishes the state once and binds it; the delete
 /// command is the invalidation, which is why this needs no capacity and no
 /// generation.
-#[cfg(feature = "backend-vulkan")]
 pub type TaskDepthStencilStates =
     TaskReferenceStates<crate::runtime::decode::resource::DepthStencilDescriptor>;
+
+#[cfg(test)]
+mod rail_resource_state_tests {
+    use super::*;
+    use crate::runtime::decode::resource::ListObjectEntry;
+    use std::sync::atomic::AtomicU32;
+
+    static LIVE: AtomicU32 = AtomicU32::new(0);
+
+    #[derive(Default)]
+    struct OneRail(u32);
+    impl RailResourceState for OneRail {}
+
+    #[derive(Default)]
+    struct OtherRail;
+    impl RailResourceState for OtherRail {}
+
+    /// Counts its own construction and destruction, so a test can watch the
+    /// resource's own drop release it.
+    struct Pinned;
+    impl Default for Pinned {
+        fn default() -> Self {
+            LIVE.fetch_add(1, Ordering::Relaxed);
+            Self
+        }
+    }
+    impl Drop for Pinned {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    impl RailResourceState for Pinned {}
+
+    fn resource() -> TaskResource {
+        TaskResource::new(ListObjectEntry::default(), Arc::from([]))
+    }
+
+    #[test]
+    fn a_rails_slot_is_created_empty_once_and_then_borrowed() {
+        let resource = resource();
+        assert_eq!(resource.with_rail_state(|s: &mut OneRail| s.0), Some(0));
+        assert_eq!(
+            resource.with_rail_state(|s: &mut OneRail| {
+                s.0 += 7;
+                s.0
+            }),
+            Some(7)
+        );
+        assert_eq!(
+            resource.with_rail_state(|s: &mut OneRail| s.0),
+            Some(7),
+            "a second ask must borrow the state the first one left"
+        );
+    }
+
+    #[test]
+    fn one_resource_holds_one_rails_state_and_no_others() {
+        let resource = resource();
+        assert_eq!(
+            resource.with_rail_state(|s: &mut OneRail| s.0 = 3),
+            Some(())
+        );
+        assert!(
+            resource.with_rail_state(|_: &mut OtherRail| ()).is_none(),
+            "a second rail must not be handed the first rail's slot"
+        );
+        assert_eq!(
+            resource.with_rail_state(|s: &mut OneRail| s.0),
+            Some(3),
+            "and must not have disturbed what the first rail left there"
+        );
+    }
+
+    #[test]
+    fn deleting_the_resource_releases_what_the_rail_retained() {
+        let live_before = LIVE.load(Ordering::Relaxed);
+        let resource = resource();
+        assert_eq!(resource.with_rail_state(|_: &mut Pinned| ()), Some(()));
+        assert_eq!(
+            LIVE.load(Ordering::Relaxed),
+            live_before + 1,
+            "the slot holds the rail's object"
+        );
+        drop(resource);
+        assert_eq!(
+            LIVE.load(Ordering::Relaxed),
+            live_before,
+            "the guest's delete releases the rail's retention at that instant, \
+             not on a later sweep"
+        );
+    }
+}
 
 #[cfg(test)]
 mod task_reference_state_tests {
@@ -1430,7 +1404,7 @@ pub struct MappingEntry {
     /// falls back to the CPU seed rather than loading from a resident whose
     /// currency nothing established.
     ///
-    /// Compared against [`crate::backend::vulkan::engine::resident_content_epoch`]
+    /// Compared by the running rail against its own resident-content epoch
     /// to decide whether a mapper-ref-texture LOAD may take `LoadOp::LoadFromTarget` and
     /// skip its CPU seed entirely. Never read to decide *what* to present or
     /// draw — only whether a known-equal upload can be elided.
@@ -2396,13 +2370,15 @@ pub struct DeviceState {
     /// Immutable sampler objects in the sampler API's separate ref space.
     pub task_sampler_states: TaskSamplerStates,
     /// Immutable depth-stencil objects in that API's separate ref space.
-    #[cfg(feature = "backend-vulkan")]
     pub task_depth_stencil_states: TaskDepthStencilStates,
-    /// Immutable render pipeline states in the pipeline API's separate ref
-    /// space. The guest binds these by reference after construction and ends
-    /// them with resource deletion or task teardown.
-    #[cfg(feature = "backend-vulkan")]
-    pub task_render_pipeline_states: TaskRenderPipelineStates,
+    /// What the running rail retains for exactly this device's lifetime, in
+    /// the rail's own vocabulary. See [`RailDeviceState`].
+    ///
+    /// The model owns the slot and the drop; it does not own — and cannot name
+    /// — the contents. `OnceLock` rather than a lock, because the slot is
+    /// claimed once by the one rail this process latched and never replaced, so
+    /// a read on the draw path is an acquire load and not a mutex.
+    rail: OnceLock<Box<dyn RailDeviceState>>,
     /// Mapper-ref-texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
@@ -2476,13 +2452,11 @@ pub struct DeviceState {
     /// texels did not change" key for the zero-copy sampled gathers, measured
     /// against the bytes themselves. See
     /// [`crate::runtime::gather_witness`] — it selects no behaviour.
-    #[cfg(feature = "backend-vulkan")]
     pub gather_witness: crate::runtime::gather_witness::GatherWitness,
     /// The GVA render targets a Store has stamped, and what the two write
     /// witnesses said at the time. The GVA half of the mapper-ref-texture witness that
     /// licenses the attachment LOAD elision — see
     /// [`crate::runtime::gva_store_witness`].
-    #[cfg(feature = "backend-vulkan")]
     pub gva_store_witness: crate::runtime::gva_store_witness::GvaStoreWitness,
     /// Draw-time buffer binds resolved once per reference and held. Reached
     /// only through [`DeviceState::retire_bound_buffers_for_task`] and
@@ -2743,7 +2717,6 @@ impl DeviceState {
             page_shift,
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),
-            #[cfg(feature = "backend-vulkan")]
             gva_store_witness: Default::default(),
             active_child_mask: 0,
             translation_deferred_mask: 0,
@@ -2763,10 +2736,8 @@ impl DeviceState {
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             task_sampler_states: TaskSamplerStates::default(),
-            #[cfg(feature = "backend-vulkan")]
             task_depth_stencil_states: TaskDepthStencilStates::default(),
-            #[cfg(feature = "backend-vulkan")]
-            task_render_pipeline_states: TaskRenderPipelineStates::default(),
+            rail: OnceLock::new(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -2803,7 +2774,6 @@ impl DeviceState {
             stamp_ledger: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
-            #[cfg(feature = "backend-vulkan")]
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),
@@ -2876,9 +2846,7 @@ impl DeviceState {
         // sets, and they are not reachable from any `MappingEntry` — so the
         // loop above cannot see them and a reset that only walked mappings left
         // them armed on the host forever.
-        #[cfg(feature = "backend-vulkan")]
         tokens.extend(self.gather_witness.take_tokens());
-        #[cfg(feature = "backend-vulkan")]
         tokens.extend(self.gva_store_witness.take_tokens());
         // Back onto the retired list rather than out through the return value:
         // the caller's contract is "invalidate backend aliases, then release
@@ -3015,12 +2983,28 @@ impl DeviceState {
         }
     }
 
+    /// The running rail's own device-lifetime state, created empty on first
+    /// ask.
+    ///
+    /// `None` means the slot is already held by a *different* rail's type.
+    /// [`crate::backend::select`] latches one rail per process, so no live
+    /// build can reach it; it is an answer rather than a panic because every
+    /// caller is on a path whose lawful reply to "nothing retained" is the
+    /// ablation it already implements — reconstruct, or report absent.
+    pub fn rail_state<T: RailDeviceState + Default>(&self) -> Option<&T> {
+        self.rail
+            .get_or_init(|| Box::<T>::default() as Box<dyn RailDeviceState>)
+            .as_any()
+            .downcast_ref::<T>()
+    }
+
     fn forget_compositor_mapping(&mut self, mapping_id: u32) {
         // The plane draw ring is keyed by mapping id and read by two witnesses,
         // so it is dropped with the mapping: bounded by the live compositor
         // surfaces, and a recycled id cannot inherit a predecessor's passes.
-        #[cfg(feature = "backend-vulkan")]
-        crate::runtime::draw::vulkan::forget_plane_draw_ring(mapping_id);
+        // Through the trait, because the record belongs to whichever rail is
+        // running and the model may not name one.
+        crate::backend::Backend::forget_mapping(&crate::backend::selected(), mapping_id);
         // Prune the dense-frame seq: a recycled mapping id must not inherit a
         // stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);
@@ -3189,16 +3173,13 @@ impl DeviceState {
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
         self.task_sampler_states.delete_task(task_id);
-        #[cfg(feature = "backend-vulkan")]
         crate::runtime::drain::note_store_route_n(
             "ds_state_task_deleted",
             self.task_depth_stencil_states.delete_task(task_id) as u64,
         );
-        #[cfg(feature = "backend-vulkan")]
-        crate::runtime::drain::note_store_route_n(
-            "pipeline_state_task_deleted",
-            self.task_render_pipeline_states.delete_task(task_id) as u64,
-        );
+        if let Some(rail) = self.rail.get() {
+            rail.delete_task(task_id);
+        }
         // A deleted task's whole address space goes with it, so its live
         // mappings are not leaks and a reused id must not inherit them.
         self.map_audit.remove(&task_id);
@@ -3247,16 +3228,13 @@ impl DeviceState {
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
         self.task_sampler_states.delete_task(task_id);
-        #[cfg(feature = "backend-vulkan")]
         crate::runtime::drain::note_store_route_n(
             "ds_state_task_deleted",
             self.task_depth_stencil_states.delete_task(task_id) as u64,
         );
-        #[cfg(feature = "backend-vulkan")]
-        crate::runtime::drain::note_store_route_n(
-            "pipeline_state_task_deleted",
-            self.task_render_pipeline_states.delete_task(task_id) as u64,
-        );
+        if let Some(rail) = self.rail.get() {
+            rail.delete_task(task_id);
+        }
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         self.host_texture_surfaces.retain(|&(t, _), _| t != task_id);

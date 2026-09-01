@@ -2085,7 +2085,7 @@ pub enum TargetIdentity {
         /// with nothing to say so — the same loss the `Gva` namespace had, for
         /// the same reason, found the same way.
         ///
-        /// [`crate::runtime::present_identity::surface_identity`] is the only
+        /// [`crate::backend::vulkan::present_identity::surface_identity`] is the only
         /// producer, and it resolves this through
         /// [`crate::runtime::mapping_write::mapping_store_format`] — the same
         /// function the writeback lays its rows out from, so the resident and

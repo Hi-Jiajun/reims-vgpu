@@ -173,7 +173,7 @@ for arm in $ARMS; do
 
   # Everything before this point is boot noise; the scored window starts here.
   MARK=$(grep -c '' /tmp/reims-vgpu-fail.log)
-  QMP_SOCK="$REPO/vm/disks/run/qmp.sock" timeout $((SECS + 240)) \
+  QMP_SOCK="$("$REPO/scripts/qmp/qmp.py" sock)" timeout $((SECS + 240)) \
     "$PROBE" "$OUT/$tag-work" "$SECS" >"$OUT/$tag-probe.log" 2>&1
   probe_exit=$?
   SLICE="$OUT/$tag-slice.log"

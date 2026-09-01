@@ -68,6 +68,38 @@
 //! arithmetic is worse than one a reader can divide. They are stated here so the
 //! division is the first thing done with the line.
 //!
+//! # Both rails are measured, and they fill different bars
+//!
+//! The timer is runtime-side, so it brackets whichever rail
+//! [`crate::backend::select`] picked — `runtime::draw::vulkan::encode_draw_chain`
+//! and `runtime::draw::metal::encode_draw_chain` each open one. **Say which rail
+//! a reading came from**; the two do different work per draw and their columns
+//! are not comparable term by term.
+//!
+//! The eight top-level bars are filled by both. Of the sub-phases:
+//!
+//! | bar | Vulkan | Metal |
+//! |---|---|---|
+//! | `pl_desc` | the task's render-pipeline-state lookup | same |
+//! | `pl_mtlb` | both `load_mtlb` calls | same |
+//! | `asm_depth` | the depth/stencil descriptor load | same |
+//! | `prep_pages` | `sync_store_allowed_pages` | `sync_store_target_pages` |
+//! | `pl_gen`, `pl_air`, `pl_xlate` | the GVA allocation walk and the AIR→SPIR-V rails | **zero** — this rail hands Metal the guest's own MTLB and translates nothing |
+//! | `asm_target`, `asm_trail` | the four identity rails and the hang trail | **zero** — neither exists on that rail |
+//!
+//! A zero there is the absence of a rail rather than a fast one, which is why
+//! they are named here instead of being left for a reader to guess at. For the
+//! same reason `pipeline_us` — the leftover once the five are carved out — reads
+//! near zero on Metal: on that rail there is nothing left over.
+//!
+//! The second identity above (`engine_us` equals `draw_phase`'s phases summed)
+//! is Vulkan-only, because `draw_phase` is that rail's engine-internal census
+//! and the Metal rail has no equivalent. On Metal `engine_us` is
+//! `backend::metal::render::render_core_mrt` whole — one command buffer, one
+//! encoder, one `commit` and one `waitUntilCompleted`, so it carries GPU latency
+//! that the Vulkan rail's batching keeps off the recording thread entirely. Read
+//! that function's own doc before ranking anything against it.
+//!
 //! # What it does not do
 //!
 //! It reports no loss. Every phase here is a draw that drew; a slow draw is not
@@ -275,6 +307,41 @@ pub fn take_window() -> Option<ChainPhaseWindow> {
         max_us: to_us(MAX_NS.swap(0, Ordering::Relaxed)),
     };
     (chains > 0).then_some(w)
+}
+
+/// One named microsecond span inside a phase, committed on `Drop`.
+///
+/// The eight phases above divide a chain exhaustively and cannot be subdivided
+/// without changing what a bar means across boots. This is the tool for the
+/// other question — "what inside this bar costs" — and it answers by adding a
+/// counter beside the bars rather than by re-cutting them: a span's total is a
+/// `store_routes` key like any other, so two spans that divide one phase can be
+/// read against it and the phase keeps meaning what it meant last boot.
+///
+/// Nestable and overlappable by construction, because it counts elapsed time
+/// under a name rather than owning a slot. Two overlapping spans double-count
+/// the overlap, which is the caller's to arrange.
+pub struct CostSpan {
+    name: &'static str,
+    started: Instant,
+}
+
+impl CostSpan {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for CostSpan {
+    fn drop(&mut self) {
+        crate::runtime::drain::note_store_route_us(
+            self.name,
+            self.started.elapsed().as_micros() as u64,
+        );
+    }
 }
 
 /// Close the open phase and open `next`. Inert when no [`ChainTimer`] is live.

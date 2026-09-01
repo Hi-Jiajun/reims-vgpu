@@ -21,6 +21,8 @@ pub mod census;
 /// Where a draw chain's wall clock goes on the runtime side of the engine
 /// boundary, which is 82% of it.
 pub mod chain_phase;
+/// The byte runs in which a newly rendered row differs from the guest's.
+pub mod changed_runs;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).
 // See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
 // carried on failure paths, and boxing it would cost the refusal vocabulary
@@ -43,7 +45,6 @@ pub mod exec;
 pub mod fence_exec;
 /// Is the hypervisor's guest-write generation a sound cache key for the
 /// zero-copy sampled gathers? Measurement, not policy.
-#[cfg(feature = "backend-vulkan")]
 pub mod gather_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
@@ -60,10 +61,10 @@ pub mod guest_ram_map;
 /// both backends and every test arm reach it.
 /// Task GVA → guest RAM reads.
 pub mod gva_mem;
-/// Gated with the `GuestWriteVerdict` it reuses and the `TargetIdentity` it
-/// keys on, both of which are Vulkan-side; the mapper-ref-texture twin this mirrors
-/// (`mapper::mapping_guest_write_verdict`) carries the same gate.
-#[cfg(feature = "backend-vulkan")]
+/// Which GVA render targets a Store has stamped, and what the two write
+/// witnesses said at the time. Neutral: it keys on the guest span a rail's
+/// resident stands for — see `Backend::gva_witness_key` — and not on the rail's
+/// own name for that resident.
 pub mod gva_store_witness;
 /// Task-GVA HostOps views (MapMemory2 / UnmapMemory lifecycle).
 pub mod gva_view;
@@ -98,13 +99,7 @@ pub mod mtlb;
 pub mod node_guard;
 /// Object-list lookup and mapper-ref-texture registration.
 pub mod objects;
-/// A draw's pipeline and both its shaders, resolved once per pipeline object.
-#[cfg(feature = "backend-vulkan")]
-pub mod pipeline_resolve;
 pub mod plan;
-/// The resident identity a mapper-ref-texture guest surface renders into.
-#[cfg(feature = "backend-vulkan")]
-pub mod present_identity;
 /// Whether a range's page-table entries are in the state the guest's own next
 /// edit of them requires — the direction that is ordered is the map.
 pub mod range_coverage;
@@ -112,6 +107,9 @@ pub mod released_pages;
 /// Transfer a host-resident render frame into guest pages when synchronization
 /// or a guest-memory reader makes the bytes observable.
 pub mod render_writeback;
+/// A rail's own name for a resident render target, opaque to the layers that
+/// carry it. See the module doc for the ledger this exists for.
+pub mod resident_target;
 /// The guest's per-resource validity quad, from both of its producers.
 pub mod resource_validity;
 /// The split of [`chain_phase`]'s largest *undivided* column, `sampled_us`.
@@ -125,6 +123,9 @@ mod spirv_layout;
 pub mod spirv_vertex_input;
 /// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).
 pub mod surface_cache;
+/// Whether a host-side copy of a mapper-ref-texture surface's pixels is still
+/// that surface's content, per the hypervisor's witness.
+pub mod surface_currency;
 /// The wire task word a command payload carries → a live task slot.
 pub mod task_slot;
 /// Texture / mapper-ref-texture geometry registration.

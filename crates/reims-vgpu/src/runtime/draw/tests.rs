@@ -1061,7 +1061,7 @@ fn encode_status_renders_its_check_beside_the_class_it_collapsed_to() {
     {
         let backend =
             crate::backend::metal::error::Status::execute("metal_render_command_buffer_failed");
-        let carried = EncodeStatus::MetalBackend(backend);
+        let carried = EncodeStatus::RailRefused(backend);
         assert_eq!(carried.class(), "metal_execute");
         assert_eq!(
             Emit::refusal("draw_encode_fail", &carried)
@@ -1120,6 +1120,7 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
         depth_qualifier: None,
         stencil_members: vec![],
         local_size: None,
+        max_work_group_size: None,
         kernel_dispatch: None,
         vertex_builtins: Some(VertexBuiltins {
             uses_vertex_index: true,
@@ -2869,16 +2870,18 @@ fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encod
             .texture_to_mapping
             .insert((1, texture_ref), mapping_id);
     }
-    state.task_render_pipeline_states.register(
-        1,
-        7,
-        crate::runtime::pipeline_resolve::retained_pipeline_with_desc_for_test(
-            RenderPipelineDescriptor {
-                raster_sample_count: 4,
-                ..RenderPipelineDescriptor::default()
-            },
-        ),
-    );
+    crate::backend::vulkan::pipeline_resolve::retained(&state)
+        .expect("this rail owns the device's rail-state slot")
+        .register(
+            1,
+            7,
+            crate::backend::vulkan::pipeline_resolve::retained_pipeline_with_desc_for_test(
+                RenderPipelineDescriptor {
+                    raster_sample_count: 4,
+                    ..RenderPipelineDescriptor::default()
+                },
+            ),
+        );
     let mut att = clear_black_attachment(42);
     att.resolve_texture_ref = 43;
     att.store_action = MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
@@ -4148,6 +4151,165 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
     )
     .expect("texture-ref cache seed at the address that produced it");
     assert_eq!(texture_seed, vec![0, 180, 0, 255, 0, 180, 0, 255]);
+}
+
+/// A colour LOAD seed for a mapper-ref-texture attachment is served from this
+/// device's own last publication of the surface, and only while the
+/// hypervisor's witness positively says the guest has not repainted it.
+///
+/// Both doors above this one key on `target_gva`, and a mapper-ref-texture
+/// attachment has no address of its own — so on the Metal rail, whose colour
+/// targets are all mapper-ref-texture surfaces, the cache was unreachable by
+/// construction. One driven macos-13 Metal boot asked the ref door 201 times,
+/// was refused 201 times, and paid a whole-frame guest read plus a scalar
+/// per-pixel format conversion for every colour LOAD in the boot.
+///
+/// The three legs are the whole contract, and the third is the one that keeps
+/// the first from being a hazard. A LOAD seed is the attachment's prior content
+/// and the matching Store publishes the composite back over the surface's guest
+/// pages, so there is no rung under this door to correct a stale serve: a wrong
+/// frame becomes the surface and the next frame loads what this one stored.
+/// [`CurrencyStandard::WatchedAndUnwritten`] is what makes it safe on a pathway
+/// whose dirty tracking may never arm — under the permissive standard a rail
+/// that never stamps answers `NoStamp` to every ask and this door would serve
+/// whatever the cache holds, forever.
+#[test]
+fn a_mapper_ref_texture_load_seed_serves_a_published_frame_only_on_a_watched_clean_witness() {
+    use crate::contract::endian::{st16, st32};
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_MAPPER_REF_TEXTURE,
+    };
+    use crate::runtime::gva_mem;
+    use crate::runtime::host::HostOps;
+
+    let (w, h) = (2u32, 2u32);
+    let mid = 71u32;
+    let texture_ref = 2u32;
+    let task_id = 1u32;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+
+    // A one-level page table for task 1, with three mapped leaf pages: the
+    // object list, the descriptor, and the surface's own storage.
+    let (dir_pfn, root_pfn) = (2u32, 3u32);
+    let (dir_gpa, root_gpa) = (
+        (dir_pfn as u64) << PAGE_SHIFT_X86,
+        (root_pfn as u64) << PAGE_SHIFT_X86,
+    );
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    let mut dir = [0u8; 8];
+    st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+    assert!(host.write_gpa(dir_gpa, &dir).is_ok());
+    for i in 0..3u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+    }
+    state.define_task(task_id, 0x1000, dir_pfn);
+    assert!(state.set_object_list(task_id, 0, 32));
+
+    // The mapper-ref-texture object: an IOSurface descriptor naming the mapping,
+    // its format and its geometry, published through the task's object list.
+    const DESC_LEN: usize = 0x20;
+    let desc_gva = 0x1000u64;
+    let mut desc = vec![0u8; DESC_LEN];
+    st32(&mut desc[0..], mid);
+    st16(&mut desc[0x16..], MTL_FORMAT_BGRA8_UNORM);
+    st32(&mut desc[0x18..], w);
+    st32(&mut desc[0x1c..], h);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[task_id],
+        desc_gva,
+        &desc,
+        PAGE_SHIFT_X86
+    )
+    .is_ok());
+    let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut list_entry,
+        u32::from(OBJECT_TYPE_MAPPER_REF_TEXTURE) | ((DESC_LEN as u32) << 8),
+    );
+    list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[task_id],
+        list_object_entry_offset(texture_ref, 32).unwrap(),
+        &list_entry,
+        PAGE_SHIFT_X86
+    )
+    .is_ok());
+
+    // The surface's own guest pages, painted a colour the cache does not hold —
+    // so "served from the cache" and "read from the guest" are distinguishable
+    // by value and not merely by a counter.
+    let page_gpa = 6u64 << PAGE_SHIFT_X86;
+    assert!(state.map_surface(mid));
+    {
+        let m = state.mappings.get_mut(&mid).expect("mapped above");
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![(6u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+    let guest_bgra = [0x11u8, 0x22, 0x33, 0xff].repeat((w * h) as usize);
+    assert!(host.write_gpa(page_gpa, &guest_bgra).is_ok());
+    const GUEST_RGBA: [u8; 4] = [0x33, 0x22, 0x11, 0xff];
+
+    // What this device last published for the surface, as `mapping_write` would
+    // have left it: BGRA in the host cache.
+    let published = [0xAAu8, 0xBB, 0xCC, 0xff].repeat((w * h) as usize);
+    crate::runtime::surface_cache::store(&mut state, mid, w, h, published);
+    const PUBLISHED_RGBA: [u8; 4] = [0xCC, 0xBB, 0xAA, 0xff];
+
+    // Leg 1 — unwatched. The cache holds the surface and the witness has not
+    // been armed, so the strict standard refuses and the guest's pages answer.
+    // This is the whole reason the standard is a parameter: the permissive one
+    // serves here, and a rail that never stamps would serve here every time.
+    let unwatched = seed_color_load(&mut state, &mut host, task_id, texture_ref, 0, w, h)
+        .expect("the guest's own pages are always a seed");
+    assert_eq!(
+        &unwatched[..4],
+        &GUEST_RGBA,
+        "an unstamped surface has no witness to spend, and the cache must not be served"
+    );
+
+    // Leg 2 — watched and clean. Arm the token and stamp it, which is what
+    // `mapping_write` does in the same breath as it fills the cache.
+    let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
+        .expect("FakeHost observes guest writes");
+    state
+        .mappings
+        .get_mut(&mid)
+        .expect("mapped above")
+        .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
+    let served = seed_color_load(&mut state, &mut host, task_id, texture_ref, 0, w, h)
+        .expect("a published frame under a clean witness is the attachment's prior content");
+    assert_eq!(
+        &served[..4],
+        &PUBLISHED_RGBA,
+        "with the witness clean the device's own publication is the surface, and \
+         re-reading the guest's pages is the cost this door exists to remove"
+    );
+
+    // Leg 3 — repainted. The guest CPU stores into the surface with no device
+    // operation at all, so this witness is the only thing that sees it.
+    host.guest_wrote_page(page_gpa);
+    let repainted = seed_color_load(&mut state, &mut host, task_id, texture_ref, 0, w, h)
+        .expect("a repainted surface still seeds, from its own pages");
+    assert_eq!(
+        &repainted[..4],
+        &GUEST_RGBA,
+        "the cache is a frame the guest has since painted over; serving it would \
+         composite this pass onto a stale layer and store the result back"
+    );
 }
 
 /// A draw whose colour0 LOAD seed was elided must leave the encode holding
@@ -7887,4 +8049,129 @@ fn a_planes_drain_counts_every_arrival_even_past_the_ring_it_remembers() {
         " draws=0",
         "a plane that received nothing reports the count and no tail"
     );
+}
+
+/// The eight-bit colour orders lose nothing at `RGBA8Unorm`, and everything the
+/// contract admits as a store layout that is not one of them does.
+///
+/// # Why this is asserted over `store_texel_order` rather than a list
+///
+/// `ColorTargetNarrowing` is a second reading of the contract's own store
+/// table, and a second reading drifts. If a layout is added to
+/// `store_texel_order` and not considered here it would be reported as an exact
+/// render, which is the direction that says "nothing was lost" about a frame
+/// that lost something. So the two are compared over the whole ordinal space,
+/// and the only formats allowed to answer `None` are the two the contract maps
+/// to an eight-bit colour order.
+#[test]
+fn only_the_eight_bit_colour_orders_render_exactly_at_rgba8() {
+    use crate::contract::pixel_format::{store_texel_order, TexelLayout};
+    use crate::runtime::draw::{color_target_narrowing, ColorTargetNarrowing};
+    for format in 0u16..=0xffff {
+        let got = color_target_narrowing(format);
+        let want = match store_texel_order(format) {
+            Some(TexelLayout::Rgba8 | TexelLayout::Bgra8) => ColorTargetNarrowing::None,
+            Some(layout) => ColorTargetNarrowing::Quantised(layout),
+            None => ColorTargetNarrowing::Undeclared,
+        };
+        assert_eq!(got, want, "{format:#x}");
+    }
+}
+
+/// The formats this actually fires for on a live guest, named so a reader of
+/// the census knows what the counter is about.
+///
+/// `0x73` is `MTLPixelFormatRGBA16Float`, which a driven macos-13 boot reports
+/// as the window server's main compositing surface — the frame this rail
+/// quantises to 256 levels a channel on every Store. `0x50`/`0x51` are the
+/// BGRA8 pair the same boot reports for the other mappings, and they must stay
+/// exact or the counter would report the ordinary case as a loss.
+#[test]
+fn the_live_compositor_formats_answer_as_measured() {
+    use crate::contract::pixel_format::{
+        TexelLayout, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA16_FLOAT,
+    };
+    use crate::runtime::draw::{color_target_narrowing, ColorTargetNarrowing};
+    assert_eq!(
+        color_target_narrowing(MTL_FORMAT_RGBA16_FLOAT),
+        ColorTargetNarrowing::Quantised(TexelLayout::Rgba16Float),
+        "the window server's surface is the one that loses"
+    );
+    for exact in [MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB] {
+        assert_eq!(
+            color_target_narrowing(exact),
+            ColorTargetNarrowing::None,
+            "{exact:#x} is carried exactly"
+        );
+    }
+}
+
+/// A narrowing is counted on the always-on channel, and an exact target is
+/// quiet on it.
+///
+/// # Why
+///
+/// `AGENTS.md`: degraded guest work produces a typed reason, expected control
+/// flow stays quiet. A counter that fired for every Store would drown the one
+/// that matters, and one that fired for none would leave the loss where it was
+/// — invisible, which is how `present_identity`'s doc records the same defect
+/// surviving on the other rail.
+///
+/// Read as deltas because the route counters are process-cumulative and this
+/// test shares them with every other one in the binary.
+#[test]
+fn a_narrowed_target_is_counted_and_an_exact_one_is_quiet() {
+    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
+    use crate::runtime::drain::store_route_count;
+    use crate::runtime::draw::note_store_narrowing;
+
+    let before = store_route_count("store_target_narrowed");
+    note_store_narrowing(MTL_FORMAT_BGRA8_UNORM, 1920, 1080);
+    assert_eq!(
+        store_route_count("store_target_narrowed"),
+        before,
+        "an eight-bit target is ordinary work and says nothing"
+    );
+    note_store_narrowing(MTL_FORMAT_RGBA16_FLOAT, 1920, 1080);
+    assert_eq!(
+        store_route_count("store_target_narrowed"),
+        before + 1,
+        "the half-float target is counted"
+    );
+    // Unconditional, not first-sight: the census must carry the size of the
+    // loss and not merely its existence. The log line is what is deduped.
+    note_store_narrowing(MTL_FORMAT_RGBA16_FLOAT, 1920, 1080);
+    assert_eq!(
+        store_route_count("store_target_narrowed"),
+        before + 2,
+        "every narrowed Store counts, so the census reports a rate"
+    );
+}
+
+/// The two spellings of the R/B exchange must agree byte for byte, including on
+/// a trailing partial pixel.
+///
+/// They exist as a pair because both call shapes exist — a borrowed frame needs
+/// the allocating one, a produced frame needs the in-place one — and a pair is
+/// exactly the shape that drifts. The exchange is also its own inverse, which is
+/// what lets one function serve BGRA→RGBA and RGBA→BGRA, so that is checked
+/// here too rather than left as a claim in a doc comment.
+#[test]
+fn both_spellings_of_the_channel_exchange_agree_and_are_their_own_inverse() {
+    for len in 0..=37usize {
+        let src: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37)).collect();
+        let allocated = super::swap_rb_channels(&src);
+        let mut in_place = src.clone();
+        super::swap_rb_channels_in_place(&mut in_place);
+        assert_eq!(
+            in_place, allocated,
+            "len {len}: the in-place exchange must be the allocating one"
+        );
+        let round_trip = super::swap_rb_channels(&allocated);
+        assert_eq!(
+            round_trip, src,
+            "len {len}: the exchange is its own inverse, which is what lets one \
+             function serve both directions"
+        );
+    }
 }

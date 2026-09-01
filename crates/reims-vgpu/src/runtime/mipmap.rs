@@ -388,12 +388,13 @@ fn generate_via_box_filter(
         .checked_mul(height as usize)
         .and_then(|v| v.checked_mul(RGBA8_BPP as usize))
         .ok_or(MipmapStatus::Capacity)?;
+    let row_rail =
+        pixel_format::RowToRgba8::for_format(fmt).ok_or(MipmapStatus::UnsupportedFormat)?;
     let mut prev = vec![0u8; rgba_need];
     for y in 0..height {
         let src_off = (y as usize) * (tight0 as usize);
         let dst_off = (y as usize) * (width as usize) * 4;
-        if !pixel_format::convert_row_to_rgba8(
-            fmt,
+        if !row_rail.convert(
             &level0_native[src_off..src_off + tight0 as usize],
             width,
             &mut prev[dst_off..],
@@ -418,12 +419,13 @@ fn generate_via_box_filter(
         let need = (tight as usize)
             .checked_mul(dh as usize)
             .ok_or(MipmapStatus::Capacity)?;
+        let store_rail =
+            pixel_format::Rgba8ToRow::for_format(fmt).ok_or(MipmapStatus::UnsupportedFormat)?;
         let mut native = vec![0u8; need];
         for y in 0..dh {
             let src_off = (y as usize) * (dw as usize) * 4;
             let dst_off = (y as usize) * (tight as usize);
-            if !pixel_format::convert_rgba8_to_row(
-                fmt,
+            if !store_rail.convert(
                 &next_rgba[src_off..],
                 dw,
                 &mut native[dst_off..dst_off + tight as usize],

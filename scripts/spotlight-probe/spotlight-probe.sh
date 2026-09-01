@@ -30,8 +30,14 @@
 # over ssh, bounded by `timeout`, so a wedged guest cannot hang the run.
 set -u
 OUT="${1:?outdir}"; SECS="${2:-30}"
-REPO=/home/aneesiqbal/Projects/steelbrain/reims-vgpu
-export QMP_SOCK="${QMP_SOCK:-$REPO/vm/disks/run/qmp.sock}"
+# Derived, not spelled: this probe used to name one checkout's absolute path, so
+# it could not run anywhere else — including on the Apple host, which is the only
+# host the Metal rail exists on.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# `qmp.py` resolves whichever pathway is live (vm/guest/run for boot-arm64.sh,
+# vm/disks/run for boot-x86.sh). Naming one of them here pinned the x86 pathway
+# and made this probe unable to drive an arm64 boot at all.
+export QMP_SOCK="${QMP_SOCK:-$("$REPO/scripts/qmp/qmp.py" sock)}"
 Q="$REPO/scripts/qmp/qmp.py"
 FAILLOG=/tmp/reims-vgpu-fail.log
 # What to type. Several rounds of a query that matches a lot (so the results

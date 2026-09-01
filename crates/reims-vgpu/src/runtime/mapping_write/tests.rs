@@ -1870,8 +1870,14 @@ fn clear_store_full_write_overwrites_prior_guest_outside_scissor() {
     rgba[4] = 255; // R
     rgba[4 + 3] = 255; // A
     assert!(write_rgba8_image_changed(
-        &mut state, &mut host, 7, &rgba, None, // Clear Store: not image_changed vs clear seed
-        4, 2
+        &mut state,
+        &mut host,
+        7,
+        &rgba,
+        None, // Clear Store: not image_changed vs clear seed
+        4,
+        2,
+        FramePublication::HostCache
     ));
     let mut row = vec![0u8; 16];
     assert!(read_rect_raw(
@@ -2017,7 +2023,14 @@ fn every_rgba8_image_changed_refusal_names_itself() {
     // A zero dimension is not a rect.
     let n = before("surface_write_geometry");
     assert!(!write_rgba8_image_changed(
-        &mut state, &mut host, 7, &frame, None, 0, 2
+        &mut state,
+        &mut host,
+        7,
+        &frame,
+        None,
+        0,
+        2,
+        FramePublication::HostCache
     ));
     assert_eq!(store_route_count("surface_write_geometry"), n + 1);
 
@@ -2030,7 +2043,8 @@ fn every_rgba8_image_changed_refusal_names_itself() {
         &frame[..4],
         None,
         4,
-        2
+        2,
+        FramePublication::HostCache
     ));
     assert_eq!(store_route_count("surface_write_source_short"), n + 1);
 
@@ -2043,7 +2057,8 @@ fn every_rgba8_image_changed_refusal_names_itself() {
         &frame,
         Some(&frame[..4]),
         4,
-        2
+        2,
+        FramePublication::HostCache
     ));
     assert_eq!(
         store_route_count("surface_write_seed_short"),
@@ -2054,7 +2069,14 @@ fn every_rgba8_image_changed_refusal_names_itself() {
     // No such mapping: the surface went away between the arm and the landing.
     let n = before("surface_write_mapping_absent");
     assert!(!write_rgba8_image_changed(
-        &mut state, &mut host, 4242, &frame, None, 4, 2
+        &mut state,
+        &mut host,
+        4242,
+        &frame,
+        None,
+        4,
+        2,
+        FramePublication::HostCache
     ));
     assert_eq!(store_route_count("surface_write_mapping_absent"), n + 1);
 
@@ -2062,7 +2084,14 @@ fn every_rgba8_image_changed_refusal_names_itself() {
     let n = before("surface_write_geometry_moved");
     let big = vec![0u8; 8 * 8 * 4];
     assert!(!write_rgba8_image_changed(
-        &mut state, &mut host, 7, &big, None, 8, 8
+        &mut state,
+        &mut host,
+        7,
+        &big,
+        None,
+        8,
+        8,
+        FramePublication::HostCache
     ));
     assert_eq!(store_route_count("surface_write_geometry_moved"), n + 1);
 
@@ -2070,7 +2099,14 @@ fn every_rgba8_image_changed_refusal_names_itself() {
     let n = before("surface_write_mapping_not_resident");
     state.mappings.get_mut(&7).unwrap().mapped = false;
     assert!(!write_rgba8_image_changed(
-        &mut state, &mut host, 7, &frame, None, 4, 2
+        &mut state,
+        &mut host,
+        7,
+        &frame,
+        None,
+        4,
+        2,
+        FramePublication::HostCache
     ));
     assert_eq!(
         store_route_count("surface_write_mapping_not_resident"),
@@ -2106,7 +2142,8 @@ fn rgba8_image_changed_writes_only_diff_spans() {
         &rgba,
         Some(&seed),
         4,
-        2
+        2,
+        FramePublication::HostCache
     ));
     // Read back first row of mapping (BGRA native).
     let mut row = vec![0u8; 16];
@@ -2126,6 +2163,370 @@ fn rgba8_image_changed_writes_only_diff_spans() {
     // Pixel 1 is red in BGRA: B=0 G=0 R=255 A=255
     assert_eq!(&row[4..8], &[0, 0, 255, 255]);
     assert_eq!(&row[0..4], &[0, 0, 0, 0]);
+}
+
+/// Every writer of a mapping's guest pages leaves *no* host-side copy claiming
+/// to be them.
+///
+/// This is the rule the two rect writers and the raw-row writer used to break,
+/// and it is not a rule about caches — it is what makes the hypervisor's witness
+/// answerable. `mapping_guest_write_verdict` reports whether the *guest* wrote
+/// these pages, and this device's own writes go through a mapped host pointer
+/// that cannot set `DIRTY_MEMORY_VGA`, so the witness is structurally blind to
+/// them. Only the writer can retire the copy, and a writer that does not leaves
+/// a stale frame the witness will go on calling `Clean` forever.
+///
+/// The consequence was measured on the colour LOAD seed:
+/// `draw::seed_from_published_surface` serves that entry as the attachment's
+/// prior content, the pass composites onto it, and its Store publishes the
+/// result back over the guest's pages — so a partial store's pixels are lost and
+/// then *held*, which is the class the door's strict evidence standard exists to
+/// prevent and could not prevent alone.
+///
+/// Every writer in this file is asserted, including the ones that already
+/// published or forgot, because the value of the rule is that it has no
+/// exceptions to remember.
+/// The `cache_rows_are_native` shortcut's premise: for a BGRA8 mapping, this
+/// writer's native row *is* the host cache's row, byte for byte.
+///
+/// `write_rgba8_image_changed` used to convert the frame twice — once per row
+/// into the mapping's native texels for the guest write, and once whole-frame
+/// into BGRA for the cache — and the second pass was 45.9 % of the Metal rail's
+/// `store_us`. It now converts once and the row loop reads the cache. That is
+/// only sound while these two produce identical bytes, so the equality is
+/// asserted directly rather than left to the reader of two loops in different
+/// parts of the file.
+///
+/// The sRGB spelling is included because it is the other format the shortcut
+/// admits, and a transfer function applied on one side and not the other would
+/// be invisible in any test that used only one of them.
+///
+/// The store rail is asked by ordinal rather than named as `Rgba8ToRow::Bgra8`
+/// on purpose: the shortcut's condition is a `matches!` on those two ordinals,
+/// so what has to hold is that *the ordinals the shortcut admits* reach the
+/// swapping arm. Naming the variant would assert the swap and skip the mapping,
+/// which is the half that can drift.
+#[test]
+fn a_bgra8_native_row_is_the_host_cache_row() {
+    const W: u32 = 4;
+    let rgba: Vec<u8> = (0..W * 4)
+        .map(|i| (i as u8).wrapping_mul(7).wrapping_add(3))
+        .collect();
+    // What the cache build performs: RGBA8 in, BGRA8 out.
+    let mut cache_row = vec![0u8; (W * 4) as usize];
+    for x in 0..W as usize {
+        let i = x * 4;
+        cache_row[i] = rgba[i + 2];
+        cache_row[i + 1] = rgba[i + 1];
+        cache_row[i + 2] = rgba[i];
+        cache_row[i + 3] = rgba[i + 3];
+    }
+    for format in [
+        MTL_FORMAT_BGRA8_UNORM,
+        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
+    ] {
+        let mut native = vec![0u8; (W * 4) as usize];
+        let rail = crate::contract::pixel_format::Rgba8ToRow::for_format(format)
+            .expect("both BGRA8 spellings have a store arm");
+        assert!(rail.convert(&rgba, W, &mut native));
+        assert_eq!(
+            native, cache_row,
+            "format {format:#x} takes the shortcut, so its native row must be the cache row"
+        );
+        assert_eq!(
+            crate::contract::pixel_format::tight_row_bytes(W, format),
+            Some(W * 4),
+            "the shortcut also requires the tight row to be the whole of the cache row"
+        );
+    }
+}
+
+/// A ceded write lands the guest's pages exactly as a cached one does, names
+/// the frame, and holds none of its bytes.
+///
+/// The three clauses are the whole of [`FramePublication`]'s contract, and only
+/// the first is checkable from the guest's side. The other two are what the rail
+/// depends on: a cession that failed to name the frame would retire the caller's
+/// resident content claim at the moment it earned it, and a cession that still
+/// held bytes would serve them beside a resident that had superseded them.
+#[test]
+fn a_ceded_write_lands_the_same_guest_pages_and_publishes_no_host_bytes() {
+    const W: u32 = 4;
+    const H: u32 = 4;
+
+    let frame: Vec<u8> = (0..(W * H * 4) as u8).collect();
+    let land = |publication| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x12u32;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        state.map_surface(5);
+        let m = state.mappings.get_mut(&5).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        assert!(state.set_mapping_geom(5, W, H, MTL_FORMAT_BGRA8_UNORM));
+        assert!(write_rgba8_image_changed(
+            &mut state,
+            &mut host,
+            5,
+            &frame,
+            None,
+            W,
+            H,
+            publication,
+        ));
+        let mut pages = vec![0u8; (W * H * 4) as usize];
+        assert!(read_rect_raw(
+            &mut state,
+            &mut host,
+            5,
+            Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: W,
+                height: H,
+            },
+            &mut pages,
+            W * 4,
+        ));
+        (state, pages)
+    };
+
+    let (cached, cached_pages) = land(FramePublication::HostCache);
+    let (ceded, ceded_pages) = land(FramePublication::RailResident);
+
+    assert_eq!(
+        ceded_pages, cached_pages,
+        "the guest sees the same frame either way; the publication decides only \
+         where this device keeps its own copy"
+    );
+    assert!(
+        crate::runtime::surface_cache::get(&cached, 5, W, H).is_some(),
+        "the cached arm publishes the bytes"
+    );
+    assert!(
+        crate::runtime::surface_cache::get(&ceded, 5, W, H).is_none()
+            && crate::runtime::surface_cache::surface_ceded_to_resident(&ceded, 5, W, H),
+        "the ceded arm publishes no bytes, and says so as a cession rather than \
+         as an absence"
+    );
+    assert!(
+        crate::runtime::surface_cache::frame_generation(&ceded, 5, W, H).is_some(),
+        "a ceded frame is still this mapping's published frame, which is what \
+         the caller's resident content claim is compared against"
+    );
+}
+
+/// A changed-span write publishes the *whole* frame to the host cache, even
+/// though it lands only the rows that differ in the guest's pages.
+///
+/// This is what `take_frame_buffer`'s contract is for. The buffer it hands back
+/// holds the previous frame, not zeroes, so a cache build that skipped a row —
+/// for instance by following the row loop's own skip — would republish that
+/// row's *old* pixels under a fresh generation. Every reader of this cache,
+/// including the Metal rail's LOAD seed and its sampled rung, would then serve
+/// them as current.
+///
+/// The fixture makes that failure visible: the second frame differs from the
+/// first in exactly one row, so a whole-frame cache and a skipping one differ in
+/// three of the four rows.
+#[test]
+fn a_changed_span_write_republishes_the_whole_frame_to_the_host_cache() {
+    const W: u32 = 4;
+    const H: u32 = 4;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let pfn = 0x12u32;
+    host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+    state.map_surface(5);
+    let m = state.mappings.get_mut(&5).unwrap();
+    m.mapped = true;
+    m.mapping_internal = 1;
+    m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    assert!(state.set_mapping_geom(5, W, H, MTL_FORMAT_BGRA8_UNORM));
+
+    let first: Vec<u8> = [0x10u8, 0x20, 0x30, 0xff].repeat((W * H) as usize);
+    assert!(write_rgba8_image_changed(
+        &mut state,
+        &mut host,
+        5,
+        &first,
+        None,
+        W,
+        H,
+        FramePublication::HostCache
+    ));
+    assert_eq!(
+        crate::runtime::surface_cache::get(&state, 5, W, H).map(|f| f[..4].to_vec()),
+        // RGBA 10/20/30 stored as BGRA.
+        Some(vec![0x30, 0x20, 0x10, 0xff])
+    );
+
+    // The second frame differs from the first in row 2 only, and is handed the
+    // first as its seed — so the guest write lands one row and the cache must
+    // still carry four.
+    let mut second = first.clone();
+    let row = (W * 4) as usize;
+    second[2 * row..3 * row].copy_from_slice(&[0x77u8, 0x88, 0x99, 0xff].repeat(W as usize));
+    assert!(write_rgba8_image_changed(
+        &mut state,
+        &mut host,
+        5,
+        &second,
+        Some(&first),
+        W,
+        H,
+        FramePublication::HostCache
+    ));
+
+    let published = crate::runtime::surface_cache::get(&state, 5, W, H)
+        .expect("a successful write publishes its frame")
+        .to_vec();
+    let mut expect = vec![0u8; second.len()];
+    for x in 0..(W * H) as usize {
+        let i = x * 4;
+        expect[i] = second[i + 2];
+        expect[i + 1] = second[i + 1];
+        expect[i + 2] = second[i];
+        expect[i + 3] = second[i + 3];
+    }
+    assert_eq!(
+        published, expect,
+        "the cache carries the whole frame, not only the rows the guest write touched"
+    );
+}
+
+#[test]
+fn no_writer_of_a_mappings_pages_leaves_a_host_copy_claiming_to_be_them() {
+    const W: u32 = 4;
+    const H: u32 = 2;
+
+    /// A one-page BGRA mapping with a stale host-cache frame already in it, and
+    /// a stamp saying nothing has written since — the state a full Store leaves
+    /// and every writer below then invalidates.
+    fn staged() -> (DeviceState, FakeHost) {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x12u32;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        state.map_surface(5);
+        let m = state.mappings.get_mut(&5).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        assert!(state.set_mapping_geom(5, W, H, MTL_FORMAT_BGRA8_UNORM));
+        crate::runtime::surface_cache::store(
+            &mut state,
+            5,
+            W,
+            H,
+            vec![0xCCu8; (W * H * 4) as usize],
+        );
+        crate::runtime::mapper::stamp_guest_write_gen(&mut state, &mut host, 5);
+        assert!(
+            crate::runtime::surface_cache::get(&state, 5, W, H).is_some(),
+            "the fixture must start with a host copy for the writer to retire"
+        );
+        (state, host)
+    }
+
+    fn assert_retired(state: &DeviceState, who: &str) {
+        assert!(
+            crate::runtime::surface_cache::get(state, 5, W, H).is_none(),
+            "{who} wrote the mapping's pages and left a host copy still claiming \
+             to be them; the hypervisor's witness cannot see this device's own \
+             writes, so nothing below would ever correct it"
+        );
+    }
+
+    // A sub-rect: the partial store the Metal draw rail takes for a
+    // single-scissor draw.
+    let (mut state, mut host) = staged();
+    let src = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    assert!(write_rect_raw(
+        &mut state,
+        &mut host,
+        5,
+        Rect {
+            origin_x: 1,
+            origin_y: 1,
+            width: 2,
+            height: 1
+        },
+        &src,
+        8
+    ));
+    assert_retired(&state, "write_rect_raw");
+
+    // The whole plane through the same writer, which is the blit arm — and the
+    // worse case, because it replaces every texel the stale entry claims.
+    let (mut state, mut host) = staged();
+    let full = vec![0x77u8; (W * H * 4) as usize];
+    assert!(write_rect_raw(
+        &mut state,
+        &mut host,
+        5,
+        Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: W,
+            height: H
+        },
+        &full,
+        W * 4
+    ));
+    assert_retired(&state, "write_rect_raw over the whole plane");
+
+    // Raw rows: depth and stencil, so the entry is not normally there at all —
+    // asserted because the rule has no exceptions to remember.
+    let (mut state, mut host) = staged();
+    assert!(write_raw_rows(
+        &mut state,
+        &mut host,
+        5,
+        &vec![0x99u8; (W * H * 4) as usize],
+        W * 4,
+        W * 4,
+        W,
+        H
+    ));
+    assert_retired(&state, "write_raw_rows");
+
+    // Native texels, which already carried the rule and is where the other two
+    // took it from.
+    let (mut state, mut host) = staged();
+    assert!(write_native_image(
+        &mut state,
+        &mut host,
+        5,
+        &vec![0x55u8; (W * H * 4) as usize],
+        W * 4,
+        W,
+        H,
+        MTL_FORMAT_BGRA8_UNORM
+    ));
+    assert_retired(&state, "write_native_image");
+
+    // The two that *publish* rather than retire satisfy the rule the other way:
+    // the copy they leave is the frame they just wrote, so it does claim to be
+    // the pages and is right to.
+    let (mut state, mut host) = staged();
+    assert!(write_bgra8(
+        &mut state,
+        &mut host,
+        5,
+        &vec![0x31u8; (W * H * 4) as usize],
+        W * 4,
+        W,
+        H
+    ));
+    assert_eq!(
+        crate::runtime::surface_cache::get(&state, 5, W, H).map(|f| f[0]),
+        Some(0x31),
+        "write_bgra8 publishes what it wrote, which is the other lawful outcome"
+    );
 }
 
 #[test]

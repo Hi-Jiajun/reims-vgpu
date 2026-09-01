@@ -30,6 +30,9 @@ pub mod init_decline;
 mod linear_target_import;
 mod pools;
 mod queue_owner;
+/// This rail's half of a serialized resource's rail state: the resident-target
+/// leases the guest's own delete releases.
+pub mod resource_lease;
 mod scatter_shader;
 pub(crate) mod stamp_completion;
 /// The requested draw-time buffer-gather working set. Re-exported for the same
@@ -1948,6 +1951,23 @@ pub fn prepare_window_resident_present(
         }
     }
     resident_present_decision(pools, identity, width, height)
+}
+
+/// This rail's name for a resident render target, as the layers above it carry
+/// it.
+///
+/// The ledger that holds one across a Store and its payment is neutral and does
+/// not know what a `TargetIdentity` is — see
+/// [`crate::runtime::resident_target`] for the defect that made it have to hold
+/// the exact one the draw registered, and for why it holds it opaquely.
+impl crate::runtime::resident_target::RailTarget for TargetIdentity {
+    fn same_target(&self, other: &dyn crate::runtime::resident_target::RailTarget) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// What storage owns a ready resident's pixels.

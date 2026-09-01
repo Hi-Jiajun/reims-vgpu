@@ -219,6 +219,102 @@ pub fn get_shared_with_gen(
     Some((get_shared(state, surface_id, width, height)?, host_gen))
 }
 
+/// Take a frame buffer for `surface_id` at this geometry, leaving no entry
+/// behind.
+///
+/// For a writer about to produce this surface's next frame. Instead of
+/// allocating a fresh multi-megabyte `Vec` — which comes back as untouched pages
+/// and faults every one of them in, measured at 1.21 ms a flush on the sibling
+/// writer and 2 296 us a draw on this one — it reuses the buffer the previous
+/// frame is in, whenever nothing else holds that frame.
+///
+/// The returned buffer is exactly `width * height * 4` bytes and its contents
+/// are **the previous frame, or zeroes, arbitrarily**. Every byte must be
+/// written before it is published with [`store`]; that is the price of not
+/// zeroing it, and it is why this is not a `get_mut`.
+///
+/// # Why the entry goes rather than empties
+///
+/// A writer that has started producing a new frame has, from that moment, guest
+/// pages the old frame no longer describes — so the old frame must not be
+/// servable, and a writer that refuses partway leaves this cache holding
+/// nothing rather than holding a lie. That is the same rule every writer in
+/// `mapping_write` now follows, applied to the window in which one of them is
+/// running.
+///
+/// Removing loses nothing this map carries: `host_surfaces` uses `host_gen`,
+/// geometry, the bytes and `guest_holds_bytes`, all of which [`store`] sets.
+/// `backing`, `source_gva` and `last_touch` belong to the GVA and texture maps.
+pub fn take_frame_buffer(
+    state: &mut DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let need = (height as usize)
+        .saturating_mul(width as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    if let Some(entry) = state.host_surfaces.remove(&surface_id) {
+        if let Ok(mut buffer) = std::sync::Arc::try_unwrap(entry.bgra) {
+            if buffer.len() == need {
+                return buffer;
+            }
+            // Wrong geometry, so the bytes are useless — but the allocation may
+            // not be. `resize` keeps the capacity when it is large enough,
+            // which is the whole saving on a surface that changes size.
+            buffer.clear();
+            buffer.resize(need, 0);
+            return buffer;
+        }
+    }
+    vec![0u8; need]
+}
+
+/// The generation of the frame this cache would serve for `surface_id` at this
+/// geometry, without taking the frame.
+///
+/// The identity half of [`get_shared_with_gen`], for a caller that does not want
+/// the bytes. A rail that retains its own copy of a surface's pixels asks this
+/// to decide whether the copy it holds is still the frame the cache holds —
+/// `Some(g)` twice with the same `g` is a statement that the bytes have not
+/// moved, and every writer of this map takes a fresh
+/// [`DeviceState::next_sampled_content_generation`] in the same breath as it
+/// changes them.
+///
+/// `None` for a missing entry and for a geometry mismatch. It **hits** on the
+/// ceded shell [`cede_surface_to_resident`] leaves behind, and that is the one
+/// place this reader deliberately parts company with [`get_shared`].
+///
+/// # The two questions this map answers, and why they are not one
+///
+/// "Which frame is this mapping's published content?" and "hand me that frame's
+/// bytes" look like one lookup and are not. A cession is precisely the state
+/// where the first has an answer and the second does not: the frame exists, it
+/// has a generation, and a rail's resident holds the bytes instead of this map.
+///
+/// This used to delegate to [`get_from_with_gen`] so the two "cannot disagree",
+/// which made the identity unavailable exactly when the bytes moved — so a rail
+/// that ceded lost its resident's content claim in the same breath as it earned
+/// it, and the next draw re-uploaded the whole attachment into the texture that
+/// already held it. Agreeing about *content* was never what the caller wanted:
+/// [`crate::runtime::draw::published_mapping_frame`] asks this to name the
+/// frame, and then either takes the bytes from [`get_shared`] or reads the
+/// rail's resident, and both of those still miss on a cession.
+///
+/// The generation itself carries the same meaning either way, because
+/// [`cede_surface_to_resident`] takes a fresh
+/// `DeviceState::next_sampled_content_generation` exactly as a byte-holding
+/// store does.
+pub fn frame_generation(
+    state: &DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+) -> Option<u64> {
+    let e = state.host_surfaces.get(&surface_id)?;
+    (e.width == width && e.height == height).then_some(e.host_gen)
+}
+
 /// Cede this mapping's cached frame to the engine resident a deferred mapper-ref-texture
 /// render Store just pinned: the entry keeps its geometry and its `host_gen`
 /// lineage, and holds no bytes.

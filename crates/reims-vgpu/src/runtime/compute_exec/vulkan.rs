@@ -11,6 +11,7 @@
 //! staging site there resolves to "no resident to serve from".
 
 use super::*;
+use crate::runtime::draw::vulkan::gva_span_identity;
 
 /// The sampled-image bindings that need a neutral texture: those the module
 /// statically uses and `bound` does not cover.
@@ -120,7 +121,7 @@ impl crate::observe::Decline for NeutralSampledImage {
 pub(super) fn direct_destination<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    tex: &StagedTexture,
+    tex: &StagedTexture<VulkanStage>,
     held: ash::vk::Format,
 ) -> crate::backend::vulkan::engine::ComputeImageDestination {
     use crate::backend::vulkan::engine::ComputeImageDestination;
@@ -162,7 +163,7 @@ pub(super) fn direct_destination<M: HostMemory + HostOps>(
             // separately because the resident half is the half that needs the
             // engine's pin, and it is the half that used to read back: a boot
             // where it stays at zero is a boot where the pin never had to work.
-            crate::runtime::drain::note_store_route(if tex.residency.is_some() {
+            crate::runtime::drain::note_store_route(if tex.rail.residency.is_some() {
                 "compute_dst_guest_pages_resident"
             } else {
                 "compute_dst_guest_pages_transient"
@@ -208,7 +209,7 @@ pub(super) fn direct_destination<M: HostMemory + HostOps>(
 pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    tex: &StagedTexture,
+    tex: &StagedTexture<VulkanStage>,
     held: ash::vk::Format,
 ) -> crate::backend::vulkan::engine::ComputeImageDestination {
     use crate::backend::vulkan::engine::ComputeImageDestination;
@@ -248,7 +249,7 @@ pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
     ) {
         Ok(licence) => {
             crate::runtime::drain::note_store_route("compute_dst_guest_pages");
-            crate::runtime::drain::note_store_route(if tex.residency.is_some() {
+            crate::runtime::drain::note_store_route(if tex.rail.residency.is_some() {
                 "compute_dst_guest_pages_mapper_ref_texture_resident"
             } else {
                 "compute_dst_guest_pages_mapper_ref_texture_transient"
@@ -277,10 +278,59 @@ pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ComputeStorageResidencyCandidate {
-    pub(super) key: crate::model::ComputeStorageResidencyKey,
-    pub(super) seed_generation: u32,
+/// This rail's half of a staged compute texture. See [`RailStage`].
+///
+/// [`RailStage`]: crate::runtime::compute_exec::RailStage
+#[derive(Debug, Default)]
+pub(crate) struct VulkanStage {
+    /// Which element of the descriptor binding's array this fills.
+    pub(crate) array_element: u32,
+    /// How many descriptors the binding declares.
+    pub(crate) descriptor_count: u32,
+    /// The storage-mirror window this staging corresponds to, so the writeback
+    /// can register the resident it produced under the same key.
+    pub(crate) residency: Option<ComputeStorageResidencyCandidate>,
+    /// What the engine could already serve for this binding, so the stage-time
+    /// guest read was skipped and `bytes` is a zero placeholder.
+    ///
+    /// [`ResidentServe::Seed`] — a storage binding whose resident the engine
+    /// holds at a verified generation; it must never be seeded from the
+    /// placeholder. [`ResidentServe::Sample`] — a sampled input whose window is
+    /// a prior dispatch's storage output; the engine seeds the sampled image by
+    /// copy-on-sample from that resident, again never from the bytes.
+    ///
+    /// One field rather than the `bool` and `Option` pair it replaces: those
+    /// were the variant tag and the payload of this enum stored apart, so every
+    /// producer had to rebuild both halves and nothing made a producer that set
+    /// one without the other fail to compile.
+    pub(crate) serve: Option<ResidentServe>,
+    /// The retained multisample render target this binding is served from.
+    ///
+    /// Set only for a kernel-declared `texture2d_ms<T, access::read>`, and it is
+    /// exclusive with everything above it by construction: `bytes` is empty,
+    /// `serve` is `None`, and nothing is staged, because
+    /// `engine::types::SampledResource::multisampled` says linear bytes cannot
+    /// be uploaded into a multisample image at all. The engine binds this
+    /// target's own view.
+    pub(crate) multisample_target: Option<crate::backend::vulkan::engine::TargetIdentity>,
+}
+
+impl RailStage for VulkanStage {
+    /// The guest ref is not kept: this rail reaches its images through the
+    /// engine's own registry and never names the object the guest bound.
+    fn stage(
+        _texture_ref: u32,
+        residency: Option<ComputeStorageResidencyCandidate>,
+        serve: Option<ResidentServe>,
+    ) -> Self {
+        Self {
+            array_element: 0,
+            descriptor_count: 1,
+            residency,
+            serve,
+            multisample_target: None,
+        }
+    }
 }
 
 /// Bound on mirror entries per mapping: a ping-pong canvas needs 2, planar
@@ -312,8 +362,11 @@ pub(super) struct ComputeStorageResidencyCandidate {
 /// has yet produced the "planar layouts a few more" case that chose it.
 pub(super) const STORAGE_RESIDENCY_WINDOWS_PER_MAPPING: usize = 8;
 
-pub(super) fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTexture) {
-    let Some(candidate) = texture.residency else {
+pub(super) fn note_storage_residency_writeback(
+    state: &mut DeviceState,
+    texture: &StagedTexture<VulkanStage>,
+) {
+    let Some(candidate) = texture.rail.residency else {
         return;
     };
     // Linear windows keep their authority in the host_linear_textures entry
@@ -693,7 +746,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     }
 
-    let mut staged_tex: Vec<StagedTexture> = Vec::new();
+    let mut staged_tex: Vec<StagedTexture<VulkanStage>> = Vec::new();
     let mut storage_writeonly_count = 0usize;
     for t in &acc.textures {
         use crate::runtime::spirv_bind::{
@@ -792,10 +845,17 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         } else {
             None
         };
-        match stage_texture_raw(state, host, task_id, t.texture_ref, binding, is_storage) {
+        match stage_texture_raw::<VulkanStage, _>(
+            state,
+            host,
+            task_id,
+            t.texture_ref,
+            binding,
+            is_storage,
+        ) {
             Ok(mut s) => {
-                s.array_element = descriptor.array_element;
-                s.descriptor_count = descriptor.descriptor_count;
+                s.rail.array_element = descriptor.array_element;
+                s.rail.descriptor_count = descriptor.descriptor_count;
                 if let Some(storage_access) = storage_access {
                     if storage_access == "write_only" {
                         storage_writeonly_count += 1;
@@ -1027,8 +1087,8 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             }
             storage_images.push(ComputeStorageImageResource {
                 binding: t.binding,
-                array_element: t.array_element,
-                descriptor_count: t.descriptor_count,
+                array_element: t.rail.array_element,
+                descriptor_count: t.rail.descriptor_count,
                 format: shader_fmt,
                 width: t.width,
                 height: t.height,
@@ -1040,7 +1100,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 // where that is absent the licence declines by name and this
                 // reads back exactly as it always did.
                 destination: direct_destination(state, host, t, shader_fmt.vk_format()),
-                residency: t.residency.map(|candidate| {
+                residency: t.rail.residency.map(|candidate| {
                     crate::backend::vulkan::engine::ComputeStorageResidency {
                         identity: candidate.key,
                         seed_generation: candidate.seed_generation,
@@ -1049,7 +1109,11 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         ),
                     }
                 }),
-                seed_skipped: t.serve.and_then(ResidentServe::seed_generation).is_some(),
+                seed_skipped: t
+                    .rail
+                    .serve
+                    .and_then(ResidentServe::seed_generation)
+                    .is_some(),
             });
         } else {
             let Some(sampled_fmt) = mtl_to_engine_sampled(t.pixel_format) else {
@@ -1061,8 +1125,8 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             };
             sampled_images.push(ComputeSampledImageResource {
                 binding: t.binding,
-                array_element: t.array_element,
-                descriptor_count: t.descriptor_count,
+                array_element: t.rail.array_element,
+                descriptor_count: t.rail.descriptor_count,
                 format: sampled_fmt,
                 width: t.width,
                 height: t.height,
@@ -1071,9 +1135,9 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 // pair: the producer that sets `multisample_target` is the one
                 // rail that stages nothing, and it leaves `serve` and `bytes`
                 // empty because there is nothing for either to hold.
-                source: match t.multisample_target.take() {
+                source: match t.rail.multisample_target.take() {
                     Some(identity) => ComputeSampledSource::MultisampleTarget(identity),
-                    None => match t.serve.and_then(ResidentServe::sample_source) {
+                    None => match t.rail.serve.and_then(ResidentServe::sample_source) {
                         Some((identity, generation)) => ComputeSampledSource::ResidentCopy(
                             crate::backend::vulkan::engine::ComputeResidentSampleBind {
                                 identity,
@@ -1333,7 +1397,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         // deferred branch above reaches the same edge through its own flush;
         // without this one a synchronously-written resident stayed flagged
         // unreproducible forever and no reclaim could ever touch it.
-        if let Some(candidate) = t.residency {
+        if let Some(candidate) = t.rail.residency {
             crate::backend::vulkan::engine::note_resident_storage_copied_out(&candidate.key);
         }
         note_storage_residency_writeback(state, t);
@@ -1778,4 +1842,175 @@ pub(super) fn specialized_storage_image_format(
         return Err("spirv_guest_numeric_class_mismatch");
     }
     Ok(specialized)
+}
+
+/// Resolve a kernel-declared `texture2d_ms<T, access::read>` binding to the
+/// retained multisample target that holds its samples.
+///
+/// # Why this rail exists beside `stage_texture_raw` rather than inside it
+///
+/// Every other compute texture binding is *staged*: guest texels are read into
+/// a host buffer and uploaded into a pooled transient. A multisample image
+/// cannot be filled that way at all —
+/// `engine::types::SampledResource::multisampled` states the rule, "such an
+/// image can only come from a retained multisample target; linear bytes cannot
+/// be uploaded into one with a buffer-to-image copy" — so a staging function
+/// asked for one has nothing to do and no way to say so except by refusing.
+///
+/// That is exactly what the compute rail did: `reflected_compute_texture`
+/// classified the shape as `UnstageableShape { axis: "multisampled" }`, beside
+/// the 1D, 3D, cube, buffer and arrayed axes, and the dispatch was refused
+/// whole. For those five the premise holds — the rail produces a single-layer
+/// 2D rectangle and binding it to another declared shape is a descriptor-type
+/// mismatch. For this one the premise is about bytes that were never wanted.
+///
+/// # What it resolves, and why through the same span the render rail uses
+///
+/// The samples live in the engine resident the render pass wrote, keyed by that
+/// target's `TargetIdentity`. It is named through `draw::vulkan::gva_span_identity`,
+/// which is the identity half of the currency test itself, and not rebuilt
+/// here: a second derivation of the same registry key is how two rails come to
+/// name different residents for one texture.
+///
+/// What this rail does *not* take is the other half —
+/// `draw::gva_resident_if_current`, the currency test the single-sample
+/// resident rails share. That test asks whether
+/// anything has written the target's guest pages since the Store, making the
+/// resident stale against them. A multisample target has no such second copy:
+/// no rail of this device writes a multisample target's guest pages, and this
+/// device is the only reader of them. With nothing to compare, the witness
+/// cannot answer — it reports no observed write rather than a quiet span — and
+/// a refusal for want of an answer would cost the guest its dispatch while
+/// protecting nothing. The hazard it stands in for on other rails, an absent or
+/// unready resident, is carried here by the engine's own `MultisampleSample*`
+/// declines at bind time.
+///
+/// The target's own geometry comes from `draw::color_target_request`, which is
+/// the same resolver the render pass resolved its attachment through, so the
+/// bind and the render cannot disagree about extent, format, or sample count.
+///
+/// Every refusal is fail-visible and named for the rung that refused. A guest
+/// kernel that reaches here and gets nothing has lost work.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the binding's descriptor identity plus the guest object it names"
+)]
+fn multisample_sampled_texture<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    pipeline_ref: u32,
+    texture_ref: u32,
+    binding: u32,
+    descriptor: crate::runtime::spirv_bind::ReflectedTextureDescriptor,
+) -> Result<StagedTexture<VulkanStage>, ComputeStatus> {
+    let refuse = |reason: &'static str, detail: String, status: ComputeStatus| {
+        crate::observe::fail(format!(
+            "compute_linux texture_multisample fail reason={reason} pipe={pipeline_ref} \
+             ref={texture_ref} bind={binding} {detail}"
+        ));
+        status
+    };
+    // The attachment resolver, not a second reading of the descriptor: the
+    // render pass that produced these samples resolved its target through this
+    // same function, so its geometry, format and sample count are the ones the
+    // resident was created from.
+    let Some(req) = crate::runtime::draw::color_target_request(
+        state,
+        host,
+        task_id,
+        crate::runtime::decode::render::ColorAttachment {
+            texture_ref,
+            ..Default::default()
+        },
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+    ) else {
+        return Err(refuse(
+            "target_unresolved",
+            String::new(),
+            ComputeStatus::MissingTexture("compute_multisample_target_unresolved"),
+        ));
+    };
+    let c0 = req
+        .colors
+        .first()
+        .expect("color_target_request builds exactly one colour");
+    // The texture's own declaration, decoded from its descriptor's trailer. A
+    // kernel declaring `texture2d_ms` against a texture that declares one
+    // sample is a disagreement between two guest statements, and this device
+    // must not pick a side by binding either shape.
+    if c0.sample_count <= 1 {
+        return Err(refuse(
+            "texture_is_single_sample",
+            format!(
+                "samples={} {}x{} gva={:#x}",
+                c0.sample_count, c0.width, c0.height, c0.target_gva
+            ),
+            ComputeStatus::Unsupported("compute_multisample_texture_is_single_sample"),
+        ));
+    }
+    // Asked here rather than left to the request builder below, which would
+    // refuse the whole dispatch under a name that says nothing about which
+    // texture carried the format.
+    if vulkan::mtl_to_engine_sampled(c0.format).is_none() {
+        return Err(refuse(
+            "mtl_format_unsupported",
+            format!("fmt={:#x}", c0.format),
+            ComputeStatus::Unsupported("compute_multisample_format_unsupported"),
+        ));
+    }
+    // The geometry the resident was created from, read once off the resolved
+    // attachment and used by the refusals, the identity and the bind alike.
+    let (sample_count, width, height, format, target_gva, row_stride) = (
+        c0.sample_count,
+        c0.width,
+        c0.height,
+        c0.format,
+        c0.target_gva,
+        c0.row_stride,
+    );
+    let span = crate::runtime::draw::GvaSpan {
+        texture_ref,
+        gva: target_gva,
+        row_stride,
+        width,
+        height,
+        format,
+    };
+    let Some(identity) = gva_span_identity(state, host, task_id, span) else {
+        return Err(refuse(
+            "resident_unnamed",
+            format!("samples={sample_count} {width}x{height} gva={target_gva:#x}"),
+            ComputeStatus::MissingTexture("compute_multisample_resident_unnamed"),
+        ));
+    };
+    crate::runtime::drain::note_store_route("compute_multisample_resident_bind");
+    Ok(StagedTexture {
+        binding,
+        pixel_format: format,
+        // A multisample image is never a storage image on this rail, so it has
+        // no storage selector to carry.
+        storage_selector: None,
+        width,
+        height,
+        // A multisample texture has one level by construction.
+        mip_levels: 1,
+        bytes: Vec::new(),
+        is_storage: false,
+        // Read-only: the kernel declares `access::read` or this shape would
+        // have been refused as `multisampled_storage` before reaching here.
+        writeback: TextureWriteback::None,
+        rail: VulkanStage {
+            array_element: descriptor.array_element,
+            descriptor_count: descriptor.descriptor_count,
+            residency: None,
+            serve: None,
+            multisample_target: Some(identity),
+        },
+    })
 }

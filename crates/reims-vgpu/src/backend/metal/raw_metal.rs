@@ -331,6 +331,91 @@ pub fn new_texture(device: &DeviceRef, descriptor: &TextureDescriptorRef) -> Opt
     }
 }
 
+/// `newTextureWithDescriptor:offset:bytesPerRow:` on a buffer — a *linear*
+/// texture, whose texels are the buffer's bytes in row-major order rather than
+/// in the GPU's tiled layout.
+///
+/// # What the linearity buys, and it is not the allocation
+///
+/// A tiled colour target's pixels can only leave it through `getBytes:`, which
+/// de-tiles into a host buffer. That copy is this rail's largest remaining item
+/// after the host frame cache went: `metal_readback_us` plus
+/// `metal_resident_read_us` were 23 % of `draw_us` on a driven macos-13 boot,
+/// and both are the same operation. A linear target's pixels are *already* laid
+/// out the way every reader wants them, so the copy is a pointer —
+/// [`linear_pixels`].
+///
+/// # Capability, measured
+///
+/// Whether a linear texture may carry `MTLTextureUsageRenderTarget` is a
+/// property of the host GPU and not of a version or a device name: Metal answers
+/// nil for a combination it will not build. That nil is this function's `None`
+/// and the caller's fallback to [`new_texture`], which is the whole gate. Do not
+/// replace it with a family check — the probe is one allocation and it is right
+/// by construction.
+///
+/// `bytes_per_row` must be a multiple of the device's
+/// `minimumLinearTextureAlignmentForPixelFormat:` and the buffer must be at
+/// least `offset + bytes_per_row * height` long; Metal answers nil otherwise.
+pub fn new_linear_texture(
+    buffer: &BufferRef,
+    descriptor: &TextureDescriptorRef,
+    offset: NSUInteger,
+    bytes_per_row: NSUInteger,
+) -> Option<Texture> {
+    unsafe {
+        let ptr: *mut Object = msg_send![
+            buffer,
+            newTextureWithDescriptor: descriptor
+            offset: offset
+            bytesPerRow: bytes_per_row
+        ];
+        (!ptr.is_null()).then(|| Texture::from_ptr(ptr as *mut _))
+    }
+}
+
+/// This texture's pixels as host bytes, when it is a linear texture over a
+/// CPU-visible buffer laid out exactly `bytes_per_row` by `height`.
+///
+/// `None` for a tiled texture, for one whose row pitch is not the caller's, and
+/// for one whose buffer does not cover the rows asked for — each of which sends
+/// the caller back to `getBytes:` rather than to a wrong or short frame. The
+/// texture is asked for all three rather than the caller carrying them beside
+/// it: `buffer`, `bufferOffset` and `bufferBytesPerRow` are the texture's own
+/// account of where its texels live, and a second copy of that account beside
+/// the handle is a thing that can disagree with it.
+///
+/// # Safety
+///
+/// The returned bytes are the live contents of a shared buffer the GPU may also
+/// be writing. The caller must have established that every command that renders
+/// into this texture has completed — on this rail that is
+/// `render_core_mrt`'s `waitUntilCompleted` — and must not let the slice outlive
+/// the texture.
+pub unsafe fn linear_pixels(
+    texture: &TextureRef,
+    bytes_per_row: NSUInteger,
+    height: NSUInteger,
+) -> Option<&[u8]> {
+    let buffer = texture.buffer()?;
+    if texture.buffer_stride() != bytes_per_row || bytes_per_row == 0 {
+        return None;
+    }
+    let offset = texture.buffer_offset();
+    let span = bytes_per_row.checked_mul(height)?;
+    if offset.checked_add(span)? > buffer.length() {
+        return None;
+    }
+    let base = buffer.contents() as *const u8;
+    if base.is_null() {
+        return None;
+    }
+    // SAFETY: the buffer covers `offset + span` bytes (checked above) and is
+    // CPU-visible (`contents` is non-null, which a private-storage buffer's is
+    // not). The caller owes GPU completion; see this function's safety note.
+    Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), span as usize) })
+}
+
 /// `newBufferWithLength:options:`, with the nil an exhausted device returns.
 pub fn new_buffer(
     device: &DeviceRef,
@@ -1280,5 +1365,105 @@ mod tests {
             &DeviceRef,
             &FunctionRef,
         ) -> Result<Option<AbBufferLayout>, MetalPipelineDecline> = reflect_argument_buffer_layout;
+    }
+}
+
+#[cfg(test)]
+mod linear_target_tests {
+    use super::*;
+    use metal::{MTLStorageMode, MTLTextureUsage, TextureDescriptor};
+
+    /// The host GPU renders into a linear texture, and the pixels it wrote are
+    /// the bytes [`linear_pixels`] hands back.
+    ///
+    /// This is a *capability* test, not a unit test: whether a buffer-backed
+    /// texture may carry `MTLTextureUsageRenderTarget` is a property of the host
+    /// and `AGENTS.md` forbids answering it from a version or a device name.
+    /// `resident::linear_target` reads the same nil this reads and falls back to
+    /// a tiled texture, so a host that fails here is slow rather than broken —
+    /// which is exactly why the failure needs a test to be visible at all.
+    ///
+    /// The clear is the whole render because the question is about where the
+    /// texels *land*, not about what drew them. A clear to a non-trivial colour
+    /// is enough to tell a live frame from a zeroed buffer.
+    #[test]
+    fn the_host_renders_into_a_linear_texture_and_the_buffer_holds_the_pixels() {
+        let Some(device) = crate::backend::metal::runtime::system_device() else {
+            return;
+        };
+        let (w, h) = (64u64, 4u64);
+        let format = MTLPixelFormat::RGBA8Unorm;
+        let alignment = device.minimum_linear_texture_alignment_for_pixel_format(format);
+        let bytes_per_row = (w * 4).div_ceil(alignment.max(1)) * alignment.max(1);
+
+        let descriptor = TextureDescriptor::new();
+        descriptor.set_texture_type(MTLTextureType::D2);
+        descriptor.set_pixel_format(format);
+        descriptor.set_width(w);
+        descriptor.set_height(h);
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+
+        let buffer = new_buffer(
+            device,
+            bytes_per_row * h,
+            metal::MTLResourceOptions::StorageModeShared,
+        )
+        .expect("a shared buffer of 1 KiB");
+        let Some(linear) = new_linear_texture(&buffer, &descriptor, 0, bytes_per_row) else {
+            // The documented fallback, not a failure of this device model.
+            eprintln!("this host declines a linear render target; the rail stays tiled");
+            return;
+        };
+
+        // A tiled texture of the same shape must answer `None`, and so must the
+        // linear one asked at a pitch that is not its own. Both are the
+        // difference between a pointer and a wrong frame.
+        let tiled = new_texture(device, &descriptor).expect("a tiled texture of the same shape");
+        assert!(
+            unsafe { linear_pixels(&tiled, bytes_per_row, h) }.is_none(),
+            "a tiled texture has no host bytes to hand back"
+        );
+        assert!(
+            unsafe { linear_pixels(&linear, bytes_per_row + 4, h) }.is_none(),
+            "a pitch that is not the texture's own must not be read as if it were"
+        );
+        assert!(
+            unsafe { linear_pixels(&linear, bytes_per_row, h + 1) }.is_none(),
+            "a height past the buffer must refuse rather than read past it"
+        );
+
+        let queue = device.new_command_queue();
+        let pass = metal::RenderPassDescriptor::new();
+        let attachment = pass
+            .color_attachments()
+            .object_at(0)
+            .expect("slot 0 of a fresh pass descriptor");
+        attachment.set_texture(Some(&linear));
+        attachment.set_load_action(metal::MTLLoadAction::Clear);
+        attachment.set_store_action(metal::MTLStoreAction::Store);
+        attachment.set_clear_color(metal::MTLClearColor::new(0.0, 1.0, 0.0, 1.0));
+        let command_buffer = queue.new_command_buffer();
+        command_buffer
+            .new_render_command_encoder(pass)
+            .end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // SAFETY: the command buffer above has completed.
+        let pixels = unsafe { linear_pixels(&linear, bytes_per_row, h) }
+            .expect("the texture this rail just rendered into is linear");
+        assert_eq!(
+            &pixels[..4],
+            &[0, 255, 0, 255],
+            "the clear colour must be in the buffer, in RGBA8 order, with no \
+             getBytes: between the render and this read"
+        );
+        assert_eq!(
+            &pixels[(bytes_per_row * (h - 1)) as usize..][..4],
+            &[0, 255, 0, 255],
+            "every row, not only the first — a pitch this rail got wrong would \
+             land the last row somewhere else"
+        );
     }
 }

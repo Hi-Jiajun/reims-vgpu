@@ -11,10 +11,9 @@
 //! on success.
 
 use crate::contract::iosurface_pages::{packed_span_estimate, sample_window_from_device_desc};
-use crate::contract::pixel_format::{
-    self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
-};
+use crate::contract::pixel_format::{self, RowToRgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
 use crate::model::{scanout_extent_ok, DeviceState, MappingEntry, MAX_SCANOUT_DIM};
+use crate::runtime::changed_runs::ChangedRuns;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 
@@ -695,7 +694,7 @@ fn mapping_write_geometry(m: &MappingEntry, width: u32, height: u32) -> (u32, u3
 /// Public because the *resident* has to agree with it. A render target's
 /// identity carries the format its image is created with, and for this namespace
 /// that answer is this one — so
-/// [`crate::runtime::present_identity::surface_identity`] reads it here rather
+/// [`crate::backend::vulkan::present_identity::surface_identity`] reads it here rather
 /// than deriving a second copy from the same fields. Two derivations agreeing
 /// only because they share an input is precisely how the primary attachment's
 /// format used to be decided, and it did not stay agreed.
@@ -846,6 +845,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // safe — a short source row would otherwise leave the previous row's bytes
     // in its tail.
     let direct_rows = rgba.is_none() && tight == (mw as usize) * (RGBA8_BPP as usize);
+    // Parsed once for both staged arms below. `Option` rather than an early
+    // refusal because `direct_rows` converts nothing, so a format with no arm is
+    // not that path's problem. See `pixel_format::Rgba8ToRow`.
+    let store_rail = pixel_format::Rgba8ToRow::for_format(format);
 
     use crate::runtime::drain::{
         note_surface_write_path, note_surface_write_phase, SurfaceWritePhase,
@@ -876,8 +879,8 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 &src_row[..tight]
             } else {
                 if let Some(ref mut rgba_row) = rgba {
-                    if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row)
-                        || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
+                    if !RowToRgba8::Bgra8.convert(src_row, mw, rgba_row)
+                        || !store_rail.is_some_and(|rail| rail.convert(rgba_row, mw, &mut row))
                     {
                         return refuse(
                             mapping_id,
@@ -958,8 +961,9 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                         &src_row[..tight]
                     } else {
                         if let Some(ref mut rgba_row) = rgba {
-                            if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row)
-                                || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
+                            if !RowToRgba8::Bgra8.convert(src_row, mw, rgba_row)
+                                || !store_rail
+                                    .is_some_and(|rail| rail.convert(rgba_row, mw, &mut row))
                             {
                                 return refuse(
                                     mapping_id,
@@ -1135,6 +1139,45 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     true
 }
 
+/// What becomes of this device's own copy of the frame a Store lands.
+///
+/// # Why the caller decides and not this writer
+///
+/// The host copy is not part of the write: the guest's pages hold the frame
+/// either way, and every reader of the copy has another source. What the copy
+/// buys is *speed* for two readers — the present capture and a sampled bind of
+/// the surface — and what it costs is a second whole-frame pass over the source,
+/// which a driven macos-13 Metal boot measured at 12.6 ms a flush, 43 % of that
+/// rail's `store_us`.
+///
+/// Only the caller knows whether that pass is worth running, because only the
+/// caller knows whether its rail is about to hold the same frame in a resident
+/// render target it can read instead. Deriving it here would mean this writer
+/// asking a rail a question about a texture, which is the wrong direction
+/// through the layer.
+///
+/// Both arms leave one invariant true, and it is the one the readers depend on:
+/// after either, [`crate::runtime::surface_cache::frame_generation`] names this
+/// frame. They differ only in where its bytes are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FramePublication {
+    /// Build the BGRA8 host copy and publish it. The frame is readable from
+    /// [`crate::runtime::surface_cache::get`] and its siblings.
+    HostCache,
+    /// Skip the copy and cede the frame to the caller's rail resident
+    /// ([`crate::runtime::surface_cache::cede_surface_to_resident`]).
+    ///
+    /// The caller is promising that a resident of its rail holds these same
+    /// pixels and can be read back — on the Metal rail that promise is
+    /// `backend::metal::resident::read_published_bgra8`, and it is kept by
+    /// `runtime::draw::metal::publish_resident_target` running after this
+    /// returns. A caller that cedes without a resident does not corrupt
+    /// anything: the guest's pages are still written, and the two byte readers
+    /// simply miss, which they already handle (the capture keeps the prior
+    /// frame, the sampled bind reads the guest's pages).
+    RailResident,
+}
+
 /// Write a tight RGBA8 image into a mapper-ref-texture mapping, optionally as changed-spans.
 ///
 /// Archive `apple_pv_gpu_write_mapper_ref_texture_image_changed`: when `seed_rgba` is present
@@ -1143,6 +1186,15 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
 /// was the Metal Load attachment content (unchanged texels match guest), without
 /// rewriting multi-MiB of identical bytes on every damage pass. `seed_rgba = None`
 /// always writes every row (Clear / multi-draw final / force-full).
+///
+/// `publication` says what becomes of the host copy of the frame; see
+/// [`FramePublication`], and note that it decides whether the second whole-frame
+/// pass over `rgba` runs at all.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the mapping writer keeps source rows, destination geometry and \
+              frame publication explicit"
+)]
 pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1151,6 +1203,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     seed_rgba: Option<&[u8]>,
     width: u32,
     height: u32,
+    publication: FramePublication,
 ) -> bool {
     if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
@@ -1238,10 +1291,138 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
     // SAFETY: when Some, contig covers span_end.
     let base = contig.map(|(ptr, _)| unsafe { (ptr as *mut u8).add(base_off as usize) });
+
+    // The host-cache frame, built once, up here, into the buffer the previous
+    // frame is already in.
+    //
+    // It used to be built after the row loop, into a fresh `vec![0u8; need]`,
+    // by a second whole-frame pass over `rgba` — and that was 45.9 % of the
+    // Metal rail's `store_us`, 2 296 us a draw, for a conversion the row loop
+    // below had already performed. `tight_row_is_bgra8` is when the two are the
+    // same bytes: a BGRA8 mapping's native texel *is* the cache's, so the rows
+    // are taken from here and converted once instead of twice.
+    //
+    // Building it before the write rather than after is what lets the rows read
+    // from it, and it is safe in the direction that matters: `take_frame_buffer`
+    // has already removed the entry, so a refusal below leaves this cache
+    // holding nothing rather than holding a frame the guest's half-written pages
+    // no longer match. Publishing happens at the bottom, on success only.
+    // Empty when the frame is ceded: nothing below reads it, because
+    // `cache_rows_are_native` is `&&`-ed with the same condition.
+    //
+    // Both arms *remove* this mapping's entry before the write, and that is the
+    // half that matters for correctness rather than for allocation reuse: a
+    // refusal below leaves the guest's pages half-written, and an entry that
+    // survived would go on claiming to be a frame those pages no longer hold.
+    // `take_frame_buffer` removes and hands back the allocation; the ceded arm
+    // has no allocation to want, so it removes and keeps nothing. Either way the
+    // claim is only put back at the bottom, on success.
+    let mut cache = match publication {
+        FramePublication::HostCache => {
+            crate::runtime::surface_cache::take_frame_buffer(state, mapping_id, mw, mh)
+        }
+        FramePublication::RailResident => {
+            crate::runtime::surface_cache::forget(state, mapping_id);
+            Vec::new()
+        }
+    };
+    if publication == FramePublication::HostCache {
+        let _span_cache = crate::runtime::chain_phase::CostSpan::new("surface_changed_cache_us");
+        // Converted straight into the cache buffer, overwriting the previous
+        // frame. What that costs is measured: ~0.90 ms a flush moving 16.6 MB,
+        // which is memory-bound.
+        //
+        // # The previous frame is under this write, and using it does not pay
+        //
+        // `take_frame_buffer` reuses the buffer the *previous* frame is in, so
+        // the bytes being overwritten here are the last frame this device
+        // published — and a BGRA8 row equals its predecessor exactly when the
+        // RGBA8 row it came from does. That is a free damage map, in principle:
+        // 1c81555a puts the row loop's convert at ~88 % of this writer and
+        // `surface_row_no_seed` at 200 of 201 flushes, so every row is converted
+        // and landed because nothing says which rows changed.
+        //
+        // It was built, measured on a driven macos-13 Metal boot, and removed.
+        // **71 % of rows are unchanged under a full-screen drag and 96 % at
+        // idle** — the win is real and large. Detecting it is not free, and the
+        // cost lands in a place the offline numbers did not predict:
+        //
+        // ```text
+        //                                     offline bench   live
+        //   convert straight into the cache        0.15 ms    0.90 ms
+        //   convert into a scratch, then bcmp      0.75 ms   11.57 ms
+        // ```
+        //
+        // Split three ways live, the scratch version spends 10.05 ms in the
+        // *conversion*, 1.15 ms in the comparison and 0.28 ms in the copy back.
+        // The comparison is as cheap as the bench said; converting a row into a
+        // small reused buffer instead of into its place in the frame is what
+        // costs, by an order of magnitude, and no reading of the two loops
+        // explains it. The cache loop's share of the row loop went from 0.14 to
+        // 0.83 across the change, so this is not boot-to-boot drift.
+        //
+        // Net: the detection costs about what skipping the unchanged rows would
+        // save. Two other shapes were tried and are worse — see the table in the
+        // commit and note that both were written as `Rgba8ToRow` methods and
+        // neither survived its measurement, so neither is in the tree.
+        //
+        // What is worth trying next is not a cheaper comparison. It is not
+        // needing one: the guest's Load attachment already carries the previous
+        // content as `seed_rgba`, and it arrived on 1 of 201 flushes. Why the
+        // other 200 have no seed is a question about `seed_color_load` and the
+        // pass's load action, not about this loop.
+        for y in 0..mh as usize {
+            let off = y * rgba_stride as usize;
+            let src_row = &rgba[off..off + rgba_stride as usize];
+            let dst_row = &mut cache[off..off + rgba_stride as usize];
+            // `Rgba8ToRow::Bgra8` *is* this swap. It was the third hand-inlined
+            // copy of it in this crate; the other two were the row loop's
+            // `rgba8_row_to_native` and the staged writers'. Named as the
+            // variant rather than parsed from an ordinal because the cache's
+            // layout is this device's own choice and not the guest's — see
+            // `cache_rows_are_native` below, which is the only place the two
+            // meet.
+            let swapped = pixel_format::Rgba8ToRow::Bgra8.convert(src_row, mw, dst_row);
+            debug_assert!(swapped, "the cache row is exactly mw BGRA8 texels");
+        }
+    }
+    // Whether a cache row is byte for byte this mapping's native texel row, so
+    // the row loop can read it instead of converting again. Both halves must
+    // hold: the format's tight row is BGRA8, and the tight row is the whole of
+    // the cache's row — `tight_row_bytes` and `rgba_stride` are computed from
+    // different places and a format that made them differ would slice the wrong
+    // bytes.
+    let cache_rows_are_native = publication == FramePublication::HostCache
+        && matches!(
+            format,
+            MTL_FORMAT_BGRA8_UNORM | pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
+        )
+        && tight == rgba_stride as usize;
+
+    // Parsed once above `surface_changed_rows_us`, which this loop is: it runs
+    // `mh` times a flush and used to re-answer "is this BGRA8" per row and then
+    // the format ordinal per texel. `Rgba8ToRow::Bgra8` *is* the hand-rolled
+    // BGRA arm this replaced, vectorised. `Option` rather than an early refusal
+    // because `cache_rows_are_native` converts nothing, so a format with no arm
+    // is not that path's problem.
+    let store_rail = pixel_format::Rgba8ToRow::for_format(format);
+    let span_rows = crate::runtime::chain_phase::CostSpan::new("surface_changed_rows_us");
+    // The three things inside `surface_changed_rows_us`, which was 90 % of the
+    // Metal rail's `store_us` and had nothing dividing it. Accumulated in
+    // locals and emitted once per flush rather than through
+    // `chain_phase::CostSpan` per row, for two reasons `sampled_phase`'s doc
+    // records: a `CostSpan` truncates to microseconds and a row's convert is
+    // ~0.15 us at the rates `pixel_format::Rgba8ToRow` reaches, so every part
+    // but the landing write would report as free; and a per-row commit would be
+    // `mh` atomic map lookups a flush where three suffice.
+    let (mut convert_ns, mut diff_ns, mut land_ns) = (0u64, 0u64, 0u64);
     for y in 0..mh as usize {
         let src_off = y * rgba_stride as usize;
         let src_row = &rgba[src_off..src_off + rgba_stride as usize];
-        if !rgba8_row_to_native(format, src_row, mw, &mut native) {
+        let row_started = std::time::Instant::now();
+        if !cache_rows_are_native
+            && !store_rail.is_some_and(|rail| rail.convert(src_row, mw, &mut native))
+        {
             return refuse(
                 mapping_id,
                 SurfaceWriteRefusal::RowConvert {
@@ -1250,9 +1431,16 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                 },
             );
         }
+        // One name for the row's native bytes, whichever produced them, so the
+        // three readers below cannot disagree about which buffer they are in.
+        let native: &[u8] = if cache_rows_are_native {
+            &cache[src_off..src_off + tight]
+        } else {
+            &native
+        };
         let seed_row = if let Some(seed) = seed_rgba {
             let s = &seed[src_off..src_off + rgba_stride as usize];
-            if !rgba8_row_to_native(format, s, mw, &mut seed_native) {
+            if !store_rail.is_some_and(|rail| rail.convert(s, mw, &mut seed_native)) {
                 return refuse(
                     mapping_id,
                     SurfaceWriteRefusal::SeedRowConvert {
@@ -1265,100 +1453,154 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
         } else {
             None
         };
-        if let Some(srow) = seed_row {
-            if srow == native.as_slice() {
-                continue;
-            }
+        convert_ns += row_started.elapsed().as_nanos() as u64;
+        let diff_started = std::time::Instant::now();
+        let row_unchanged = seed_row.is_some_and(|srow| srow == native);
+        diff_ns += diff_started.elapsed().as_nanos() as u64;
+        if row_unchanged {
+            continue;
         }
         let row_moff = base_off.saturating_add((y as u64).saturating_mul(bpr));
         if let Some(base) = base {
             let dst = unsafe { base.add(y.saturating_mul(bpr_usize)) };
             if let Some(seed) = seed_row {
-                // Changed spans only within the row.
-                let mut x = 0usize;
-                while x < tight {
-                    while x < tight && native[x] == seed[x] {
-                        x += 1;
-                    }
-                    if x >= tight {
-                        break;
-                    }
-                    let start = x;
-                    while x < tight && native[x] != seed[x] {
-                        x += 1;
-                    }
+                // Changed spans only within the row. The scan and the copy are
+                // charged apart because they are the two candidate answers for
+                // this bar and they have opposite fixes.
+                let mut runs = ChangedRuns::new(&native[..tight], &seed[..tight]);
+                loop {
+                    let scan_started = std::time::Instant::now();
+                    let run = runs.next();
+                    diff_ns += scan_started.elapsed().as_nanos() as u64;
+                    let Some(run) = run else { break };
+                    let land_started = std::time::Instant::now();
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            native.as_ptr().add(start),
-                            dst.add(start),
-                            x - start,
+                            native.as_ptr().add(run.start),
+                            dst.add(run.start),
+                            run.len(),
                         );
                     }
+                    land_ns += land_started.elapsed().as_nanos() as u64;
                 }
             } else {
+                let land_started = std::time::Instant::now();
                 unsafe {
                     std::ptr::copy_nonoverlapping(native.as_ptr(), dst, tight);
                 }
+                land_ns += land_started.elapsed().as_nanos() as u64;
             }
         } else if let Some(seed) = seed_row {
-            let mut x = 0usize;
-            while x < tight {
-                while x < tight && native[x] == seed[x] {
-                    x += 1;
-                }
-                if x >= tight {
-                    break;
-                }
-                let start = x;
-                while x < tight && native[x] != seed[x] {
-                    x += 1;
-                }
-                if !mapper::write_mapping_bytes(
+            let mut runs = ChangedRuns::new(&native[..tight], &seed[..tight]);
+            loop {
+                let scan_started = std::time::Instant::now();
+                let run = runs.next();
+                diff_ns += scan_started.elapsed().as_nanos() as u64;
+                let Some(run) = run else { break };
+                let land_started = std::time::Instant::now();
+                let landed = mapper::write_mapping_bytes(
                     state,
                     host,
                     mapping_id,
-                    row_moff.saturating_add(start as u64),
-                    &native[start..x],
+                    row_moff.saturating_add(run.start as u64),
+                    &native[run.clone()],
                     &vouched,
-                ) {
+                );
+                land_ns += land_started.elapsed().as_nanos() as u64;
+                if !landed {
                     return refuse(
                         mapping_id,
                         SurfaceWriteRefusal::MapperWrite {
-                            lo: row_moff.saturating_add(start as u64),
-                            len: x - start,
+                            lo: row_moff.saturating_add(run.start as u64),
+                            len: run.len(),
                         },
                     );
                 }
             }
-        } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, &native, &vouched)
-        {
-            return refuse(
-                mapping_id,
-                SurfaceWriteRefusal::MapperWrite {
-                    lo: row_moff,
-                    len: native.len(),
+        } else {
+            let land_started = std::time::Instant::now();
+            let landed =
+                mapper::write_mapping_bytes(state, host, mapping_id, row_moff, native, &vouched);
+            land_ns += land_started.elapsed().as_nanos() as u64;
+            if !landed {
+                return refuse(
+                    mapping_id,
+                    SurfaceWriteRefusal::MapperWrite {
+                        lo: row_moff,
+                        len: native.len(),
+                    },
+                );
+            }
+        }
+    }
+    drop(span_rows);
+    // Three counters a flush, not `mh` of them. Nanoseconds, so a part that is
+    // sub-microsecond per row is not reported as free; divide by 1000 against
+    // `surface_changed_rows_us` by hand.
+    crate::runtime::drain::note_store_route_n("surface_row_convert_ns", convert_ns);
+    crate::runtime::drain::note_store_route_n("surface_row_diff_ns", diff_ns);
+    crate::runtime::drain::note_store_route_n("surface_row_land_ns", land_ns);
+    // The denominators. A microsecond total answers "how long"; it cannot
+    // answer "per what", and the three parts above have different per-whats.
+    crate::runtime::drain::note_store_route("surface_row_flushes");
+    crate::runtime::drain::note_store_route_n("surface_row_rows", mh as u64);
+    crate::runtime::drain::note_store_route_n(
+        "surface_row_dst_bytes",
+        (mh as u64).saturating_mul(tight as u64),
+    );
+    // Which format the rows are converted *to*. The rate the convert reaches
+    // has no meaning without it: this rail's arms differ by 40x and by a factor
+    // of two in destination width, and the census cannot say which arm ran.
+    if crate::observe::first_sight("surface_row_native_format", u64::from(format)) {
+        // `publication` rides along because `cache_is_native` reads `false` for
+        // two unrelated reasons — a format whose texel is not the cache's, and a
+        // frame that has no cache at all — and the fix for each is the other's
+        // no-op.
+        crate::observe::fail(format!(
+            "surface_row_native_format format={format:#x} tight={tight} \
+             rgba_stride={rgba_stride} cache_is_native={cache_rows_are_native} \
+             publication={publication:?} mapping={mapping_id}"
+        ));
+    }
+    crate::runtime::drain::note_store_route_n(
+        "surface_row_src_bytes",
+        (mh as u64).saturating_mul(rgba_stride as u64),
+    );
+    crate::runtime::drain::note_store_route(if cache_rows_are_native {
+        "surface_row_cache_is_native"
+    } else {
+        "surface_row_converts_frame"
+    });
+    crate::runtime::drain::note_store_route(if seed_rgba.is_some() {
+        "surface_row_has_seed"
+    } else {
+        "surface_row_no_seed"
+    });
+    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+    let _ = state.mark_mapping_written(mapping_id);
+    // Host render-cache (Linux §8.5): the frame, published now that the guest's
+    // pages hold it too. Both arms publish a *generation* for this frame — see
+    // `FramePublication` — and differ only in whether the bytes are here or in
+    // the caller's rail resident.
+    match publication {
+        FramePublication::HostCache => {
+            crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache)
+        }
+        FramePublication::RailResident => {
+            crate::runtime::drain::note_store_route(
+                if crate::runtime::surface_cache::cede_surface_to_resident(
+                    state, mapping_id, mw, mh,
+                ) {
+                    "surface_row_ceded"
+                } else {
+                    // A geometry this cache would not have stored anyway. The
+                    // guest's pages are written; nothing host-side claims the
+                    // frame, which is the same state a refused store leaves.
+                    "surface_row_cede_refused"
                 },
             );
         }
     }
-    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
-    let _ = state.mark_mapping_written(mapping_id);
-    // Host render-cache (Linux §8.5): full-frame BGRA from the Store rgba.
-    let mut cache = vec![0u8; need];
-    for y in 0..mh as usize {
-        let so = y * rgba_stride as usize;
-        let doff = y * rgba_stride as usize;
-        let src_row = &rgba[so..so + rgba_stride as usize];
-        // rgba → bgra for host cache (same as write_bgra8 source convention).
-        for x in 0..mw as usize {
-            let i = x * 4;
-            cache[doff + i] = src_row[i + 2];
-            cache[doff + i + 1] = src_row[i + 1];
-            cache[doff + i + 2] = src_row[i];
-            cache[doff + i + 3] = src_row[i + 3];
-        }
-    }
-    crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
     // This write just made the host copy and the guest pages agree, so it is the
     // moment the copy's currency can be pinned. Nothing else arms this mapping:
     // the backing sampled ladder's first census read `gw_no_stamp` 14 092 against
@@ -1368,23 +1610,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // worst on every bind.
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
-}
-
-fn rgba8_row_to_native(format: u16, rgba_row: &[u8], width: u32, native: &mut [u8]) -> bool {
-    if format == MTL_FORMAT_BGRA8_UNORM || format == pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB {
-        if rgba_row.len() < native.len() || native.len() < (width as usize) * 4 {
-            return false;
-        }
-        for i in 0..(width as usize) {
-            let o = i * 4;
-            native[o] = rgba_row[o + 2];
-            native[o + 1] = rgba_row[o + 1];
-            native[o + 2] = rgba_row[o];
-            native[o + 3] = rgba_row[o + 3];
-        }
-        return true;
-    }
-    convert_rgba8_to_row(format, rgba_row, width, native)
 }
 
 /// Write rows already encoded as a mapper-ref-texture mapping's native pixel format.
@@ -1628,6 +1853,14 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     }
     state.invalidate_storage_residency_window(mapping_id, 0, span_end);
     let _ = state.mark_mapping_written(mapping_id);
+    // Depth and stencil rows, so there is usually no BGRA entry under this
+    // mapping at all and this is a no-op. Kept anyway, and not as a formality:
+    // a mapping's id is not typed by aspect, and the one thing that must never
+    // happen is a writer of a mapping's pages leaving a host-side copy behind
+    // that claims to be them. The rule belongs to every writer here or it is
+    // not a rule.
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 
@@ -2295,6 +2528,8 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
                 return false;
             }
             let _ = state.mark_mapping_written(mapping_id);
+            crate::runtime::surface_cache::forget(state, mapping_id);
+            crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
             return true;
         }
         let mut frame = vec![0u8; frame_len];
@@ -2349,6 +2584,33 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
+    // Guest pages are authoritative after this write and no host-side copy
+    // represents them, so an older cache entry must retire. The same two lines
+    // `write_native_image` carries, for the same reason and against a sharper
+    // consequence: unlike a native-texel write, this one leaves a *BGRA* entry
+    // of exactly this geometry behind, which is the shape every reader of the
+    // cache is looking for.
+    //
+    // # The defect these close
+    //
+    // This writer publishes nothing and used to stamp nothing, so a partial
+    // store landed composite pixels in the guest's pages while
+    // `host_surfaces[mapping_id]` kept the previous frame and
+    // `mapping_guest_write_verdict` kept answering `Clean` — the device's own
+    // writes go through a mapped host pointer and cannot set `DIRTY_MEMORY_VGA`
+    // (`reims-vgpu-dirty.c`), so the hypervisor's witness cannot see them and
+    // only the writer can. `draw::seed_from_published_surface` then served that
+    // stale frame as the attachment's prior content, the pass composited onto
+    // it, and its Store published the result back over the guest's pages: the
+    // rect's pixels lost, and *held*, which is the exact class that door's
+    // strict evidence standard exists to prevent.
+    //
+    // Retiring rather than repairing, because this writer holds rows in the
+    // mapping's native layout and the cache holds a tight BGRA frame; building
+    // the second from the first is the full-frame conversion the partial store
+    // exists to avoid. A miss costs the next LOAD a guest read.
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 

@@ -75,7 +75,7 @@
 ///
 /// `mib` is the same level and is not a rate: it is guest RAM the device can
 /// currently reach, against what the machine reported.
-pub fn emit_guest_import_levels() {
+pub(crate) fn emit_guest_import_levels() {
     let (bytes, count, aliases) = crate::backend::vulkan::engine::guest_import_census();
     let (spans, span_bytes) = crate::runtime::guest_ram_map::span_census();
     // An engine that never imported emits nothing, so a host on a negative
@@ -106,7 +106,7 @@ pub fn emit_guest_import_levels() {
 ///
 /// `m2v` counts translated shaders (`runtime::m2v_cache`); the rest are the
 /// Vulkan engine's immutable-object caches.
-pub fn emit_object_cache_levels() {
+pub(crate) fn emit_object_cache_levels() {
     let [shaders, layouts, passes, pipelines, samplers, compute_pipelines] =
         crate::backend::vulkan::engine::object_cache_levels();
     let (_, _, m2v) = crate::runtime::m2v_cache::stats();
@@ -117,7 +117,7 @@ pub fn emit_object_cache_levels() {
     ));
 }
 
-pub fn emit_engine_delta() {
+pub(crate) fn emit_engine_delta() {
     use crate::backend::vulkan::engine::CounterSnapshot;
     static PREV: std::sync::Mutex<Option<CounterSnapshot>> = std::sync::Mutex::new(None);
     let now = crate::backend::vulkan::engine::counter_snapshot();
@@ -389,7 +389,7 @@ fn emit_stage_phase() {
 /// `host_window_cadence presents` is what reached the screen, and when the two
 /// disagree the first candidate is that the window thread could not have the
 /// engine while the worker held it.
-pub fn emit_engine_lock(win_ms: u64) {
+pub(crate) fn emit_engine_lock(win_ms: u64) {
     if let Some(line) = crate::backend::vulkan::engine::take_engine_lock_census(win_ms) {
         crate::observe::off(line);
     }
@@ -401,7 +401,7 @@ pub fn emit_engine_lock(win_ms: u64) {
 /// is interpretable without the other. The second is the same question one rail
 /// over, and the one with no cache behind it yet — `buffer_guest_gathers` says
 /// how many gathers ran and this says how few distinct windows they were.
-pub fn emit_working_set() {
+pub(crate) fn emit_working_set() {
     if let Some(wanted) = crate::backend::vulkan::engine::sampled_working_set_census() {
         crate::observe::off(wanted);
     }

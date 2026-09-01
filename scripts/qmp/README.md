@@ -6,7 +6,8 @@ default here; override with `QMP_SOCK=/path/to.sock`.
 
 The x86 guest rail (`vm/boot-x86.sh`) puts its per-boot socket + `qmp.sock` symlink
 under `vm/disks/run/`, so the arm default does **not** apply there — pass
-`QMP_SOCK=vm/disks/run/qmp.sock` (the boot script prints the exact path).
+`QMP_SOCK=...` (`scripts/qmp/qmp.py sock` prints the one it resolved, and the
+boot script prints the same path).
 
 Covers both **raw QMP** commands and GUI input helpers over the machine's
 built-in usb-kbd + usb-tablet.

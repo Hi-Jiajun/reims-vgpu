@@ -46,8 +46,10 @@
 //! lifetime is explicit — resource discard/delete and task teardown — so an
 //! unrelated capacity limit must not invent an early synchronization point.
 
+use crate::backend::Backend as _;
 use crate::model::DeviceState;
 use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::resident_target::ResidentTarget;
 
 /// Debts held at once, before an arm pays the oldest to make room.
 ///
@@ -57,38 +59,12 @@ use crate::runtime::host::{HostMemory, HostOps};
 /// cannot lose pixels. `wbdebt_evicted` reports when a workload reaches it.
 pub const MAX_DEBTS: usize = 32;
 
-/// The engine identity of the resident a debt's frame lives in.
-///
-/// This module is compiled on every backend arm and the ledger is backend-
-/// agnostic, but the identity of a resident is not: only the Vulkan engine has
-/// one. An alias rather than a `cfg` on the field, so [`WritebackDebt`] and
-/// [`PendingWritebacks::arm`] have **one** shape on every arm — two shapes is
-/// how a struct starts disagreeing with itself across a feature boundary, and
-/// nothing in the toolchain compares them.
-///
-/// Nothing arms a surface debt on a Metal build: the sole caller is
-/// `runtime::draw::vulkan`. The placeholder is what lets the ledger's own tests
-/// compile there anyway.
-#[cfg(feature = "backend-vulkan")]
-pub type ResidentIdentity = crate::backend::vulkan::engine::TargetIdentity;
-
-/// See the Vulkan spelling above. A named zero-sized type rather than `()`,
-/// because `()` as an argument is a clippy lint at every call site and a reader
-/// cannot tell a deliberate placeholder from a function that forgot to return.
-#[cfg(not(feature = "backend-vulkan"))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NoResidentIdentity;
-
-/// See [`NoResidentIdentity`].
-#[cfg(not(feature = "backend-vulkan"))]
-pub type ResidentIdentity = NoResidentIdentity;
-
-/// A synthetic resident identity, for tests that arm a debt without a device.
+/// A synthetic resident target, for tests that arm a debt without a device.
 ///
 /// Here rather than in each test module because it is the one place that knows
-/// which arm [`ResidentIdentity`] is on — two spellings of it would be a
-/// divergence across a feature boundary, which is the thing the alias exists to
-/// prevent.
+/// which rail's identity a [`ResidentTarget`] is carrying on this build — two
+/// spellings of that would be a divergence across a feature boundary, which is
+/// what the ledger's own opaque handle exists to prevent.
 #[cfg(test)]
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn test_resident_identity(
@@ -96,39 +72,68 @@ pub(crate) fn test_resident_identity(
     width: u32,
     height: u32,
     generation: u64,
-) -> ResidentIdentity {
-    crate::backend::vulkan::engine::TargetIdentity::Surface {
+) -> ResidentTarget {
+    ResidentTarget::new(crate::backend::vulkan::engine::TargetIdentity::Surface {
         id,
         width,
         height,
         generation,
         format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+    })
+}
+
+/// The arm that compiles no rail keeping resident render targets.
+///
+/// It carries the same four integers so the ledger's own tests — supersede,
+/// eviction order, "the debt remembers what it was armed with" — mean the same
+/// thing there. They are about the ledger, not about a rail.
+#[cfg(test)]
+#[cfg(not(feature = "backend-vulkan"))]
+#[derive(Debug, PartialEq, Eq)]
+struct TestTarget {
+    id: u32,
+    width: u32,
+    height: u32,
+    generation: u64,
+}
+
+#[cfg(test)]
+#[cfg(not(feature = "backend-vulkan"))]
+impl crate::runtime::resident_target::RailTarget for TestTarget {
+    fn same_target(&self, other: &dyn crate::runtime::resident_target::RailTarget) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
-/// The placeholder arm: every identity is the same value, which is exactly true
-/// — a Metal build arms no surface debt at all.
+/// See the Vulkan spelling above.
 #[cfg(test)]
 #[cfg(not(feature = "backend-vulkan"))]
 pub(crate) fn test_resident_identity(
-    _id: u32,
-    _width: u32,
-    _height: u32,
-    _generation: u64,
-) -> ResidentIdentity {
-    NoResidentIdentity
+    id: u32,
+    width: u32,
+    height: u32,
+    generation: u64,
+) -> ResidentTarget {
+    ResidentTarget::new(TestTarget {
+        id,
+        width,
+        height,
+        generation,
+    })
 }
 
 /// A frame owed to one mapper-ref-texture mapping's guest pages.
 ///
 /// Values only, and no memory. See the module doc: the rail this replaces held
 /// resolved host pointers and corrupted the guest's page tables with them. A
-/// [`crate::backend::vulkan::engine::TargetIdentity`] is `Copy` and every field
-/// of it is a scalar the protocol handed over, so holding one keeps that rule.
+/// [`ResidentTarget`] is the rail's own *name* for an image and holds no
+/// pointer into one, so carrying it keeps that rule.
 ///
-/// `Clone` and not `Copy`, which the identity's own doc explains: it is a value
-/// either way, and the debt is moved out of the ledger by `take` rather than
-/// copied out of it.
+/// `Clone` and not `Copy`: the target is a shared handle, and the debt is moved
+/// out of the ledger by `take` rather than copied out of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WritebackDebt {
     /// The resident the frame is *in*.
@@ -149,7 +154,7 @@ pub struct WritebackDebt {
     /// [`Self::map_generation`] beside it is a different question and both are
     /// needed: this says *which image the pixels are in*, that says *whether the
     /// pages are still the ones they were promised to*.
-    pub identity: ResidentIdentity,
+    pub target: ResidentTarget,
     /// Geometry the Store was taken at, and the geometry the payment writes.
     pub width: u32,
     pub height: u32,
@@ -234,6 +239,59 @@ pub struct GvaWritebackDebt {
     pub generation: u64,
     pub guest_write: crate::runtime::buffer_write_gen::BufferWriteStamp,
     pub seq: u64,
+}
+
+impl GvaWritebackDebt {
+    /// The guest coordinates this frame was armed at.
+    pub fn window(&self) -> GvaWindow {
+        GvaWindow {
+            gva: self.gva,
+            width: self.width,
+            height: self.height,
+            generation: self.generation,
+        }
+    }
+}
+
+/// Where one deferred GVA frame lives in the guest: its address, its extent,
+/// and which allocation lifetime the address belonged to.
+///
+/// # Why the ledger speaks this and not a rail's identity
+///
+/// A rail that keeps a render target resident has its own name for the image —
+/// the Vulkan rail's is an engine `TargetIdentity` — and the arm and the
+/// payment both have to reach *that* image. The ledger cannot hold that name
+/// for a GVA debt the way [`WritebackDebt::target`] does for a surface, because
+/// the payment also has to answer questions the name cannot: which plane of
+/// which resource owes the frame, whether that plane's transfer backing is
+/// still live, and whether the guest CPU wrote into it since. Those are all
+/// asked in guest coordinates.
+///
+/// So the ledger's key is the guest's coordinates and the rail's name is
+/// *derived* from the debt through `Backend::gva_resident`.
+/// That derivation is safe here and is not safe for a surface for one concrete
+/// reason: a GVA resident is built from the attachment request and this
+/// generation alone (`draw::vulkan::gva_chain_identity`), both of which the
+/// debt carries verbatim, whereas a surface resident's generation is read from
+/// a mapping that moves underneath the ledger. `arm_gva` refuses rather than
+/// assumes when the window it is handed disagrees with the attachment.
+///
+/// # Why the format is not in here
+///
+/// The rail's resident carries a pixel format and this window does not, because
+/// the ledger has never keyed on one: two debts cannot share an address, an
+/// extent *and* a resolved page-set generation and differ only in how their
+/// texels are spelled. [`GvaWritebackDebt::format`] carries the guest's
+/// declaration for the rail to resolve when it names the resident, which is the
+/// one place it decides anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GvaWindow {
+    pub gva: u64,
+    pub width: u32,
+    pub height: u32,
+    /// The resolved page set this address stood for — `gva_span_alloc_generation`
+    /// for an unnamed span, [`gva_resource_generation`] for a named resource.
+    pub generation: u64,
 }
 
 /// The transfer backing retained by one live plane of a GVA texture resource.
@@ -328,7 +386,7 @@ impl PendingWritebacks {
     pub fn arm(
         &mut self,
         mapping_id: u32,
-        identity: ResidentIdentity,
+        target: ResidentTarget,
         width: u32,
         height: u32,
         map_generation: u32,
@@ -342,7 +400,7 @@ impl PendingWritebacks {
         let previous = self.debts.insert(
             mapping_id,
             WritebackDebt {
-                identity,
+                target,
                 width,
                 height,
                 map_generation,
@@ -457,7 +515,6 @@ impl PendingWritebacks {
     ///
     /// `pages` is adopted only into a plane that has none, exactly as on the
     /// establishing path.
-    #[cfg(feature = "backend-vulkan")]
     fn reback_gva_resource(&mut self, plane: GvaPlaneKey, pages: Option<Vec<u64>>) -> bool {
         let Some(resource) = self.gva_resources.get_mut(&plane) else {
             return false;
@@ -468,7 +525,6 @@ impl PendingWritebacks {
         true
     }
 
-    #[cfg(any(feature = "backend-vulkan", test))]
     fn gva_resource_backing(
         &self,
         plane: GvaPlaneKey,
@@ -481,11 +537,6 @@ impl PendingWritebacks {
         ))
     }
 
-    /// Gated on the arm that calls it. Unlike [`Self::gva_resource_backing`],
-    /// which the tests in this module exercise directly, the only reader of
-    /// this one is [`gva_resource_generation`], which is Vulkan-only — so
-    /// admitting `test` here leaves it dead on the Metal arm's test build.
-    #[cfg(feature = "backend-vulkan")]
     fn gva_resource_status(&self, plane: GvaPlaneKey) -> Option<(u64, u64, bool)> {
         self.gva_resources
             .get(&plane)
@@ -577,7 +628,6 @@ impl PendingWritebacks {
     /// Put back a debt whose guest backing was temporarily unavailable.
     /// Preserves its original age: inability to pay does not make an old frame
     /// the newest member of the ledger.
-    #[cfg(feature = "backend-vulkan")]
     fn restore_gva(&mut self, plane: GvaPlaneKey, debt: GvaWritebackDebt) {
         let previous = self.gva_debts.insert(plane, debt);
         debug_assert!(
@@ -610,29 +660,15 @@ impl PendingWritebacks {
         all
     }
 
-    #[cfg(feature = "backend-vulkan")]
-    fn gva_for_identity(
-        &self,
-        identity: &crate::backend::vulkan::engine::TargetIdentity,
-    ) -> Option<(GvaPlaneKey, GvaWritebackDebt)> {
-        let crate::backend::vulkan::engine::TargetIdentity::Gva {
-            gva,
-            width,
-            height,
-            generation,
-            ..
-        } = *identity
-        else {
-            return None;
-        };
+    /// The plane owed a frame at these guest coordinates, if any.
+    ///
+    /// A scan and not a lookup because the ledger is keyed by
+    /// [`GvaPlaneKey`] — resource plus address — and this asks with an address
+    /// and no resource. [`MAX_DEBTS`] bounds the walk.
+    fn gva_for_window(&self, window: GvaWindow) -> Option<(GvaPlaneKey, GvaWritebackDebt)> {
         self.gva_debts
             .iter()
-            .find(|(_, debt)| {
-                debt.gva == gva
-                    && debt.width == width
-                    && debt.height == height
-                    && debt.generation == generation
-            })
+            .find(|(_, debt)| debt.window() == window)
             .map(|(key, debt)| (*key, *debt))
     }
 }
@@ -709,11 +745,12 @@ pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
         };
         pay(state, host, mapping_id, debt, "wbdebt_paid_all");
     }
+    let rail = crate::backend::selected();
     for plane in state.pending_writebacks.gvas_by_age() {
         let Some(debt) = state.pending_writebacks.take_gva_plane(plane) else {
             continue;
         };
-        let _ = pay_gva(state, host, plane, debt, GvaPaySite::All);
+        let _ = pay_gva(rail, state, host, plane, debt, GvaPaySite::All);
     }
 }
 
@@ -835,11 +872,12 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
         texture_ref,
     };
     let mut named = false;
+    let rail = crate::backend::selected();
     // Every plane the reference owes, not the one that sorts first: a sampled
     // read names the resource, and a mip pyramid's levels are separate debts.
     for (plane, debt) in state.pending_writebacks.take_gva(gva_key) {
         named = true;
-        let _ = pay_gva(state, host, plane, debt, GvaPaySite::Named);
+        let _ = pay_gva(rail, state, host, plane, debt, GvaPaySite::Named);
     }
     // Both surface spellings, from the one resolver `resource_validity::apply`
     // uses: a reference that is itself a mapping id, and the per-task
@@ -908,11 +946,11 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
 /// that reference compared against the same dead declaration and refused again —
 /// one macos-26 report carried 5 197 of these lines over 280 references, one of
 /// them refused 803 times in a single boot. What `0` costs depends on which
-/// caller asked: `draw::vulkan`'s resident resolve turns it into
-/// `GvaResidentRefusal::NoGeneration` and loses the frame, while the secondary
-/// MRT builder puts it straight into [`TargetIdentity::Gva`], where generation
-/// zero is the one value that cannot distinguish two allocations — the
-/// wrong-content class that identity exists to close.
+/// caller asked: a rail's resident resolve turns it into a "no generation"
+/// refusal and loses the frame, while the secondary MRT builder puts it
+/// straight into the resident's name, where generation zero is the one value
+/// that cannot distinguish two allocations — the wrong-content class a
+/// [`GvaWindow`]'s generation exists to close.
 ///
 /// So a differing declaration is handled as what it is, a lifetime boundary,
 /// through the same [`retire_gva_resource`] that `CmdDeleteResource` uses: the
@@ -926,9 +964,6 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
 /// ways, in which case each draw would mint a generation and no resident could
 /// ever be reused. The line names both declarations so that reading can be made
 /// from a log rather than from a rebuild.
-///
-/// [`TargetIdentity::Gva`]: crate::backend::vulkan::engine::TargetIdentity::Gva
-#[cfg(feature = "backend-vulkan")]
 pub fn gva_resource_generation<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,
@@ -986,14 +1021,12 @@ pub fn gva_resource_generation<M: HostMemory>(
 /// reader has is whether they are *stable* — a reference reused, ordinary guest
 /// lifetime — or whether they alternate, which would be this device describing
 /// one plane two ways.
-#[cfg(feature = "backend-vulkan")]
 struct GvaResourceRedeclared {
     gva: u64,
     was_span: u64,
     now_span: u64,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for GvaResourceRedeclared {
     fn slug(&self) -> &'static str {
         "gva_resource_declaration_changed"
@@ -1008,7 +1041,6 @@ impl crate::observe::Decline for GvaResourceRedeclared {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 crate::observe::decline_display!(GvaResourceRedeclared);
 
 /// Re-establish the transfer backing of the plane a debt names, without any
@@ -1021,7 +1053,6 @@ crate::observe::decline_display!(GvaResourceRedeclared);
 /// released by the caller, where before it reached
 /// [`PendingWritebacks::ensure_gva_resource`] and could re-create the retired
 /// object at the dead declaration it was carrying.
-#[cfg(feature = "backend-vulkan")]
 fn reback_gva_resource<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,
@@ -1050,21 +1081,31 @@ fn reback_gva_resource<M: HostMemory>(
 /// Record a GVA render result as host-authoritative without touching guest
 /// pages. Returns `false` when the attachment has no resource identity and must
 /// use the eager transfer path.
+///
+/// Gated on the arm that compiles a caller. Only a rail that keeps a render
+/// target resident can defer a Store into one, so on a build with no such rail
+/// this entry point has nobody to call it — which is what the `cfg` says, and
+/// the only thing a `cfg` may say. The *ledger* below it is neutral and is
+/// exercised on every arm through the payment and retirement paths.
 #[cfg(feature = "backend-vulkan")]
-pub fn arm_gva<M: HostMemory + HostOps>(
+pub(crate) fn arm_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
+    rail: B,
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     c0: &crate::runtime::draw::ColorRtRequest,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    window: GvaWindow,
 ) -> bool {
-    let Some(generation) = (match *identity {
-        crate::backend::vulkan::engine::TargetIdentity::Gva { generation, .. } => Some(generation),
-        _ => None,
-    }) else {
+    if c0.texture_ref == 0 || window.generation == 0 {
         return false;
-    };
-    if c0.texture_ref == 0 || generation == 0 {
+    }
+    // The resident the payment will name is derived from `c0` and this
+    // generation; the caller's own resident was derived the same way. See
+    // [`GvaWindow`] — the derivation is only sound while the two agree, so a
+    // disagreement refuses the deferral rather than arming a debt that would
+    // pay out of an image no draw wrote.
+    if window.gva != c0.target_gva || window.width != c0.width || window.height != c0.height {
+        crate::runtime::drain::note_store_route("gvadebt_arm_window_diverges");
         return false;
     }
     // Every older host-side spelling of this resource is stale as soon as the
@@ -1078,6 +1119,16 @@ pub fn arm_gva<M: HostMemory + HostOps>(
         texture_ref: c0.texture_ref,
     };
     let plane = key.plane(c0.target_gva);
+    let debt = GvaWritebackDebt {
+        gva: c0.target_gva,
+        row_stride: c0.row_stride,
+        width: c0.width,
+        height: c0.height,
+        format: c0.format,
+        generation: window.generation,
+        guest_write: state.buffer_write_gen.stamp(task_id, c0.texture_ref),
+        seq: 0,
+    };
     // Arm the guest-write witness *before* the ledger, because whether it arms
     // decides whether this frame may be deferred at all.
     //
@@ -1094,22 +1145,12 @@ pub fn arm_gva<M: HostMemory + HostOps>(
     // the meantime. Everything else takes the eager copying rail the caller
     // falls back to, which lands the frame in the guest's pages now and has
     // nothing left to lose.
-    if !gva_writeback_is_recoverable(state, host, identity, plane) {
+    if !gva_writeback_is_recoverable(rail, state, host, &debt, plane) {
         return false;
     }
-    let debt = GvaWritebackDebt {
-        gva: c0.target_gva,
-        row_stride: c0.row_stride,
-        width: c0.width,
-        height: c0.height,
-        format: c0.format,
-        generation,
-        guest_write: state.buffer_write_gen.stamp(task_id, c0.texture_ref),
-        seq: 0,
-    };
     let previous = state.pending_writebacks.arm_gva(key, debt);
     if let Some(previous) = previous.filter(|previous| !same_gva_identity(*previous, debt)) {
-        release_gva(previous);
+        release_gva(rail, previous);
     }
     true
 }
@@ -1129,10 +1170,11 @@ pub fn arm_gva<M: HostMemory + HostOps>(
 /// window, and every one of the 7 frames the ledger lost to a guest write was
 /// one of them.
 #[cfg(feature = "backend-vulkan")]
-fn gva_writeback_is_recoverable<M: HostMemory + HostOps>(
+fn gva_writeback_is_recoverable<B: crate::backend::Backend, M: HostMemory + HostOps>(
+    rail: B,
     state: &mut DeviceState,
     host: &mut M,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    debt: &GvaWritebackDebt,
     plane: GvaPlaneKey,
 ) -> bool {
     let Some((_, _, ordered)) = state.pending_writebacks.gva_resource_backing(plane) else {
@@ -1141,7 +1183,7 @@ fn gva_writeback_is_recoverable<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("gvadebt_arm_unbacked");
         return false;
     };
-    let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(identity) else {
+    let Some(key) = rail.gva_witness_key(debt) else {
         crate::runtime::drain::note_store_route("gvadebt_arm_unnamed");
         return false;
     };
@@ -1154,14 +1196,13 @@ fn gva_writeback_is_recoverable<M: HostMemory + HostOps>(
     }
 }
 
-/// Whether this exact GVA resident is the host-authoritative copy named by an
-/// unpaid resource debt.
-#[cfg(feature = "backend-vulkan")]
-pub fn gva_resident_authoritative(
-    state: &DeviceState,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
-) -> bool {
-    let Some((plane, debt)) = state.pending_writebacks.gva_for_identity(identity) else {
+/// Whether the resident at these guest coordinates is the host-authoritative
+/// copy named by an unpaid resource debt.
+///
+/// The caller holds a rail resident and asks with the window that resident
+/// stands for, which is the same key the arm recorded — see [`GvaWindow`].
+pub fn gva_resident_authoritative(state: &DeviceState, window: GvaWindow) -> bool {
+    let Some((plane, debt)) = state.pending_writebacks.gva_for_window(window) else {
         return false;
     };
     state
@@ -1174,17 +1215,15 @@ pub fn gva_resident_authoritative(
 /// be replaced. The pixels are deliberately not copied: after this lifecycle
 /// transition the old object no longer names guest storage to synchronize.
 pub fn retire_gva_for_task(state: &mut DeviceState, task_id: u32) -> usize {
+    let rail = crate::backend::selected();
     let keys = state.pending_writebacks.gvas_for_task(task_id);
     let mut retired = 0;
     for key in keys {
         let (_, debts) = state.pending_writebacks.retire_gva_resource(key);
         retired += 1;
-        #[cfg(feature = "backend-vulkan")]
         for debt in debts {
-            release_gva(debt);
+            release_gva(rail, debt);
         }
-        #[cfg(not(feature = "backend-vulkan"))]
-        let _ = debts;
     }
     if retired != 0 {
         crate::runtime::drain::note_store_route_n("gvadebt_retired_task", retired as u64);
@@ -1200,12 +1239,10 @@ pub fn retire_gva_resource(state: &mut DeviceState, task_id: u32, texture_ref: u
     };
     let (existed, debts) = state.pending_writebacks.retire_gva_resource(key);
     let owed = !debts.is_empty();
-    #[cfg(feature = "backend-vulkan")]
+    let rail = crate::backend::selected();
     for debt in debts {
-        release_gva(debt);
+        release_gva(rail, debt);
     }
-    #[cfg(not(feature = "backend-vulkan"))]
-    let _ = debts;
     existed || owed
 }
 
@@ -1225,31 +1262,21 @@ fn same_gva_identity(a: GvaWritebackDebt, b: GvaWritebackDebt) -> bool {
         && a.format == b.format
 }
 
-/// The engine resident one armed GVA debt names.
+/// End `rail`'s hold on the resident this debt was armed against, without
+/// writing its pixels anywhere.
 ///
-/// `pub(crate)` because a debt is not only something to pay: a reader that wants
-/// the *content* rather than the guest's copy of it — the blit rail's whole-plane
-/// GPU arm — needs exactly this identity, and deriving a second one from the same
-/// debt fields is how two spellings of one resident start disagreeing. There is
-/// one derivation and it is here.
-#[cfg(feature = "backend-vulkan")]
-pub(crate) fn gva_identity(
-    debt: GvaWritebackDebt,
-) -> crate::backend::vulkan::engine::TargetIdentity {
-    crate::backend::vulkan::engine::TargetIdentity::Gva {
-        gva: debt.gva,
-        width: debt.width,
-        height: debt.height,
-        generation: debt.generation,
-        format: crate::runtime::draw::vulkan::gva_resident_format(debt.format),
+/// Free on a rail that keeps no GVA resident: it names none for this debt and
+/// there is nothing to let go of.
+fn release_gva<B: crate::backend::Backend>(rail: B, debt: GvaWritebackDebt) {
+    if let Some(target) = rail.gva_resident(&debt) {
+        rail.abandon_resident(&target);
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn release_gva(debt: GvaWritebackDebt) {
-    crate::backend::vulkan::engine::note_resident_content_copied_out(&gva_identity(debt));
-}
-
+/// Pay one ledger entry named by key, for the arm that had to evict it.
+///
+/// Gated on the arm whose draw rail evicts: the `cfg` answers "did this build
+/// compile a caller", which is the one question a `cfg` may answer.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn pay_key<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1489,7 +1516,6 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
 ///   leaks per occurrence. `wbdebt_generation_moved` is how a boot says how many;
 ///   a reading above single digits is the signal to carry the arm's whole
 ///   identity rather than the four integers that re-derive it.
-#[cfg(feature = "backend-vulkan")]
 fn pay<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1507,32 +1533,31 @@ fn pay<M: HostMemory + HostOps>(
         return;
     }
     // The resident the draw registered, not the one a fresh derivation would
-    // name today. See `WritebackDebt::identity`.
-    let identity = debt.identity;
+    // name today. See `WritebackDebt::target`.
+    let rail = crate::backend::selected();
     if crate::runtime::resource_validity::licence_of(validity)
         == crate::runtime::resource_validity::WritebackLicence::Superseded
     {
         crate::runtime::drain::note_store_route("wbdebt_abandoned_guest_wrote");
-        crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
+        rail.abandon_resident(&debt.target);
         return;
     }
     crate::runtime::drain::note_store_route(route);
-    if !crate::runtime::render_writeback::vulkan::store_render_frame(
+    if !rail.pay_surface_writeback(
         state,
         host,
         mapping_id,
-        &identity,
+        &debt.target,
         debt.width,
         debt.height,
     ) {
-        // `store_render_frame` reports its own loss on the failure channel; this
-        // names the rail that owed it, because a debt paid late and refused is a
-        // different investigation from a Store refused where it was issued.
+        // The rail reports its own loss on the failure channel; this names the
+        // rail that owed it, because a debt paid late and refused is a different
+        // investigation from a Store refused where it was issued.
         crate::observe::fail(format!(
             "wbdebt_pay_lost mapping={mapping_id} {}x{} reason=store_refused",
             debt.width, debt.height
         ));
-        crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
     }
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
 }
@@ -1543,7 +1568,6 @@ enum GvaPaySite {
     All,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl GvaPaySite {
     fn route(self) -> &'static str {
         match self {
@@ -1565,11 +1589,6 @@ impl GvaPaySite {
 /// The result is ascending, disjoint, and clamped to `span`, which is what
 /// [`crate::runtime::mapping_write::SkipRanges`] promises its readers.
 ///
-/// Gated the way [`PendingWritebacks::gva_resource_backing`] is: only the Vulkan
-/// arm arms a GVA debt, so the Metal build has no caller — but the relation is
-/// plain arithmetic over a page list and its tests are worth running on every
-/// arm.
-#[cfg(any(feature = "backend-vulkan", test))]
 fn plane_offsets_of_pages(
     ordered: &[u64],
     page_size: u64,
@@ -1610,15 +1629,15 @@ fn plane_offsets_of_pages(
 /// has not yet run since the guest's store is indistinguishable from a guest
 /// that wrote nothing — and the guest's own declaration already said it wrote.
 /// Two witnesses disagreeing is not a licence to pick the convenient one.
-#[cfg(feature = "backend-vulkan")]
-fn guest_owned_plane_ranges<M: HostOps>(
+fn guest_owned_plane_ranges<B: crate::backend::Backend, M: HostOps>(
+    rail: B,
     state: &DeviceState,
     host: &M,
-    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    debt: &GvaWritebackDebt,
     ordered: &[u64],
     span: u64,
 ) -> Option<Vec<(u64, u64)>> {
-    let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(identity) else {
+    let Some(key) = rail.gva_witness_key(debt) else {
         crate::runtime::drain::note_store_route("gvadebt_merge_no_key");
         return None;
     };
@@ -1638,8 +1657,8 @@ fn guest_owned_plane_ranges<M: HostOps>(
 /// Materialize one host-authoritative GVA resource into its retained transfer
 /// backing. After explicit discard, synchronize lazily recreates that backing;
 /// ordinary virtual-memory unmap does not participate in resource lifetime.
-#[cfg(feature = "backend-vulkan")]
-fn pay_gva<M: HostMemory + HostOps>(
+fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
+    rail: B,
     state: &mut DeviceState,
     host: &mut M,
     plane: GvaPlaneKey,
@@ -1647,7 +1666,14 @@ fn pay_gva<M: HostMemory + HostOps>(
     site: GvaPaySite,
 ) -> bool {
     let key = plane.resource;
-    let identity = gva_identity(debt);
+    // A rail that keeps no GVA resident arms no GVA debt, so this ledger is
+    // empty on that arm and the arrival is the statement of that rule rather
+    // than a live branch. Discharged rather than restored: a debt nothing can
+    // read would otherwise sit in the ledger forever.
+    let Some(target) = rail.gva_resident(&debt) else {
+        crate::runtime::drain::note_store_route("gvadebt_no_rail_resident");
+        return true;
+    };
     // Whether the guest has declared a CPU write to this resource since the
     // Store. It is not yet a verdict: the declaration is one resource-wide bit
     // (`shouldInvalidateHost`, a `lock btr` of the object's dirty flag) and the
@@ -1663,7 +1689,7 @@ fn pay_gva<M: HostMemory + HostOps>(
             "gvadebt_pay_lost task={} texture={} reason=span_overflow",
             key.task_id, key.texture_ref
         ));
-        release_gva(debt);
+        rail.abandon_resident(&target);
         return true;
     };
     // The resource's own declaration decides whether its pages come back, not
@@ -1673,7 +1699,7 @@ fn pay_gva<M: HostMemory + HostOps>(
     // nothing retired can grow pages back.
     if !reback_gva_resource(state, host, plane) {
         crate::runtime::drain::note_store_route("gvadebt_resource_retired");
-        release_gva(debt);
+        rail.abandon_resident(&target);
         return true;
     }
     let Some((backing_generation, backing_span, ordered)) =
@@ -1696,7 +1722,7 @@ fn pay_gva<M: HostMemory + HostOps>(
     // reach here: it would have found no plane at all above.
     if backing_generation != debt.generation || backing_span != span {
         crate::runtime::drain::note_store_route("gvadebt_generation_moved");
-        release_gva(debt);
+        rail.abandon_resident(&target);
         return true;
     }
     // The third answer. Writing the whole frame over a plane the guest CPU wrote
@@ -1706,14 +1732,14 @@ fn pay_gva<M: HostMemory + HostOps>(
     // guest's bytes win — the same direction every other consumer of that
     // witness fails in.
     let skip = if guest_declared_write {
-        match guest_owned_plane_ranges(state, host, &identity, &ordered, span) {
+        match guest_owned_plane_ranges(rail, state, host, &debt, &ordered, span) {
             Some(ranges) => {
                 crate::runtime::drain::note_store_route("gvadebt_merged_guest_wrote");
                 ranges
             }
             None => {
                 crate::runtime::drain::note_store_route("gvadebt_abandoned_guest_wrote");
-                release_gva(debt);
+                rail.abandon_resident(&target);
                 return true;
             }
         }
@@ -1732,55 +1758,16 @@ fn pay_gva<M: HostMemory + HostOps>(
         ..Default::default()
     };
     crate::runtime::drain::note_store_route(site.route());
-    if let Err(reason) = crate::runtime::render_writeback::vulkan::store_gva_frame(
+    rail.pay_gva_writeback(
         state,
         host,
         key.task_id,
-        &identity,
+        &target,
         &request,
         key.texture_ref,
-        Some(&pages),
+        &pages,
         &skip,
-    ) {
-        // Through the builder rather than by interpolating the decline, which
-        // renders its own `reason=` and produced `reason=reason=<slug>` — a line
-        // the standard ranking grep drops. The builder also carries the
-        // decline's own fields, so the `via=` that says which check inside the
-        // store refused now reaches the log instead of being formatted away.
-        crate::observe::Emit::decline("gvadebt_pay_lost", &reason)
-            .field("task", key.task_id)
-            .field("texture", key.texture_ref)
-            .fail();
-        release_gva(debt);
-    }
-    true
-}
-
-/// [`pay`] on an arm with no Vulkan engine to owe a frame to.
-///
-/// Unreachable rather than merely unused: the only arm site is the mapper-ref-texture
-/// surface Store in `draw::vulkan`, so the ledger is empty on this arm and both
-/// callers return at their emptiness check before reaching here. It exists so
-/// the reader-side helpers can be one set of functions on both arms instead of
-/// two spellings the settle sites would have to choose between.
-#[cfg(not(feature = "backend-vulkan"))]
-fn pay<M: HostMemory + HostOps>(
-    _state: &mut DeviceState,
-    _host: &mut M,
-    _mapping_id: u32,
-    _debt: WritebackDebt,
-    _route: &'static str,
-) {
-}
-
-#[cfg(not(feature = "backend-vulkan"))]
-fn pay_gva<M: HostMemory + HostOps>(
-    _state: &mut DeviceState,
-    _host: &mut M,
-    _plane: GvaPlaneKey,
-    _debt: GvaWritebackDebt,
-    _site: GvaPaySite,
-) -> bool {
+    );
     true
 }
 
@@ -1819,11 +1806,14 @@ mod tests {
         assert_eq!(pending.arm(7, resident.clone(), 1920, 1080, 9), None);
         let debt = pending.take(7).expect("the debt was armed");
         assert_eq!(
-            debt.identity, resident,
+            debt.target, resident,
             "the payment would read a resident the draw never wrote"
         );
         assert_eq!(
-            debt.identity.generation(),
+            debt.target
+                .get::<crate::backend::vulkan::engine::TargetIdentity>()
+                .expect("this rail issued the target")
+                .generation(),
             8,
             "the resident's generation, not the mapping's"
         );
@@ -2172,13 +2162,17 @@ mod tests {
     /// as 0 until a harvest has run. The second is the one that bit — on the
     /// macos-15 battery every frame the ledger lost to a guest write was a
     /// first Store into a fresh plane.
+    ///
+    /// Named against [`crate::backend::vulkan::VulkanBackend`] and not against
+    /// `selected()`: this is a test about the arm gate of the one rail that
+    /// keeps GVA residents, and asking the process which rail it latched would
+    /// make the assertion mean two different things on the two-rail build.
     #[cfg(feature = "backend-vulkan")]
     #[test]
     fn an_unwitnessed_gva_store_is_not_deferred() {
         fn arm(host: &mut crate::runtime::FakeHost) -> (bool, DeviceState) {
             let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
             let debt = gva_debt(9);
-            let identity = gva_identity(debt);
             let key = GvaResourceKey {
                 task_id: 3,
                 texture_ref: 12,
@@ -2199,7 +2193,14 @@ mod tests {
                 format: debt.format,
                 ..Default::default()
             };
-            let armed = arm_gva(&mut state, host, key.task_id, &c0, &identity);
+            let armed = arm_gva(
+                crate::backend::vulkan::VulkanBackend,
+                &mut state,
+                host,
+                key.task_id,
+                &c0,
+                debt.window(),
+            );
             (armed, state)
         }
 
@@ -2249,14 +2250,14 @@ mod tests {
         let ordered: Vec<u64> = (0..4).map(|i| (0x40 + i) * page).collect();
         let span = 4 * page;
         let debt = gva_debt(9);
-        let identity = gva_identity(debt);
-        let key = crate::runtime::gva_store_witness::GvaTargetKey::of(&identity)
-            .expect("a GVA identity names a witness target");
+        let rail = crate::backend::vulkan::VulkanBackend;
+        let key = crate::backend::Backend::gva_witness_key(&rail, &debt)
+            .expect("a GVA debt names a witness target");
 
         // Nothing armed: the host cannot name a page, so the guest keeps
         // everything — the direction every unknown answers in.
         assert_eq!(
-            guest_owned_plane_ranges(&state, &host, &identity, &ordered, span),
+            guest_owned_plane_ranges(rail, &state, &host, &debt, &ordered, span),
             None,
             "an unstamped target has no extent to report"
         );
@@ -2266,14 +2267,14 @@ mod tests {
         // the guest's own declaration is what brought the caller here, and a
         // harvest that has not run yet reports the same empty list.
         assert_eq!(
-            guest_owned_plane_ranges(&state, &host, &identity, &ordered, span),
+            guest_owned_plane_ranges(rail, &state, &host, &debt, &ordered, span),
             None,
             "an empty report is an unknown, not a finding"
         );
 
         host.guest_wrote_page(ordered[2] + 8);
         assert_eq!(
-            guest_owned_plane_ranges(&state, &host, &identity, &ordered, span),
+            guest_owned_plane_ranges(rail, &state, &host, &debt, &ordered, span),
             Some(vec![(2 * page, 3 * page)]),
             "only the page the guest wrote is the guest's"
         );
@@ -2282,7 +2283,6 @@ mod tests {
     /// A guest validity transition after the Store makes guest memory newer
     /// than the held resident. The debt remains available for an orderly
     /// abandon, but it must immediately stop licensing host-resident reads.
-    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_guest_write_revokes_gva_resident_authority() {
         let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
@@ -2292,12 +2292,11 @@ mod tests {
         };
         let debt = gva_debt(99);
         let _ = state.pending_writebacks.arm_gva(key, debt);
-        let identity = gva_identity(debt);
-        assert!(gva_resident_authoritative(&state, &identity));
+        assert!(gva_resident_authoritative(&state, debt.window()));
         state
             .buffer_write_gen
             .note_write(key.task_id, key.texture_ref);
-        assert!(!gva_resident_authoritative(&state, &identity));
+        assert!(!gva_resident_authoritative(&state, debt.window()));
         assert!(state.pending_writebacks.get_gva(key).is_some());
     }
 

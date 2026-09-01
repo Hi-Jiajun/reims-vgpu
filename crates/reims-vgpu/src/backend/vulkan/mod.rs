@@ -18,9 +18,17 @@
 //! decision cannot be made twice with two different answers.
 
 pub mod caps;
+/// The census lines only this rail can answer. Reached through
+/// [`Backend::emit_census`], never through a `cfg`.
+mod census;
 pub mod engine;
+/// A draw's pipeline and both its shaders, resolved once per pipeline object.
+pub mod pipeline_resolve;
+/// The resident identity a mapper-ref-texture guest surface renders into.
+pub mod present_identity;
 pub mod translate;
 
+use crate::backend::compute_session::ComputeSession;
 #[cfg(feature = "host-window")]
 use crate::backend::window;
 use crate::backend::{
@@ -30,15 +38,16 @@ use crate::backend::{
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus, ResidentServe};
-use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::drain;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::ImportId;
+use crate::runtime::gva_store_witness::GvaTargetKey;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::render_writeback::SettleSite;
 use crate::runtime::scanout;
+use crate::runtime::writeback_debt::{GvaWindow, GvaWritebackDebt};
 
 /// The Vulkan rail's [`Backend`] handle.
 ///
@@ -55,6 +64,85 @@ pub struct VulkanBackend;
 impl VulkanBackend {
     pub fn new() -> Self {
         Self
+    }
+}
+
+/// This rail's name for the resident behind one deferred GVA frame.
+///
+/// The single derivation, and `pub(crate)` because a debt is not only something
+/// to pay: a reader that wants the *content* rather than the guest's copy of it
+/// — the blit rail's whole-plane GPU arm — needs exactly this identity, and a
+/// second one built from the same debt fields is how two spellings of one
+/// resident start disagreeing.
+///
+/// It matches `draw::vulkan::gva_chain_identity` field for field, which is what
+/// makes [`crate::runtime::writeback_debt::GvaWindow`]'s deferral sound: the
+/// draw registers its resident from the attachment request and the allocation
+/// generation, and both reach the ledger verbatim.
+pub(crate) fn gva_identity(
+    debt: &crate::runtime::writeback_debt::GvaWritebackDebt,
+) -> engine::TargetIdentity {
+    engine::TargetIdentity::Gva {
+        gva: debt.gva,
+        width: debt.width,
+        height: debt.height,
+        generation: debt.generation,
+        format: draw::vulkan::gva_resident_format(debt.format),
+    }
+}
+
+/// The guest-write witness key for one of this rail's GVA residents, or `None`
+/// for any other identity kind or an unusable generation.
+///
+/// The only constructor a product path may use, so the arm site and the payment
+/// site cannot drift into naming different targets.
+///
+/// The task is deliberately not in the key. Two tasks colliding here would need
+/// identical resolved page sets at the same address and extent, which is the
+/// same physical memory — the same target by every test this device applies to
+/// it.
+pub(crate) fn gva_witness_key(identity: &engine::TargetIdentity) -> Option<GvaTargetKey> {
+    match *identity {
+        engine::TargetIdentity::Gva {
+            gva,
+            width,
+            height,
+            generation,
+            format: _,
+        } if generation != 0 && gva != 0 => Some(GvaTargetKey {
+            gva,
+            generation,
+            width,
+            height,
+            // Asked of the identity rather than spelled here. A channel order
+            // is one question with one owner, and a second hand-written copy of
+            // it is the divergence that put an R/B-exchanged frame in guest
+            // memory once already — see `engine::ResidentReadSnapshot::bgra`.
+            // The pattern still names the field so a new one cannot be added
+            // without meeting it.
+            bgra: identity.is_bgra(),
+        }),
+        _ => None,
+    }
+}
+
+/// The guest coordinates one of this rail's GVA residents stands for, or `None`
+/// for an identity that names no guest span.
+pub(crate) fn gva_window(identity: &engine::TargetIdentity) -> Option<GvaWindow> {
+    match *identity {
+        engine::TargetIdentity::Gva {
+            gva,
+            width,
+            height,
+            generation,
+            format: _,
+        } => Some(GvaWindow {
+            gva,
+            width,
+            height,
+            generation,
+        }),
+        _ => None,
     }
 }
 
@@ -139,16 +227,15 @@ impl Backend for VulkanBackend {
         object_ref: u32,
     ) -> ObjectRetirement {
         // This rail retains both kinds by `(task, ref)` — the depth-stencil
-        // table for `draw::vulkan`, the pipeline table for
-        // `runtime::pipeline_resolve` — so the guest's declaration is the
+        // table on the neutral device model, the pipeline table in this rail's
+        // own device-lifetime state — so the guest's declaration is the
         // invalidation, and it is what makes the retention sound.
         let retired = match object {
             RetainedObject::DepthStencilState => {
                 state.task_depth_stencil_states.delete(task_id, object_ref)
             }
-            RetainedObject::RenderPipelineState => state
-                .task_render_pipeline_states
-                .delete(task_id, object_ref),
+            RetainedObject::RenderPipelineState => pipeline_resolve::retained(state)
+                .is_some_and(|states| states.delete(task_id, object_ref)),
         };
         if retired {
             ObjectRetirement::Retired
@@ -190,8 +277,9 @@ impl Backend for VulkanBackend {
         width: u32,
         height: u32,
     ) -> Result<window::WindowResident, &'static str> {
-        let identity =
-            crate::runtime::present_identity::surface_identity(state, mapping_id, width, height);
+        let identity = crate::backend::vulkan::present_identity::surface_identity(
+            state, mapping_id, width, height,
+        );
         // One engine operation keeps this resident alive across the idle sweep,
         // reclaims aged peers, and returns the direct-present decision for this
         // exact identity and geometry — so it runs whether or not the window
@@ -376,6 +464,17 @@ impl Backend for VulkanBackend {
         scanout::vulkan::try_capture_from_resident(state, buf, mapping_id, width, height)
     }
 
+    fn published_frame_rgba8(
+        &self,
+        state: &DeviceState,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+        _generation: u64,
+    ) -> Option<Vec<u8>> {
+        scanout::vulkan::published_frame_rgba8(state, mapping_id, width, height)
+    }
+
     fn order_completion_stamp<M: HostMemory + HostOps>(
         &self,
         state: &DeviceState,
@@ -395,6 +494,92 @@ impl Backend for VulkanBackend {
         pixel_format: u16,
     ) -> Option<ResidentServe> {
         compute_exec::vulkan::resident_serve(key, mirror_generation, is_storage, pixel_format)
+    }
+
+    /// This rail's targets are engine `TargetIdentity`s; a handle it did not
+    /// issue names no image it can read, and the frame is lost rather than
+    /// written from the wrong one.
+    fn pay_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        mapping_id: u32,
+        target: &crate::runtime::resident_target::ResidentTarget,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let Some(identity) = target.get::<engine::TargetIdentity>() else {
+            return false;
+        };
+        let paid = crate::runtime::render_writeback::vulkan::store_render_frame(
+            state, host, mapping_id, identity, width, height,
+        );
+        if !paid {
+            // The hold ends either way: a frame nothing will ask for again must
+            // not keep its image alive to the next device reset.
+            engine::note_resident_content_copied_out(identity);
+        }
+        paid
+    }
+
+    fn abandon_resident(&self, target: &crate::runtime::resident_target::ResidentTarget) {
+        if let Some(identity) = target.get::<engine::TargetIdentity>() {
+            engine::note_resident_content_copied_out(identity);
+        }
+    }
+
+    fn gva_resident(
+        &self,
+        debt: &GvaWritebackDebt,
+    ) -> Option<crate::runtime::resident_target::ResidentTarget> {
+        Some(crate::runtime::resident_target::ResidentTarget::new(
+            gva_identity(debt),
+        ))
+    }
+
+    fn gva_witness_key(&self, debt: &GvaWritebackDebt) -> Option<GvaTargetKey> {
+        gva_witness_key(&gva_identity(debt))
+    }
+
+    /// A handle this rail did not issue names no image it can read, so the
+    /// frame is lost rather than written from the wrong one — the rule
+    /// [`Self::pay_surface_writeback`] states, applied to the GVA namespace.
+    fn pay_gva_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        target: &crate::runtime::resident_target::ResidentTarget,
+        c0: &crate::runtime::draw::ColorRtRequest,
+        texture_ref: u32,
+        pages: &crate::runtime::draw::StoreTargetPages,
+        skip: crate::runtime::mapping_write::SkipRanges<'_>,
+    ) {
+        let Some(identity) = target.get::<engine::TargetIdentity>() else {
+            return;
+        };
+        if let Err(reason) = crate::runtime::render_writeback::vulkan::store_gva_frame(
+            state,
+            host,
+            task_id,
+            identity,
+            c0,
+            texture_ref,
+            Some(pages),
+            skip,
+        ) {
+            // Through the builder rather than by interpolating the decline,
+            // which renders its own `reason=` and produced `reason=reason=<slug>`
+            // — a line the standard ranking grep drops. The builder also carries
+            // the decline's own fields, so the `via=` that says which check
+            // inside the store refused now reaches the log instead of being
+            // formatted away.
+            crate::observe::Emit::decline("gvadebt_pay_lost", &reason)
+                .field("task", task_id)
+                .field("texture", texture_ref)
+                .fail();
+            engine::note_resident_content_copied_out(identity);
+        }
     }
 
     fn preflight_translations<M: HostMemory + HostOps>(
@@ -433,7 +618,7 @@ impl Backend for VulkanBackend {
         task_id: u32,
         pipeline_ref: u32,
     ) -> Option<u32> {
-        crate::runtime::pipeline_resolve::attachment_sample_count(
+        crate::backend::vulkan::pipeline_resolve::attachment_sample_count(
             state,
             host,
             task_id,
@@ -445,8 +630,11 @@ impl Backend for VulkanBackend {
         draw::vulkan::read_plane_draw_ring(reader, mapping_id).to_string()
     }
 
+    fn forget_mapping(&self, mapping_id: u32) {
+        draw::vulkan::forget_plane_draw_ring(mapping_id);
+    }
+
     fn emit_census(&self, site: CensusSite) {
-        use drain::census::vulkan as census;
         match site {
             CensusSite::Serialization { win_ms } => census::emit_engine_lock(win_ms),
             CensusSite::WorkingSet => census::emit_working_set(),

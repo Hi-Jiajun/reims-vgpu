@@ -25,13 +25,15 @@
 // The Vulkan rail's answers about a present's resident, named rather than
 // re-exported flat — a capture reaches them only through `Backend`, so this
 // module's own code never mentions a rail.
+#[cfg(feature = "backend-metal")]
+pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
 use crate::backend::Backend as _;
 use crate::contract::pixel_format::{
-    self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM,
-    MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM, RGBA8_BPP,
+    self, Rgba8ToRow, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM,
+    RGBA8_BPP,
 };
 use crate::model::{scanout_extent_ok, DeviceState, EFI_BOOT_HEIGHT, EFI_BOOT_WIDTH};
 use crate::runtime::host::HostMemory;
@@ -1056,6 +1058,9 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     } else {
         Some(vec![0u8; (mw as usize) * (RGBA8_BPP as usize)])
     };
+    // Parsed once for the whole capture rather than per row: one present of a
+    // 1920x1080 surface runs this loop 1,080 times over one format.
+    let row_rail = pixel_format::RowToRgba8::for_format(format);
 
     for y in 0..mh {
         let dst_off = (y as usize) * (dst_stride as usize);
@@ -1082,10 +1087,12 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
                 return fail(CaptureDecline::ConvertRowMissing { row: y });
             }
             let dst_row = &mut dst[dst_off..dst_off + dst_row_len];
-            if !convert_row_to_rgba8(format, &src_row[..tight as usize], mw, rgba) {
+            let converted =
+                row_rail.is_some_and(|rail| rail.convert(&src_row[..tight as usize], mw, rgba));
+            if !converted {
                 return fail(CaptureDecline::ConvertToRgba { format });
             }
-            if !convert_rgba8_to_row(MTL_FORMAT_BGRA8_UNORM, rgba, mw, dst_row) {
+            if !Rgba8ToRow::Bgra8.convert(rgba, mw, dst_row) {
                 return fail(CaptureDecline::ConvertFromRgba);
             }
         } else {

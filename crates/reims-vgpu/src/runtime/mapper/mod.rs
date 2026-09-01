@@ -1664,7 +1664,6 @@ pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
 /// Every variant but [`Self::Clean`] means "assume written". They are kept
 /// apart because "this rail never got started" and "the guest rewrites this
 /// surface every frame" are the same refusal and completely different findings.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuestWriteVerdict {
     /// The host has observed no write to these pages since the stamp.
@@ -1686,7 +1685,6 @@ pub enum GuestWriteVerdict {
 /// more than one rail can ask the same question and report it under its own names. A shared counter
 /// would pool two rails' refusals into one number, and the number would then be unreadable for
 /// either.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     state: &DeviceState,
     host: &M,

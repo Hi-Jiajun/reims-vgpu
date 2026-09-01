@@ -1371,15 +1371,17 @@ pub fn resolve_icb_record<M: HostMemory + HostOps>(
 // Host ICB cache: (task_id, icb_ref) → filled Metal ICB + retained resources
 // ---------------------------------------------------------------------------
 
-/// Drop every recorded ICB and every cached host ICB (tests / task teardown).
+/// Drop every recorded ICB and every host ICB the running rail built from one
+/// (tests / task teardown).
 ///
 /// One entry point for both maps: they are keyed alike and a registry entry
-/// outliving its host object would name a descriptor no `MTLIndirectCommandBuffer`
-/// was built from. On the Vulkan arm there is no second map to clear.
+/// outliving its host object would name a descriptor no host indirect-command
+/// buffer was built from. The rail's half is
+/// [`crate::backend::Backend::forget_host_icbs`], which is free on a rail that
+/// builds none.
 pub fn clear_icb_cache() {
     icb_registry().lock().clear();
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    metal::clear_host_icb_cache();
+    crate::backend::Backend::forget_host_icbs(&crate::backend::selected());
 }
 
 /// Info-segment opcode for `PGSerializerInfoCommandEncoder icbHostResourceInfo:info:`.
