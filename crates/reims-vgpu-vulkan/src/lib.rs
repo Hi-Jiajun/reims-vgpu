@@ -91,6 +91,7 @@ pub mod barrier;
 pub mod bindings;
 pub mod buffer;
 pub mod census;
+pub mod depth_stencil;
 pub mod descriptor;
 pub mod device;
 pub mod frames;

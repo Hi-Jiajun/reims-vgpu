@@ -54,6 +54,8 @@
 //!   does.
 //! - [`pixel_format`] — the format ordinals, what each one is made of, and the
 //!   conversions between a texel and the eight-bit colour the device carries.
+//! - [`depth_stencil`] — `MTLDepthStencilDescriptor`'s ordinals, and which
+//!   of its two faces the record actually wrote.
 //! - [`sampler`] — `MTLSamplerDescriptor`'s ordinals, and the combinations
 //!   the guest API itself does not admit.
 //! - [`texture_shape`] — what a texture declaration is: its type ordinal, the
@@ -101,6 +103,7 @@ pub mod checked;
 pub mod closure;
 pub mod compute;
 pub mod decode;
+pub mod depth_stencil;
 pub mod dispatch;
 pub mod draw;
 pub mod endian;

@@ -86,6 +86,14 @@ pub use reims_vgpu_protocol::texture_shape;
 /// sees this crate rather than the protocol one.
 pub use reims_vgpu_protocol::sampler;
 
+/// The depth-stencil state a guest declares, re-exported from the protocol
+/// layer.
+///
+/// Which comparison, which face is bound, what a face does at each outcome —
+/// the same questions on either rail, and neither answer names a native
+/// object.
+pub use reims_vgpu_protocol::depth_stencil;
+
 pub mod stream;
 pub mod submit;
 pub mod sync;
