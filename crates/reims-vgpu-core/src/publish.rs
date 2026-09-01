@@ -71,6 +71,13 @@ struct Domain {
     order: VecDeque<ChannelSequence>,
     /// Positions whose work has completed, waiting for the head to reach them.
     finished: HashMap<ChannelSequence, Option<CompletionStamp>>,
+    /// The highest position ever admitted into this lifetime of the channel.
+    ///
+    /// Kept apart from `order`, which holds only what is still outstanding: a
+    /// released position leaves the FIFO, so the FIFO's back is not the
+    /// channel's high-water mark and comparing against it would let a channel
+    /// rewind through every position it had already published.
+    admitted_through: Option<ChannelSequence>,
 }
 
 /// Ordered guest publication for every channel.
@@ -91,15 +98,25 @@ impl Publisher {
     /// # Panics
     ///
     /// If `sequence` is not greater than the last position admitted into this
-    /// channel. Publication order *is* channel order; admitting out of it
-    /// would make the FIFO a queue of whatever arrived rather than a
-    /// statement about the guest's channel.
+    /// channel — *ever*, and not merely the last one still outstanding.
+    /// Publication order *is* channel order; admitting out of it would make the
+    /// FIFO a queue of whatever arrived rather than a statement about the
+    /// guest's channel.
+    ///
+    /// A channel that has published everything it admitted has an empty FIFO,
+    /// so the outstanding positions cannot answer this: compared against them,
+    /// a channel could rewind to any position it had already published and
+    /// publish it a second time, and the guest would read a stamp for work that
+    /// was reported done long before. The high-water mark answers it, and
+    /// [`Self::retire`] is what clears it — a later definition of the same
+    /// channel is a new lifetime and starts at position one.
     pub fn admit(&mut self, domain: ChannelId, sequence: ChannelSequence) {
         let queue = self.domains.entry(domain).or_default();
         assert!(
-            queue.order.back().is_none_or(|last| sequence > *last),
+            queue.admitted_through.is_none_or(|last| sequence > last),
             "publication order is channel order; {sequence:?} was admitted after a later position"
         );
+        queue.admitted_through = Some(sequence);
         queue.order.push_back(sequence);
     }
 
@@ -401,5 +418,230 @@ mod tests {
         p.admit(ChannelId(1), seq(2));
         p.complete(ChannelId(1), seq(2), None);
         p.complete(ChannelId(1), seq(2), None);
+    }
+
+    /// A channel that has published everything it admitted still may not go
+    /// back: the FIFO is empty, and the emptiness is not permission.
+    #[test]
+    #[should_panic(expected = "publication order is channel order")]
+    fn a_channel_that_published_everything_cannot_rewind_behind_it() {
+        let mut p = Publisher::new();
+        p.admit(ChannelId(1), seq(5));
+        assert_eq!(p.complete(ChannelId(1), seq(5), stamp(5)).len(), 1);
+        assert_eq!(p.outstanding(ChannelId(1)), 0, "the FIFO is empty");
+        p.admit(ChannelId(1), seq(3));
+    }
+
+    /// Retiring is what makes position one legal again, and it is the only
+    /// thing that does.
+    #[test]
+    fn a_retired_channel_starts_its_next_lifetime_at_position_one() {
+        let mut p = Publisher::new();
+        p.admit(ChannelId(1), seq(5));
+        assert_eq!(p.complete(ChannelId(1), seq(5), stamp(5)).len(), 1);
+        p.retire(ChannelId(1)).expect("nothing outstanding");
+        p.admit(ChannelId(1), seq(1));
+        assert_eq!(p.head(ChannelId(1)), Some(seq(1)));
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// Three channels, so head-of-line blocking has somewhere to leak to if it
+    /// can.
+    const CHANNELS: u64 = 3;
+
+    /// **The rule, driven over histories: each domain publishes its own
+    /// admission order and nothing else's.**
+    ///
+    /// The shadow is a plain `Vec` per channel with a finished-set beside it —
+    /// no `VecDeque`, no shared structure — so a release the module makes that
+    /// the shadow's own prefix rule does not license is a release out of order,
+    /// and a domain that answers for another domain's head cannot even be
+    /// expressed on the shadow side.
+    ///
+    /// What it asserts after every step: the releases are exactly the finished
+    /// prefix, in ascending order; no position is released twice or lost; and
+    /// `outstanding`, `head`, `blocked` and `released` all agree.
+    #[test]
+    fn every_channel_publishes_its_own_order_and_holds_nothing_elses() {
+        let mut releases = 0usize;
+        let mut held_behind_a_head = 0usize;
+        let mut withdrawals = 0usize;
+        let mut withdrawals_that_released = 0usize;
+        let mut retires = 0usize;
+        let mut retires_refused = 0usize;
+
+        for seed in 0..512u64 {
+            let mut rng = Rng::new(seed);
+            let mut p = Publisher::new();
+            // Shadow: admission order, what has finished, and the high-water
+            // mark that says which position may be admitted next.
+            let mut order: Vec<Vec<ChannelSequence>> = vec![Vec::new(); CHANNELS as usize];
+            let mut finished: Vec<HashMap<ChannelSequence, Option<CompletionStamp>>> =
+                vec![HashMap::new(); CHANNELS as usize];
+            let mut next: Vec<u64> = vec![1; CHANNELS as usize];
+            let mut published: Vec<Vec<ChannelSequence>> = vec![Vec::new(); CHANNELS as usize];
+            // This publisher's own tally. `releases` is the whole sweep's, for
+            // the non-vacuity floor, and a fresh publisher has released nothing.
+            let mut released_here = 0usize;
+
+            for _ in 0..48 {
+                let c = rng.below(CHANNELS) as usize;
+                let id = ChannelId(c as u32);
+                match rng.below(10) {
+                    // Admit the next position. Sequences skip, because a
+                    // channel may refuse a packet without admitting one.
+                    0..=3 => {
+                        let s = seq(next[c]);
+                        next[c] += 1 + rng.below(3);
+                        p.admit(id, s);
+                        order[c].push(s);
+                    }
+                    // Complete an outstanding position that has not finished.
+                    4..=7 => {
+                        let pending: Vec<ChannelSequence> = order[c]
+                            .iter()
+                            .copied()
+                            .filter(|s| !finished[c].contains_key(s))
+                            .collect();
+                        if pending.is_empty() {
+                            continue;
+                        }
+                        let s = pending[rng.below(pending.len() as u64) as usize];
+                        let st = (rng.below(2) == 0).then(|| stamp(s.0 as u32).expect("some"));
+                        let got = p.complete(id, s, st);
+                        finished[c].insert(s, st);
+                        let expected = drain_shadow(&mut order[c], &mut finished[c]);
+                        assert_eq!(got, expected, "seed {seed}: complete released wrongly");
+                        releases += got.len();
+                        released_here += got.len();
+                        published[c].extend(got.iter().map(|r| r.sequence));
+                    }
+                    // Withdraw one that will never publish.
+                    8 => {
+                        let live: Vec<ChannelSequence> = order[c]
+                            .iter()
+                            .copied()
+                            .filter(|s| !finished[c].contains_key(s))
+                            .collect();
+                        if live.is_empty() {
+                            continue;
+                        }
+                        let s = live[rng.below(live.len() as u64) as usize];
+                        let got = p.withdraw(id, s);
+                        order[c].retain(|held| *held != s);
+                        let expected = drain_shadow(&mut order[c], &mut finished[c]);
+                        assert_eq!(got, expected, "seed {seed}: withdraw released wrongly");
+                        withdrawals += 1;
+                        if !got.is_empty() {
+                            withdrawals_that_released += 1;
+                        }
+                        releases += got.len();
+                        released_here += got.len();
+                        published[c].extend(got.iter().map(|r| r.sequence));
+                    }
+                    // End the channel's lifetime.
+                    _ => {
+                        let outstanding = order[c].len();
+                        match p.retire(id) {
+                            Ok(()) => {
+                                assert_eq!(outstanding, 0, "seed {seed}: retired a live channel");
+                                retires += 1;
+                                // A new lifetime starts at position one.
+                                next[c] = 1;
+                                published[c].clear();
+                                finished[c].clear();
+                            }
+                            Err(RetireRefusal::LivePositions { outstanding: n }) => {
+                                assert_eq!(n, outstanding, "seed {seed}");
+                                assert!(n > 0);
+                                retires_refused += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Every observer agrees with the shadow after every step.
+                for c in 0..CHANNELS as usize {
+                    let id = ChannelId(c as u32);
+                    assert_eq!(
+                        p.outstanding(id),
+                        order[c].len(),
+                        "seed {seed}: outstanding"
+                    );
+                    assert_eq!(p.head(id), order[c].first().copied(), "seed {seed}: head");
+                    // Published in ascending order, each position once.
+                    assert!(
+                        published[c].windows(2).all(|w| w[0] < w[1]),
+                        "seed {seed}: channel {c} published out of order"
+                    );
+                }
+                let mut expected_blocked: Vec<(ChannelId, usize)> = (0..CHANNELS as usize)
+                    .filter(|c| !finished[*c].is_empty())
+                    .map(|c| (ChannelId(c as u32), finished[c].len()))
+                    .collect();
+                expected_blocked.sort_unstable();
+                assert_eq!(p.blocked(), expected_blocked, "seed {seed}: blocked");
+                held_behind_a_head += expected_blocked.iter().map(|(_, n)| n).sum::<usize>();
+                assert_eq!(p.released(), released_here, "seed {seed}: released");
+            }
+        }
+
+        // Non-vacuity: every shape an assertion above depends on reaching.
+        assert!(releases > 3_000, "positions published: {releases}");
+        assert!(
+            held_behind_a_head > 3_000,
+            "finished positions held behind a head: {held_behind_a_head}"
+        );
+        assert!(withdrawals > 400, "withdrawals: {withdrawals}");
+        assert!(
+            withdrawals_that_released > 100,
+            "withdrawals that unblocked something: {withdrawals_that_released}"
+        );
+        assert!(retires > 300, "channel lifetimes ended: {retires}");
+        assert!(
+            retires_refused > 300,
+            "retires refused for live positions: {retires_refused}"
+        );
+    }
+
+    /// The shadow's own release rule: the finished prefix of the admission
+    /// order, stated as a prefix and not as a queue operation.
+    fn drain_shadow(
+        order: &mut Vec<ChannelSequence>,
+        finished: &mut HashMap<ChannelSequence, Option<CompletionStamp>>,
+    ) -> Vec<Release> {
+        let mut out = Vec::new();
+        while let Some(head) = order.first().copied() {
+            let Some(stamp) = finished.remove(&head) else {
+                break;
+            };
+            order.remove(0);
+            out.push(Release {
+                sequence: head,
+                stamp,
+            });
+        }
+        out
     }
 }
