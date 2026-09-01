@@ -448,13 +448,34 @@ impl SessionModel {
         released
     }
 
-    /// Remove a transaction that will never publish, releasing whatever its
-    /// channel was holding behind it.
+    /// Remove a transaction that will never publish, releasing everything it
+    /// was holding.
     ///
-    /// A position that cannot finish still holds its channel's head, so
-    /// something has to take it out. Nothing here decides *that* it cannot
-    /// finish; the caller does, and says so on its failure channel.
+    /// A transaction that cannot finish holds a position in **three** planes,
+    /// and taking it out of one is not taking it out. Its channel's publication
+    /// head is the visible one. The other two are the ones that hang: its
+    /// accesses stay live in the dependency graph, so every later transaction
+    /// touching that memory takes a hazard wait on an ordinal nothing will ever
+    /// complete; and it stays pending in the readiness service, which is the
+    /// only thing that decrements a dependent's remaining hazards.
+    ///
+    /// This used to release the first and neither of the other two, so
+    /// withdrawing a transaction to un-stall a channel stalled every later one
+    /// that shared a backing with it — the exact failure the withdrawal exists
+    /// to prevent, moved from one plane to another.
+    ///
+    /// Nothing here decides *that* it cannot finish; the caller does, and says
+    /// so on its failure channel.
+    ///
+    /// **Its own completion word is not published.** The work never ran, and a
+    /// stamp published for it is a value the guest acts on. What the guest is
+    /// owed instead is the typed reason, which is why the caller names one.
     pub fn withdraw(&mut self, ingress: IngressOrdinal) -> Vec<Release> {
+        // Releases this transaction's dependents and forgets what it was
+        // waiting on. The stamp it owed comes back and is deliberately dropped:
+        // publication is `complete`'s and this is not a completion.
+        let _never_published = self.scheduler.complete(ingress);
+        self.graph.retire(ingress);
         let (domain, sequence) = self
             .position
             .remove(&ingress)
@@ -1206,6 +1227,81 @@ mod tests {
         let later = touching(packet(0x37), vec![whole(1, AccessMode::Write)]);
         let l = s.admit(&later).expect("accepted");
         assert_eq!(l.hazard_waits, vec![r.transaction.identity.ingress]);
+    }
+
+    /// Withdrawing a transaction stops it ordering later work, not only its
+    /// channel.
+    ///
+    /// A transaction holds a position in three planes and a withdrawal used to
+    /// release one of them. The dependency graph kept its accesses live, so
+    /// every later transaction touching that backing took a hazard wait on an
+    /// ordinal nothing would ever complete; and the readiness service kept it
+    /// pending, and that is the only thing that decrements a dependent's
+    /// remaining hazards. So un-stalling a channel stalled every later
+    /// transaction that shared a backing with the one taken out.
+    #[test]
+    fn a_withdrawn_transaction_stops_ordering_the_work_behind_it() {
+        let mut s = session();
+        let doomed = touching(packet(0x37), vec![whole(1, AccessMode::Write)]);
+        let after = touching(packet(0x37), vec![whole(1, AccessMode::Write)]);
+
+        let d = s.admit(&doomed).expect("accepted");
+        let a = s.admit(&after).expect("accepted");
+        assert!(!a.ready, "it waits on the one before it");
+        assert_eq!(a.hazard_waits, vec![d.transaction.identity.ingress]);
+        assert_eq!(s.take_ready(), vec![d.transaction.identity.ingress]);
+
+        s.withdraw(d.transaction.identity.ingress);
+        assert_eq!(
+            s.take_ready(),
+            vec![a.transaction.identity.ingress],
+            "the hazard it held is released, not left on an ordinal nothing completes"
+        );
+        assert_eq!(s.scheduler().pending(), 1, "and it is no longer pending");
+
+        // Its accesses stop ordering anything admitted later, too: a third
+        // writer waits on the one still live and not on the one that left.
+        let l = s
+            .admit(&touching(packet(0x37), vec![whole(1, AccessMode::Write)]))
+            .expect("accepted");
+        assert_eq!(l.hazard_waits, vec![a.transaction.identity.ingress]);
+    }
+
+    /// A withdrawn transaction publishes no completion word of its own, and
+    /// still releases the ones queued behind it.
+    ///
+    /// The work never ran, so a stamp published for it is a value the guest
+    /// acts on. What the guest is owed is the typed reason, which is the
+    /// caller's to name.
+    #[test]
+    fn a_withdrawal_publishes_what_was_behind_it_and_not_its_own_word() {
+        let mut s = session();
+        let mut doomed = packet(0x37);
+        doomed.completion = Some(CompletionStamp {
+            slot: StampSlot(0),
+            value: StampValue(1),
+        });
+        let mut behind = packet(0x37);
+        behind.completion = Some(CompletionStamp {
+            slot: StampSlot(0),
+            value: StampValue(2),
+        });
+        let d = s.admit(&doomed).expect("accepted");
+        let b = s.admit(&behind).expect("accepted");
+        assert!(s.complete(b.transaction.identity.ingress).is_empty());
+
+        assert_eq!(
+            s.withdraw(d.transaction.identity.ingress)
+                .into_iter()
+                .map(|r| r.stamp)
+                .collect::<Vec<_>>(),
+            vec![behind.completion],
+            "only the word behind it"
+        );
+        assert_eq!(
+            s.scheduler().published_value(StampSlot(0)),
+            Some(StampValue(2))
+        );
     }
 
     /// Out-of-order completion is ordinary; out-of-order publication is not.
