@@ -122,12 +122,25 @@ pub enum ResourceListDecodeError {
     },
 }
 
-impl reims_vgpu_observe::Decline for ResourceListDecodeError {
-    fn slug(&self) -> &'static str {
+impl ResourceListDecodeError {
+    /// The slug this refusal reports under.
+    ///
+    /// Inherent as well as a [`reims_vgpu_observe::Decline`] method, because a
+    /// layer that may not depend on `observe` still has to be able to name the
+    /// refusal it is forwarding — and naming it by writing the string again is
+    /// how two spellings of one check come to exist.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
         match self {
             Self::ShortHeader { .. } => "resource_list_short_header",
             Self::Truncated { .. } => "resource_list_truncated",
         }
+    }
+}
+
+impl reims_vgpu_observe::Decline for ResourceListDecodeError {
+    fn slug(&self) -> &'static str {
+        Self::slug(*self)
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {

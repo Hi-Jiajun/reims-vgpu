@@ -60,6 +60,7 @@ use crate::heap::{self, HeapPlacement, Heaps, Retirement};
 use crate::identity::{ChannelId, ObjectListRef, ResourceId, TaskId};
 use crate::namespace::{self, Namespace, Teardown};
 use crate::transaction::{classify, PayloadClass};
+use reims_vgpu_protocol::fifo;
 use reims_vgpu_protocol::packets::Channel;
 use std::collections::HashMap;
 
@@ -110,6 +111,44 @@ impl LifecycleKind {
             (Child, 0x36) => Self::DeleteBacking,
             _ => return None,
         })
+    }
+
+    /// The length of one record in this command's counted resource list, or
+    /// `None` when the command carries no such list.
+    ///
+    /// **Four of the twelve carry one, and they do not all use the same record
+    /// length.** `Invalidate` carries the guest's validity quad beside each
+    /// object ref, so its record is eight bytes; the three that only name
+    /// objects use four. Nothing else here has a list at all: a task
+    /// definition, an object-list bind, a single delete, a map, an unmap, a
+    /// re-point and a backing retirement each name one thing.
+    ///
+    /// The map lives here rather than in [`reims_vgpu_protocol::fifo`] because
+    /// that module holds the layouts and deliberately holds no opcodes — a
+    /// second table of the same numbers cannot be kept honest by anything in
+    /// the toolchain. This is the one table, and it is keyed on the kind rather
+    /// than on the opcode for the same reason: [`Self::of`] already turned the
+    /// opcode into a kind.
+    ///
+    /// Before it, the choice of decoder was made at each call site in the
+    /// device's drain — three arms picked the four-byte decoder and one picked
+    /// the eight-byte one, and nothing could compare them.
+    #[must_use]
+    pub const fn resource_list_record_len(self) -> Option<u32> {
+        match self {
+            Self::Invalidate => Some(fifo::CHILD_INVALIDATE_RECORD_LEN),
+            Self::Synchronize | Self::SynchronizeAndDiscard | Self::Discard => {
+                Some(fifo::CHILD_SYNCHRONIZE_RECORD_LEN)
+            }
+            Self::DefineTask
+            | Self::DeleteTask
+            | Self::SetObjectList
+            | Self::DeleteResource
+            | Self::MapMemory
+            | Self::UnmapMemory
+            | Self::ReplacePhysical
+            | Self::DeleteBacking => None,
+        }
     }
 
     #[must_use]
@@ -277,6 +316,101 @@ pub struct Effects {
     /// Copies offered for release, evaluated when the transfers above have
     /// executed. See the module docs for why this is not immediate.
     pub at_completion: Vec<DeferredDiscard>,
+}
+
+/// Why a lifecycle packet's bytes did not become an operation.
+///
+/// Separate from [`Refusal`], which is why a well-formed operation could not be
+/// *applied*. A payload that cannot be read and a task that does not exist are
+/// different failures with different fixes, and folding them would make the log
+/// unable to say which one happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveRefusal {
+    /// The command carries no counted resource list, so there is nothing for
+    /// [`resource_list`] to read. Not a malformed packet — a caller asking the
+    /// wrong question.
+    NotAResourceList { kind: LifecycleKind },
+    /// The payload disagrees with itself: too short for its header, or
+    /// declaring more records than it carries.
+    Payload(fifo::ResourceListDecodeError),
+    /// A ref in the list names no live object.
+    ///
+    /// Carries the guest's number, because the number is what a log line has to
+    /// contain for anyone to find which object the guest thought it had.
+    UnknownRef { object_ref: u32 },
+}
+
+impl ResolveRefusal {
+    #[must_use]
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NotAResourceList { .. } => "lifecycle_not_a_resource_list",
+            Self::Payload(inner) => inner.slug(),
+            Self::UnknownRef { .. } => "lifecycle_unknown_ref",
+        }
+    }
+}
+
+/// Turn one resource-list packet's payload into the operation it names.
+///
+/// **The link between "the wire has a resource list" and "the model has a
+/// lifecycle operation".** [`reims_vgpu_protocol::fifo`] could read the list
+/// and [`LifecycleOp`] could describe the result, and nothing joined them: the
+/// only code that did was the device's drain, which acted on the decoded
+/// records directly and produced no operation at all.
+///
+/// Every ref resolves or the whole packet refuses. A partial list is not an
+/// option here — `Invalidate` says a set of resources went stale together, and
+/// applying it to the subset that happened to resolve claims the others are
+/// still fresh.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a kind with no list, a payload that disagrees with
+/// itself, or a ref naming nothing live.
+pub fn resource_list(
+    kind: LifecycleKind,
+    payload: &[u8],
+    resolver: &impl crate::resolve::RefResolver,
+) -> Result<LifecycleOp, ResolveRefusal> {
+    let Some(record_len) = kind.resource_list_record_len() else {
+        return Err(ResolveRefusal::NotAResourceList { kind });
+    };
+    // Which decoder is which record length, asked once. The eight-byte record
+    // carries the guest's validity quad; the four-byte one is object refs
+    // alone. `resource_list_record_len` is the only thing that decides.
+    let (task, refs) = if record_len == fifo::CHILD_INVALIDATE_RECORD_LEN {
+        let cmd = fifo::decode_invalidate_resources(payload).map_err(ResolveRefusal::Payload)?;
+        let refs: Vec<u32> = cmd.records.iter().map(|r| r.object_id).collect();
+        (cmd.task_id, refs)
+    } else {
+        let cmd = fifo::decode_synchronize_resources(payload).map_err(ResolveRefusal::Payload)?;
+        (cmd.task_id, cmd.object_ids)
+    };
+
+    let mut resources = Vec::with_capacity(refs.len());
+    for object_ref in refs {
+        let resolved = resolver
+            .resource(object_ref)
+            .ok_or(ResolveRefusal::UnknownRef { object_ref })?;
+        resources.push(resolved);
+    }
+
+    let task = TaskId(task);
+    Ok(match kind {
+        LifecycleKind::Invalidate => LifecycleOp::Invalidate { task, resources },
+        LifecycleKind::Synchronize => LifecycleOp::Synchronize { task, resources },
+        LifecycleKind::SynchronizeAndDiscard => {
+            LifecycleOp::SynchronizeAndDiscard { task, resources }
+        }
+        LifecycleKind::Discard => LifecycleOp::Discard { task, resources },
+        // Unreachable: `resource_list_record_len` answered `Some` for exactly
+        // the four above, and a `None` returned before this point. Stated as a
+        // refusal rather than a panic because the two functions are separate,
+        // and a fifth kind gaining a record length without gaining an arm here
+        // must be a caller-visible refusal rather than a lost packet.
+        other => return Err(ResolveRefusal::NotAResourceList { kind: other }),
+    })
 }
 
 /// Why a lifecycle operation did not happen.
@@ -1558,6 +1692,208 @@ mod tests {
             l.content()
                 .is_fresh(BackingId(50), range(256, 256), Replica::GuestPages),
             "and stopped at its own end"
+        );
+    }
+
+    // ------------------------------------------- bytes to a lifecycle op
+
+    /// A resolver that answers every ref, so a resolution test is about the
+    /// list and not about whether the objects exist.
+    struct Everything;
+
+    impl crate::resolve::RefResolver for Everything {
+        fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+            Some(ResourceId {
+                slot: ObjectListRef(object_ref),
+                generation: SlotGeneration(1),
+            })
+        }
+    }
+
+    /// A resolver whose slots are all empty.
+    struct Nothing;
+
+    impl crate::resolve::RefResolver for Nothing {
+        fn resource(&self, _object_ref: u32) -> Option<ResourceId> {
+            None
+        }
+    }
+
+    /// A payload too short to hold even a resource-list header.
+    fn alloc_short() -> Vec<u8> {
+        vec![0u8; 3]
+    }
+
+    /// A resource-list payload: `{task, count}` then `count` records of
+    /// `record_len`, with the object ref in the first word of each.
+    fn list_bytes(task: u32, refs: &[u32], record_len: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&task.to_le_bytes());
+        out.extend_from_slice(&u32::try_from(refs.len()).expect("small").to_le_bytes());
+        for r in refs {
+            out.extend_from_slice(&r.to_le_bytes());
+            out.resize(out.len() + record_len as usize - 4, 0);
+        }
+        out
+    }
+
+    /// Exactly four of the twelve lifecycle commands carry a counted resource
+    /// list, and the two record lengths are not interchangeable: `Invalidate`
+    /// puts the guest's validity quad beside each ref. Reading one command's
+    /// list at the other's stride walks off the records.
+    #[test]
+    fn exactly_the_four_list_commands_have_a_record_length() {
+        let with: Vec<LifecycleKind> = LEDGER
+            .iter()
+            .filter_map(|p| LifecycleKind::of(p.channel, p.opcode))
+            .filter(|k| k.resource_list_record_len().is_some())
+            .collect();
+        assert_eq!(
+            with,
+            vec![
+                LifecycleKind::Invalidate,
+                LifecycleKind::Synchronize,
+                LifecycleKind::SynchronizeAndDiscard,
+                LifecycleKind::Discard,
+            ]
+        );
+        assert_eq!(
+            LifecycleKind::Invalidate.resource_list_record_len(),
+            Some(8)
+        );
+        for kind in [
+            LifecycleKind::Synchronize,
+            LifecycleKind::SynchronizeAndDiscard,
+            LifecycleKind::Discard,
+        ] {
+            assert_eq!(kind.resource_list_record_len(), Some(4), "{}", kind.name());
+        }
+    }
+
+    /// The join this function exists to be: a guest's bytes become the
+    /// operation the model names, with every ref resolved.
+    #[test]
+    fn a_resource_list_payload_becomes_the_operation_its_command_names() {
+        for kind in [
+            LifecycleKind::Invalidate,
+            LifecycleKind::Synchronize,
+            LifecycleKind::SynchronizeAndDiscard,
+            LifecycleKind::Discard,
+        ] {
+            let stride = kind.resource_list_record_len().expect("a list command");
+            let bytes = list_bytes(7, &[11, 12, 13], stride);
+            let op = resource_list(kind, &bytes, &Everything).expect("well formed");
+            assert_eq!(op.kind(), kind, "the op is the command's own");
+            assert_eq!(op.task(), TaskId(7));
+            let resources = match &op {
+                LifecycleOp::Invalidate { resources, .. }
+                | LifecycleOp::Synchronize { resources, .. }
+                | LifecycleOp::SynchronizeAndDiscard { resources, .. }
+                | LifecycleOp::Discard { resources, .. } => resources.clone(),
+                other => panic!("{other:?} is not a list operation"),
+            };
+            assert_eq!(
+                resources.iter().map(|r| r.slot.0).collect::<Vec<_>>(),
+                vec![11, 12, 13],
+                "{}",
+                kind.name()
+            );
+        }
+    }
+
+    /// The stride is the command's, and reading a list at the other command's
+    /// stride is not a near miss — it walks off the records entirely.
+    #[test]
+    fn a_list_read_at_the_other_commands_stride_does_not_agree() {
+        // Three eight-byte records, read as if they were four-byte ones.
+        let bytes = list_bytes(7, &[11, 12, 13], 8);
+        let wide =
+            resource_list(LifecycleKind::Invalidate, &bytes, &Everything).expect("its own stride");
+        let narrow =
+            resource_list(LifecycleKind::Synchronize, &bytes, &Everything).expect("long enough");
+        assert_ne!(
+            format!("{wide:?}").replace("Invalidate", "X"),
+            format!("{narrow:?}").replace("Synchronize", "X"),
+            "the two strides must not read the same refs out of one payload"
+        );
+    }
+
+    /// One unresolvable ref refuses the whole packet. `Invalidate` says a set
+    /// of resources went stale together; applying it to the subset that
+    /// happened to resolve claims the others are still fresh.
+    #[test]
+    fn one_unknown_ref_refuses_the_whole_list() {
+        let bytes = list_bytes(7, &[11, 12], 4);
+        assert_eq!(
+            resource_list(LifecycleKind::Synchronize, &bytes, &Nothing),
+            Err(ResolveRefusal::UnknownRef { object_ref: 11 })
+        );
+        assert_eq!(
+            resource_list(LifecycleKind::Synchronize, &bytes, &Nothing)
+                .expect_err("refused")
+                .slug(),
+            "lifecycle_unknown_ref"
+        );
+    }
+
+    /// A payload that disagrees with itself refuses with the decoder's own
+    /// reason, forwarded rather than restated.
+    #[test]
+    fn a_payload_that_cannot_be_read_forwards_the_decoders_reason() {
+        let short = resource_list(LifecycleKind::Synchronize, &[0u8; 3], &Everything)
+            .expect_err("no header");
+        assert_eq!(
+            short,
+            ResolveRefusal::Payload(fifo::ResourceListDecodeError::ShortHeader { plen: 3 })
+        );
+        assert_eq!(short.slug(), "resource_list_short_header");
+
+        // A count the payload cannot carry is the other half.
+        let mut bytes = list_bytes(7, &[11], 4);
+        bytes[4..8].copy_from_slice(&9u32.to_le_bytes());
+        let truncated = resource_list(LifecycleKind::Synchronize, &bytes, &Everything)
+            .expect_err("nine records in one record's worth of bytes");
+        assert_eq!(truncated.slug(), "resource_list_truncated");
+    }
+
+    /// The eight commands that carry no list say so, rather than being read as
+    /// an empty one — an empty `Invalidate` is a real packet and means nothing
+    /// went stale, which is not what a `DefineTask` means.
+    #[test]
+    fn a_command_with_no_list_refuses_rather_than_reading_an_empty_one() {
+        for kind in [
+            LifecycleKind::DefineTask,
+            LifecycleKind::DeleteTask,
+            LifecycleKind::SetObjectList,
+            LifecycleKind::DeleteResource,
+            LifecycleKind::MapMemory,
+            LifecycleKind::UnmapMemory,
+            LifecycleKind::ReplacePhysical,
+            LifecycleKind::DeleteBacking,
+        ] {
+            // Both a payload long enough to look like a list header and one
+            // too short to be one. The reason has to be "this command has no
+            // list" either way: a `DefineTask` refused for a short *list*
+            // sends the reader looking for a list that was never there.
+            for bytes in [list_bytes(7, &[], 4), alloc_short()] {
+                assert_eq!(
+                    resource_list(kind, &bytes, &Everything),
+                    Err(ResolveRefusal::NotAResourceList { kind }),
+                    "{} at {} bytes",
+                    kind.name(),
+                    bytes.len()
+                );
+            }
+        }
+        // And an empty list on a command that has one is a real operation.
+        let empty = resource_list(LifecycleKind::Discard, &list_bytes(7, &[], 4), &Everything)
+            .expect("an empty discard is well formed");
+        assert_eq!(
+            empty,
+            LifecycleOp::Discard {
+                task: TaskId(7),
+                resources: Vec::new(),
+            }
         );
     }
 }
