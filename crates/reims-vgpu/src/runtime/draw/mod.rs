@@ -1177,6 +1177,107 @@ pub(crate) fn note_sampled_narrowing(
     ));
 }
 
+/// What rendering a Store's colour target at `RGBA8Unorm` does to the format
+/// the guest declared for its destination.
+///
+/// # Why this exists at all
+///
+/// The Metal rail creates **every** colour render target as `RGBA8Unorm`. The
+/// destination mapping's declared format is available at the same call site and
+/// is not forwarded: `ColorRt::pixel_format` is a literal `0`, which
+/// `backend::metal::render` reads as "the writeback format". That is a policy,
+/// and until this type it was a constant with a comment.
+///
+/// It is not a harmless one. A driven macos-13 boot reports the window server's
+/// main compositing surface as `MTLPixelFormatRGBA16Float`, so the guest's
+/// half-float frame is rendered into an eight-bit attachment, read back as
+/// unorm8, and expanded again to half-float on the way into the guest's pages —
+/// where it arrives with 256 levels per channel and everything above 1.0 gone.
+///
+/// The Vulkan rail had exactly this defect and fixed it;
+/// `backend::vulkan::present_identity::surface_identity`'s doc states the
+/// finding in its own words: *"Ignoring the declaration renders a guest's
+/// half-float compositing into an eight-bit image and quantizes it with nothing
+/// to say so — the loss is invisible because every rail downstream still works,
+/// which is how the same bug survived in the `Gva` namespace until a counter on
+/// an unrelated gate exposed it."*
+///
+/// "With nothing to say so" is the part this type changes. `AGENTS.md` requires
+/// degraded guest work to produce a typed reason on the always-on failure
+/// channel, and the store direction had none — [`note_sampled_narrowing`] is
+/// the load direction's and has no counterpart. Naming the decision does not
+/// fix it; it makes the size of it countable, and it gives the fix one place to
+/// happen.
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColorTargetNarrowing {
+    /// The guest declared an eight-bit colour order, so an `RGBA8Unorm`
+    /// attachment carries it exactly and the writeback conversion is a channel
+    /// permutation.
+    None,
+    /// The guest declared a store layout this rail does not render in. Carries
+    /// it, because "half-float" and "ten-bit packed" and "integer" are three
+    /// different losses and a single slug would report them as one.
+    Quantised(pixel_format::TexelLayout),
+    /// The guest's declaration has no store layout in this contract at all, so
+    /// what is lost cannot be named — only that the rail chose for it.
+    Undeclared,
+}
+
+/// Read the declaration for a Store destination.
+///
+/// Asked of the **guest's** declared format, which is the only place the width
+/// it wanted is still known: past the attachment every texel is four unorm8
+/// bytes and nothing downstream can tell a narrowed target from a native one.
+/// That is [`pixel_format::narrows_to_unorm8`]'s argument one stage earlier in
+/// the pipeline.
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+pub(crate) fn color_target_narrowing(declared_format: u16) -> ColorTargetNarrowing {
+    use pixel_format::TexelLayout;
+    match pixel_format::store_texel_order(declared_format) {
+        // The two eight-bit colour orders. `RGBA8Unorm` holds either exactly;
+        // which of the two the guest picked changes the byte order of the
+        // writeback and not what survives it.
+        Some(TexelLayout::Rgba8 | TexelLayout::Bgra8) => ColorTargetNarrowing::None,
+        Some(layout) => ColorTargetNarrowing::Quantised(layout),
+        None => ColorTargetNarrowing::Undeclared,
+    }
+}
+
+/// Count, and describe once, a colour target this rail rendered narrower than
+/// the guest declared.
+///
+/// The store-direction mirror of [`note_sampled_narrowing`], and deduped the
+/// same way and for the same measured reason: per (format, extent), because a
+/// boot narrowing one surface and a boot narrowing a dozen of one format print
+/// the same single line otherwise.
+///
+/// The count is unconditional and the line is once, so a reader gets the size of
+/// the loss from the census and its shape from the log.
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+pub(crate) fn note_store_narrowing(declared_format: u16, w: u32, h: u32) {
+    let (slug, detail) = match color_target_narrowing(declared_format) {
+        ColorTargetNarrowing::None => return,
+        ColorTargetNarrowing::Quantised(layout) => (
+            "store_target_narrowed",
+            format!("declared={layout:?} lost=clamp_to_unit_and_256_levels"),
+        ),
+        ColorTargetNarrowing::Undeclared => (
+            "store_target_undeclared",
+            "declared=none lost=unnameable".to_string(),
+        ),
+    };
+    crate::runtime::drain::note_store_route(slug);
+    let key = u64::from(declared_format) | (u64::from(w) << 16) | (u64::from(h) << 40);
+    if !crate::observe::first_sight(slug, key) {
+        return;
+    }
+    crate::observe::fail(format!(
+        "store_target_narrowed reason={slug} fmt={declared_format:#x} {w}x{h} \
+         rendered=rgba8unorm {detail}"
+    ));
+}
+
 /// Load an opcode-9 buffer-backed texture as tight RGBA8 (width, height, bytes).
 ///
 /// The sampled bytes are the source MTLBuffer's guest storage read at `offset`

@@ -8049,3 +8049,100 @@ fn a_planes_drain_counts_every_arrival_even_past_the_ring_it_remembers() {
         "a plane that received nothing reports the count and no tail"
     );
 }
+
+/// The eight-bit colour orders lose nothing at `RGBA8Unorm`, and everything the
+/// contract admits as a store layout that is not one of them does.
+///
+/// # Why this is asserted over `store_texel_order` rather than a list
+///
+/// `ColorTargetNarrowing` is a second reading of the contract's own store
+/// table, and a second reading drifts. If a layout is added to
+/// `store_texel_order` and not considered here it would be reported as an exact
+/// render, which is the direction that says "nothing was lost" about a frame
+/// that lost something. So the two are compared over the whole ordinal space,
+/// and the only formats allowed to answer `None` are the two the contract maps
+/// to an eight-bit colour order.
+#[test]
+fn only_the_eight_bit_colour_orders_render_exactly_at_rgba8() {
+    use crate::contract::pixel_format::{store_texel_order, TexelLayout};
+    use crate::runtime::draw::{color_target_narrowing, ColorTargetNarrowing};
+    for format in 0u16..=0xffff {
+        let got = color_target_narrowing(format);
+        let want = match store_texel_order(format) {
+            Some(TexelLayout::Rgba8 | TexelLayout::Bgra8) => ColorTargetNarrowing::None,
+            Some(layout) => ColorTargetNarrowing::Quantised(layout),
+            None => ColorTargetNarrowing::Undeclared,
+        };
+        assert_eq!(got, want, "{format:#x}");
+    }
+}
+
+/// The formats this actually fires for on a live guest, named so a reader of
+/// the census knows what the counter is about.
+///
+/// `0x73` is `MTLPixelFormatRGBA16Float`, which a driven macos-13 boot reports
+/// as the window server's main compositing surface — the frame this rail
+/// quantises to 256 levels a channel on every Store. `0x50`/`0x51` are the
+/// BGRA8 pair the same boot reports for the other mappings, and they must stay
+/// exact or the counter would report the ordinary case as a loss.
+#[test]
+fn the_live_compositor_formats_answer_as_measured() {
+    use crate::contract::pixel_format::{
+        TexelLayout, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA16_FLOAT,
+    };
+    use crate::runtime::draw::{color_target_narrowing, ColorTargetNarrowing};
+    assert_eq!(
+        color_target_narrowing(MTL_FORMAT_RGBA16_FLOAT),
+        ColorTargetNarrowing::Quantised(TexelLayout::Rgba16Float),
+        "the window server's surface is the one that loses"
+    );
+    for exact in [MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB] {
+        assert_eq!(
+            color_target_narrowing(exact),
+            ColorTargetNarrowing::None,
+            "{exact:#x} is carried exactly"
+        );
+    }
+}
+
+/// A narrowing is counted on the always-on channel, and an exact target is
+/// quiet on it.
+///
+/// # Why
+///
+/// `AGENTS.md`: degraded guest work produces a typed reason, expected control
+/// flow stays quiet. A counter that fired for every Store would drown the one
+/// that matters, and one that fired for none would leave the loss where it was
+/// — invisible, which is how `present_identity`'s doc records the same defect
+/// surviving on the other rail.
+///
+/// Read as deltas because the route counters are process-cumulative and this
+/// test shares them with every other one in the binary.
+#[test]
+fn a_narrowed_target_is_counted_and_an_exact_one_is_quiet() {
+    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
+    use crate::runtime::drain::store_route_count;
+    use crate::runtime::draw::note_store_narrowing;
+
+    let before = store_route_count("store_target_narrowed");
+    note_store_narrowing(MTL_FORMAT_BGRA8_UNORM, 1920, 1080);
+    assert_eq!(
+        store_route_count("store_target_narrowed"),
+        before,
+        "an eight-bit target is ordinary work and says nothing"
+    );
+    note_store_narrowing(MTL_FORMAT_RGBA16_FLOAT, 1920, 1080);
+    assert_eq!(
+        store_route_count("store_target_narrowed"),
+        before + 1,
+        "the half-float target is counted"
+    );
+    // Unconditional, not first-sight: the census must carry the size of the
+    // loss and not merely its existence. The log line is what is deduped.
+    note_store_narrowing(MTL_FORMAT_RGBA16_FLOAT, 1920, 1080);
+    assert_eq!(
+        store_route_count("store_target_narrowed"),
+        before + 2,
+        "every narrowed Store counts, so the census reports a rate"
+    );
+}

@@ -955,9 +955,17 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     None
                 }
             });
+        // What this rail is about to do to the guest's declaration, counted
+        // before it does it. `pixel_format: 0` below is `RGBA8Unorm` for every
+        // target whatever the destination declared, and until this call there
+        // was nothing on the always-on channel to say when that quantised a
+        // wider one. See `runtime::draw::ColorTargetNarrowing`.
+        crate::runtime::draw::note_store_narrowing(c.format, width, height);
         color_rts.push(ColorRt {
             slot: c.slot,
-            // Host RT: 0 = RGBA8Unorm (writeback conversion path).
+            // Host RT: 0 = RGBA8Unorm (writeback conversion path). The one
+            // place this rail decides a colour target's format; the narrowing
+            // it can cause is named and counted directly above.
             pixel_format: 0,
             seed_rgba8: color_seeds[i].as_deref(),
             out_rgba8: Some(out),
