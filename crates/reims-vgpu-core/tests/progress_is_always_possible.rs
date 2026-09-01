@@ -205,7 +205,42 @@ impl Exercised {
 /// Drive one batch to completion under one policy, asserting that a state with
 /// work remaining and nothing enabled never occurs.
 fn drive(seed: u64, count: usize, channels: u32, queues: u32, policy: Policy) -> Exercised {
+    drive_withdrawing(seed, count, channels, queues, policy, false)
+}
+
+/// The same drive, optionally taking one transaction out before the loop
+/// starts.
+///
+/// **A withdrawal is the one action that removes work without completing it**,
+/// and it is the action a pipeline that will never build or a device loss
+/// forces. The transaction holds a position in the publication order, the
+/// dependency graph and the readiness service, and the last of those is the
+/// only thing that discharges another transaction's hazard wait — so a
+/// withdrawal that released the first plane and not the third strands every
+/// later transaction sharing its backing. That is a hang, it was real, and this
+/// driver is where it should have shown.
+///
+/// The transaction taken out is chosen so that **nothing waits on its
+/// completion word**. A stamp wait on a withdrawn producer can never be
+/// satisfied — the work never ran and no word is published for it, which is the
+/// contract — so withdrawing a producer would be a legitimate stall rather than
+/// a defect, and the property under test here is the *hazard* obligation.
+fn drive_withdrawing(
+    seed: u64,
+    count: usize,
+    channels: u32,
+    queues: u32,
+    policy: Policy,
+    withdraw_one: bool,
+) -> Exercised {
     let specs = batch(seed, count, channels);
+    // Nothing may wait on the one taken out; see the doc above. The last such
+    // transaction, so it has predecessors to have taken hazard waits on.
+    let doomed = withdraw_one
+        .then(|| {
+            (0..specs.len()).rfind(|i| specs.iter().all(|s| s.wait.map(|(_, p)| p) != Some(*i)))
+        })
+        .flatten();
     let mut model = SessionModel::new(SessionId(1));
     let mut map = QueueMap::new();
     for c in 1..=channels {
@@ -262,6 +297,13 @@ fn drive(seed: u64, count: usize, channels: u32, queues: u32, policy: Policy) ->
         ordinals.push(ordinal);
     }
 
+    let mut withdrawn: BTreeSet<IngressOrdinal> = BTreeSet::new();
+    if let Some(i) = doomed {
+        model.withdraw(ordinals[i]);
+        gate.retire(ordinals[i]);
+        withdrawn.insert(ordinals[i]);
+    }
+
     let mut rng = Rng::new(seed ^ 0x5EED);
     let mut ready: BTreeSet<IngressOrdinal> = BTreeSet::new();
     let mut submitted: BTreeSet<IngressOrdinal> = BTreeSet::new();
@@ -281,7 +323,7 @@ fn drive(seed: u64, count: usize, channels: u32, queues: u32, policy: Policy) ->
             .collect();
         let completable: Vec<IngressOrdinal> = submitted.difference(&completed).copied().collect();
 
-        if completed.len() == count {
+        if completed.len() + withdrawn.len() == count {
             assert!(
                 submittable.is_empty() && completable.is_empty(),
                 "everything completed and something is still enabled"
@@ -300,10 +342,11 @@ fn drive(seed: u64, count: usize, channels: u32, queues: u32, policy: Policy) ->
             !submittable.is_empty() || !completable.is_empty(),
             "seed {seed} policy {policy:?} step {step}: work remains and \
              nothing is enabled. ready={} submitted={} completed={}/{count} \
-             blocked={:?} gate_holds={}",
+             withdrawn={} blocked={:?} gate_holds={}",
             ready.len(),
             submitted.len(),
             completed.len(),
+            withdrawn.len(),
             model.publisher().blocked(),
             gate.holds()
         );
@@ -335,9 +378,10 @@ fn drive(seed: u64, count: usize, channels: u32, queues: u32, policy: Policy) ->
     }
 
     panic!(
-        "seed {seed} policy {policy:?}: {} of {count} completed within the step \
-         budget, which is livelock rather than progress",
-        completed.len()
+        "seed {seed} policy {policy:?}: {} of {count} completed ({} withdrawn) \
+         within the step budget, which is livelock rather than progress",
+        completed.len(),
+        withdrawn.len()
     );
 }
 
@@ -378,6 +422,35 @@ fn a_batch_always_has_something_it_can_do() {
         total.publication_blocked > 0,
         "no channel ever held a finished position behind an unfinished one"
     );
+}
+
+/// The same claim, with one transaction withdrawn before anything runs.
+///
+/// A withdrawal is the only action that removes work without completing it, and
+/// it is what a pipeline that will never build and a device loss both force. The
+/// withdrawn transaction was holding a position in three planes, and only one of
+/// them is the channel's publication order — the other two order later work, and
+/// leaving either behind strands every transaction that shares its backing.
+///
+/// The batches are the same shapes as the sweep above, so the difference between
+/// the two tests is the withdrawal and nothing else.
+#[test]
+fn a_batch_with_a_withdrawn_transaction_still_finishes() {
+    let mut total = Exercised::default();
+    for policy in Policy::ALL {
+        for seed in 0..24u64 {
+            total.absorb(drive_withdrawing(seed, 12, 4, 2, policy, true));
+            total.absorb(drive_withdrawing(seed, 10, 3, 1, policy, true));
+            total.absorb(drive_withdrawing(seed, 8, 1, 1, policy, true));
+            total.absorb(drive_withdrawing(seed, 10, 4, 4, policy, true));
+        }
+    }
+    // Non-vacuity, as the sweep above: a run in which nothing was ever held and
+    // no state needed a completion would pass on an implementation with no
+    // rules in it.
+    assert!(total.gate_holds > 0);
+    assert!(total.only_completable > 0);
+    assert!(total.publication_blocked > 0);
 }
 
 /// The sweep is only worth running if the interleavings actually differ. A
