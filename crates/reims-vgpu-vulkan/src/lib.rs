@@ -27,6 +27,8 @@
 //!   may branch on topology in a way the guest can observe.
 //! - [`queues`] — which queue family this rail submits to, and the value that
 //!   makes a `VkQueue` have exactly one owner.
+//! - [`barrier`] — what a declared barrier becomes on this host, and which of
+//!   the guest's stages this host has no equivalent for.
 //! - [`pools`] — one command pool per worker, and the rule that a command
 //!   buffer is recordable again only when the timeline says the GPU is done
 //!   with it.
@@ -39,6 +41,7 @@
 // precondition.
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod barrier;
 pub mod memory;
 pub mod pools;
 pub mod queues;

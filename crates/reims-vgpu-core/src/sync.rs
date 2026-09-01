@@ -38,7 +38,11 @@
 //! distinction for stamp waits, and an event wait joins it.
 
 use crate::identity::ResourceId;
-use reims_vgpu_protocol::residency::RenderStages;
+/// Re-exported because a barrier's stage mask is part of this vocabulary, and
+/// the executor that has to translate it sees this crate and not the protocol
+/// one. Reaching past core for it would be the executor taking a dependency its
+/// own layering rule forbids.
+pub use reims_vgpu_protocol::residency::RenderStages;
 pub use reims_vgpu_protocol::sync::{BarrierKind, BarrierScope, EventKind, FenceKind};
 
 /// A fence update or wait, on the encoder that issued it.
