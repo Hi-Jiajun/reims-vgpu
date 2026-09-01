@@ -699,6 +699,25 @@ fn note_resource_list_decode_fail(
         .fail_once(u64::from(opcode));
 }
 
+/// A fixed-size FIFO payload the guest sent short.
+///
+/// Same shape and same latching as [`note_resource_list_decode_fail`]: the
+/// decline carries the two lengths, this adds the command that was expecting
+/// them, and the pair is emitted once per opcode because a guest that sends a
+/// malformed command sends it malformed every time.
+fn note_short_payload(
+    op: &'static str,
+    opcode: u16,
+    channel_id: u32,
+    short: &crate::protocol::fifo::ShortPayload,
+) {
+    crate::observe::Emit::decline("packet_short", short)
+        .field("op", op)
+        .field("opcode", format!("{opcode:#x}"))
+        .field("ch", channel_id)
+        .fail_once(u64::from(opcode));
+}
+
 fn note_display_txn_payload(
     state: &mut DeviceState,
     channel_id: u32,
@@ -4396,13 +4415,13 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // surface and no packet said so" is what a lost half of it looks like
         // from the far end.
         CHILD_OP_REPLACE_PHYSICAL => {
-            if !packet_short(
-                "replace_physical",
-                Some(channel_id),
-                packet.payload.len(),
-                crate::protocol::fifo::CHILD_REPLACE_PHYSICAL_LEN as usize,
-            ) {
-                if let Some(cmd) = crate::protocol::fifo::decode_replace_physical(&packet.payload) {
+            // One bounds check, in the decoder that owns the layout. This arm
+            // used to make its own with the command's length constant and then
+            // call a decoder that checked the same floor again — so the second
+            // check was unreachable, and its `None` arm would have dropped the
+            // packet in silence if it ever were reached.
+            match crate::protocol::fifo::decode_replace_physical(&packet.payload) {
+                Ok(cmd) => {
                     // The GPA behind this resource changes here. The command is
                     // scoped to one task-local resource id, so unrelated
                     // resources on the same task keep both their authoritative
@@ -4424,6 +4443,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         cmd.task_id,
                         cmd.object_id,
                     );
+                }
+                Err(short) => {
+                    note_short_payload("replace_physical", packet.opcode, channel_id, &short);
                 }
             }
         }

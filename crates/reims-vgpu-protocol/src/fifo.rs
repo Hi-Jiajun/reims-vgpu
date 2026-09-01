@@ -43,6 +43,44 @@ pub const CHILD_REPLACE_PHYSICAL_LEN: u32 = 8;
 /// `clear_host_valid | set_host_valid | clear_guest_valid | set_guest_valid`.
 /// Pageon = clear hostValid + set guestValid (host cache stale; guest pages live).
 pub const CHILD_INVALIDATE_PAGEON_FLAGS: u32 = 0x0100_0001;
+/// A fixed-size FIFO payload shorter than the command that emitted it.
+///
+/// One type for every fixed-shape command here, because the fact is always the
+/// same one: the guest sent fewer bytes than the command's own layout needs, so
+/// there is nothing to read. The *command* is the caller's field to add — it
+/// has the opcode and the channel — which is what keeps this from needing a
+/// variant per command and keeps a new fixed-size decoder from needing a new
+/// refusal.
+///
+/// One slug, shared across the commands that use it, on the same footing as
+/// [`ResourceListDecodeError`]'s two: the caller's `op=` field is what tells
+/// them apart in the log, and without it neither type could name the command
+/// anyway — a decoder does not know its own opcode.
+///
+/// It exists because the alternative was in production: a caller checked the
+/// floor with its own literal, reported that, and then called a decoder that
+/// checked the same floor again and returned a bare `Option` whose `None` arm
+/// dropped the packet in silence. Two checks of one fact, one of them
+/// unreachable and the other unreported if it ever were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShortPayload {
+    pub plen: usize,
+    pub need: usize,
+}
+
+impl reims_vgpu_observe::Decline for ShortPayload {
+    fn slug(&self) -> &'static str {
+        "fifo_payload_short"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("plen", self.plen.to_string()),
+            ("need", self.need.to_string()),
+        ]
+    }
+}
+
 /// Why a `CmdInvalidateResources` / `CmdSynchronizeResources` payload did not
 /// decode.
 ///
@@ -403,11 +441,21 @@ pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc
 ///
 /// `task_id` is a plain slot id, as the other resource-list commands carry it,
 /// and not the doubled `DefineTask2` word.
-pub fn decode_replace_physical(payload: &[u8]) -> Option<ReplacePhysicalCommand> {
-    if payload.len() < CHILD_REPLACE_PHYSICAL_LEN as usize {
-        return None;
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the command's eight bytes.
+/// Typed rather than a bare `None`, so the one caller reports it instead of
+/// checking the same floor itself and dropping the `None` in silence.
+pub fn decode_replace_physical(payload: &[u8]) -> Result<ReplacePhysicalCommand, ShortPayload> {
+    let need = CHILD_REPLACE_PHYSICAL_LEN as usize;
+    if payload.len() < need {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need,
+        });
     }
-    Some(ReplacePhysicalCommand {
+    Ok(ReplacePhysicalCommand {
         task_id: ld32(&payload[CHILD_REPLACE_PHYSICAL_TASK_ID as usize..]),
         object_id: ld32(&payload[CHILD_REPLACE_PHYSICAL_OBJECT_ID as usize..]),
     })
@@ -702,15 +750,22 @@ mod tests {
         payload.extend_from_slice(&0x5566_7788u32.to_le_bytes());
         assert_eq!(
             decode_replace_physical(&payload),
-            Some(ReplacePhysicalCommand {
+            Ok(ReplacePhysicalCommand {
                 task_id: 0x1122_3344,
                 object_id: 0x5566_7788,
             })
         );
         // One byte short is not a replace. Refused rather than clamped: acting
         // on object id zero re-points whatever holds slot zero.
-        for short in 0..CHILD_REPLACE_PHYSICAL_LEN as usize {
-            assert_eq!(decode_replace_physical(&payload[..short]), None, "{short}");
+        for plen in 0..CHILD_REPLACE_PHYSICAL_LEN as usize {
+            assert_eq!(
+                decode_replace_physical(&payload[..plen]),
+                Err(ShortPayload {
+                    plen,
+                    need: CHILD_REPLACE_PHYSICAL_LEN as usize
+                }),
+                "{plen}"
+            );
         }
         // And a longer payload decodes the same two words rather than refusing;
         // the length is the guest's and a trailer this device does not name is
@@ -718,7 +773,7 @@ mod tests {
         payload.extend_from_slice(&[0xff; 16]);
         assert_eq!(
             decode_replace_physical(&payload).map(|c| c.object_id),
-            Some(0x5566_7788)
+            Ok(0x5566_7788)
         );
     }
 
@@ -815,9 +870,8 @@ mod tests {
                         <= len
                 );
             }
-            let replaced = decode_replace_physical(&payload);
             assert_eq!(
-                replaced.is_some(),
+                decode_replace_physical(&payload).is_ok(),
                 len >= CHILD_REPLACE_PHYSICAL_LEN as usize
             );
         }

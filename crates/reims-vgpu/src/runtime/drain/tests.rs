@@ -565,6 +565,63 @@ fn replace_physical_drops_the_cached_page_list() {
     );
 }
 
+/// A `CmdReplacePhysical` too short to hold its eight bytes reports, and does
+/// not act.
+///
+/// The arm checked the floor itself and then called a decoder that checked it
+/// again and returned a bare `Option`. The second check could not fire, and if
+/// it ever had, its `None` arm dropped the packet without a word — on the
+/// command that re-points a resource at different host frames, where a dropped
+/// one leaves this device resolving a stale address.
+#[test]
+fn a_short_replace_physical_is_reported_and_not_acted_on() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::default();
+    // Two mappings: the one a well-formed packet would name, and the one a
+    // decoder that zero-filled the words it could not read would name instead.
+    // Nothing may touch either.
+    for object in [0u32, 7] {
+        state.mappings.insert(object, Default::default());
+        if let Some(m) = state.mappings.get_mut(&object) {
+            m.page_entries = vec![0x11, 0x22, 0x33];
+        }
+    }
+    let short = |plen: usize| Packet {
+        opcode: CHILD_OP_REPLACE_PHYSICAL,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + plen as u32,
+        completion_stamp: 0,
+        payload: vec![0u8; plen],
+        next_head: 0,
+    };
+    // Seven bytes first, and alone in its own capture. It is the length a
+    // decoder that read what it could and zero-filled the rest would accept —
+    // the line is latched per opcode, so a later length reporting instead of
+    // this one would look identical from outside.
+    let cap = crate::observe::FailCapture::start();
+    process_child_packet(&mut state, &mut host, 2, &short(7));
+    let lines = cap.lines();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("fifo_payload_short"))
+        .unwrap_or_else(|| panic!("a short replace-physical said nothing: {lines:?}"));
+    assert!(
+        line.contains("op=replace_physical") && line.contains("need=8") && line.contains("plen=7"),
+        "the line must name the command, what it needed and what it got: {line}"
+    );
+    for plen in 0..7usize {
+        process_child_packet(&mut state, &mut host, 2, &short(plen));
+    }
+    for object in [0u32, 7] {
+        assert_eq!(
+            state.mappings.get(&object).map(|m| m.page_entries.len()),
+            Some(3),
+            "a packet with nothing to read must not re-point anything, least of \
+             all whatever holds slot zero"
+        );
+    }
+}
+
 /// A re-point naming a mapper-ref-texture resource reaches the mapping associated with its
 /// task-local ref. This is the packet family the arm used to drop entirely —
 /// 57 % of the re-points on a driven boot found no mapping under `object_id` —
