@@ -25,6 +25,8 @@
 //!   is a performance bug and never a correctness one: topology selects a
 //!   preference order, the required flags are always the fallback, and nothing
 //!   may branch on topology in a way the guest can observe.
+//! - [`queues`] — which queue family this rail submits to, and the value that
+//!   makes a `VkQueue` have exactly one owner.
 
 // Calling Vulkan is unsafe by construction; a `forbid` here would be a lie the
 // first entry point breaks. `unsafe_op_in_unsafe_fn` is the rule that actually
@@ -33,3 +35,4 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod memory;
+pub mod queues;

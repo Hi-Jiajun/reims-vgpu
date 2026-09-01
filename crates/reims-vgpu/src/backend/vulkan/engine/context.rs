@@ -3,6 +3,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use ash::vk;
+use reims_vgpu_vulkan::queues;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -890,48 +891,16 @@ impl DeviceContext {
             DrawError::Init(decline)
         })?;
         let qfs = instance.get_physical_device_queue_family_properties(pd);
-        // Prefer a combined GRAPHICS|COMPUTE family so draws and dispatches share
-        // one queue / submission order. Fall back to graphics-only (compute requests
-        // then fail named Unsupported).
-        let graphics_compute = qfs.iter().position(|q| {
-            q.queue_flags
-                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
-        });
-        let graphics_only = qfs
-            .iter()
-            .position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS));
-        let (gq, compute_capable) = match (graphics_compute, graphics_only) {
-            (Some(i), _) => (i as u32, true),
-            (None, Some(i)) => (i as u32, false),
-            (None, None) => {
-                return Err(DrawError::Init(InitDecline::NoGraphicsQueueFamily));
-            }
-        };
-        // A queue family that transfers and does nothing else is a dedicated
-        // copy engine, and the reason to want one is that this device's largest
-        // remaining cost is bytes crossing the bus: a driven Safari drag moves
-        // ~2.7 GB of guest buffer runs into device-local memory and writes
-        // ~5.1 GB of rendered surface back to guest pages every second, all of
-        // it recorded into the draw's own command buffer, where it serialises
-        // against the rendering it feeds.
-        //
-        // Selected here and reported below, and nothing yet asks for a queue
-        // from it — the reading comes first, on every pathway, because most
-        // integrated parts have no such family and a rail built for one would
-        // then be a rail most hosts never take.
-        //
-        // Selected by what the family can do, never by device or driver name.
-        // `TRANSFER` alone is the whole test: `GRAPHICS` or `COMPUTE` implies
-        // transfer support, so a family carrying either is the one this device
-        // already submits draws to and moving copies there buys nothing.
-        // Sparse-binding and the video/optical-flow bits do not disqualify a
-        // family — they say what else the hardware block can do, not that it
-        // shares the graphics engine.
-        //
-        // `None` on a host with no such family, where everything stays on `gq`.
-        // That is not a fallback: it is the only arrangement most integrated
-        // parts offer.
-        let transfer_qf = dedicated_transfer_family(&qfs);
+        // Which family this rail submits to, and whether the host has a copy
+        // engine, are one owner's answer: `reims_vgpu_vulkan::queues`. It reads
+        // flags and nothing else, it carries the measurement that says why the
+        // copy engine is recorded and not submitted to, and having it here as
+        // well would be a second answer to the same question.
+        let plan = queues::QueuePlan::choose(&queues::families(&qfs))
+            .map_err(|_| DrawError::Init(InitDecline::NoGraphicsQueueFamily))?;
+        let gq = plan.universal().index;
+        let compute_capable = plan.compute();
+        let transfer_qf = plan.dedicated_transfer().map(|f| f.index);
         let prio = [1.0f32];
         let qci = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(gq)
@@ -1720,143 +1689,6 @@ impl DeviceContext {
     }
 }
 
-/// The index of a queue family that transfers and does nothing else — a copy
-/// engine that runs beside the graphics one rather than through it.
-///
-/// `TRANSFER` alone is the whole test. `GRAPHICS` and `COMPUTE` both imply
-/// transfer support, so a family carrying either is one this device already
-/// submits draws to, and moving a copy there would buy nothing. Sparse binding,
-/// video decode/encode and optical flow do **not** disqualify a family: they say
-/// what else that hardware block can do, not that it shares the graphics engine.
-///
-/// `None` where the host has no such family, which is most integrated parts.
-/// That is the arrangement rather than a degraded one, and the caller keeps
-/// every copy on the graphics queue.
-///
-/// # What a boot found, and what it is worth
-///
-/// This was added without ever being read on a live device. It has been now, on
-/// the x86/Vulkan pathway against an RTX 5080 Laptop:
-///
-/// ```text
-/// vk_queues families=6 graphics_family=0 compute_capable=true transfer_family=1
-/// ```
-///
-/// So the copy engine is there, and every byte this device moves is still going
-/// to family 0 with the draws. The size of that is measurable rather than
-/// arguable, because the guest-page writeback carries its own GPU timestamps: a
-/// driven Safari-drag second reports `gpu_us=167437` over `gpu=836` copies —
-/// **167 ms of GPU time per second at ~200 us a copy**, which for a 3.33 MB
-/// copy is a healthy ~16 GB/s and not a slow rail. Scaling the buffer gather by
-/// its share of the bytes (2.74 GB/s against the writeback's 5.19) puts total
-/// copy occupancy near 255 ms/s.
-///
-/// In the same second `draw_phase`'s `slot_us` is 245 ms/s — the drain worker
-/// blocked in `begin_entry` on a ring slot whose fence the GPU has not signalled.
-/// Those two numbers being within 5 % of each other is the reason to look here:
-/// the CPU's wait for the GPU is about the size of the GPU's copy work, and that
-/// work is serialised against the rendering only because it shares a queue.
-///
-/// # An ablation says the whole ceiling is this
-///
-/// The correspondence above is not a proof, so it was tested directly: a probe
-/// boot recorded the writeback's barriers, batch flush, stamp and every CPU-side
-/// bookkeeping step exactly as normal, and skipped only the
-/// `cmd_copy_image_to_buffer`/scatter commands themselves — the GPU work, and
-/// nothing else. The guest loses its frames that way, so it is an ablation and
-/// never a shipping arm; it is recorded here because of what it measured.
-///
-/// | | shipping | writeback GPU work removed |
-/// |---|---|---|
-/// | `present_hz` median | 72.7-76.4 | **104.0** |
-/// | seconds below 100 Hz | 24/24 | **4/25** |
-/// | `slot_us` | 245 750 us/s | **3 986 us/s** |
-/// | `drain_duty` `duty` | 0.81 | 0.59 |
-/// | `draw_us/draw` | 132-139 us | 78 us |
-/// | draws | 4 383-4 800/s | 5 916-6 407/s |
-///
-/// `slot_us` falls by a factor of 62. It was not ring depth, not submission
-/// overhead and not jitter: it was this device's own copies sitting in the queue
-/// ahead of the draws whose slots it was waiting for. Every earlier attempt on
-/// `slot_us` moved a number that was downstream of this one, which is why
-/// halving the submissions once bought no frames at all.
-///
-/// # The prize is not here, and a built rail measured that
-///
-/// It reads from the table above as if moving the copies off this queue were
-/// worth the gap between 76 Hz and 104 Hz. It is not, and the way to find that
-/// out was to build it: a second queue, a ring of transfer command buffers, two
-/// timeline semaphores, and the writeback's scatter submitted to the copy
-/// engine instead of appended to the draw batch. It ran, on the x86/Vulkan
-/// pathway against the same host, with `vk_queues transfer_family=1`.
-///
-/// The split was at the **scratch buffer**, not at the image, and that part of
-/// the design was right and stays recorded because it is the cheap answer to the
-/// ownership problem below. The detile (`vkCmdCopyImageToBuffer` into the
-/// device-local scratch) stayed on `gq`, so the render target never left its
-/// family and never gave up its lossless framebuffer compression. Only the
-/// scatter — `vkCmdCopyBuffer` out of the scratch into imported guest pages —
-/// crossed, and the only resources both queues saw were buffers, which are free
-/// to share `CONCURRENT`.
-///
-/// What four driven Safari-drag boots measured, against a 67.8 Hz baseline taken
-/// on the same tree and machine that hour:
-///
-/// | arrangement | `present_hz` med | `slot_us` | CPU wait on the copy engine |
-/// |---|---|---|---|
-/// | shipping — every copy on `gq` | 67.8 | 265 000 us/s | — |
-/// | scatter on the copy engine, 4-deep ring | 67.4 | **8 000 us/s** | 240 000 us/s |
-/// | same, 16-deep | 69.8 | 290 000 us/s | ~0 |
-/// | same, 64-deep | 69.0 | 230 000 us/s | ~0 |
-///
-/// `slot_us` really does collapse — by 33x, close to what the ablation
-/// predicted. And it buys nothing, because **the block is conserved**. At depth
-/// 4 the drain worker stops waiting for a ring slot and starts waiting for a
-/// transfer command buffer instead, for the same 240 ms a second. Deepening the
-/// ring removes that wait and the block reappears a third time, as the graphics
-/// submission's own write-after-read wait for the scratch buffer it is about to
-/// overwrite. Three arrangements, three different counters, one number.
-///
-/// # Because the wall is the bus, and every queue shares it
-///
-/// A narrower ablation says so directly. Skipping only the image read, with the
-/// scatter still running and still moving its bytes, gives **72.9 Hz** — four
-/// Hertz, not thirty. The earlier ablation reached 104 Hz because it removed the
-/// scatter too, and with it the bus traffic. A copy engine moves those same
-/// bytes over that same link.
-///
-/// The traffic is the finding: ~1 500 guest-page writebacks a second at ~3.34 MB
-/// each is **~5.0 GB/s into guest RAM**, sustained, at ~70 displayed frames a
-/// second. That is about **21 full-surface writebacks per frame the user sees**,
-/// spread over roughly six surfaces — and it is split across two rails, the
-/// render Store at ~613/s (`readback_split`'s `vouch`) and the GVA Store making
-/// up the rest of `guest_write_linear`.
-///
-/// So the route to 120 Hz is fewer bytes crossing, and nothing about which
-/// engine carries them. Do not rebuild this rail to chase frames. It is worth
-/// rebuilding only *after* the byte volume comes down, when a decoupled
-/// `slot_us` would have something left to convert into frames — and the shape it
-/// should take is the one above.
-///
-/// A copy engine is still not free, and anything built here has to answer three
-/// costs the shared queue does not pay: a cross-queue dependency needs a
-/// semaphore rather than a pipeline barrier, an image written by one family and
-/// read by another needs an ownership transfer or `CONCURRENT` sharing, and
-/// splitting a copy out of the batch it is currently appended to restores the
-/// second submission that appending it removed. Splitting at the scratch buffer
-/// answers the middle one for nothing, which is why that is where it belongs.
-fn dedicated_transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
-    families
-        .iter()
-        .position(|q| {
-            q.queue_flags.contains(vk::QueueFlags::TRANSFER)
-                && !q
-                    .queue_flags
-                    .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
-        })
-        .map(|i| i as u32)
-}
-
 /// Process-global engine state ownership (device + recreate policy + init fail cache).
 pub(crate) struct ContextOwner {
     pub ctx: Option<DeviceContext>,
@@ -2391,86 +2223,6 @@ mod pipeline_cache_blob_tests {
             }
         }
         std::fs::remove_dir_all(&root).ok();
-    }
-}
-
-#[cfg(test)]
-mod transfer_family_tests {
-    use super::*;
-
-    fn family(flags: vk::QueueFlags) -> vk::QueueFamilyProperties {
-        vk::QueueFamilyProperties::default()
-            .queue_flags(flags)
-            .queue_count(1)
-    }
-
-    /// A family that also draws or dispatches is one this device already
-    /// submits to, so picking it would move nothing off the graphics engine
-    /// while adding an ownership transfer to every copy. Both bits disqualify,
-    /// and `TRANSFER` is often not even spelled on a graphics family — the spec
-    /// makes it implicit — so the test is over families that name it and
-    /// families that do not.
-    #[test]
-    fn a_family_that_also_draws_or_dispatches_is_not_a_copy_engine() {
-        use vk::QueueFlags as F;
-        for flags in [
-            F::GRAPHICS,
-            F::COMPUTE,
-            F::GRAPHICS | F::COMPUTE,
-            F::GRAPHICS | F::TRANSFER,
-            F::COMPUTE | F::TRANSFER,
-            F::GRAPHICS | F::COMPUTE | F::TRANSFER | F::SPARSE_BINDING,
-        ] {
-            assert_eq!(
-                dedicated_transfer_family(&[family(flags)]),
-                None,
-                "{flags:?} shares the engine this device already submits to"
-            );
-        }
-    }
-
-    /// The bits that say what *else* a copy engine can do must not disqualify
-    /// it. A discrete part commonly exposes several transfer-only families that
-    /// differ exactly in these, and refusing them would leave a host with a copy
-    /// engine reading as a host without one.
-    #[test]
-    fn the_other_bits_on_a_transfer_only_family_do_not_disqualify_it() {
-        use vk::QueueFlags as F;
-        for extra in [
-            F::empty(),
-            F::SPARSE_BINDING,
-            F::VIDEO_DECODE_KHR,
-            F::VIDEO_ENCODE_KHR,
-            F::OPTICAL_FLOW_NV,
-        ] {
-            assert_eq!(
-                dedicated_transfer_family(&[family(F::TRANSFER | extra)]),
-                Some(0),
-                "TRANSFER | {extra:?} is still a copy engine"
-            );
-        }
-    }
-
-    /// A family with no transfer bit at all is not one, and a host that offers
-    /// none answers `None` rather than falling to index zero — which would
-    /// submit copies to the graphics family under a name that says otherwise.
-    #[test]
-    fn a_host_with_no_copy_engine_answers_none_rather_than_the_first_family() {
-        use vk::QueueFlags as F;
-        assert_eq!(dedicated_transfer_family(&[]), None);
-        assert_eq!(
-            dedicated_transfer_family(&[family(F::GRAPHICS | F::COMPUTE | F::TRANSFER)]),
-            None,
-            "the single-family host every integrated part presents"
-        );
-        assert_eq!(
-            dedicated_transfer_family(&[
-                family(F::GRAPHICS | F::COMPUTE | F::TRANSFER),
-                family(F::TRANSFER | F::SPARSE_BINDING),
-            ]),
-            Some(1),
-            "the second family is the copy engine and the index must be its own"
-        );
     }
 }
 
