@@ -736,7 +736,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     range_length: u64,
 ) -> EncodeStatus {
     use crate::backend::metal::runtime::{system_device, thread_queue};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::icb::metal::{fill_icb_from_command_memory, resolve_metal_icb};
     use ::metal::*;
 

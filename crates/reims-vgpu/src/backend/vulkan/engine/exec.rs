@@ -1518,14 +1518,14 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         let Some(expected) = reims_vgpu_protocol::extent::tight_image_bytes(
             req.width,
             req.height,
-            crate::contract::pixel_format::RGBA8_BPP as usize,
+            crate::protocol::pixel_format::RGBA8_BPP as usize,
         ) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::UnrepresentableImageBytes {
                     width: req.width,
                     height: req.height,
                     layers: 1,
-                    bytes_per_texel: crate::contract::pixel_format::RGBA8_BPP,
+                    bytes_per_texel: crate::protocol::pixel_format::RGBA8_BPP,
                 },
             ));
         };
@@ -1699,8 +1699,8 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // zero — that is the spelling Metal requires, the decoder deliberately
         // preserves it, and this binding's divisor is 0 whatever the rate says.
         // Asking `rate == 0` alone declined that guest's draw outright, for a
-        // field nothing downstream reads. `contract::vertex_step` owns the pair.
-        if !crate::contract::vertex_step::step_rate_in_contract(
+        // field nothing downstream reads. `protocol::vertex_step` owns the pair.
+        if !crate::protocol::vertex_step::step_rate_in_contract(
             attribute.step_function.mtl_ordinal(),
             attribute.step_rate,
         ) {
@@ -1890,7 +1890,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         };
         // Four factors, so the widening the operands already carry is not
         // enough — see the target-seed check above for why two of them exhaust
-        // a u64 on their own. `contract::extent` owns the checked form.
+        // a u64 on their own. `protocol::extent` owns the checked form.
         let Some(expected) = reims_vgpu_protocol::extent::tight_layered_block_bytes(
             image.width,
             image.height,
@@ -3425,7 +3425,7 @@ pub(crate) unsafe fn execute_draw_inner(
         };
         let pixels = req.width.saturating_mul(req.height);
         let mut wide = vec![0u8; (pixels as usize) * (layout.bytes_per_texel() as usize)];
-        if !crate::contract::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
+        if !crate::protocol::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
             return Err(DrawError::DrawExecution(
                 DrawExecutionDecline::SeedFormatUnwritable {
                     format: color0_format,
@@ -6997,7 +6997,7 @@ mod tests {
                 ),
                 byte_origin: Default::default(),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
-                    crate::contract::pixel_format::TexelLayout::Bgra8,
+                    crate::protocol::pixel_format::TexelLayout::Bgra8,
                 ),
                 identity: None,
                 swizzle: Default::default(),
@@ -7434,7 +7434,7 @@ mod tests {
     /// `1`.
     #[test]
     fn integer_attachment_clears_use_integer_union_members() {
-        use crate::contract::pixel_format::MTL_FORMAT_RG16_UINT;
+        use crate::protocol::pixel_format::MTL_FORMAT_RG16_UINT;
 
         let attachment =
             crate::backend::vulkan::translate::pixel::color_attachment(MTL_FORMAT_RG16_UINT)

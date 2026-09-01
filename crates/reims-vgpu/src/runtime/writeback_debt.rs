@@ -1918,7 +1918,7 @@ mod tests {
             row_stride: 256,
             width: 64,
             height: 64,
-            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
             generation,
             guest_write: Default::default(),
             seq: 0,

@@ -544,9 +544,9 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let (tg_x, tg_y, tg_z) = (tg.x, tg.y, tg.z);
     // Resolved here, before any staging, so a record with no work costs nothing
     // — but computed by the same function that refuses the zero, because the two
-    // are one rule. See [`crate::contract::dispatch::workgroup_counts`] for why
+    // are one rule. See [`crate::protocol::dispatch::workgroup_counts`] for why
     // splitting them put an unreachable `.max(1)` on the quotients.
-    let Some([wg_x, wg_y, wg_z]) = crate::contract::dispatch::workgroup_counts(
+    let Some([wg_x, wg_y, wg_z]) = crate::protocol::dispatch::workgroup_counts(
         [grid_x, grid_y, grid_z],
         [tg_x, tg_y, tg_z],
         dispatch_threads,

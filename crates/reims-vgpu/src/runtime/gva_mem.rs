@@ -208,7 +208,7 @@ fn note_read_refusal(task_id: u32, gva: u64, named: MemError) {
 /// is not a rule a reader has to hold, and it is not something to go looking
 /// for: this gate and the one on [`define_task_pages_arm64e`] are the only two
 /// arch-fixed functions in the crate, and behind them a product call is a
-/// `cannot find function` from rustc rather than a finding. `contract::gva`
+/// `cannot find function` from rustc rather than a finding. `protocol::gva`
 /// exposes the arch-fixed *constants* ungated, which is fine — a shift is
 /// picked from `state.page_shift` at the call site, and a constant cannot
 /// silently walk a page table at the wrong stride the way a helper can.
@@ -243,9 +243,9 @@ pub fn define_task_pages_arm64e(
     data_base_pfn: u32,
     pages: u32,
 ) {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::PAGE_SHIFT_ARM64E;
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     let dir_pfn = 2u32;
     let root_pfn = 3u32;
     let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
@@ -814,8 +814,8 @@ pub fn format_active_tasks(tasks: &TaskTable) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
     use crate::observe::Decline;
+    use crate::protocol::endian::st32;
 
     /// The collapse this migration ended: every distinct check — the walk's own
     /// and four more here — answered `MemError::Unmapped`, and
@@ -893,8 +893,8 @@ mod tests {
         assert_eq!(MemError::Unresolved(R::Ok).slug(), "mem_unresolved_ok");
     }
 
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{DeviceId, DeviceState, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::RESOURCE_PAGE_SHIFT;
     use crate::runtime::host::FakeHost;
 

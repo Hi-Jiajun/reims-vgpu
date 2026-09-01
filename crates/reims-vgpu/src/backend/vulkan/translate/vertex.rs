@@ -369,14 +369,14 @@ mod tests {
     ///
     /// [`VertexStepFunction::mtl_ordinal`] exists so a rule stated over the
     /// guest's ordinal can be asked on this side — the step/rate pair in
-    /// `contract::vertex_step` is the one that does — and a rule asked through
+    /// `protocol::vertex_step` is the one that does — and a rule asked through
     /// an inverse that is not an inverse is a rule asked about a different
     /// attribute. The three accepted ordinals are named from the contract here
     /// rather than spelled again, so this also pins that the `match` above
     /// agrees with the declaration.
     #[test]
     fn an_accepted_step_function_round_trips_to_its_own_ordinal() {
-        use crate::contract::vertex_step as step;
+        use crate::protocol::vertex_step as step;
         for ordinal in [
             step::MTL_VERTEX_STEP_FUNCTION_CONSTANT,
             step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,

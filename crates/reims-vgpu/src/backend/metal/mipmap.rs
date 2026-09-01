@@ -6,7 +6,7 @@
 //!
 //! What is left here is exactly the part that needs a device. The request's
 //! argument ladder, the filterable-format set and [`MetalMipmapError`] itself
-//! are arithmetic over guest numbers, so they live in [`crate::contract::mipmap`]
+//! are arithmetic over guest numbers, so they live in [`crate::protocol::mipmap`]
 //! where they can be executed on a host with no Apple linker — which is where
 //! five of this module's six tests went with them. The one that stayed
 //! (`metal_generate_constant_rgba8_preserves_color`) asks Metal to filter real
@@ -14,7 +14,7 @@
 
 use crate::backend::metal::mtl_enum;
 use crate::backend::metal::runtime::{system_device, thread_queue};
-use crate::contract::mipmap::{filterable_bpp, plan_level0, MetalMipmapError};
+use crate::protocol::mipmap::{filterable_bpp, plan_level0, MetalMipmapError};
 use metal::{
     MTLCommandBufferStatus, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize, MTLStorageMode,
     MTLTextureType, MTLTextureUsage, TextureDescriptor,
@@ -152,7 +152,7 @@ pub fn generate_mipmaps_filtered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM;
 
     #[test]
     fn metal_generate_constant_rgba8_preserves_color() {

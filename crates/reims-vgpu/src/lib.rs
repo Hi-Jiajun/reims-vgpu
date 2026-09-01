@@ -2,7 +2,7 @@
 //!
 //! | Module | Role |
 //! | --- | --- |
-//! | [`contract`] | Stable facts: formats, layouts, pure arithmetic |
+//! | [`protocol`] | Stable facts: formats, layouts, pure arithmetic |
 //! | [`model`] | Live guest-visible state (regs, rings, objects, present) |
 //! | [`runtime`] | Drain / parse / resolve / plan / HostActions |
 //! | [`backend`] | Trait + self-contained [`backend::metal`] / [`backend::vulkan`] |
@@ -91,10 +91,15 @@ compile_error!(
 pub use reims_vgpu_config as config;
 /// The backend-neutral protocol vocabulary, in the crate that owns it.
 ///
-/// Re-exported under the path every caller already writes
-/// (`crate::contract::…`). See `reims_vgpu_contract` for what the crate
-/// boundary makes true that the module boundary only asserted.
-pub use reims_vgpu_contract as contract;
+/// The first layer allowed to say what a wire tag *means*: formats, layouts,
+/// geometry, page arithmetic, the closed ordinal rules, and the refusals they
+/// name. It absorbed `reims-vgpu-contract`, which had the same job under a
+/// second name — one vocabulary in two crates is two places to look and two
+/// places for a rule to drift.
+///
+/// See `reims_vgpu_protocol` for what the crate boundary makes true that a
+/// module boundary only asserted.
+pub use reims_vgpu_protocol as protocol;
 pub mod model;
 /// Crate-wide observability: the always-on fail sink and the decline
 /// vocabulary. Above `runtime/` because every subsystem owes the reader a

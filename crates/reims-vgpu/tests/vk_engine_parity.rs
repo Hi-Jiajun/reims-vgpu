@@ -2424,7 +2424,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
 /// is exactly the silent failure this asserts against.
 #[test]
 fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
-    use reims_vgpu::contract::pixel_format;
+    use reims_vgpu::protocol::pixel_format;
 
     let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
@@ -3490,7 +3490,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         width: 16,
         height: 16,
         attachment: color_attachment(
-            reims_vgpu::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            reims_vgpu::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,
             [0.0, 0.0, 1.0, 1.0],
         ),
         load: false,
@@ -3583,7 +3583,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         width: 32,
         height: 32,
         attachment: color_attachment(
-            reims_vgpu::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+            reims_vgpu::protocol::pixel_format::MTL_FORMAT_RG16_FLOAT,
             [1.0, 0.5, 0.0, 0.0],
         ),
         load: false,
@@ -3652,7 +3652,7 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
             width: w,
             height: h,
             attachment: color_attachment(
-                reims_vgpu::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                reims_vgpu::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,
                 [0.0, 0.0, 1.0, 1.0],
             ),
             load: false,

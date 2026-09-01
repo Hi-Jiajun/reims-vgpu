@@ -1192,7 +1192,7 @@ mod tests {
     /// and read identically.
     #[test]
     fn a_backing_render_target_declines_the_decoders_format_refusal() {
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::drain::store_route_count;
 
         let before = store_route_count("rt_base_fmt_declined");
@@ -1223,7 +1223,7 @@ mod tests {
     /// on a driven macos-13 boot at icon size.
     #[test]
     fn a_ref_texture_views_declared_format_is_what_the_colour_attachment_attaches() {
-        use crate::contract::pixel_format::{
+        use crate::protocol::pixel_format::{
             MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA16_FLOAT,
         };
         use crate::runtime::objects::RefTextureView;
@@ -1473,9 +1473,9 @@ mod tests {
     /// at LOD 0.
     #[test]
     fn a_colour_attachment_at_mip_one_resolves_that_levels_own_plane() {
-        use crate::contract::endian::{st16, st32, st64};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::model::PAGE_SHIFT_ARM64E;
+        use crate::protocol::endian::{st16, st32, st64};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::decode::resource::{
             list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
             TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS,
@@ -1583,9 +1583,9 @@ mod tests {
     /// rows overlapping in guest memory.
     #[test]
     fn a_linear_target_with_a_stride_narrower_than_its_own_row_names_both_numbers() {
-        use crate::contract::endian::{st16, st32, st64};
-        use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
         use crate::model::PAGE_SHIFT_ARM64E;
+        use crate::protocol::endian::{st16, st32, st64};
+        use crate::protocol::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
         use crate::runtime::decode::resource::{
             list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
             TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,

@@ -272,18 +272,18 @@ pub const fn scanout_extent_ok(width: u32, height: u32) -> bool {
     scanout_extent_fault(width, height).is_none()
 }
 
-// Single source of truth for the shifts: `contract::gva::PAGE_SHIFT_*`,
+// Single source of truth for the shifts: `protocol::gva::PAGE_SHIFT_*`,
 // re-exported rather than restated. There is **no** bare `PAGE_SIZE` /
 // `PAGE_SHIFT` — those names defaulted to arm16K and caused x86 wild writes
 // (stamp slots). Product code uses `state.page_size()` / `state.page_shift`;
 // fixtures pick an arch-qualified name.
 //
-// The two `PAGE_SIZE_*` below are NOT the `contract::gva` constants of the same
+// The two `PAGE_SIZE_*` below are NOT the `protocol::gva` constants of the same
 // name: those are `u32` for page-offset masking, these are the `u64` widening
 // the device's address arithmetic and its fixtures want. Both derive from the
 // one re-exported shift, so they cannot disagree in value — but the names do
 // collide, so import from one module or the other on purpose.
-pub(crate) use crate::contract::gva::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+pub(crate) use crate::protocol::gva::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 // Gated with the fixtures that want them. That is the same statement the
 // comment above makes, now enforced rather than asserted: no product path
 // names either one, because product code goes through `state.page_size()`.
@@ -1247,7 +1247,7 @@ pub const DEVICE_INFO_KEY_RGB10A2_GAMMA: u32 = 8;
 /// out on, so it is a promise about what this device can address rather than a
 /// capability it can decline later.
 ///
-/// Distinct from [`crate::contract::iosurface_pages::ROW_BYTES_ALIGN`], which is
+/// Distinct from [`crate::protocol::iosurface_pages::ROW_BYTES_ALIGN`], which is
 /// an IOSurface row estimate for counting pages and is deliberately not a pitch.
 /// Do not relate the two: one is Metal's linear-texture rule and the other is
 /// IOSurface's allocator, and nothing says they are the same number.
@@ -1350,7 +1350,7 @@ pub const DEVICE_INFO_SERIALIZER_VERSION: u32 = 8;
 ///
 /// Not a count and not a maximum: the guest's `supportsPrimitiveType:` tests
 /// **bit `type`** of this value for any `type <= 8`, and answers `type < 5` when
-/// the key is absent. See [`crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES`]
+/// the key is absent. See [`crate::protocol::draw::EXECUTABLE_PRIMITIVE_TYPES`]
 /// for what this device puts in it and why that is narrower than the capture.
 ///
 /// Narrowing it changed nothing on the x86 pathway, as expected and no more
@@ -1520,7 +1520,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     ),
     (
         DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK,
-        crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES,
+        crate::protocol::draw::EXECUTABLE_PRIMITIVE_TYPES,
     ),
     (DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES, 1),
     (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 256),
@@ -2269,7 +2269,7 @@ mod tests {
     /// `reims-vgpu-mmio.c` sizes its `mach_vm_remap` view, its alignment mask
     /// and its packed-contiguity stride from the header's arm64e page size,
     /// while every Rust reader derives the same number from
-    /// `contract::gva::PAGE_SHIFT_ARM64E`. A drift is a view built at one
+    /// `protocol::gva::PAGE_SHIFT_ARM64E`. A drift is a view built at one
     /// stride and addressed at another, on one pathway, with no failure at the
     /// seam.
     ///

@@ -196,11 +196,11 @@ mod tests {
     use reims_vgpu_wire::OP_HEADER_LEN;
 
     use super::*;
-    use crate::contract::endian::{st32, st64};
     use crate::model::{
         DeviceId, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
         PAGE_SHIFT_ARM64E,
     };
+    use crate::protocol::endian::{st32, st64};
     use crate::runtime::decode::event::{
         OP_SIGNAL_EVENT, OP_WAIT_EVENT, OP_WAIT_EVENT_TIMEOUT, SIGNAL_WAIT_PAYLOAD_LEN, TIMEOUT,
         WAIT_TIMEOUT_PAYLOAD_LEN,

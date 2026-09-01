@@ -32,7 +32,7 @@
 
 use ash::vk;
 
-use crate::contract::pixel_format::TexelLayout;
+use crate::protocol::pixel_format::TexelLayout;
 
 /// How this device can satisfy `MTLSamplerAddressModeMirrorClampToEdge`.
 ///

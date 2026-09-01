@@ -10,9 +10,9 @@
 //! `0xff000000ff000000` class). Always bumps [`DeviceState::mark_mapping_written`]
 //! on success.
 
-use crate::contract::iosurface_pages::{packed_span_estimate, sample_window_from_device_desc};
-use crate::contract::pixel_format::{self, RowToRgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
 use crate::model::{scanout_extent_ok, DeviceState, MappingEntry, MAX_SCANOUT_DIM};
+use crate::protocol::iosurface_pages::{packed_span_estimate, sample_window_from_device_desc};
+use crate::protocol::pixel_format::{self, RowToRgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
 use crate::runtime::changed_runs::ChangedRuns;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;

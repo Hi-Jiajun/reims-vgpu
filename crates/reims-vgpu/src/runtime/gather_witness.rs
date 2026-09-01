@@ -294,7 +294,7 @@
 
 use std::collections::HashMap;
 
-use crate::contract::fnv;
+use crate::protocol::fnv;
 
 /// Which zero-copy sampled producer built the window.
 ///

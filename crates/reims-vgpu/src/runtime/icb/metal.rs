@@ -1000,11 +1000,11 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             // All three extents are checked per component, not by their first
             // one: Metal validates an `MTLSize` in every dimension, so a zero in
             // `grid[1]` is as unencodable as one in `grid[0]` and used to reach
-            // the selector. See `contract::dispatch::mesh_draw_dims`, which also
+            // the selector. See `protocol::dispatch::mesh_draw_dims`, which also
             // owns the one substitution allowed here — an absent object
             // threadgroup read as 1.
             let Some(dims) =
-                crate::contract::dispatch::mesh_draw_dims(mesh.grid, mesh.object_tg, mesh.mesh_tg)
+                crate::protocol::dispatch::mesh_draw_dims(mesh.grid, mesh.object_tg, mesh.mesh_tg)
             else {
                 return Err(IcbStatus::Args(if threads {
                     "icb_frc_mesh_threads_zero_dims"

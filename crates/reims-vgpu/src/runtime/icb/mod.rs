@@ -30,8 +30,8 @@
 //! (`0xe4`/`0xe5`) re-fills from registered command memory when present. Host
 //! Metal fill API remains for tests without guest backing.
 
-use crate::contract::endian::{ld32, ld64}; // ld64: 0x1d1 gpu_address + dispatch args
 use crate::model::DeviceState;
+use crate::protocol::endian::{ld32, ld64}; // ld64: 0x1d1 gpu_address + dispatch args
 use crate::runtime::decode::resource::{
     decode_serializer_object_descriptor, icb_layout_attribute_stride_slot_count,
     icb_layout_kernel_tg_slot_count, icb_layout_table_len, Descriptor as ResourceDescriptor,
@@ -437,7 +437,7 @@ impl IcbMeshDraw {
     /// its only caller [`encode_render_command_slot`].
     #[cfg(test)]
     fn encode(&self, slot: &mut [u8], args: usize) {
-        use crate::contract::endian::st64;
+        use crate::protocol::endian::st64;
         for (i, v) in self
             .grid
             .iter()
@@ -904,7 +904,7 @@ fn write_tessellation_factor(
     if off + ICB_TESSELLATION_FACTOR_LEN > slot.len() {
         return Err(IcbStatus::Args("icb_write_tess_factor_oob"));
     }
-    use crate::contract::endian::{st32, st64};
+    use crate::protocol::endian::{st32, st64};
     st32(&mut slot[off..], tf.buffer_ref);
     let va = if tf.wire_va != 0 { tf.wire_va } else { 0 };
     st64(&mut slot[off + 4..], va);
@@ -924,7 +924,7 @@ pub fn encode_render_command_slot(
     layout: &IcbCommandLayout,
     fill: &IcbRenderFill,
 ) -> Result<Vec<u8>, IcbStatus> {
-    use crate::contract::endian::{st16, st32, st64};
+    use crate::protocol::endian::{st16, st32, st64};
     let size = layout.command_size as usize;
     if size == 0 {
         return Err(IcbStatus::Args("icb_ers_zero_command_size"));
@@ -1105,7 +1105,7 @@ pub fn encode_compute_command_slot(
     layout: &IcbCommandLayout,
     fill: &IcbComputeFill,
 ) -> Result<Vec<u8>, IcbStatus> {
-    use crate::contract::endian::{st32, st64};
+    use crate::protocol::endian::{st32, st64};
     let size = layout.command_size as usize;
     if size == 0 {
         return Err(IcbStatus::Args("icb_ecs_zero_command_size"));
@@ -1648,7 +1648,7 @@ fn write_attribute_stride(
     index: u32,
     stride: u64,
 ) -> Result<(), IcbStatus> {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
     let slots = icb_layout_attribute_stride_slot_count(layout);
     if slots == 0 || index >= slots || layout.attribute_stride_offset == 0 {
         return Err(IcbStatus::Args("icb_attribute_stride_no_slot"));

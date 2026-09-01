@@ -6,8 +6,8 @@ use reims_vgpu_wire::ops::compute as wire_compute;
 use reims_vgpu_wire::OP_HEADER_LEN;
 
 use super::*;
-use crate::contract::endian::{st16, st32, st64};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::protocol::endian::{st16, st32, st64};
 use crate::runtime::decode::render::{
     PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
     PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE,
@@ -719,7 +719,7 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
 /// This counted and rendered anyway until the arms beside it stopped doing so.
 #[test]
 fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     use crate::runtime::decode::render::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
 
     // A full-length record, not the `PASS_MIN_PAYLOAD` one the arms below use:
@@ -808,7 +808,7 @@ fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws()
 /// is entitled to ask; this is the refusal that says what that costs.
 #[test]
 fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_the_draws() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
 
     let record = |count: u32| {
         let total = wire_pass::DEFAULT_RASTER_SAMPLE_COUNT_TOTAL_LEN as usize;
@@ -895,7 +895,7 @@ fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_t
 ///
 #[test]
 fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_draws() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     use crate::runtime::decode::render::{
         PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
         PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
@@ -1267,7 +1267,7 @@ fn wide_indexed_draw_reaches_pending_draw() {
 /// `DrawEncodeRequest` fails here.
 #[test]
 fn a_base_vertex_and_base_instance_reach_the_pending_draw() {
-    use crate::contract::endian::st16;
+    use crate::protocol::endian::st16;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
@@ -1948,9 +1948,9 @@ fn zero_ref_render_bind_unbinds_existing_slots() {
 /// x86 backing display mid: clear-only stream must Store solid BGRA into pages.
 #[test]
 fn clear_only_backing_surface_writes_guest_pages() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::endian::{st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
 
@@ -2059,8 +2059,8 @@ fn finish_stream_clear_only_branch_without_draws() {
 /// must materialize the result directly in the mapper-ref-texture mapping's native texels.
 #[test]
 fn clear_only_rg16uint_publishes_native_guest_texels() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::{MTL_FORMAT_RG16_UINT, RG16_BPP};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::{MTL_FORMAT_RG16_UINT, RG16_BPP};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -2123,7 +2123,7 @@ fn clear_only_rg16uint_publishes_native_guest_texels() {
 /// its guest-declared row pitch rather than a tightly packed substitute.
 #[test]
 fn clear_only_rg16uint_publishes_native_linear_gva_rows() {
-    use crate::contract::pixel_format::MTL_FORMAT_RG16_UINT;
+    use crate::protocol::pixel_format::MTL_FORMAT_RG16_UINT;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
         OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
@@ -2298,8 +2298,8 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
 /// Linux NoMetal: draws fail but CLEAR seed still Stores into backing pages.
 #[test]
 fn nometal_draw_falls_back_to_backing_clear() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::{st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
     use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
@@ -2692,7 +2692,7 @@ fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
         let mut c = vec![0u8; total];
         st32(&mut c[0..], opcode);
         st32(&mut c[4..], total as u32);
-        crate::contract::endian::st64(&mut c[reims_vgpu_wire::OP_HEADER_LEN..], action);
+        crate::protocol::endian::st64(&mut c[reims_vgpu_wire::OP_HEADER_LEN..], action);
         c
     };
     let mut send = |acc: &mut StreamAccum, opcode: u32, action: u64| {
@@ -2781,7 +2781,7 @@ fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
 /// three times — fails here rather than passing on a degenerate fixture.
 #[test]
 fn a_plural_scissor_record_reaches_the_accumulator_whole() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
@@ -2867,7 +2867,7 @@ fn a_plural_scissor_record_reaches_the_accumulator_whole() {
 /// selects, so dropping slot 1 silently renumbers slot 2.
 #[test]
 fn an_empty_rect_in_a_plural_scissor_record_keeps_the_previous_state() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
     use crate::runtime::drain::store_route_count;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -3596,7 +3596,7 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
         );
         assert_eq!(
             acc.draws[0].draw,
-            crate::contract::draw::DrawArgs {
+            crate::protocol::draw::DrawArgs {
                 vertex_count: 11,
                 instance_count: 22,
                 primitive_type: 4,
@@ -3942,7 +3942,7 @@ fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
 /// cannot tell those apart cannot answer the question they exist to answer.
 #[test]
 fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
     use crate::runtime::drain::store_route_count;
     use reims_vgpu_wire::ops::blit as wire;
 
@@ -4028,7 +4028,7 @@ fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
 /// boot's reading unusable for deciding which executor to build.
 #[test]
 fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
     use crate::runtime::drain::store_route_count;
     use reims_vgpu_wire::ops::blit as wire;
 
@@ -4164,7 +4164,7 @@ fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
 /// entry is the guest's number and not padding.
 #[test]
 fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
 
     let total = reims_vgpu_wire::OP_HEADER_LEN
         + render::BIND_ENTRIES
@@ -4280,7 +4280,7 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
 /// replaced their rows.
 #[test]
 fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
     use crate::runtime::drain::store_route_count;
 
     // (opcode, total length, payload writer, route, whether a default-valued
@@ -4587,7 +4587,7 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
 /// wireframed.
 #[test]
 fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
 
     let drive = |op: u32, mode: u64| {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -4981,7 +4981,7 @@ fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
 /// single-offset fixture.
 #[test]
 fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
     };
@@ -5390,7 +5390,7 @@ fn clear_fallback_draw_accounting_is_scoped_to_one_render_stream() {
 /// clear written over the guest's four-sample pages, twice a boot.
 #[test]
 fn a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_clear() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
         OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,

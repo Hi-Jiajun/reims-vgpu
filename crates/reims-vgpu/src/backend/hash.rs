@@ -1,6 +1,6 @@
 //! The two content hashes the Metal backend's compiled-object caches key on.
 //!
-//! Both are built from the FNV-1a parameters in [`crate::contract::fnv`]. The
+//! Both are built from the FNV-1a parameters in [`crate::protocol::fnv`]. The
 //! constants live there rather than here because callers of theirs are not
 //! backends at all — the sampled gather witness and the panic latch both fold
 //! with them — and this module was behind `feature = "backend-metal"` when
@@ -24,7 +24,7 @@
 //! obligation than an ABI, and worth stating plainly rather than leaving a
 //! reader to infer an external contract that is not there.
 
-use crate::contract::fnv::{fold_bytes, FNV_OFFSET_BASIS, FNV_PRIME};
+use crate::protocol::fnv::{fold_bytes, FNV_OFFSET_BASIS, FNV_PRIME};
 
 /// Fold `data` into a 64-bit content hash.
 ///

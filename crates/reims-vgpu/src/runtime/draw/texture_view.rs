@@ -406,7 +406,7 @@ pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
 /// Three different bugs, and only one of them is this crate's:
 ///
 /// * `BaseUndeclared` — a format the guest's own texture is in that
-///   `contract::pixel_format` has no row for. **Ours.** Nothing about the bind
+///   `protocol::pixel_format` has no row for. **Ours.** Nothing about the bind
 ///   is wrong; this table is short.
 /// * `ViewUndeclared` — the guest named an override this table has no row for.
 ///   Also ours, one argument over.
@@ -1295,7 +1295,7 @@ mod texture_view_split_tests {
     /// sixteen texels.
     #[test]
     fn a_view_is_compatible_by_storage_grid_not_by_texel_width() {
-        use crate::contract::pixel_format as pf;
+        use crate::protocol::pixel_format as pf;
 
         // No override: the base format alone must pass, which is the case that
         // was refusing every compressed texture.
@@ -1387,7 +1387,7 @@ mod texture_view_split_tests {
     /// family would create an image in a format the driver never advertised.
     #[test]
     fn a_compressed_bind_is_native_or_refused() {
-        use crate::contract::pixel_format::{self as pf, TexelLayout};
+        use crate::protocol::pixel_format::{self as pf, TexelLayout};
 
         let capable = NativeUploads {
             block_compressed: true,
@@ -1444,7 +1444,7 @@ mod texture_view_split_tests {
 
     #[test]
     fn view_pixel_format_override_effective() {
-        use crate::contract::pixel_format::{
+        use crate::protocol::pixel_format::{
             MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
             MTL_FORMAT_RGBA8_UNORM,
         };
@@ -1485,7 +1485,7 @@ mod texture_view_split_tests {
     /// see `an_integer_texel_is_declared_but_has_no_sampled_rail`.
     #[test]
     fn a_declared_format_clears_the_width_gate_whether_or_not_a_rail_takes_it() {
-        use crate::contract::pixel_format::{
+        use crate::protocol::pixel_format::{
             MTL_FORMAT_R8_UINT, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA8_UNORM,
         };
         assert_eq!(
@@ -1514,7 +1514,7 @@ mod texture_view_split_tests {
     /// the success case to say so.
     #[test]
     fn the_view_gate_names_which_of_its_three_terms_refused() {
-        use crate::contract::pixel_format::{
+        use crate::protocol::pixel_format::{
             MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA8_UNORM,
         };
         // A value Metal does not define and this table therefore has no row for.

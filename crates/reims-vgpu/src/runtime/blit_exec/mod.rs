@@ -39,9 +39,9 @@
 // The backend the process executes on, reached only through the trait: this
 // module names no rail.
 use crate::backend::Backend as _;
-use crate::contract::pixel_format::{self, MTL_FORMAT_BGRA8_UNORM};
 use crate::model::DeviceState;
 use crate::observe::Decline;
+use crate::protocol::pixel_format::{self, MTL_FORMAT_BGRA8_UNORM};
 use crate::runtime::decode::blit::{self, BlitAspect, Command, CopyKind, Kind, Point};
 use crate::runtime::decode::resource::{
     decode_buffer_descriptor, decode_iosurface_texture_descriptor, decode_texture_descriptor,
@@ -3802,10 +3802,10 @@ fn gpu_whole_plane_destination(
     // reads 81/81/80 and equality calls that a disagreement forever. A `None`
     // still refuses — a format with no byte-copy layout is one where the copy
     // would have to convert, which this arm does not do.
-    let texel = crate::contract::pixel_format::store_texel_order(dst.pixel_format);
+    let texel = crate::protocol::pixel_format::store_texel_order(dst.pixel_format);
     if texel.is_none()
-        || crate::contract::pixel_format::store_texel_order(src.pixel_format) != texel
-        || crate::contract::pixel_format::store_texel_order(window.pixel_format) != texel
+        || crate::protocol::pixel_format::store_texel_order(src.pixel_format) != texel
+        || crate::protocol::pixel_format::store_texel_order(window.pixel_format) != texel
     {
         return Err(GpuPlaneRefusal::FormatDiffers);
     }

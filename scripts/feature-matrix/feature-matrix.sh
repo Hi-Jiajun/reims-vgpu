@@ -324,7 +324,7 @@ esac
 # first number would read that move as exactly the loss this cell exists to
 # catch. Every arm links these, so the feature set does not change them.
 count_cell "support crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
-  "-p reims-vgpu-contract -p reims-vgpu-config -p reims-vgpu-memory -p reims-vgpu-observe \
+  "-p reims-vgpu-config -p reims-vgpu-memory -p reims-vgpu-observe \
    -p reims-vgpu-paging -p reims-vgpu-wire"
 
 # The replacement crates. `reims-vgpu-core` is deliberately not a dependency of
@@ -344,6 +344,15 @@ run_cell "replacement crates / $HOST_TRIPLE" "" "" "$WORKSPACE_DIR" \
 # vocabulary compiles fine everywhere else.
 run_cell "observe / no_std vocabulary" "" "--no-default-features" \
   "$WORKSPACE_DIR" "-p reims-vgpu-observe" "--lib"
+
+# And the library that depends on it, at `--lib` scope on purpose.
+# `reims-vgpu-protocol`'s tests assert what a refusal renders as, which needs
+# the sink, so they carry a dev-dependency on observe with `std` on. Under
+# resolver 2 that feature is not unified into a build that does not compile
+# tests — but `--all-targets` does compile them, so the cell above would let a
+# `std::` into the library and never notice. This is the cell that notices.
+run_cell "protocol / no_std library" "" "" "$WORKSPACE_DIR" \
+  "-p reims-vgpu-protocol" "--lib"
 count_cell "replacement crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
   "-p reims-vgpu-protocol -p reims-vgpu-core"
 if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then

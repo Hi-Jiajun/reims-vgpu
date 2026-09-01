@@ -1,8 +1,11 @@
 //! IOSurface mapper/page-table planning (port of `host/utils/reims-vgpu-iosurface-pages`).
 
+use crate::checked::{align_up_u64, checked_add_u64, checked_mul_u64};
 use crate::endian::{ld16, ld32, ld64};
 use crate::pixel_format;
-use crate::{align_up_u64, checked_add_u64, checked_mul_u64};
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 pub const U32_SIZE: usize = 4;
 

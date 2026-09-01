@@ -969,7 +969,7 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
 /// `lookup_list_entry` -> `read_descriptor` -> `decode_texture_descriptor`, so
 /// **any** object whose descriptor is at least `TEXTURE_DESC_GEOMETRY_LEN`
 /// bytes decodes as a texture and yields a plausible extent rather than a
-/// refusal. That is the hazard `contract::iosurface_pages` documents for the
+/// refusal. That is the hazard `protocol::iosurface_pages` documents for the
 /// `TEXTURE_DESC_WIDTH` name collision, reached a different way.
 ///
 /// # It reports and does not refuse, on purpose
@@ -1242,7 +1242,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // surface has its own format, extent and offset, and the
                 // mapping-derived window cannot describe it, which is why the
                 // video planes were absent from this record.
-                if let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(view.pixel_format)
+                if let Some(bpp) = crate::protocol::pixel_format::bytes_per_pixel(view.pixel_format)
                 {
                     if let Some((base_off, bpr, _)) = state.mappings.get(&mid).and_then(|m| {
                         crate::runtime::mapping_write::ref_texture_sample_window(
@@ -2475,7 +2475,7 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
             view.pixel_format,
         ) else {
             let desc =
-                crate::contract::iosurface_pages::decode_device_surface(&m.device_desc).map(|d| {
+                crate::protocol::iosurface_pages::decode_device_surface(&m.device_desc).map(|d| {
                     (
                         d.width,
                         d.height,
@@ -3167,7 +3167,7 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
         let page_base = backing.gva & !(page - 1);
         let head = backing.gva - page_base;
         let map_len =
-            crate::contract::checked::align_up_u64(head.checked_add(backing.size)?, page)?;
+            crate::protocol::checked::align_up_u64(head.checked_add(backing.size)?, page)?;
         // The one admission rule, which asks the map's standing refusal before
         // the latches. Assembling it here from the latches alone is what let
         // this rail import on a host that had already refused the whole map.
@@ -8109,7 +8109,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // texels, not one. `layers` is 1 for every other shape here, so
                 // the repeat is the identity for them.
                 source: crate::backend::vulkan::engine::SampledSource::Bytes(std::sync::Arc::new(
-                    crate::contract::pixel_format::solid_rgba8(1, 1, &[0.0; 4])
+                    crate::protocol::pixel_format::solid_rgba8(1, 1, &[0.0; 4])
                         .repeat(shape.layers.max(1) as usize),
                 )),
                 byte_origin: crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
@@ -10543,7 +10543,7 @@ pub(crate) fn gva_chain_identity(
 ///
 /// The fallback is a fidelity loss and not a refusal. The draw still runs, and
 /// the Store still lands correctly-shaped bytes for the guest's declared texel,
-/// because [`crate::contract::pixel_format::convert_rgba8_to_row`] expands them
+/// because [`crate::protocol::pixel_format::convert_rgba8_to_row`] expands them
 /// from eight bits — the guest reads a well-formed half-float frame carrying
 /// eight bits of information. What the fallback costs is the range and the
 /// precision the guest asked for: anything above 1.0 in a half-float
@@ -11592,8 +11592,8 @@ mod vulkan_split_tests {
     /// GVA walker will accept. Returns the state the walk reads its task from;
     /// the caller re-points the entry by calling this again on the same host.
     fn map_one_gva_page(host: &mut FakeHost, pfn: u32) {
-        use crate::contract::endian::st32;
-        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::protocol::endian::st32;
+        use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
         use crate::runtime::host::HostMemory;
         let page = 1u64 << PAGE_SHIFT_X86;
         // Directory at pfn 2, its root page table at pfn 3, data pages above.
@@ -11909,8 +11909,8 @@ mod vulkan_split_tests {
     /// that only asked whether the map contained the key would pass either way.
     #[test]
     fn arming_a_writeback_debt_stops_the_host_cache_naming_the_previous_frame() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::mapping_write::write_bgra8;
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -12015,8 +12015,8 @@ mod vulkan_split_tests {
     /// generation this test bumps to.
     #[test]
     fn the_store_names_the_slot_the_draw_registered_after_the_mapping_generation_moves() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::mapping_write::write_bgra8;
 
         if !crate::runtime::writeback_debt::lazy_writeback_enabled() {
@@ -12098,8 +12098,8 @@ mod vulkan_split_tests {
     /// it.
     #[test]
     fn the_mapper_ref_texture_zero_copy_gather_pays_the_frame_those_pages_owe() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
         // Keep this large enough that either the direct resource or the copied
         // fallback can take; the test is about debt payment, not ownership.
@@ -12218,8 +12218,8 @@ mod vulkan_split_tests {
     /// from both copies and the next frame loads what this one stored.
     #[test]
     fn the_mapper_ref_texture_load_seed_cache_rung_refuses_a_surface_the_guest_rewrote() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::host::HostOps;
         use crate::runtime::mapping_write::write_bgra8;
 
@@ -12322,8 +12322,8 @@ mod vulkan_split_tests {
 
     #[test]
     fn a_mapper_ref_texture_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::mapping_write::write_bgra8;
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -12449,7 +12449,7 @@ mod vulkan_split_tests {
     /// behaviour, and refusing on it would re-read a surface per bind.
     #[test]
     fn the_host_cache_sample_rung_refuses_a_surface_the_guest_rewrote() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use crate::runtime::host::{FakeHost, HostOps};
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -13121,7 +13121,7 @@ mod vulkan_split_tests {
                 mapping_id: 9,
                 width: 8,
                 height: 8,
-                format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+                format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
                 ..ColorRtRequest::default()
             },
             ColorRtRequest {
@@ -13131,7 +13131,7 @@ mod vulkan_split_tests {
                 row_stride: 32,
                 width: 8,
                 height: 8,
-                format: crate::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+                format: crate::protocol::pixel_format::MTL_FORMAT_RG16_FLOAT,
                 ..ColorRtRequest::default()
             },
         ];
@@ -14476,7 +14476,7 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
             // This rail converts every format to RGBA8 unconditionally — the
             // loop above is `convert_row_to_rgba8` with no native arm — so the
             // layout is fixed rather than chosen.
-            layout: crate::contract::pixel_format::TexelLayout::Rgba8,
+            layout: crate::protocol::pixel_format::TexelLayout::Rgba8,
             generation,
         },
         entry_bytes,

@@ -59,8 +59,8 @@ fn clear_black_attachment(texture_ref: u32) -> crate::runtime::decode::render::C
 /// Named because it used to be spelled `3, 1, 3, 0, 0` at four call sites — five
 /// positional `u32`s with two `3`s among them, where a transposition compiles and
 /// draws something plausible.
-fn test_triangle() -> crate::contract::draw::DrawArgs {
-    crate::contract::draw::DrawArgs {
+fn test_triangle() -> crate::protocol::draw::DrawArgs {
+    crate::protocol::draw::DrawArgs {
         vertex_count: 3,
         instance_count: 1,
         primitive_type: 3,
@@ -150,7 +150,7 @@ fn a_small_reflected_object_stays_on_the_gather_rail_and_moves_only_its_extent()
 #[test]
 fn the_sampled_gather_floor_gives_one_verdict_to_all_three_rails() {
     use super::vulkan::{sampled_gather_floor_admits, SampledFloorRail, SAMPLED_GATHER_MIN_BYTES};
-    use crate::contract::pixel_format::TexelLayout;
+    use crate::protocol::pixel_format::TexelLayout;
 
     let rails = [
         SampledFloorRail::Linear,
@@ -340,8 +340,8 @@ fn strided_window_extent_measures_padded_rows_and_refuses_unrepresentable_stride
     // bytes of stride over 16-byte blocks is 20 blocks = 80 texels. A stride
     // that does not divide into whole blocks cannot describe a block row and
     // refuses rather than rounding into a shifted image.
-    let bc3 = crate::contract::pixel_format::block_geometry(
-        crate::contract::pixel_format::MTL_FORMAT_BC3_RGBA,
+    let bc3 = crate::protocol::pixel_format::block_geometry(
+        crate::protocol::pixel_format::MTL_FORMAT_BC3_RGBA,
     )
     .unwrap();
     let level = |bpr: u64| crate::runtime::decode::resource::TextureLevelLayout {
@@ -378,8 +378,8 @@ fn strided_window_extent_measures_padded_rows_and_refuses_unrepresentable_stride
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn mapper_ref_texture_zero_copy_declines_transient_host_mappings() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -426,8 +426,8 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     // some other test's host and refuses — which is the right refusal against
     // the wrong host.
     crate::runtime::guest_ram_map::reset();
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let page = 1u64 << PAGE_SHIFT_X86;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -450,7 +450,7 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         mid,
         128,
         128,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
     ));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
     let mapper_ref_texture_witnesses = crate::runtime::drain::store_route_count("gw_rail_t11");
@@ -557,8 +557,8 @@ fn small_mapping_sampled_plane_uses_its_direct_resource() {
     // some other test's host and refuses — which is the right refusal against
     // the wrong host.
     crate::runtime::guest_ram_map::reset();
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let page = 1u64 << PAGE_SHIFT_X86;
     let (width, height) = (16u32, 16u32);
@@ -626,7 +626,7 @@ fn linear_volume_gather_carries_every_depth_plane() {
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn tight_linear_cpu_fallback_reads_every_depth_plane() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let native = [3u8, 5, 7, 255].repeat(2 * 2 * 3);
     let (bytes, format) = load_tight_linear_rgba_with(
@@ -648,9 +648,9 @@ fn tight_linear_cpu_fallback_reads_every_depth_plane() {
 
 #[test]
 fn cpu_portability_store_publishes_composite() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::SurfaceWriteKind;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -1477,7 +1477,7 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_guest_write_since_the_store_refuses_the_resident() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostOps};
 
     let entry_for =
@@ -1578,7 +1578,7 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn the_guest_write_verdict_separates_its_refusals() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostOps};
 
     let entry_for =
@@ -1645,7 +1645,7 @@ fn the_guest_write_verdict_separates_its_refusals() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_replaced_page_list_invalidates_the_token_it_was_built_for() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostOps};
 
     let entry_for =
@@ -1724,7 +1724,7 @@ fn a_replaced_page_list_invalidates_the_token_it_was_built_for() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_host_that_cannot_observe_guest_writes_never_vouches() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::FakeHost;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -2785,7 +2785,7 @@ fn blend_state_maps_src_alpha_one_minus() {
 /// (archive NULL seed / Metal Clear invent) — does not drop the pass.
 #[test]
 fn mrt_draw_request_load_seed_miss_still_encodes() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::host::FakeHost;
 
@@ -2822,7 +2822,7 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
 
 #[test]
 fn mrt_draw_request_keeps_multisample_source_and_resolve_destination_distinct() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2856,7 +2856,7 @@ fn mrt_draw_request_keeps_multisample_source_and_resolve_destination_distinct() 
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encode() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::RenderPipelineDescriptor;
     use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
 
@@ -2913,7 +2913,7 @@ fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encod
 
 #[test]
 fn mrt_draw_request_refuses_a_resolve_destination_with_different_geometry() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2944,8 +2944,8 @@ fn mrt_draw_request_refuses_a_resolve_destination_with_different_geometry() {
 /// that bind a view as color attachment drop the entire MRT pass.
 #[test]
 fn mrt_draw_request_texture_view_view_of_mapper_ref_texture_as_color_rt() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -3017,8 +3017,8 @@ fn mrt_draw_request_texture_view_view_of_mapper_ref_texture_as_color_rt() {
 /// base as texture-view and dropped the MRT pass (`view_base_or_swizzle`).
 #[test]
 fn mrt_draw_request_nested_texture_view_view_chain_to_mapper_ref_texture() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -3093,8 +3093,8 @@ fn mrt_draw_request_nested_texture_view_view_chain_to_mapper_ref_texture() {
 /// Archive resolve_texture rejects non-identity swizzle for RT resolve.
 #[test]
 fn mrt_draw_request_texture_view_swizzled_view_rejected_as_color_rt() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -3179,8 +3179,8 @@ fn mrt_draw_request_texture_view_swizzled_view_rejected_as_color_rt() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_cube_texture_loads_six_faces_in_slice_order() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::{MTL_FORMAT_BC3_RGBA, MTL_FORMAT_RGBA8_UNORM};
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::{MTL_FORMAT_BC3_RGBA, MTL_FORMAT_RGBA8_UNORM};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
         OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
@@ -3255,7 +3255,7 @@ fn a_cube_texture_loads_six_faces_in_slice_order() {
     .expect("six RGBA8 faces load");
     assert_eq!(
         format.layout(),
-        crate::contract::pixel_format::TexelLayout::Rgba8
+        crate::protocol::pixel_format::TexelLayout::Rgba8
     );
     assert_eq!(
         bytes.len(),
@@ -3302,7 +3302,7 @@ fn a_cube_texture_loads_six_faces_in_slice_order() {
     .expect("an allocation sized exactly for six BC3 faces loads");
     assert_eq!(
         format.layout(),
-        crate::contract::pixel_format::TexelLayout::Bc3Rgba
+        crate::protocol::pixel_format::TexelLayout::Bc3Rgba
     );
     assert_eq!(bytes.len() as u64, bc_face * 6);
 
@@ -3345,8 +3345,8 @@ fn a_cube_texture_loads_six_faces_in_slice_order() {
 /// fail-closed (live residual ref=199 type=2 fmt=0x73).
 #[test]
 fn mrt_draw_request_texture_rgba16f_as_color_rt_despite_stale_t11_latch() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
         OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
@@ -3410,9 +3410,9 @@ fn mrt_draw_request_texture_rgba16f_as_color_rt_despite_stale_t11_latch() {
 /// the mid named by the live descriptor, not a prior latch).
 #[test]
 fn mrt_draw_request_mapper_ref_texture_live_mapping_overrides_stale_latch() {
-    use crate::contract::endian::{st16, st32};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::host::FakeHost;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -3464,8 +3464,8 @@ fn mrt_draw_request_mapper_ref_texture_live_mapping_overrides_stale_latch() {
 /// Color RT materialization does not rematerialize non-zero view mips.
 #[test]
 fn mrt_draw_request_texture_view_nonzero_level_rejected_as_color_rt() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -3537,8 +3537,8 @@ fn mrt_draw_request_texture_view_nonzero_level_rejected_as_color_rt() {
 /// compositor blur/backdrop pyramids render into successive mips.
 #[test]
 fn mrt_draw_request_texture_view_mip_level_view_of_linear_as_color_rt() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
         OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_LEVEL_RECORDS,
@@ -3713,9 +3713,9 @@ fn view_format_reinterprets_bgra_storage_as_rgba() {
 /// on Ventura/Tahoe x86 product boots.
 #[test]
 fn write_gva_rgba8_uses_device_page_shift_x86() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::host::FakeHost;
 
     let page_shift = PAGE_SHIFT_X86;
@@ -3837,9 +3837,9 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
@@ -3946,9 +3946,9 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn padded_bgra8_memoized_uploads_native_without_swizzle() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
@@ -4175,9 +4175,9 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
 /// whatever the cache holds, forever.
 #[test]
 fn a_mapper_ref_texture_load_seed_serves_a_published_frame_only_on_a_watched_clean_witness() {
-    use crate::contract::endian::{st16, st32};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::endian::{st16, st32};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_MAPPER_REF_TEXTURE,
     };
@@ -4347,9 +4347,9 @@ fn a_mapper_ref_texture_load_seed_serves_a_published_frame_only_on_a_watched_cle
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
@@ -4492,8 +4492,8 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn ref_texture_sample_uses_descriptor_surface_id_not_ref_collision() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
     use crate::runtime::gva_mem;
 
@@ -4632,8 +4632,8 @@ fn ref_texture_sample_uses_descriptor_surface_id_not_ref_collision() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn mapper_ref_texture_host_cache_rung_identity_tracks_the_cached_frame() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
     use crate::runtime::gva_mem;
 
@@ -4797,13 +4797,13 @@ fn mapper_ref_texture_host_cache_rung_identity_tracks_the_cached_frame() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn ref_texture_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS,
         DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
     };
-    use crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_RG8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
     use crate::runtime::gva_mem;
 
@@ -4935,12 +4935,12 @@ fn ref_texture_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn ref_texture_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS,
         DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
     };
-    use crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_RG8_UNORM;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -5047,7 +5047,7 @@ fn ref_texture_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn ref_texture_view_materializes_only_when_base_identity_differs() {
-    use crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_RG8_UNORM;
 
     let exact = objects::RefTextureView {
         pixel_format: MTL_FORMAT_BGRA8_UNORM,
@@ -5325,7 +5325,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
             target_gva: 0x2000,
             width: 64,
             height: 64,
-            format: crate::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+            format: crate::protocol::pixel_format::MTL_FORMAT_RG16_FLOAT,
             ..ColorRtRequest::default()
         },
     ];
@@ -5437,7 +5437,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         target_gva: 0x2000,
         width: 64,
         height: 64,
-        format: crate::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+        format: crate::protocol::pixel_format::MTL_FORMAT_RG16_FLOAT,
         ..ColorRtRequest::default()
     };
 
@@ -5551,7 +5551,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RG16_FLOAT};
+    use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RG16_FLOAT};
     use crate::runtime::census::present_proxy::MrtDrop;
     use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
 
@@ -5679,8 +5679,8 @@ fn texture_ref_cache_geom_mismatch_does_not_hit_get_texture() {
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn guest_runs_decline_on_unstable_host_mappings() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page_shift = crate::model::PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
@@ -5791,8 +5791,8 @@ fn the_packed_alias_rail_refuses_on_a_host_whose_map_refused() {
 #[cfg(feature = "backend-vulkan")]
 fn a_packed_run_names_the_window_and_not_its_offset_into_the_block() {
     crate::runtime::guest_ram_map::reset();
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page_shift = PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
@@ -5870,8 +5870,8 @@ fn packed_buffer_alias_is_reused_across_offsets() {
     // some other test's host and refuses — which is the right refusal against
     // the wrong host.
     crate::runtime::guest_ram_map::reset();
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page_shift = PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
@@ -6077,9 +6077,9 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
         512,
         0x2000,
         128,
-        crate::contract::pixel_format::TexelLayout::Rgba8,
+        crate::protocol::pixel_format::TexelLayout::Rgba8,
         ash::vk::Format::R8G8B8A8_UNORM,
-        crate::contract::pixel_format::SwizzlePlan::default(),
+        crate::protocol::pixel_format::SwizzlePlan::default(),
         resource.lifetime_ref(),
     )
     .expect("the retained allocation directly supplies this plane");
@@ -6123,8 +6123,8 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
 #[cfg(feature = "backend-vulkan")]
 fn a_window_refusal_names_which_check_refused() {
     use super::vulkan::WindowRefusal;
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page_shift = crate::model::PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
@@ -6210,8 +6210,8 @@ struct StoreRig {
 impl StoreRig {
     /// Task 1, `entries` mapped virtual pages, `page_shift` geometry.
     fn new(entries: u32) -> Self {
-        use crate::contract::endian::st32;
-        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::protocol::endian::st32;
+        use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
         let mut host = FakeHost::new();
         let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let (dir_pfn, root_pfn) = (2u32, 3u32);
@@ -6244,7 +6244,7 @@ impl StoreRig {
 
     /// Point virtual page `entry` of the task at guest frame `pfn`.
     fn point(&mut self, entry: u32, pfn: u32) {
-        use crate::contract::endian::st32;
+        use crate::protocol::endian::st32;
         let mut pte = [0u8; 4];
         st32(&mut pte, pfn);
         let _ = self
@@ -6321,7 +6321,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         row_stride: 64 * 4,
         width: 64,
         height: 64,
-        format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
         sample_count: 1,
         load_action: MTL_LOAD_ACTION_LOAD,
         store_action: MTL_STORE_ACTION_STORE,
@@ -6350,7 +6350,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     // The guest hands that virtual page to a different allocation while the GPU
     // is working. The write that follows must not reach the new owner.
     let mut pte = [0u8; 4];
-    crate::contract::endian::st32(&mut pte, pt_base + 6);
+    crate::protocol::endian::st32(&mut pte, pt_base + 6);
     let _ = host.write_gpa(root_gpa + 4, &pte);
     let rgba = vec![0xffu8; 64 * 64 * 4];
     let err = write_gva_rgba8_within(
@@ -6457,7 +6457,7 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
             row_stride: 64 * 4,
             width: 64,
             height: 64,
-            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
             load_action: MTL_LOAD_ACTION_CLEAR,
             store_action: MTL_STORE_ACTION_STORE,
             ..Default::default()
@@ -6520,7 +6520,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
     const W: u32 = 64;
     const H: u32 = 128;
     const BPR: u32 = W * 4;
-    let fmt = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let fmt = crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let target = ColorRtRequest {
         slot: 0,
         texture_ref: 7,
@@ -6639,8 +6639,8 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
 /// after the geometry read.
 #[test]
 fn mapper_ref_texture_sample_resolves_geometry_before_reading_it() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::endian::{st32, st64};
+    use crate::protocol::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
         DEVICE_DESC_PIXEL_FORMAT, DEVICE_DESC_PLANE_COUNT, MAPPING_INTERNAL_BACKPTR,
         MAPPING_INTERNAL_DESC_PTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
@@ -6836,8 +6836,8 @@ fn a_degradation_reports_once_per_pipeline_and_slug() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_sampled_ref_naming_another_object_kind_is_reported_and_still_resolves() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::{st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN,
     };
@@ -7044,7 +7044,7 @@ fn a_bind_stride_overrides_the_pipeline_stride_only_where_it_exists() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{TextureDescriptor, TextureLevelLayout};
     use crate::runtime::drain::store_route_count;
     use crate::runtime::gva_store_witness::{note_store, GvaTargetKey};
@@ -7497,7 +7497,7 @@ fn the_buffer_backed_texture_rail_pays_for_its_texture_reference() {
             is_drawable: false,
             allow_gpu_optimized_contents: false,
             usage: 0,
-            pixel_format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            pixel_format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
             width: 32,
             height: 32,
             depth: 1,
@@ -7732,9 +7732,9 @@ fn an_attachment_sample_count_taken_from_the_pipeline_names_where_the_samples_go
 #[test]
 #[ignore = "contract obligation not yet met: a DontCare GVA attachment keys the pass to CLEAR"]
 fn a_preserving_gva_attachment_reaches_the_encoder_able_to_preserve() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
@@ -7826,7 +7826,7 @@ fn a_preserving_gva_attachment_reaches_the_encoder_able_to_preserve() {
                 },
             )],
             &[],
-            crate::contract::draw::DrawArgs {
+            crate::protocol::draw::DrawArgs {
                 vertex_count: 3,
                 instance_count: 1,
                 ..Default::default()
@@ -7900,9 +7900,9 @@ fn a_preserving_gva_attachment_reaches_the_encoder_able_to_preserve() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_span_can_be_named_without_asking_whether_its_guest_pages_are_current() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::draw::vulkan::GvaResidentRefusal;
     use crate::runtime::draw::vulkan::{gva_resident_if_current, gva_span_identity};
     use crate::runtime::draw::GvaSpan;
@@ -8065,7 +8065,7 @@ fn a_planes_drain_counts_every_arrival_even_past_the_ring_it_remembers() {
 /// to an eight-bit colour order.
 #[test]
 fn only_the_eight_bit_colour_orders_render_exactly_at_rgba8() {
-    use crate::contract::pixel_format::{store_texel_order, TexelLayout};
+    use crate::protocol::pixel_format::{store_texel_order, TexelLayout};
     use crate::runtime::draw::{color_target_narrowing, ColorTargetNarrowing};
     for format in 0u16..=0xffff {
         let got = color_target_narrowing(format);
@@ -8088,7 +8088,7 @@ fn only_the_eight_bit_colour_orders_render_exactly_at_rgba8() {
 /// exact or the counter would report the ordinary case as a loss.
 #[test]
 fn the_live_compositor_formats_answer_as_measured() {
-    use crate::contract::pixel_format::{
+    use crate::protocol::pixel_format::{
         TexelLayout, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA16_FLOAT,
     };
     use crate::runtime::draw::{color_target_narrowing, ColorTargetNarrowing};
@@ -8121,7 +8121,7 @@ fn the_live_compositor_formats_answer_as_measured() {
 /// test shares them with every other one in the binary.
 #[test]
 fn a_narrowed_target_is_counted_and_an_exact_one_is_quiet() {
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
+    use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
     use crate::runtime::drain::store_route_count;
     use crate::runtime::draw::note_store_narrowing;
 

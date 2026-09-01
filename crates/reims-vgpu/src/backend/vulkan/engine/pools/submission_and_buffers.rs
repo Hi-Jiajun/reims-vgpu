@@ -4674,7 +4674,7 @@ mod recycle_tests {
             arrayed: false,
             one_dim: false,
             format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
-                crate::contract::pixel_format::TexelLayout::Bgra8,
+                crate::protocol::pixel_format::TexelLayout::Bgra8,
             ),
             swizzle: Default::default(),
         }

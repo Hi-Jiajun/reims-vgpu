@@ -76,9 +76,9 @@ fn windows_may_be_queried_out_of_order() {
 /// legitimate write in production.
 #[test]
 fn the_page_witness_sees_a_rewire_no_packet_announced() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{BackingWalk, DeviceId, PAGE_SHIFT_X86};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostMemory};
 
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -182,8 +182,8 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
 /// proceeds exactly as before.
 #[test]
 fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::FakeHost;
 
     let host = FakeHost::new();
@@ -241,9 +241,9 @@ fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
 /// nothing at all.
 #[test]
 fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{BackingWalk, DeviceId, PAGE_SHIFT_X86};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostMemory};
 
     crate::observe::redirect_logs_for_tests();
@@ -321,9 +321,9 @@ fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
 /// last. The single-page test above cannot see this class at all.
 #[test]
 fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{BackingWalk, DeviceId, PAGE_SHIFT_X86};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostMemory};
 
     crate::observe::redirect_logs_for_tests();
@@ -409,8 +409,8 @@ fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
 /// surface the instant a task went away.
 #[test]
 fn a_walk_that_visits_nothing_is_not_agreement() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{BackingWalk, DeviceId, PAGE_SHIFT_X86};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::FakeHost;
 
     crate::observe::redirect_logs_for_tests();
@@ -444,8 +444,8 @@ fn a_walk_that_visits_nothing_is_not_agreement() {
 /// for a page this surface does not own would exclude bytes at random.
 #[test]
 fn mapping_offsets_of_pages_maps_guest_pages_to_surface_offsets() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     const PAGE: u64 = 1 << PAGE_SHIFT_X86;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -481,8 +481,8 @@ fn mapping_offsets_of_pages_maps_guest_pages_to_surface_offsets() {
 }
 
 use super::*;
-use crate::contract::endian::st32;
-use crate::contract::iosurface_pages::{
+use crate::protocol::endian::st32;
+use crate::protocol::iosurface_pages::{
     MAPPING_INTERNAL_BACKPTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
     MAPPING_INTERNAL_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
 };
@@ -909,7 +909,7 @@ fn assert_revalidate_error_preserves_cached_page_plan(err: MemError) {
         3,
         64,
         64,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
     ));
     {
         let m = state.mappings.get_mut(&3).unwrap();
@@ -966,7 +966,7 @@ fn pages_cover_geom_false_when_table_shorter_than_span() {
         8,
         1440,
         1080,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
     ));
     assert!(
         !pages_cover_geom(&state, 8),
@@ -985,7 +985,7 @@ fn pages_cover_geom_true_for_full_table() {
         3,
         64,
         64,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
     ));
     // 64×64 BGRA packed bpr 256 → 16 KiB → 1×16KiB page covers.
     {
@@ -1010,8 +1010,8 @@ fn pages_cover_geom_true_for_full_table() {
 /// a third of that size.
 #[test]
 fn a_generous_table_cannot_cover_a_window_past_the_wire_allocation() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::endian::{st32, st64};
+    use crate::protocol::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
         DEVICE_DESC_PLANE_COUNT,
     };
@@ -1034,7 +1034,7 @@ fn a_generous_table_cannot_cover_a_window_past_the_wire_allocation() {
         9,
         1024,
         1024,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
     ));
     {
         let m = state.mappings.get_mut(&9).unwrap();
@@ -1065,7 +1065,7 @@ fn pages_cover_geom_249_tile_fits_in_sixteen_16k_pages() {
         8,
         249,
         249,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
     ));
     assert!(
         pages_cover_geom(&state, 8),

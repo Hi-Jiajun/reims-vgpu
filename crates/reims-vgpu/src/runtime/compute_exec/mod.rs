@@ -26,9 +26,9 @@
 
 // The backend the process executes on, reached only through the trait.
 use crate::backend::Backend as _;
-use crate::contract::endian::ld32;
-use crate::contract::pixel_format;
 use crate::model::DeviceState;
+use crate::protocol::endian::ld32;
+use crate::protocol::pixel_format;
 use crate::runtime::decode::compute::{
     BufferBinding, Command as ComputeCommand, Kind, RefBinding, SamplerBinding,
 };
@@ -743,7 +743,7 @@ pub fn apply_record<M: HostMemory + HostOps>(
 /// `compute_dispatch_type_unknown` is ever seen, the evidence to decide arrives
 /// before the behaviour change does.
 fn accepted_dispatch_type(task_id: u32, declared: u32) -> u32 {
-    use crate::contract::dispatch::{
+    use crate::protocol::dispatch::{
         is_declared_dispatch_type, MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL,
     };
     if is_declared_dispatch_type(declared) {
@@ -1551,7 +1551,7 @@ fn stage_buffer_texture<R: RailStage, M: HostMemory + HostOps>(
     let format = if bt.desc.pixel_format != 0 {
         bt.desc.pixel_format
     } else {
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
     };
     let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
         crate::observe::fail(format!(
@@ -2149,7 +2149,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         let pages_n = m.page_entries.len();
         // Wire backing `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
         // Independent of plane w/h and of MapMemory2 IOAccelMemory length — measure-only.
-        let wire_len = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc)
+        let wire_len = crate::protocol::iosurface_pages::decode_device_surface(&m.device_desc)
             .map(|s| s.alloc_size as u64)
             .unwrap_or(0);
         // A ref-texture record names its IOSurface plane on the wire (record `+0x20`,
@@ -2177,12 +2177,12 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 // byte count this geometry needs; a descriptor whose alloc is
                 // smaller is a different failure from one whose plane records
                 // matched nothing.
-                let ds = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc);
+                let ds = crate::protocol::iosurface_pages::decode_device_surface(&m.device_desc);
                 let (dw, dh, dbpr, dalloc) = ds
                     .as_ref()
                     .map(|s| (s.width, s.height, s.bytes_per_row, s.alloc_size))
                     .unwrap_or((0, 0, 0, 0));
-                let reach = crate::contract::iosurface_pages::packed_span_estimate(
+                let reach = crate::protocol::iosurface_pages::packed_span_estimate(
                     stage_fmt, width, height,
                 )
                 .unwrap_or(0);

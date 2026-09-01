@@ -67,7 +67,7 @@ reims-vgpu-memory = { path = "../reims-vgpu-memory" }
 # The backend-neutral protocol vocabulary: layouts, formats, geometry, page
 # arithmetic. A crate so that nothing in it can name a Vulkan handle, a Metal
 # object, or this device's state.
-reims-vgpu-contract = { path = "../reims-vgpu-contract" }
+
 # The always-on sink, the decline vocabulary, and the slug registry. A crate so
 # that the layers below the device can name their own refusal type without
 # depending on the device, and so nothing in it can reach back up.

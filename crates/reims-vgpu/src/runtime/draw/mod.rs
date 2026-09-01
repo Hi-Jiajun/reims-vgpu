@@ -26,10 +26,10 @@
 //! names, and only one of them was wrong.
 
 use crate::backend::Backend as _;
-use crate::contract::pixel_format::{
+use crate::model::DeviceState;
+use crate::protocol::pixel_format::{
     self, solid_rgba8, SampledByteFormat, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
-use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
 use crate::observe::Decline;
 // The one downgrade site left in this tree is the secondary colour attachment,
@@ -2192,7 +2192,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     pipeline_ref: u32,
     color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
     clears: &[crate::runtime::decode::render::ColorAttachment],
-    draw: crate::contract::draw::DrawArgs,
+    draw: crate::protocol::draw::DrawArgs,
 ) -> Option<DrawEncodeRequest> {
     if color_slots.is_empty() {
         return None;

@@ -275,7 +275,7 @@ fn display_descriptor_advertises_four_modes_incl_4k() {
 
 #[test]
 fn present_page_identity_reports_alias_and_disjoint_peers() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let entry = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     // Present-named surface (surface-id namespace): pages A.
@@ -380,8 +380,8 @@ fn display_swap_paints_mapping_geom_not_console_fallback() {
 /// buffer the guest never asked for.
 #[test]
 fn clear_only_present_captures_the_surface_the_transaction_names() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -616,7 +616,7 @@ fn replace_physical_retires_only_the_named_resource() {
         row_stride: 256,
         width: 64,
         height: 64,
-        format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
         generation,
         guest_write: Default::default(),
         seq: 0,
@@ -791,8 +791,8 @@ fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
 /// when one moved, and visible thrash as the choice oscillates.
 #[test]
 fn composite_named_present_captures_the_named_member_however_far_it_lags() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1087,8 +1087,8 @@ fn map_surface_clears_stale_geom() {
 /// x86 Ventura/Tahoe display pipe: present opcode 6 paints like DisplaySwap.
 #[test]
 fn present_x86_op6_paints_surface_id_mapping() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1127,8 +1127,8 @@ fn present_x86_op6_paints_surface_id_mapping() {
 /// presents; host paint clears the counter (entry-side backpressure).
 #[test]
 fn display_swap_unpainted_presents_counts_until_paint() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1185,8 +1185,8 @@ fn display_swap_unpainted_presents_counts_until_paint() {
 /// read-clears the word).
 #[test]
 fn display_swap_signals_present_complete_on_shared_page() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -1332,7 +1332,7 @@ fn present_action_starvation_proxy_is_once_per_held_head() {
 
 #[test]
 fn child_drain_yields_after_present_for_display_consumer() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -1484,8 +1484,8 @@ fn poll_rescue_only_publishes_work_for_async_drain() {
 /// returns current content_generation. Does not drain other FIFOs.
 #[test]
 fn wait_surface_noop_when_no_async_job() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1516,8 +1516,8 @@ fn wait_surface_noop_when_no_async_job() {
 /// Regression gate for P1 dual-mid flicker (measure before fix).
 #[test]
 fn display_swap_encodes_at_present_after_wait_surface() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
     use crate::runtime::scanout::{copy_to_bgra8, ScanoutCopyResult};
 
@@ -1585,8 +1585,8 @@ fn display_swap_encodes_at_present_after_wait_surface() {
 /// hostPresentCount re-shows the last successful present until capture works.
 #[test]
 fn display_swap_capture_fail_keeps_prior_retain() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
     use crate::runtime::scanout::{copy_to_bgra8, ScanoutCopyResult};
 
@@ -1670,8 +1670,8 @@ fn display_swap_capture_fail_keeps_prior_retain() {
 /// retain only — never mixes mid A partial with mid B full.
 #[test]
 fn display_swap_dual_mid_full_composites_both_retain() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
     use crate::runtime::scanout::{copy_to_bgra8, ScanoutCopyResult};
 
@@ -1828,8 +1828,8 @@ fn display_swap_alternating_mappings_both_paint() {
 /// the first frame boundary — writebacks and ch2 present-into-mid must not.
 #[test]
 fn only_display_swap_paints_after_frame_flush_seen() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
     use crate::runtime::scanout::note_front_buffer_writeback;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2509,8 +2509,8 @@ fn the_window_publish_census_keeps_its_three_refusals_apart() {
 /// **and** the guest's pages must hold exactly what was written.
 #[test]
 fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2584,8 +2584,8 @@ fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
 /// distinguishes publishing from copying: the bytes are equal either way.
 #[test]
 fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8_owned;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2662,8 +2662,8 @@ fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
 /// filled.
 #[test]
 fn a_borrowed_writeback_drops_the_cache_entry_rather_than_leaving_it_stale() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::{write_bgra8_owned, write_bgra8_uncached};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -3495,9 +3495,9 @@ fn acked_stale_online_bit_is_suppressed_not_redelivered() {
 /// HostOps GVA views covering the range **must** be retired (Apple unmapMemory).
 #[test]
 fn unmap_memory_retains_gva_host_cache_for_sample() {
-    use crate::contract::endian::{st32, st64};
     use crate::model::GvaHostView;
     use crate::model::CHILD_OP_UNMAP_MEMORY;
+    use crate::protocol::endian::{st32, st64};
     use crate::runtime::surface_cache;
 
     let page_shift = PAGE_SHIFT_X86;
@@ -3560,8 +3560,8 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
 /// RE pageBacking Invalidate: clr hostValid → bump content_generation.
 #[test]
 fn invalidate_resources_bumps_mapping_content_generation() {
-    use crate::contract::endian::st32;
     use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
+    use crate::protocol::endian::st32;
     use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
 
     let mut host = FakeHost::new();
@@ -3596,9 +3596,9 @@ fn invalidate_resources_bumps_mapping_content_generation() {
 /// freelist PTE panic correlation). Helper still unit-tested in surface_cache.
 #[test]
 fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::CHILD_OP_MAP_MEMORY2;
+    use crate::protocol::endian::{st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::surface_cache;
 
     let page_shift = PAGE_SHIFT_X86;
@@ -3655,10 +3655,10 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
 /// Synchronize 0x35 is stamp + wait only — no host_cache→guest write (RE audit).
 #[test]
 fn synchronize_resources_does_not_write_guest_pages() {
-    use crate::contract::endian::st32;
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::CHILD_OP_SYNCHRONIZE_RESOURCES;
+    use crate::protocol::endian::st32;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::surface_cache;
 
     let page_shift = PAGE_SHIFT_X86;
@@ -3715,8 +3715,8 @@ fn synchronize_resources_does_not_write_guest_pages() {
 /// set guestValid alone must not bump host content generation.
 #[test]
 fn invalidate_without_clr_host_does_not_bump_generation() {
-    use crate::contract::endian::st32;
     use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
+    use crate::protocol::endian::st32;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -5853,7 +5853,7 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
 /// `map_memory2_does_not_flush_gva_host_cache_on_wire` and the view-retire tests.
 #[test]
 fn each_map_family_command_takes_its_own_branch() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
 
     const MAPPING: u32 = 0x2a;

@@ -125,7 +125,7 @@ mod tests {
     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E, PAGE_SIZE_X86};
 
     use super::*;
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     use crate::runtime::host::{HostActionKind, HostMemory};
     use crate::runtime::FakeHost;
 

@@ -48,8 +48,8 @@
 //! seed and its Store publishes the composite back over the guest's pages;
 //! re-reading the guest's pages costs a copy.
 
-use crate::contract::pixel_format;
 use crate::model::DeviceState;
+use crate::protocol::pixel_format;
 use crate::runtime::host::HostOps;
 use crate::runtime::mapper::{self, GuestWriteVerdict};
 

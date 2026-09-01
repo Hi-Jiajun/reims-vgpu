@@ -1,7 +1,9 @@
 //! Metal pixel-format helpers (port of `host/utils/reims-vgpu-pixel-format`).
 
 use crate::endian::{ld16, st16};
-use reims_vgpu_protocol::extent::BlockGeometry;
+use crate::extent::BlockGeometry;
+
+use alloc::vec::Vec;
 
 pub const COMPONENT_COUNT: usize = 4;
 pub const COMPONENT_R: usize = 0;
@@ -2173,7 +2175,7 @@ pub fn f64_to_unorm8(value: f64) -> u8 {
 /// The fill therefore walks the buffer instead of counting texels. A
 /// `chunks_exact_mut` cannot describe a different image from the one that was
 /// allocated, where a second expression always can — the rule
-/// [`reims_vgpu_protocol::extent::tight_image_layout`] states for a length and its
+/// [`crate::extent::tight_image_layout`] states for a length and its
 /// stride, one level down.
 ///
 /// Here rather than in either caller because it is arithmetic both rails need

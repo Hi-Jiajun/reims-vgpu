@@ -19,3 +19,10 @@ reims-vgpu-paging = { path = "../reims-vgpu-paging" }
 # sink that logs it. `default-features = false` is what keeps this crate
 # `no_std`, and it is the dependency the layering exists for.
 reims-vgpu-observe = { path = "../reims-vgpu-observe", default-features = false }
+
+[dev-dependencies]
+# The tests assert what a refusal *renders* as, which is the sink's half. Under
+# resolver 2 a dev-dependency's features are not unified into a build that does
+# not compile tests, so the library stays `no_std`; the feature matrix checks
+# that separately with `--lib`, because `--all-targets` turns this on.
+reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["std", "testing"] }

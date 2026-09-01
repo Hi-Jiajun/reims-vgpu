@@ -30,9 +30,14 @@ Persist only the resulting field, layout, lifetime, ordering, or calling-convent
   `HostOps` plumbing.
 - `crates/reims-vgpu`: device model, decode, mapping, scheduling, command execution, presentation,
   and backend policy.
-- `crates/reims-vgpu-contract`: backend-neutral layouts, formats, geometry, page arithmetic, and
-  contract refusals.
 - `crates/reims-vgpu-wire`: derived wire views; its nested instructions also apply.
+- `crates/reims-vgpu-protocol`: `no_std`. The first layer allowed to assign meaning to a wire tag —
+  backend-neutral layouts, formats, geometry, page arithmetic, closed ordinal rules, and the
+  contract refusals they name.
+- `crates/reims-vgpu-core`: the backend-independent semantic model. Transactions, dependency and
+  publication domains, session generations and device epochs, the fixed executor, and the serial
+  reference interpreter every parallel schedule is checked against. It can name no Vulkan handle,
+  Metal object, QEMU structure or guest-RAM pointer, and its dependency list is that claim.
 - `crates/reims-vgpu-memory`: the guest-RAM bound — imports, checked slices, page footprints.
 - `crates/reims-vgpu-config`: the single parse and declaration point for operator switches. An
   override may only narrow what the device does; it may never widen it.

@@ -248,9 +248,9 @@ fn blob_at(data: &[u8], off: usize) -> Result<&[u8], MtlbDecline> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+    use crate::protocol::endian::{st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::host::FakeHost;
 
     /// Task 1 with a one-entry object list whose ref 1 holds `object_type`, and

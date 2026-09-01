@@ -19,7 +19,7 @@ use crate::backend::vulkan::caps::memory_topology::{
     classify_memory, select_memory_type, MappedMemoryKind, MemoryClass, MemoryRequest,
 };
 use crate::backend::vulkan::caps::{DriverQuirk, HostGpuCaps};
-use crate::contract::pixel_format::TexelLayout;
+use crate::protocol::pixel_format::TexelLayout;
 
 /// Max device recreates **that produce no guest work between them**.
 ///
@@ -570,7 +570,7 @@ pub(crate) struct DeviceContext {
     pub spirv_storage_write_without_format: bool,
     pub spirv_storage_read_without_format: bool,
     pub spirv_storage_extended_formats: bool,
-    /// For each [`crate::contract::pixel_format::TexelLayout`], whether this
+    /// For each [`crate::protocol::pixel_format::TexelLayout`], whether this
     /// host can sample its Vulkan format with linear filtering; gates the
     /// native sampled rails (see [`DeviceFeatures::sampled_linear_filter`]).
     pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],

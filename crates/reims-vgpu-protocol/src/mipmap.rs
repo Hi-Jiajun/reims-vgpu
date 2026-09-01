@@ -37,6 +37,9 @@
 //! contract fact wherever it is checked.
 
 use crate::pixel_format::{self, bytes_per_pixel};
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Exact failed checks for the Metal mipmap path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -209,7 +209,7 @@ fn packet_echo_fields(
     let words = payload
         .chunks_exact(4)
         .take(UNKNOWN_OPCODE_ECHO_WORDS_MAX)
-        .map(|word| format!("{:#010x}", crate::contract::endian::ld32(word)))
+        .map(|word| format!("{:#010x}", crate::protocol::endian::ld32(word)))
         .collect::<Vec<_>>()
         .join(":");
     if !words.is_empty() {
@@ -1535,7 +1535,7 @@ impl MappingEntry {
     /// answer for all three: it is what the record declares.
     pub fn device_desc_complete(&self) -> Option<&[u8]> {
         self.device_desc
-            .get(..crate::contract::iosurface_pages::DEVICE_DESC_LEN)
+            .get(..crate::protocol::iosurface_pages::DEVICE_DESC_LEN)
     }
 }
 
@@ -2236,7 +2236,7 @@ pub struct GuestLinearMemo {
     /// into a four-byte image, which is a length the engine refuses and, if it
     /// had not, garbage. A `bool` standing in for an enum is the one shape
     /// `rustc` cannot tell you has gone short.
-    pub layout: crate::contract::pixel_format::TexelLayout,
+    pub layout: crate::protocol::pixel_format::TexelLayout,
     /// Content generation: bumps only when the native bytes change.
     pub generation: u64,
 }
@@ -3773,7 +3773,7 @@ impl DeviceState {
         let shift = self.page_shift;
         m.page_entries
             .iter()
-            .map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
+            .map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, shift))
             .collect()
     }
 
@@ -3791,7 +3791,7 @@ impl DeviceState {
         let shift = self.page_shift;
         if entries
             .iter()
-            .any(|&entry| crate::contract::iosurface_pages::entry_gpa_shift(entry, shift).is_none())
+            .any(|&entry| crate::protocol::iosurface_pages::entry_gpa_shift(entry, shift).is_none())
         {
             // A mapping whose pages cannot be named exactly cannot have its
             // write ruled out later. Record one unnamed write rather than the
@@ -3801,7 +3801,7 @@ impl DeviceState {
         }
         self.host_writes
             .note_page_iter(entries.iter().map(|&entry| {
-                crate::contract::iosurface_pages::entry_gpa_shift(entry, shift)
+                crate::protocol::iosurface_pages::entry_gpa_shift(entry, shift)
                     .expect("page entries were validated above")
             }));
     }
@@ -3959,7 +3959,7 @@ impl DeviceState {
 #[cfg(test)]
 mod device_desc_tests {
     use super::*;
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::iosurface_pages::{
         device_desc_plane, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_PLANE_DESC_LEN,
     };
 
@@ -4017,7 +4017,7 @@ mod device_desc_tests {
 
         // A descriptor declaring eight planes, cached over-long.
         let mut over = vec![0u8; eighth + DEVICE_PLANE_DESC_LEN];
-        over[crate::contract::iosurface_pages::DEVICE_DESC_PLANE_COUNT] = 8;
+        over[crate::protocol::iosurface_pages::DEVICE_DESC_PLANE_COUNT] = 8;
         assert!(
             device_desc_plane(&over, 7).is_some(),
             "the whole-slice spelling would have found an eighth plane"
@@ -4303,7 +4303,7 @@ mod fail_vocabulary_tests {
     /// success one.
     #[test]
     fn a_mapping_reach_set_is_every_page_or_none() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         let shift = crate::model::PAGE_SHIFT_X86;
         let mut state = DeviceState::new(DeviceId(1), shift);
         assert!(state.set_mapping_geom(3, 64, 64, 0x50));

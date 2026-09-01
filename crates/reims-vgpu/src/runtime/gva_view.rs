@@ -780,9 +780,9 @@ fn span_multi<H: HostMemory + HostOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::host::FakeHost;
     use reims_vgpu_paging::resolve::ResolveStatus;
 

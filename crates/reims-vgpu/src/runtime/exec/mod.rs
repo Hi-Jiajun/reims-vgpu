@@ -12,10 +12,10 @@ pub mod vulkan;
 // The backend the process executes on, reached only through the trait: this
 // module names no rail.
 use crate::backend::Backend as _;
-use crate::contract::draw::DrawArgs;
-use crate::contract::endian::{ld32, ld64};
-use crate::contract::pixel_format::{self, ClearImageEncoding};
 use crate::model::DeviceState;
+use crate::protocol::draw::DrawArgs;
+use crate::protocol::endian::{ld32, ld64};
+use crate::protocol::pixel_format::{self, ClearImageEncoding};
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit::{self, Kind as BlitKind};
@@ -3683,7 +3683,7 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
     cmd: &render::Command,
     acc: &mut StreamAccum,
 ) {
-    use crate::contract::draw::indirect;
+    use crate::protocol::draw::indirect;
 
     let indexed_form = cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_INDIRECT;
     let block_len = if indexed_form {

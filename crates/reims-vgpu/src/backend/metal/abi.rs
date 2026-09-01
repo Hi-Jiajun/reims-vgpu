@@ -31,15 +31,15 @@ pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_LINE_STRIP: u32 = 2;
 pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_TRIANGLE: u32 = 3;
 pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP: u32 = 4;
 
-// `contract::dispatch` is where the shared decode/exec path reads this pair, so
+// `protocol::dispatch` is where the shared decode/exec path reads this pair, so
 // it is the definition and these are aliases. This module is
 // `backend-metal`-gated, so a value spelled only here is unreachable from the
 // code that accepts the field off the wire; deriving rather than re-spelling is
 // what stops the two names from parting.
 pub const REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL: u32 =
-    crate::contract::dispatch::MTL_DISPATCH_TYPE_SERIAL;
+    crate::protocol::dispatch::MTL_DISPATCH_TYPE_SERIAL;
 pub const REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT: u32 =
-    crate::contract::dispatch::MTL_DISPATCH_TYPE_CONCURRENT;
+    crate::protocol::dispatch::MTL_DISPATCH_TYPE_CONCURRENT;
 
 // The dispatch kind reaches `compute::compute_core` as a `bool` and never
 // becomes an ordinal on this side: it is produced as a `bool`, and widening it
@@ -185,7 +185,7 @@ pub struct ReimsVgpuStorageImage {
     /// `#[repr(u32)]`, so this occupies the same four bytes the `u32` did and
     /// the layout assertions below are unchanged — but the consumer can no
     /// longer be handed a value it has no arm for.
-    pub format: crate::contract::pixel_format::StorageImageSelector,
+    pub format: crate::protocol::pixel_format::StorageImageSelector,
     pub width: u32,
     pub height: u32,
     pub data: *mut u8,
@@ -200,7 +200,7 @@ const _: () = assert!(offset_of!(ReimsVgpuStorageImage, data) == 16);
 pub struct ReimsVgpuComputeSampledImage {
     pub binding: u32,
     /// The contract's selector, for [`ReimsVgpuStorageImage::format`]'s reason.
-    pub format: crate::contract::pixel_format::StorageImageSelector,
+    pub format: crate::protocol::pixel_format::StorageImageSelector,
     pub width: u32,
     pub height: u32,
     pub data: *const u8,
@@ -226,7 +226,7 @@ impl ReimsVgpuComputeSampledImage {
     /// disagree about.
     pub fn unswizzled(
         binding: u32,
-        format: crate::contract::pixel_format::StorageImageSelector,
+        format: crate::protocol::pixel_format::StorageImageSelector,
         width: u32,
         height: u32,
         data: *const u8,

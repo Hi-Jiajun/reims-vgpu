@@ -263,7 +263,7 @@ checked_ordinal! {
 // The clause above pins the five discriminants to `0..=4`, and these five pin
 // them to the names the rest of the tree reads them by. Both are wanted: the
 // clause states the accepted *set* and would still hold if this list and
-// `contract::vertex_step` drifted apart together, which is the failure these
+// `protocol::vertex_step` drifted apart together, which is the failure these
 // catch. The gap is not hypothetical — the sibling `MTLStepFunction` below is
 // measured to have six of its nine names on the wrong discriminants in this very
 // crate version, and `render.rs` used to express "no step function above
@@ -271,28 +271,28 @@ checked_ordinal! {
 // top was whatever the crate happened to say.
 //
 // The five ordinals come from `MTLVertexDescriptor.h` and are declared in
-// `contract::vertex_step`, where the shared step/rate rule reads them. Every
+// `protocol::vertex_step`, where the shared step/rate rule reads them. Every
 // assertion here is evaluated on each arm that compiles the file, including the
 // cross-compiled Metal clippy run.
 const _: () = assert!(
     MTLVertexStepFunction::Constant as u32
-        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_CONSTANT
+        == crate::protocol::vertex_step::MTL_VERTEX_STEP_FUNCTION_CONSTANT
 );
 const _: () = assert!(
     MTLVertexStepFunction::PerVertex as u32
-        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX
+        == crate::protocol::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX
 );
 const _: () = assert!(
     MTLVertexStepFunction::PerInstance as u32
-        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE
+        == crate::protocol::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE
 );
 const _: () = assert!(
     MTLVertexStepFunction::PerPatch as u32
-        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_PATCH
+        == crate::protocol::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_PATCH
 );
 const _: () = assert!(
     MTLVertexStepFunction::PerPatchControlPoint as u32
-        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT
+        == crate::protocol::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT
 );
 
 /// `MTLStepFunction` by ordinal, indexed by Apple's numbering.
@@ -414,7 +414,7 @@ checked_ordinal! {
 // The Vulkan translator carries the same pin as a test, so the two spellings of
 // one Apple enum cannot drift apart on a host that can only build one of them.
 const _: () = {
-    use crate::contract::visibility::{
+    use crate::protocol::visibility::{
         visibility_result_mode_recordable, VISIBILITY_RESULT_MODE_DISABLED,
         VISIBILITY_RESULT_MODE_SWEEP_END,
     };
@@ -482,7 +482,7 @@ checked_ordinal! {
 // The primitive types this rail can encode are exactly the ones the device
 // tells the guest it may draw.
 //
-// `contract::draw::EXECUTABLE_PRIMITIVE_TYPES` leaves this device as
+// `protocol::draw::EXECUTABLE_PRIMITIVE_TYPES` leaves this device as
 // device-info key 11, which the guest reads as a *permission* mask — a bit set
 // there without an arm above is a draw the guest was invited to make and this
 // rail then refuses. A `const` block rather than a `#[test]` for the reason
@@ -493,7 +493,7 @@ const _: () = {
     let mut mtl = 0u32;
     while mtl <= 8 {
         assert!(
-            primitive_type(mtl).is_some() == crate::contract::draw::primitive_type_executable(mtl),
+            primitive_type(mtl).is_some() == crate::protocol::draw::primitive_type_executable(mtl),
             "a primitive type this device advertises has no Metal arm, or vice versa",
         );
         mtl += 1;
@@ -628,7 +628,7 @@ checked_ordinal! {
     /// `X32_Stencil8` and `X24_Stencil8` above the pair they alias.
     ///
     /// This lists everything `metal` 0.33 declares rather than the subset
-    /// `crate::contract::pixel_format` sizes. The two are different questions —
+    /// `crate::protocol::pixel_format` sizes. The two are different questions —
     /// this one is "can the Rust type hold this value at all", and answering it
     /// with the narrower table would refuse formats this device hands to Metal
     /// unexamined today. What each call site does with a format it cannot size

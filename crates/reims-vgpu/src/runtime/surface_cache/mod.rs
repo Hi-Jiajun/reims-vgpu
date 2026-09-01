@@ -17,8 +17,8 @@
 //! store; [`crate::runtime::scanout::capture_present_frame`] prefers surface_id
 //! cache content when present so scanout matches what the host executed.
 
-use crate::contract::pixel_format::RGBA8_BPP;
 use crate::model::{scanout_extent_ok, DeviceState, GvaBacking, HostSurface};
+use crate::protocol::pixel_format::RGBA8_BPP;
 use crate::runtime::host::HostMemory;
 
 /// `generation` is issued by
@@ -531,7 +531,7 @@ impl LinearWindow {
     /// This is the whole precondition both store paths share. `None` is a
     /// refusal to create an entry, not a missing format lookup.
     fn storable_bpp(&self) -> Option<u32> {
-        let bpp = crate::contract::pixel_format::bytes_per_pixel(self.pixel_format)?;
+        let bpp = crate::protocol::pixel_format::bytes_per_pixel(self.pixel_format)?;
         let ok = self.texture_ref != 0
             && self.gva != 0
             && self.width != 0
@@ -695,7 +695,7 @@ pub fn materialize_linear_resident(
             resident_gen: entry.resident_gen,
         });
     }
-    let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(entry.pixel_format) else {
+    let Some(bpp) = crate::protocol::pixel_format::bytes_per_pixel(entry.pixel_format) else {
         return Err(LinearMaterializeDecline::FormatUnsized {
             pixel_format: entry.pixel_format,
         });
@@ -729,7 +729,7 @@ pub fn get_linear_texture<'a>(state: &'a DeviceState, w: &LinearWindow) -> Optio
     if !w.describes(entry) {
         return None;
     }
-    let bpp = crate::contract::pixel_format::bytes_per_pixel(w.pixel_format)?;
+    let bpp = crate::protocol::pixel_format::bytes_per_pixel(w.pixel_format)?;
     let need = w.tight_len(bpp)?;
     (entry.bytes.len() >= need).then(|| &entry.bytes[..need])
 }
@@ -738,7 +738,7 @@ pub fn get_linear_texture<'a>(state: &'a DeviceState, w: &LinearWindow) -> Optio
 /// the BGRA render-sample caches. Deferred linear writebacks are gated on
 /// `!linear_mirrorable` so render-side consumers never lose the mirror.
 pub fn linear_mirrorable(pixel_format: u16) -> bool {
-    use crate::contract::pixel_format::{
+    use crate::protocol::pixel_format::{
         MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM,
         MTL_FORMAT_RGBA8_UNORM_SRGB,
     };
@@ -763,7 +763,7 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
     w: &LinearWindow,
     bytes: &[u8],
 ) {
-    use crate::contract::pixel_format::{
+    use crate::protocol::pixel_format::{
         MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM,
         MTL_FORMAT_RGBA8_UNORM_SRGB,
     };

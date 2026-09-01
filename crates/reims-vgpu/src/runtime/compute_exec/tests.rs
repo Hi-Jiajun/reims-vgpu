@@ -28,9 +28,9 @@ impl RailStage for NeutralStage {
 // re-exported into `super`, so each is named where its arm compiles.
 #[cfg(feature = "backend-vulkan")]
 use super::vulkan::*;
-use crate::contract::endian::{st32, st64};
-use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::protocol::endian::{st32, st64};
+use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::runtime::decode::compute;
 use crate::runtime::decode::resource::{
     list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER,
@@ -142,13 +142,13 @@ fn argument_buffer_reflection_decline_carries_the_owner_coordinate() {
 /// and plane 2 are both R8 at identical dims, plane 1 is the RG8 chroma.
 #[test]
 fn stage_texture_ref_texture_plane_index_beats_the_ambiguous_geometry_scan() {
-    use crate::contract::endian::st16;
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::endian::st16;
+    use crate::protocol::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
         DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
         DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
     };
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM};
+    use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM};
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
 
     // elemW@0, width u24@1, elemH@4, height u24@5.
@@ -992,9 +992,9 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
     // `MetalStage` and there is no Vulkan field here to get wrong.
     let mut no_selector = StagedTexture {
         binding: 33,
-        // A sample-only format: `contract::pixel_format::storage_selector` has
+        // A sample-only format: `protocol::pixel_format::storage_selector` has
         // no entry for it by design, which is exactly the class this refuses.
-        pixel_format: crate::contract::pixel_format::MTL_FORMAT_R32_FLOAT,
+        pixel_format: crate::protocol::pixel_format::MTL_FORMAT_R32_FLOAT,
         storage_selector: None,
         mip_levels: 1,
         width: 4,
@@ -1209,8 +1209,8 @@ fn dispatch_missing_texture_fails() {
 /// MissingTexture (`compute_stage_tex … ot=5`).
 #[test]
 fn stage_texture_ref_texture_ref_resolves_surface_mapping() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1263,8 +1263,8 @@ fn stage_texture_ref_texture_ref_resolves_surface_mapping() {
 /// `uint4` image write stores four packed BGRA pixels.
 #[test]
 fn stage_texture_ref_texture_record_reshapes_stageable_single_plane_surface() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::{
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::{
         StorageImageSelector, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R32_UINT, MTL_FORMAT_RGBA32_UINT,
     };
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
@@ -1360,13 +1360,13 @@ fn stage_texture_ref_texture_record_reshapes_stageable_single_plane_surface() {
 /// (wallpaper '420f', journal 2026-07-14 compute census).
 #[test]
 fn stage_texture_ref_texture_record_stages_biplanar_y_plane() {
-    use crate::contract::endian::{st16, st64};
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::endian::{st16, st64};
+    use crate::protocol::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
         DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
         DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
     };
-    use crate::contract::pixel_format::MTL_FORMAT_R8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_R8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
 
     let pack_dims = |w: u64, h: u64| ((w & 0xffffff) << 8) | ((h & 0xffffff) << 40);
@@ -1437,7 +1437,7 @@ fn stage_texture_ref_texture_record_stages_biplanar_y_plane() {
     assert_eq!((staged.width, staged.height), (16, 8));
     assert_eq!(
         staged.storage_selector,
-        Some(crate::contract::pixel_format::StorageImageSelector::R8Unorm)
+        Some(crate::protocol::pixel_format::StorageImageSelector::R8Unorm)
     );
     assert_eq!(staged.bytes.len(), 16 * 8);
     assert!(staged.bytes.iter().all(|&b| b == 0x77));
@@ -1466,7 +1466,7 @@ fn stage_texture_ref_texture_record_stages_biplanar_y_plane() {
 /// (no BGRA invent over multi-plane bytes).
 #[test]
 fn stage_texture_ref_texture_multiplanar_without_record_fails_closed() {
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::iosurface_pages::{
         DEVICE_DESC_LEN, DEVICE_DESC_PLANE_COUNT, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
     };
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
@@ -1524,8 +1524,8 @@ fn stage_texture_ref_texture_multiplanar_without_record_fails_closed() {
 /// the biplanar wallpaper.
 #[test]
 fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1573,7 +1573,7 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn stage_heap_texture_uses_host_only_residency_identity() {
-    use crate::contract::pixel_format::{StorageImageSelector, MTL_FORMAT_RGBA32_FLOAT};
+    use crate::protocol::pixel_format::{StorageImageSelector, MTL_FORMAT_RGBA32_FLOAT};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, HEAP_TEXTURE_DESCRIPTOR, HEAP_TEXTURE_HEAP_REF, HEAP_TEXTURE_LEN,
         HEAP_TEXTURE_OFFSET, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_USE_OFFSET, OBJECT_LIST_ENTRY_LEN,
@@ -1656,7 +1656,7 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
 /// a fail-closed write into freed guest pages.
 #[test]
 fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use crate::runtime::surface_cache;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -1718,7 +1718,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
 /// be host-addressable (usize), not rejected by an arbitrary cap.
 #[test]
 fn compute_stage_admits_full_screen_wide_gamut_without_cap() {
-    use crate::contract::pixel_format::{bytes_per_pixel, MTL_FORMAT_RGBA16_FLOAT};
+    use crate::protocol::pixel_format::{bytes_per_pixel, MTL_FORMAT_RGBA16_FLOAT};
     use crate::runtime::draw::host_alloc_len;
     let bpp = bytes_per_pixel(MTL_FORMAT_RGBA16_FLOAT).expect("rgba16f bpp") as u64;
     let need = 1928u64 * 1920 * bpp;
@@ -1734,8 +1734,8 @@ fn compute_stage_admits_full_screen_wide_gamut_without_cap() {
 /// returned the wrong mapping.
 #[test]
 fn stage_texture_ref_texture_ignores_task_object_list_slot_collision() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2282,8 +2282,8 @@ fn bulk_linear_helpers_fall_back_on_fragmented_span() {
 /// rail, and the guest can hand the range to something else across it.
 #[test]
 fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (dir_pfn, root_pfn, pt_base) = (2u32, 3u32, 4u32);
@@ -2377,7 +2377,7 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
 #[test]
 fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     use crate::backend::vulkan::engine::ComputeImageDestination;
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use crate::runtime::drain::census::store_route_count;
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2478,7 +2478,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     let not_linear = store_route_count("compute_dst_host_not_linear");
     for (mapping_id, format) in [
         (1, MTL_FORMAT_RGBA8_UNORM),
-        (2, crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT),
+        (2, crate::protocol::pixel_format::MTL_FORMAT_RGBA16_FLOAT),
         (3, MTL_FORMAT_RGBA8_UNORM),
     ] {
         assert!(
@@ -2564,8 +2564,8 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
 /// asked for.
 #[test]
 fn a_staged_window_records_its_pages_in_guest_virtual_order() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (dir_pfn, root_pfn, pt_base) = (2u32, 3u32, 4u32);
@@ -2693,7 +2693,7 @@ fn a_resident_answer_is_a_seed_or_a_sample_and_never_both() {
 /// that means something.
 #[test]
 fn an_undeclared_dispatch_type_is_named_and_counted_before_it_becomes_serial() {
-    use crate::contract::dispatch::{MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL};
+    use crate::protocol::dispatch::{MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL};
     use crate::runtime::drain::store_route_count;
 
     let before = store_route_count("compute_dispatch_type_unknown");
@@ -2985,8 +2985,8 @@ fn a_sampled_image_the_kernel_uses_and_the_guest_left_empty_gets_a_neutral_textu
 /// the same reason.
 #[test]
 fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
-    use crate::contract::endian::st16;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::st16;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         BUF_TEX_DESC_BUFFER_REF, BUF_TEX_DESC_BYTES_PER_ROW, BUF_TEX_DESC_OFFSET,
         BUF_TEX_WIDE_DESC_BODY, BUF_TEX_WIDE_LEN, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_OPCODE,
@@ -3127,8 +3127,8 @@ fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
 /// another level's stride is a different value and not merely a shifted one.
 #[test]
 fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN,
         TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,

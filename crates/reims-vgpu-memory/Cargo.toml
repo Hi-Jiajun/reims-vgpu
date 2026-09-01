@@ -15,8 +15,10 @@ name = "reims_vgpu_memory"
 # is this" two ways, and the second answer is where a raw pointer and an offset
 # escape.
 [dependencies]
-# `align_up_u64`, the one piece of contract arithmetic an import alignment needs.
-reims-vgpu-contract = { path = "../reims-vgpu-contract" }
+# `align_up_u64`, the one piece of protocol arithmetic an import alignment
+# needs.
+reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }
+
 # The contiguous-run partition of a page list. A footprint derives its runs once
 # and that arithmetic already lives above the page-table format.
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }

@@ -69,8 +69,8 @@
 //! the alias is optional; a driver may refuse it and the existing gather remains
 //! the correctness path. It is never attempted per draw.
 
-use reims_vgpu_contract::checked::align_up_u64;
 use reims_vgpu_observe::{Decline, Emit};
+use reims_vgpu_protocol::checked::align_up_u64;
 
 /// Exact physical footprint retained with one imported guest allocation.
 ///

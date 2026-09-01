@@ -1,8 +1,8 @@
 //! Resource descriptor decode (port of `host/utils/reims-vgpu-resource-decode`).
 
-use crate::contract::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
+use crate::protocol::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
 #[cfg(test)]
-use crate::contract::endian::{st16, st32};
+use crate::protocol::endian::{st16, st32};
 use crate::runtime::heap_query; // ICB layout fixture encoder only
 
 use core::mem::{offset_of, size_of};
@@ -364,10 +364,10 @@ pub struct BufferDescriptor {
 pub const LINEAR_DESC_MIN_LEN: usize = 16;
 pub const LINEAR_DESC_SIZE: usize = 0;
 pub const LINEAR_DESC_HANDLE: usize = 8;
-/// Arm fixture alias of [`crate::contract::gva::PAGE_SHIFT_ARM64E`].
+/// Arm fixture alias of [`crate::protocol::gva::PAGE_SHIFT_ARM64E`].
 /// Prefer `PAGE_SHIFT_ARM64E` / `PAGE_SHIFT_X86` at new call sites. Product
 /// paths must pass `DeviceState::page_shift`, not a fixed arch constant.
-pub const RESOURCE_PAGE_SHIFT: u32 = crate::contract::gva::PAGE_SHIFT_ARM64E;
+pub const RESOURCE_PAGE_SHIFT: u32 = crate::protocol::gva::PAGE_SHIFT_ARM64E;
 
 impl BufferDescriptor {
     /// Guest VA of buffer backing at the given page_shift, or None when
@@ -422,7 +422,7 @@ impl TextureLevelLayout {
     ///
     /// The row count is a parameter because a **block-compressed** level has
     /// fewer rows of storage than it has rows of texels: a 64x64 BC3 level is
-    /// sixteen 256-byte rows, not sixty-four. `contract::pixel_format::
+    /// sixteen 256-byte rows, not sixty-four. `protocol::pixel_format::
     /// tight_row_count` is what a caller passes, and it answers `height` for
     /// every uncompressed format — so `read_span` above is this with the count
     /// it always used.

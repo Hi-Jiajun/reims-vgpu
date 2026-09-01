@@ -41,7 +41,7 @@ fn surface_format(state: &DeviceState, mapping_id: u32) -> vk::Format {
         .mappings
         .get(&mapping_id)
         .map(crate::runtime::mapping_write::mapping_store_format)
-        .and_then(crate::contract::pixel_format::store_texel_order)
+        .and_then(crate::protocol::pixel_format::store_texel_order)
         .map(crate::backend::vulkan::translate::pixel::vk_texel_layout)
         .unwrap_or(crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT)
 }
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn a_mappings_resident_follows_the_pixel_format_it_declares() {
         use crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
-        use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
+        use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         assert!(state.map_surface(7));
@@ -173,7 +173,7 @@ mod tests {
             m.has_geom = true;
             m.width = 64;
             m.height = 32;
-            m.format = crate::contract::pixel_format::MTL_FORMAT_RGBA32_FLOAT;
+            m.format = crate::protocol::pixel_format::MTL_FORMAT_RGBA32_FLOAT;
         }
         assert_eq!(
             surface_identity(&state, 7, 64, 32).resident_format(),

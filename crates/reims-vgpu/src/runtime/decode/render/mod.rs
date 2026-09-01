@@ -846,8 +846,8 @@ pub(crate) fn unclaimed_accepted_opcode() -> u32 {
     (0..=wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE)
         .find(|&op| {
             let mut v = vec![0u8; OP_HEADER_LEN];
-            crate::contract::endian::st32(&mut v[0..4], op);
-            crate::contract::endian::st32(&mut v[4..8], OP_HEADER_LEN as u32);
+            crate::protocol::endian::st32(&mut v[0..4], op);
+            crate::protocol::endian::st32(&mut v[4..8], OP_HEADER_LEN as u32);
             matches!(decode(&v), Ok(c) if c.kind == Kind::OtherAccepted)
         })
         .expect("every opcode in the window is decoded; the catch-all is unreachable")

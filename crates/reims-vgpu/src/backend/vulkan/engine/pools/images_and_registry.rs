@@ -164,7 +164,7 @@ impl ResourcePools {
         let components = if key.sampled_only {
             translate::pixel::vk_component_mapping(&plan)
         } else {
-            if !crate::contract::pixel_format::swizzle_is_identity(&plan) {
+            if !crate::protocol::pixel_format::swizzle_is_identity(&plan) {
                 ctx.device.free_memory(memory, None);
                 ctx.device.destroy_image(image, None);
                 return Err(DrawError::Unsupported(

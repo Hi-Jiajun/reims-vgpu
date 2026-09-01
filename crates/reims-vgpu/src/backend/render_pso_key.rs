@@ -39,7 +39,7 @@
 
 use crate::backend::blob::{BlobIdentity, BlobKey};
 use crate::backend::hash::hash_u64;
-use crate::contract::fnv::FNV_OFFSET_BASIS;
+use crate::protocol::fnv::FNV_OFFSET_BASIS;
 use crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS;
 use crate::runtime::decode::resource::{MAX_VERTEX_ATTRS, MTL_COLOR_WRITE_MASK_ALL};
 

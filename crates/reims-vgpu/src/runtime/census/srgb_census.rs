@@ -31,7 +31,7 @@
 //! beside it bound the `_SRGB` view and decoded, and which of the two a bind
 //! took was a cost decision.
 //!
-//! That variant now carries [`crate::contract::pixel_format::SampledByteFormat`],
+//! That variant now carries [`crate::protocol::pixel_format::SampledByteFormat`],
 //! which pairs the layout with the source format, so the rung *honours* the
 //! qualifier and there is nothing left to report for the eight-bit colour
 //! orders. What remains is [`site::SAMPLED_BYTE_UPLOAD`]: a loader that
@@ -160,7 +160,7 @@ pub fn reset_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM_SRGB};
+    use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM_SRGB};
 
     /// A per-draw rail must cost one line per distinct (site, format) pair, not
     /// one per bind — the dedup is what makes it safe to leave on forever, and

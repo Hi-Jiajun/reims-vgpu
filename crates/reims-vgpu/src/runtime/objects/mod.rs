@@ -12,15 +12,15 @@
 //! [`reims_vgpu_wire::device_desc`], which states it once with `offset_of!`
 //! rather than as the eight literal offsets that used to sit in this module.
 
-use crate::contract::endian::{ld32, st16, st32, st64};
-use crate::contract::iosurface_pages::{
+use crate::model::{DeviceState, MappingEntry, TaskResource, TaskTable};
+use crate::protocol::endian::{ld32, st16, st32, st64};
+use crate::protocol::iosurface_pages::{
     entry_gpa_shift, page_size_of, DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BASE_OFFSET,
     DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT,
     DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT, DEVICE_PLANE_BPE, DEVICE_PLANE_BPR,
     DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
     PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
 };
-use crate::model::{DeviceState, MappingEntry, TaskResource, TaskTable};
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
     OBJECT_TYPE_MAPPER_REF_TEXTURE,
@@ -608,7 +608,7 @@ pub fn backing_is_multiplanar(surf: &BackingRecord) -> bool {
 
 /// Mapping has multi-plane device geometry (plane_count≥2) or biplanar FourCC.
 pub fn mapping_is_multiplanar(m: &MappingEntry) -> bool {
-    use crate::contract::iosurface_pages::decode_device_surface;
+    use crate::protocol::iosurface_pages::decode_device_surface;
     if let Some(s) = decode_device_surface(&m.device_desc) {
         if s.plane_count > 1 {
             return true;
@@ -663,7 +663,7 @@ pub fn device_desc_format_to_mtl(raw: u32) -> u16 {
 ///
 /// Unknown formats fail closed.
 pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
-    use crate::contract::pixel_format::{
+    use crate::protocol::pixel_format::{
         MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM,
         MTL_FORMAT_RG8_UNORM, MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM,
     };
@@ -698,7 +698,7 @@ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
         // bits, then ten each of red, green and blue, with blue in the low
         // bits. That is `MTLPixelFormatBGR10A2Unorm`'s word exactly, which is
         // also `VK_FORMAT_A2R10G10B10_UNORM_PACK32`'s — see
-        // `contract::pixel_format::MTL_FORMAT_BGR10A2_UNORM` and
+        // `protocol::pixel_format::MTL_FORMAT_BGR10A2_UNORM` and
         // `backend::vulkan::translate::pixel`, which already paired those two.
         //
         // Two independent sources agree on it, which is why it is stated rather
@@ -1096,7 +1096,7 @@ fn synthesize_device_desc_from_backing(surf: &BackingRecord) -> Vec<u8> {
             st32(&mut device_desc[DEVICE_DESC_BASE_OFFSET..], base_offset);
         }
         if mtl != 0 {
-            if let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(mtl) {
+            if let Some(bpp) = crate::protocol::pixel_format::bytes_per_pixel(mtl) {
                 st16(&mut device_desc[DEVICE_DESC_BPE..], bpp as u16);
             }
         }

@@ -1012,7 +1012,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         &frag,
         width,
         height,
-        crate::contract::draw::DrawArgs {
+        crate::protocol::draw::DrawArgs {
             vertex_count,
             instance_count: req.instance_count,
             primitive_type: req.primitive_type,
@@ -2153,11 +2153,11 @@ mod tests {
     /// whatever the cache held, forever.
     #[test]
     fn a_sampled_mapper_ref_texture_serves_a_published_frame_only_on_a_watched_clean_witness() {
-        use crate::contract::endian::{st16, st32};
-        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::model::PAGE_SHIFT_X86;
+        use crate::protocol::endian::{st16, st32};
+        use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::decode::resource::{
             list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_MAPPER_REF_TEXTURE,
         };
