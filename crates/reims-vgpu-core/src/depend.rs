@@ -28,7 +28,7 @@
 //! ([`Census::domain_only_comparisons`]) rather than hidden, because the point
 //! of measuring it is to know what narrowing an access would buy.
 
-use crate::access::{requires_edge, AccessIntent, AccessKey, BackingId, HeapId};
+use crate::access::{requires_edge, AccessIntent, AccessKey, BackingId};
 use crate::identity::{ChannelId, IngressOrdinal};
 use std::collections::{BTreeSet, HashMap};
 
@@ -71,7 +71,11 @@ pub struct Census {
 pub struct DependencyGraph {
     entries: Vec<Entry>,
     by_backing: HashMap<BackingId, Vec<usize>>,
-    by_heap: HashMap<HeapId, Vec<usize>>,
+    /// Keyed by the heap, not by `HeapId`: the membership generation says
+    /// which set a record was written against and never which memory exists, so
+    /// indexing on it would file one heap's accesses in several buckets that
+    /// never meet. `AccessKey::may_alias` asks the same question.
+    by_heap: HashMap<u64, Vec<usize>>,
     by_domain: HashMap<ChannelId, Vec<usize>>,
     domain_only: HashMap<ChannelId, Vec<usize>>,
     by_ordinal: HashMap<IngressOrdinal, Vec<usize>>,
@@ -166,7 +170,7 @@ impl DependencyGraph {
                 }
             }
             AccessKey::Heap(h) => {
-                if let Some(v) = self.by_heap.get(&h) {
+                if let Some(v) = self.by_heap.get(&h.id) {
                     out.extend_from_slice(v);
                 }
             }
@@ -175,7 +179,7 @@ impl DependencyGraph {
                     out.extend_from_slice(v);
                 }
                 if let Some(h) = r.heap {
-                    if let Some(v) = self.by_heap.get(&h) {
+                    if let Some(v) = self.by_heap.get(&h.id) {
                         out.extend_from_slice(v);
                     }
                 }
@@ -197,14 +201,14 @@ impl DependencyGraph {
         self.by_ordinal.entry(ordinal).or_default().push(idx);
         match intent.key {
             AccessKey::DomainOnly => self.domain_only.entry(intent.domain).or_default().push(idx),
-            AccessKey::Heap(h) => self.by_heap.entry(h).or_default().push(idx),
+            AccessKey::Heap(h) => self.by_heap.entry(h.id).or_default().push(idx),
             AccessKey::Range(r, _) | AccessKey::Subresource(r, _) | AccessKey::Whole(r) => {
                 self.by_backing.entry(r.backing).or_default().push(idx);
                 // Also under its heap, so a heap declaration can find it: a
                 // heap-use record names the heap and never its members, so
                 // membership has to be reachable from both directions.
                 if let Some(h) = r.heap {
-                    self.by_heap.entry(h).or_default().push(idx);
+                    self.by_heap.entry(h.id).or_default().push(idx);
                 }
             }
         }
@@ -248,7 +252,7 @@ impl DependencyGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::{AccessMode, ByteRange, ResourceKey, SubresourceRange};
+    use crate::access::{AccessMode, ByteRange, HeapId, ResourceKey, SubresourceRange};
 
     fn res(backing: u64) -> ResourceKey {
         ResourceKey {
@@ -373,6 +377,38 @@ mod tests {
         assert_eq!(
             g.admit(ord(2), &[intent(member, AccessMode::Read)]),
             vec![ord(1)]
+        );
+    }
+
+    /// The graph's heap index has to answer the same question
+    /// `AccessKey::may_alias` does. Filing accesses under `(heap, membership)`
+    /// puts a declaration written before a placement and a member access
+    /// written after it in two buckets that never meet, and the write/read
+    /// hazard between them disappears — silently, and only when the guest
+    /// happens to allocate from the heap in between.
+    #[test]
+    fn a_placement_between_two_uses_does_not_dissolve_the_heap_edge() {
+        let at = |generation| HeapId {
+            id: 3,
+            membership_generation: generation,
+        };
+        let member = |generation| {
+            AccessKey::Whole(ResourceKey {
+                backing: BackingId(9),
+                heap: Some(at(generation)),
+            })
+        };
+        let mut g = DependencyGraph::new();
+        g.admit(ord(1), &[intent(AccessKey::Heap(at(1)), AccessMode::Write)]);
+        assert_eq!(
+            g.admit(ord(2), &[intent(member(2), AccessMode::Read)]),
+            vec![ord(1)],
+            "the resource did not move when something else was placed beside it"
+        );
+        assert_eq!(
+            g.admit(ord(3), &[intent(AccessKey::Heap(at(2)), AccessMode::Read)]),
+            vec![ord(1)],
+            "and the later declaration still meets the earlier one's write"
         );
     }
 

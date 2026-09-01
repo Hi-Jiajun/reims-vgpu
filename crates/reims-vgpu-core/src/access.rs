@@ -48,16 +48,32 @@ use crate::identity::{ChannelId, ResourceId};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BackingId(pub u64);
 
-/// A heap, and the generation of its membership.
+/// A heap, and the generation of its membership at the point the record was
+/// decoded.
 ///
-/// The generation is part of the identity because heap-use participation is
-/// evaluated at the command point: a heap whose membership changed between two
-/// commands is not the same participation domain for both, and comparing them
-/// by heap number alone would silently order against the wrong set.
+/// The generation is carried because it is a decoded fact worth reporting —
+/// it says *which* membership set the declaration was written against — but it
+/// is deliberately not part of the aliasing question. A resource leaves a heap
+/// only by being destroyed, so a declaration recorded at generation *N* and an
+/// access recorded at generation *N+1* can still name the very same bytes;
+/// requiring the generations to match would drop that edge, and a dropped
+/// hazard edge is a race. [`HeapId::same_heap`] is therefore what the conflict
+/// test asks, and the cost of asking it is over-ordering against resources
+/// placed after the declaration — the sound direction, and the same
+/// conservatism the heap rung already carries by naming no usage at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HeapId {
     pub id: u64,
     pub membership_generation: u64,
+}
+
+impl HeapId {
+    /// Whether these name the same heap, whatever either one's membership was
+    /// when it was recorded.
+    #[must_use]
+    pub const fn same_heap(self, other: HeapId) -> bool {
+        self.id == other.id
+    }
 }
 
 /// A half-open byte range within one backing.
@@ -188,14 +204,13 @@ impl AccessKey {
             return true;
         }
         match (self, other) {
-            // Two heap declarations meet when they are the same heap at the
-            // same membership; a different membership generation is a
-            // different set of resources, so it is a different domain.
-            (Self::Heap(a), Self::Heap(b)) => a == b,
+            // Two declarations of one heap meet, whichever membership each
+            // was recorded against.
+            (Self::Heap(a), Self::Heap(b)) => a.same_heap(b),
             // A heap declaration meets every resource allocated from it.
-            (Self::Heap(h), key) | (key, Self::Heap(h)) => {
-                key.resource().is_some_and(|r| r.heap == Some(h))
-            }
+            (Self::Heap(h), key) | (key, Self::Heap(h)) => key
+                .resource()
+                .is_some_and(|r| r.heap.is_some_and(|rh| rh.same_heap(h))),
             (a, b) => {
                 let (Some(ra), Some(rb)) = (a.resource(), b.resource()) else {
                     return false;
@@ -507,10 +522,9 @@ mod tests {
     }
 
     /// A heap declaration names no resource, so it can only meet one through
-    /// membership — and membership at the command point, since a heap whose
-    /// contents changed is a different participation domain.
+    /// membership.
     #[test]
-    fn a_heap_declaration_meets_its_members_and_not_a_later_membership() {
+    fn a_heap_declaration_meets_its_members_and_not_a_stranger() {
         let heap = HeapId {
             id: 5,
             membership_generation: 2,
@@ -526,14 +540,42 @@ mod tests {
             !AccessKey::Heap(heap).may_alias(stranger),
             "a resource with no heap is not in one"
         );
-        let later = HeapId {
+        let other_heap = HeapId {
+            id: 6,
+            membership_generation: 2,
+        };
+        assert!(
+            !AccessKey::Heap(heap).may_alias(AccessKey::Heap(other_heap)),
+            "two heaps are two sets of memory"
+        );
+        assert!(
+            !AccessKey::Heap(other_heap).may_alias(member),
+            "and a member of one is not a member of the other"
+        );
+    }
+
+    /// Placing a resource in a heap advances that heap's membership, and the
+    /// resource that was already there did not move. A declaration recorded
+    /// before the placement and an access recorded after it are talking about
+    /// the same bytes, so they must still meet: the generation says which set
+    /// was declared, not which memory exists.
+    #[test]
+    fn a_membership_change_does_not_dissolve_a_heap_hazard() {
+        let declared = HeapId {
+            id: 5,
+            membership_generation: 2,
+        };
+        let after_a_placement = HeapId {
             id: 5,
             membership_generation: 3,
         };
-        assert!(
-            !AccessKey::Heap(heap).may_alias(AccessKey::Heap(later)),
-            "the same heap at a different membership is a different set"
-        );
+        assert!(AccessKey::Heap(declared).may_alias(AccessKey::Heap(after_a_placement)));
+        let member_now = AccessKey::Whole(ResourceKey {
+            backing: BackingId(11),
+            heap: Some(after_a_placement),
+        });
+        assert!(AccessKey::Heap(declared).may_alias(member_now));
+        assert!(member_now.may_alias(AccessKey::Heap(declared)));
     }
 
     /// Incomplete participation could be anything, so it meets everything —
