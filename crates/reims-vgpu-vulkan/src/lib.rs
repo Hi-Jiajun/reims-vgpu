@@ -40,6 +40,8 @@
 //!   is a performance bug and never a correctness one: topology selects a
 //!   preference order, the required flags are always the fallback, and nothing
 //!   may branch on topology in a way the guest can observe.
+//! - [`recording`] — everything one native recording owns, held as one value
+//!   from the slots it takes to the pipelines it releases.
 //! - [`queues`] — which queue family this rail submits to, and the value that
 //!   makes a `VkQueue` have exactly one owner.
 //! - [`barrier`] — what a declared barrier becomes on this host, and which of
@@ -75,6 +77,7 @@ pub mod memory;
 pub mod placement;
 pub mod pools;
 pub mod queues;
+pub mod recording;
 pub mod submission;
 pub mod timeline;
 pub mod variant;

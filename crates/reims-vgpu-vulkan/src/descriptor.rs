@@ -363,6 +363,9 @@ pub struct Census {
     pub recycled: usize,
     /// Emissions refused for want of a set.
     pub refused: usize,
+    /// Emissions planned and then given up, because the recording that owned
+    /// them failed before its write completed.
+    pub abandoned: usize,
 }
 
 /// One worker's descriptor sets for one layout: which of them describes the
@@ -548,6 +551,35 @@ impl SetRing {
     #[must_use]
     pub fn resettable(&self) -> bool {
         self.in_flight() == 0
+    }
+
+    /// The recording that planned this emission gave it up, so whatever the
+    /// emission was going to write was never written.
+    ///
+    /// Clears [`Self::holder`] when it names this set, which is the whole
+    /// point: after a half-finished write, the set does not describe the
+    /// binding table, and a later clean draw that bound it would bind
+    /// descriptors that were never emitted. The next emission takes a fresh
+    /// set and writes the whole table, which is the correct price for a failed
+    /// one.
+    ///
+    /// The set itself returns to [`SetState::Free`] *unless* a submission
+    /// already named it. A partial emission reuses a live holder, and another
+    /// recording may have submitted that same holder in between; freeing it
+    /// then would hand a set the GPU is reading to the next writer. So the
+    /// in-flight case gives up the holder and nothing else, and the timeline
+    /// stays the only thing that frees a submitted set.
+    pub fn abandoned(&mut self, emission: SetEmission) {
+        let Some(state) = self.sets.get_mut(emission.set) else {
+            return;
+        };
+        if !matches!(*state, SetState::Submitted(_)) {
+            *state = SetState::Free;
+        }
+        if self.holder == Some(emission.set) {
+            self.holder = None;
+        }
+        self.census.abandoned += 1;
     }
 
     /// The pool was reset, so every set is gone and nothing describes the
@@ -1226,5 +1258,65 @@ mod tests {
         ] {
             assert!(!t.name().is_empty());
         }
+    }
+
+    #[test]
+    fn an_abandoned_fresh_emission_frees_its_set_and_gives_up_the_holder() {
+        let mut ring = SetRing::new(2);
+        let first = ring.emit().expect("a free set");
+        assert_eq!(ring.holder(), Some(first.set));
+
+        ring.abandoned(first);
+
+        // Freed rather than leaked: nothing else can free a set that was never
+        // submitted, so an abandoned one would take a slot out of the ring for
+        // the life of the epoch.
+        assert_eq!(ring.state(first.set), Some(SetState::Free));
+        assert_eq!(ring.free(), 2);
+        assert_eq!(ring.holder(), None);
+        assert_eq!(ring.census().abandoned, 1);
+    }
+
+    #[test]
+    fn the_emission_after_an_abandoned_one_writes_the_whole_table() {
+        let mut ring = SetRing::new(2);
+        let first = ring.emit().expect("a free set");
+        ring.abandoned(first);
+
+        let second = ring.emit().expect("a free set");
+        // Not partial: the abandoned write may have landed in part, so nothing
+        // in the ring describes the binding table any more.
+        assert!(second.whole());
+    }
+
+    #[test]
+    fn abandoning_a_submitted_holder_gives_up_the_holder_and_frees_nothing() {
+        let mut ring = SetRing::new(2);
+        let first = ring.emit().expect("a free set");
+        // A second recording reuses the live holder, then the first one is
+        // submitted while the second is still preparing.
+        let partial = ring.emit().expect("the live holder");
+        assert_eq!(partial.set, first.set);
+        ring.submitted(at(7));
+
+        ring.abandoned(partial);
+
+        // The GPU may still be reading it, so the timeline stays the only
+        // thing that frees it.
+        assert_eq!(ring.state(first.set), Some(SetState::Submitted(at(7))));
+        assert_eq!(ring.holder(), None);
+        assert_eq!(ring.recycle(at(7)), 1);
+        assert_eq!(ring.state(first.set), Some(SetState::Free));
+    }
+
+    #[test]
+    fn abandoning_an_emission_for_a_set_outside_the_ring_changes_nothing() {
+        let mut ring = SetRing::new(1);
+        let before = ring.clone();
+        ring.abandoned(SetEmission {
+            set: 9,
+            partial: false,
+        });
+        assert_eq!(ring, before);
     }
 }
