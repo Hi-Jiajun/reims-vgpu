@@ -2095,6 +2095,69 @@ mod tests {
         );
     }
 
+    /// The real namespace resolves a delete, and stops resolving it once the
+    /// guest has deleted it.
+    ///
+    /// Every other test here uses a stub that answers about everything or
+    /// nothing. This one drives `operation` from `crate::namespace::Namespace`,
+    /// which is what the trait is for: the resolution path had no implementation
+    /// but stubs, so nothing checked that what the namespace actually holds is
+    /// what a command resolves against.
+    #[test]
+    fn a_delete_resolves_against_the_namespace_that_declared_the_object() {
+        let mut names = crate::namespace::Namespace::new();
+        let id = names
+            .declare(ObjectListRef(7), crate::access::BackingId(10))
+            .expect("a free slot");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&TASK.0.to_le_bytes());
+        payload.extend_from_slice(&7u32.to_le_bytes());
+
+        assert_eq!(
+            operation(
+                LifecycleKind::DeleteResource,
+                &payload,
+                &names,
+                &EveryMapping
+            ),
+            Ok(LifecycleOp::DeleteResource {
+                task: TASK,
+                resource: id,
+            })
+        );
+
+        // The generation is the object's own, not a number this test chose: a
+        // second declaration in the same slot is a different name, and work
+        // still carrying the first one no longer resolves to it.
+        names.delete(id).expect("declared");
+        assert_eq!(
+            operation(
+                LifecycleKind::DeleteResource,
+                &payload,
+                &names,
+                &EveryMapping
+            ),
+            Err(ResolveRefusal::UnknownRef { object_ref: 7 }),
+            "a deleted slot stops resolving"
+        );
+        let again = names
+            .declare(ObjectListRef(7), crate::access::BackingId(11))
+            .expect("the slot is free");
+        assert_ne!(again, id);
+        assert_eq!(
+            operation(
+                LifecycleKind::DeleteResource,
+                &payload,
+                &names,
+                &EveryMapping
+            ),
+            Ok(LifecycleOp::DeleteResource {
+                task: TASK,
+                resource: again,
+            })
+        );
+    }
+
     /// A ref naming nothing live refuses on the ref, for both kinds — the
     /// object is judged before the operation is.
     #[test]

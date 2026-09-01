@@ -367,9 +367,42 @@ impl Namespace {
     }
 }
 
+/// **The join between a guest's object-list ref and the identity work carries.**
+///
+/// [`crate::resolve`] and [`crate::lifecycle`] both take a
+/// [`RefResolver`](crate::resolve::RefResolver) and this module holds the slots,
+/// and nothing implemented the trait — so the only resolvers in the crate were
+/// test stubs, and the whole resolution path could be driven by nothing that
+/// knew what was actually declared.
+///
+/// # Identity, and not a claim
+///
+/// This answers *which* object a ref names. It does not acquire anything, and
+/// that is deliberate rather than an omission: a record resolves before its
+/// transaction is admitted, and a claim taken at resolution would be a claim on
+/// work that may still be refused. [`Namespace::resolve_slot`] is the other
+/// door — it returns a [`Lease`], which is the thing [`Namespace::acquire`]
+/// takes — and the two questions belong to different moments. The refusal
+/// vocabulary already says so: `ResolveRefusal::NeedsStorage` exists precisely
+/// because a `RefResolver` answers identity only.
+///
+/// Deleted slots answer `None`, which is the module's own invariant: deletion
+/// stops *new* resolution and leaves accepted work alone.
+impl crate::resolve::RefResolver for Namespace {
+    fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+        let slot = ObjectListRef(object_ref);
+        let held = self.slots.get(&slot)?;
+        (!held.deleted).then_some(ResourceId {
+            slot,
+            generation: held.generation,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolve::RefResolver as _;
 
     fn slot(n: u32) -> ObjectListRef {
         ObjectListRef(n)
@@ -548,5 +581,51 @@ mod tests {
         let mut ns = Namespace::new();
         let id = ns.declare(slot(1), backing(10)).expect("free slot");
         assert_ne!(id.generation, SlotGeneration::default());
+    }
+
+    /// Resolving a ref for identity gives the live occupant, the current
+    /// generation, and nothing for a slot the guest deleted.
+    ///
+    /// The generation half is the whole reason a slot number is not an
+    /// identity: a slot reused after a delete answers with a *different*
+    /// generation, so work still carrying the old id no longer names it.
+    #[test]
+    fn a_ref_resolves_to_the_slots_live_occupant_and_its_generation() {
+        let mut ns = Namespace::new();
+        assert_eq!(ns.resource(1), None, "nothing has been declared");
+        let first = ns.declare(slot(1), backing(10)).expect("free slot");
+        assert_eq!(ns.resource(1), Some(first));
+
+        ns.delete(first).expect("declared");
+        assert_eq!(
+            ns.resource(1),
+            None,
+            "a delete stops new resolution, which is the module's invariant"
+        );
+
+        let second = ns.declare(slot(1), backing(11)).expect("the slot is free");
+        assert_eq!(ns.resource(1), Some(second));
+        assert_ne!(second, first, "a reused slot is not the same name");
+    }
+
+    /// Resolving for identity takes no claim, and the census says so.
+    ///
+    /// A record resolves before its transaction is admitted, and a claim taken
+    /// at resolution would be a claim held for work that may still be refused.
+    /// `resolve_slot` is the door that produces a `Lease`; this one does not,
+    /// and a reader has to be able to tell them apart.
+    #[test]
+    fn resolving_for_identity_is_not_a_lease() {
+        let mut ns = Namespace::new();
+        let id = ns.declare(slot(1), backing(10)).expect("free slot");
+        let before = ns.census();
+        assert_eq!(ns.resource(1), Some(id));
+        assert_eq!(ns.census(), before, "identity is not a resolution taken");
+        assert_eq!(ns.outstanding(id), 0);
+
+        let lease = ns.resolve_slot(slot(1)).expect("live");
+        assert_eq!(ns.census(), (before.0 + 1, before.1));
+        ns.acquire(lease);
+        assert_eq!(ns.outstanding(id), 1, "the lease is the claim");
     }
 }
