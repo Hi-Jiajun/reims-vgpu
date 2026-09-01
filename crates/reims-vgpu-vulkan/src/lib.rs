@@ -22,6 +22,8 @@
 //!
 //! - [`bindings`] — what a draw has to re-emit, and far more often what it
 //!   does not.
+//! - [`buffer`] — why every guest buffer here can be bound as every class,
+//!   and the two things a device can still refuse about one.
 //! - [`census`] — what this physical device offers, taken once, and the floor
 //!   it has to clear to be used at all. Every capability gate below reads from
 //!   it, and it holds no device name for one to branch on.
@@ -69,6 +71,7 @@
 
 pub mod barrier;
 pub mod bindings;
+pub mod buffer;
 pub mod census;
 pub mod descriptor;
 pub mod device;

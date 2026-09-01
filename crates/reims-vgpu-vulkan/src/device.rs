@@ -314,6 +314,7 @@ mod tests {
             mesh_shader: features.1,
             descriptor_buffer: features.2,
             max_push_descriptors: 32,
+            max_buffer_size: None,
             memory: &memory,
             queue_families: &families,
         })
@@ -495,6 +496,7 @@ mod tests {
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,
+            max_buffer_size: None,
             memory: &memory,
             queue_families: &families,
         });

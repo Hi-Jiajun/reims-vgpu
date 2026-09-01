@@ -100,6 +100,8 @@ pub mod extension {
     pub const EXTERNAL_MEMORY_HOST: &str = "VK_EXT_external_memory_host";
     pub const SYNCHRONIZATION_2: &str = "VK_KHR_synchronization2";
     pub const SWAPCHAIN: &str = "VK_KHR_swapchain";
+    /// Carries `maxBufferSize`, which 1.3 promoted to core.
+    pub const MAINTENANCE_4: &str = "VK_KHR_maintenance4";
 }
 
 /// What the driver said, as the caller read it off the device.
@@ -126,6 +128,10 @@ pub struct Reported<'a> {
     pub descriptor_buffer: bool,
     /// `VkPhysicalDevicePushDescriptorPropertiesKHR::maxPushDescriptors`.
     pub max_push_descriptors: u32,
+    /// `VkPhysicalDeviceMaintenance4Properties::maxBufferSize`, when this
+    /// device reported one. See [`crate::buffer::BufferLimits`] for why the
+    /// absence is carried rather than substituted.
+    pub max_buffer_size: Option<u64>,
     pub memory: &'a vk::PhysicalDeviceMemoryProperties,
     pub queue_families: &'a [vk::QueueFamilyProperties],
 }
@@ -253,6 +259,7 @@ pub struct Census {
     queues: QueueChoice,
     stages: StageSupport,
     descriptors: DescriptorCell,
+    buffers: crate::buffer::BufferLimits,
     host_pointer_import: bool,
     synchronization2: bool,
     can_present: bool,
@@ -309,6 +316,9 @@ impl Census {
                 descriptor_buffer,
                 // Never reported by a driver. See [`DescriptorBufferProbe`].
                 descriptor_buffer_qualified: false,
+            },
+            buffers: crate::buffer::BufferLimits {
+                max_buffer_size: reported.max_buffer_size,
             },
             host_pointer_import: reported.has(extension::EXTERNAL_MEMORY_HOST),
             // 1.3 promoted it to core, so a 1.3 device has it whether or not it
@@ -378,6 +388,12 @@ impl Census {
     #[must_use]
     pub const fn descriptors(&self) -> DescriptorCell {
         self.descriptors
+    }
+
+    /// The bound [`crate::buffer::plan`] checks a length against.
+    #[must_use]
+    pub const fn buffers(&self) -> crate::buffer::BufferLimits {
+        self.buffers
     }
 
     /// The cell [`crate::placement`] decides a route from.
@@ -493,6 +509,7 @@ mod tests {
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,
+            max_buffer_size: None,
             memory,
             queue_families: families,
         }
@@ -820,5 +837,21 @@ mod tests {
         assert!(!a.at_least(1, 3));
         assert!(a.at_least(1, 0));
         assert!(ApiVersion::decode(vk::make_api_version(0, 2, 0, 0)).at_least(1, 9));
+    }
+
+    #[test]
+    fn a_reported_buffer_maximum_reaches_the_planner_and_an_absent_one_stays_absent() {
+        let memory = mem::nvidia_discrete();
+        let families = discrete_families();
+        let absent = Census::take(reported(packed(1, 2), BASELINE, &memory, &families))
+            .expect("the baseline");
+        assert_eq!(absent.buffers().max_buffer_size, None);
+
+        let stated = Census::take(Reported {
+            max_buffer_size: Some(1 << 30),
+            ..reported(packed(1, 3), BASELINE, &memory, &families)
+        })
+        .expect("the baseline");
+        assert_eq!(stated.buffers().max_buffer_size, Some(1 << 30));
     }
 }

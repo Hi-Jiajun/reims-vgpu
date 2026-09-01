@@ -21,6 +21,7 @@ use ash::vk;
 use reims_vgpu_core::identity::DeviceEpoch as EpochId;
 use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM;
 use reims_vgpu_core::texture_shape::{TextureKind, TextureShape, TextureUsage};
+use reims_vgpu_vulkan::buffer;
 use reims_vgpu_vulkan::device::DeviceEpoch;
 use reims_vgpu_vulkan::host::VulkanHost;
 use reims_vgpu_vulkan::image;
@@ -412,6 +413,26 @@ fn a_decoded_texture_becomes_an_image_the_driver_admitted() {
             max: 11,
         })
     );
+
+    // The buffer half, through the same census. `maxBufferSize` is core in 1.3
+    // and an extension below it, so whether this host reported one at all is a
+    // real answer and the run prints it.
+    let limits = census.buffers();
+    println!("buffer max={:?}", limits.max_buffer_size);
+    let buffer_plan = buffer::plan(
+        1 << 16,
+        Route::HostStaging {
+            working: MemoryClass::DeviceLocal,
+        },
+        limits,
+    )
+    .unwrap_or_else(|refusal| panic!("{refusal}"));
+    // Every operation class at once. A driver that rejected the combination
+    // would fail here, which is the only thing about the wide usage set that a
+    // unit test cannot check.
+    let wide = unsafe { device.create_buffer(&buffer_plan.create_info(), None) }
+        .expect("a buffer bindable as every class");
+    unsafe { device.destroy_buffer(wide, None) };
 
     unsafe {
         device.device_wait_idle().expect("idle before teardown");

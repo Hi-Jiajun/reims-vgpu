@@ -423,6 +423,18 @@ unsafe fn judge(
         unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
     }
 
+    // `maxBufferSize` is core in 1.3 and reachable below it only through
+    // `VK_KHR_maintenance4`. Asked for only when one of those is true, so that
+    // a device that never answered is distinguishable from one that answered
+    // zero — see `crate::buffer::BufferLimits`.
+    let api = ApiVersion::decode(properties.api_version);
+    let max_buffer_size = (api.at_least(1, 3) || has(extension::MAINTENANCE_4)).then(|| {
+        let mut maintenance4 = vk::PhysicalDeviceMaintenance4Properties::default();
+        let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance4);
+        unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+        maintenance4.max_buffer_size
+    });
+
     let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
     let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
 
@@ -434,6 +446,7 @@ unsafe fn judge(
         mesh_shader: mesh.mesh_shader == vk::TRUE,
         descriptor_buffer: descriptor_buffer.descriptor_buffer == vk::TRUE,
         max_push_descriptors: push.max_push_descriptors,
+        max_buffer_size,
         memory: &memory,
         queue_families: &queue_families,
     });
@@ -465,6 +478,7 @@ mod tests {
             mesh_shader: false,
             descriptor_buffer: false,
             max_push_descriptors: 0,
+            max_buffer_size: None,
             memory: &memory,
             queue_families: &families,
         });
