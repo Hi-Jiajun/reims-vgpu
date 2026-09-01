@@ -13,6 +13,7 @@
 use crate::contract::iosurface_pages::{packed_span_estimate, sample_window_from_device_desc};
 use crate::contract::pixel_format::{self, RowToRgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
 use crate::model::{scanout_extent_ok, DeviceState, MappingEntry, MAX_SCANOUT_DIM};
+use crate::runtime::changed_runs::ChangedRuns;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 
@@ -1338,23 +1339,12 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             let dst = unsafe { base.add(y.saturating_mul(bpr_usize)) };
             if let Some(seed) = seed_row {
                 // Changed spans only within the row.
-                let mut x = 0usize;
-                while x < tight {
-                    while x < tight && native[x] == seed[x] {
-                        x += 1;
-                    }
-                    if x >= tight {
-                        break;
-                    }
-                    let start = x;
-                    while x < tight && native[x] != seed[x] {
-                        x += 1;
-                    }
+                for run in ChangedRuns::new(&native[..tight], &seed[..tight]) {
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            native.as_ptr().add(start),
-                            dst.add(start),
-                            x - start,
+                            native.as_ptr().add(run.start),
+                            dst.add(run.start),
+                            run.len(),
                         );
                     }
                 }
@@ -1364,31 +1354,20 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                 }
             }
         } else if let Some(seed) = seed_row {
-            let mut x = 0usize;
-            while x < tight {
-                while x < tight && native[x] == seed[x] {
-                    x += 1;
-                }
-                if x >= tight {
-                    break;
-                }
-                let start = x;
-                while x < tight && native[x] != seed[x] {
-                    x += 1;
-                }
+            for run in ChangedRuns::new(&native[..tight], &seed[..tight]) {
                 if !mapper::write_mapping_bytes(
                     state,
                     host,
                     mapping_id,
-                    row_moff.saturating_add(start as u64),
-                    &native[start..x],
+                    row_moff.saturating_add(run.start as u64),
+                    &native[run.clone()],
                     &vouched,
                 ) {
                     return refuse(
                         mapping_id,
                         SurfaceWriteRefusal::MapperWrite {
-                            lo: row_moff.saturating_add(start as u64),
-                            len: x - start,
+                            lo: row_moff.saturating_add(run.start as u64),
+                            len: run.len(),
                         },
                     );
                 }

@@ -21,6 +21,8 @@ pub mod census;
 /// Where a draw chain's wall clock goes on the runtime side of the engine
 /// boundary, which is 82% of it.
 pub mod chain_phase;
+/// The byte runs in which a newly rendered row differs from the guest's.
+pub mod changed_runs;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).
 // See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
 // carried on failure paths, and boxing it would cost the refusal vocabulary
