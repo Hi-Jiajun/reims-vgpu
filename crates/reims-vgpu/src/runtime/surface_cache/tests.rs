@@ -274,7 +274,7 @@ fn every_host_cache_producer_draws_from_one_generation_source() {
 /// resident-authoritative afterwards is the proof the bytes did not land.
 #[test]
 fn a_short_resident_readback_is_distinguishable_from_a_supersede() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
     let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let win = LinearWindow {
         task_id: 6,
@@ -309,7 +309,7 @@ fn a_short_resident_readback_is_distinguishable_from_a_supersede() {
 /// and a plain bytes store also clears it.
 #[test]
 fn linear_resident_note_materialize_and_store_clear() {
-    use crate::contract::pixel_format::{MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM};
+    use crate::protocol::pixel_format::{MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM};
     let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let win = LinearWindow {
         task_id: 6,
@@ -378,7 +378,7 @@ fn linear_resident_note_materialize_and_store_clear() {
 /// again.
 #[test]
 fn both_linear_store_paths_admit_the_same_windows() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
     let ok = LinearWindow {
         task_id: 6,
         texture_ref: 21,
@@ -446,7 +446,7 @@ fn both_linear_store_paths_admit_the_same_windows() {
 /// engine unpin key (the runtime drains `retired_linear_residents`).
 #[test]
 fn linear_resident_retires_on_task_and_object_delete() {
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
     let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     st.define_task(6, 0x1000, 1);
     let win = LinearWindow {
@@ -658,7 +658,7 @@ fn gva_encode_is_keyed_by_address_at_any_size() {
 ///  - `get_from` returns the same bytes, dropping only the generation.
 #[test]
 fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
-    use crate::contract::pixel_format::RGBA8_BPP;
+    use crate::protocol::pixel_format::RGBA8_BPP;
     let (id, w, h) = (7u32, 4u32, 2u32);
     let need = (w * h * RGBA8_BPP) as usize; // 32
     let mut map: std::collections::BTreeMap<u32, HostSurface> = Default::default();
@@ -878,8 +878,8 @@ fn get_shared_hits_wherever_get_hits_and_never_serves_slop() {
 /// re-point by rewriting one PTE — which is exactly what the guest does when
 /// it hands a virtual address to a different allocation.
 fn setup_depth1_task(host: &mut FakeHost, state: &mut DeviceState) -> u64 {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     const DIR_PFN: u32 = 2;
     const ROOT_PFN: u32 = 3;
     const PT_BASE: u32 = 4;
@@ -903,7 +903,7 @@ fn setup_depth1_task(host: &mut FakeHost, state: &mut DeviceState) -> u64 {
 }
 
 fn repoint_pte(host: &mut FakeHost, root_gpa: u64, index: u64, pfn: u32) {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     let mut pte = [0u8; 4];
     st32(&mut pte, pfn);
     let _ = host.write_gpa(root_gpa + index * 4, &pte);

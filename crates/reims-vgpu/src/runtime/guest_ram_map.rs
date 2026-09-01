@@ -43,7 +43,7 @@
 //! addresses it covers, so none of them is a slow path and none may be silent.
 //! The one *expected* refusal is [`MapRefusal::NoBackendImport`](crate::runtime::guest_ram_map::MapRefusal::NoBackendImport): a host without
 //! the extension, or an operator who set
-//! [`crate::env::GUEST_IMPORT`](crate::env::GUEST_IMPORT) off. That one is a
+//! [`crate::config::GUEST_IMPORT`](crate::config::GUEST_IMPORT) off. That one is a
 //! statement about the host rather than a loss, so it is reported once on the
 //! off channel rather than as a failure per reference.
 
@@ -83,7 +83,7 @@ pub enum MapRefusal {
     /// and a dead guest rather than as a slow rail. That has been reported from
     /// the field on `radv`/`amdgpu` (`Not enough memory for command submission`,
     /// then a lost context), and the reporter's own fix was to set
-    /// [`crate::env::GUEST_IMPORT`] off by hand. This makes the device reach the
+    /// [`crate::config::GUEST_IMPORT`] off by hand. This makes the device reach the
     /// same state without being told to.
     ///
     /// Refusing the whole map rather than the oversized block is what makes it

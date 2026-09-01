@@ -39,9 +39,9 @@
 // The backend the process executes on, reached only through the trait: this
 // module names no rail.
 use crate::backend::Backend as _;
-use crate::contract::pixel_format::{self, MTL_FORMAT_BGRA8_UNORM};
 use crate::model::DeviceState;
 use crate::observe::Decline;
+use crate::protocol::pixel_format::{self, MTL_FORMAT_BGRA8_UNORM};
 use crate::runtime::decode::blit::{self, BlitAspect, Command, CopyKind, Kind, Point};
 use crate::runtime::decode::resource::{
     decode_buffer_descriptor, decode_iosurface_texture_descriptor, decode_texture_descriptor,
@@ -325,7 +325,7 @@ pub(crate) struct LinearTextureLevel {
     /// below. A compressed copy is an uncompressed copy of the block image, and
     /// converting once at the top is what lets that be true rather than
     /// threading a grid through every helper.
-    block: pixel_format::BlockGeometry,
+    block: reims_vgpu_protocol::extent::BlockGeometry,
     pixel_format: u16,
 }
 
@@ -391,13 +391,13 @@ impl TextureBacking {
         }
     }
     /// The storage grid one [`Self::bpp`] unit covers.
-    fn block(&self) -> pixel_format::BlockGeometry {
+    fn block(&self) -> reims_vgpu_protocol::extent::BlockGeometry {
         match self {
             TextureBacking::Linear(t) => t.block,
             // A mapper-ref-texture IOSurface is never block-compressed: its resolve takes
             // `bytes_per_pixel`, which has no answer for a compressed format, so
             // such a surface is refused as `t11_fmt_bpp` long before here.
-            TextureBacking::MapperRefTexture(t) => pixel_format::BlockGeometry {
+            TextureBacking::MapperRefTexture(t) => reims_vgpu_protocol::extent::BlockGeometry {
                 width: 1,
                 height: 1,
                 bytes: t.bpp,
@@ -3802,10 +3802,10 @@ fn gpu_whole_plane_destination(
     // reads 81/81/80 and equality calls that a disagreement forever. A `None`
     // still refuses — a format with no byte-copy layout is one where the copy
     // would have to convert, which this arm does not do.
-    let texel = crate::contract::pixel_format::store_texel_order(dst.pixel_format);
+    let texel = crate::protocol::pixel_format::store_texel_order(dst.pixel_format);
     if texel.is_none()
-        || crate::contract::pixel_format::store_texel_order(src.pixel_format) != texel
-        || crate::contract::pixel_format::store_texel_order(window.pixel_format) != texel
+        || crate::protocol::pixel_format::store_texel_order(src.pixel_format) != texel
+        || crate::protocol::pixel_format::store_texel_order(window.pixel_format) != texel
     {
         return Err(GpuPlaneRefusal::FormatDiffers);
     }

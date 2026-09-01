@@ -1,6 +1,6 @@
 //! Pixel-format helpers matching ObjC `reims_vgpu_storage_image_format` / `reims_vgpu_mtl_pixel_format_bpp`.
 
-use crate::contract::pixel_format::StorageImageSelector;
+use crate::protocol::pixel_format::StorageImageSelector;
 use metal::MTLPixelFormat;
 
 /// The packed 32-bit colour family's wire codes are Apple's own ordinals.
@@ -17,7 +17,7 @@ use metal::MTLPixelFormat;
 /// cross-compiled `--target aarch64-apple-darwin` clippy run, so a Linux host
 /// checks them too.
 const _: () = {
-    use crate::contract::pixel_format as pf;
+    use crate::protocol::pixel_format as pf;
     assert!(pf::MTL_FORMAT_RGB10A2_UNORM as u64 == MTLPixelFormat::RGB10A2Unorm as u64);
     assert!(pf::MTL_FORMAT_RGB10A2_UINT as u64 == MTLPixelFormat::RGB10A2Uint as u64);
     assert!(pf::MTL_FORMAT_RG11B10_FLOAT as u64 == MTLPixelFormat::RG11B10Float as u64);
@@ -63,7 +63,7 @@ pub fn storage_image_format(selector: StorageImageSelector) -> (MTLPixelFormat, 
 
 /// Bytes per texel for a raw `MTLPixelFormat` value.
 ///
-/// Asks [`crate::contract::pixel_format::bytes_per_pixel`] rather than carrying
+/// Asks [`crate::protocol::pixel_format::bytes_per_pixel`] rather than carrying
 /// a table. The two are the same numbering: the contract's wire codes *are*
 /// Apple's `MTLPixelFormat` values, so `MTL_FORMAT_BGRA8_UNORM` is `0x50` and
 /// `MTLPixelFormat::BGRA8Unorm` is 80.
@@ -78,7 +78,7 @@ pub fn storage_image_format(selector: StorageImageSelector) -> (MTLPixelFormat, 
 /// `MTLPixelFormat` fits, so a wider value names no format and declines.
 pub fn mtl_pixel_format_bpp(pixel_format: u32) -> Option<usize> {
     let code = u16::try_from(pixel_format).ok()?;
-    crate::contract::pixel_format::bytes_per_pixel(code).map(|bpp| bpp as usize)
+    crate::protocol::pixel_format::bytes_per_pixel(code).map(|bpp| bpp as usize)
 }
 
 #[cfg(test)]
@@ -88,12 +88,12 @@ mod tests {
     /// Every selector's Metal format and texel width, written out rather than
     /// derived from the table under test.
     ///
-    /// The widths are checked against [`crate::contract::pixel_format`] rather
+    /// The widths are checked against [`crate::protocol::pixel_format`] rather
     /// than only against this list, because the width is the number a staging
     /// buffer is sized by and two tables disagreeing about it is a short read.
     #[test]
     fn storage_image_formats_report_their_metal_format_and_texel_size() {
-        use crate::contract::pixel_format as pf;
+        use crate::protocol::pixel_format as pf;
         use StorageImageSelector as S;
 
         let cases = [

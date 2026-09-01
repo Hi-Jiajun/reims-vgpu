@@ -10,6 +10,7 @@ pub mod blit;
 pub mod compute;
 pub mod depth_stencil;
 pub mod destroy;
+pub mod event;
 pub mod fence;
 pub mod heap_texture;
 pub mod icb;

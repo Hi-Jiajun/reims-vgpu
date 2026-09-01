@@ -7,8 +7,8 @@ use crate::backend::metal::abi::{
     ReimsVgpuSampler,
 };
 use crate::backend::render_pso_key::{RenderPsoIdentity, RenderPsoLookup};
-use crate::contract::fnv::FNV_OFFSET_BASIS;
 use crate::model::content_cache::{CacheEntry, ContentCache};
+use crate::protocol::fnv::FNV_OFFSET_BASIS;
 use metal::{ComputePipelineState, DepthStencilState, Function, RenderPipelineState, SamplerState};
 use parking_lot::Mutex;
 

@@ -2,7 +2,7 @@
 //!
 //! | Module | Role |
 //! | --- | --- |
-//! | [`contract`] | Stable facts: formats, layouts, pure arithmetic |
+//! | [`protocol`] | Stable facts: formats, layouts, pure arithmetic |
 //! | [`model`] | Live guest-visible state (regs, rings, objects, present) |
 //! | [`runtime`] | Drain / parse / resolve / plan / HostActions |
 //! | [`backend`] | Trait + self-contained [`backend::metal`] / [`backend::vulkan`] |
@@ -81,20 +81,25 @@ compile_error!(
      target_os = \"linux\", and target_os = \"windows\" (native ICDs)"
 );
 
+/// Operator configuration: the switches this device reads, their names, and the
+/// one place they parse.
+///
+/// Named `config` rather than `env` because the environment is how a switch
+/// arrives today and not what it *is*. The crate owns the declaration, the
+/// parse and the rule — see `reims_vgpu_config` for why a switch may only
+/// narrow what this device does and may never widen it.
+pub use reims_vgpu_config as config;
 /// The backend-neutral protocol vocabulary, in the crate that owns it.
 ///
-/// Re-exported under the path every caller already writes
-/// (`crate::contract::…`). See `reims_vgpu_contract` for what the crate
-/// boundary makes true that the module boundary only asserted.
-pub use reims_vgpu_contract as contract;
-/// Every environment variable this device reads, and the rule that an override
-/// may only narrow what it does — see the module doc.
-/// Operator switches, in the crate that owns their names and their parse.
+/// The first layer allowed to say what a wire tag *means*: formats, layouts,
+/// geometry, page arithmetic, the closed ordinal rules, and the refusals they
+/// name. It absorbed `reims-vgpu-contract`, which had the same job under a
+/// second name — one vocabulary in two crates is two places to look and two
+/// places for a rule to drift.
 ///
-/// Re-exported under the path every caller already writes (`crate::env::…`) so
-/// moving the module out did not move a call site. See `reims_vgpu_env` for why
-/// a switch may only narrow what this device does.
-pub use reims_vgpu_env as env;
+/// See `reims_vgpu_protocol` for what the crate boundary makes true that a
+/// module boundary only asserted.
+pub use reims_vgpu_protocol as protocol;
 pub mod model;
 /// Crate-wide observability: the always-on fail sink and the decline
 /// vocabulary. Above `runtime/` because every subsystem owes the reader a

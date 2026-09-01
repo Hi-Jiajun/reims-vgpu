@@ -99,7 +99,7 @@
 //! the race.
 //!
 //! So this is a **probe, not a guard**, and it is off unless
-//! [`crate::env::RANGE_COVERAGE`] asks for it. Turn it on to ask its question and
+//! [`crate::config::RANGE_COVERAGE`] asks for it. Turn it on to ask its question and
 //! off before quoting any other counter from the same boot.
 //!
 //! That accident is also the most useful thing this module has produced. It is a
@@ -129,7 +129,7 @@ pub const MAX_SCAN_PAGES: u64 = 1 << 20;
 ///
 /// **The only instrument here that is off unless asked for, and the reason is a
 /// measurement rather than caution.** See the module doc's cost section and
-/// [`crate::env::RANGE_COVERAGE`].
+/// [`crate::config::RANGE_COVERAGE`].
 ///
 /// Read once and cached: the alternative is an environment lookup on the drain
 /// thread for every map and unmap packet, which is the kind of cost this gate
@@ -141,7 +141,7 @@ pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         enabled_from(
-            crate::env::switch(crate::env::RANGE_COVERAGE),
+            crate::config::switch(crate::config::RANGE_COVERAGE),
             crate::runtime::node_guard::enabled(),
         )
     })
@@ -152,8 +152,8 @@ pub fn enabled() -> bool {
 /// [`enabled`] latches in a `OnceLock` and the environment is process-global, so
 /// a test of the real function could assert one arm per process at best. This is
 /// the whole rule and it is total over both inputs.
-fn enabled_from(asked: crate::env::Switch, guards_on: bool) -> bool {
-    asked == crate::env::Switch::On && guards_on
+fn enabled_from(asked: crate::config::Switch, guards_on: bool) -> bool {
+    asked == crate::config::Switch::On && guards_on
 }
 
 /// Which way the guest is about to edit the range.
@@ -319,7 +319,7 @@ mod tests {
     /// quiet default rather than silently costing a boot its readings.
     #[test]
     fn the_probe_is_off_unless_asked_for_by_name_and_the_guards_agree() {
-        use crate::env::Switch;
+        use crate::config::Switch;
         assert!(enabled_from(Switch::On, true));
         for asked in [Switch::Unset, Switch::Off, Switch::Unrecognized] {
             assert!(!enabled_from(asked, true), "{asked:?} started the probe");

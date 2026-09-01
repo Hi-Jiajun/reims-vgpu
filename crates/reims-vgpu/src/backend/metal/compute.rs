@@ -25,8 +25,8 @@ use crate::backend::metal::util::{
     bytes_of, clear_err, sampler_index, set_err, texture_index, valid_buffer_binding,
     valid_threadgroup_memory_index, ErrOut, Status,
 };
-use crate::contract::extent::{tight_image_bytes, Extent3};
 use metal::*;
+use reims_vgpu_protocol::extent::{tight_image_bytes, Extent3};
 use std::ptr;
 
 pub fn hash_compute_stage_input(stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>) -> u64 {

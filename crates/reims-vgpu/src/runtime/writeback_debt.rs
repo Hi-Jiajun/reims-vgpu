@@ -681,12 +681,12 @@ pub fn lazy_writeback_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::LAZY_WRITEBACK);
+        let (state, value) = crate::config::read(crate::config::LAZY_WRITEBACK);
         // Only an explicit `off` narrows to the eager Store. Unset, `on` and an
         // unrecognized value are all the shipping rail, which is what makes
         // `Switch::Unrecognized` — an operator's typo — fail toward the measured
         // default rather than silently selecting the arm it is 45 % slower on.
-        let on = !matches!(state, crate::env::Switch::Off);
+        let on = !matches!(state, crate::config::Switch::Off);
         crate::observe::off(format!(
             "lazy_writeback on={on} switch={state:?} value={}",
             value.unwrap_or_else(|| "<unset>".into())
@@ -1754,7 +1754,7 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
         width: debt.width,
         height: debt.height,
         format: debt.format,
-        store_action: crate::contract::pass_action::MTL_STORE_ACTION_STORE,
+        store_action: reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_STORE,
         ..Default::default()
     };
     crate::runtime::drain::note_store_route(site.route());
@@ -1918,7 +1918,7 @@ mod tests {
             row_stride: 256,
             width: 64,
             height: 64,
-            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
             generation,
             guest_write: Default::default(),
             seq: 0,

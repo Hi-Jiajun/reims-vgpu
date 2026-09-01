@@ -324,8 +324,37 @@ esac
 # first number would read that move as exactly the loss this cell exists to
 # catch. Every arm links these, so the feature set does not change them.
 count_cell "support crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
-  "-p reims-vgpu-contract -p reims-vgpu-env -p reims-vgpu-observe -p reims-vgpu-paging \
-   -p reims-vgpu-wire"
+  "-p reims-vgpu-config -p reims-vgpu-memory -p reims-vgpu-observe \
+   -p reims-vgpu-paging -p reims-vgpu-wire"
+
+# The replacement crates. `reims-vgpu-core` is deliberately not a dependency of
+# `reims-vgpu` yet — the replacement stays reachable only from model tests until
+# production ingress switches — which means no arm above links it and nothing
+# here would compile it. A gate that skips the code under construction is a gate
+# that reports green on a tree that does not build, so it gets its own cell:
+# checked with --all-targets so its tests compile, and counted so a cfg or a
+# module move cannot empty it quietly.
+run_cell "replacement crates / $HOST_TRIPLE" "" "" "$WORKSPACE_DIR" \
+  "-p reims-vgpu-protocol -p reims-vgpu-core -p reims-vgpu-testkit -p reims-vgpu-vulkan"
+
+# The decline vocabulary without the sink. `reims-vgpu-observe` is `no_std` plus
+# `alloc` with its `std` feature off, so a layer below the device can name its
+# own refusals in the same words the device logs them in. Nothing else in the
+# matrix builds that configuration, and a `std::` that creeps into the
+# vocabulary compiles fine everywhere else.
+run_cell "observe / no_std vocabulary" "" "--no-default-features" \
+  "$WORKSPACE_DIR" "-p reims-vgpu-observe" "--lib"
+
+# And the library that depends on it, at `--lib` scope on purpose.
+# `reims-vgpu-protocol`'s tests assert what a refusal renders as, which needs
+# the sink, so they carry a dev-dependency on observe with `std` on. Under
+# resolver 2 that feature is not unified into a build that does not compile
+# tests — but `--all-targets` does compile them, so the cell above would let a
+# `std::` into the library and never notice. This is the cell that notices.
+run_cell "protocol / no_std library" "" "" "$WORKSPACE_DIR" \
+  "-p reims-vgpu-protocol" "--lib"
+count_cell "replacement crates / $HOST_TRIPLE" "" "$WORKSPACE_DIR" \
+  "-p reims-vgpu-protocol -p reims-vgpu-core -p reims-vgpu-testkit -p reims-vgpu-vulkan"
 if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then
   run_cell "vulkan,host-window / $CROSS_TARGET" "$CROSS_TARGET" "$FEATURES_VULKAN"
   if [ "$COUNT_TESTS" -eq 1 ]; then

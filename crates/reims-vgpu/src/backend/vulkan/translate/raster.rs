@@ -160,7 +160,7 @@ pub fn vk_index_type(index: IndexType) -> vk::IndexType {
 /// disarming is a thing the guest is entitled to ask for, and an unknown
 /// ordinal is not.
 pub fn visibility_result_mode(mtl: u32) -> Result<Option<VisibilityResultMode>, TranslateReason> {
-    use crate::contract::visibility::VISIBILITY_RESULT_MODE_DISABLED;
+    use crate::protocol::visibility::VISIBILITY_RESULT_MODE_DISABLED;
     Ok(match mtl {
         // The one arm that is a *meaning* rather than a mode, so it is the one
         // arm spelled from the contract rather than as a literal beside its
@@ -268,7 +268,7 @@ mod tests {
 
     /// Every primitive type this device *advertises* has an arm here.
     ///
-    /// [`crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES`] is what the guest
+    /// [`crate::protocol::draw::EXECUTABLE_PRIMITIVE_TYPES`] is what the guest
     /// reads as permission, so a bit set there without an arm here is a draw the
     /// guest was invited to make and this rail refuses. Both directions are
     /// asserted: an arm without the bit would be a type this device can execute
@@ -278,7 +278,7 @@ mod tests {
         for mtl in 0..=8u32 {
             assert_eq!(
                 primitive_topology(mtl).is_ok(),
-                crate::contract::draw::primitive_type_executable(mtl),
+                crate::protocol::draw::primitive_type_executable(mtl),
                 "primitive type {mtl}: advertisement and translation disagree"
             );
         }
@@ -454,12 +454,12 @@ mod tests {
     /// `backend::metal::mtl_enum::visibility_result_mode`, with nothing in the
     /// toolchain comparing them. A mode this arm records and that one refuses
     /// is a guest that culls correctly on one host and reads a stale word on
-    /// the other, so both are held to [`crate::contract::visibility`] — this
+    /// the other, so both are held to [`crate::protocol::visibility`] — this
     /// one as a test, the Metal one as a `const` block, because its tests run
     /// on no machine anybody edits from.
     #[test]
     fn the_recorded_visibility_modes_are_the_ones_the_contract_names() {
-        use crate::contract::visibility::{
+        use crate::protocol::visibility::{
             visibility_result_mode_recordable, VISIBILITY_RESULT_MODE_DISABLED,
             VISIBILITY_RESULT_MODE_SWEEP_END,
         };

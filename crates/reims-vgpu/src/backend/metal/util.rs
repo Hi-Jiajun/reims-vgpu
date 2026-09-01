@@ -5,7 +5,7 @@
 //! product `width * height * bpp` is not a Metal fact, this module is behind
 //! `feature = "backend-metal"`, and `runtime::compute_session` was reaching
 //! through that gate for it — so it is
-//! [`crate::contract::extent::tight_image_bytes`] now, where its test runs on
+//! [`reims_vgpu_protocol::extent::tight_image_bytes`] now, where its test runs on
 //! every host instead of only on an Apple one. An `f32_from_bits` wrapper went
 //! with them: it forwarded `f32::from_bits` unchanged, and the test it carried
 //! asserted a property of the standard library.

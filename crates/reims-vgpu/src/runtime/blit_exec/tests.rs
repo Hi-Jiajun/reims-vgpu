@@ -5,9 +5,9 @@
 )]
 
 use super::*;
-use crate::contract::endian::{st16, st32, st64};
-use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
 use crate::model::{DeviceId, FENCE_DOMAIN_BLIT, PAGE_SHIFT_ARM64E};
+use crate::protocol::endian::{st16, st32, st64};
+use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
 use crate::runtime::decode::blit::{self, Point, Size};
 use crate::runtime::decode::resource::{
     list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_MIN_LEN, LINEAR_DESC_SIZE,
@@ -92,7 +92,7 @@ fn copy_cmd(copy_kind: CopyKind, source: u32, destination: u32) -> Command {
 /// This is the surface state every mapper-ref-texture / ref-texture install needs before it
 /// can attach geometry or a descriptor.
 fn map_one_page_surface(host: &mut FakeHost, state: &mut DeviceState, mapping_id: u32, pfn: u32) {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
     state.map_surface(mapping_id);
     let m = state.mappings.get_mut(&mapping_id).unwrap();
@@ -774,7 +774,7 @@ fn install_biplanar_mapping(
     mapping_id: u32,
     pfn: u32,
 ) {
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
         DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
         DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
@@ -890,13 +890,13 @@ fn install_ref_texture(
 /// assertion on the offset is exactly the assertion that the index was used.
 #[test]
 fn a_ref_texture_blit_source_reads_the_plane_the_wire_named() {
-    use crate::contract::endian::st64;
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::endian::st64;
+    use crate::protocol::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
         DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
         DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
     };
-    use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
+    use crate::protocol::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
     // Device-plane dims word: width u24@1, height u24@5 (`decode_device_plane`).
     let pack_plane_dims =
         |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);
@@ -1006,7 +1006,7 @@ fn set_ref_texture_record_plane(
 /// window backing lands. Mirrors the mapper-ref-texture install fixtures.
 #[test]
 fn ref_texture_resolves_as_mapper_ref_texture_blit_backing() {
-    use crate::contract::pixel_format::bytes_per_pixel;
+    use crate::protocol::pixel_format::bytes_per_pixel;
     let (mut host, mut state) = blit_device();
     let mapping_id = 34u32;
     let obj_ref = 12u32;
@@ -1060,7 +1060,7 @@ fn ref_texture_unknown_record_tag_fails_closed() {
 
 #[test]
 fn biplanar_mapper_ref_texture_y_and_uv_planes_distinct() {
-    use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
+    use crate::protocol::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
     let (mut host, mut state) = blit_device();
     let mapping_id = 7u32;
     install_biplanar_mapping(&mut host, &mut state, mapping_id, 0x30);
@@ -1377,7 +1377,8 @@ fn texture_view_level_base_on_mapper_ref_texture_rejected() {
 /// wrong `texel_offset` reads the right number of bytes from the wrong place.
 #[test]
 fn a_compressed_level_addresses_blocks_in_both_axes() {
-    use crate::contract::pixel_format::{self as pf, BlockGeometry};
+    use crate::protocol::pixel_format::{self as pf};
+    use reims_vgpu_protocol::extent::BlockGeometry;
     // A 64x64 BC3 level as a guest sends it: 16 block columns of 16 bytes, and
     // 16 block rows, so one image is 4096 bytes and not 16384.
     let bc3 = LinearTextureLevel {
@@ -1457,7 +1458,7 @@ fn texel_offset_math() {
         height: 4,
         depth: 1,
         bpp: 4,
-        block: crate::contract::pixel_format::BlockGeometry {
+        block: reims_vgpu_protocol::extent::BlockGeometry {
             width: 1,
             height: 1,
             bytes: 4,
@@ -1531,7 +1532,7 @@ fn a_linear_rectangle_lands_row_exact_through_one_page_table_walk() {
         // This tree carries the block grid the v6 branch predates; an
         // uncompressed format is a 1x1 grid, so `bpp` and the grid agree and the
         // rectangle walk under test is unaffected by it.
-        block: crate::contract::pixel_format::block_geometry(MTL_FORMAT_RGBA8_UNORM)
+        block: crate::protocol::pixel_format::block_geometry(MTL_FORMAT_RGBA8_UNORM)
             .expect("rgba8 has a grid"),
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
     };
@@ -1637,7 +1638,7 @@ fn an_unmeasurable_copy_region_refuses_rather_than_writing_unbounded() {
         height: 1,
         depth: 1,
         bpp: 4,
-        block: crate::contract::pixel_format::BlockGeometry {
+        block: reims_vgpu_protocol::extent::BlockGeometry {
             width: 1,
             height: 1,
             bytes: 4,
@@ -2564,7 +2565,7 @@ fn blit_fence_zero_ref_fails() {
 /// result; this locks the extent/stride/aspect-flag contract directly.
 #[test]
 fn blit_geometry_helpers_clamp_bpp_and_aspect() {
-    use crate::contract::pixel_format::{
+    use crate::protocol::pixel_format::{
         MTL_FORMAT_A8_UNORM, MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, MTL_FORMAT_RGBA16_FLOAT,
     };
     use crate::runtime::decode::blit::{
@@ -3066,7 +3067,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
 /// is what the assertions below pin.
 #[test]
 fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
-    use crate::contract::pixel_format::{
+    use crate::protocol::pixel_format::{
         MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_R32_FLOAT, MTL_FORMAT_RGBA8_UNORM_SRGB,
     };
     use GpuPlaneRefusal::*;

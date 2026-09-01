@@ -278,7 +278,7 @@ fn host_console_bar1_until_present_boundary() {
 /// the firmware console, and only one pathway refused it.
 #[test]
 fn only_the_latched_front_may_paint_before_the_present_boundary() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
 

@@ -269,13 +269,13 @@ pub(crate) fn retained_pipeline_for_test() -> Arc<ResolvedRenderPipeline> {
     retained_pipeline_with_desc_for_test(RenderPipelineDescriptor::default())
 }
 
-/// Whether retained pipeline states are on. See [`crate::env::PIPELINE_MEMO`].
+/// Whether retained pipeline states are on. See [`crate::config::PIPELINE_MEMO`].
 fn memo_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            crate::env::read(crate::env::PIPELINE_MEMO).0,
-            crate::env::Switch::Off
+            crate::config::read(crate::config::PIPELINE_MEMO).0,
+            crate::config::Switch::Off
         )
     })
 }

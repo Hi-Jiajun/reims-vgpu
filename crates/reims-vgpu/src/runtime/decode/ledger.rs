@@ -1,0 +1,305 @@
+//! Does the closure ledger describe *these* decoders?
+//!
+//! `reims_vgpu_protocol::closure` records one outcome per decodable operation,
+//! and its own tests keep the row set equal to the serializer's selector
+//! manifest. Neither of those touches this crate. So the ledger could say a
+//! render opcode is implemented while this rail's decoder refuses it as
+//! unknown, and nothing would notice: one is a statement about the protocol,
+//! the other is a match arm, and until now they were only ever read by people.
+//!
+//! These tests are the join. They drive the real per-rail decoders across every
+//! ledger row and assert the two agree about which operations exist. They say
+//! nothing about whether an outcome is the *right* one — no test can — only
+//! that the ledger and the decoders are describing the same opcode space.
+//!
+//! # What "recognised" means here
+//!
+//! Each rail refuses an opcode outside its own accepted window with a distinct
+//! status (`ErrUnknownOpcode`, `ErrUnsupportedOpcode`), separately from
+//! refusing a record whose payload is too short for its layout (`ErrShort`,
+//! `ErrBadLength`). Only the first pair is a claim about the opcode, so that is
+//! what is asserted: a generously sized zero payload is offered and the decoder
+//! may still refuse its *contents*, because a record of zeroes is not a record
+//! any of these selectors would actually write.
+
+use reims_vgpu_protocol::closure::{Rail, LEDGER};
+
+/// A record header for `opcode` followed by `payload` zero bytes.
+fn zero_record(opcode: u32, payload: usize) -> Vec<u8> {
+    let total = reims_vgpu_wire::OP_HEADER_LEN + payload;
+    let mut v = vec![0u8; total];
+    v[0..4].copy_from_slice(&opcode.to_le_bytes());
+    v[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+    v
+}
+
+/// Wide enough for every head in these families plus a counted entry array;
+/// the point is to reach the opcode arm, not to satisfy a layout.
+const GENEROUS_PAYLOAD: usize = 256;
+
+/// Candidate records for one opcode, for the tests that need a decode to
+/// *succeed* rather than merely not be refused by opcode.
+///
+/// Several of these families check the payload length exactly — "the product
+/// refuses slack the guest did not size for" — so one generous buffer reaches
+/// almost none of them. The probe walks the plausible lengths instead, with and
+/// without a leading `1` for the count-led families, and the caller takes
+/// whichever spelling decodes. Nothing here claims to synthesise a *meaningful*
+/// record; it only has to reach the arm.
+fn probe_records(opcode: u32) -> impl Iterator<Item = Vec<u8>> {
+    (0..=GENEROUS_PAYLOAD).flat_map(move |len| {
+        let plain = zero_record(opcode, len);
+        let counted = (len >= 4).then(|| {
+            let mut v = zero_record(opcode, len);
+            v[reims_vgpu_wire::OP_HEADER_LEN..reims_vgpu_wire::OP_HEADER_LEN + 4]
+                .copy_from_slice(&1u32.to_le_bytes());
+            v
+        });
+        core::iter::once(plain).chain(counted)
+    })
+}
+
+#[test]
+fn the_render_decoder_recognises_every_render_operation_the_ledger_records() {
+    use super::render::{decode, DecodeStatus};
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Render)
+        .filter_map(|o| o.opcode)
+    {
+        let refused_the_opcode = matches!(
+            decode(&zero_record(op, GENEROUS_PAYLOAD)),
+            Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrUnsupportedOpcode)
+        );
+        assert!(
+            !refused_the_opcode,
+            "the closure ledger records render {op:#x} and this rail's decoder \
+             refuses the opcode itself: one of the two is describing an \
+             operation the other says does not exist"
+        );
+    }
+}
+
+#[test]
+fn the_compute_decoder_recognises_every_compute_operation_the_ledger_records() {
+    use super::compute::{decode, DecodeStatus};
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Compute)
+        .filter_map(|o| o.opcode)
+    {
+        let refused_the_opcode = matches!(
+            decode(&zero_record(op, GENEROUS_PAYLOAD)),
+            Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrUnsupportedOpcode)
+        );
+        assert!(
+            !refused_the_opcode,
+            "the closure ledger records compute {op:#x} and this rail's decoder \
+             refuses the opcode itself"
+        );
+    }
+}
+
+#[test]
+fn the_blit_decoder_recognises_every_blit_operation_the_ledger_records() {
+    use super::blit::{decode, DecodeStatus};
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Blit)
+        .filter_map(|o| o.opcode)
+    {
+        let refused_the_opcode = matches!(
+            decode(&zero_record(op, GENEROUS_PAYLOAD)),
+            Err(DecodeStatus::ErrUnknownOpcode)
+        );
+        assert!(
+            !refused_the_opcode,
+            "the closure ledger records blit {op:#x} and this rail's decoder \
+             refuses the opcode itself"
+        );
+    }
+}
+
+#[test]
+fn the_event_decoder_recognises_every_event_operation_the_ledger_records() {
+    use super::event::{decode, DecodeStatus};
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Event)
+        .filter_map(|o| o.opcode)
+    {
+        let refused_the_opcode = probe_records(op).all(|r| {
+            matches!(
+                decode(&r),
+                Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrRejectedOpcode)
+            )
+        });
+        assert!(
+            !refused_the_opcode,
+            "the closure ledger records event {op:#x} and this rail's decoder refuses the opcode \
+             itself under every payload length"
+        );
+    }
+}
+
+/// Recognising an opcode is not claiming it.
+///
+/// The render decoder accepts a contiguous range and falls through to
+/// `Kind::OtherAccepted` inside it, which is how an opcode can be accepted with
+/// no arm decoding it — and the rail then reports the record as
+/// `accepted_without_executor` and drops it. That is precisely the state the
+/// opcode-recognition test above cannot see, because a fall-through is not a
+/// refusal. So this is the sharper claim: an operation the ledger judges must
+/// reach an arm that names what it is.
+///
+/// A record that decodes under none of [`probe_records`]' spellings is
+/// inconclusive rather than a failure: this test is about which arm claims an
+/// opcode, not about whether this file can synthesise a legal record for every
+/// family. The reached count is printed rather than asserted, because it is a
+/// property of the probe.
+#[test]
+fn no_render_operation_the_ledger_judges_decodes_as_unclaimed() {
+    use super::render::{decode, Kind};
+    let mut conclusive = 0usize;
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Render)
+        .filter_map(|o| o.opcode)
+    {
+        let Some(cmd) = probe_records(op).find_map(|r| decode(&r).ok()) else {
+            continue;
+        };
+        conclusive += 1;
+        assert_ne!(
+            cmd.kind,
+            Kind::OtherAccepted,
+            "the closure ledger judges render {op:#x} and the decoder has no arm for it, so the \
+             rail reports it as accepted-without-executor and drops it whatever the ledger says"
+        );
+    }
+    println!("{conclusive} of the ledger's render operations reached a decode arm");
+}
+
+/// The other direction on the one rail that can state its own window.
+///
+/// The render decoder accepts a contiguous opcode range and falls through to
+/// `Kind::OtherAccepted` inside it, so an opcode can be *accepted* without any
+/// arm claiming it — which is a decodable operation the device drops. Those are
+/// numbers rather than known selectors, so the ledger does not carry rows for
+/// them; what it must not do is disagree about the window's edge, because an
+/// operation the ledger judges must be inside it.
+#[test]
+fn no_ledger_operation_sits_outside_the_render_encoder_window() {
+    use super::render::opcode_above_the_encoder_window;
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Render)
+        .filter_map(|o| o.opcode)
+    {
+        assert!(
+            !opcode_above_the_encoder_window(op),
+            "render {op:#x} is judged by the ledger and above the window this \
+             rail accepts, so the judgement can never be acted on"
+        );
+    }
+}
+
+/// The packet half of the same join.
+///
+/// `protocol::packets` records an outcome per FIFO packet class, and the
+/// serializer manifest cannot enumerate that space — there is no runtime to ask
+/// which packets exist, only the dispatch table this device transcribed. So the
+/// enumeration lives in `model::regs` and this is what keeps the ledger equal to
+/// it in both directions: a command declared here without a row is a packet
+/// class nobody has judged, and a row naming an opcode no constant declares is a
+/// judgement about a command this device cannot receive.
+mod packets {
+    use crate::model::{
+        is_deprecated_child_opcode, CHILD_COMMANDS, CHILD_DEPRECATED_OPS, CHILD_OP_MAX,
+        ROOT_COMMANDS,
+    };
+    use reims_vgpu_protocol::packets::{find, Channel, LEDGER, OPCODE_CEILING};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn every_declared_command_has_a_ledger_row() {
+        for (name, op) in CHILD_COMMANDS {
+            assert!(
+                find(Channel::Child, *op).is_some(),
+                "CHILD_OP_{name} ({op:#04x}) is a command this device dispatches and the closure \
+                 ledger does not judge"
+            );
+        }
+        for (name, op) in ROOT_COMMANDS {
+            assert!(
+                find(Channel::Root, *op).is_some(),
+                "ROOT_OP_{name} ({op:#04x}) is a command this device dispatches and the closure \
+                 ledger does not judge"
+            );
+        }
+    }
+
+    /// The retired slots are commands too — the reference host has one handler
+    /// for all fifteen — so each is a row, and a row that says the shared
+    /// handler's behavior *is* the contract rather than a gap.
+    #[test]
+    fn every_retired_slot_has_a_ledger_row() {
+        for op in CHILD_DEPRECATED_OPS {
+            let row = find(Channel::Child, op)
+                .unwrap_or_else(|| panic!("retired slot {op:#04x} is unjudged"));
+            assert!(
+                matches!(
+                    row.closure,
+                    reims_vgpu_protocol::closure::Closure::ProvenNoOp { .. }
+                ),
+                "retired slot {op:#04x} reads as {} — the reference host's shared handler is the \
+                 whole contract, so anything else claims this device owes more or less than the \
+                 host it is imitating",
+                row.closure.name()
+            );
+        }
+    }
+
+    #[test]
+    fn no_ledger_row_names_a_command_this_device_cannot_receive() {
+        let child: BTreeSet<u16> = CHILD_COMMANDS
+            .iter()
+            .map(|(_, op)| *op)
+            .chain(CHILD_DEPRECATED_OPS)
+            .collect();
+        let root: BTreeSet<u16> = ROOT_COMMANDS.iter().map(|(_, op)| *op).collect();
+        for p in LEDGER {
+            let known = match p.channel {
+                Channel::Child => child.contains(&p.opcode),
+                Channel::Root => root.contains(&p.opcode),
+            };
+            assert!(
+                known,
+                "the ledger judges {} {:#04x} and no constant in model::regs declares it",
+                p.channel.name(),
+                p.opcode
+            );
+        }
+    }
+
+    /// Two transcriptions of one number the reference host reads off its own
+    /// dispatch table. They were taken separately, and a disagreement means one
+    /// of them is describing a table this device does not dispatch against.
+    #[test]
+    fn the_two_dispatch_ceilings_agree() {
+        assert_eq!(CHILD_OP_MAX, OPCODE_CEILING);
+    }
+
+    /// A slot cannot be both a live command and one the host retired, on either
+    /// side of the join.
+    #[test]
+    fn no_live_command_is_also_a_retired_slot() {
+        for (name, op) in CHILD_COMMANDS {
+            assert!(
+                !is_deprecated_child_opcode(*op),
+                "CHILD_OP_{name} is also listed as a retired slot, so the drain would give one \
+                 number two arms and the retired one would swallow a live command"
+            );
+        }
+    }
+}

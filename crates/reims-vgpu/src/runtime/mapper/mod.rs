@@ -7,7 +7,8 @@
 
 // The backend the process executes on, reached only through the trait.
 use crate::backend::Backend as _;
-use crate::contract::iosurface_pages::{
+use crate::model::{DeviceState, MapperCapture};
+use crate::protocol::iosurface_pages::{
     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
     mapper_request_published_entry_offset, mapping_span_bound, read_internal_desc_ptr,
     read_mapper_identity, read_mapper_internal, validate_mapper_internal, PagesMemory,
@@ -15,7 +16,6 @@ use crate::contract::iosurface_pages::{
     MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
     MAPPER_REQUEST_UNMAP,
 };
-use crate::model::{DeviceState, MapperCapture};
 use crate::runtime::host::{HostMemory, HostOps, MemError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -793,7 +793,7 @@ fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<
     let mine: std::collections::HashSet<u64> = m
         .page_entries
         .iter()
-        .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+        .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift))
         .map(page_base)
         .collect();
     if mine.is_empty() {
@@ -804,7 +804,7 @@ fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<
             continue;
         }
         for &e in &other.page_entries {
-            if let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift) {
+            if let Some(gpa) = crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift) {
                 if mine.contains(&page_base(gpa)) {
                     return Some((page_base(gpa), other_id));
                 }
@@ -871,7 +871,7 @@ fn fail_closed_surface_page_collision(
 pub(crate) fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u64)> {
     let (mut lo, mut hi) = (u64::MAX, 0u64);
     for &e in entries {
-        if let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift) {
+        if let Some(gpa) = crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift) {
             lo = lo.min(gpa);
             hi = hi.max(gpa);
         }
@@ -958,13 +958,13 @@ pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
         m.format
     } else {
         // Match scanout/writeback default when format not latched.
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
     };
     let Some(span_end) = mapping_span_bound(m.device_desc_complete(), format, m.width, m.height)
     else {
         return false;
     };
-    let page_size = crate::contract::iosurface_pages::page_size_of(state.page_shift);
+    let page_size = crate::protocol::iosurface_pages::page_size_of(state.page_shift);
     let covered = (m.page_entries.len() as u64).saturating_mul(page_size);
     covered >= span_end.max(page_size)
 }
@@ -1207,7 +1207,7 @@ pub fn backing_pages_witness<H: HostMemory>(
         return BackingWitness::Unwitnessed("no_pages");
     }
     let page_shift = state.page_shift;
-    let page_size = crate::contract::iosurface_pages::page_size_of(page_shift);
+    let page_size = crate::protocol::iosurface_pages::page_size_of(page_shift);
     // Checked here as well as by the visitor below, which visits nothing for an
     // inactive task: the two answers are the same refusal, and only this one can
     // say *why* without the reader having to know the visitor's early returns.
@@ -1260,7 +1260,7 @@ pub fn backing_pages_witness<H: HostMemory>(
                 return false;
             };
             let gva = base_gva + (i as u64) * page_size;
-            let cached = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift);
+            let cached = crate::protocol::iosurface_pages::entry_gpa_shift(entry, page_shift);
             let Some(live) = walked else {
                 // No translation now. This used to answer the failed walk with
                 // the GVA, to match the identity fallback that produced the
@@ -1585,7 +1585,7 @@ pub fn ensure_guest_write_token<H: HostOps>(
     let gpas: Vec<u64> = m
         .page_entries
         .iter()
-        .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+        .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift))
         .collect();
     // A partial list would have the host watch some of the surface and report
     // "unwritten" for the rest, which is the one answer that must never be
@@ -1774,7 +1774,7 @@ pub fn mapping_offsets_of_pages(
     sorted.sort_unstable();
     let mut out: Vec<(u64, u64)> = Vec::new();
     for (i, &entry) in m.page_entries.iter().enumerate() {
-        let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
+        let Some(gpa) = crate::protocol::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
             continue;
         };
         if sorted.binary_search(&gpa).is_err() {
@@ -1814,7 +1814,7 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     let gpas: Vec<u64> = m
         .page_entries
         .iter()
-        .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+        .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift))
         .collect();
     if gpas.is_empty() || gpas.len() != m.page_entries.len() {
         return None;
@@ -1985,7 +1985,7 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
         }
     }
     let gpas = mapping_page_gpas(state, host, mapping_id)?;
-    let page_sz = crate::contract::iosurface_pages::page_size_of(state.page_shift) as usize;
+    let page_sz = crate::protocol::iosurface_pages::page_size_of(state.page_shift) as usize;
     let physical_runs = reims_vgpu_paging::runs::contig_run_count(&gpas, page_sz as u64);
     let Some(ptr) = host.map_pages(&gpas, page_sz) else {
         let served = CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2083,7 +2083,7 @@ pub(crate) fn note_mapping_write_footprint(
     note_page_write_footprint(page_size, off, len, |i| {
         m.page_entries
             .get(i)
-            .map(|&entry| crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift))
+            .map(|&entry| crate::protocol::iosurface_pages::entry_gpa_shift(entry, page_shift))
     });
 }
 

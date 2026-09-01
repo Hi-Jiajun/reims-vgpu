@@ -600,7 +600,7 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
         .iter()
         .enumerate()
     {
-        let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
+        let Some(gpa) = crate::protocol::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
             return Err(GpuWritebackDecline::PageUnbacked {
                 index: plan.first_page + i,
             });
@@ -759,8 +759,8 @@ fn guest_store_needs_separate_sync(recorded_in_draw: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::DeviceId;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::FakeHost;
 
     #[test]
@@ -863,7 +863,7 @@ mod tests {
     /// as correct.
     #[test]
     fn a_pitch_resolves_to_the_destinations_own_texels() {
-        use crate::contract::pixel_format::RGBA16F_BPP;
+        use crate::protocol::pixel_format::RGBA16F_BPP;
         // One tightly-packed row of 256 half-float RGBA texels.
         let bpr = 256 * RGBA16F_BPP;
         let span = u64::from(bpr) * 4;
@@ -1028,8 +1028,8 @@ mod tests {
     /// licence still owns, and therefore says both got through all of them.
     #[test]
     fn a_mapper_ref_texture_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::model::PAGE_SHIFT_X86;
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         const PAGE: u64 = 1 << PAGE_SHIFT_X86;
 
         let mut state = DeviceState::new(DeviceId(9), PAGE_SHIFT_X86);

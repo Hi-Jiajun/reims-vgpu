@@ -15,7 +15,7 @@
 //! ```
 //!
 //! +31.6 ms a second over ~36 700 dispatches is **0.86 µs each**, and that is
-//! the number that keeps [`crate::env::COMPUTE_GATHER`] switched off. A
+//! the number that keeps [`crate::config::COMPUTE_GATHER`] switched off. A
 //! command-buffer run-table arena and a recycled descriptor set already took it
 //! down from ~1.05 µs; guessing which of what is left is the next ~0.8 is how a
 //! session spends a day on `vkCmdBindPipeline` and finds it was never the cost.
@@ -49,7 +49,7 @@
 //! ```
 //!
 //! **The descriptor set is already nearly free, and the fix this crate had
-//! written down was aimed at it.** `env::COMPUTE_GATHER` named the destination
+//! written down was aimed at it.** `config::COMPUTE_GATHER` named the destination
 //! arena — the change that makes all three bindings constant so a draw needs one
 //! set instead of 1.4 — as "the candidate that survives the arithmetic without a
 //! reading". It attacks the 9 % column. Recycling the sets, which cost four
@@ -229,7 +229,7 @@ mod tests {
     }
 
     /// A boot that never dispatches a gather publishes no line at all, which is
-    /// how the census says which arm of [`crate::env::COMPUTE_GATHER`] ran
+    /// how the census says which arm of [`crate::config::COMPUTE_GATHER`] ran
     /// without a second counter to disagree with.
     #[test]
     fn no_gather_publishes_no_window() {

@@ -176,7 +176,7 @@
 //! ## Measured, by making it worse on purpose
 //!
 //! That reading was tested directly, and the controlled form is the useful one:
-//! [`crate::env::SCATTER_SPLIT`] cuts every scatter run into four contiguous
+//! [`crate::config::SCATTER_SPLIT`] cuts every scatter run into four contiguous
 //! sub-ranges that tile it exactly. The guest bytes written are byte-for-byte
 //! identical; only the region count changes. Eight driven macos-13 boots, four
 //! per arm, one binary:

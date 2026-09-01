@@ -272,18 +272,18 @@ pub const fn scanout_extent_ok(width: u32, height: u32) -> bool {
     scanout_extent_fault(width, height).is_none()
 }
 
-// Single source of truth for the shifts: `contract::gva::PAGE_SHIFT_*`,
+// Single source of truth for the shifts: `protocol::gva::PAGE_SHIFT_*`,
 // re-exported rather than restated. There is **no** bare `PAGE_SIZE` /
 // `PAGE_SHIFT` — those names defaulted to arm16K and caused x86 wild writes
 // (stamp slots). Product code uses `state.page_size()` / `state.page_shift`;
 // fixtures pick an arch-qualified name.
 //
-// The two `PAGE_SIZE_*` below are NOT the `contract::gva` constants of the same
+// The two `PAGE_SIZE_*` below are NOT the `protocol::gva` constants of the same
 // name: those are `u32` for page-offset masking, these are the `u64` widening
 // the device's address arithmetic and its fixtures want. Both derive from the
 // one re-exported shift, so they cannot disagree in value — but the names do
 // collide, so import from one module or the other on purpose.
-pub(crate) use crate::contract::gva::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+pub(crate) use crate::protocol::gva::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 // Gated with the fixtures that want them. That is the same statement the
 // comment above makes, now enforced rather than asserted: no product path
 // names either one, because product code goes through `state.page_size()`.
@@ -554,6 +554,72 @@ pub const DISPLAY_TRANSACTION2_SURFACE_ID: usize = 0x04;
 /// so its surface and task words are swapped relative to op 6's.
 pub const DISPLAY_TRANSACTION3_SURFACE_ID: usize = 0x08;
 
+/// Every child-channel command this device names, with the name a log line and
+/// a ledger row spell it by.
+///
+/// One list rather than three. The dispatch-ceiling assertion below, the
+/// collision test, and the closure ledger's join all need the same enumeration,
+/// and they used to each carry their own copy of it — twenty-eight constants
+/// written out three times, where adding a command meant remembering all three
+/// and the cost of forgetting one was silence in exactly the check that was
+/// supposed to notice.
+///
+/// The names are the command's, without the `CHILD_OP_` prefix, because that is
+/// what a reader greps for.
+pub const CHILD_COMMANDS: &[(&str, u16)] = &[
+    ("DEBUG", CHILD_OP_DEBUG),
+    ("SETUP_SHARED_STATE", CHILD_OP_SETUP_SHARED_STATE),
+    ("ONLINE_ACK", CHILD_OP_ONLINE_ACK),
+    ("CURSOR_GLYPH", CHILD_OP_CURSOR_GLYPH),
+    ("CURSOR_SHOW", CHILD_OP_CURSOR_SHOW),
+    ("DISPLAY_TRANSACTION2", CHILD_OP_DISPLAY_TRANSACTION2),
+    ("DISPLAY_TRANSACTION3", CHILD_OP_DISPLAY_TRANSACTION3),
+    ("DISPLAY_SWAP", CHILD_OP_DISPLAY_SWAP),
+    ("DISPLAY_SLEEP_STATE", CHILD_OP_DISPLAY_SLEEP_STATE),
+    ("DISPLAY_SET_PROPERTIES", CHILD_OP_DISPLAY_SET_PROPERTIES),
+    ("NOP", CHILD_OP_NOP),
+    ("DELETE_TASK", CHILD_OP_DELETE_TASK),
+    ("UNMAP_MEMORY", CHILD_OP_UNMAP_MEMORY),
+    ("DELETE_RESOURCE", CHILD_OP_DELETE_RESOURCE),
+    ("DELETE_OBJECT", CHILD_OP_DELETE_OBJECT),
+    ("SET_OBJECT_LIST", CHILD_OP_SET_OBJECT_LIST),
+    ("INVALIDATE_RESOURCES", CHILD_OP_INVALIDATE_RESOURCES),
+    ("SYNCHRONIZE_RESOURCES", CHILD_OP_SYNCHRONIZE_RESOURCES),
+    (
+        "DELETE_IOSURFACE_BACKING2",
+        CHILD_OP_DELETE_IOSURFACE_BACKING2,
+    ),
+    ("EXEC_INDIRECT2", CHILD_OP_EXEC_INDIRECT2),
+    ("DEFINE_TASK2", CHILD_OP_DEFINE_TASK2),
+    ("MAP_MEMORY2", CHILD_OP_MAP_MEMORY2),
+    ("GET_COMPUTE_INFO", CHILD_OP_GET_COMPUTE_INFO),
+    ("REPLACE_PHYSICAL", CHILD_OP_REPLACE_PHYSICAL),
+    ("DELAY", CHILD_OP_DELAY),
+    (
+        "SYNCHRONIZE_AND_DISCARD_RESOURCES",
+        CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+    ),
+    ("DISCARD_RESOURCES", CHILD_OP_DISCARD_RESOURCES),
+    (
+        "HEAP_TEXTURE_SIZE_AND_ALIGN",
+        CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
+    ),
+];
+
+/// Every root-channel command this device names. See [`CHILD_COMMANDS`] — the
+/// two are views of one flat opcode space, split by which channel this device
+/// has seen each command arrive on.
+pub const ROOT_COMMANDS: &[(&str, u16)] = &[
+    ("SETUP_SHARED_STATE", ROOT_OP_SETUP_SHARED_STATE),
+    ("DELETE_TASK", ROOT_OP_DELETE_TASK),
+    ("DEVICE_INFO_MONTEREY", ROOT_OP_DEVICE_INFO_MONTEREY),
+    ("DEFINE_FIFO", ROOT_OP_DEFINE_FIFO),
+    ("FREE_FIFO", ROOT_OP_FREE_FIFO),
+    ("SET_OBJECT_LIST", ROOT_OP_SET_OBJECT_LIST),
+    ("DEFINE_TASK2", ROOT_OP_DEFINE_TASK2),
+    ("DEVICE_INFO_TAHOE", ROOT_OP_DEVICE_INFO_TAHOE),
+];
+
 /// Every command opcode is inside the dispatch ceiling, and no command opcode is
 /// also a deprecated slot.
 ///
@@ -565,47 +631,31 @@ pub const DISPLAY_TRANSACTION3_SURFACE_ID: usize = 0x08;
 /// [`CHILD_DEPRECATED_OPS`] would give one number two arms in the drain, and the
 /// deprecated one would swallow a live command.
 const _: () = {
-    let ops = [
-        CHILD_OP_DEBUG,
-        CHILD_OP_SETUP_SHARED_STATE,
-        CHILD_OP_ONLINE_ACK,
-        CHILD_OP_CURSOR_GLYPH,
-        CHILD_OP_CURSOR_SHOW,
-        CHILD_OP_DISPLAY_TRANSACTION2,
-        CHILD_OP_DISPLAY_TRANSACTION3,
-        CHILD_OP_DISPLAY_SWAP,
-        CHILD_OP_DISPLAY_SLEEP_STATE,
-        CHILD_OP_DISPLAY_SET_PROPERTIES,
-        CHILD_OP_NOP,
-        CHILD_OP_DELETE_TASK,
-        CHILD_OP_UNMAP_MEMORY,
-        CHILD_OP_DELETE_RESOURCE,
-        CHILD_OP_DELETE_OBJECT,
-        CHILD_OP_SET_OBJECT_LIST,
-        CHILD_OP_INVALIDATE_RESOURCES,
-        CHILD_OP_SYNCHRONIZE_RESOURCES,
-        CHILD_OP_DELETE_IOSURFACE_BACKING2,
-        CHILD_OP_EXEC_INDIRECT2,
-        CHILD_OP_DEFINE_TASK2,
-        CHILD_OP_MAP_MEMORY2,
-        CHILD_OP_GET_COMPUTE_INFO,
-        CHILD_OP_REPLACE_PHYSICAL,
-        CHILD_OP_DELAY,
-        CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
-        CHILD_OP_DISCARD_RESOURCES,
-        CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
-    ];
+    let ops = CHILD_COMMANDS;
     let mut i = 0;
     while i < ops.len() {
         assert!(
-            ops[i] <= CHILD_OP_MAX,
+            ops[i].1 <= CHILD_OP_MAX,
             "a command opcode sits above the host's dispatch ceiling"
         );
         assert!(
-            !is_deprecated_child_opcode(ops[i]),
+            !is_deprecated_child_opcode(ops[i].1),
             "a command opcode is also listed as a deprecated slot"
         );
         i += 1;
+    }
+    // The root table is a view of the same flat space, so its commands are
+    // bounded by the same ceiling. Asserted separately rather than by
+    // concatenating the two: a root command is allowed to share a number with a
+    // child one (`0x01` and `0x20` deliberately do), and a merged list would
+    // report those as collisions.
+    let mut r = 0;
+    while r < ROOT_COMMANDS.len() {
+        assert!(
+            ROOT_COMMANDS[r].1 <= CHILD_OP_MAX,
+            "a root command opcode sits above the host's dispatch ceiling"
+        );
+        r += 1;
     }
     let mut j = 0;
     while j < CHILD_DEPRECATED_OPS.len() {
@@ -1197,7 +1247,7 @@ pub const DEVICE_INFO_KEY_RGB10A2_GAMMA: u32 = 8;
 /// out on, so it is a promise about what this device can address rather than a
 /// capability it can decline later.
 ///
-/// Distinct from [`crate::contract::iosurface_pages::ROW_BYTES_ALIGN`], which is
+/// Distinct from [`crate::protocol::iosurface_pages::ROW_BYTES_ALIGN`], which is
 /// an IOSurface row estimate for counting pages and is deliberately not a pitch.
 /// Do not relate the two: one is Metal's linear-texture rule and the other is
 /// IOSurface's allocator, and nothing says they are the same number.
@@ -1300,7 +1350,7 @@ pub const DEVICE_INFO_SERIALIZER_VERSION: u32 = 8;
 ///
 /// Not a count and not a maximum: the guest's `supportsPrimitiveType:` tests
 /// **bit `type`** of this value for any `type <= 8`, and answers `type < 5` when
-/// the key is absent. See [`crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES`]
+/// the key is absent. See [`crate::protocol::draw::EXECUTABLE_PRIMITIVE_TYPES`]
 /// for what this device puts in it and why that is narrower than the capture.
 ///
 /// Narrowing it changed nothing on the x86 pathway, as expected and no more
@@ -1470,7 +1520,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     ),
     (
         DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK,
-        crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES,
+        crate::protocol::draw::EXECUTABLE_PRIMITIVE_TYPES,
     ),
     (DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES, 1),
     (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 256),
@@ -2219,7 +2269,7 @@ mod tests {
     /// `reims-vgpu-mmio.c` sizes its `mach_vm_remap` view, its alignment mask
     /// and its packed-contiguity stride from the header's arm64e page size,
     /// while every Rust reader derives the same number from
-    /// `contract::gva::PAGE_SHIFT_ARM64E`. A drift is a view built at one
+    /// `protocol::gva::PAGE_SHIFT_ARM64E`. A drift is a view built at one
     /// stride and addressed at another, on one pathway, with no failure at the
     /// seam.
     ///
@@ -2273,45 +2323,7 @@ mod tests {
     /// still checks each side alone.
     #[test]
     fn no_two_child_opcodes_share_a_number() {
-        let table = [
-            ("DEBUG", CHILD_OP_DEBUG),
-            ("SETUP_SHARED_STATE", CHILD_OP_SETUP_SHARED_STATE),
-            ("ONLINE_ACK", CHILD_OP_ONLINE_ACK),
-            ("CURSOR_GLYPH", CHILD_OP_CURSOR_GLYPH),
-            ("CURSOR_SHOW", CHILD_OP_CURSOR_SHOW),
-            ("DISPLAY_TRANSACTION2", CHILD_OP_DISPLAY_TRANSACTION2),
-            ("DISPLAY_TRANSACTION3", CHILD_OP_DISPLAY_TRANSACTION3),
-            ("DISPLAY_SWAP", CHILD_OP_DISPLAY_SWAP),
-            ("DISPLAY_SLEEP_STATE", CHILD_OP_DISPLAY_SLEEP_STATE),
-            ("DISPLAY_SET_PROPERTIES", CHILD_OP_DISPLAY_SET_PROPERTIES),
-            ("NOP", CHILD_OP_NOP),
-            ("DELETE_TASK", CHILD_OP_DELETE_TASK),
-            ("UNMAP_MEMORY", CHILD_OP_UNMAP_MEMORY),
-            ("DELETE_RESOURCE", CHILD_OP_DELETE_RESOURCE),
-            ("DELETE_OBJECT", CHILD_OP_DELETE_OBJECT),
-            ("SET_OBJECT_LIST", CHILD_OP_SET_OBJECT_LIST),
-            ("INVALIDATE_RESOURCES", CHILD_OP_INVALIDATE_RESOURCES),
-            ("SYNCHRONIZE_RESOURCES", CHILD_OP_SYNCHRONIZE_RESOURCES),
-            (
-                "DELETE_IOSURFACE_BACKING2",
-                CHILD_OP_DELETE_IOSURFACE_BACKING2,
-            ),
-            ("EXEC_INDIRECT2", CHILD_OP_EXEC_INDIRECT2),
-            ("DEFINE_TASK2", CHILD_OP_DEFINE_TASK2),
-            ("MAP_MEMORY2", CHILD_OP_MAP_MEMORY2),
-            ("GET_COMPUTE_INFO", CHILD_OP_GET_COMPUTE_INFO),
-            ("REPLACE_PHYSICAL", CHILD_OP_REPLACE_PHYSICAL),
-            ("DELAY", CHILD_OP_DELAY),
-            (
-                "SYNCHRONIZE_AND_DISCARD_RESOURCES",
-                CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
-            ),
-            ("DISCARD_RESOURCES", CHILD_OP_DISCARD_RESOURCES),
-            (
-                "HEAP_TEXTURE_SIZE_AND_ALIGN",
-                CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
-            ),
-        ];
+        let table = CHILD_COMMANDS;
         for (i, (name, op)) in table.iter().enumerate() {
             for (other, other_op) in &table[i + 1..] {
                 assert_ne!(

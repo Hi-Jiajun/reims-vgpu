@@ -365,7 +365,7 @@ pub fn borrow_published(key: &ResidentColorKey, content_gen: u64) -> Option<Text
 /// format, and a wrong guess is a channel swap that renders as an orange sky
 /// rather than as a failure.
 pub fn read_published_rgba8(key: &ResidentColorKey, content_gen: u64) -> Option<Vec<u8>> {
-    use crate::contract::pixel_format::RGBA8_BPP;
+    use crate::protocol::pixel_format::RGBA8_BPP;
     // Only the format this rail actually renders colour targets in reads back as
     // RGBA8. A key naming any other one is a future this function has not been
     // taught, and `None` sends the caller to the source it already falls through

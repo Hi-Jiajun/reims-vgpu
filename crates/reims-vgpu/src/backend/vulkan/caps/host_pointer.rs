@@ -33,11 +33,11 @@
 //! they are the arm a discrete GPU takes regardless, because there the copy into
 //! VRAM is the point.
 //!
-//! [`crate::env::GUEST_IMPORT`] adds one more rung: an operator can take a host
+//! [`crate::config::GUEST_IMPORT`] adds one more rung: an operator can take a host
 //! that *is* capable down to [`HostPointerImport::DisabledByEnv`]. That is the
 //! only way to exercise the copying rails on a machine where the import works,
 //! so a regression in them is findable without hunting for hardware that lacks
-//! the extension. It cannot run the other way — see [`crate::env`] for why no
+//! the extension. It cannot run the other way — see [`crate::config`] for why no
 //! variable may widen a measured capability.
 
 use ash::vk;
@@ -110,7 +110,7 @@ pub enum HostPointerImport {
     /// import trims forward to the granule and refuses per region, which is a
     /// property of one block rather than of the device.
     AlignmentUnsatisfiable,
-    /// [`crate::env::GUEST_IMPORT`] was set off. The only rung that is a
+    /// [`crate::config::GUEST_IMPORT`] was set off. The only rung that is a
     /// statement about policy rather than about the host: this device may well
     /// be capable, and the operator asked for the copying rails anyway.
     /// Distinct from every rung above precisely so a log does not read as a
@@ -222,7 +222,7 @@ impl HostPointerCaps {
     }
 }
 
-/// What [`crate::env::GUEST_IMPORT`] says about running this rail at all.
+/// What [`crate::config::GUEST_IMPORT`] says about running this rail at all.
 ///
 /// `None` to go on and ask the device. `Some` short-circuits [`query`], which is
 /// deliberate on two counts: the device is not asked about a handle type nothing
@@ -230,7 +230,7 @@ impl HostPointerCaps {
 /// switch produces exactly the device a host without it would get rather than a
 /// capable device with one gate closed.
 ///
-/// [`crate::env::Switch::On`] is not a way to turn the rail on — no variable may
+/// [`crate::config::Switch::On`] is not a way to turn the rail on — no variable may
 /// widen a measured capability — but it is not ignored either: an operator who
 /// set it has stated an expectation, and if the device then refuses, the
 /// `vk_caps` line names the rung that refused. Only the unrecognized case is
@@ -238,18 +238,18 @@ impl HostPointerCaps {
 /// "the switch did nothing" with no way to tell a typo from a device that
 /// declined.
 fn env_override() -> Option<HostPointerImport> {
-    match crate::env::read(crate::env::GUEST_IMPORT) {
-        (crate::env::Switch::Off, _) => Some(HostPointerImport::DisabledByEnv),
-        (crate::env::Switch::Unrecognized, value) => {
+    match crate::config::read(crate::config::GUEST_IMPORT) {
+        (crate::config::Switch::Off, _) => Some(HostPointerImport::DisabledByEnv),
+        (crate::config::Switch::Unrecognized, value) => {
             crate::observe::fail(format!(
                 "vk_guest_import_env_unrecognized var={} value={:?} (expected on|off; the rail is \
                  left to the device)",
-                crate::env::GUEST_IMPORT,
+                crate::config::GUEST_IMPORT,
                 value.unwrap_or_default()
             ));
             None
         }
-        (crate::env::Switch::On | crate::env::Switch::Unset, _) => None,
+        (crate::config::Switch::On | crate::config::Switch::Unset, _) => None,
     }
 }
 
@@ -582,7 +582,7 @@ mod tests {
         }
     }
 
-    /// Set [`crate::env::GUEST_IMPORT`] to `value`, read the override, and
+    /// Set [`crate::config::GUEST_IMPORT`] to `value`, read the override, and
     /// restore. One test at a time: the variable is process-global.
     fn with_env(value: Option<&str>) -> Option<HostPointerImport> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -591,12 +591,12 @@ mod tests {
         // process, and the only reader is `env_override`, called below.
         unsafe {
             match value {
-                Some(v) => std::env::set_var(crate::env::GUEST_IMPORT, v),
-                None => std::env::remove_var(crate::env::GUEST_IMPORT),
+                Some(v) => std::env::set_var(crate::config::GUEST_IMPORT, v),
+                None => std::env::remove_var(crate::config::GUEST_IMPORT),
             }
         }
         let out = env_override();
-        unsafe { std::env::remove_var(crate::env::GUEST_IMPORT) };
+        unsafe { std::env::remove_var(crate::config::GUEST_IMPORT) };
         out
     }
 
@@ -618,7 +618,7 @@ mod tests {
     }
 
     /// The switch has no on direction. Setting it affirmatively hands the answer
-    /// straight back to the device — which is the whole rule from [`crate::env`]:
+    /// straight back to the device — which is the whole rule from [`crate::config`]:
     /// a variable may narrow what this device does and may never widen it,
     /// because binding an extension the host does not advertise fails
     /// `vkCreateDevice` and importing a handle type it declines is undefined
@@ -632,7 +632,7 @@ mod tests {
     }
 
     /// A misspelled value leaves the device to decide, rather than guessing at
-    /// an intent. `env::read` keeps the raw value so the line above names it.
+    /// an intent. `config::read` keeps the raw value so the line above names it.
     #[test]
     fn an_unrecognized_value_does_not_change_the_answer() {
         assert_eq!(with_env(Some("maybe")), None);

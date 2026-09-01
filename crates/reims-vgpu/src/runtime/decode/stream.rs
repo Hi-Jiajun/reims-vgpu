@@ -1,14 +1,14 @@
 //! Command-stream framing decoder (port of `host/utils/reims-vgpu-stream-decode`).
 
-use crate::contract::endian::ld32;
-use crate::contract::size_fits_u32;
+use crate::protocol::checked::size_fits_u32;
+use crate::protocol::endian::ld32;
 
 // Segment types and header length from `reims-vgpu-wire` (observed serializer
 // surface). Re-exported so stream walkers share one path with the wire crate.
 //
 // `SEGMENT_TYPE_INFO` is 4, not the next integer in sequence — a guess would
-// write 3, which is `SEGMENT_TYPE_EVENT` and stays local below. Protection
-// options joined once the capture drove that envelope.
+// write 3, which is `SEGMENT_TYPE_EVENT` and comes from `reims-vgpu-protocol`
+// below. Protection options joined once the capture drove that envelope.
 use reims_vgpu_wire::ops::segment as wire_segment;
 pub use reims_vgpu_wire::ops::segment::{
     SEGMENT_HEADER_LEN, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_INFO,
@@ -16,10 +16,12 @@ pub use reims_vgpu_wire::ops::segment::{
 };
 
 // The one type the wire crate deliberately does not name, because its capture
-// has never driven the encoder that writes it. Keeping it here rather than
-// pushing it upstream is the honest split: `reims-vgpu-wire` names what Apple's
-// serializer was observed to emit, and an unobserved value has no place in it.
-pub const SEGMENT_TYPE_EVENT: u8 = 3;
+// has never driven the encoder that writes it. It is not this module's either:
+// naming a value no fixture wrote is assigning a meaning, and
+// `reims-vgpu-protocol` is the layer that does that. It re-derives it there
+// from the deserializer's contiguous `0..=3` decoder set, and this is the
+// re-export so the two readings cannot drift.
+pub use reims_vgpu_protocol::segment::SEGMENT_TYPE_EVENT;
 
 /// Segment-header field offsets, from the view that derived them.
 ///
@@ -227,12 +229,19 @@ impl crate::observe::Refusal for SegmentDisposition {
     }
 }
 
+/// The disposition of a segment type, derived from the one parse that owns it.
+///
+/// `reims_vgpu_protocol::segment::segment_role` decides which byte is which
+/// family; this only says what *this* walker does with each answer. Listing the
+/// five record-bearing types again here would be a second copy of the segment
+/// map, and the failure mode of a second copy is a family admitted by one and
+/// refused by the other.
 pub fn segment_disposition(type_: u8) -> SegmentDisposition {
-    match type_ {
-        SEGMENT_TYPE_RENDER | SEGMENT_TYPE_COMPUTE | SEGMENT_TYPE_BLIT | SEGMENT_TYPE_EVENT
-        | SEGMENT_TYPE_INFO => SegmentDisposition::Walk,
-        SEGMENT_TYPE_PROTECTION_OPTIONS => SegmentDisposition::Envelope,
-        _ => SegmentDisposition::Unknown,
+    use reims_vgpu_protocol::segment::SegmentRole;
+    match reims_vgpu_protocol::segment::segment_role(type_) {
+        Some(SegmentRole::Encoder(_)) => SegmentDisposition::Walk,
+        Some(SegmentRole::ProtectionEnvelope) => SegmentDisposition::Envelope,
+        None => SegmentDisposition::Unknown,
     }
 }
 
@@ -461,7 +470,7 @@ pub fn iter_segments(bytes: &[u8]) -> Result<Vec<Segment>, DecodeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
 
     /// The four chain routes are distinct, and each pair of flags selects its
     /// own. A collision would fold two populations into one bucket, which is

@@ -4,8 +4,8 @@
 //! on the mapping when a texture descriptor is resolved. Device-desc geom
 //! (mapper path) and texture-path geom share [`DeviceState::set_mapping_geom`].
 
-use crate::contract::iosurface_pages::decode_texture_descriptor;
 use crate::model::{is_mapping_id, DeviceState};
+use crate::protocol::iosurface_pages::decode_texture_descriptor;
 use crate::runtime::decode::resource::{decode_descriptor, Descriptor};
 
 /// Register geometry from a decoded mapper-ref-texture / IOSurface texture descriptor.
@@ -83,9 +83,9 @@ pub fn register_from_descriptor_bytes(
 mod tests {
 
     use super::*;
-    use crate::contract::endian::st16;
-    use crate::contract::endian::st32;
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+    use crate::protocol::endian::st16;
+    use crate::protocol::endian::st32;
 
     #[test]
     fn mapper_ref_texture_geom_and_generation() {
@@ -166,7 +166,7 @@ mod tests {
     /// `TYPE11_DESC_MIN_LEN` does not.
     #[test]
     fn a_short_headerless_descriptor_is_refused_by_the_decoder_alone() {
-        let min = crate::contract::iosurface_pages::TYPE11_DESC_MIN_LEN;
+        let min = crate::protocol::iosurface_pages::TYPE11_DESC_MIN_LEN;
         let mut s = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
 
         let mut short = vec![0u8; min - 1];

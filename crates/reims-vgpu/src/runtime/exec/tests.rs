@@ -6,14 +6,14 @@ use reims_vgpu_wire::ops::compute as wire_compute;
 use reims_vgpu_wire::OP_HEADER_LEN;
 
 use super::*;
-use crate::contract::endian::{st16, st32, st64};
-use crate::contract::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::protocol::endian::{st16, st32, st64};
 use crate::runtime::decode::render::{
     PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
     PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE,
 };
 use crate::runtime::host::FakeHost;
+use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 
 #[test]
 fn render_pass_chain_edges_follow_the_decoded_encoder() {
@@ -719,7 +719,7 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
 /// This counted and rendered anyway until the arms beside it stopped doing so.
 #[test]
 fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     use crate::runtime::decode::render::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
 
     // A full-length record, not the `PASS_MIN_PAYLOAD` one the arms below use:
@@ -808,7 +808,7 @@ fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws()
 /// is entitled to ask; this is the refusal that says what that costs.
 #[test]
 fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_the_draws() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
 
     let record = |count: u32| {
         let total = wire_pass::DEFAULT_RASTER_SAMPLE_COUNT_TOTAL_LEN as usize;
@@ -895,7 +895,7 @@ fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_t
 ///
 #[test]
 fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_draws() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     use crate::runtime::decode::render::{
         PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
         PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
@@ -1267,7 +1267,7 @@ fn wide_indexed_draw_reaches_pending_draw() {
 /// `DrawEncodeRequest` fails here.
 #[test]
 fn a_base_vertex_and_base_instance_reach_the_pending_draw() {
-    use crate::contract::endian::st16;
+    use crate::protocol::endian::st16;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
@@ -1948,9 +1948,9 @@ fn zero_ref_render_bind_unbinds_existing_slots() {
 /// x86 backing display mid: clear-only stream must Store solid BGRA into pages.
 #[test]
 fn clear_only_backing_surface_writes_guest_pages() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::endian::{st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
 
@@ -2059,8 +2059,8 @@ fn finish_stream_clear_only_branch_without_draws() {
 /// must materialize the result directly in the mapper-ref-texture mapping's native texels.
 #[test]
 fn clear_only_rg16uint_publishes_native_guest_texels() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::{MTL_FORMAT_RG16_UINT, RG16_BPP};
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::{MTL_FORMAT_RG16_UINT, RG16_BPP};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -2123,7 +2123,7 @@ fn clear_only_rg16uint_publishes_native_guest_texels() {
 /// its guest-declared row pitch rather than a tightly packed substitute.
 #[test]
 fn clear_only_rg16uint_publishes_native_linear_gva_rows() {
-    use crate::contract::pixel_format::MTL_FORMAT_RG16_UINT;
+    use crate::protocol::pixel_format::MTL_FORMAT_RG16_UINT;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
         OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
@@ -2298,8 +2298,8 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
 /// Linux NoMetal: draws fail but CLEAR seed still Stores into backing pages.
 #[test]
 fn nometal_draw_falls_back_to_backing_clear() {
-    use crate::contract::endian::{st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::endian::{st32, st64};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
     use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
@@ -2593,7 +2593,7 @@ fn dropped_clear_logs_once_per_reason_target() {
 /// pass by coincidence.
 #[test]
 fn a_store_action_override_reaches_the_slot_it_names() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
@@ -2678,9 +2678,9 @@ fn a_store_action_override_reaches_the_slot_it_names() {
 /// the wrong one cannot pass.
 #[test]
 fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     use crate::runtime::decode::render::StencilAttachment;
     use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
@@ -2692,7 +2692,7 @@ fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
         let mut c = vec![0u8; total];
         st32(&mut c[0..], opcode);
         st32(&mut c[4..], total as u32);
-        crate::contract::endian::st64(&mut c[reims_vgpu_wire::OP_HEADER_LEN..], action);
+        crate::protocol::endian::st64(&mut c[reims_vgpu_wire::OP_HEADER_LEN..], action);
         c
     };
     let mut send = |acc: &mut StreamAccum, opcode: u32, action: u64| {
@@ -2781,7 +2781,7 @@ fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
 /// three times — fails here rather than passing on a degenerate fixture.
 #[test]
 fn a_plural_scissor_record_reaches_the_accumulator_whole() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
@@ -2867,7 +2867,7 @@ fn a_plural_scissor_record_reaches_the_accumulator_whole() {
 /// selects, so dropping slot 1 silently renumbers slot 2.
 #[test]
 fn an_empty_rect_in_a_plural_scissor_record_keeps_the_previous_state() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
     use crate::runtime::drain::store_route_count;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -3596,7 +3596,7 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
         );
         assert_eq!(
             acc.draws[0].draw,
-            crate::contract::draw::DrawArgs {
+            crate::protocol::draw::DrawArgs {
                 vertex_count: 11,
                 instance_count: 22,
                 primitive_type: 4,
@@ -3774,7 +3774,7 @@ fn a_later_icb_execute_opens_its_pass_with_load() {
             1u32,
             ColorAttachment {
                 texture_ref: 12,
-                load_action: crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE,
+                load_action: reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE,
                 store_action: MTL_STORE_ACTION_STORE,
                 clear_color: [0.0; 4],
                 // A second attachment whose action is *not* CLEAR, so the
@@ -3881,14 +3881,20 @@ fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
     use crate::runtime::drain::store_route_count;
 
     for (op, route, payload_len) in [
+        // A zero-filled `useResource` declares residency with no access at
+        // all, which is its own class: it is not the read case, and reporting
+        // it as one would let the reading that confirms the no-op absorb a
+        // shape the argument does not describe.
         (
             wire_render::OPCODE_USE_RESOURCE,
-            "render_noop_residency_hint",
+            "render_residency_empty",
             render::USE_RESOURCE_REFS + 4,
         ),
+        // `useHeap:` carries no usage argument, so its zero is a property of
+        // the selector rather than a guest declaration.
         (
             wire_render::OPCODE_USE_HEAP,
-            "render_noop_residency_hint",
+            "render_residency_heap",
             render::USE_HEAP_REFS + 4,
         ),
         (
@@ -3936,7 +3942,7 @@ fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
 /// cannot tell those apart cannot answer the question they exist to answer.
 #[test]
 fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
     use crate::runtime::drain::store_route_count;
     use reims_vgpu_wire::ops::blit as wire;
 
@@ -4022,7 +4028,7 @@ fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
 /// boot's reading unusable for deciding which executor to build.
 #[test]
 fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
     use crate::runtime::drain::store_route_count;
     use reims_vgpu_wire::ops::blit as wire;
 
@@ -4158,7 +4164,7 @@ fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
 /// entry is the guest's number and not padding.
 #[test]
 fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
 
     let total = reims_vgpu_wire::OP_HEADER_LEN
         + render::BIND_ENTRIES
@@ -4274,7 +4280,7 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
 /// replaced their rows.
 #[test]
 fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
     use crate::runtime::drain::store_route_count;
 
     // (opcode, total length, payload writer, route, whether a default-valued
@@ -4581,7 +4587,7 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
 /// wireframed.
 #[test]
 fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
 
     let drive = |op: u32, mode: u64| {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -4975,7 +4981,7 @@ fn an_armed_visibility_query_and_its_buffer_both_reach_the_accumulator() {
 /// single-offset fixture.
 #[test]
 fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
     };
@@ -5166,11 +5172,11 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
 /// without restoring the seed leaves the original bug.
 #[test]
 fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
-    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     use crate::runtime::decode::render::{
         PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
         PASS_COLOR_ATTACH_OFF,
     };
+    use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
     let seeded = |store_action: u16| {
         let mut payload = vec![0u8; 0x400];
@@ -5234,7 +5240,7 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
 /// The two resolve-carrying actions have different publication contracts.
 #[test]
 fn a_clear_distinguishes_resolve_only_from_store_and_resolve() {
-    use crate::contract::pass_action::{
+    use reims_vgpu_protocol::pass_action::{
         MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
         MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
     };
@@ -5384,7 +5390,7 @@ fn clear_fallback_draw_accounting_is_scoped_to_one_render_stream() {
 /// clear written over the guest's four-sample pages, twice a boot.
 #[test]
 fn a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_clear() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
         OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
@@ -5493,5 +5499,181 @@ fn a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_cle
         }),
         "the refused publication must be fail-visible: a clear this device drops \
          silently is the one outcome the ground rules forbid"
+    );
+}
+
+/// The info rail had exactly one arm and seventeen silences. A boot in which
+/// the guest asked eighteen questions and got no answers read identically to a
+/// boot in which it asked none, and the answer it read back was whatever its
+/// reply buffer last held.
+#[test]
+fn an_unanswered_info_query_names_the_question_it_did_not_answer() {
+    use reims_vgpu_wire::ops::info as w;
+    let cap = crate::observe::sink::FailCapture::start();
+    super::note_info_record_unanswered(9, w::OPCODE_HEAP_HOST_RESOURCE_INFO, 0x18);
+    let line = cap.one("info_record");
+    assert!(
+        line.contains("reason=info_query_unanswered"),
+        "the ledger has this query as unresolved, so the line must say so: {line}"
+    );
+    assert!(
+        line.contains("op=0x1cf") && line.contains("task=9"),
+        "the line must name the query and whose task asked it: {line}"
+    );
+    assert!(
+        line.contains("selector=heapHostResourceInfo"),
+        "ten of these selectors write the same record and differ only in what \
+         they ask about, so the selector is the whole content of the line: {line}"
+    );
+}
+
+/// An opcode on a rail whose whole space is enumerated is not a dropped
+/// command — it is a stream this project cannot frame.
+#[test]
+fn an_info_opcode_outside_the_declared_space_says_it_is_unjudged() {
+    let cap = crate::observe::sink::FailCapture::start();
+    super::note_info_record_unanswered(4, 0x1ff, 0x18);
+    let line = cap.one("info_record");
+    assert!(
+        line.contains("reason=info_opcode_unjudged"),
+        "an opcode the manifest and the ledger both lack must not read as a \
+         merely-unanswered query: {line}"
+    );
+}
+
+/// The ledger and the rail disagreeing is its own finding. Nothing in the
+/// shipped ledger produces it today — every info row is unresolved — so the
+/// arm is proved against a row rather than against the rail, which is also the
+/// only way it stays proved once a row is closed.
+#[test]
+fn a_ledger_row_the_rail_cannot_honour_reports_the_disagreement() {
+    use crate::observe::Decline as _;
+    use reims_vgpu_protocol::closure::{Closure, Op, Rail};
+    const CLAIMED: Op = Op {
+        rail: Rail::Info,
+        opcode: Some(0x1c2),
+        selector: "computePipelineStateInfo:info:",
+        closure: Closure::Implemented {
+            evidence: "a row that claims an answer this rail does not produce",
+        },
+    };
+    let decline = super::report::InfoRecordUnanswered {
+        opcode: 0x1c2,
+        len: 0x18,
+        judged: Some(&CLAIMED),
+    };
+    assert_eq!(decline.slug(), "info_query_ledger_disagrees");
+    let fields = decline.fields();
+    assert!(
+        fields.contains(&("closure", "implemented".to_string())),
+        "the line must carry what the ledger claimed, or the reader cannot tell \
+         which of the two is wrong: {fields:?}"
+    );
+}
+
+/// A residency declaration that names a GPU **write** is not the record the
+/// no-op argument covers.
+///
+/// The whole family used to reach one counter, so a guest declaring that the
+/// GPU would write a resource through a path this rail never bound produced the
+/// same number as a guest declaring it would read one it already has. The first
+/// leaves the guest reading back content it believes was just produced; the
+/// second costs nothing. This pins that they are told apart, and that the write
+/// case additionally reaches the always-on channel with the declaration on it.
+#[test]
+fn a_residency_write_declaration_is_named_rather_than_counted_with_the_reads() {
+    use crate::runtime::decode::render;
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::residency::{RenderStages, ResourceUsage};
+
+    // `useResource:usage:stages:`: count at +0, usage and stages as two u16
+    // sharing the word at +4, refs from +8.
+    let record = |usage: u16, stages: u16| {
+        let total = reims_vgpu_wire::OP_HEADER_LEN + render::USE_RESOURCE_REFS + 4;
+        let mut v = vec![0u8; total];
+        st32(&mut v[0..], wire_render::OPCODE_USE_RESOURCE);
+        st32(&mut v[4..], total as u32);
+        st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], 1);
+        v[reims_vgpu_wire::OP_HEADER_LEN + 4..reims_vgpu_wire::OP_HEADER_LEN + 6]
+            .copy_from_slice(&usage.to_le_bytes());
+        v[reims_vgpu_wire::OP_HEADER_LEN + 6..reims_vgpu_wire::OP_HEADER_LEN + 8]
+            .copy_from_slice(&stages.to_le_bytes());
+        v
+    };
+
+    let decoded = render::decode(&record(
+        ResourceUsage::WRITE as u16,
+        RenderStages::FRAGMENT as u16,
+    ))
+    .expect("a well-formed useResource decodes");
+    assert_eq!(
+        decoded.residency_usage,
+        ResourceUsage(ResourceUsage::WRITE),
+        "the usage half must survive decode — it is what decides whether \
+         answering by doing nothing is sound"
+    );
+    assert_eq!(
+        decoded.residency_stages,
+        RenderStages(RenderStages::FRAGMENT)
+    );
+
+    let run = |usage: u16, stages: u16| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let command = record(usage, stages);
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_render::OPCODE_USE_RESOURCE,
+            &command,
+            &mut out,
+            &mut acc,
+        );
+    };
+
+    let before_read = store_route_count("render_residency_read");
+    run(ResourceUsage::READ as u16, RenderStages::VERTEX as u16);
+    assert_eq!(
+        store_route_count("render_residency_read") - before_read,
+        1,
+        "a read declaration is the case the no-op argument covers"
+    );
+
+    let cap = crate::observe::sink::FailCapture::start();
+    let before_write = store_route_count("render_residency_write");
+    run(ResourceUsage::WRITE as u16, RenderStages::FRAGMENT as u16);
+    assert_eq!(
+        store_route_count("render_residency_write") - before_write,
+        1,
+        "a write declaration must not be counted with the reads"
+    );
+    let line = cap.one("render_residency");
+    assert!(
+        line.contains("reason=render_residency_write_dropped"),
+        "a GPU write through a path this rail did not bind is lost guest \
+         content, not a hint: {line}"
+    );
+    assert!(
+        line.contains("usage=0x2") && line.contains("stages=0x2"),
+        "the line must carry the declaration, or it cannot be acted on: {line}"
+    );
+
+    // A usage bit the API does not declare is not narrowed into the bits it
+    // shares: `READ|0x8` must not read as the one case this rail is sure it
+    // owes nothing on.
+    let before_undeclared = store_route_count("render_residency_undeclared");
+    run((ResourceUsage::READ | 0x8) as u16, 0);
+    assert_eq!(
+        store_route_count("render_residency_undeclared") - before_undeclared,
+        1,
+        "an undeclared usage bit must not classify as a read"
+    );
+    assert_eq!(
+        store_route_count("render_residency_read") - before_read,
+        1,
+        "and it must not also count as one"
     );
 }

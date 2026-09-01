@@ -750,8 +750,8 @@ fn air_capture_dir() -> std::path::PathBuf {
 /// translation produced or whether it was cached.
 fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
     if !matches!(
-        crate::env::switch(crate::env::AIR_CAPTURE),
-        crate::env::Switch::On
+        crate::config::switch(crate::config::AIR_CAPTURE),
+        crate::config::Switch::On
     ) {
         return;
     }

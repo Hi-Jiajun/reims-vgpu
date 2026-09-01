@@ -10,8 +10,8 @@
 //! Single-level textures fail visibly (Metal rejects `mipmapLevelCount == 1`).
 
 use crate::backend::Backend as _;
-use crate::contract::pixel_format::{self, RGBA8_BPP};
 use crate::model::DeviceState;
+use crate::protocol::pixel_format::{self, RGBA8_BPP};
 use crate::runtime::decode::resource::{
     decode_texture_descriptor, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
     TEXTURE_MAX_MIP_LEVELS,
@@ -21,11 +21,11 @@ use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::objects;
 
-// The refusal type is portable data and lives in `contract::mipmap` so its
+// The refusal type is portable data and lives in `protocol::mipmap` so its
 // checks can be executed on a host with no Apple linker. The import still
 // carries this gate, because only this arm can produce one.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::contract::mipmap::MetalMipmapError;
+use crate::protocol::mipmap::MetalMipmapError;
 
 /// Outcome of a generateMipmaps attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,8 +229,8 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
     let l0 = tex.levels[0];
     for level in 0..levels {
         let layout = &tex.levels[level];
-        let exp_w = crate::contract::extent::mip_extent(l0.width, level as u32);
-        let exp_h = crate::contract::extent::mip_extent(l0.height, level as u32);
+        let exp_w = reims_vgpu_protocol::extent::mip_extent(l0.width, level as u32);
+        let exp_h = reims_vgpu_protocol::extent::mip_extent(l0.height, level as u32);
         if layout.width != exp_w
             || layout.height != exp_h
             || layout.width == 0
@@ -408,8 +408,8 @@ fn generate_via_box_filter(
     let mut prev_w = width;
     let mut prev_h = height;
     for level in 1..levels {
-        let dw = crate::contract::extent::mip_extent(width, level as u32);
-        let dh = crate::contract::extent::mip_extent(height, level as u32);
+        let dw = reims_vgpu_protocol::extent::mip_extent(width, level as u32);
+        let dh = reims_vgpu_protocol::extent::mip_extent(height, level as u32);
         let Some(next_rgba) = downsample_rgba8_box(&prev, prev_w, prev_h, dw, dh) else {
             return Err(MipmapStatus::IncompleteLayout);
         };
@@ -505,8 +505,8 @@ pub fn generate_mipmaps_linear<M: HostMemory + HostOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use crate::observe::Refusal;
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM;
 
     /// `Ok` must produce no line, every other outcome must produce a distinct
     /// one. Before this the dispatch site logged `st={st:?}` with no `reason=`

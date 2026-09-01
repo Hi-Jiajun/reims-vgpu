@@ -416,10 +416,10 @@ impl ColorClearValue {
     /// Convert Metal's double-precision component carrier according to the
     /// attachment's declared numeric type.
     pub(crate) fn from_components(
-        numeric: crate::contract::pixel_format::ColorNumericType,
+        numeric: crate::protocol::pixel_format::ColorNumericType,
         components: [f64; 4],
     ) -> Self {
-        use crate::contract::pixel_format::ClearComponents;
+        use crate::protocol::pixel_format::ClearComponents;
         match numeric.clear_components(components) {
             ClearComponents::Float(values) => Self::Float(values),
             ClearComponents::Uint(values) => Self::Uint(values),
@@ -613,7 +613,7 @@ pub struct DrawRequest {
     /// answer for it and clears. Only a caller that has decoded a real load
     /// action fills this in, so an unfilled request cannot silently acquire a
     /// preserving reading it was never given evidence for.
-    pub color0_declared: Option<crate::contract::pass_action::LoadAction>,
+    pub color0_declared: Option<reims_vgpu_protocol::pass_action::LoadAction>,
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
@@ -1028,10 +1028,10 @@ impl VertexStepFunction {
     /// The inverse of [`translate::vertex::step_function`], which is where the
     /// three accepted ordinals are chosen and where the round trip is pinned.
     /// It exists so a rule stated over the *wire* value — the step/rate pair in
-    /// [`crate::contract::vertex_step`] — can be asked on this side without a
+    /// [`crate::protocol::vertex_step`] — can be asked on this side without a
     /// second copy of the mapping.
     pub fn mtl_ordinal(self) -> u32 {
-        use crate::contract::vertex_step as step;
+        use crate::protocol::vertex_step as step;
         match self {
             Self::Constant => step::MTL_VERTEX_STEP_FUNCTION_CONSTANT,
             Self::PerVertex => step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
@@ -1211,7 +1211,7 @@ pub struct SampledImageResource {
     /// rewriting texels is what lets a swizzled texture stay on whatever
     /// content rail it was already on, including the zero-copy one — a CPU
     /// remap would force every swizzled bind onto the upload path.
-    pub swizzle: crate::contract::pixel_format::SwizzlePlan,
+    pub swizzle: crate::protocol::pixel_format::SwizzlePlan,
 }
 
 /// Contract-level source of a CPU-materialized sampled image.
@@ -1833,7 +1833,7 @@ pub struct ComputeSampledImageResource {
     pub width: u32,
     pub height: u32,
     /// Levels `bytes` carries, base first, tightly packed by
-    /// [`crate::contract::extent::tight_pyramid_spans`] — `1` for every
+    /// [`reims_vgpu_protocol::extent::tight_pyramid_spans`] — `1` for every
     /// binding but a guest mip chain sampled by an explicit LOD.
     pub mip_levels: u32,
     /// Where this binding's texels come from.
@@ -1853,7 +1853,7 @@ pub struct ComputeSampledImageResource {
 pub enum ComputeSampledSource {
     /// Host bytes uploaded into a pooled transient: every level the binding
     /// declares, base first, tightly packed by
-    /// [`crate::contract::extent::tight_pyramid_spans`].
+    /// [`reims_vgpu_protocol::extent::tight_pyramid_spans`].
     Bytes(Vec<u8>),
     /// A device-local copy from the named resident storage image into a pooled
     /// transient (copy-on-sample: the transient never aliases the live
@@ -1905,7 +1905,7 @@ pub enum StorageImageFormat {
     /// format to a host one can no longer derive it. This enum is that
     /// reduction, so the distinction has to survive it.
     ///
-    /// Sampled only. `contract::pixel_format::storage_selector` has no entry for
+    /// Sampled only. `protocol::pixel_format::storage_selector` has no entry for
     /// this format, and a Vulkan storage-image view must carry an identity
     /// mapping, so a storage image of it is refused rather than built.
     A8Unorm,
@@ -2045,7 +2045,7 @@ impl StorageImageFormat {
 ///
 /// * `Gva` takes `translate::pixel::color_attachment(guest_u16).vk`, which
 ///   keeps the sRGB spelling the guest declared — a distinction
-///   `contract::pixel_format::TexelLayout` deliberately folds away, so a
+///   `protocol::pixel_format::TexelLayout` deliberately folds away, so a
 ///   `TexelLayout` field would silently drop the transfer function.
 /// * `runtime::draw::vulkan::gva_resident_format` narrows that again by asking
 ///   the *host* whether it renders to and blends the layout, falling back to

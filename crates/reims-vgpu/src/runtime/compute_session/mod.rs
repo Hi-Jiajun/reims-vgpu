@@ -144,9 +144,9 @@ mod tests {
     // carrying both rails may be *running* the other one.
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     use crate::backend::metal::MetalBackend;
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    use crate::contract::endian::{st32, st64};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+    use crate::protocol::endian::{st32, st64};
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,

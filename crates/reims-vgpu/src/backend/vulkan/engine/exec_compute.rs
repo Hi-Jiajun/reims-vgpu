@@ -213,7 +213,7 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
         // binding declares, and checking only the base would let a request
         // through whose upper levels the copy then reads past the end of.
         if let ComputeSampledSource::Bytes(bytes) = &img.source {
-            let expected = crate::contract::extent::tight_pyramid_bytes(
+            let expected = reims_vgpu_protocol::extent::tight_pyramid_bytes(
                 img.width,
                 img.height,
                 img.mip_levels,
@@ -653,7 +653,7 @@ pub(crate) unsafe fn execute_compute_inner(
         // The byte weight of this binding, derived from its own geometry rather
         // than carried beside it. Both arms below want it, and the upload arm's
         // `bytes` is required to equal it by the request validation above.
-        let staged_bytes = crate::contract::extent::tight_pyramid_bytes(
+        let staged_bytes = reims_vgpu_protocol::extent::tight_pyramid_bytes(
             resource.width,
             resource.height,
             resource.mip_levels.max(1),
@@ -972,7 +972,7 @@ pub(crate) unsafe fn execute_compute_inner(
             // One region per level, at the offset the *producer* packed it at.
             // Both ends read `tight_pyramid_spans`, so neither computes a
             // layout of its own and the two cannot drift.
-            let Some(spans) = crate::contract::extent::tight_pyramid_spans(
+            let Some(spans) = reims_vgpu_protocol::extent::tight_pyramid_spans(
                 width,
                 height,
                 mip_levels,

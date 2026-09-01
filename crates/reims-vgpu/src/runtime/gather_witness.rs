@@ -177,7 +177,7 @@
 //! exists to remove — but it is the wrong ratio to answer "is this cache sound
 //! on this host" with.
 //!
-//! [`crate::env::GATHER_AUDIT_ALL`] sets [`AuditDensity::EveryBind`], under which
+//! [`crate::config::GATHER_AUDIT_ALL`] sets [`AuditDensity::EveryBind`], under which
 //! every vouched bind is compared against the bind before it: the stride drops to
 //! 1 and a completed comparison leaves the window armed, its own fold being the
 //! next bind's baseline. It can only turn elisions into re-gathers, never the
@@ -294,7 +294,7 @@
 
 use std::collections::HashMap;
 
-use crate::contract::fnv;
+use crate::protocol::fnv;
 
 /// Which zero-copy sampled producer built the window.
 ///
@@ -488,14 +488,14 @@ pub enum AuditDensity {
     #[default]
     Strided,
     /// Every bind this device vouches for is compared against the one before
-    /// it. A soundness sweep, never a timing — see [`crate::env::GATHER_AUDIT_ALL`].
+    /// it. A soundness sweep, never a timing — see [`crate::config::GATHER_AUDIT_ALL`].
     EveryBind,
 }
 
 impl AuditDensity {
     fn from_env() -> Self {
-        match crate::env::switch(crate::env::GATHER_AUDIT_ALL) {
-            crate::env::Switch::On => Self::EveryBind,
+        match crate::config::switch(crate::config::GATHER_AUDIT_ALL) {
+            crate::config::Switch::On => Self::EveryBind,
             _ => Self::default(),
         }
     }

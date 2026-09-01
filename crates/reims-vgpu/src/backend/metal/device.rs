@@ -11,8 +11,8 @@
 use crate::backend::compute_session::ComputeSession;
 use crate::backend::metal::runtime::system_device;
 use crate::backend::{Backend, CensusSite, MipmapGeneration, Rail};
-use crate::contract::mipmap::MetalMipmapError;
 use crate::model::{DeviceInfoLimits, DeviceState};
+use crate::protocol::mipmap::MetalMipmapError;
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session;
 use crate::runtime::decode::compute::Command as ComputeCommand;

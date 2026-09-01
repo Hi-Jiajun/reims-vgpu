@@ -2,7 +2,7 @@
 //!
 //! C owns the QEMU DisplaySurface; Rust fills it (apple-gfx's
 //! encodeCurrentFrame / getBytes role). Page-table paint uses
-//! [`crate::contract::iosurface_pages`] when the mapping has entries;
+//! [`crate::protocol::iosurface_pages`] when the mapping has entries;
 //! otherwise we fall back to the programmed EFI framebuffer or clear.
 //!
 //! Early-boot / present policy (archive apple-pv-gpu + live Monterey + PGDisplay):
@@ -31,11 +31,11 @@ pub mod metal;
 pub mod vulkan;
 
 use crate::backend::Backend as _;
-use crate::contract::pixel_format::{
+use crate::model::{scanout_extent_ok, DeviceState, EFI_BOOT_HEIGHT, EFI_BOOT_WIDTH};
+use crate::protocol::pixel_format::{
     self, Rgba8ToRow, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM,
     RGBA8_BPP,
 };
-use crate::model::{scanout_extent_ok, DeviceState, EFI_BOOT_HEIGHT, EFI_BOOT_WIDTH};
 use crate::runtime::host::HostMemory;
 
 /// Mapper-ref-texture color formats that may be the compositor front before DisplaySwap.
@@ -1481,7 +1481,7 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     let Some(gpas) = state.mappings.get(&mapping_id).map(|m| {
         m.page_entries
             .iter()
-            .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+            .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift))
             .collect::<Vec<u64>>()
     }) else {
         return;
@@ -1657,7 +1657,7 @@ pub fn note_present_field_witness<M: HostMemory>(
         .map(|m| {
             m.page_entries
                 .iter()
-                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+                .filter_map(|&e| crate::protocol::iosurface_pages::entry_gpa_shift(e, page_shift))
                 .collect::<Vec<u64>>()
         })
     else {

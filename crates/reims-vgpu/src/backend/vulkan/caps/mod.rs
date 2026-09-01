@@ -49,12 +49,16 @@ pub mod device_select;
 pub mod host_pointer;
 pub mod linear_sampled;
 pub mod linear_target;
-pub mod memory_topology;
 pub mod push_descriptor;
 
 pub(crate) use host_pointer::{HostPointerCaps, HostPointerImport};
-pub(crate) use memory_topology::{MappedMemoryKind, MemoryClass, MemoryProfile};
+// Moved to `reims-vgpu-vulkan`, which is the layer the architecture names as
+// the only one that turns host capabilities into placement policy. Re-exported
+// here so `caps::` stays the one name this crate asks capability questions
+// through.
 pub(crate) use push_descriptor::PushDescriptorCaps;
+pub use reims_vgpu_vulkan::memory as memory_topology;
+pub(crate) use reims_vgpu_vulkan::memory::{MappedMemoryKind, MemoryClass, MemoryProfile};
 
 use ash::vk;
 
@@ -146,7 +150,7 @@ impl HostGpuCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use memory_topology::fixtures;
+    use reims_vgpu_vulkan::memory::fixtures;
 
     fn caps(api: u32, props: &vk::PhysicalDeviceMemoryProperties) -> HostGpuCaps {
         HostGpuCaps {

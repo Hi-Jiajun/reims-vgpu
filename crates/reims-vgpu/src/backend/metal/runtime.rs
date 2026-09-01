@@ -103,7 +103,7 @@ const APPLE_SILICON_PAGE: u32 = 16 * 1024;
 /// run, so this one is checked from Linux and a `#[test]` beside it would not
 /// be.
 const _: () = assert!(
-    crate::contract::gva::PAGE_SIZE_ARM64E.is_multiple_of(APPLE_SILICON_PAGE),
+    crate::protocol::gva::PAGE_SIZE_ARM64E.is_multiple_of(APPLE_SILICON_PAGE),
     "a guest arm64e page must be a whole number of Apple Silicon pages, or a \
      guest-page-aligned base is not a valid newBufferWithBytesNoCopy base"
 );

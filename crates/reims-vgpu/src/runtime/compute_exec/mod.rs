@@ -26,9 +26,9 @@
 
 // The backend the process executes on, reached only through the trait.
 use crate::backend::Backend as _;
-use crate::contract::endian::ld32;
-use crate::contract::pixel_format;
 use crate::model::DeviceState;
+use crate::protocol::endian::ld32;
+use crate::protocol::pixel_format;
 use crate::runtime::decode::compute::{
     BufferBinding, Command as ComputeCommand, Kind, RefBinding, SamplerBinding,
 };
@@ -743,7 +743,7 @@ pub fn apply_record<M: HostMemory + HostOps>(
 /// `compute_dispatch_type_unknown` is ever seen, the evidence to decide arrives
 /// before the behaviour change does.
 fn accepted_dispatch_type(task_id: u32, declared: u32) -> u32 {
-    use crate::contract::dispatch::{
+    use crate::protocol::dispatch::{
         is_declared_dispatch_type, MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL,
     };
     if is_declared_dispatch_type(declared) {
@@ -899,7 +899,12 @@ fn apply_record_inner<M: HostMemory + HostOps>(
             None
         }
         Kind::UseHeaps | Kind::UseResources => {
-            crate::runtime::drain::note_store_route("compute_noop_residency_hint");
+            note_residency_declaration(
+                cmd.kind == Kind::UseHeaps,
+                cmd.opcode,
+                cmd.count,
+                cmd.resource_usage,
+            );
             None
         }
         Kind::CompressedTextureFlush => {
@@ -1424,7 +1429,7 @@ pub(crate) struct StagedTexture<R: RailStage> {
     pub width: u32,
     pub height: u32,
     /// How many mip levels `bytes` carries, base first, packed tightly by
-    /// [`crate::contract::extent::tight_pyramid_spans`].
+    /// [`reims_vgpu_protocol::extent::tight_pyramid_spans`].
     ///
     /// `1` on every rail but the normal-texture linear one, and `1` there too for a
     /// storage binding or a view that already names a level: a compute write
@@ -1546,7 +1551,7 @@ fn stage_buffer_texture<R: RailStage, M: HostMemory + HostOps>(
     let format = if bt.desc.pixel_format != 0 {
         bt.desc.pixel_format
     } else {
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
     };
     let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
         crate::observe::fail(format!(
@@ -2144,7 +2149,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         let pages_n = m.page_entries.len();
         // Wire backing `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
         // Independent of plane w/h and of MapMemory2 IOAccelMemory length — measure-only.
-        let wire_len = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc)
+        let wire_len = crate::protocol::iosurface_pages::decode_device_surface(&m.device_desc)
             .map(|s| s.alloc_size as u64)
             .unwrap_or(0);
         // A ref-texture record names its IOSurface plane on the wire (record `+0x20`,
@@ -2172,12 +2177,12 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 // byte count this geometry needs; a descriptor whose alloc is
                 // smaller is a different failure from one whose plane records
                 // matched nothing.
-                let ds = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc);
+                let ds = crate::protocol::iosurface_pages::decode_device_surface(&m.device_desc);
                 let (dw, dh, dbpr, dalloc) = ds
                     .as_ref()
                     .map(|s| (s.width, s.height, s.bytes_per_row, s.alloc_size))
                     .unwrap_or((0, 0, 0, 0));
-                let reach = crate::contract::iosurface_pages::packed_span_estimate(
+                let reach = crate::protocol::iosurface_pages::packed_span_estimate(
                     stage_fmt, width, height,
                 )
                 .unwrap_or(0);
@@ -2485,7 +2490,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             texture_ref,
         ));
     }
-    let Some(pyramid) = crate::contract::extent::tight_pyramid_spans(
+    let Some(pyramid) = reims_vgpu_protocol::extent::tight_pyramid_spans(
         w,
         h,
         level_sources.len() as u32,
@@ -2524,7 +2529,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     // per-level read cannot drift from each other — and so a level's cache key
     // is that level's own rows and extent rather than the base's.
     let level_window = |source: &LinearLevelSource,
-                        span: &crate::contract::extent::MipLevelSpan| {
+                        span: &reims_vgpu_protocol::extent::MipLevelSpan| {
         crate::runtime::surface_cache::LinearWindow {
             task_id,
             texture_ref: stage_ref,
@@ -2780,7 +2785,7 @@ struct LinearLevelSource {
 /// reported by name rather than left to read as a texture that simply has fewer
 /// levels.
 ///
-/// Extents are checked against [`crate::contract::extent::mip_extent`] because
+/// Extents are checked against [`reims_vgpu_protocol::extent::mip_extent`] because
 /// the packed layout is derived from the base geometry alone; a level whose
 /// declared extent disagrees would be read at one size and copied at another.
 fn linear_extra_levels(
@@ -2794,8 +2799,8 @@ fn linear_extra_levels(
     let declared = tex.mipmap_level_count.max(1);
     let mut out = Vec::new();
     for level in 1..declared {
-        let want_w = crate::contract::extent::mip_extent(base_width, level);
-        let want_h = crate::contract::extent::mip_extent(base_height, level);
+        let want_w = reims_vgpu_protocol::extent::mip_extent(base_width, level);
+        let want_h = reims_vgpu_protocol::extent::mip_extent(base_height, level);
         let refuse = |reason: &str, detail: String| {
             crate::observe::fail(format!(
                 "compute_stage_tex mip_truncated reason={reason} ref={texture_ref} level={level}                  staged={} declared={declared} want={want_w}x{want_h} {detail}",
@@ -3323,11 +3328,11 @@ fn u32_dim(v: u64) -> Result<u32, ComputeStatus> {
 
 /// The dispatch extents, narrowed from the wire's `u64` by [`u32_dim`].
 ///
-/// The type is [`crate::contract::extent::Extent3`], which both this decoder
+/// The type is [`reims_vgpu_protocol::extent::Extent3`], which both this decoder
 /// and the Metal backend it dispatches through now name. It used to be private
 /// here, which protected construction and stopped at the backend call — see its
 /// doc for why that was the wrong half of the journey to protect.
-use crate::contract::extent::Extent3;
+use reims_vgpu_protocol::extent::Extent3;
 
 // The two rails. Named rather than re-exported flat: each owns a dispatch
 // executor with the same neutral signature, and this module reaches whichever
@@ -3481,3 +3486,74 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
 
 #[cfg(test)]
 mod tests;
+
+/// A compute residency declaration whose usage the no-op argument does not
+/// cover.
+///
+/// The reasoning and the vocabulary are the render rail's — see
+/// `runtime::exec::report::ResidencyWriteDeclared`, which carries it — with one
+/// difference this rail owns. The compute encoder inherits only the
+/// **unqualified** residency selectors, so no record here carries a stage
+/// argument and there is no stage half to report; the usage half is the whole
+/// declaration, and it is the half that decides whether answering by doing
+/// nothing is sound.
+struct ComputeResidencyDeclared {
+    opcode: u32,
+    count: u32,
+    usage: reims_vgpu_protocol::residency::ResourceUsage,
+}
+
+impl crate::observe::Decline for ComputeResidencyDeclared {
+    fn slug(&self) -> &'static str {
+        use reims_vgpu_protocol::residency::UsageClass;
+        match self.usage.classify() {
+            UsageClass::Undeclared => "compute_residency_usage_undeclared",
+            _ => "compute_residency_write_dropped",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("op", format!("{:#x}", self.opcode)),
+            ("count", self.count.to_string()),
+            ("usage", format!("{:#x}", self.usage.0)),
+            (
+                "undeclared_usage",
+                format!("{:#x}", self.usage.undeclared_bits()),
+            ),
+        ]
+    }
+}
+
+/// Price one compute residency declaration by what it declared.
+fn note_residency_declaration(
+    is_heap: bool,
+    opcode: u32,
+    count: u32,
+    usage: reims_vgpu_protocol::residency::ResourceUsage,
+) {
+    use reims_vgpu_protocol::residency::UsageClass;
+    let class = usage.classify();
+    crate::runtime::drain::note_store_route(match (is_heap, class) {
+        // The heap form carries no usage argument, so there is no class to
+        // report — the route says only that a heap was declared.
+        (true, _) => "compute_residency_heap",
+        (false, UsageClass::Empty) => "compute_residency_empty",
+        (false, UsageClass::ReadOnly) => "compute_residency_read",
+        (false, UsageClass::Writes) => "compute_residency_write",
+        (false, UsageClass::Undeclared) => "compute_residency_undeclared",
+    });
+    if is_heap || matches!(class, UsageClass::Empty | UsageClass::ReadOnly) {
+        return;
+    }
+    // A dispatch writing through a path this rail did not bind loses content
+    // the guest expects to read back, which is not what a residency *hint*
+    // costs. Latched on the declaration: the same kernel asks for the same
+    // thing every frame, and a second shape is the event.
+    let decline = ComputeResidencyDeclared {
+        opcode,
+        count,
+        usage,
+    };
+    crate::observe::Emit::decline("compute_residency", &decline).fail_once(u64::from(usage.0));
+}

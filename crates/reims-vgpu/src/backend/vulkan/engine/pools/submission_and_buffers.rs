@@ -37,27 +37,27 @@ pub(crate) struct ReadbackLease {
 /// Whether the identity-only lookup runs, given what the environment said.
 ///
 /// Split from the read below so the one thing left to get wrong is testable
-/// without an environment. [`crate::env::read`] has already folded every
-/// negative spelling into [`crate::env::Switch::Off`]; what remains is which
+/// without an environment. [`crate::config::read`] has already folded every
+/// negative spelling into [`crate::config::Switch::Off`]; what remains is which
 /// states count as off, and `Unrecognized` must not — a mistyped value would
 /// otherwise narrow this device silently, which is the opposite of what a
 /// mistyped switch should do.
-const fn identity_lookup_on(switch: crate::env::Switch) -> bool {
-    !matches!(switch, crate::env::Switch::Off)
+const fn identity_lookup_on(switch: crate::config::Switch) -> bool {
+    !matches!(switch, crate::config::Switch::Off)
 }
 
 /// Whether the sampled cache's identity-only lookup is on. **Default on**; see
-/// [`crate::env::SAMPLED_IDENTITY`] for what switching it off narrows and why
+/// [`crate::config::SAMPLED_IDENTITY`] for what switching it off narrows and why
 /// that arm is worth having at all.
 fn sampled_identity_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| identity_lookup_on(crate::env::read(crate::env::SAMPLED_IDENTITY).0))
+    *ON.get_or_init(|| identity_lookup_on(crate::config::read(crate::config::SAMPLED_IDENTITY).0))
 }
 
 #[cfg(test)]
 mod sampled_identity_switch {
     use super::identity_lookup_on;
-    use crate::env::Switch;
+    use crate::config::Switch;
 
     /// Only an explicit negative spelling narrows. Enumerated rather than
     /// sampled: a new `Switch` variant that this does not mention fails to
@@ -1708,7 +1708,7 @@ impl ResourcePools {
     /// -> 108 us/draw). The cap keeps the GPU fed every ~N draws while still
     /// amortizing the per-draw submit+fence cost N-fold.
     ///
-    /// `narrow_to_target` is [`crate::env::BATCH_MIXED_TARGETS`] switched off.
+    /// `narrow_to_target` is [`crate::config::BATCH_MIXED_TARGETS`] switched off.
     /// The default is that the batch's own target does not decide this: a draw
     /// from another Metal encoder closes any retained pass before beginning its
     /// own, while the flush itself reads only the CB, fence, and accumulated
@@ -3918,7 +3918,7 @@ impl ResourcePools {
     ///
     /// It is also the only bind in the sampled path that rests on evidence this
     /// device did not read at bind time, which is why
-    /// [`crate::env::SAMPLED_IDENTITY`] can switch it off: with it off a
+    /// [`crate::config::SAMPLED_IDENTITY`] can switch it off: with it off a
     /// `Gathered` entry is unreachable and every guest-gather bind re-gathers,
     /// which is strictly more copying and cannot reach a different image.
     fn find_sampled_by_identity(
@@ -4674,7 +4674,7 @@ mod recycle_tests {
             arrayed: false,
             one_dim: false,
             format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
-                crate::contract::pixel_format::TexelLayout::Bgra8,
+                crate::protocol::pixel_format::TexelLayout::Bgra8,
             ),
             swizzle: Default::default(),
         }

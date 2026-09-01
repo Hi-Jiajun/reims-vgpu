@@ -2445,7 +2445,7 @@ pub fn first_non_sampled_texture_descriptor(
     })
 }
 
-/// Whether [`crate::env::BUFFER_EXTENT`] is switched off, read once per process.
+/// Whether [`crate::config::BUFFER_EXTENT`] is switched off, read once per process.
 ///
 /// Latched because this sits on the per-bind path and `std::env::var_os` is a
 /// lock and an allocation; the variable is read at the first bind of the boot
@@ -2456,9 +2456,9 @@ fn buffer_extent_disabled() -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::BUFFER_EXTENT);
+        let (state, value) = crate::config::read(crate::config::BUFFER_EXTENT);
         match state {
-            crate::env::Switch::Off => {
+            crate::config::Switch::Off => {
                 crate::observe::off("buffer_extent reason=buffer_extent_disabled_by_env");
                 true
             }
@@ -2466,14 +2466,14 @@ fn buffer_extent_disabled() -> bool {
             // default, which is the one way an operator concludes a switch does
             // not work. It still takes the default arm: this switch may only
             // turn a rail off, and a value nobody can parse is not that.
-            crate::env::Switch::Unrecognized => {
+            crate::config::Switch::Unrecognized => {
                 crate::observe::fail(format!(
                     "buffer_extent reason=buffer_extent_env_unrecognized value={}",
                     value.unwrap_or_default()
                 ));
                 false
             }
-            crate::env::Switch::On | crate::env::Switch::Unset => false,
+            crate::config::Switch::On | crate::config::Switch::Unset => false,
         }
     })
 }
@@ -2816,7 +2816,7 @@ pub fn neutral_bind_bytes() -> std::sync::Arc<Vec<u8>> {
         .clone()
 }
 
-/// Whether [`crate::env::UNUSED_BINDS`] is switched off, read once per process.
+/// Whether [`crate::config::UNUSED_BINDS`] is switched off, read once per process.
 ///
 /// Same shape as [`buffer_extent_disabled`], and read once for the same reason:
 /// this sits in the per-draw path at tens of thousands of binds a second, and an
@@ -2824,20 +2824,20 @@ pub fn neutral_bind_bytes() -> std::sync::Arc<Vec<u8>> {
 fn unused_binds_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::UNUSED_BINDS);
+        let (state, value) = crate::config::read(crate::config::UNUSED_BINDS);
         match state {
-            crate::env::Switch::Off => {
+            crate::config::Switch::Off => {
                 crate::observe::off("unused_binds reason=unused_binds_disabled_by_env");
                 true
             }
-            crate::env::Switch::Unrecognized => {
+            crate::config::Switch::Unrecognized => {
                 crate::observe::fail(format!(
                     "unused_binds reason=unused_binds_env_unrecognized value={}",
                     value.unwrap_or_default()
                 ));
                 false
             }
-            crate::env::Switch::Unset | crate::env::Switch::On => false,
+            crate::config::Switch::Unset | crate::config::Switch::On => false,
         }
     })
 }
@@ -2905,7 +2905,7 @@ pub fn vertex_buffer_extent(
 /// compute dispatch skip an extra guest bind while failing closed on a declared
 /// buffer whose access could not be classified.
 ///
-/// Deliberately not gated on [`crate::env::BUFFER_EXTENT`]. That switch governs
+/// Deliberately not gated on [`crate::config::BUFFER_EXTENT`]. That switch governs
 /// narrowing a bind's byte window, which is a different question from whether
 /// the bind is read at all, and folding the two would make one switch silently
 /// answer for two rails.

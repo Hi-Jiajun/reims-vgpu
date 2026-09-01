@@ -1146,10 +1146,13 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "raw-window-handle",
- "reims-vgpu-contract",
- "reims-vgpu-env",
+ "reims-vgpu-config",
+ "reims-vgpu-memory",
  "reims-vgpu-observe",
  "reims-vgpu-paging",
+ "reims-vgpu-protocol",
+ "reims-vgpu-testkit",
+ "reims-vgpu-vulkan",
  "reims-vgpu-wire",
  "serde_json",
  "wayland-backend",
@@ -1160,23 +1163,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "reims-vgpu-contract"
+name = "reims-vgpu-config"
+version = "0.1.0"
+
+[[package]]
+name = "reims-vgpu-core"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-protocol",
+ "reims-vgpu-testkit",
+ "reims-vgpu-wire",
+ "serde_json",
+]
+
+[[package]]
+name = "reims-vgpu-memory"
 version = "0.1.0"
 dependencies = [
  "reims-vgpu-observe",
  "reims-vgpu-paging",
- "reims-vgpu-wire",
+ "reims-vgpu-protocol",
 ]
-
-[[package]]
-name = "reims-vgpu-env"
-version = "0.1.0"
 
 [[package]]
 name = "reims-vgpu-observe"
 version = "0.1.0"
 dependencies = [
- "reims-vgpu-env",
+ "reims-vgpu-config",
 ]
 
 [[package]]
@@ -1187,9 +1200,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "reims-vgpu-protocol"
+version = "0.1.0"
+dependencies = [
+ "reims-vgpu-observe",
+ "reims-vgpu-paging",
+ "reims-vgpu-wire",
+]
+
+[[package]]
+name = "reims-vgpu-testkit"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "reims-vgpu-vulkan"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "reims-vgpu-config",
+ "reims-vgpu-core",
+ "reims-vgpu-observe",
+]
+
+[[package]]
 name = "reims-vgpu-wire"
 version = "0.1.0"
 dependencies = [
+ "reims-vgpu-testkit",
  "serde_json",
 ]
 

@@ -525,7 +525,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // guest-RAM import serves it instead of losing every frame of it.
     let extent = match readback.texel.native_layout() {
         Some(layout) => {
-            if crate::contract::pixel_format::store_texel_order(c0.format) != Some(layout) {
+            if crate::protocol::pixel_format::store_texel_order(c0.format) != Some(layout) {
                 return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
             }
             crate::runtime::drain::note_store_route("gva_flush_copied_native");
@@ -591,7 +591,7 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
     // The destination extent in the destination's own bytes, which is what the
     // direct arm returns too — the two rails must agree about how much guest
     // memory a Store of this geometry lands, or a caller could tell them apart.
-    let Some(tight) = crate::contract::pixel_format::tight_row_bytes(c0.width, c0.format) else {
+    let Some(tight) = crate::protocol::pixel_format::tight_row_bytes(c0.width, c0.format) else {
         return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
     };
     let extent =
@@ -955,8 +955,8 @@ mod gva_copying_arm_tests {
             // Byte-identical with the RGBA8 the readback hands over, so the
             // assertion below is about where the bytes landed and not about the
             // conversion, which has its own tests.
-            format: crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
-            store_action: crate::contract::pass_action::MTL_STORE_ACTION_STORE,
+            format: crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            store_action: reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_STORE,
             ..Default::default()
         }
     }

@@ -4,6 +4,9 @@ pub mod blit;
 pub mod compute;
 pub mod event;
 pub mod fifo;
+/// Cross-checks between the closure ledger and these decoders.
+#[cfg(test)]
+mod ledger;
 pub mod render;
 pub mod resource;
 pub mod stream;

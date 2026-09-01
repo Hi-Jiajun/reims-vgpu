@@ -30,12 +30,25 @@ Persist only the resulting field, layout, lifetime, ordering, or calling-convent
   `HostOps` plumbing.
 - `crates/reims-vgpu`: device model, decode, mapping, scheduling, command execution, presentation,
   and backend policy.
-- `crates/reims-vgpu-contract`: backend-neutral layouts, formats, geometry, page arithmetic, and
-  contract refusals.
 - `crates/reims-vgpu-wire`: derived wire views; its nested instructions also apply.
-- `crates/reims-vgpu-env`: the single parse and declaration point for environment switches.
+- `crates/reims-vgpu-protocol`: `no_std`. The first layer allowed to assign meaning to a wire tag —
+  backend-neutral layouts, formats, geometry, page arithmetic, closed ordinal rules, and the
+  contract refusals they name.
+- `crates/reims-vgpu-core`: the backend-independent semantic model. Transactions, dependency and
+  publication domains, session generations and device epochs, the fixed executor, and the serial
+  reference interpreter every parallel schedule is checked against. It can name no Vulkan handle,
+  Metal object, QEMU structure or guest-RAM pointer, and its dependency list is that claim.
+- `crates/reims-vgpu-memory`: the guest-RAM bound — imports, checked slices, page footprints.
+- `crates/reims-vgpu-config`: the single parse and declaration point for operator switches. An
+  override may only narrow what the device does; it may never widen it.
 - `crates/reims-vgpu-observe`: typed observations and refusals. It describes decisions but does not
   select behavior.
+- `crates/reims-vgpu-vulkan`: the Vulkan rail — the only layer that turns host
+  capabilities into placement and transfer policy. It sees `ash`, the semantic
+  model, the refusal vocabulary and the operator switches, and nothing of QEMU,
+  the device model, guest-RAM ownership or decode.
+- `crates/reims-vgpu-testkit`: shared behavioral fixtures — where the oracle's
+  capture is, whether it is there, and how the suites that read it read it.
 - `conformance`: native-oracle and guest-visible compatibility cases.
 - `vm`: rail-selected, snapshot-reverting boot harnesses.
 
@@ -43,7 +56,7 @@ Product logic belongs in Rust. C and Objective-C connect QEMU to Rust and must n
 policy from multiple Rust queries. Shared C/Rust constants need a `qemu::abi::header_define` test.
 No panic may cross an FFI boundary.
 
-Guest RAM bounds and provenance belong to `runtime/guest_ram.rs`; extend `GuestRamImport` or
+Guest RAM bounds and provenance belong to `crates/reims-vgpu-memory`; extend `GuestRamImport` or
 `GuestSlice` instead of exposing raw pointers and offsets. Resource state that represents guest
 work follows the contract-owned guest lifetime. Do not silently evict it with arbitrary cache
 bounds; refuse excess work explicitly when the contract provides no lawful loss.
@@ -54,7 +67,7 @@ after the guest may release or reuse resources. Submission is not completion.
 
 Unknown, dropped, rejected, degraded, or unsupported guest work must produce a typed reason on the
 always-on failure channel. Expected not-ready control flow stays quiet. Read environment variables
-only through the environment owner.
+only through the configuration owner.
 
 ## Supported pathways
 

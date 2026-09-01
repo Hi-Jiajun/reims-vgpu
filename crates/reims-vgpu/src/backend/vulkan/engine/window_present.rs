@@ -657,20 +657,20 @@ impl WindowPresenter {
     fn present_depth() -> usize {
         static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *DEPTH.get_or_init(|| {
-            let (state, value) = crate::env::read(crate::env::PRESENT_DEPTH);
+            let (state, value) = crate::config::read(crate::config::PRESENT_DEPTH);
             match state {
-                crate::env::Switch::Off => {
+                crate::config::Switch::Off => {
                     crate::observe::off("present_depth reason=present_depth_disabled_by_env");
                     1
                 }
-                crate::env::Switch::Unrecognized => {
+                crate::config::Switch::Unrecognized => {
                     crate::observe::fail(format!(
                         "present_depth reason=present_depth_env_unrecognized value={}",
                         value.unwrap_or_default()
                     ));
                     PRESENT_IN_FLIGHT
                 }
-                crate::env::Switch::Unset | crate::env::Switch::On => PRESENT_IN_FLIGHT,
+                crate::config::Switch::Unset | crate::config::Switch::On => PRESENT_IN_FLIGHT,
             }
         })
     }

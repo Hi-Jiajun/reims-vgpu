@@ -9,16 +9,14 @@ use super::*;
 use super::metal::*;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::backend::metal::MetalBackend;
-use crate::contract::endian::{st16, st32, st64};
-use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+use crate::protocol::endian::{st16, st32, st64};
+use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 /// Page-entry bits for hand-mapping a draw target. Metal-arm only, same reason
 /// as the compute-pipeline block below.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::contract::pass_action::MTL_STORE_ACTION_STORE;
-use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 use crate::runtime::decode::resource::{
     compute_only_icb_layout, encode_icb_command_layout, list_object_entry_offset,
     render_icb_layout, ICB_DESC_FLAGS, ICB_DESC_LAYOUT, ICB_DESC_LEN, ICB_DESC_MAX_COMMAND_COUNT,
@@ -47,6 +45,8 @@ use crate::runtime::host::FakeHost;
 /// test needs this same set; it was spelled inside 29 test bodies before.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::mapping_write;
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_STORE;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -765,7 +765,7 @@ fn draw_request(mapping_id: u32) -> DrawEncodeRequest {
             mapping_id,
             width: 4,
             height: 4,
-            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
             store_action: MTL_STORE_ACTION_STORE,
             target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
             ..Default::default()
@@ -950,7 +950,7 @@ fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
         // The helper ORs the serializer's default word in, so a flag the guest
         // *clears* has to be cleared after the fact.
         let mut desc = make_icb_desc_bytes_tg(8, 4, 0, set);
-        let word = crate::contract::endian::ld16(&desc[ICB_DESC_FLAGS..]);
+        let word = crate::protocol::endian::ld16(&desc[ICB_DESC_FLAGS..]);
         st16(&mut desc[ICB_DESC_FLAGS..], word & !clear);
         let gva = 1u64 << RESOURCE_PAGE_SHIFT;
         put_object(
@@ -4780,7 +4780,7 @@ fn put_texture(
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
-    let bpp = crate::contract::pixel_format::bytes_per_pixel(pixel_format).unwrap_or(4);
+    let bpp = crate::protocol::pixel_format::bytes_per_pixel(pixel_format).unwrap_or(4);
     let row_stride = width * bpp;
     let size = (row_stride as u64) * (height as u64);
     let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
@@ -4851,7 +4851,7 @@ fn put_serializer_object_sampler(
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn icb_parent_encoder_texture_and_sampler_binds() {
     use crate::backend::Backend as _;
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
 
     let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
@@ -4976,7 +4976,7 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn icb_argument_buffer_storage_texture_xyplane() {
     use crate::backend::Backend as _;
-    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UINT;
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UINT;
     use crate::runtime::compute_exec::{ComputeAccum, ComputeTextureBind};
 
     let _guard = icb_test_guard();
@@ -5087,7 +5087,7 @@ fn icb_argument_buffer_storage_texture_xyplane() {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn icb_argument_buffer_sample_and_write() {
     use crate::backend::Backend as _;
-    use crate::contract::pixel_format::{MTL_FORMAT_RGBA8_UINT, MTL_FORMAT_RGBA8_UNORM};
+    use crate::protocol::pixel_format::{MTL_FORMAT_RGBA8_UINT, MTL_FORMAT_RGBA8_UNORM};
     use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
 
     let _guard = icb_test_guard();

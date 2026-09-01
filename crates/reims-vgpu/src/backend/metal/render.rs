@@ -21,11 +21,11 @@ use crate::backend::metal::util::{
     Status,
 };
 use crate::backend::render_pso_key::{RenderPsoKey, RenderPsoLookup};
-use crate::contract::extent::tight_image_bytes;
-use crate::contract::vertex_step::{step_rate_in_contract, MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE};
+use crate::protocol::vertex_step::{step_rate_in_contract, MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE};
 use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
 use foreign_types::ForeignType;
 use metal::*;
+use reims_vgpu_protocol::extent::tight_image_bytes;
 use std::ptr;
 
 struct AttrBufferSlot {
@@ -510,7 +510,7 @@ fn make_vertex_descriptor(
                 .field("step", step_ordinal));
         }
         // A rate of zero is legal for exactly one step function and required by
-        // it, which `contract::vertex_step` states beside the ordinals. Under
+        // it, which `protocol::vertex_step` states beside the ordinals. Under
         // any other, a zero rate advances nothing and `MTLVertexDescriptor`
         // validation rejects the descriptor, so refuse it here by name instead.
         // Asked here rather than where the buffer slot is allocated, because
@@ -1044,7 +1044,7 @@ fn bind_sampled_images(
             let Some(expected_len) = tight_image_bytes(
                 image.width,
                 image.height,
-                crate::contract::pixel_format::RGBA8_BPP as usize,
+                crate::protocol::pixel_format::RGBA8_BPP as usize,
             ) else {
                 set_err(
                     err,
@@ -1825,7 +1825,7 @@ pub fn render_core_mrt(
     frag_mtlb: &[u8],
     width: u32,
     height: u32,
-    draw: crate::contract::draw::DrawArgs,
+    draw: crate::protocol::draw::DrawArgs,
     primitive_indirect: Option<&ReimsVgpuPrimitiveIndirectDraw>,
     indexed: Option<&ReimsVgpuIndexedDraw>,
     attrs: &[ReimsVgpuVertexAttr],

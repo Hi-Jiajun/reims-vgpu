@@ -13,11 +13,11 @@ use super::*;
 use crate::backend::vulkan::engine::{resource_lease, DrawError, DrawPreparationDecline};
 use crate::backend::vulkan::translate;
 use crate::backend::PlaneDrawReader;
-use crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 use crate::runtime::census::srgb_census;
 use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, SurfaceCurrency};
+use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
@@ -969,7 +969,7 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
 /// `lookup_list_entry` -> `read_descriptor` -> `decode_texture_descriptor`, so
 /// **any** object whose descriptor is at least `TEXTURE_DESC_GEOMETRY_LEN`
 /// bytes decodes as a texture and yields a plausible extent rather than a
-/// refusal. That is the hazard `contract::iosurface_pages` documents for the
+/// refusal. That is the hazard `protocol::iosurface_pages` documents for the
 /// `TEXTURE_DESC_WIDTH` name collision, reached a different way.
 ///
 /// # It reports and does not refuse, on purpose
@@ -1242,7 +1242,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // surface has its own format, extent and offset, and the
                 // mapping-derived window cannot describe it, which is why the
                 // video planes were absent from this record.
-                if let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(view.pixel_format)
+                if let Some(bpp) = crate::protocol::pixel_format::bytes_per_pixel(view.pixel_format)
                 {
                     if let Some((base_off, bpr, _)) = state.mappings.get(&mid).and_then(|m| {
                         crate::runtime::mapping_write::ref_texture_sample_window(
@@ -2475,7 +2475,7 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
             view.pixel_format,
         ) else {
             let desc =
-                crate::contract::iosurface_pages::decode_device_surface(&m.device_desc).map(|d| {
+                crate::protocol::iosurface_pages::decode_device_surface(&m.device_desc).map(|d| {
                     (
                         d.width,
                         d.height,
@@ -3167,7 +3167,7 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
         let page_base = backing.gva & !(page - 1);
         let head = backing.gva - page_base;
         let map_len =
-            crate::contract::checked::align_up_u64(head.checked_add(backing.size)?, page)?;
+            crate::protocol::checked::align_up_u64(head.checked_add(backing.size)?, page)?;
         // The one admission rule, which asks the map's standing refusal before
         // the latches. Assembling it here from the latches alone is what let
         // this rail import on a host that had already refused the whole map.
@@ -3484,7 +3484,7 @@ pub(super) fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Optio
 /// busy.
 pub(super) fn strided_level_extent(
     layout: &crate::runtime::decode::resource::TextureLevelLayout,
-    block: pixel_format::BlockGeometry,
+    block: reims_vgpu_protocol::extent::BlockGeometry,
 ) -> Option<(u64, u32)> {
     let bytes = u64::from(block.bytes);
     let bpr = layout.row_stride;
@@ -5847,7 +5847,7 @@ fn preserving_partial_route(
     seeded: bool,
     from_target: bool,
 ) -> Option<&'static str> {
-    use crate::contract::pass_action::LoadAction;
+    use reims_vgpu_protocol::pass_action::LoadAction;
     // An absent action is the same unknown the ordinal match spells
     // `draw_partial_load_unknown`, and the contract's own answer for an unknown
     // is DontCare — which preserves. Folding it in rather than dropping it is
@@ -6699,7 +6699,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // A secondary attachment opens with the same 28-byte prefix as the
         // primary and the depth slot, so its load action carries the same
         // meaning — see
-        // [`crate::contract::pass_action::LoadAction::preserves_prior_contents`].
+        // [`reims_vgpu_protocol::pass_action::LoadAction::preserves_prior_contents`].
         //
         // It has no seed door of its own: this key bit is the whole decision.
         // So what stands in for "were the prior contents resolved" is the
@@ -6717,15 +6717,19 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // merely *permits* them, so with nothing to preserve it falls back to
         // the clear — which is legal for it, and is the arm that cannot leak a
         // previous tenant.
-        let declared = crate::contract::pass_action::LoadAction::from_declared(c.load_action);
+        let declared = reims_vgpu_protocol::pass_action::LoadAction::from_declared(c.load_action);
         let load = match declared {
-            crate::contract::pass_action::LoadAction::Clear => false,
-            crate::contract::pass_action::LoadAction::Load => true,
-            crate::contract::pass_action::LoadAction::DontCare => {
+            reims_vgpu_protocol::pass_action::LoadAction::Clear => false,
+            reims_vgpu_protocol::pass_action::LoadAction::Load => true,
+            reims_vgpu_protocol::pass_action::LoadAction::DontCare => {
                 crate::backend::vulkan::engine::resident_content_ready(&identity)
             }
         };
-        if matches!(declared, crate::contract::pass_action::LoadAction::DontCare) && !load {
+        if matches!(
+            declared,
+            reims_vgpu_protocol::pass_action::LoadAction::DontCare
+        ) && !load
+        {
             // Reported only where it still costs the guest: a DontCare whose
             // resident cannot answer for the attachment is the one that still
             // becomes a clear over live content.
@@ -8105,7 +8109,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // texels, not one. `layers` is 1 for every other shape here, so
                 // the repeat is the identity for them.
                 source: crate::backend::vulkan::engine::SampledSource::Bytes(std::sync::Arc::new(
-                    crate::contract::pixel_format::solid_rgba8(1, 1, &[0.0; 4])
+                    crate::protocol::pixel_format::solid_rgba8(1, 1, &[0.0; 4])
                         .repeat(shape.layers.max(1) as usize),
                 )),
                 byte_origin: crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
@@ -8441,7 +8445,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // `load_action` was already folded to DontCare above for anything
             // out of contract, so this fold is exact and the two spellings
             // cannot disagree.
-            use crate::contract::pass_action::LoadAction;
+            use reims_vgpu_protocol::pass_action::LoadAction;
             let declared = LoadAction::from_declared(load_action);
             let (declared_n, declared_area) = declared.census_routes();
             crate::runtime::drain::note_store_route(declared_n);
@@ -8682,7 +8686,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .first()
             .filter(|color| color.multisample_source_ref != 0)
         {
-            use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+            use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
             if color.store_action != MTL_STORE_ACTION_MULTISAMPLE_RESOLVE {
                 return Err(DrawError::Unsupported(
                     crate::backend::vulkan::engine::reason::DrawReason::MultisampleStoreActionUnsupported {
@@ -8803,7 +8807,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .colors
             .first()
             .map(|c| {
-                crate::contract::pass_action::store_action_publishes_single_sample(c.store_action)
+                reims_vgpu_protocol::pass_action::store_action_publishes_single_sample(
+                    c.store_action,
+                )
             })
             .unwrap_or(true);
         resources.target_rgba8 = target_rgba8;
@@ -8924,7 +8930,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.color0_declared = req
             .colors
             .first()
-            .map(|c| crate::contract::pass_action::LoadAction::from_declared(c.load_action));
+            .map(|c| reims_vgpu_protocol::pass_action::LoadAction::from_declared(c.load_action));
         if chain_load_from_target {
             // The GVA Load elision validated its own identity and is the only
             // rail here whose target is not also claimed by a Store rail: a pass
@@ -8961,7 +8967,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // for the same reason: a DontCare that this device can
                     // serve prior contents for must be served them, or the
                     // attachment starts at a colour nothing asked for.
-                    crate::contract::pass_action::LoadAction::from_declared(color.load_action)
+                    reims_vgpu_protocol::pass_action::LoadAction::from_declared(color.load_action)
                         .preserves_prior_contents()
                         && color.target_seed_rgba.is_none()
                 });
@@ -9789,7 +9795,7 @@ fn depth_state_for(
         // decided here: `honours_load` gates on the depth resident actually
         // holding content and degrades to CLEAR by name, so a DontCare with
         // nothing behind it cannot load an undefined image.
-        load: crate::contract::pass_action::LoadAction::from_declared(load_action)
+        load: reims_vgpu_protocol::pass_action::LoadAction::from_declared(load_action)
             .preserves_prior_contents(),
         stencil,
     }
@@ -9971,7 +9977,7 @@ fn mapper_ref_texture_render_identity(
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
     let c0 = req.colors.first()?;
     if c0.mapping_id == 0
-        || !crate::contract::pass_action::store_action_publishes_single_sample(c0.store_action)
+        || !reims_vgpu_protocol::pass_action::store_action_publishes_single_sample(c0.store_action)
     {
         return None;
     }
@@ -10027,11 +10033,11 @@ fn mapper_ref_texture_guest_target_backing<H: HostMemory + HostOps>(
 /// divide candidates, not all draws.
 ///
 /// DontCare qualifies alongside Load: see
-/// [`crate::contract::pass_action::LoadAction::preserves_prior_contents`] for
+/// [`reims_vgpu_protocol::pass_action::LoadAction::preserves_prior_contents`] for
 /// why undefined contents permit the prior ones, and why serving them is what
 /// keeps this arm agreeing with the Metal one.
 pub(super) fn mapper_ref_texture_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
-    crate::contract::pass_action::LoadAction::from_declared(c0.load_action)
+    reims_vgpu_protocol::pass_action::LoadAction::from_declared(c0.load_action)
         .preserves_prior_contents()
         && c0.target_seed_rgba.is_none()
 }
@@ -10537,7 +10543,7 @@ pub(crate) fn gva_chain_identity(
 ///
 /// The fallback is a fidelity loss and not a refusal. The draw still runs, and
 /// the Store still lands correctly-shaped bytes for the guest's declared texel,
-/// because [`crate::contract::pixel_format::convert_rgba8_to_row`] expands them
+/// because [`crate::protocol::pixel_format::convert_rgba8_to_row`] expands them
 /// from eight bits — the guest reads a well-formed half-float frame carrying
 /// eight bits of information. What the fallback costs is the range and the
 /// precision the guest asked for: anything above 1.0 in a half-float
@@ -10831,7 +10837,7 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
     //
     // The eager arm has always done this — `write_bgra8_from_resident_gpu` calls
     // `invalidate_storage_residency_window` over the same extent — so without it
-    // here the two arms of `env::LAZY_WRITEBACK` disagree about what the GPU
+    // here the two arms of `config::LAZY_WRITEBACK` disagree about what the GPU
     // observes, which is the one thing that switch's doc promises they never do.
     // Nothing else drops an entry from that map and no guest-write witness feeds
     // it, so a stale claim is held until the window is written some other way.
@@ -11113,7 +11119,7 @@ mod vulkan_split_tests {
     /// population silently.
     #[test]
     fn every_preserving_load_action_with_no_prior_contents_shares_one_bucket() {
-        use crate::contract::pass_action::LoadAction;
+        use reims_vgpu_protocol::pass_action::LoadAction;
         // The declared set plus a sweep past its top, which is where an
         // out-of-contract ordinal comes from; `from_declared` folds those to
         // DontCare, and DontCare preserves.
@@ -11586,8 +11592,8 @@ mod vulkan_split_tests {
     /// GVA walker will accept. Returns the state the walk reads its task from;
     /// the caller re-points the entry by calling this again on the same host.
     fn map_one_gva_page(host: &mut FakeHost, pfn: u32) {
-        use crate::contract::endian::st32;
-        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::protocol::endian::st32;
+        use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
         use crate::runtime::host::HostMemory;
         let page = 1u64 << PAGE_SHIFT_X86;
         // Directory at pfn 2, its root page table at pfn 3, data pages above.
@@ -11903,8 +11909,8 @@ mod vulkan_split_tests {
     /// that only asked whether the map contained the key would pass either way.
     #[test]
     fn arming_a_writeback_debt_stops_the_host_cache_naming_the_previous_frame() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::mapping_write::write_bgra8;
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -12009,8 +12015,8 @@ mod vulkan_split_tests {
     /// generation this test bumps to.
     #[test]
     fn the_store_names_the_slot_the_draw_registered_after_the_mapping_generation_moves() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::mapping_write::write_bgra8;
 
         if !crate::runtime::writeback_debt::lazy_writeback_enabled() {
@@ -12092,8 +12098,8 @@ mod vulkan_split_tests {
     /// it.
     #[test]
     fn the_mapper_ref_texture_zero_copy_gather_pays_the_frame_those_pages_owe() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
         // Keep this large enough that either the direct resource or the copied
         // fallback can take; the test is about debt payment, not ownership.
@@ -12212,8 +12218,8 @@ mod vulkan_split_tests {
     /// from both copies and the next frame loads what this one stored.
     #[test]
     fn the_mapper_ref_texture_load_seed_cache_rung_refuses_a_surface_the_guest_rewrote() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::host::HostOps;
         use crate::runtime::mapping_write::write_bgra8;
 
@@ -12316,8 +12322,8 @@ mod vulkan_split_tests {
 
     #[test]
     fn a_mapper_ref_texture_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::mapping_write::write_bgra8;
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -12443,7 +12449,7 @@ mod vulkan_split_tests {
     /// behaviour, and refusing on it would re-read a surface per bind.
     #[test]
     fn the_host_cache_sample_rung_refuses_a_surface_the_guest_rewrote() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use crate::runtime::host::{FakeHost, HostOps};
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -13115,7 +13121,7 @@ mod vulkan_split_tests {
                 mapping_id: 9,
                 width: 8,
                 height: 8,
-                format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+                format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
                 ..ColorRtRequest::default()
             },
             ColorRtRequest {
@@ -13125,7 +13131,7 @@ mod vulkan_split_tests {
                 row_stride: 32,
                 width: 8,
                 height: 8,
-                format: crate::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+                format: crate::protocol::pixel_format::MTL_FORMAT_RG16_FLOAT,
                 ..ColorRtRequest::default()
             },
         ];
@@ -13770,7 +13776,7 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
 /// with it.** A DontCare now enters the same seed doors as a Load, because
 /// undefined permits the prior contents and preserving is the realization the
 /// guest relies on — see
-/// [`crate::contract::pass_action::LoadAction::preserves_prior_contents`]. The
+/// [`reims_vgpu_protocol::pass_action::LoadAction::preserves_prior_contents`]. The
 /// count that argued for that widening was this one: a driven macos-15 boot ran
 /// `passbegin_clear` exactly `color0_declared_dontcare` above the clears the
 /// guest asked for, an identity rather than a correlation, which also proved
@@ -14298,7 +14304,7 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
     // latched census reports it, but only from the colour-seed site, which a
     // pass whose seed is elided never reaches -- so the full-screen CLEAR passes
     // are exactly the ones missing from it.
-    let clear = if color.load_action == crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR {
+    let clear = if color.load_action == reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_CLEAR {
         format!(
             "/c[{:.3},{:.3},{:.3},{:.3}]",
             color.clear_color[0], color.clear_color[1], color.clear_color[2], color.clear_color[3]
@@ -14470,7 +14476,7 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
             // This rail converts every format to RGBA8 unconditionally — the
             // loop above is `convert_row_to_rgba8` with no native arm — so the
             // layout is fixed rather than chosen.
-            layout: crate::contract::pixel_format::TexelLayout::Rgba8,
+            layout: crate::protocol::pixel_format::TexelLayout::Rgba8,
             generation,
         },
         entry_bytes,
@@ -14487,7 +14493,7 @@ fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
 #[cfg(test)]
 mod load_action_contract_tests {
     use super::{load_action_in_contract, note_load_action_dont_care};
-    use crate::contract::pass_action::{
+    use reims_vgpu_protocol::pass_action::{
         MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD,
     };
 
@@ -14580,7 +14586,7 @@ mod load_action_contract_tests {
 #[cfg(test)]
 mod store_action_contract_tests {
     use super::store_action_in_contract;
-    use crate::contract::pass_action::{
+    use reims_vgpu_protocol::pass_action::{
         MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
         MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
     };

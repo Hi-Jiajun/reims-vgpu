@@ -12,15 +12,10 @@ pub mod vulkan;
 // The backend the process executes on, reached only through the trait: this
 // module names no rail.
 use crate::backend::Backend as _;
-use crate::contract::draw::DrawArgs;
-use crate::contract::endian::{ld32, ld64};
-use crate::contract::pass_action::{
-    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
-    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
-    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
-};
-use crate::contract::pixel_format::{self, ClearImageEncoding};
 use crate::model::DeviceState;
+use crate::protocol::draw::DrawArgs;
+use crate::protocol::endian::{ld32, ld64};
+use crate::protocol::pixel_format::{self, ClearImageEncoding};
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit::{self, Kind as BlitKind};
@@ -55,6 +50,11 @@ use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+use reims_vgpu_protocol::pass_action::{
+    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
+    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
+    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+};
 use reims_vgpu_wire::ops::blit as wire_blit;
 use reims_vgpu_wire::ops::render as wire_render;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
@@ -1055,6 +1055,13 @@ fn handle_info_record<M: HostMemory + HostOps>(
             }
         }
     }
+    // Every info record is a question, `0x1d1` included: the arm above logs
+    // where the answer would go and does not compute one, so the reply buffer
+    // is left holding whatever it held. Reporting them all through one site
+    // keeps that true — an arm that starts answering `0x1d1` has to return
+    // before it reaches here, which is a change this line makes visible rather
+    // than one it hides.
+    note_info_record_unanswered(task_id, opcode, bytes.len());
 }
 
 fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) {
@@ -2056,12 +2063,14 @@ fn handle_render_record<M: HostMemory + HostOps>(
         // the right one.
         //
         // The arguments are the compute rail's, which reached the same two
-        // conclusions first (`compute_noop_residency_hint`,
-        // `compute_noop_barrier`). Residency: `useResource:`/`useHeap:` are
-        // hints for a driver that pages resources, and this product resolves
-        // every binding per draw, so there is nothing for them to keep
-        // resident. Barriers: the render rail submits and waits at pass
-        // granularity, so a barrier inside the pass is implied by the boundary.
+        // conclusions first. Residency: `useResource:`/`useHeap:` are hints for
+        // a driver that pages resources, and this product resolves every
+        // binding per draw, so there is nothing for them to keep resident —
+        // for the half of the family that declares a *read*. The write half is
+        // not covered by that argument and is now told apart from it; see
+        // `report::note_residency_declaration`. Barriers: the render rail
+        // submits and waits at pass granularity, so a barrier inside the pass
+        // is implied by the boundary.
         //
         // These counters exist to price those arguments rather than to doubt
         // them. A large residency count is the cost of resolving per draw; a
@@ -2221,7 +2230,14 @@ fn handle_render_record<M: HostMemory + HostOps>(
             execute_indirect_draw(state, host, task_id, &cmd, acc);
         }
         RenderKind::UseResource | RenderKind::UseHeap => {
-            crate::runtime::drain::note_store_route("render_noop_residency_hint");
+            note_residency_declaration(
+                task_id,
+                cmd.kind == RenderKind::UseHeap,
+                cmd.opcode,
+                cmd.count,
+                cmd.residency_usage,
+                cmd.residency_stages,
+            );
         }
         RenderKind::Barrier => {
             crate::runtime::drain::note_store_route("render_noop_barrier");
@@ -3667,7 +3683,7 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
     cmd: &render::Command,
     acc: &mut StreamAccum,
 ) {
-    use crate::contract::draw::indirect;
+    use crate::protocol::draw::indirect;
 
     let indexed_form = cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_INDIRECT;
     let block_len = if indexed_form {
@@ -4171,8 +4187,8 @@ use report::{
     is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
     note_empty_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
-    note_pass_array_length_unsupported, note_pass_extent_for_slot,
-    note_pass_raster_sample_count_unsupported, note_pass_target_extent,
+    note_info_record_unanswered, note_pass_array_length_unsupported, note_pass_extent_for_slot,
+    note_pass_raster_sample_count_unsupported, note_pass_target_extent, note_residency_declaration,
     note_store_action_no_attachment, note_stream_draw_drops, note_unimplemented_render_opcode,
     note_unnamed_icb_execute,
 };

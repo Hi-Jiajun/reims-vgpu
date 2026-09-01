@@ -1,7 +1,7 @@
 use crate::model::PAGE_SHIFT_ARM64E;
 
 use super::*;
-use crate::contract::endian::st32;
+use crate::protocol::endian::st32;
 
 /// A `newSampler` record carrying `state`, at the layout the wire crate's
 /// own fixtures use.
@@ -931,7 +931,7 @@ fn a_dispatch_only_command_mask_keeps_the_stated_fragment_bind_count() {
 /// layout table sizing for object/mesh/objectTG/kernelTG.
 #[test]
 fn icb_create_body_max_count_matrix() {
-    use crate::contract::endian::st16;
+    use crate::protocol::endian::st16;
 
     // --- Decode: single-byte fields at RE offsets ---
     let mut b = [0u8; ICB_DESC_LEN];
@@ -1041,7 +1041,7 @@ fn icb_create_body_max_count_matrix() {
 /// pinned by `const` assertion beside the masks, not here.
 #[test]
 fn a_packed_stage_input_bit_with_no_field_says_so() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     use crate::runtime::decode::resource::{
         COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_MASK, COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_SHIFT,
     };
@@ -1421,8 +1421,8 @@ fn iosurface_mapper_ref_texture() {
 /// not defaulted to 1, which is the value it would silently look correct as.
 #[test]
 fn a_sample_count_is_read_only_from_a_trailer_that_corroborates_the_extent() {
-    use crate::contract::endian::{st16, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let build = |trailer_w: u32, samples: u16| {
         let mut b = vec![0u8; TEXTURE_DESC_BASE_LEN];
         st64(&mut b[0..], 0x10000);
@@ -1473,8 +1473,8 @@ fn the_trailer_offsets_are_derived_from_one_anchor() {
 
 #[test]
 fn linear_texture_geometry() {
-    use crate::contract::endian::{st16, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let mut b = vec![0u8; TEXTURE_DESC_BASE_LEN];
     st64(&mut b[0..], 0x10000);
     st32(&mut b[8..], 0x10);
@@ -1504,7 +1504,7 @@ fn linear_texture_geometry() {
 /// the result from a real bind.
 #[test]
 fn a_descriptor_naming_no_extent_is_not_a_one_by_one_texture() {
-    use crate::contract::endian::st64;
+    use crate::protocol::endian::st64;
     let mut b = vec![0u8; TEXTURE_DESC_BASE_LEN];
     st64(&mut b[0..], 0x10000);
     st32(&mut b[8..], 0x10);
@@ -1539,8 +1539,8 @@ fn a_descriptor_naming_no_extent_is_not_a_one_by_one_texture() {
 
 #[test]
 fn multi_mip_level_layouts() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     // 2 mips: L0 64x32 + L1 record + format trailer shifted by 36.
     let levels = 2u32;
     let body = TEXTURE_DESC_BASE_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN; // 116+36=152
@@ -1592,7 +1592,7 @@ fn multi_mip_level_layouts() {
 /// 4096 bytes, which is 1 MiB exactly and no trailing padding to discount.
 #[test]
 fn a_compressed_level_spans_its_block_rows_not_its_texel_rows() {
-    use crate::contract::pixel_format as pf;
+    use crate::protocol::pixel_format as pf;
     let level = TextureLevelLayout {
         offset: 0,
         size: 1024 * 1024,
@@ -1653,8 +1653,8 @@ fn a_compressed_level_spans_its_block_rows_not_its_texel_rows() {
 /// [`TEXTURE_DESC_MIPMAP_LEVEL_COUNT`].
 #[test]
 fn the_mip_level_count_is_one_byte_and_its_neighbour_is_another_field() {
-    use crate::contract::endian::{st16, st32};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::{st16, st32};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     const LEVELS: usize = 7;
     let body = TEXTURE_DESC_BASE_LEN + (LEVELS - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
     assert_eq!(body, 332, "the length identity this test turns on");
@@ -1726,7 +1726,7 @@ fn the_mip_level_count_is_one_byte_and_its_neighbour_is_another_field() {
 /// format trailer.
 #[test]
 fn a_level_record_the_body_does_not_reach_is_reported_not_dropped() {
-    use crate::contract::endian::{st16, st32, st64};
+    use crate::protocol::endian::{st16, st32, st64};
     // Declares 3 levels but carries only L0's geometry prefix and one
     // record's worth of room — L2's record runs past the end.
     let body = TEXTURE_DESC_LEVEL_RECORDS + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
@@ -1778,7 +1778,7 @@ fn a_level_record_the_body_does_not_reach_is_reported_not_dropped() {
 /// has to fix the fixtures first rather than only measure a boot.
 #[test]
 fn a_serializer_object_header_states_its_payload_length_twice_and_says_when_they_disagree() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
 
     // A minimal classic pipeline: header, then a one-field TLV block of seven
     // bytes, padded to eight by the declared length.
@@ -1825,7 +1825,7 @@ fn a_serializer_object_header_states_its_payload_length_twice_and_says_when_they
 
 #[test]
 fn compact_render_pipeline_funcs() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     // Minimal serializer-object render pipeline: header + fieldCount=2 with vert/frag refs.
     let mut b = vec![0u8; 16 + 1 + 6 + 6];
     let blen = b.len() as u32;
@@ -2135,7 +2135,7 @@ fn a_pipeline_sample_count_is_preserved_for_backend_rasterization() {
 /// otherwise.
 #[test]
 fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     // Tags no other test in this process uses, so `first_sight` cannot have
     // latched either shape or either drop already.
     const UNKNOWN_TAG_A: u8 = 0x6d;
@@ -2244,7 +2244,7 @@ fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
 /// refusal.
 #[test]
 fn an_identified_but_unapplied_pipeline_field_still_builds_the_pipeline() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
 
     let mut b = vec![0u8; 16 + 1 + 6 + 6 + 6];
     let blen = b.len() as u32;
@@ -2313,7 +2313,7 @@ fn an_identified_but_unapplied_pipeline_field_still_builds_the_pipeline() {
 /// readable off the result rather than argued.
 #[test]
 fn a_classic_pipeline_takes_its_vertex_block_from_the_stated_offset() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
 
     const DECOY_BUFFER: u32 = 0;
     const REAL_BUFFER: u32 = 2;
@@ -2383,7 +2383,7 @@ fn a_classic_pipeline_takes_its_vertex_block_from_the_stated_offset() {
 /// what makes the stated offset usable as the only route to the block.
 #[test]
 fn a_classic_pipeline_without_the_offset_reports_no_vertex_descriptor() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
 
     let mut b = vec![0u8; 16 + 13 + 8];
     let blen = b.len() as u32;
@@ -2410,7 +2410,7 @@ fn a_classic_pipeline_without_the_offset_reports_no_vertex_descriptor() {
 
 #[test]
 fn compact_render_pipeline_object_mesh_funcs() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     // Mesh SPI shape: tag 0x14 section offset + 0x01 object / 0x02 mesh / 0x03 frag.
     // (Host serializeMeshRenderPipelineDescriptor differentials, 2026-07-12.)
     //
@@ -2449,7 +2449,7 @@ fn compact_render_pipeline_object_mesh_funcs() {
 
 #[test]
 fn depth_stencil_object_decode() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     let mut b = vec![0u8; DEPTH_STENCIL_DESC_LEN];
     st32(&mut b[0..], SERIALIZER_OBJECT_DEPTH_STENCIL);
     st32(&mut b[4..], DEPTH_STENCIL_DESC_LEN as u32);
@@ -2472,8 +2472,8 @@ fn depth_stencil_object_decode() {
 
 #[test]
 fn color_attachment0_blend_section() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::st32;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     // Place section at off=16 (nonzero; 0 means "absent" for callers).
     // Section: count=1, entry_rel=8, entry with fieldCount + tags.
     let off = 16usize;
@@ -2520,7 +2520,7 @@ fn color_attachment0_blend_section() {
 /// borrowing entry 0's would be visible rather than coincidentally equal.
 #[test]
 fn colour_attachment_slots_are_their_own_index_and_carry_their_own_state() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     // [count][off0][off1][off2] then three 1-field entries, 7 bytes each.
     const ENTRY_LEN: usize = 7;
     let off = 16usize;
@@ -2573,8 +2573,8 @@ fn colour_attachment_slots_are_their_own_index_and_carry_their_own_state() {
 /// fit, and both take the same exit.
 #[test]
 fn a_colour_attachment_table_that_cannot_deliver_its_count_refuses() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::st32;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let off = 16usize;
     // Header (count + 3 offset words) then one entry: one tag, 6 bytes.
     let mut buf = vec![0u8; off + 4 + 3 * 4 + 1 + 6];
@@ -2657,7 +2657,7 @@ fn a_colour_table_reach_past_the_record_refuses_instead_of_indexing_past_it() {
 /// rest onto nothing.
 #[test]
 fn a_colour_attachment_count_past_the_eight_slot_array_refuses() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     let off = 16usize;
     let declared = MAX_COLOR_ATTACHMENTS + 1;
     // Only the header needs to be well formed: the count is refused before any
@@ -2689,8 +2689,8 @@ fn a_colour_attachment_count_past_the_eight_slot_array_refuses() {
 /// pipeline to build.
 #[test]
 fn a_colour_attachment_slot_past_the_array_refuses_instead_of_taking_a_position() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::st32;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let off = 16usize;
     let mut buf = vec![0u8; off + 8 + 1 + 2 * 6];
     st32(&mut buf[off..], 1);
@@ -2729,8 +2729,8 @@ fn a_colour_attachment_slot_past_the_array_refuses_instead_of_taking_a_position(
 /// half, and assert the refusal names the pair.
 #[test]
 fn a_colour_attachment_entry_shorter_than_its_field_count_is_refused() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::st32;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     let off = 16usize;
     // Header (count + one offset), then `[3][01:4 <fmt>][02:4 <trunc>]` — the
@@ -2790,8 +2790,8 @@ fn a_colour_attachment_entry_shorter_than_its_field_count_is_refused() {
 /// without it puts Metal's default where the guest set its own.
 #[test]
 fn an_unconsumed_colour_attachment_field_refuses_the_pipeline() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::st32;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     // A tag no other test in this process uses, so `first_sight` cannot
     // have latched it already.
     const UNKNOWN_TAG: u8 = 0x7f;
@@ -2873,8 +2873,8 @@ fn an_unconsumed_colour_attachment_field_refuses_the_pipeline() {
 /// already read from the wire.
 #[test]
 fn a_colour_attachment_takes_the_slot_the_guest_declared() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
+    use crate::protocol::endian::st32;
+    use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
 
     // Two entries, declared out of order: table position 0 names slot 3 and
     // position 1 names slot 1. Nothing but the declared index distinguishes
@@ -2931,8 +2931,8 @@ fn a_colour_attachment_takes_the_slot_the_guest_declared() {
 /// that omits it left the property at `all`.
 #[test]
 fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
-    use crate::contract::endian::st32;
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::endian::st32;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
     // `[fieldCount][01 pixelFormat][09 writeMask]`, the shape the live
     // guest sent (alpha-only, value 1).
@@ -2982,7 +2982,7 @@ fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
 /// refusing is what a device that does not know what it is holding does.
 #[test]
 fn a_write_mask_outside_the_four_bits_refuses_the_pipeline() {
-    use crate::contract::endian::st32;
+    use crate::protocol::endian::st32;
     let off = 16usize;
     let mut buf = vec![0u8; off + 8 + 1 + 6];
     st32(&mut buf[off..], 1);
@@ -3160,7 +3160,7 @@ fn a_slice_read_span_charges_full_planes_and_a_tight_last_row() {
 
 #[test]
 fn texture_view_simple() {
-    use crate::contract::endian::{st16, st32};
+    use crate::protocol::endian::{st16, st32};
     let mut b = vec![0u8; TEXTURE_VIEW_MIN_SIMPLE];
     st32(
         &mut b[TEXTURE_VIEW_DESC_OPCODE..],
@@ -3198,7 +3198,7 @@ fn texture_view_simple() {
 
 #[test]
 fn texture_view_swizzle_form() {
-    use crate::contract::endian::{st16, st32, st64};
+    use crate::protocol::endian::{st16, st32, st64};
     let mut b = vec![0u8; TEXTURE_VIEW_MIN_SWIZZLE];
     st32(
         &mut b[TEXTURE_VIEW_DESC_OPCODE..],
@@ -3237,7 +3237,7 @@ fn texture_view_swizzle_form() {
 
 #[test]
 fn texture_view_ranged_form() {
-    use crate::contract::endian::{st16, st32, st64};
+    use crate::protocol::endian::{st16, st32, st64};
     let mut b = vec![0u8; TEXTURE_VIEW_MIN_RANGED];
     st32(
         &mut b[TEXTURE_VIEW_DESC_OPCODE..],
@@ -3314,11 +3314,11 @@ fn decodes_opcode9_buffer_texture_live_blobs() {
 
     // A real texture-VIEW (opcode 8) is NOT a buffer texture.
     let mut view = vec![0u8; TEXTURE_VIEW_MIN_RANGED];
-    crate::contract::endian::st32(
+    crate::protocol::endian::st32(
         &mut view[TEXTURE_VIEW_DESC_OPCODE..],
         TEXTURE_VIEW_OPCODE_RANGED,
     );
-    crate::contract::endian::st32(
+    crate::protocol::endian::st32(
         &mut view[TEXTURE_VIEW_DESC_LEN..],
         TEXTURE_VIEW_MIN_RANGED as u32,
     );
@@ -3343,11 +3343,11 @@ fn the_texture_view_header_peek_is_bounded_by_the_header_it_reads() {
     // Exactly the header, declaring a 64-byte buffer-backed texture: the
     // shortest blob that carries an opcode at all.
     let mut short = vec![0u8; OP_HDR];
-    crate::contract::endian::st32(
+    crate::protocol::endian::st32(
         &mut short[TEXTURE_VIEW_DESC_OPCODE..],
         TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     );
-    crate::contract::endian::st32(&mut short[TEXTURE_VIEW_DESC_LEN..], BUF_TEX_MIN_LEN as u32);
+    crate::protocol::endian::st32(&mut short[TEXTURE_VIEW_DESC_LEN..], BUF_TEX_MIN_LEN as u32);
     assert_eq!(
         texture_view_header(&short),
         Some((TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, BUF_TEX_MIN_LEN as u32)),
@@ -3518,7 +3518,7 @@ pub(crate) fn dual_plane_body(
     plane0: (u32, u32),
     pixel_format: u16,
 ) -> Vec<u8> {
-    use crate::contract::endian::{st16, st32, st64};
+    use crate::protocol::endian::{st16, st32, st64};
     // Either bit above the 14-bit count will do. This is the one the game whose
     // descriptors settled the count's width does *not* set, so these bodies
     // cannot consume the `texture_desc_mip_field_undecoded` report that
@@ -3599,7 +3599,7 @@ fn the_dimension_block_geometry_derives_the_level_record_offset() {
 /// dimension block.
 #[test]
 fn a_dual_plane_descriptor_decodes_both_planes_and_the_shared_trailer() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let b = dual_plane_body([1, 1], (1920, 1080), MTL_FORMAT_BGRA8_UNORM);
     assert_eq!(b.len(), 176, "the length identity this test turns on");
     assert_eq!(
@@ -3655,7 +3655,7 @@ fn a_dual_plane_descriptor_decodes_both_planes_and_the_shared_trailer() {
 /// as the pixel format. A wrong texture rather than a missing one.
 #[test]
 fn the_single_plane_decoder_reads_plane_ones_header_as_the_format_trailer() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let b = dual_plane_body([1, 1], (1920, 1080), MTL_FORMAT_BGRA8_UNORM);
     let cap = crate::observe::FailCapture::start();
     let wrong = decode_texture_descriptor(&b).expect("it does not fail, which is the problem");
@@ -3687,7 +3687,7 @@ fn the_single_plane_decoder_reads_plane_ones_header_as_the_format_trailer() {
 /// moves the second plane and the trailer together.
 #[test]
 fn a_mipmapped_dual_plane_body_splits_at_plane_zeros_level_count() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     const LEVELS: usize = 4;
     let b = dual_plane_body(
         [LEVELS as u32, LEVELS as u32],
@@ -3725,7 +3725,7 @@ fn a_mipmapped_dual_plane_body_splits_at_plane_zeros_level_count() {
 /// body is exactly the length this must not accept.
 #[test]
 fn a_dual_plane_body_short_of_its_second_plane_is_refused() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let full = dual_plane_body([1, 1], (64, 64), MTL_FORMAT_BGRA8_UNORM);
     let both_blocks =
         TEXTURE_DIM_BASE + 2 * (TEXTURE_DIM_HEADER_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN);
@@ -3753,10 +3753,10 @@ fn a_dual_plane_body_short_of_its_second_plane_is_refused() {
 /// Neither is a decode, so this refuses and says which counts disagreed.
 #[test]
 fn planes_declaring_different_level_counts_are_refused_not_mis_sliced() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let mut b = dual_plane_body([2, 2], (64, 64), MTL_FORMAT_BGRA8_UNORM);
     let plane1 = TEXTURE_DIM_BASE + TEXTURE_DIM_HEADER_LEN + 2 * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
-    crate::contract::endian::st16(&mut b[plane1..], 3 | 0x4000);
+    crate::protocol::endian::st16(&mut b[plane1..], 3 | 0x4000);
 
     let cap = crate::observe::FailCapture::start();
     assert_eq!(
@@ -3780,7 +3780,7 @@ fn planes_declaring_different_level_counts_are_refused_not_mis_sliced() {
 /// level loop uses, and refuses rather than reporting a short body.
 #[test]
 fn an_absurd_level_count_refuses_as_a_bad_count_not_as_a_short_body() {
-    use crate::contract::endian::st16;
+    use crate::protocol::endian::st16;
     let mut b = vec![0u8; 4096];
     st16(
         &mut b[TEXTURE_DIM_BASE..],

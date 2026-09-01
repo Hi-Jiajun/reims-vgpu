@@ -4,14 +4,14 @@
 //! control-plane ops update device state; unknown opcodes are recorded visibly.
 
 use crate::backend::{Backend as _, RetainedObject};
-use crate::contract::endian::{ld16, ld32, ld64, st16, st32};
-use crate::contract::iosurface_pages::{
-    MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP, MAPPER_REQUEST_MAPPING_ID, MAPPER_REQUEST_TYPE,
-    MAPPER_REQUEST_UNMAP,
-};
 use crate::model::*;
 use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, UnimplementedCommand};
 use crate::observe::Emit;
+use crate::protocol::endian::{ld16, ld32, ld64, st16, st32};
+use crate::protocol::iosurface_pages::{
+    MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP, MAPPER_REQUEST_MAPPING_ID, MAPPER_REQUEST_TYPE,
+    MAPPER_REQUEST_UNMAP,
+};
 use crate::runtime::decode::fifo::{
     display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
     DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
@@ -3014,8 +3014,8 @@ fn present_page_identity_line(state: &DeviceState, mapping: u32, w: u32, h: u32)
     let named_pfns: HashSet<u32> = named
         .page_entries
         .iter()
-        .filter(|&&e| e & crate::contract::iosurface_pages::PAGE_ENTRY_VALID != 0)
-        .map(|&e| e >> crate::contract::iosurface_pages::PAGE_ENTRY_PFN_SHIFT)
+        .filter(|&&e| e & crate::protocol::iosurface_pages::PAGE_ENTRY_VALID != 0)
+        .map(|&e| e >> crate::protocol::iosurface_pages::PAGE_ENTRY_PFN_SHIFT)
         .collect();
     let mut peers = String::new();
     for (&mid, m) in state.mappings.iter() {
@@ -3033,10 +3033,10 @@ fn present_page_identity_line(state: &DeviceState, mapping: u32, w: u32, h: u32)
         } else {
             m.page_entries
                 .iter()
-                .filter(|&&e| e & crate::contract::iosurface_pages::PAGE_ENTRY_VALID != 0)
+                .filter(|&&e| e & crate::protocol::iosurface_pages::PAGE_ENTRY_VALID != 0)
                 .filter(|&&e| {
                     named_pfns
-                        .contains(&(e >> crate::contract::iosurface_pages::PAGE_ENTRY_PFN_SHIFT))
+                        .contains(&(e >> crate::protocol::iosurface_pages::PAGE_ENTRY_PFN_SHIFT))
                 })
                 .count()
         };
@@ -3667,9 +3667,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
     let plen = packet.payload.len();
     let name = family.name();
     if matches!(family, MapFamily::MapMemory2 | MapFamily::UnmapMemory) && plen >= 20 {
-        let task_id = crate::contract::endian::ld32(&packet.payload[0..]);
-        let gva = crate::contract::endian::ld64(&packet.payload[4..]);
-        let length = crate::contract::endian::ld64(&packet.payload[12..]);
+        let task_id = crate::protocol::endian::ld32(&packet.payload[0..]);
+        let gva = crate::protocol::endian::ld64(&packet.payload[4..]);
+        let length = crate::protocol::endian::ld64(&packet.payload[12..]);
         // Audit the interval against what this task already has live: a range
         // mapped twice or unmapped without a map is a disagreement the guest's
         // own teardown assertion will eventually find.
@@ -3823,8 +3823,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // boundary for the host IOSurface backing, not stamp-only
         // bookkeeping. Keeping page_entries after it lets later id
         // reuse/clear write pixels into pages the guest has recycled.
-        let object_id = crate::contract::endian::ld32(&packet.payload[0..]);
-        let task_id = crate::contract::endian::ld32(&packet.payload[4..]);
+        let object_id = crate::protocol::endian::ld32(&packet.payload[0..]);
+        let task_id = crate::protocol::endian::ld32(&packet.payload[4..]);
         // Never write guest pages here — the delete trails the guest's
         // CPU-side release asynchronously and the pages may already be
         // recycled (boot-16 PTE-corruption panic: a 14.7 MB delete-time
@@ -4011,12 +4011,12 @@ fn apply_map_family<H: HostMemory + HostOps>(
         }
     } else {
         let w0 = if plen >= 4 {
-            crate::contract::endian::ld32(&packet.payload[0..])
+            crate::protocol::endian::ld32(&packet.payload[0..])
         } else {
             0
         };
         let w1 = if plen >= 8 {
-            crate::contract::endian::ld32(&packet.payload[4..])
+            crate::protocol::endian::ld32(&packet.payload[4..])
         } else {
             0
         };
@@ -4731,9 +4731,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
 
     // Every packet below stamps `stamp_index`, which was read once above, so the
     // whole drain owes one slot one value. See [`PendingStamp`] for why that is
-    // collapsed rather than written per packet, and `env::STAMP_COALESCE` for
+    // collapsed rather than written per packet, and `config::STAMP_COALESCE` for
     // the switch that restores the per-packet arm.
-    let coalesce = crate::env::switch(crate::env::STAMP_COALESCE) != crate::env::Switch::Off;
+    let coalesce =
+        crate::config::switch(crate::config::STAMP_COALESCE) != crate::config::Switch::Off;
     let mut pending = PendingStamp::default();
     // The slot the latch is about, resolved the same way `write_stamp` resolves
     // it, so a wait naming that slot is compared against the same index the

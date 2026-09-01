@@ -6,8 +6,8 @@
 //! quarter of the file that was hardest to find.
 
 use super::*;
-use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::model::{DeviceId, PAGE_SHIFT_X86};
+use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::runtime::host::FakeHost;
 
 #[test]

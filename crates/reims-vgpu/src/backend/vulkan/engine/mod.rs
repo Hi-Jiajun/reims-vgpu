@@ -473,8 +473,8 @@ const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
 /// `TexelLayout::is_render_target_layout` and
 /// `TexelLayout::needs_sampled_filter_query` for the two sets.
 const CAP_RENDER_TARGET_COUNT: u32 =
-    crate::contract::pixel_format::TexelLayout::RENDER_TARGET_COUNT as u32;
-const CAP_FILTER_COUNT: u32 = crate::contract::pixel_format::TexelLayout::FILTER_COUNT as u32;
+    crate::protocol::pixel_format::TexelLayout::RENDER_TARGET_COUNT as u32;
+const CAP_FILTER_COUNT: u32 = crate::protocol::pixel_format::TexelLayout::FILTER_COUNT as u32;
 const CAP_GPU_ONLY_BIT: u32 = CAP_LAYOUT_SHIFT + CAP_RENDER_TARGET_COUNT;
 const CAP_SAMPLED_FILTER_SHIFT: u32 = CAP_GPU_ONLY_BIT + 1;
 const CAP_PUBLISHED_BIT: u32 = CAP_SAMPLED_FILTER_SHIFT + CAP_FILTER_COUNT;
@@ -505,7 +505,7 @@ impl DeviceCapabilitySnapshot {
         // indexed by `TexelLayout::index()` over the whole vocabulary and each
         // mask by its own index over its own part of it, so enumerating the
         // array would put a layout's answer in another layout's bit.
-        for layout in crate::contract::pixel_format::TexelLayout::ALL {
+        for layout in crate::protocol::pixel_format::TexelLayout::ALL {
             if let Some(bit) = layout.render_target_index() {
                 if features.color_attachment[layout.index()] {
                     word |= 1_u64 << (CAP_LAYOUT_SHIFT + bit as u32);
@@ -533,7 +533,7 @@ impl DeviceCapabilitySnapshot {
 
     fn render_target_layout_supported(
         self,
-        layout: crate::contract::pixel_format::TexelLayout,
+        layout: crate::protocol::pixel_format::TexelLayout,
     ) -> bool {
         let Some(bit) = layout.render_target_index() else {
             // A layout this device does not render into at all.
@@ -564,7 +564,7 @@ impl DeviceCapabilitySnapshot {
 
     fn sampled_layout_linear_filter_if_published(
         self,
-        layout: crate::contract::pixel_format::TexelLayout,
+        layout: crate::protocol::pixel_format::TexelLayout,
     ) -> Option<bool> {
         if self.0 & (1_u64 << CAP_PUBLISHED_BIT) == 0 {
             return None;
@@ -614,7 +614,7 @@ fn clear_device_capabilities() {
 #[cfg(test)]
 mod device_capability_snapshot_tests {
     use super::*;
-    use crate::contract::pixel_format::TexelLayout;
+    use crate::protocol::pixel_format::TexelLayout;
 
     #[test]
     fn the_no_device_snapshot_is_the_conservative_contract() {
@@ -2239,8 +2239,8 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
 /// answers `false`, which narrows to the format the target would have had
 /// anyway — an override or an unresolved device may never widen what the
 /// device does.
-pub fn render_target_layout_supported(layout: crate::contract::pixel_format::TexelLayout) -> bool {
-    use crate::contract::pixel_format::TexelLayout;
+pub fn render_target_layout_supported(layout: crate::protocol::pixel_format::TexelLayout) -> bool {
+    use crate::protocol::pixel_format::TexelLayout;
     if matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8) {
         return true;
     }
@@ -2505,7 +2505,7 @@ pub fn supports_storage_image_write_without_format() -> bool {
 /// mandated for the integer layouts this device names, so the bind is
 /// admissible without a query and the filter mask is not this layout's
 /// question.
-pub fn supports_sampled_layout_bind(layout: crate::contract::pixel_format::TexelLayout) -> bool {
+pub fn supports_sampled_layout_bind(layout: crate::protocol::pixel_format::TexelLayout) -> bool {
     if layout.is_integer() {
         return true;
     }
@@ -2525,7 +2525,7 @@ pub fn supports_sampled_layout_bind(layout: crate::contract::pixel_format::Texel
 /// Returns `false` — declining the rail, leaving the sample fail-visible — if
 /// the engine cannot initialize.
 pub fn supports_sampled_layout_linear_filter(
-    layout: crate::contract::pixel_format::TexelLayout,
+    layout: crate::protocol::pixel_format::TexelLayout,
 ) -> bool {
     if let Some(supported) = device_capabilities().sampled_layout_linear_filter_if_published(layout)
     {
@@ -3081,7 +3081,7 @@ pub struct TargetReadback {
     pub texel: ReadbackTexel,
 }
 
-use crate::contract::pixel_format::TexelLayout;
+use crate::protocol::pixel_format::TexelLayout;
 
 /// What one texel of a frame this engine hands out is.
 ///
@@ -3970,7 +3970,7 @@ enum ScatterForm {
     ///
     /// The only form on a host without the guest-RAM import, the form for a run
     /// the dispatch cannot express, and the A/B baseline. See
-    /// [`crate::env::COMPUTE_SCATTER`].
+    /// [`crate::config::COMPUTE_SCATTER`].
     Regions(Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>),
     /// One compute dispatch per destination buffer, over a run table.
     ///
@@ -4033,8 +4033,8 @@ fn scatter_split_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
-            crate::env::read(crate::env::SCATTER_SPLIT).0,
-            crate::env::Switch::On
+            crate::config::read(crate::config::SCATTER_SPLIT).0,
+            crate::config::Switch::On
         )
     })
 }
@@ -4108,13 +4108,13 @@ unsafe fn plan_guest_linear_copies(
     Ok(grouped)
 }
 
-/// Whether the compute scatter is on. See [`crate::env::COMPUTE_SCATTER`].
+/// Whether the compute scatter is on. See [`crate::config::COMPUTE_SCATTER`].
 fn compute_scatter_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            crate::env::read(crate::env::COMPUTE_SCATTER).0,
-            crate::env::Switch::Off
+            crate::config::read(crate::config::COMPUTE_SCATTER).0,
+            crate::config::Switch::Off
         )
     })
 }
@@ -4846,7 +4846,7 @@ fn readback_vk_format(layout: TexelLayout) -> ash::vk::Format {
 /// through [`TargetReadback::into_rgba8`].
 fn narrow_readback_to_rgba8(
     out: Vec<u8>,
-    layout: crate::contract::pixel_format::TexelLayout,
+    layout: crate::protocol::pixel_format::TexelLayout,
     _format: ash::vk::Format,
     pixels: u64,
     bgra: bool,
@@ -4856,7 +4856,7 @@ fn narrow_readback_to_rgba8(
     }
     let count = u32::try_from(pixels).unwrap_or(u32::MAX);
     let mut narrowed = vec![0u8; (pixels * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize];
-    if !crate::contract::pixel_format::narrow_texel_to_rgba8(layout, &out, count, &mut narrowed) {
+    if !crate::protocol::pixel_format::narrow_texel_to_rgba8(layout, &out, count, &mut narrowed) {
         return Ok((out, ReadbackTexel::Native(layout)));
     }
     // Visible, because it is a fidelity loss and not just a slow path: the
@@ -5054,7 +5054,7 @@ mod resident_read_order_tests {
     /// two spellings of one declaration behave differently.
     #[test]
     fn a_copied_store_lands_the_bytes_the_gpu_direct_store_would_have() {
-        use crate::contract::pixel_format as pf;
+        use crate::protocol::pixel_format as pf;
         const PIXELS: u32 = 3;
         // Deliberately asymmetric per channel, so an exchange of any two of them
         // is visible and an all-grey frame cannot pass.
@@ -5153,7 +5153,7 @@ fn readback_snapshot(
 ) -> Result<
     (
         ResidentReadSnapshot,
-        crate::contract::pixel_format::TexelLayout,
+        crate::protocol::pixel_format::TexelLayout,
     ),
     DrawError,
 > {
@@ -6081,7 +6081,7 @@ mod guest_page_target_tests {
 #[cfg(test)]
 mod readback_width_tests {
     use super::*;
-    use crate::contract::pixel_format::TexelLayout;
+    use crate::protocol::pixel_format::TexelLayout;
 
     /// The slot a readback is taken into and the narrowing that consumes it must
     /// derive their texel width from the same place.
@@ -6141,7 +6141,7 @@ mod readback_width_tests {
                     assert_eq!(pixels.len(), sized, "{layout:?}: native keeps its width");
                     let mut dst = vec![0u8; (PIXELS * 4) as usize];
                     assert!(
-                        !crate::contract::pixel_format::narrow_texel_to_rgba8(
+                        !crate::protocol::pixel_format::narrow_texel_to_rgba8(
                             layout,
                             &vec![0u8; sized * 8],
                             PIXELS as u32,

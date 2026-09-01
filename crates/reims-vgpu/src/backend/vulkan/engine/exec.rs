@@ -265,7 +265,7 @@ struct GatherDispatch {
 /// headroom that did not exist when it was measured.
 ///
 /// `off` restores the ~13 `VkBufferCopy` regions per gathered window. See
-/// [`crate::env::COMPUTE_GATHER`] for both sets of boots and for why the earlier
+/// [`crate::config::COMPUTE_GATHER`] for both sets of boots and for why the earlier
 /// rejection was right at the time.
 /// Whether the layout-churn probe is on. **Default off**, and never anything but
 /// a probe: it adds two image barriers per draw and removes nothing.
@@ -277,8 +277,8 @@ fn layout_churn_probe_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
-            crate::env::read(crate::env::LAYOUT_CHURN).0,
-            crate::env::Switch::On
+            crate::config::read(crate::config::LAYOUT_CHURN).0,
+            crate::config::Switch::On
         )
     })
 }
@@ -287,15 +287,15 @@ fn layout_churn_probe_enabled() -> bool {
 /// probe: it adds one empty render pass instance per loading draw and removes
 /// nothing.
 ///
-/// See its one call site for what it prices, and [`crate::env::PASS_CHURN`] for
+/// See its one call site for what it prices, and [`crate::config::PASS_CHURN`] for
 /// why the question is not otherwise answerable without building the merge it is
 /// pricing.
 fn pass_churn_probe_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
-            crate::env::read(crate::env::PASS_CHURN).0,
-            crate::env::Switch::On
+            crate::config::read(crate::config::PASS_CHURN).0,
+            crate::config::Switch::On
         )
     })
 }
@@ -304,8 +304,8 @@ fn compute_gather_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            crate::env::read(crate::env::COMPUTE_GATHER).0,
-            crate::env::Switch::Off
+            crate::config::read(crate::config::COMPUTE_GATHER).0,
+            crate::config::Switch::Off
         )
     })
 }
@@ -1515,17 +1515,17 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // third factor that overflows. A refusal rather than a clamp, because
         // this length is what the next line compares the buffer against and a
         // wrapped one would let a short buffer match.
-        let Some(expected) = crate::contract::extent::tight_image_bytes(
+        let Some(expected) = reims_vgpu_protocol::extent::tight_image_bytes(
             req.width,
             req.height,
-            crate::contract::pixel_format::RGBA8_BPP as usize,
+            crate::protocol::pixel_format::RGBA8_BPP as usize,
         ) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::UnrepresentableImageBytes {
                     width: req.width,
                     height: req.height,
                     layers: 1,
-                    bytes_per_texel: crate::contract::pixel_format::RGBA8_BPP,
+                    bytes_per_texel: crate::protocol::pixel_format::RGBA8_BPP,
                 },
             ));
         };
@@ -1699,8 +1699,8 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // zero — that is the spelling Metal requires, the decoder deliberately
         // preserves it, and this binding's divisor is 0 whatever the rate says.
         // Asking `rate == 0` alone declined that guest's draw outright, for a
-        // field nothing downstream reads. `contract::vertex_step` owns the pair.
-        if !crate::contract::vertex_step::step_rate_in_contract(
+        // field nothing downstream reads. `protocol::vertex_step` owns the pair.
+        if !crate::protocol::vertex_step::step_rate_in_contract(
             attribute.step_function.mtl_ordinal(),
             attribute.step_rate,
         ) {
@@ -1890,8 +1890,8 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         };
         // Four factors, so the widening the operands already carry is not
         // enough — see the target-seed check above for why two of them exhaust
-        // a u64 on their own. `contract::extent` owns the checked form.
-        let Some(expected) = crate::contract::extent::tight_layered_block_bytes(
+        // a u64 on their own. `protocol::extent` owns the checked form.
+        let Some(expected) = reims_vgpu_protocol::extent::tight_layered_block_bytes(
             image.width,
             image.height,
             image.layers,
@@ -2211,7 +2211,7 @@ struct JoinTerms {
     /// which is why this rung shared its condition with `is_mrt` and
     /// `color_input`, the other two terms of `ordinary_ad_hoc_framebuffer`.
     /// Both paths now dispose through [`dispose_ad_hoc_attachments`], so the
-    /// term is only what [`crate::env::BATCH_DEPTH`] restores for an A/B.
+    /// term is only what [`crate::config::BATCH_DEPTH`] restores for an A/B.
     depth_barred: bool,
     reads_back: bool,
     has_query: bool,
@@ -2223,7 +2223,7 @@ struct JoinTerms {
     target_switch: bool,
 }
 
-/// Whether [`crate::env::BATCH_MIXED_TARGETS`] is switched off, read once per
+/// Whether [`crate::config::BATCH_MIXED_TARGETS`] is switched off, read once per
 /// process.
 ///
 /// Latched for the same reason [`crate::runtime::spirv_bind`]'s extent switch
@@ -2235,28 +2235,28 @@ fn batch_mixed_targets_disabled() -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::BATCH_MIXED_TARGETS);
+        let (state, value) = crate::config::read(crate::config::BATCH_MIXED_TARGETS);
         match state {
-            crate::env::Switch::Off => {
+            crate::config::Switch::Off => {
                 crate::observe::off("batch_mixed reason=batch_mixed_targets_disabled_by_env");
                 true
             }
             // An unrecognized spelling is named rather than silently read as the
             // default. It still takes the default arm: this switch may only turn
             // a rail off, and a value nobody can parse is not that.
-            crate::env::Switch::Unrecognized => {
+            crate::config::Switch::Unrecognized => {
                 crate::observe::fail(format!(
                     "batch_mixed reason=batch_mixed_targets_env_unrecognized value={}",
                     value.unwrap_or_default()
                 ));
                 false
             }
-            crate::env::Switch::On | crate::env::Switch::Unset => false,
+            crate::config::Switch::On | crate::config::Switch::Unset => false,
         }
     })
 }
 
-/// Whether [`crate::env::BATCH_DEPTH`] is switched off, read once per process.
+/// Whether [`crate::config::BATCH_DEPTH`] is switched off, read once per process.
 ///
 /// Latched for the same reason [`batch_mixed_targets_disabled`] is: this sits on
 /// the per-draw path and `std::env::var_os` is a lock and an allocation.
@@ -2264,23 +2264,23 @@ fn batch_depth_disabled() -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::BATCH_DEPTH);
+        let (state, value) = crate::config::read(crate::config::BATCH_DEPTH);
         match state {
-            crate::env::Switch::Off => {
+            crate::config::Switch::Off => {
                 crate::observe::off("batch_depth reason=batch_depth_disabled_by_env");
                 true
             }
             // Named rather than silently read as the default. It still takes the
             // default arm: this switch may only turn a rail off, and a value
             // nobody can parse is not that.
-            crate::env::Switch::Unrecognized => {
+            crate::config::Switch::Unrecognized => {
                 crate::observe::fail(format!(
                     "batch_depth reason=batch_depth_env_unrecognized value={}",
                     value.unwrap_or_default()
                 ));
                 false
             }
-            crate::env::Switch::On | crate::env::Switch::Unset => false,
+            crate::config::Switch::On | crate::config::Switch::Unset => false,
         }
     })
 }
@@ -3425,7 +3425,7 @@ pub(crate) unsafe fn execute_draw_inner(
         };
         let pixels = req.width.saturating_mul(req.height);
         let mut wide = vec![0u8; (pixels as usize) * (layout.bytes_per_texel() as usize)];
-        if !crate::contract::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
+        if !crate::protocol::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
             return Err(DrawError::DrawExecution(
                 DrawExecutionDecline::SeedFormatUnwritable {
                     format: color0_format,
@@ -5321,7 +5321,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // says 82 % of draws could share one instance once the guest gathers
         // recorded between them are hoisted; hoisting needs a second command
         // buffer per batch, and this says what that work would be worth before
-        // any of it is built. See [`crate::env::PASS_CHURN`].
+        // any of it is built. See [`crate::config::PASS_CHURN`].
         //
         // Pixel-neutral, which is what makes it a control rather than a change:
         // `LOAD`/`STORE` preserves the attachment and no draw is recorded inside
@@ -6997,7 +6997,7 @@ mod tests {
                 ),
                 byte_origin: Default::default(),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
-                    crate::contract::pixel_format::TexelLayout::Bgra8,
+                    crate::protocol::pixel_format::TexelLayout::Bgra8,
                 ),
                 identity: None,
                 swizzle: Default::default(),
@@ -7434,7 +7434,7 @@ mod tests {
     /// `1`.
     #[test]
     fn integer_attachment_clears_use_integer_union_members() {
-        use crate::contract::pixel_format::MTL_FORMAT_RG16_UINT;
+        use crate::protocol::pixel_format::MTL_FORMAT_RG16_UINT;
 
         let attachment =
             crate::backend::vulkan::translate::pixel::color_attachment(MTL_FORMAT_RG16_UINT)

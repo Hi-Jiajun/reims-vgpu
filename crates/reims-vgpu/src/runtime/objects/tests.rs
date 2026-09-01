@@ -1,10 +1,10 @@
 use reims_vgpu_wire::device_desc::BackingBuilder;
 
 use super::*;
-use crate::contract::endian::{ld32, st16, st32, st64};
-use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-use crate::contract::iosurface_pages::DEVICE_DESC_PLANE_COUNT;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::protocol::endian::{ld32, st16, st32, st64};
+use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+use crate::protocol::iosurface_pages::DEVICE_DESC_PLANE_COUNT;
 use crate::runtime::decode::resource::SERIALIZER_OBJECT_SAMPLER;
 use crate::runtime::host::FakeHost;
 
@@ -472,7 +472,7 @@ fn decode_backing_plane0() {
     assert!(!backing_is_multiplanar(&s));
     assert_eq!(
         iosurface_pixel_format_to_mtl(s.pixel_format),
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
     );
 }
 
@@ -492,7 +492,7 @@ fn decode_backing_plane0() {
 /// wearing a colour name.
 #[test]
 fn an_l10r_surface_resolves_as_a_packed_ten_bit_colour_attachment() {
-    use crate::contract::pixel_format as pf;
+    use crate::protocol::pixel_format as pf;
 
     const FOURCC_L10R: u32 = 0x6c31_3072;
     let built =
@@ -564,7 +564,7 @@ fn a_small_value_is_not_read_as_an_mtl_ordinal() {
     // on, not a narrowing of what the converter accepts.
     assert_eq!(
         iosurface_pixel_format_to_mtl(0x4247_5241),
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM
     );
 }
 
@@ -609,7 +609,7 @@ fn decode_backing_biplanar_420f_planes() {
     );
     let dev = synthesize_device_desc_from_backing(&s);
     assert_eq!(dev[DEVICE_DESC_PLANE_COUNT], 2);
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::iosurface_pages::{
         decode_device_surface, mapping_span_bound, sample_window_from_device_desc,
         DEVICE_DESC_PIXEL_FORMAT,
     };
@@ -624,7 +624,7 @@ fn decode_backing_biplanar_420f_planes() {
     let y = sample_window_from_device_desc(
         Some(&dev),
         None,
-        crate::contract::pixel_format::MTL_FORMAT_R8_UNORM,
+        crate::protocol::pixel_format::MTL_FORMAT_R8_UNORM,
         1024,
         1024,
     )
@@ -635,7 +635,7 @@ fn decode_backing_biplanar_420f_planes() {
     let uv = sample_window_from_device_desc(
         Some(&dev),
         None,
-        crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM,
+        crate::protocol::pixel_format::MTL_FORMAT_RG8_UNORM,
         512,
         512,
     )
@@ -647,14 +647,14 @@ fn decode_backing_biplanar_420f_planes() {
     assert!(sample_window_from_device_desc(
         Some(&dev),
         None,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
         1024,
         1024,
     )
     .is_none());
     assert!(mapping_span_bound(
         Some(&dev),
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
         1024,
         1024,
     )
@@ -1728,7 +1728,7 @@ fn decode_ref_texture_view_fail_closed() {
 /// for every read window built over it.
 #[test]
 fn a_latched_backing_is_stale_when_any_of_geometry_or_format_moved() {
-    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
+    use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
     let surf = |w: u32, h: u32, fourcc: u32| BackingRecord {
         length: 0x1000,
         backing_pfn: 1,
@@ -1821,8 +1821,8 @@ fn a_multiplane_backing_compares_equal_to_the_zero_it_latched() {
 /// `sample_window_from_device_plane` treats a plane's.
 #[test]
 fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
-    use crate::contract::iosurface_pages::{decode_device_surface, sample_window_from_device_desc};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::iosurface_pages::{decode_device_surface, sample_window_from_device_desc};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     const BASE: u32 = 0x800;
     let (w, h, bpr) = (8u32, 4u32, 32u32);
     let mut surf = BackingRecord {
@@ -1884,7 +1884,7 @@ fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
 /// with a format that refuses every sample window and every render target.
 #[test]
 fn the_device_descriptor_format_word_survives_both_of_its_encodings() {
-    use crate::contract::pixel_format::{
+    use crate::protocol::pixel_format::{
         bytes_per_pixel, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
     };
 

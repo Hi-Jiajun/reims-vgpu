@@ -6,8 +6,8 @@
 //! harder half to find.
 
 use super::*;
-use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::runtime::host::FakeHost;
 
 /// `mapping_geom_window` puts each measurement in the field of its own name.
@@ -24,7 +24,7 @@ use crate::runtime::host::FakeHost;
 /// field holds what.
 #[test]
 fn the_surface_window_names_which_measurement_is_which() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mid = 30u32;
     state.map_surface(mid);
@@ -798,8 +798,8 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
 /// than zeroes so "refused" and "wrote zeroes" cannot be confused.
 #[test]
 fn a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone() {
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{BackingWalk, PAGE_SHIFT_X86};
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 
     let page = 1u64 << PAGE_SHIFT_X86;
     let mut host = FakeHost::new();
@@ -1573,13 +1573,13 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
 /// the wire meant for alpha, silently.
 #[test]
 fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
-    use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::iosurface_pages::{
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT, DEVICE_PLANE_BPE,
         DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET,
         DEVICE_PLANE_SIZE,
     };
-    use crate::contract::pixel_format::MTL_FORMAT_R8_UNORM;
+    use crate::protocol::pixel_format::MTL_FORMAT_R8_UNORM;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.map_surface(8);
@@ -1594,7 +1594,7 @@ fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
     );
 
     // Publish a v0a8-shaped descriptor: planes 0 and 2 are both R8 4x2.
-    let mut desc = vec![0u8; crate::contract::iosurface_pages::DEVICE_DESC_LEN];
+    let mut desc = vec![0u8; crate::protocol::iosurface_pages::DEVICE_DESC_LEN];
     st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x2000);
     desc[DEVICE_DESC_PLANE_COUNT] = 3;
     let pack = |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);
@@ -2223,10 +2223,10 @@ fn a_bgra8_native_row_is_the_host_cache_row() {
     }
     for format in [
         MTL_FORMAT_BGRA8_UNORM,
-        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
     ] {
         let mut native = vec![0u8; (W * 4) as usize];
-        let rail = crate::contract::pixel_format::Rgba8ToRow::for_format(format)
+        let rail = crate::protocol::pixel_format::Rgba8ToRow::for_format(format)
             .expect("both BGRA8 spellings have a store arm");
         assert!(rail.convert(&rgba, W, &mut native));
         assert_eq!(
@@ -2234,7 +2234,7 @@ fn a_bgra8_native_row_is_the_host_cache_row() {
             "format {format:#x} takes the shortcut, so its native row must be the cache row"
         );
         assert_eq!(
-            crate::contract::pixel_format::tight_row_bytes(W, format),
+            crate::protocol::pixel_format::tight_row_bytes(W, format),
             Some(W * 4),
             "the shortcut also requires the tight row to be the whole of the cache row"
         );

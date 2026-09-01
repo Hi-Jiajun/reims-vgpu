@@ -78,7 +78,7 @@ pub struct BindPhaseWindow {
     ///
     /// With the rail on this is the stage-in exclusion refusing a substitution,
     /// which is expected rather than an error. With
-    /// [`crate::env::UNUSED_BINDS`] off it equals [`Self::access_unused`], which
+    /// [`crate::config::UNUSED_BINDS`] off it equals [`Self::access_unused`], which
     /// is how the off arm is confirmed to have taken.
     pub access_unused_staged: u64,
     /// Binds served the neutral page instead of the guest's bytes.

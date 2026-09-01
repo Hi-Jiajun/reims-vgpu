@@ -4,8 +4,8 @@
 //! this have: colocated, these 1,266 lines were 53% of `scanout.rs`.
 
 use super::*;
-use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::runtime::host::{FakeHost, HostActionKind};
 
 const ALL_CAPTURE: &[CaptureDecline] = &[
@@ -416,8 +416,8 @@ fn post_display_swap_writeback_does_not_rename_present_mapping() {
 /// failing not_contig (live boot class: fullscreen present surfaces).
 #[test]
 fn paint_mapping_fragmented_pages_multi_import() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::PAGE_SHIFT_X86;
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::mapping_write::write_bgra8;
 
     let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);

@@ -472,7 +472,7 @@ mod tests {
             // This tree carries the block grid the v6 branch predates. Bgra8 is a
             // 1x1 grid, so it agrees with `bpp` and the whole-plane licence under
             // test is unaffected by it.
-            block: crate::contract::pixel_format::block_geometry(MTL_FORMAT_BGRA8_UNORM)
+            block: crate::protocol::pixel_format::block_geometry(MTL_FORMAT_BGRA8_UNORM)
                 .expect("bgra8 has a grid"),
             pixel_format: MTL_FORMAT_BGRA8_UNORM,
         };

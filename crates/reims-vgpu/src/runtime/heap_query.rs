@@ -4,7 +4,7 @@
 //! Apple host routine reconstructs an `MTLTextureDescriptor` and returns the
 //! device's `MTLSizeAndAlign` as two little-endian `u64`s.
 
-use crate::contract::endian::{ld32, ld64, st64};
+use crate::protocol::endian::{ld32, ld64, st64};
 use reims_vgpu_wire::ops::texture as wire;
 
 pub const REQUEST_HEADER_LEN: usize = 24;
@@ -48,7 +48,7 @@ pub struct TextureDescriptor {
     pub protection_options: u64,
     /// `MTLTextureSwizzleChannels` as four raw `MTLTextureSwizzle` ordinals in
     /// red, green, blue, alpha order — the same encoding the texture-view swizzle
-    /// view carries, so [`crate::contract::pixel_format::swizzle_plan`] reads
+    /// view carries, so [`crate::protocol::pixel_format::swizzle_plan`] reads
     /// both.
     ///
     /// `None` on the narrow body, which has no such field at all. That is not

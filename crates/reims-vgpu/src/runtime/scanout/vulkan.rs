@@ -51,7 +51,7 @@ pub fn published_frame_rgba8(
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
-    use crate::contract::pixel_format::RGBA8_BPP;
+    use crate::protocol::pixel_format::RGBA8_BPP;
     let need = (width as usize)
         .checked_mul(RGBA8_BPP as usize)?
         .checked_mul(height as usize)?;
