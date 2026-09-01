@@ -209,6 +209,54 @@ fn mixed(seed: u64, count: u64) -> Vec<ExecTransaction> {
     batch
 }
 
+/// A batch whose accesses came from Apple's record shapes rather than from this
+/// file.
+///
+/// Every workload above states its accesses with [`ExecBuilder::declare_access`]
+/// — which is the right way to reach an access shape the registry would not
+/// produce, and the wrong way to answer "does the batch a guest actually sends
+/// still schedule the same". This one answers that: bytes go through
+/// [`crate::walk::exec`], each record states its own participation, and the
+/// hazard graph is built from whatever comes out. Nothing here names an access.
+///
+/// The refs interleave on purpose. Transaction `n` touches ref `n % 3` and ref
+/// `n % 2`, so the batch is neither a chain nor independent: some pairs
+/// conflict and some do not, which is the shape a schedule can reorder without
+/// being free to reorder everything.
+///
+/// One domain. Two channels writing memory they share is
+/// [`Ineligible::UnorderedVersionRace`], and what this workload adds is the
+/// records rather than the domain split the ones above already cover.
+fn from_records(count: u64) -> Vec<ExecTransaction> {
+    const TASK: crate::identity::TaskId = crate::identity::TaskId(1);
+    const SLOTS: &[u32] = &[1, 2, 3, 10, 11];
+    // One registry for the whole batch, which is the point: content versions
+    // are the session's, so transaction `n`'s write reserves the version after
+    // whatever `n - 1` reserved. A registry per transaction would hand every
+    // one of them version 1 and leave the trace with nothing to disagree about.
+    let mut model = crate::testing::registry(TASK, SLOTS);
+    (1..=count)
+        .map(|n| {
+            let bytes = crate::testing::blit_stream(&[
+                u32::try_from(n % 3).expect("small") + 1,
+                u32::try_from(n % 2).expect("small") + 10,
+            ]);
+            let mut tx = crate::walk::exec(
+                &bytes,
+                &crate::testing::Everything,
+                &mut model.task_access(TASK, ChannelId(1)),
+                builder(1, n),
+            )
+            .expect("a stream of records the ledger has judged");
+            tx.publication.stamp = Some(CompletionStamp {
+                slot: StampSlot(1),
+                value: StampValue(u32::try_from(n).expect("small")),
+            });
+            tx
+        })
+        .collect()
+}
+
 // ------------------------------------------------------------- the sweep
 
 /// The sweep is only meaningful if the seeds actually reach different
@@ -290,6 +338,75 @@ fn every_permitted_schedule_means_what_the_serial_one_meant() {
         reordered >= 20,
         "only {reordered} of 24 workloads were reordered at all; a sweep over \
          schedules that are all the same schedule proves nothing"
+    );
+}
+
+/// Seam 2's exit, over a batch built from command-stream bytes.
+///
+/// The sweep above proves the property over access sets this file states. This
+/// one proves it over access sets the *records* state: the same batch a guest
+/// would send, walked into transactions by the same path production will use,
+/// with every hazard edge derived from a participation rather than declared.
+///
+/// A schedule that reordered these would be the first evidence that the
+/// derivation and the declaration disagree about what a record touches — and
+/// the declaration is the one with a test, which is exactly why it cannot be
+/// the only input.
+#[test]
+fn a_batch_built_from_records_schedules_the_way_a_declared_one_does() {
+    let batch = from_records(12);
+    eligible(&batch).expect("one domain, judged records");
+    // The point of the workload: every transaction's accesses came from its
+    // records, and there are some.
+    assert!(
+        batch.iter().all(|tx| !tx.accesses.is_empty()),
+        "a record named a resource and the transaction carries no access for it"
+    );
+    assert!(
+        batch.iter().all(|tx| tx.record_count() == 2),
+        "the walk lost a record"
+    );
+    // And the registry gave them versions, which is what puts anything in the
+    // trace for two orders to disagree about. A source that returned none would
+    // leave a trace of stamps alone, and stamps publish in channel order under
+    // every schedule — so the sweep would pass without testing the accesses.
+    assert!(
+        batch
+            .iter()
+            .any(|tx| tx.published_versions().next().is_some()),
+        "no transaction publishes a content version; the trace has nothing in \
+         it that a reordering could move"
+    );
+
+    let reference = serial(&batch);
+    let mut orders = std::collections::BTreeSet::new();
+    for seed in 0..32u64 {
+        let run = parallel(&batch, seed);
+        assert!(
+            run.stalled.is_empty(),
+            "seed {seed} stalled at {:?}",
+            run.stalled
+        );
+        assert_eq!(
+            run.order().len(),
+            batch.len(),
+            "seed {seed} left work unrun"
+        );
+        equivalent(&reference, &run).unwrap_or_else(|d| panic!("seed {seed} diverged: {d:?}"));
+        orders.insert(run.order());
+    }
+    // The derived hazard edges must order *something* and not everything: a
+    // batch that reached one order would prove the accesses were too coarse,
+    // and one that reached every order would prove they were absent.
+    assert!(
+        orders.len() > 1,
+        "the derived accesses admitted exactly one schedule, so the sweep \
+         proved nothing about them"
+    );
+    assert_eq!(
+        parallel_with(&batch, |_| 0).order(),
+        reference.order(),
+        "taking the lowest ready ordinal every time must reproduce ingress order"
     );
 }
 

@@ -125,3 +125,7 @@ pub mod submit;
 pub mod sync;
 pub mod transaction;
 pub mod walk;
+
+/// Command-stream bytes for the suites that want the model driven from them.
+#[cfg(test)]
+mod testing;

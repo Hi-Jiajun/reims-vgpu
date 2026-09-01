@@ -496,7 +496,17 @@ impl ExecBuilder {
         Ok(end)
     }
 
-    pub fn declare_access(&mut self, access: AccessIntent) {
+    /// State an access beside the records rather than deriving it from them.
+    ///
+    /// **Test-only, and the gate is the invariant.** A transaction whose
+    /// `accesses` disagree with its `streams` is representable the moment the
+    /// two can be supplied separately, and the disagreement is silent because
+    /// nothing downstream reads the records to check — which is why
+    /// [`Self::record`] derives them. What is left is a test that wants an
+    /// access shape the registry would not produce, and the `cfg` is what says
+    /// no production path may want the same thing.
+    #[cfg(test)]
+    pub(crate) fn declare_access(&mut self, access: AccessIntent) {
         self.accesses.push(access);
     }
 

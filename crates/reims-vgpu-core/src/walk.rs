@@ -230,58 +230,15 @@ mod tests {
     use super::*;
     use crate::access::StubRegistry;
     use crate::exec::ExecArenas;
-    use crate::identity::{
-        ChannelId, ChannelSequence, IngressOrdinal, ObjectListRef, ResourceId, SessionGeneration,
-        SlotGeneration,
-    };
+    use crate::identity::{ChannelId, ChannelSequence, IngressOrdinal, SessionGeneration};
+    use crate::testing::{generate_mipmaps, record, segment_bytes, segment_bytes_with, Everything};
     use reims_vgpu_protocol::segment::{
         SegmentKind, SegmentLifetime, SEGMENT_TYPE_PROTECTION_OPTIONS,
     };
-    use reims_vgpu_wire::ops::blit::OPCODE_GENERATE_MIPMAPS;
     use reims_vgpu_wire::ops::render::OPCODE_SET_LINE_WIDTH;
     use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
 
     const DOMAIN: ChannelId = ChannelId(3);
-
-    /// A resolver that answers every ref, because resolution is not what these
-    /// tests are about.
-    struct Everything;
-
-    impl RefResolver for Everything {
-        fn resource(&self, object_ref: u32) -> Option<ResourceId> {
-            Some(ResourceId {
-                slot: ObjectListRef(object_ref),
-                generation: SlotGeneration(1),
-            })
-        }
-    }
-
-    fn builder() -> ExecBuilder {
-        ExecBuilder::new(
-            SessionGeneration::FIRST,
-            DOMAIN,
-            ChannelSequence(1),
-            IngressOrdinal(1),
-        )
-    }
-
-    /// One record, framed the way the serializer frames one.
-    fn record(opcode: u32, payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let length = (OP_HEADER_LEN + payload.len()) as u32;
-        out.extend_from_slice(&opcode.to_le_bytes());
-        out.extend_from_slice(&length.to_le_bytes());
-        out.extend_from_slice(payload);
-        out
-    }
-
-    fn line_width(width: f32) -> Vec<u8> {
-        record(OPCODE_SET_LINE_WIDTH, &width.to_le_bytes())
-    }
-
-    fn generate_mipmaps(texture: u32) -> Vec<u8> {
-        record(OPCODE_GENERATE_MIPMAPS, &texture.to_le_bytes())
-    }
 
     /// The encoder outlives this segment.
     const HOLDS: SegmentLifetime = SegmentLifetime {
@@ -301,6 +258,19 @@ mod tests {
         continues_into_next: true,
     };
 
+    fn builder() -> ExecBuilder {
+        ExecBuilder::new(
+            SessionGeneration::FIRST,
+            DOMAIN,
+            ChannelSequence(1),
+            IngressOrdinal(1),
+        )
+    }
+
+    fn line_width(width: f32) -> Vec<u8> {
+        record(OPCODE_SET_LINE_WIDTH, &width.to_le_bytes())
+    }
+
     /// A compute-encoder scope barrier: a four-byte payload of which the
     /// serializer writes the first two.
     fn barrier() -> Vec<u8> {
@@ -309,32 +279,6 @@ mod tests {
             &[1, 0, 0xaa, 0xaa],
         )
     }
-
-    /// One segment, with the length `-endEncoding` fills in.
-    fn segment_bytes(wire_type: u8, records: &[Vec<u8>]) -> Vec<u8> {
-        segment_bytes_with(wire_type, SegmentLifetime::SELF_CONTAINED, records)
-    }
-
-    fn segment_bytes_with(
-        wire_type: u8,
-        lifetime: SegmentLifetime,
-        records: &[Vec<u8>],
-    ) -> Vec<u8> {
-        let body: usize = records.iter().map(Vec::len).sum();
-        let mut out = Vec::new();
-        out.extend_from_slice(&((SEGMENT_HEADER_LEN + body) as u32).to_le_bytes());
-        out.push(wire_type);
-        out.push(u8::from(lifetime.continues_previous));
-        out.push(u8::from(lifetime.continues_into_next));
-        // The byte the serializer never writes.
-        out.push(0xaa);
-        for r in records {
-            out.extend_from_slice(r);
-        }
-        out
-    }
-
-    const OP_HEADER_LEN: usize = reims_vgpu_protocol::decode::OP_HEADER_LEN;
 
     /// The whole path, from bytes to a transaction whose accesses came from the
     /// records that named them.
