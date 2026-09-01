@@ -41,11 +41,12 @@
 
 use crate::access::{AccessKey, ContentVersion};
 use crate::content::{ContentLedger, Replica};
-use crate::exec::{ExecTransaction, Prerequisite, ResolvedOperation};
+use crate::exec::{published_versions, Prerequisite, ResolvedOperation};
 use crate::identity::{
     CompletionStamp, IngressOrdinal, ResourceId, SessionGeneration, StampSlot, StampValue,
 };
 use crate::sync::{EventKind, FenceKind};
+use crate::transaction::DeviceTransaction;
 use std::collections::HashMap;
 
 /// Something a guest could observe.
@@ -217,7 +218,7 @@ impl Interpreter {
     /// the two halves are [`Self::complete`] and [`Self::publish`]; this is
     /// them back to back, which is what a schedule of one transaction at a
     /// time makes them.
-    pub fn run(&mut self, tx: &ExecTransaction) -> Outcome {
+    pub fn run(&mut self, tx: &DeviceTransaction) -> Outcome {
         match self.complete(tx) {
             Ok(owed) => {
                 if let Some(stamp) = owed {
@@ -241,27 +242,33 @@ impl Interpreter {
     ///
     /// The refusal, which is also appended to the trace: a guest that is
     /// refused observes the refusal.
-    pub fn complete(&mut self, tx: &ExecTransaction) -> Result<Option<CompletionStamp>, Refusal> {
-        if tx.session() != self.generation {
-            self.refuse(tx.ingress(), Refusal::StaleGeneration);
+    pub fn complete(&mut self, tx: &DeviceTransaction) -> Result<Option<CompletionStamp>, Refusal> {
+        if tx.identity.session != self.generation {
+            self.refuse(tx.identity.ingress, Refusal::StaleGeneration);
             return Err(Refusal::StaleGeneration);
         }
         if let Some(refusal) = self.unmet_prerequisite(tx) {
-            self.refuse(tx.ingress(), refusal);
+            self.refuse(tx.identity.ingress, refusal);
             return Err(refusal);
         }
 
         // The records run in order, and the ones with observable state are the
         // synchronisation records. Everything else contributes through the
         // transaction's accesses, which is where its memory effect lives.
-        for record in tx.records() {
-            self.apply_record(&record.op);
+        //
+        // Only an EXEC has records. The four other classes reach the trace
+        // through their accesses and their completion word alone, which is
+        // exactly what a guest can observe of them.
+        if let Some(exec) = tx.exec() {
+            for record in exec.records() {
+                self.apply_record(&record.op);
+            }
         }
 
         // The bytes land, and then the version that says they are current
         // becomes visible. Both come from the same list — the accesses — so a
         // version cannot be published for memory nothing wrote.
-        for published in tx.published_versions() {
+        for published in published_versions(tx.accesses()) {
             // The version the access reserved, not one this ledger mints: the
             // reservation happened when the transaction was planned, and a
             // completion that took a fresh number here would beat every writer
@@ -300,7 +307,7 @@ impl Interpreter {
             });
         }
         self.ran += 1;
-        Ok(tx.work.publication.stamp)
+        Ok(tx.completion)
     }
 
     /// Make a completion word readable, as ordered guest publication releases
@@ -331,13 +338,20 @@ impl Interpreter {
     }
 
     /// The first prerequisite this transaction cannot meet, if any.
-    fn unmet_prerequisite(&self, tx: &ExecTransaction) -> Option<Refusal> {
-        for prerequisite in tx.prerequisites() {
+    fn unmet_prerequisite(&self, tx: &DeviceTransaction) -> Option<Refusal> {
+        // The envelope's waits, which every class of packet carries.
+        for wait in &tx.stamp_waits {
+            let met = self
+                .stamps
+                .get(&wait.slot)
+                .is_some_and(|published| !wait.value.follows(*published));
+            if !met {
+                return Some(Refusal::UnmeetableWait);
+            }
+        }
+        let exec = tx.exec()?;
+        for prerequisite in exec.prerequisites() {
             let met = match *prerequisite {
-                Prerequisite::Stamp(wait) => self
-                    .stamps
-                    .get(&wait.slot)
-                    .is_some_and(|published| !wait.value.follows(*published)),
                 Prerequisite::Event { event, value } => self.event_generation(event) >= value,
                 // A fence is encoder-scoped and its producer is inside this
                 // packet or an earlier one; a serial run has already finished
@@ -443,6 +457,36 @@ mod tests {
         crate::testing::At::new(1, ingress)
     }
 
+    /// A packet that is not GPU work: a control command, with only the
+    /// envelope every transaction has.
+    fn control(ingress: u64) -> DeviceTransaction {
+        DeviceTransaction {
+            identity: crate::testing::identity(1, ingress),
+            stamp_waits: Vec::new(),
+            completion: None,
+            payload: crate::transaction::Payload::Control(crate::control::ControlOp::Inert {
+                kind: crate::control::ControlKind::Nop,
+            }),
+        }
+    }
+
+    /// A lifecycle packet that synchronises a resource: no records, and an
+    /// access that produces content the guest reads back.
+    fn synchronize(ingress: u64, accesses: Vec<AccessIntent>) -> DeviceTransaction {
+        DeviceTransaction {
+            identity: crate::testing::identity(1, ingress),
+            stamp_waits: Vec::new(),
+            completion: None,
+            payload: crate::transaction::Payload::ResourceLifecycle {
+                op: crate::lifecycle::LifecycleOp::Synchronize {
+                    task: crate::identity::TaskId(1),
+                    resources: vec![res(1)],
+                },
+                accesses,
+            },
+        }
+    }
+
     fn signal(event: ResourceId, value: u64) -> ResolvedOperation {
         ResolvedOperation::Event(EventOp {
             kind: EventKind::Signal,
@@ -481,10 +525,7 @@ mod tests {
                 slot: StampSlot(3),
                 value: StampValue(value),
             });
-            assert_eq!(
-                interp.run(&b.finish().expect("frozen").view()),
-                Outcome::Ran
-            );
+            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
         }
         assert_eq!(
             interp.trace(),
@@ -514,10 +555,7 @@ mod tests {
                 slot: StampSlot(3),
                 value: StampValue(value),
             });
-            assert_eq!(
-                interp.run(&b.finish().expect("frozen").view()),
-                Outcome::Ran
-            );
+            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
         }
         assert_eq!(interp.trace().len(), 4, "every step advanced");
         assert_eq!(interp.stamp(StampSlot(3)), Some(StampValue(1)));
@@ -540,7 +578,7 @@ mod tests {
         let tx = b.finish().expect("frozen");
 
         let mut interp = Interpreter::new();
-        assert_eq!(interp.run(&tx.view()), Outcome::Ran);
+        assert_eq!(interp.run(&tx), Outcome::Ran);
         assert_eq!(
             interp.trace(),
             &[
@@ -571,22 +609,22 @@ mod tests {
         let producer = producer.finish().expect("frozen");
 
         let mut waiter = builder(2);
-        waiter.require(Prerequisite::Stamp(StampWait {
+        waiter.wait_for(StampWait {
             slot: StampSlot(1),
             value: StampValue(5),
-        }));
+        });
         let waiter = waiter.finish().expect("frozen");
 
         let mut early = Interpreter::new();
         assert_eq!(
-            early.run(&waiter.view()),
+            early.run(&waiter),
             Outcome::Refused(Refusal::UnmeetableWait),
             "nothing has published slot 1"
         );
 
         let mut ordered = Interpreter::new();
-        assert_eq!(ordered.run(&producer.view()), Outcome::Ran);
-        assert_eq!(ordered.run(&waiter.view()), Outcome::Ran);
+        assert_eq!(ordered.run(&producer), Outcome::Ran);
+        assert_eq!(ordered.run(&waiter), Outcome::Ran);
         assert_eq!(ordered.census(), (2, 0));
     }
 
@@ -610,7 +648,7 @@ mod tests {
         let tx = b.finish().expect("frozen");
 
         let mut interp = Interpreter::new();
-        interp.run(&tx.view());
+        interp.run(&tx);
         assert_eq!(
             interp.trace(),
             &[
@@ -645,7 +683,7 @@ mod tests {
         let producer = producer.finish().expect("frozen");
 
         let mut interp = Interpreter::new();
-        interp.run(&producer.view());
+        interp.run(&producer);
 
         for (value, expected) in [(4u64, Outcome::Ran), (5, Outcome::Ran)] {
             let mut b = builder(2);
@@ -653,7 +691,7 @@ mod tests {
                 event: res(4),
                 value,
             });
-            assert_eq!(interp.run(&b.finish().expect("frozen").view()), expected);
+            assert_eq!(interp.run(&b.finish().expect("frozen")), expected);
         }
         let mut b = builder(3);
         b.require(Prerequisite::Event {
@@ -661,7 +699,7 @@ mod tests {
             value: 6,
         });
         assert_eq!(
-            interp.run(&b.finish().expect("frozen").view()),
+            interp.run(&b.finish().expect("frozen")),
             Outcome::Refused(Refusal::UnmeetableWait)
         );
     }
@@ -689,7 +727,7 @@ mod tests {
             },
             Replica::GuestPages,
         );
-        interp.run(&tx.view());
+        interp.run(&tx);
         assert!(interp.content.is_fresh(
             BackingId(9),
             ByteRange {
@@ -761,13 +799,13 @@ mod tests {
     #[test]
     fn a_refusal_is_part_of_the_trace() {
         let mut b = builder(1);
-        b.require(Prerequisite::Stamp(StampWait {
+        b.wait_for(StampWait {
             slot: StampSlot(1),
             value: StampValue(1),
-        }));
+        });
         let tx = b.finish().expect("frozen");
         let mut interp = Interpreter::new();
-        interp.run(&tx.view());
+        interp.run(&tx);
         assert_eq!(
             interp.trace(),
             &[Observation::Refused {
@@ -786,7 +824,7 @@ mod tests {
         let mut interp = Interpreter::new();
         interp.reset();
         assert_eq!(
-            interp.run(&tx.view()),
+            interp.run(&tx),
             Outcome::Refused(Refusal::StaleGeneration),
             "the transaction was built in the first generation"
         );
@@ -809,7 +847,7 @@ mod tests {
         });
         let tx = b.finish().expect("frozen");
         let mut interp = Interpreter::new();
-        interp.run(&tx.view());
+        interp.run(&tx);
         interp.reset();
         assert_eq!(interp.stamp(StampSlot(2)), Some(StampValue(4)));
         assert_ne!(interp.generation(), SessionGeneration::FIRST);
@@ -839,8 +877,8 @@ mod tests {
         let tx = make();
         let mut a = Interpreter::new();
         let mut b = Interpreter::new();
-        a.run(&tx.view());
-        b.run(&make().view());
+        a.run(&tx);
+        b.run(&make());
         assert_eq!(a.trace(), b.trace());
     }
 
@@ -882,10 +920,7 @@ mod tests {
             for (n, access) in order.into_iter().enumerate() {
                 let mut b = builder(n as u64 + 1);
                 b.declare_access(access);
-                assert_eq!(
-                    interp.run(&b.finish().expect("frozen").view()),
-                    Outcome::Ran
-                );
+                assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
             }
             assert!(
                 !interp
@@ -938,10 +973,7 @@ mod tests {
         for (n, access) in [newer, older].into_iter().enumerate() {
             let mut b = builder(n as u64 + 1);
             b.declare_access(access);
-            assert_eq!(
-                interp.run(&b.finish().expect("frozen").view()),
-                Outcome::Ran
-            );
+            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
         }
         assert_eq!(
             interp.trace(),
@@ -989,10 +1021,7 @@ mod tests {
         for (n, access) in [newer, straddling].into_iter().enumerate() {
             let mut b = builder(n as u64 + 1);
             b.declare_access(access);
-            assert_eq!(
-                interp.run(&b.finish().expect("frozen").view()),
-                Outcome::Ran
-            );
+            assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
         }
         assert_eq!(
             interp.trace()[1..],
@@ -1041,10 +1070,7 @@ mod tests {
             output_content_version: Some(ContentVersion(5)),
             ..write_access(9, 0, 0x100)
         });
-        assert_eq!(
-            interp.run(&b.finish().expect("frozen").view()),
-            Outcome::Ran
-        );
+        assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
 
         let content = interp.content_mut();
         assert!(content.is_fresh(BackingId(9), extent, Replica::DeviceOwned));
@@ -1067,13 +1093,108 @@ mod tests {
             output_content_version: Some(ContentVersion(2)),
             ..write_access(9, 0, 0x40)
         });
-        assert_eq!(
-            interp.run(&b.finish().expect("frozen").view()),
-            Outcome::Ran
-        );
+        assert_eq!(interp.run(&b.finish().expect("frozen")), Outcome::Ran);
         assert!(interp
             .trace()
             .iter()
             .any(|o| matches!(o, Observation::VersionBeaten { landed: 0, .. })));
+    }
+
+    /// A control command has no records and no accesses, and the guest can
+    /// still observe exactly one thing about it: its completion word. Before
+    /// the interpreter took the envelope it could not run one at all, so a
+    /// batch that mixed a `CmdNOP` into a schedule had a reference that
+    /// silently omitted it.
+    #[test]
+    fn a_packet_that_is_not_gpu_work_still_publishes_its_completion_word() {
+        let mut interp = Interpreter::new();
+        let mut nop = control(1);
+        nop.completion = Some(CompletionStamp {
+            slot: StampSlot(3),
+            value: StampValue(7),
+        });
+        assert_eq!(interp.run(&nop), Outcome::Ran);
+        assert_eq!(interp.stamp(StampSlot(3)), Some(StampValue(7)));
+        assert_eq!(
+            interp.trace(),
+            &[Observation::StampPublished {
+                slot: StampSlot(3),
+                value: StampValue(7),
+            }]
+        );
+    }
+
+    /// A stamp wait is the envelope's, so it holds every class of packet — not
+    /// just the one that also has records to state it in. A control command
+    /// that waits for a word nothing has published is refused, exactly as an
+    /// EXEC is.
+    #[test]
+    fn a_stamp_wait_holds_a_packet_that_carries_no_records() {
+        let mut interp = Interpreter::new();
+        let mut waiter = control(1);
+        waiter.stamp_waits.push(StampWait {
+            slot: StampSlot(4),
+            value: StampValue(2),
+        });
+        assert_eq!(
+            interp.run(&waiter),
+            Outcome::Refused(Refusal::UnmeetableWait)
+        );
+
+        // And it runs once the word is there.
+        let mut producer = control(2);
+        producer.completion = Some(CompletionStamp {
+            slot: StampSlot(4),
+            value: StampValue(2),
+        });
+        assert_eq!(interp.run(&producer), Outcome::Ran);
+        assert_eq!(interp.run(&waiter), Outcome::Ran);
+    }
+
+    /// Content versions come from the accesses, and the accesses are the
+    /// payload's whichever payload it is. A lifecycle synchronise writes bytes
+    /// the guest reads back; a reference that only published an EXEC's versions
+    /// would disagree with any device that honours one.
+    #[test]
+    fn a_lifecycle_transaction_publishes_the_versions_its_accesses_produce() {
+        let mut interp = Interpreter::new();
+        interp.content_mut().declare(
+            BackingId(9),
+            ByteRange {
+                offset: 0,
+                length: 256,
+            },
+            Replica::GuestPages,
+        );
+        let region = AccessKey::Range(
+            ResourceKey {
+                backing: BackingId(9),
+                heap: None,
+            },
+            ByteRange {
+                offset: 0,
+                length: 128,
+            },
+        );
+        let tx = synchronize(
+            1,
+            vec![AccessIntent {
+                domain: ChannelId(1),
+                key: region,
+                mode: AccessMode::Write,
+                api_stages: 0,
+                input_content_version: None,
+                output_content_version: Some(ContentVersion(4)),
+            }],
+        );
+        assert_eq!(interp.run(&tx), Outcome::Ran);
+        assert_eq!(
+            interp.trace(),
+            &[Observation::VersionPublished {
+                backing: BackingId(9),
+                region,
+                version: ContentVersion(4),
+            }]
+        );
     }
 }

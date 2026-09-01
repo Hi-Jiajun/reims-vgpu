@@ -9,12 +9,13 @@ use super::*;
 use crate::access::{AccessIntent, AccessKey, AccessMode, ByteRange, ResourceKey, StubRegistry};
 use crate::exec::{ExecBuilder, ResolvedOperation};
 use crate::identity::{
-    ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration, TransactionIdentity,
+    ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SlotGeneration, StampWait,
+    TransactionIdentity,
 };
 use crate::prereq::Diagnosis;
 use crate::stream::{SegmentKind, SegmentLifetime};
 use crate::sync::{EventKind, EventOp, FenceKind, FenceOp};
-use crate::testing::{views, Stamped};
+use crate::transaction::{DeviceTransaction, Payload, PayloadClass};
 
 fn res(slot: u32) -> ResourceId {
     ResourceId {
@@ -73,7 +74,7 @@ fn ranged(domain: u32, backing: u64, offset: u64) -> AccessIntent {
 
 /// A batch that is a straight hazard chain: every transaction writes the same
 /// backing, so the dependency graph totally orders them.
-fn chain(length: u64) -> Vec<Stamped> {
+fn chain(length: u64) -> Vec<DeviceTransaction> {
     (1..=length)
         .map(|n| {
             let mut b = builder(1, n);
@@ -89,7 +90,7 @@ fn chain(length: u64) -> Vec<Stamped> {
 
 /// A batch of transactions that touch nothing in common, so the dependency
 /// graph orders none of them.
-fn independent(count: u64) -> Vec<Stamped> {
+fn independent(count: u64) -> Vec<DeviceTransaction> {
     (1..=count)
         .map(|n| {
             let mut b = builder(1, n);
@@ -107,7 +108,7 @@ fn independent(count: u64) -> Vec<Stamped> {
 /// refuses to order accesses in different domains — which is correct, and
 /// which means a version reservation on a backing two domains write would have
 /// no legal order at all.
-fn mixed(seed: u64, count: u64) -> Vec<Stamped> {
+fn mixed(seed: u64, count: u64) -> Vec<DeviceTransaction> {
     const DOMAINS: u64 = 3;
     let mut rng = Rng::new(seed ^ 0xC0FF_EE00);
     let mut batch = Vec::new();
@@ -143,10 +144,10 @@ fn mixed(seed: u64, count: u64) -> Vec<Stamped> {
         if rng.next().is_multiple_of(4) {
             let owed = stamp[usize::try_from(domain).expect("small") - 1];
             if owed > 0 {
-                b.require(Prerequisite::Stamp(StampWait {
+                b.wait_for(StampWait {
                     slot: StampSlot(domain),
                     value: StampValue(owed),
-                }));
+                });
             }
         }
         // Records: an event signal, or a fence update on a blit encoder.
@@ -225,7 +226,7 @@ fn mixed(seed: u64, count: u64) -> Vec<Stamped> {
 /// One domain. Two channels writing memory they share is
 /// [`Ineligible::UnorderedVersionRace`], and what this workload adds is the
 /// records rather than the domain split the ones above already cover.
-fn from_records(count: u64) -> Vec<Stamped> {
+fn from_records(count: u64) -> Vec<DeviceTransaction> {
     const TASK: crate::identity::TaskId = crate::identity::TaskId(1);
     const SLOTS: &[u32] = &[1, 2, 3, 10, 11];
     // One registry for the whole batch, which is the point: content versions
@@ -239,20 +240,21 @@ fn from_records(count: u64) -> Vec<Stamped> {
                 u32::try_from(n % 3).expect("small") + 1,
                 u32::try_from(n % 2).expect("small") + 10,
             ]);
-            let mut work = crate::walk::exec(
+            let work = crate::walk::exec(
                 &bytes,
                 &crate::testing::Everything,
                 &mut model.task_access(TASK, ChannelId(1)),
                 crate::exec::ExecBuilder::new(),
             )
             .expect("a stream of records the ledger has judged");
-            work.publication.stamp = Some(CompletionStamp {
-                slot: StampSlot(1),
-                value: StampValue(u32::try_from(n).expect("small")),
-            });
-            Stamped {
-                work,
+            DeviceTransaction {
                 identity: crate::testing::identity(1, n),
+                stamp_waits: Vec::new(),
+                completion: Some(CompletionStamp {
+                    slot: StampSlot(1),
+                    value: StampValue(u32::try_from(n).expect("small")),
+                }),
+                payload: Payload::Exec(work),
             }
         })
         .collect()
@@ -265,9 +267,9 @@ fn from_records(count: u64) -> Vec<Stamped> {
 #[test]
 fn independent_transactions_reach_many_completion_orders() {
     let batch = independent(6);
-    eligible(&views(&batch)).expect("independent work is eligible");
+    eligible(&batch).expect("independent work is eligible");
     let orders: std::collections::BTreeSet<Vec<IngressOrdinal>> = (0..64u64)
-        .map(|seed| parallel(&views(&batch), seed).order())
+        .map(|seed| parallel(&batch, seed).order())
         .collect();
     assert!(
         orders.len() > 8,
@@ -277,15 +279,145 @@ fn independent_transactions_reach_many_completion_orders() {
     );
 }
 
+/// A batch whose classes are mixed: EXECs, a lifecycle synchronise that
+/// produces content, and control commands that carry only their envelopes.
+///
+/// The scheduler used to take `ExecTransaction`, so a batch could contain
+/// nothing else — and a device whose channel carries a delete between two draws
+/// had no reference to be checked against for that sequence at all. Every
+/// transaction here writes the same backing, so the dependency graph totally
+/// orders the ones that touch memory and the control commands float.
+fn mixed_classes() -> Vec<DeviceTransaction> {
+    let mut batch = Vec::new();
+    for n in 1..=6u64 {
+        let identity = crate::testing::identity(1, n);
+        let completion = Some(CompletionStamp {
+            slot: StampSlot(1),
+            value: StampValue(u32::try_from(n).expect("small")),
+        });
+        let accesses = vec![produces(1, 1, n)];
+        batch.push(match n % 3 {
+            0 => DeviceTransaction {
+                identity,
+                stamp_waits: Vec::new(),
+                completion,
+                payload: Payload::Control(crate::control::ControlOp::Inert {
+                    kind: crate::control::ControlKind::Nop,
+                }),
+            },
+            1 => {
+                let mut b = ExecBuilder::new();
+                b.declare_access(accesses[0]);
+                DeviceTransaction {
+                    identity,
+                    stamp_waits: Vec::new(),
+                    completion,
+                    payload: Payload::Exec(b.finish().expect("frozen")),
+                }
+            }
+            _ => DeviceTransaction {
+                identity,
+                stamp_waits: Vec::new(),
+                completion,
+                payload: Payload::ResourceLifecycle {
+                    op: crate::lifecycle::LifecycleOp::Synchronize {
+                        task: crate::identity::TaskId(1),
+                        resources: vec![res(1)],
+                    },
+                    accesses,
+                },
+            },
+        });
+    }
+    batch
+}
+
+/// A completion word is the envelope's, so the packet that publishes one an
+/// EXEC waits for need not be an EXEC.
+///
+/// The wait graph used to see only EXECs, which made this batch look like a
+/// wait nothing answers — and `eligible` would have refused a schedule the
+/// guest is entitled to.
+#[test]
+fn a_control_command_can_answer_an_execs_stamp_wait() {
+    let producer = DeviceTransaction {
+        identity: crate::testing::identity(1, 1),
+        stamp_waits: Vec::new(),
+        completion: Some(CompletionStamp {
+            slot: StampSlot(1),
+            value: StampValue(5),
+        }),
+        payload: Payload::Control(crate::control::ControlOp::Inert {
+            kind: crate::control::ControlKind::Nop,
+        }),
+    };
+    let mut b = builder(1, 2);
+    b.wait_for(StampWait {
+        slot: StampSlot(1),
+        value: StampValue(5),
+    });
+    let waiter = b.finish().expect("frozen");
+    let batch = vec![producer, waiter];
+    eligible(&batch).expect("the control command answers the wait");
+
+    // And the reference runs both, in order, with the stamp published before
+    // the waiter is allowed to proceed.
+    let run = serial(&batch);
+    assert_eq!(run.order(), vec![IngressOrdinal(1), IngressOrdinal(2)]);
+    assert!(run.stalled.is_empty());
+}
+
+/// The claim the envelope exists to make: ordering and publication are owed to
+/// every class equally, so a batch that mixes them schedules the same however
+/// it is run.
+#[test]
+fn a_batch_of_mixed_classes_schedules_equivalently() {
+    let batch = mixed_classes();
+    assert_eq!(
+        batch.iter().filter(|tx| tx.exec().is_some()).count(),
+        2,
+        "the workload has to actually mix classes"
+    );
+    assert!(
+        batch
+            .iter()
+            .any(|tx| tx.class() == PayloadClass::Control && tx.accesses().is_empty()),
+        "and a control command that touches nothing has to be in it"
+    );
+    eligible(&batch).expect("a mixed batch is eligible");
+    let reference = serial(&batch);
+    assert!(
+        reference
+            .trace
+            .iter()
+            .any(|o| matches!(o, crate::interpret::Observation::VersionPublished { .. })),
+        "a schedule trace with no version published tests only the stamps"
+    );
+    let mut orders = std::collections::BTreeSet::new();
+    for seed in 0..64u64 {
+        let run = parallel(&batch, seed);
+        assert!(run.stalled.is_empty(), "seed {seed} stalled");
+        equivalent(&reference, &run).unwrap_or_else(|d| {
+            panic!("seed {seed} gave a mixed batch a different meaning: {d:?}")
+        });
+        orders.insert(run.order());
+    }
+    assert!(
+        orders.len() > 1,
+        "the control commands touch nothing, so some seed has to run one out of \
+         ingress order — a sweep that finds one order proves nothing"
+    );
+}
+
 /// And a chain must reach exactly one, or the dependency graph is not ordering
 /// what it claims to.
 #[test]
 fn a_hazard_chain_reaches_exactly_one_order_and_an_identical_trace() {
     let batch = chain(6);
-    eligible(&views(&batch)).expect("a chain is eligible");
-    let reference = serial(&views(&batch));
+    eligible(&batch).expect("a chain is eligible");
+    let reference = serial(&batch);
     for seed in 0..64u64 {
-        let run = parallel(&views(&batch), seed);
+        let run = parallel(&batch, seed);
         assert_eq!(
             run.order(),
             (1..=6).map(IngressOrdinal).collect::<Vec<_>>(),
@@ -304,12 +436,11 @@ fn every_permitted_schedule_means_what_the_serial_one_meant() {
     let mut reordered = 0usize;
     for workload in 0..24u64 {
         let batch = mixed(workload, 14);
-        eligible(&views(&batch))
-            .unwrap_or_else(|e| panic!("workload {workload} is ineligible: {e:?}"));
-        let reference = serial(&views(&batch));
+        eligible(&batch).unwrap_or_else(|e| panic!("workload {workload} is ineligible: {e:?}"));
+        let reference = serial(&batch);
         let mut orders = std::collections::BTreeSet::new();
         for seed in 0..24u64 {
-            let run = parallel(&views(&batch), seed);
+            let run = parallel(&batch, seed);
             assert!(
                 run.stalled.is_empty(),
                 "workload {workload} seed {seed} stalled at {:?}",
@@ -329,7 +460,7 @@ fn every_permitted_schedule_means_what_the_serial_one_meant() {
             reordered += 1;
         }
         assert_eq!(
-            parallel_with(&views(&batch), |_| 0).order(),
+            parallel_with(&batch, |_| 0).order(),
             reference.order(),
             "workload {workload}: taking the lowest ready ordinal every time \
              must reproduce ingress order, or the readiness service is \
@@ -357,15 +488,17 @@ fn every_permitted_schedule_means_what_the_serial_one_meant() {
 #[test]
 fn a_batch_built_from_records_schedules_the_way_a_declared_one_does() {
     let batch = from_records(12);
-    eligible(&views(&batch)).expect("one domain, judged records");
+    eligible(&batch).expect("one domain, judged records");
     // The point of the workload: every transaction's accesses came from its
     // records, and there are some.
     assert!(
-        batch.iter().all(|s| !s.work.accesses.is_empty()),
+        batch.iter().all(|tx| !tx.accesses().is_empty()),
         "a record named a resource and the transaction carries no access for it"
     );
     assert!(
-        batch.iter().all(|s| s.work.record_count() == 2),
+        batch
+            .iter()
+            .all(|tx| tx.exec().expect("an EXEC").record_count() == 2),
         "the walk lost a record"
     );
     // And the registry gave them versions, which is what puts anything in the
@@ -375,15 +508,17 @@ fn a_batch_built_from_records_schedules_the_way_a_declared_one_does() {
     assert!(
         batch
             .iter()
-            .any(|s| s.work.published_versions().next().is_some()),
+            .any(|tx| crate::exec::published_versions(tx.accesses())
+                .next()
+                .is_some()),
         "no transaction publishes a content version; the trace has nothing in \
          it that a reordering could move"
     );
 
-    let reference = serial(&views(&batch));
+    let reference = serial(&batch);
     let mut orders = std::collections::BTreeSet::new();
     for seed in 0..32u64 {
-        let run = parallel(&views(&batch), seed);
+        let run = parallel(&batch, seed);
         assert!(
             run.stalled.is_empty(),
             "seed {seed} stalled at {:?}",
@@ -406,7 +541,7 @@ fn a_batch_built_from_records_schedules_the_way_a_declared_one_does() {
          proved nothing about them"
     );
     assert_eq!(
-        parallel_with(&views(&batch), |_| 0).order(),
+        parallel_with(&batch, |_| 0).order(),
         reference.order(),
         "taking the lowest ready ordinal every time must reproduce ingress order"
     );
@@ -419,9 +554,9 @@ fn a_channel_publishes_in_its_own_order_however_the_schedule_runs() {
     let mut ever_held = false;
     for workload in 0..24u64 {
         let batch = mixed(workload, 14);
-        let reference = serial(&views(&batch));
+        let reference = serial(&batch);
         for seed in 0..24u64 {
-            let run = parallel(&views(&batch), seed);
+            let run = parallel(&batch, seed);
             for domain in reference.domains() {
                 assert_eq!(
                     run.published_by(domain),
@@ -443,14 +578,14 @@ fn a_channel_publishes_in_its_own_order_however_the_schedule_runs() {
 #[test]
 fn a_hazard_chain_never_holds_a_position() {
     let batch = chain(6);
-    let run = parallel_with(&views(&batch), |_| 0);
+    let run = parallel_with(&batch, |_| 0);
     assert!(run.blocked.is_empty());
 }
 
 #[test]
 fn the_equivalence_relation_rejects_a_channel_that_published_out_of_order() {
     let batch = chain(3);
-    let reference = serial(&views(&batch));
+    let reference = serial(&batch);
     let mut broken = reference.clone();
     broken.releases.swap(0, 2);
     assert!(matches!(
@@ -464,7 +599,7 @@ fn the_equivalence_relation_rejects_a_channel_that_published_out_of_order() {
 #[test]
 fn independent_work_compiles_no_hazard_edges() {
     let batch = independent(8);
-    let run = parallel(&views(&batch), 0);
+    let run = parallel(&batch, 0);
     assert_eq!(run.census.edges, 0);
     assert_eq!(run.census.accesses, 8);
     assert_eq!(
@@ -478,10 +613,10 @@ fn independent_work_compiles_no_hazard_edges() {
 #[test]
 fn a_wait_for_a_later_packets_stamp_has_no_serial_meaning() {
     let mut waiter = builder(1, 1);
-    waiter.require(Prerequisite::Stamp(StampWait {
+    waiter.wait_for(StampWait {
         slot: StampSlot(1),
         value: StampValue(5),
-    }));
+    });
     let waiter = waiter.finish().expect("frozen");
     let mut producer = builder(1, 2);
     producer.publish_stamp(CompletionStamp {
@@ -490,7 +625,7 @@ fn a_wait_for_a_later_packets_stamp_has_no_serial_meaning() {
     });
     let producer = producer.finish().expect("frozen");
     assert_eq!(
-        eligible(&[waiter.view(), producer.view()]),
+        eligible(&[waiter, producer]),
         Err(Ineligible::ForwardExplicitWait {
             waiter: IngressOrdinal(1),
             point: WaitPoint::Stamp {
@@ -511,7 +646,7 @@ fn a_wait_nothing_produces_has_no_serial_meaning() {
     });
     let batch = [waiter.finish().expect("frozen")];
     assert_eq!(
-        eligible(&views(&batch)),
+        eligible(&batch),
         Err(Ineligible::UnansweredWait {
             waiter: IngressOrdinal(1),
             point: WaitPoint::Event {
@@ -523,7 +658,7 @@ fn a_wait_nothing_produces_has_no_serial_meaning() {
     // And the wait graph says the same thing, because there is one answer to
     // this question and two callers of it.
     let mut graph = WaitGraph::new();
-    graph.admit(&batch[0].view());
+    graph.admit(&batch[0]);
     assert!(matches!(
         graph.diagnose().as_slice(),
         [Diagnosis::Unproduced { .. }]
@@ -535,7 +670,7 @@ fn an_encoder_scoped_fence_prerequisite_is_outside_the_comparison() {
     let mut b = builder(1, 1);
     b.require(Prerequisite::Fence { fence: res(3) });
     assert_eq!(
-        eligible(&[b.finish().expect("frozen").view()]),
+        eligible(&[b.finish().expect("frozen")]),
         Err(Ineligible::FencePrerequisite {
             waiter: IngressOrdinal(1)
         })
@@ -549,7 +684,7 @@ fn transactions_out_of_ingress_order_are_refused_before_anything_else() {
         builder(1, 2).finish().expect("frozen"),
     ];
     assert_eq!(
-        eligible(&views(&batch)),
+        eligible(&batch),
         Err(Ineligible::OutOfIngressOrder {
             at: IngressOrdinal(2),
             after: IngressOrdinal(5),
@@ -562,17 +697,19 @@ fn a_second_generation_in_one_batch_is_refused() {
     let first = builder(1, 1).finish().expect("frozen");
     let mut b = ExecBuilder::new();
     b.declare_access(whole(1, 1, AccessMode::Read));
-    let second = Stamped {
-        work: b.finish().expect("frozen"),
+    let second = DeviceTransaction {
         identity: TransactionIdentity {
             session: SessionGeneration::FIRST.next(),
             domain: ChannelId(1),
             domain_sequence: ChannelSequence(2),
             ingress: IngressOrdinal(2),
         },
+        stamp_waits: Vec::new(),
+        completion: None,
+        payload: Payload::Exec(b.finish().expect("frozen")),
     };
     assert_eq!(
-        eligible(&[first.view(), second.view()]),
+        eligible(&[first, second]),
         Err(Ineligible::MixedGeneration {
             expected: SessionGeneration::FIRST,
             found: SessionGeneration::FIRST.next(),
@@ -598,10 +735,10 @@ fn two_publishers_of_disjoint_regions_of_one_backing_are_independent() {
             b.finish().expect("frozen")
         })
         .collect();
-    eligible(&views(&batch)).expect("disjoint regions have no shared history");
-    let reference = serial(&views(&batch));
+    eligible(&batch).expect("disjoint regions have no shared history");
+    let reference = serial(&batch);
     for seed in 0..16u64 {
-        equivalent(&reference, &parallel(&views(&batch), seed))
+        equivalent(&reference, &parallel(&batch, seed))
             .unwrap_or_else(|d| panic!("seed {seed} diverged: {d:?}"));
     }
 }
@@ -621,7 +758,7 @@ fn two_channels_writing_shared_memory_have_no_legal_version_order() {
         })
         .collect();
     assert_eq!(
-        eligible(&views(&batch)),
+        eligible(&batch),
         Err(Ineligible::UnorderedVersionRace {
             backing: BackingId(1),
             first: IngressOrdinal(1),
@@ -637,7 +774,7 @@ fn two_channels_writing_shared_memory_have_no_legal_version_order() {
 #[test]
 fn the_equivalence_relation_rejects_a_reordered_content_history() {
     let batch = chain(3);
-    let reference = serial(&views(&batch));
+    let reference = serial(&batch);
     let mut broken = reference.clone();
     broken.trace.swap(0, 2);
     assert!(matches!(
@@ -649,7 +786,7 @@ fn the_equivalence_relation_rejects_a_reordered_content_history() {
 #[test]
 fn the_equivalence_relation_rejects_a_stamp_that_came_to_rest_elsewhere() {
     let batch = chain(3);
-    let reference = serial(&views(&batch));
+    let reference = serial(&batch);
     let mut broken = reference.clone();
     for observation in &mut broken.trace {
         if let Observation::StampPublished { value, .. } = observation {
@@ -665,7 +802,7 @@ fn the_equivalence_relation_rejects_a_stamp_that_came_to_rest_elsewhere() {
 #[test]
 fn the_equivalence_relation_rejects_a_stamp_that_goes_backwards() {
     let batch = chain(3);
-    let reference = serial(&views(&batch));
+    let reference = serial(&batch);
     let mut broken = reference.clone();
     // Republish the first slot value after the last one, which is exactly what
     // a device that overwrote instead of advancing would show a guest.
@@ -684,7 +821,7 @@ fn the_equivalence_relation_rejects_a_stamp_that_goes_backwards() {
 #[test]
 fn the_equivalence_relation_rejects_a_publication_split_by_another_transaction() {
     let batch = chain(3);
-    let reference = serial(&views(&batch));
+    let reference = serial(&batch);
     let mut broken = reference.clone();
     // Two transactions' completion windows overlap: one made its versions
     // visible while another was still making its own visible.
@@ -698,7 +835,7 @@ fn the_equivalence_relation_rejects_a_publication_split_by_another_transaction()
 #[test]
 fn the_equivalence_relation_rejects_a_stamp_published_before_its_versions() {
     let batch = chain(1);
-    let reference = serial(&views(&batch));
+    let reference = serial(&batch);
     let mut broken = reference.clone();
     broken.trace.swap(0, 1);
     assert!(
@@ -714,7 +851,7 @@ fn the_equivalence_relation_rejects_a_stamp_published_before_its_versions() {
 #[test]
 fn the_equivalence_relation_rejects_a_transaction_that_did_not_run() {
     let batch = chain(3);
-    let reference = serial(&views(&batch));
+    let reference = serial(&batch);
     let mut broken = reference.clone();
     broken.spans.pop();
     assert!(matches!(
@@ -742,7 +879,7 @@ fn the_equivalence_relation_rejects_a_missing_fence_update() {
     .expect("a fence update records");
     b.end_segment().expect("blit encoder closes");
     let work = b.finish().expect("frozen");
-    let reference = serial(&[work.view()]);
+    let reference = serial(&[work]);
     assert_eq!(reference.trace.len(), 1);
     let mut broken = reference.clone();
     broken.trace.clear();
@@ -772,7 +909,7 @@ fn the_equivalence_relation_rejects_an_event_that_came_to_rest_elsewhere() {
     .expect("a signal records");
     b.end_segment().expect("event encoder closes");
     let work = b.finish().expect("frozen");
-    let reference = serial(&[work.view()]);
+    let reference = serial(&[work]);
     let mut broken = reference.clone();
     broken.trace[0] = Observation::EventAdvanced {
         event: res(20),

@@ -38,8 +38,7 @@ use crate::blit::BlitOp;
 use crate::compute::ComputeOp;
 use crate::icb::IcbOp;
 use crate::identity::{
-    ChannelId, ChannelSequence, CompletionStamp, IngressOrdinal, ResourceId, SessionGeneration,
-    StampWait, TransactionIdentity,
+    ChannelId, ChannelSequence, IngressOrdinal, ResourceId, SessionGeneration, TransactionIdentity,
 };
 use crate::operation::OperationClass;
 use crate::pass::PassDescriptor;
@@ -179,36 +178,56 @@ pub struct VersionPublication {
     pub to: ContentVersion,
 }
 
-/// Something this transaction must wait for that is not a hazard edge.
+/// The content versions an access list makes current.
+///
+/// One per access that declared an output version and names memory. A heap
+/// declaration or a domain-only access produces none: neither names bytes, so
+/// neither can claim to have produced any.
+///
+/// A function of the accesses and nothing else, which is why it is free rather
+/// than a method on [`ExecWork`]: a lifecycle synchronise and a query reply are
+/// writes a guest reads back, and the reference interpreter has to publish
+/// their versions by the same rule it publishes a draw's.
+pub fn published_versions(
+    accesses: &[AccessIntent],
+) -> impl Iterator<Item = VersionPublication> + '_ {
+    accesses.iter().filter_map(|access| {
+        let to = access.output_content_version?;
+        let backing = match access.key {
+            AccessKey::Range(r, _) | AccessKey::Subresource(r, _) | AccessKey::Whole(r) => {
+                r.backing
+            }
+            AccessKey::Heap(_) | AccessKey::DomainOnly => return None,
+        };
+        Some(VersionPublication {
+            backing,
+            region: access.key,
+            to,
+        })
+    })
+}
+
+/// Something this transaction's *records* must wait for that is not a hazard
+/// edge.
 ///
 /// Hazard edges are compiled from accesses and always point backwards in
-/// ingress order. These do not: a guest may wait for a stamp or an event value
-/// nothing has produced yet, and that is ordinary rather than an error. The two
-/// are separate types because they are separate questions, and
-/// [`crate::ready`] tracks them apart for exactly that reason.
+/// ingress order. These do not: a guest may wait for an event value nothing has
+/// produced yet, and that is ordinary rather than an error. The two are
+/// separate types because they are separate questions, and [`crate::ready`]
+/// tracks them apart for exactly that reason.
+///
+/// **Completion-stamp waits are not here.** They are the packet's, decoded from
+/// its envelope at ingress before any side effect, and a control packet that
+/// carries no records carries them too — see
+/// [`crate::transaction::DeviceTransaction::stamp_waits`]. A `Stamp` arm here
+/// would be that same wait stated a second time, on the one class of packet
+/// that also has an envelope to state it in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prerequisite {
-    /// A completion-stamp point.
-    Stamp(StampWait),
     /// An event value.
     Event { event: ResourceId, value: u64 },
     /// A fence another encoder updates.
     Fence { fence: ResourceId },
-}
-
-/// What this transaction makes visible when its work completes.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PublicationContract {
-    /// The stamp the guest polls, if this packet carries one.
-    ///
-    /// The content versions this transaction makes current are *not* here.
-    /// They are [`ExecTransaction::published_versions`], derived from the
-    /// accesses, for the reason [`VersionPublication`] gives. What this
-    /// contract still states is the order: versions become visible when the
-    /// work completes and the stamp only when ordered guest publication
-    /// releases it, so a reader that saw the stamp cannot fail to see the
-    /// bytes.
-    pub stamp: Option<CompletionStamp>,
 }
 
 /// The variable-length parts of a packet's records.
@@ -245,7 +264,6 @@ pub struct ExecWork {
     pub accesses: Vec<AccessIntent>,
     pub pipeline_leases: Vec<ResourceId>,
     pub prerequisites: Vec<Prerequisite>,
-    pub publication: PublicationContract,
     pub arenas: ExecArenas,
 }
 
@@ -255,26 +273,9 @@ impl ExecWork {
         self.streams.iter().flat_map(|s| s.records.iter())
     }
 
-    /// The content versions this transaction makes current.
-    ///
-    /// One per access that declared an output version and names memory. A heap
-    /// declaration or a domain-only access produces none: neither names bytes,
-    /// so neither can claim to have produced any.
+    /// The content versions this work makes current.
     pub fn published_versions(&self) -> impl Iterator<Item = VersionPublication> + '_ {
-        self.accesses.iter().filter_map(|access| {
-            let to = access.output_content_version?;
-            let backing = match access.key {
-                AccessKey::Range(r, _) | AccessKey::Subresource(r, _) | AccessKey::Whole(r) => {
-                    r.backing
-                }
-                AccessKey::Heap(_) | AccessKey::DomainOnly => return None,
-            };
-            Some(VersionPublication {
-                backing,
-                region: access.key,
-                to,
-            })
-        })
+        published_versions(&self.accesses)
     }
 
     /// Pair this work with where the packet carrying it arrived.
@@ -398,7 +399,6 @@ pub struct ExecBuilder {
     accesses: Vec<AccessIntent>,
     pipeline_leases: Vec<ResourceId>,
     prerequisites: Vec<Prerequisite>,
-    publication: PublicationContract,
     arenas: ExecArenas,
     /// Scratch [`Self::record`] gathers each operation's participations into,
     /// so the walk costs no allocation after the first record.
@@ -424,7 +424,6 @@ impl ExecBuilder {
             accesses: Vec::new(),
             pipeline_leases: Vec::new(),
             prerequisites: Vec::new(),
-            publication: PublicationContract::default(),
             arenas: ExecArenas::default(),
             participation_scratch: Vec::new(),
         }
@@ -608,10 +607,6 @@ impl ExecBuilder {
         self.prerequisites.push(prerequisite);
     }
 
-    pub fn publish_stamp(&mut self, stamp: CompletionStamp) {
-        self.publication.stamp = Some(stamp);
-    }
-
     /// Freeze the transaction.
     ///
     /// Consumes the builder, so the value that comes out cannot be the one that
@@ -628,7 +623,6 @@ impl ExecBuilder {
             accesses: core::mem::take(&mut self.accesses),
             pipeline_leases: core::mem::take(&mut self.pipeline_leases),
             prerequisites: core::mem::take(&mut self.prerequisites),
-            publication: core::mem::take(&mut self.publication),
             arenas: core::mem::take(&mut self.arenas),
         })
     }
@@ -713,7 +707,7 @@ const fn class_admissible_on(class: OperationClass, kind: SegmentKind) -> bool {
 mod tests {
     use super::*;
     use crate::access::{AccessKey, AccessMode, ResourceKey, StubRegistry};
-    use crate::identity::{ObjectListRef, SlotGeneration, StampSlot, StampValue};
+    use crate::identity::{ObjectListRef, SlotGeneration};
     use crate::stream::ProtectionOptions;
     use crate::sync::{BarrierOp, BarrierTarget, ResourceSpan};
 
@@ -978,10 +972,6 @@ mod tests {
     #[test]
     fn prerequisites_and_accesses_are_separate_lists() {
         let mut b = builder();
-        b.require(Prerequisite::Stamp(StampWait {
-            slot: StampSlot(2),
-            value: StampValue(9),
-        }));
         b.require(Prerequisite::Event {
             event: res(5),
             value: 3,
@@ -998,7 +988,7 @@ mod tests {
             output_content_version: Some(ContentVersion(2)),
         });
         let tx = b.finish().expect("frozen");
-        assert_eq!(tx.prerequisites.len(), 2);
+        assert_eq!(tx.prerequisites.len(), 1);
         assert_eq!(tx.accesses.len(), 1);
         assert!(tx.writes_anything());
     }
@@ -1028,10 +1018,6 @@ mod tests {
             },
         );
         let mut b = builder();
-        b.publish_stamp(CompletionStamp {
-            slot: StampSlot(1),
-            value: StampValue(5),
-        });
         b.declare_access(AccessIntent {
             domain: ChannelId(1),
             key: region,
@@ -1041,7 +1027,6 @@ mod tests {
             output_content_version: Some(ContentVersion(2)),
         });
         let tx = b.finish().expect("frozen");
-        assert!(tx.publication.stamp.is_some());
         assert_eq!(
             tx.published_versions().collect::<Vec<_>>(),
             vec![VersionPublication {

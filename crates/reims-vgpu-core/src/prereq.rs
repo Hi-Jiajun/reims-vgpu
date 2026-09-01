@@ -40,9 +40,10 @@
 //! for the ordinary case of one encoder updating a fence a later encoder in
 //! the same packet waits on.
 
-use crate::exec::{ExecTransaction, Prerequisite, ResolvedOperation};
+use crate::exec::{Prerequisite, ResolvedOperation};
 use crate::identity::{IngressOrdinal, ResourceId, StampSlot, StampValue};
 use crate::sync::EventKind;
+use crate::transaction::DeviceTransaction;
 use std::collections::HashMap;
 
 /// A point a transaction waits for, in the two device-scoped flavours that
@@ -182,48 +183,62 @@ impl WaitGraph {
         }
     }
 
-    /// Admit a transaction: its packet-level prerequisites become waits and
-    /// its stamp and event signals become productions.
+    /// Admit a transaction: its prerequisites become waits and its stamp and
+    /// event signals become productions.
+    ///
+    /// Takes the envelope, not the EXEC view, because a completion stamp and a
+    /// stamp wait belong to every class of packet. A graph that only saw EXECs
+    /// would find a wait unproduced whenever the packet that publishes it is a
+    /// control command or a present.
     ///
     /// A signal record is a production even though it happens partway through
     /// the packet, because the packet's completion is the earliest point at
     /// which any *other* packet may rely on it. Treating it as available
     /// earlier would be a claim about record-level publication that no
     /// cross-packet consumer can observe.
-    pub fn admit(&mut self, tx: &ExecTransaction) {
-        let mut waits = Vec::new();
-        for prerequisite in tx.prerequisites() {
-            match *prerequisite {
-                Prerequisite::Stamp(w) => waits.push(WaitPoint::Stamp {
-                    slot: w.slot,
-                    value: w.value,
-                }),
-                Prerequisite::Event { event, value } => {
-                    waits.push(WaitPoint::Event { event, value });
-                }
-                // Encoder-scoped. See the module documentation.
-                Prerequisite::Fence { .. } => {}
-            }
-        }
+    pub fn admit(&mut self, tx: &DeviceTransaction) {
+        // The envelope's waits, which every class of packet has, and then the
+        // records', which only an EXEC has. One list, from two sources that
+        // decode at different times: the stamp waits before any side effect at
+        // ingress, the event waits as the records resolve.
+        let mut waits: Vec<WaitPoint> = tx
+            .stamp_waits
+            .iter()
+            .map(|w| WaitPoint::Stamp {
+                slot: w.slot,
+                value: w.value,
+            })
+            .collect();
         let mut produces = Vec::new();
-        if let Some(stamp) = tx.work.publication.stamp {
+        if let Some(stamp) = tx.completion {
             produces.push(Production::Stamp {
                 slot: stamp.slot,
                 value: stamp.value,
             });
         }
-        for record in tx.records() {
-            if let ResolvedOperation::Event(event) = record.op {
-                if event.kind == EventKind::Signal {
-                    produces.push(Production::Event {
-                        event: event.event,
-                        value: event.value,
-                    });
+        if let Some(exec) = tx.exec() {
+            for prerequisite in exec.prerequisites() {
+                match *prerequisite {
+                    Prerequisite::Event { event, value } => {
+                        waits.push(WaitPoint::Event { event, value });
+                    }
+                    // Encoder-scoped. See the module documentation.
+                    Prerequisite::Fence { .. } => {}
+                }
+            }
+            for record in exec.records() {
+                if let ResolvedOperation::Event(event) = record.op {
+                    if event.kind == EventKind::Signal {
+                        produces.push(Production::Event {
+                            event: event.event,
+                            value: event.value,
+                        });
+                    }
                 }
             }
         }
         self.nodes.push(Node {
-            ordinal: tx.ingress(),
+            ordinal: tx.identity.ingress,
             waits,
             produces,
         });
@@ -410,7 +425,7 @@ mod tests {
         ingress: u64,
         waits: &[(u32, u64)],
         signals: &[(u32, u64)],
-    ) -> crate::testing::Stamped {
+    ) -> crate::transaction::DeviceTransaction {
         let mut b = builder(ingress);
         for &(event, value) in waits {
             b.require(Prerequisite::Event {
@@ -443,8 +458,8 @@ mod tests {
     #[test]
     fn a_wait_answered_by_a_later_packet_is_an_edge_that_points_forwards() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(1, &[(7, 4)], &[]).view());
-        g.admit(&packet(2, &[], &[(7, 4)]).view());
+        g.admit(&packet(1, &[(7, 4)], &[]));
+        g.admit(&packet(2, &[], &[(7, 4)]));
         assert_eq!(
             g.edges(),
             vec![(
@@ -463,8 +478,8 @@ mod tests {
     #[test]
     fn a_wait_no_admitted_packet_produces_is_unproduced() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(1, &[(7, 4)], &[]).view());
-        g.admit(&packet(2, &[], &[(7, 3)]).view());
+        g.admit(&packet(1, &[(7, 4)], &[]));
+        g.admit(&packet(2, &[], &[(7, 3)]));
         assert_eq!(
             g.diagnose(),
             vec![Diagnosis::Unproduced {
@@ -485,7 +500,7 @@ mod tests {
             event: res(7),
             value: 9,
         });
-        g.admit(&packet(1, &[(7, 4)], &[]).view());
+        g.admit(&packet(1, &[(7, 4)], &[]));
         assert!(g.edges().is_empty());
         assert!(g.diagnose().is_empty());
     }
@@ -494,8 +509,8 @@ mod tests {
     #[test]
     fn two_packets_waiting_on_each_other_are_a_cycle() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(1, &[(8, 1)], &[(7, 1)]).view());
-        g.admit(&packet(2, &[(7, 1)], &[(8, 1)]).view());
+        g.admit(&packet(1, &[(8, 1)], &[(7, 1)]));
+        g.admit(&packet(2, &[(7, 1)], &[(8, 1)]));
         let cycles: Vec<_> = g
             .diagnose()
             .into_iter()
@@ -511,7 +526,7 @@ mod tests {
     #[test]
     fn a_packet_waiting_for_its_own_signal_is_a_one_member_cycle() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(1, &[(7, 1)], &[(7, 1)]).view());
+        g.admit(&packet(1, &[(7, 1)], &[(7, 1)]));
         assert_eq!(
             g.diagnose(),
             vec![Diagnosis::Cycle {
@@ -529,9 +544,9 @@ mod tests {
     #[test]
     fn a_three_packet_wait_chain_is_not_a_cycle() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(1, &[(7, 1)], &[]).view());
-        g.admit(&packet(2, &[(8, 1)], &[(7, 1)]).view());
-        g.admit(&packet(3, &[], &[(8, 1)]).view());
+        g.admit(&packet(1, &[(7, 1)], &[]));
+        g.admit(&packet(2, &[(8, 1)], &[(7, 1)]));
+        g.admit(&packet(3, &[], &[(8, 1)]));
         assert!(g.diagnose().is_empty(), "a chain terminates");
     }
 
@@ -540,8 +555,8 @@ mod tests {
     #[test]
     fn retiring_a_producer_keeps_the_wait_it_answered_answered() {
         let mut g = WaitGraph::new();
-        g.admit(&packet(2, &[], &[(7, 4)]).view());
-        g.admit(&packet(1, &[(7, 4)], &[]).view());
+        g.admit(&packet(2, &[], &[(7, 4)]));
+        g.admit(&packet(1, &[(7, 4)], &[]));
         g.retire(IngressOrdinal(2));
         assert_eq!(g.len(), 1);
         assert!(
@@ -553,10 +568,10 @@ mod tests {
     #[test]
     fn a_stamp_wait_participates_and_a_wrapped_value_still_discharges_it() {
         let mut b = builder(1);
-        b.require(Prerequisite::Stamp(StampWait {
+        b.wait_for(StampWait {
             slot: StampSlot(2),
             value: StampValue(1),
-        }));
+        });
         let waiter = b.finish().expect("frozen");
         let mut g = WaitGraph::new();
         g.satisfy(Production::Stamp {
@@ -567,7 +582,7 @@ mod tests {
             slot: StampSlot(2),
             value: StampValue(1),
         });
-        g.admit(&waiter.view());
+        g.admit(&waiter);
         assert!(
             g.diagnose().is_empty(),
             "1 follows u32::MAX on a wrapping timeline"
@@ -581,7 +596,7 @@ mod tests {
         b.require(Prerequisite::Fence { fence: res(3) });
         let tx = b.finish().expect("frozen");
         let mut g = WaitGraph::new();
-        g.admit(&tx.view());
+        g.admit(&tx);
         assert!(g.edges().is_empty());
         assert!(
             g.diagnose().is_empty(),
@@ -592,10 +607,10 @@ mod tests {
     #[test]
     fn a_completion_stamp_answers_a_stamp_wait_from_another_packet() {
         let mut waiter = builder(1);
-        waiter.require(Prerequisite::Stamp(StampWait {
+        waiter.wait_for(StampWait {
             slot: StampSlot(2),
             value: StampValue(5),
-        }));
+        });
         let waiter = waiter.finish().expect("frozen");
         let mut producer = builder(2);
         producer.publish_stamp(CompletionStamp {
@@ -605,8 +620,8 @@ mod tests {
         let producer = producer.finish().expect("frozen");
 
         let mut g = WaitGraph::new();
-        g.admit(&waiter.view());
-        g.admit(&producer.view());
+        g.admit(&waiter);
+        g.admit(&producer);
         assert_eq!(g.edges().len(), 1);
         assert!(g.diagnose().is_empty());
     }

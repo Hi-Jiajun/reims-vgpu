@@ -67,15 +67,16 @@
 
 use crate::access::{AccessKey, BackingId, ContentVersion};
 use crate::depend::{Census, DependencyGraph};
-use crate::exec::{ExecTransaction, Prerequisite, VersionPublication};
+use crate::exec::{Prerequisite, VersionPublication};
 use crate::identity::{
     ChannelId, ChannelSequence, IngressOrdinal, ResourceId, SessionGeneration, StampSlot,
-    StampValue, StampWait,
+    StampValue,
 };
 use crate::interpret::{Interpreter, Observation, Refusal};
 use crate::prereq::{WaitGraph, WaitPoint};
 use crate::publish::{Publisher, Release};
 use crate::ready::Scheduler;
+use crate::transaction::DeviceTransaction;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
@@ -150,33 +151,33 @@ impl Ineligible {
 /// The first condition the batch fails, in the order the variants are
 /// declared: shape before content, so a batch that is out of ingress order is
 /// reported as that rather than as whatever the misordering made of its waits.
-pub fn eligible(batch: &[ExecTransaction]) -> Result<(), Ineligible> {
+pub fn eligible(batch: &[DeviceTransaction]) -> Result<(), Ineligible> {
     for pair in batch.windows(2) {
-        if pair[1].ingress() <= pair[0].ingress() {
+        if pair[1].identity.ingress <= pair[0].identity.ingress {
             return Err(Ineligible::OutOfIngressOrder {
-                at: pair[1].ingress(),
-                after: pair[0].ingress(),
+                at: pair[1].identity.ingress,
+                after: pair[0].identity.ingress,
             });
         }
     }
     if let Some(first) = batch.first() {
         for tx in batch {
-            if tx.session() != first.session() {
+            if tx.identity.session != first.identity.session {
                 return Err(Ineligible::MixedGeneration {
-                    expected: first.session(),
-                    found: tx.session(),
+                    expected: first.identity.session,
+                    found: tx.identity.session,
                 });
             }
         }
     }
     for tx in batch {
-        if let Some(Prerequisite::Fence { .. }) = tx
-            .prerequisites()
-            .iter()
-            .find(|p| matches!(p, Prerequisite::Fence { .. }))
-        {
+        if tx.exec().is_some_and(|e| {
+            e.prerequisites()
+                .iter()
+                .any(|p| matches!(p, Prerequisite::Fence { .. }))
+        }) {
             return Err(Ineligible::FencePrerequisite {
-                waiter: tx.ingress(),
+                waiter: tx.identity.ingress,
             });
         }
     }
@@ -232,13 +233,18 @@ fn earliest_producers(waits: &WaitGraph) -> Vec<(IngressOrdinal, WaitPoint, Ingr
 /// so — which leaves exactly one shape this can still catch: two channels
 /// writing memory they share. That is real, it has no ordering the guest
 /// supplied, and it is named rather than assumed away.
-fn version_races(batch: &[ExecTransaction]) -> Result<(), Ineligible> {
+fn version_races(batch: &[DeviceTransaction]) -> Result<(), Ineligible> {
     let mut graph = DependencyGraph::new();
     let mut publishers: Vec<(IngressOrdinal, VersionPublication)> = Vec::new();
     let mut ordered: HashMap<IngressOrdinal, Vec<IngressOrdinal>> = HashMap::new();
     for tx in batch {
-        ordered.insert(tx.ingress(), graph.admit(tx.ingress(), tx.accesses()));
-        publishers.extend(tx.published_versions().map(|p| (tx.ingress(), p)));
+        ordered.insert(
+            tx.identity.ingress,
+            graph.admit(tx.identity.ingress, tx.accesses()),
+        );
+        publishers.extend(
+            crate::exec::published_versions(tx.accesses()).map(|p| (tx.identity.ingress, p)),
+        );
     }
     // Reachability over hazard edges, which point backwards, so one pass in
     // ingress order settles it.
@@ -246,13 +252,13 @@ fn version_races(batch: &[ExecTransaction]) -> Result<(), Ineligible> {
         HashMap::new();
     for tx in batch {
         let mut set = std::collections::BTreeSet::new();
-        for earlier in &ordered[&tx.ingress()] {
+        for earlier in &ordered[&tx.identity.ingress] {
             set.insert(*earlier);
             if let Some(theirs) = reaches.get(earlier) {
                 set.extend(theirs.iter().copied());
             }
         }
-        reaches.insert(tx.ingress(), set);
+        reaches.insert(tx.identity.ingress, set);
     }
     for (at, (second, later)) in publishers.iter().enumerate() {
         for (first, earlier) in &publishers[..at] {
@@ -327,10 +333,15 @@ impl Run {
 }
 
 /// Which transaction holds each channel position.
-fn positions(batch: &[ExecTransaction]) -> HashMap<(ChannelId, ChannelSequence), IngressOrdinal> {
+fn positions(batch: &[DeviceTransaction]) -> HashMap<(ChannelId, ChannelSequence), IngressOrdinal> {
     batch
         .iter()
-        .map(|tx| ((tx.domain(), tx.domain_sequence()), tx.ingress()))
+        .map(|tx| {
+            (
+                (tx.identity.domain, tx.identity.domain_sequence),
+                tx.identity.ingress,
+            )
+        })
         .collect()
 }
 
@@ -367,24 +378,31 @@ fn pay(
 /// but publication still goes through the same [`Publisher`], because ordered
 /// guest publication is a contract and not a consequence of concurrency.
 #[must_use]
-pub fn serial(batch: &[ExecTransaction]) -> Run {
+pub fn serial(batch: &[DeviceTransaction]) -> Run {
     let at = positions(batch);
     let mut interpreter = Interpreter::new();
     let mut publisher = Publisher::new();
     let mut run = Run::default();
     for tx in batch {
-        publisher.admit(tx.domain(), tx.domain_sequence());
+        publisher.admit(tx.identity.domain, tx.identity.domain_sequence);
         let start = interpreter.trace().len();
         let owed = interpreter.complete(tx);
         run.spans
-            .push((tx.ingress(), start..interpreter.trace().len()));
+            .push((tx.identity.ingress, start..interpreter.trace().len()));
         let released = match owed {
-            Ok(stamp) => publisher.complete(tx.domain(), tx.domain_sequence(), stamp),
+            Ok(stamp) => publisher.complete(tx.identity.domain, tx.identity.domain_sequence, stamp),
             // A refused position never publishes, and must not hold the ones
             // behind it.
-            Err(_) => publisher.withdraw(tx.domain(), tx.domain_sequence()),
+            Err(_) => publisher.withdraw(tx.identity.domain, tx.identity.domain_sequence),
         };
-        pay(released, tx.domain(), &mut interpreter, None, &at, &mut run);
+        pay(
+            released,
+            tx.identity.domain,
+            &mut interpreter,
+            None,
+            &at,
+            &mut run,
+        );
         note_blocked(&publisher, &mut run);
     }
     run.trace = interpreter.trace().to_vec();
@@ -411,7 +429,7 @@ fn note_blocked(publisher: &Publisher, run: &mut Run) {
 /// retirement on completion. What the seed chooses is only which of the
 /// transactions the two of them have *already declared ready* goes next.
 #[must_use]
-pub fn parallel(batch: &[ExecTransaction], seed: u64) -> Run {
+pub fn parallel(batch: &[DeviceTransaction], seed: u64) -> Run {
     let mut rng = Rng::new(seed);
     parallel_with(batch, move |ready| rng.below(ready.len()))
 }
@@ -426,11 +444,11 @@ pub fn parallel(batch: &[ExecTransaction], seed: u64) -> Run {
 /// order is still reachable.
 #[must_use]
 pub fn parallel_with(
-    batch: &[ExecTransaction],
+    batch: &[DeviceTransaction],
     mut pick: impl FnMut(&[IngressOrdinal]) -> usize,
 ) -> Run {
-    let by_ordinal: HashMap<IngressOrdinal, &ExecTransaction> =
-        batch.iter().map(|tx| (tx.ingress(), tx)).collect();
+    let by_ordinal: HashMap<IngressOrdinal, &DeviceTransaction> =
+        batch.iter().map(|tx| (tx.identity.ingress, tx)).collect();
     let at = positions(batch);
 
     // Explicit event waits become ordinal prerequisites. Eligibility has
@@ -452,29 +470,22 @@ pub fn parallel_with(
     let mut publisher = Publisher::new();
     let mut pool: Vec<IngressOrdinal> = Vec::new();
     for tx in batch {
-        publisher.admit(tx.domain(), tx.domain_sequence());
-        let mut prerequisites = graph.admit(tx.ingress(), tx.accesses());
-        prerequisites.extend(explicit.remove(&tx.ingress()).unwrap_or_default());
+        publisher.admit(tx.identity.domain, tx.identity.domain_sequence);
+        let mut prerequisites = graph.admit(tx.identity.ingress, tx.accesses());
+        prerequisites.extend(explicit.remove(&tx.identity.ingress).unwrap_or_default());
         prerequisites.sort_unstable();
         prerequisites.dedup();
-        let stamp_waits: Vec<StampWait> = tx
-            .prerequisites()
-            .iter()
-            .filter_map(|p| match p {
-                Prerequisite::Stamp(w) => Some(*w),
-                Prerequisite::Event { .. } | Prerequisite::Fence { .. } => None,
-            })
-            .collect();
+
         scheduler.admit(
-            tx.ingress(),
+            tx.identity.ingress,
             &prerequisites,
-            &stamp_waits,
+            &tx.stamp_waits,
             // A batch is compared for schedule equivalence, and a pipeline that
             // is still compiling is not a property of the schedule: every arm
             // of the comparison would hold on the same transaction. Pipeline
             // readiness is tested where it lives, in `crate::ready`.
             &[],
-            tx.work.publication.stamp,
+            tx.completion,
         );
     }
 
@@ -502,10 +513,11 @@ pub fn parallel_with(
         // released then and not before.
         let scheduled = scheduler.complete(ordinal);
         graph.retire(ordinal);
-        let released = publisher.complete(tx.domain(), tx.domain_sequence(), scheduled);
+        let released =
+            publisher.complete(tx.identity.domain, tx.identity.domain_sequence, scheduled);
         pay(
             released,
-            tx.domain(),
+            tx.identity.domain,
             &mut interpreter,
             Some(&mut scheduler),
             &at,

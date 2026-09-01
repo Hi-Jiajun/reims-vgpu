@@ -21,16 +21,20 @@
 use reims_vgpu_protocol::segment::{SegmentKind, SegmentLifetime};
 use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
 
-/// A builder paired with the identity a session would have stamped on it.
+/// A builder, the identity a session would have stamped on it, and the envelope
+/// fields a session would have taken from the packet.
 ///
-/// [`crate::exec::ExecBuilder`] cannot state where a packet arrived — that is
-/// the whole point of the split — so a test that wants a finished
-/// [`ExecTransaction`] has to choose an identity somewhere. Choosing it here,
-/// once, keeps every suite from re-deriving the pairing, and keeps the choice
-/// visible as a test's choice rather than something a builder did.
+/// [`crate::exec::ExecBuilder`] cannot state where a packet arrived or what
+/// completion word it carries — those are the envelope's, and the envelope is
+/// [`crate::session::SessionModel::admit`]'s. A test that wants a finished
+/// [`DeviceTransaction`] has to choose them somewhere. Choosing them here, once,
+/// keeps every suite from re-deriving the pairing and keeps the choice visible
+/// as a test's.
 pub(crate) struct At {
     builder: crate::exec::ExecBuilder,
     identity: crate::identity::TransactionIdentity,
+    stamp_waits: Vec<crate::identity::StampWait>,
+    completion: Option<crate::identity::CompletionStamp>,
 }
 
 impl At {
@@ -38,39 +42,31 @@ impl At {
         Self {
             builder: crate::exec::ExecBuilder::new(),
             identity: identity(domain, ingress),
+            stamp_waits: Vec::new(),
+            completion: None,
         }
     }
 
-    pub(crate) fn finish(self) -> Result<Stamped, crate::stream::StreamRefusal> {
-        Ok(Stamped {
-            work: self.builder.finish()?,
+    /// A completion-stamp point the packet's envelope waits for.
+    pub(crate) fn wait_for(&mut self, wait: crate::identity::StampWait) {
+        self.stamp_waits.push(wait);
+    }
+
+    /// The completion word the packet publishes.
+    pub(crate) fn publish_stamp(&mut self, stamp: crate::identity::CompletionStamp) {
+        self.completion = Some(stamp);
+    }
+
+    pub(crate) fn finish(
+        self,
+    ) -> Result<crate::transaction::DeviceTransaction, crate::stream::StreamRefusal> {
+        Ok(crate::transaction::DeviceTransaction {
             identity: self.identity,
+            stamp_waits: self.stamp_waits,
+            completion: self.completion,
+            payload: crate::transaction::Payload::Exec(self.builder.finish()?),
         })
     }
-}
-
-/// Resolved work a test owns, and the identity it chose for it.
-///
-/// [`crate::exec::ExecTransaction`] borrows its work, because in production the
-/// work belongs to the device transaction carrying it. A test has no device
-/// transaction, so it needs somewhere for the work to live; this is that
-/// somewhere, and [`Self::view`] is the same derivation
-/// [`crate::transaction::DeviceTransaction::exec`] performs.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Stamped {
-    pub(crate) work: crate::exec::ExecWork,
-    pub(crate) identity: crate::identity::TransactionIdentity,
-}
-
-impl Stamped {
-    pub(crate) fn view(&self) -> crate::exec::ExecTransaction<'_> {
-        self.work.stamp(self.identity)
-    }
-}
-
-/// The batch a scheduler is handed, from the work a test owns.
-pub(crate) fn views(batch: &[Stamped]) -> Vec<crate::exec::ExecTransaction<'_>> {
-    batch.iter().map(Stamped::view).collect()
 }
 
 impl core::ops::Deref for At {
