@@ -60,6 +60,8 @@
 //!   of its two faces the record actually wrote.
 //! - [`sampler`] — `MTLSamplerDescriptor`'s ordinals, and the combinations
 //!   the guest API itself does not admit.
+//! - [`vertex_format`] — `MTLVertexFormat` and the geometry every rail
+//!   derives from one.
 //! - [`topology`] — `MTLPrimitiveType` and the three classes its five
 //!   values fall into.
 //! - [`texture_shape`] — what a texture declaration is: its type ordinal, the
@@ -131,5 +133,6 @@ pub mod storage_mode;
 pub mod sync;
 pub mod texture_shape;
 pub mod topology;
+pub mod vertex_format;
 pub mod vertex_step;
 pub mod visibility;

@@ -57,6 +57,96 @@ pub fn step_rate_in_contract(step_function_ordinal: u32, step_rate: u32) -> bool
     step_rate != 0 || step_function_ordinal == MTL_VERTEX_STEP_FUNCTION_CONSTANT
 }
 
+/// `MTLVertexStepFunction`, parsed.
+///
+/// A total type rather than a raw ordinal, so a rail cannot fold an
+/// unrecognised value onto `PerVertex` — which fetches per vertex where the
+/// guest asked per instance, drawing one object's worth of geometry for a
+/// whole instanced draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StepFunction {
+    /// One fetch for the whole draw. Pairs with a rate of zero and only that.
+    Constant,
+    PerVertex,
+    PerInstance,
+    PerPatch,
+    PerPatchControlPoint,
+}
+
+impl StepFunction {
+    pub const ALL: [StepFunction; 5] = [
+        Self::Constant,
+        Self::PerVertex,
+        Self::PerInstance,
+        Self::PerPatch,
+        Self::PerPatchControlPoint,
+    ];
+
+    /// Metal's own default, and what an absent field means.
+    ///
+    /// The serializer omits the field for `PerVertex`, so absence is part of
+    /// the contract rather than a caller-side fallback — with one exception a
+    /// caller does own: a post-tessellation vertex descriptor defaults to
+    /// indexing control points instead, which is why
+    /// [`crate::decode`]'s reader takes the default it applies.
+    pub const DEFAULT: Self = Self::PerVertex;
+
+    #[must_use]
+    pub const fn parse(ordinal: u32) -> Option<Self> {
+        Some(match ordinal {
+            MTL_VERTEX_STEP_FUNCTION_CONSTANT => Self::Constant,
+            MTL_VERTEX_STEP_FUNCTION_PER_VERTEX => Self::PerVertex,
+            MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE => Self::PerInstance,
+            MTL_VERTEX_STEP_FUNCTION_PER_PATCH => Self::PerPatch,
+            MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT => Self::PerPatchControlPoint,
+            _ => return None,
+        })
+    }
+
+    #[must_use]
+    pub const fn ordinal(self) -> u32 {
+        match self {
+            Self::Constant => MTL_VERTEX_STEP_FUNCTION_CONSTANT,
+            Self::PerVertex => MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
+            Self::PerInstance => MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE,
+            Self::PerPatch => MTL_VERTEX_STEP_FUNCTION_PER_PATCH,
+            Self::PerPatchControlPoint => MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT,
+        }
+    }
+
+    /// Whether this step function only means anything inside a tessellation
+    /// pipeline.
+    ///
+    /// A recognised value that a rail may still decline — and the distinction
+    /// matters: declining it as *unknown* would say the stream was malformed
+    /// when what happened is that this device builds no tessellation pipeline
+    /// for the attribute to belong to.
+    #[must_use]
+    pub const fn is_tessellation(self) -> bool {
+        matches!(self, Self::PerPatch | Self::PerPatchControlPoint)
+    }
+
+    /// Whether a rate of zero is the rate this step function takes.
+    ///
+    /// The typed half of [`step_rate_in_contract`], which stays as it is for
+    /// the callers that hold a raw ordinal.
+    #[must_use]
+    pub const fn takes_zero_rate(self) -> bool {
+        matches!(self, Self::Constant)
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Constant => "constant",
+            Self::PerVertex => "per_vertex",
+            Self::PerInstance => "per_instance",
+            Self::PerPatch => "per_patch",
+            Self::PerPatchControlPoint => "per_patch_control_point",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +189,41 @@ mod tests {
             for rate in [1u32, 2, 7, u32::MAX] {
                 assert!(step_rate_in_contract(step, rate));
             }
+        }
+    }
+
+    /// The typed step function and the raw predicate answer the same question,
+    /// so neither can drift from the other.
+    #[test]
+    fn the_typed_step_function_agrees_with_the_raw_predicate() {
+        for step in StepFunction::ALL {
+            assert_eq!(StepFunction::parse(step.ordinal()), Some(step));
+            assert_eq!(
+                step.takes_zero_rate(),
+                step_rate_in_contract(step.ordinal(), 0)
+            );
+        }
+        assert_eq!(StepFunction::parse(5), None);
+        assert_eq!(StepFunction::DEFAULT, StepFunction::PerVertex);
+    }
+
+    /// Recognised and declinable are different things. The two tessellation
+    /// step functions are in the enum, and a rail that builds no tessellation
+    /// pipeline says so rather than calling them unknown.
+    #[test]
+    fn exactly_the_two_patch_step_functions_are_tessellation_only() {
+        let tess: alloc::vec::Vec<u32> = StepFunction::ALL
+            .iter()
+            .filter(|s| s.is_tessellation())
+            .map(|s| s.ordinal())
+            .collect();
+        assert_eq!(tess, alloc::vec![3, 4]);
+        for step in [
+            StepFunction::Constant,
+            StepFunction::PerVertex,
+            StepFunction::PerInstance,
+        ] {
+            assert!(!step.is_tessellation());
         }
     }
 }

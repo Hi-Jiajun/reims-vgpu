@@ -108,6 +108,17 @@ pub use reims_vgpu_protocol::blend;
 /// types share a class is not.
 pub use reims_vgpu_protocol::topology;
 
+/// A vertex attribute's format and the geometry it implies, re-exported from
+/// the protocol layer.
+///
+/// Component count, channel width and footprint are arithmetic that means the
+/// same thing on either rail. Which of these formats a host can fetch is not,
+/// and that belongs to the executor.
+pub use reims_vgpu_protocol::vertex_format;
+
+/// How a vertex buffer layout advances, re-exported from the protocol layer.
+pub use reims_vgpu_protocol::vertex_step;
+
 pub mod stream;
 pub mod submit;
 pub mod sync;
