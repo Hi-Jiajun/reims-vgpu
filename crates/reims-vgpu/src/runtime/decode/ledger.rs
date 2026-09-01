@@ -121,3 +121,103 @@ fn no_ledger_operation_sits_outside_the_render_encoder_window() {
         );
     }
 }
+
+/// The packet half of the same join.
+///
+/// `protocol::packets` records an outcome per FIFO packet class, and the
+/// serializer manifest cannot enumerate that space — there is no runtime to ask
+/// which packets exist, only the dispatch table this device transcribed. So the
+/// enumeration lives in `model::regs` and this is what keeps the ledger equal to
+/// it in both directions: a command declared here without a row is a packet
+/// class nobody has judged, and a row naming an opcode no constant declares is a
+/// judgement about a command this device cannot receive.
+mod packets {
+    use crate::model::{
+        is_deprecated_child_opcode, CHILD_COMMANDS, CHILD_DEPRECATED_OPS, CHILD_OP_MAX,
+        ROOT_COMMANDS,
+    };
+    use reims_vgpu_protocol::packets::{find, Channel, LEDGER, OPCODE_CEILING};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn every_declared_command_has_a_ledger_row() {
+        for (name, op) in CHILD_COMMANDS {
+            assert!(
+                find(Channel::Child, *op).is_some(),
+                "CHILD_OP_{name} ({op:#04x}) is a command this device dispatches and the closure \
+                 ledger does not judge"
+            );
+        }
+        for (name, op) in ROOT_COMMANDS {
+            assert!(
+                find(Channel::Root, *op).is_some(),
+                "ROOT_OP_{name} ({op:#04x}) is a command this device dispatches and the closure \
+                 ledger does not judge"
+            );
+        }
+    }
+
+    /// The retired slots are commands too — the reference host has one handler
+    /// for all fifteen — so each is a row, and a row that says the shared
+    /// handler's behavior *is* the contract rather than a gap.
+    #[test]
+    fn every_retired_slot_has_a_ledger_row() {
+        for op in CHILD_DEPRECATED_OPS {
+            let row = find(Channel::Child, op)
+                .unwrap_or_else(|| panic!("retired slot {op:#04x} is unjudged"));
+            assert!(
+                matches!(
+                    row.closure,
+                    reims_vgpu_protocol::closure::Closure::ProvenNoOp { .. }
+                ),
+                "retired slot {op:#04x} reads as {} — the reference host's shared handler is the \
+                 whole contract, so anything else claims this device owes more or less than the \
+                 host it is imitating",
+                row.closure.name()
+            );
+        }
+    }
+
+    #[test]
+    fn no_ledger_row_names_a_command_this_device_cannot_receive() {
+        let child: BTreeSet<u16> = CHILD_COMMANDS
+            .iter()
+            .map(|(_, op)| *op)
+            .chain(CHILD_DEPRECATED_OPS)
+            .collect();
+        let root: BTreeSet<u16> = ROOT_COMMANDS.iter().map(|(_, op)| *op).collect();
+        for p in LEDGER {
+            let known = match p.channel {
+                Channel::Child => child.contains(&p.opcode),
+                Channel::Root => root.contains(&p.opcode),
+            };
+            assert!(
+                known,
+                "the ledger judges {} {:#04x} and no constant in model::regs declares it",
+                p.channel.name(),
+                p.opcode
+            );
+        }
+    }
+
+    /// Two transcriptions of one number the reference host reads off its own
+    /// dispatch table. They were taken separately, and a disagreement means one
+    /// of them is describing a table this device does not dispatch against.
+    #[test]
+    fn the_two_dispatch_ceilings_agree() {
+        assert_eq!(CHILD_OP_MAX, OPCODE_CEILING);
+    }
+
+    /// A slot cannot be both a live command and one the host retired, on either
+    /// side of the join.
+    #[test]
+    fn no_live_command_is_also_a_retired_slot() {
+        for (name, op) in CHILD_COMMANDS {
+            assert!(
+                !is_deprecated_child_opcode(*op),
+                "CHILD_OP_{name} is also listed as a retired slot, so the drain would give one \
+                 number two arms and the retired one would swallow a live command"
+            );
+        }
+    }
+}

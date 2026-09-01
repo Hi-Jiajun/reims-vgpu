@@ -22,6 +22,8 @@
 //!   capability cell, contract-proven unsupported with its exact refusal, or
 //!   unresolved and therefore blocking. "The current workload does not use it"
 //!   and "the old backend drops it" are not outcomes and cannot be spelled here.
+//! - [`packets`] — the same ledger for the FIFO packet classes, which are the
+//!   other half of what a guest sends and which the manifest cannot enumerate.
 //! - [`residency`] — what a `useResource`/`useHeap` declaration says, split so
 //!   that the half a per-draw binder owes nothing on cannot hide the half it
 //!   does.
@@ -30,4 +32,5 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod closure;
+pub mod packets;
 pub mod residency;
