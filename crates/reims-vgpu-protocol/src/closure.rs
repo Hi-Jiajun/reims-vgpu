@@ -1059,7 +1059,7 @@ pub const LEDGER: &[Op] = &[
         opcode: Some(0x009a),
         selector: "setVertexAmplificationCount:viewMappings:",
         closure: Closure::Unresolved {
-            question: "vertex amplification count; as 0x99",
+            question: "vertex amplification count; as 0x99, and the record's view mappings are a second loss counted apart from it — they offset the viewport and render-target array indices a view rasterises into, so a count of one whose mapping is not the identity is a draw aimed at a slice this rail does not aim it at",
         },
     },
     Op {

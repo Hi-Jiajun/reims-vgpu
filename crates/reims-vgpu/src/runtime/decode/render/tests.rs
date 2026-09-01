@@ -1087,6 +1087,10 @@ fn vertex_amplification_decodes_at_the_widths_the_serializer_wrote() {
     let c = decode(&v).expect("amplification count");
     assert_eq!(c.kind, Kind::SetVertexAmplification);
     assert_eq!(c.count, 2, "the head was read as eight bytes");
+    assert!(
+        c.amplification_offsets_views,
+        "four non-zero offsets and the record claims to ask for nothing"
+    );
 
     // A count with no mappings behind it. The record is the guest's own
     // length claim, so this is the bound, and it must not wrap.
@@ -1096,6 +1100,59 @@ fn vertex_amplification_decodes_at_the_widths_the_serializer_wrote() {
     let mut huge = hdr(wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT, total);
     st32(&mut huge[OP_HEADER_LEN..], u32::MAX);
     assert_eq!(decode(&huge).unwrap_err(), DecodeStatus::ErrShort);
+}
+
+/// A count of one is the API default; a *mapping* of one is not.
+///
+/// `setVertexAmplificationCount:viewMappings:` carries one
+/// `MTLVertexAmplificationViewMapping` per view, and each offsets the viewport
+/// and render-target *array indices* that view rasterises into. So a record
+/// with count 1 and a zero mapping asks for exactly what this rail already
+/// does, while one with count 1 and a non-zero offset asks for a draw aimed at
+/// a different array slice — and until this landed the decoder discarded the
+/// mappings unread, so `count > 1` reported the two as the same record and the
+/// second rendered into slice zero with nothing said.
+///
+/// Both offsets are driven separately, because they are two different indices
+/// and an `any` over the wrong field would still pass with only one of them.
+#[test]
+fn a_single_view_mapping_that_offsets_a_view_is_not_the_default() {
+    use crate::protocol::endian::st32;
+    use reims_vgpu_wire::ops::render as wire;
+
+    let record = |viewport: u32, render_target: u32| {
+        let total = OP_HEADER_LEN + AMPLIFICATION_COUNT_LEN + AMPLIFICATION_MAPPING_SIZE;
+        let mut v = hdr(wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT, total);
+        st32(&mut v[OP_HEADER_LEN..], 1);
+        let e = OP_HEADER_LEN + AMPLIFICATION_COUNT_LEN;
+        st32(&mut v[e..], viewport);
+        st32(&mut v[e + 4..], render_target);
+        decode(&v).expect("amplification count")
+    };
+
+    let identity = record(0, 0);
+    assert_eq!(identity.count, 1);
+    assert!(
+        !identity.amplification_offsets_views,
+        "the identity mapping asks for what this rail already does"
+    );
+
+    for (viewport, render_target) in [(2u32, 0u32), (0, 3), (2, 3)] {
+        let c = record(viewport, render_target);
+        assert_eq!(c.count, 1, "still one view");
+        assert!(
+            c.amplification_offsets_views,
+            "viewport={viewport} render_target={render_target}"
+        );
+    }
+
+    // The mode record carries no mappings at all, so it never claims one.
+    let total = wire::SET_VERTEX_AMPLIFICATION_MODE_TOTAL_LEN as usize;
+    let mut v = hdr(wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE, total);
+    st32(&mut v[OP_HEADER_LEN..], 1);
+    st32(&mut v[OP_HEADER_LEN + 4..], 1);
+    let c = decode(&v).expect("amplification mode");
+    assert!(!c.amplification_offsets_views);
 }
 
 /// `0x0c` is two records, and only the length says which.

@@ -5738,6 +5738,100 @@ fn a_ledger_row_the_rail_cannot_honour_reports_the_disagreement() {
     );
 }
 
+/// A vertex-amplification count of one whose view mapping is not the identity
+/// is a loss, and it is not the same loss as a count above one.
+///
+/// The mappings offset the viewport and render-target *array indices* the views
+/// rasterise into. A count of one with a zero mapping is the API default and
+/// asks for what this rail already does; a count of one with a non-zero offset
+/// asks for a draw aimed at a different array slice, and this rail aims it at
+/// slice zero. Until the mappings were lifted, `count > 1` reported those two
+/// as the same record and the second cost the guest a wrongly-targeted draw
+/// with nothing said.
+///
+/// The two routes are pinned apart because the losses are different: one
+/// renders one view where several were asked for, and the other renders the
+/// right number of views into the wrong slice.
+#[test]
+fn a_view_mapping_that_offsets_a_view_is_named_apart_from_a_count_above_one() {
+    use crate::runtime::decode::render;
+    use crate::runtime::drain::store_route_count;
+
+    let record = |count: u32, viewport: u32, render_target: u32| {
+        let total = reims_vgpu_wire::OP_HEADER_LEN + 4 + count as usize * 8;
+        let mut v = vec![0u8; total];
+        st32(
+            &mut v[0..],
+            wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
+        );
+        st32(&mut v[4..], total as u32);
+        st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], count);
+        for i in 0..count as usize {
+            let e = reims_vgpu_wire::OP_HEADER_LEN + 4 + i * 8;
+            st32(&mut v[e..], viewport);
+            st32(&mut v[e + 4..], render_target);
+        }
+        v
+    };
+
+    let run = |command: Vec<u8>| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        render::decode(&command).expect("a well-formed amplification count decodes");
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
+            &command,
+            &mut out,
+            &mut acc,
+        );
+    };
+
+    let dropped = "render_vertex_amplification_dropped";
+    let mapping = "render_vertex_amplification_view_mapping_dropped";
+
+    // One view, identity mapping: the API default, and neither route moves.
+    let (a, b) = (store_route_count(dropped), store_route_count(mapping));
+    run(record(1, 0, 0));
+    assert_eq!(store_route_count(dropped), a, "one view is not a loss");
+    assert_eq!(
+        store_route_count(mapping),
+        b,
+        "and the identity mapping asks for nothing"
+    );
+
+    // One view, offset mapping: the mapping route alone.
+    run(record(1, 2, 3));
+    assert_eq!(
+        store_route_count(dropped),
+        a,
+        "the count is still the default, so the count route must not move"
+    );
+    assert_eq!(
+        store_route_count(mapping) - b,
+        1,
+        "a draw aimed at a different array slice is a loss and must be named"
+    );
+
+    // Two views, identity mappings: the count route alone.
+    run(record(2, 0, 0));
+    assert_eq!(store_route_count(dropped) - a, 1);
+    assert_eq!(
+        store_route_count(mapping) - b,
+        1,
+        "an identity mapping is not a second loss"
+    );
+
+    // Two views, offset mappings: both.
+    run(record(2, 4, 5));
+    assert_eq!(store_route_count(dropped) - a, 2);
+    assert_eq!(store_route_count(mapping) - b, 2);
+}
+
 /// A residency declaration that names a GPU **write** is not the record the
 /// no-op argument covers.
 ///

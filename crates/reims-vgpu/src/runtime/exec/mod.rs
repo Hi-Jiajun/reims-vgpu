@@ -2285,6 +2285,22 @@ fn handle_render_record<M: HostMemory + HostOps>(
             if asked_for_more {
                 crate::runtime::drain::note_store_route("render_vertex_amplification_dropped");
             }
+            // The count is not the whole record. Its view mappings offset the
+            // viewport and render-target *array indices* the views rasterise
+            // into, so a count of one whose mapping is not the identity is a
+            // draw aimed at a different array slice — a loss that the count
+            // alone reads as the API default and says nothing about.
+            //
+            // Its own route rather than the one above, because the two are
+            // different losses: that one renders one view where several were
+            // asked for, and this one renders the right number of views into
+            // the wrong slice. A reading that merged them could not say which
+            // had happened.
+            if cmd.amplification_offsets_views {
+                crate::runtime::drain::note_store_route(
+                    "render_vertex_amplification_view_mapping_dropped",
+                );
+            }
         }
         RenderKind::SetVisibilityResultMode => {
             // `MTLVisibilityResultModeDisabled` is 0, and it is the guest
