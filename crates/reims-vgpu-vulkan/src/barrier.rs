@@ -27,10 +27,27 @@
 //! The mapping is not a truncation. `synchronization2` split the old
 //! `SHADER_READ` into sampled and storage reads and gave them bits above the
 //! 32-bit space, so the older form is genuinely coarser and the map says by how
-//! much in one table. [`BarrierPlan::unmapped_bits`] is the check that the table
-//! covers everything this module emits — a bit with no older equivalent would
-//! otherwise be silently dropped, and the legacy host would be asked for less
-//! ordering than the guest requested.
+//! much in one table. [`BarrierPlan::unmapped_bits`] reports what the table does
+//! not cover.
+//!
+//! The table's obligation is to every value that reaches [`BarrierPlan::legacy`],
+//! not to the values [`translate`] happens to produce. A plan is four flag words
+//! and anything in this crate may build one — [`crate::layout`] does, for the
+//! image transitions it plans, and its vocabulary is not this module's: it names
+//! whole-stage sets like `ALL_TRANSFER` and `ALL_GRAPHICS` and the transfer
+//! accesses, because a layout transition is not a guest barrier. Scoping the
+//! table to "what `translate` emits" would leave a legacy host recording a
+//! staging upload with an empty access mask — an ordering that is not weaker
+//! than the guest asked for, it is absent, and the upload races the sample that
+//! reads it.
+//!
+//! So the map is total: a bit with no row widens to `ALL_COMMANDS` or to
+//! `MEMORY_READ | MEMORY_WRITE` rather than vanishing. That is the same choice
+//! [`BarrierTarget::Resources`] makes below — too strong costs throughput and
+//! too weak is a race — and it makes "the older path silently ordered less"
+//! unrepresentable rather than checked for. The rows still exist, and are still
+//! the answer: widening is the floor under a missing one, not a substitute for
+//! it.
 //!
 //! # A stage this host cannot express is refused by name
 //!
@@ -182,10 +199,11 @@ impl BarrierPlan {
 
     /// The bits with no entry in the legacy map, or empty.
     ///
-    /// Non-empty would mean this module had started emitting a
-    /// `synchronization2` value the map does not cover, and a host on the older
-    /// path would then be asked for less ordering than the guest requested. The
-    /// answer is to extend the map or refuse the host, never to drop the bit.
+    /// Non-empty means the map has no row for a value that reached a plan, so
+    /// [`Self::legacy`] answered it by widening to `ALL_COMMANDS` or to
+    /// `MEMORY_READ | MEMORY_WRITE` — correct, and coarser than the row would
+    /// have been. This is what says a row is missing; it is not what makes the
+    /// older path safe, because widening already did that.
     #[must_use]
     pub fn unmapped_bits(self) -> (u64, u64) {
         let stages = (self.src_stages | self.dst_stages).as_raw() & !mapped_stage_bits();
@@ -194,8 +212,22 @@ impl BarrierPlan {
     }
 }
 
-/// Every `synchronization2` stage this module emits, and its older equivalent.
+/// Every `synchronization2` stage that can reach a plan, and its older
+/// equivalent.
+///
+/// Wider than [`translate`]'s own output, because [`crate::layout`] builds
+/// plans too and a layout transition names stage *sets* — a transfer is not a
+/// stage this module would emit for a guest barrier, and it is exactly what the
+/// image upload path orders against.
 const STAGE_MAP: &[(vk::PipelineStageFlags2, vk::PipelineStageFlags)] = &[
+    (
+        vk::PipelineStageFlags2::ALL_TRANSFER,
+        vk::PipelineStageFlags::TRANSFER,
+    ),
+    (
+        vk::PipelineStageFlags2::ALL_GRAPHICS,
+        vk::PipelineStageFlags::ALL_GRAPHICS,
+    ),
     (
         vk::PipelineStageFlags2::COMPUTE_SHADER,
         vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -230,11 +262,21 @@ const STAGE_MAP: &[(vk::PipelineStageFlags2, vk::PipelineStageFlags)] = &[
     ),
 ];
 
-/// Every `synchronization2` access this module emits, and its older equivalent.
+/// Every `synchronization2` access that can reach a plan, and its older
+/// equivalent.
 ///
 /// Two rows collapse onto `SHADER_READ`: that is the coarsening the older
-/// vocabulary forces, and it is stated here rather than discovered.
+/// vocabulary forces, and it is stated here rather than discovered. The transfer
+/// rows are here for the reason [`STAGE_MAP`]'s are.
 const ACCESS_MAP: &[(vk::AccessFlags2, vk::AccessFlags)] = &[
+    (
+        vk::AccessFlags2::TRANSFER_READ,
+        vk::AccessFlags::TRANSFER_READ,
+    ),
+    (
+        vk::AccessFlags2::TRANSFER_WRITE,
+        vk::AccessFlags::TRANSFER_WRITE,
+    ),
     (
         vk::AccessFlags2::UNIFORM_READ,
         vk::AccessFlags::UNIFORM_READ,
@@ -374,18 +416,35 @@ fn mapped_access_bits() -> u64 {
         .fold(0, |acc, (new, _)| acc | new.as_raw())
 }
 
+/// Total: a stage bit with no row widens to `ALL_COMMANDS`.
+///
+/// The alternative is that the bit contributes nothing, which is not a coarser
+/// answer but a missing one — see the module doc.
 fn map_stages(stages: vk::PipelineStageFlags2) -> vk::PipelineStageFlags {
-    STAGE_MAP
+    let mapped = STAGE_MAP
         .iter()
         .filter(|(new, _)| stages.contains(*new))
-        .fold(vk::PipelineStageFlags::empty(), |acc, (_, old)| acc | *old)
+        .fold(vk::PipelineStageFlags::empty(), |acc, (_, old)| acc | *old);
+    if stages.as_raw() & !mapped_stage_bits() == 0 {
+        mapped
+    } else {
+        mapped | vk::PipelineStageFlags::ALL_COMMANDS
+    }
 }
 
+/// Total: an access bit with no row widens to `MEMORY_READ | MEMORY_WRITE`.
+///
+/// As [`map_stages`].
 fn map_access(access: vk::AccessFlags2) -> vk::AccessFlags {
-    ACCESS_MAP
+    let mapped = ACCESS_MAP
         .iter()
         .filter(|(new, _)| access.contains(*new))
-        .fold(vk::AccessFlags::empty(), |acc, (_, old)| acc | *old)
+        .fold(vk::AccessFlags::empty(), |acc, (_, old)| acc | *old);
+    if access.as_raw() & !mapped_access_bits() == 0 {
+        mapped
+    } else {
+        mapped | vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+    }
 }
 
 /// Translate one declared barrier.
@@ -514,6 +573,7 @@ fn stages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Use;
     use reims_vgpu_core::sync::ResourceSpan;
 
     fn scope(bits: u32, after: Option<u32>, before: Option<u32>) -> BarrierOp {
@@ -897,6 +957,113 @@ mod tests {
                 "a bit with no older equivalent reached the plan for {op:?}"
             );
         }
+    }
+
+    /// [`BarrierPlan::legacy`]'s production caller is [`crate::record`], which
+    /// hands it a [`crate::layout::Transition`] --- and a transition's four
+    /// words come from [`Use::stages`], [`Use::access`] and `NONE`. So the
+    /// sweep that says the map covers has to be over *that* vocabulary as much
+    /// as over [`translate`]'s, and it is the one that reaches a transfer.
+    #[test]
+    fn every_layout_transition_survives_the_older_vocabulary() {
+        const USES: &[Use] = &[
+            Use::ColorAttachment,
+            Use::DepthStencilAttachment,
+            Use::DepthStencilRead,
+            Use::SampledRead,
+            Use::Storage,
+            Use::TransferSrc,
+            Use::TransferDst,
+            Use::Present,
+        ];
+        for from in USES {
+            for to in USES {
+                let plan = BarrierPlan {
+                    src_stages: from.stages(),
+                    dst_stages: to.stages(),
+                    src_access: from.access(),
+                    dst_access: to.access(),
+                };
+                assert_eq!(
+                    plan.unmapped_bits(),
+                    (0, 0),
+                    "no row for the transition {from:?} -> {to:?}"
+                );
+                let legacy = plan.legacy();
+                assert_eq!(
+                    plan.src_access.is_empty(),
+                    legacy.src_access.is_empty(),
+                    "{from:?} -> {to:?} lost its source access on the older path"
+                );
+                assert_eq!(
+                    plan.dst_access.is_empty(),
+                    legacy.dst_access.is_empty(),
+                    "{from:?} -> {to:?} lost its destination access on the older path"
+                );
+                assert_eq!(
+                    plan.src_stages.is_empty(),
+                    legacy.src_stages.is_empty(),
+                    "{from:?} -> {to:?} lost its source stages on the older path"
+                );
+                assert_eq!(
+                    plan.dst_stages.is_empty(),
+                    legacy.dst_stages.is_empty(),
+                    "{from:?} -> {to:?} lost its destination stages on the older path"
+                );
+            }
+        }
+    }
+
+    /// The concrete one: a staging upload becoming a sampled read. With no
+    /// rows for it, both halves came back empty --- and [`crate::record`] reads
+    /// an empty stage mask as `TOP_OF_PIPE` to `BOTTOM_OF_PIPE`, so a legacy
+    /// host recorded a layout change with no memory dependency at all and the
+    /// sample read whatever was in the image.
+    #[test]
+    fn a_staging_upload_still_orders_the_sample_that_reads_it() {
+        let legacy = BarrierPlan {
+            src_stages: Use::TransferDst.stages(),
+            dst_stages: Use::SampledRead.stages(),
+            src_access: Use::TransferDst.access(),
+            dst_access: Use::SampledRead.access(),
+        }
+        .legacy();
+        assert_eq!(legacy.src_stages, vk::PipelineStageFlags::TRANSFER);
+        assert_eq!(legacy.src_access, vk::AccessFlags::TRANSFER_WRITE);
+        assert_eq!(
+            legacy.dst_stages,
+            vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER
+        );
+        assert_eq!(legacy.dst_access, vk::AccessFlags::SHADER_READ);
+    }
+
+    /// A bit with no row is coarser on the older path, never absent --- and
+    /// only its own half is coarsened.
+    #[test]
+    fn a_bit_with_no_row_widens_rather_than_vanishing() {
+        let plan = BarrierPlan {
+            src_stages: vk::PipelineStageFlags2::HOST,
+            dst_stages: vk::PipelineStageFlags2::VERTEX_SHADER,
+            src_access: vk::AccessFlags2::HOST_WRITE,
+            dst_access: vk::AccessFlags2::UNIFORM_READ,
+        };
+        assert_ne!(
+            plan.unmapped_bits(),
+            (0, 0),
+            "and the check still reports the missing rows"
+        );
+        let legacy = plan.legacy();
+        assert!(legacy
+            .src_stages
+            .contains(vk::PipelineStageFlags::ALL_COMMANDS));
+        assert!(legacy.src_access.contains(vk::AccessFlags::MEMORY_WRITE));
+        assert!(legacy.src_access.contains(vk::AccessFlags::MEMORY_READ));
+        assert_eq!(
+            legacy.dst_stages,
+            vk::PipelineStageFlags::VERTEX_SHADER,
+            "the half whose bits all have rows is not widened"
+        );
+        assert_eq!(legacy.dst_access, vk::AccessFlags::UNIFORM_READ);
     }
 
     /// The coarsening the older vocabulary forces, stated rather than
