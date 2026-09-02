@@ -18,7 +18,7 @@
 //! # It owns none of the four parses it drives
 //!
 //! Segments come from [`reims_vgpu_protocol::segment::SegmentStream`]. Records
-//! come from [`reims_vgpu_wire::op::OpStream`], through the protocol crate's
+//! come from `reims_vgpu_wire::op::OpStream`, through the protocol crate's
 //! re-export. Meaning comes from [`crate::resolve::operation`]. Placement,
 //! ordering and access derivation come from the builder. This module contains
 //! no byte arithmetic at all; it is the composition, and the reason it is worth
@@ -27,7 +27,8 @@
 //!
 //! The rail is the segment's. `resolve::operation` is handed a rail rather than
 //! deriving one, and the only defensible source for it is the encoder class the
-//! guest wrote the record into — [`SegmentKind::rail`], from the type byte in
+//! guest wrote the record into —
+//! [`reims_vgpu_protocol::segment::SegmentKind::rail`], from the type byte in
 //! the header immediately above the record. Taking it from anywhere else, such
 //! as a previous segment or a per-packet default, reads one encoder's commands
 //! as another's.

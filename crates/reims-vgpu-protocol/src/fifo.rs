@@ -4,7 +4,7 @@
 //! the resource-list / invalidate / synchronize record layout, the
 //! display-descriptor timing entries, and the `EXEC_INDIRECT2` header offsets.
 //!
-//! The **opcodes** those records belong to are not here. [`crate::model::regs`]
+//! The **opcodes** those records belong to are not here. `reims_vgpu::model::regs`
 //! holds one table for the whole device — root and child together — and this
 //! module used to restate five of its child entries, four of them byte-identical
 //! declarations that nothing imported while the drain's dispatch matched on
@@ -685,7 +685,7 @@ impl HeapTextureRefusal {
 ///
 /// Returns the request's three words and a borrow of the embedded descriptor
 /// body. The record's own `{opcode, length}` head is read through
-/// [`reims_vgpu_wire::op`] rather than at offsets restated here, so the
+/// [`mod@reims_vgpu_wire::op`] rather than at offsets restated here, so the
 /// framing this device checks is the framing that crate derived.
 ///
 /// # Errors

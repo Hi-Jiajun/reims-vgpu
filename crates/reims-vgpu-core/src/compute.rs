@@ -7,7 +7,7 @@
 //! `setBuffer:offset:atIndex:` does not read the buffer. It writes a slot in
 //! the encoder's binding table, and the memory is touched later, by whatever
 //! dispatch runs with that slot still bound. That is the whole reason
-//! [`ComputeOp::record_access`] answers `None` for every bind: a model that
+//! [`ComputeOp::participations`] is empty for every bind: a model that
 //! produced an access at the bind would order against memory the guest may
 //! rebind before anything reads it.
 //!

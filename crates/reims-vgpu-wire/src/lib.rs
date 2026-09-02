@@ -15,9 +15,9 @@
 //!
 //! - [`le`] — align-1 little-endian scalars, so wire structs are align-1 and no
 //!   buffer offset can be misaligned.
-//! - [`view`] — the checked cast, and the [`view::Wire`] contract a type must
+//! - [`mod@view`] — the checked cast, and the [`view::Wire`] contract a type must
 //!   meet to be viewable.
-//! - [`op`] — the `[opcode][length][payload]` record framing every command
+//! - [`mod@op`] — the `[opcode][length][payload]` record framing every command
 //!   shares, and an iterator over a stream of them.
 //! - [`ops`] — one module per operation family. [`ops::texture`] is the worked
 //!   example.
@@ -34,7 +34,7 @@
 //! - **No allocation.** The crate is `#![no_std]` and never allocates: a view
 //!   that needs to allocate is a view that copied.
 //! - **No unchecked casts.** The bytes are guest-controlled, so every
-//!   constructor is fallible. See [`view`] for why that is not parsing.
+//!   constructor is fallible. See [`mod@view`] for why that is not parsing.
 //! - **No invented fields.** A field nothing has been made to move is named
 //!   `unidentified_*` and carries the experiment that would settle it.
 //!

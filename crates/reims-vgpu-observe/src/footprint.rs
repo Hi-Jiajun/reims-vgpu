@@ -329,7 +329,7 @@ pub fn counts() -> (u64, u64) {
     )
 }
 
-/// The per-census summary line, and — at most every [`DUMP_INTERVAL_MS`], and
+/// The per-census summary line, and — at most every `DUMP_INTERVAL_MS`, and
 /// only when the set has grown since the last one — the run-length dump.
 ///
 /// Returns the lines rather than emitting them, so the caller keeps the choice

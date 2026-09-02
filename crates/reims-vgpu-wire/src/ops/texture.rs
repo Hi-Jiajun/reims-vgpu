@@ -27,7 +27,7 @@
 //! `object_ref` is a payload field, not a header one. Object-creation records
 //! carry it first and encoder records do not carry it at all, so a header that
 //! claimed it would eat the first four bytes of every render command's payload.
-//! See [`crate::op`] for the derivation.
+//! See [`mod@crate::op`] for the derivation.
 //!
 //! # How the layout was derived
 //!

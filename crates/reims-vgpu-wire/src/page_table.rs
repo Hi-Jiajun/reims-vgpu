@@ -465,7 +465,7 @@ const LEAF_BATCH: usize = 64;
 /// A caller needing a coherent snapshot needs one from the hypervisor, not from
 /// a re-read here.
 ///
-/// The deepest level is read [`LEAF_BATCH`] entries at a time, which widens
+/// The deepest level is read `LEAF_BATCH` entries at a time, which widens
 /// that same assumption from the levels above a page to the `LEAF_BATCH` pages
 /// either side of it. It does not introduce it.
 pub fn walk_run<M: GuestMemory>(

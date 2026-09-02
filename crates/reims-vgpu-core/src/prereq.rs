@@ -100,7 +100,7 @@ pub enum Diagnosis {
     /// published, produces.
     ///
     /// The waiter's own productions do not count — see
-    /// [`WaitGraph::produced_by_another`] — so a packet that waits only for a
+    /// `WaitGraph::produced_by_another` — so a packet that waits only for a
     /// point it alone publishes lands here, which is what it is: no packet that
     /// could run first produces it.
     Unproduced {
@@ -307,7 +307,7 @@ impl WaitGraph {
     /// Waiter-to-producer edges, one per (waiter, wait, producer) triple.
     ///
     /// A wait already discharged by [`Self::satisfy`] produces no edge, and a
-    /// transaction never depends on itself — see [`Self::produced_by_another`],
+    /// transaction never depends on itself — see `Self::produced_by_another`,
     /// which is the one place that rule lives.
     ///
     /// A self-wait used to be an edge, `(n, wait, n)`, which the doc here had

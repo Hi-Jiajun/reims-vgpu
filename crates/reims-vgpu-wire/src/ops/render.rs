@@ -1330,7 +1330,7 @@ pub const DRAW_INDIRECT_TOTAL_LEN: u32 = 24;
 ///
 /// The record reverses the selector: the **offset comes first**, then the
 /// buffer, then the primitive type — the same inversion
-/// [`SetVisibilityResultMode`] has. Fixture `render_draw_primitives_indirect`
+/// [`VisibilityResult`] has. Fixture `render_draw_primitives_indirect`
 /// (offset `0x1111`, buffer 5151, `MTLPrimitiveTypeTriangle`).
 ///
 /// `primitive_type` is 16 bits here where the direct draws give it 32. Two

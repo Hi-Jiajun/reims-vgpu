@@ -547,7 +547,7 @@ pub fn line(msg: impl AsRef<str>) {
 
 /// A verbose line whose *text* is expensive to build.
 ///
-/// [`line`] already drops its argument when verbose logging is off, but the
+/// The [`line!`] macro already drops its argument when verbose logging is off, but the
 /// caller has paid for the `format!` by the time it is called. A hot path that
 /// wants to skip that cost used to ask whether the sink was open and branch, which
 /// put a query about observability state inside a product path — the one shape
