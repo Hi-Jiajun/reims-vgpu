@@ -30,7 +30,7 @@
 
 use crate::access::{requires_edge, AccessIntent, AccessKey, BackingId};
 use crate::identity::{ChannelId, IngressOrdinal};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 /// One live access, and the transaction that declared it.
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +85,18 @@ pub struct DependencyGraph {
     domain_only: HashMap<ChannelId, Vec<usize>>,
     by_ordinal: HashMap<IngressOrdinal, Vec<usize>>,
     census: Census,
+    /// Buffers `admit` refills instead of allocating.
+    ///
+    /// The architecture plan's structural zeros include "heap allocations per
+    /// steady-state draw", and a graph that built a fresh candidate list per
+    /// access and a fresh tree node per edge made one trip into the allocator
+    /// per access and one per distinct wait — the cost that spreads evenly
+    /// across a profile and so is never attributed to anything. Both are the
+    /// same shape every time, so both are kept and reused. The one allocation
+    /// left on the path is the wait list `admit` hands back, which its
+    /// signature owns.
+    scratch: Vec<usize>,
+    waits: Vec<IngressOrdinal>,
 }
 
 impl DependencyGraph {
@@ -129,40 +141,61 @@ impl DependencyGraph {
                 .is_none_or(|last| ordinal > last.ordinal),
             "transactions are admitted in ingress order; {ordinal:?} arrived after a later one"
         );
-        let mut waits = BTreeSet::new();
+        // Taken out so the gathering below can borrow the indexes; put back
+        // before returning, so the next admission finds the capacity this one
+        // grew. Both are cleared here rather than at the end, because a
+        // panicking assertion above must not leave stale contents behind.
+        let mut waits = std::mem::take(&mut self.waits);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        waits.clear();
         for intent in accesses {
-            for candidate in self.candidates(intent) {
+            scratch.clear();
+            self.gather(intent, &mut scratch);
+            for &candidate in &scratch {
                 let entry = self.entries[candidate];
                 if !entry.live || entry.ordinal == ordinal {
                     continue;
                 }
-                if requires_edge(&entry.intent, intent) && waits.insert(entry.ordinal) {
-                    self.census.edges += 1;
-                    // Charged where the edge is created, not at every
-                    // comparison that would have created it. Two accesses of
-                    // one transaction meeting one earlier ordinal are one edge,
-                    // and counting the second comparison here made a fraction
-                    // of edges that could exceed one.
-                    if entry.intent.mode == crate::access::AccessMode::Unknown
-                        || intent.mode == crate::access::AccessMode::Unknown
-                    {
-                        self.census.edges_from_unknown_mode += 1;
-                    }
+                if !requires_edge(&entry.intent, intent) {
+                    continue;
+                }
+                // Kept sorted by insertion, which is both the deduplication
+                // and the order the answer is owed in. A set would spell the
+                // same thing with an allocation per member.
+                let Err(at) = waits.binary_search(&entry.ordinal) else {
+                    continue;
+                };
+                waits.insert(at, entry.ordinal);
+                self.census.edges += 1;
+                // Charged where the edge is created, not at every
+                // comparison that would have created it. Two accesses of
+                // one transaction meeting one earlier ordinal are one edge,
+                // and counting the second comparison here made a fraction
+                // of edges that could exceed one.
+                if entry.intent.mode == crate::access::AccessMode::Unknown
+                    || intent.mode == crate::access::AccessMode::Unknown
+                {
+                    self.census.edges_from_unknown_mode += 1;
                 }
             }
             self.insert(ordinal, *intent);
         }
-        waits.into_iter().collect()
+        self.scratch = scratch;
+        let out = waits.clone();
+        self.waits = waits;
+        out
     }
 
-    /// The entries an access could possibly conflict with.
+    /// The entries an access could possibly conflict with, appended to `out`.
     ///
     /// Indices rather than entries so the borrow ends before `insert` runs, and
     /// deliberately allowed to contain duplicates: a resource that belongs to a
     /// heap is reachable two ways, and the caller already deduplicates by
     /// ordinal.
-    fn candidates(&mut self, intent: &AccessIntent) -> Vec<usize> {
-        let mut out: Vec<usize> = Vec::new();
+    ///
+    /// Fills a buffer the caller owns rather than returning one, so a warm
+    /// graph makes no trip into the allocator per access. See [`Self::scratch`].
+    fn gather(&mut self, intent: &AccessIntent, out: &mut Vec<usize>) {
         // Every access meets the domain's unknown-participation accesses.
         if let Some(v) = self.domain_only.get(&intent.domain) {
             self.census.domain_only_comparisons += v.len();
@@ -193,7 +226,6 @@ impl DependencyGraph {
                 }
             }
         }
-        out
     }
 
     fn insert(&mut self, ordinal: IngressOrdinal, intent: AccessIntent) {
@@ -261,6 +293,7 @@ impl DependencyGraph {
 mod tests {
     use super::*;
     use crate::access::{AccessMode, ByteRange, HeapId, ResourceKey, SubresourceRange};
+    use std::collections::BTreeSet;
 
     fn res(backing: u64) -> ResourceKey {
         ResourceKey {
