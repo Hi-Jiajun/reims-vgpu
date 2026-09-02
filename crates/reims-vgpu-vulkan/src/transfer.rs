@@ -735,7 +735,11 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
         // A span of no levels or no slices copies no subresource. The slice
         // count is also `layerCount`, which Vulkan forbids being zero, so this
         // is the one arm where the empty case is illegal as well as pointless.
-        BlitOp::TextureSlices { source, .. } => source.level_count == 0 || source.slice_count == 0,
+        BlitOp::TextureSlices {
+            slice_count,
+            level_count,
+            ..
+        } => level_count == 0 || slice_count == 0,
         BlitOp::FillBuffer { .. } | BlitOp::GenerateMipmaps { .. } => false,
     };
     if empty {
@@ -884,22 +888,29 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
                 }),
             }
         }
-        BlitOp::TextureSlices { source, dest } => {
+        BlitOp::TextureSlices {
+            source,
+            dest,
+            slice_count,
+            level_count,
+        } => {
             let from = resolved(residency.image(source.texture))?;
             let to = resolved(residency.image(dest.texture))?;
             // Both spans, both endpoints, before a single region is built: a
             // span that runs off the end of the destination is the same
             // invalid usage as one that runs off the source, and expanding
-            // first would have found only the source's.
-            for (texture, span) in [(from.texture, source), (to.texture, dest)] {
+            // first would have found only the source's. One count of each for
+            // both ends --- see `SpanOrigin` --- so the region loop below
+            // cannot read a length from one end and a base from the other.
+            for (texture, end) in [(from.texture, source), (to.texture, dest)] {
                 within(
                     "level",
-                    u64::from(span.base_level) + u64::from(span.level_count),
+                    u64::from(end.base_level) + u64::from(level_count),
                     u64::from(texture.mip_levels()),
                 )?;
                 within(
                     "slice",
-                    u64::from(span.base_slice) + u64::from(span.slice_count),
+                    u64::from(end.base_slice) + u64::from(slice_count),
                     u64::from(texture.layers()),
                 )?;
             }
@@ -914,8 +925,8 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
                     (a < b + count && b < a + count).then_some(a.max(b))
                 };
                 if let (Some(level), Some(slice)) = (
-                    shares(source.base_level, dest.base_level, source.level_count),
-                    shares(source.base_slice, dest.base_slice, source.slice_count),
+                    shares(source.base_level, dest.base_level, level_count),
+                    shares(source.base_slice, dest.base_slice, slice_count),
                 ) {
                     if source.base_level == dest.base_level && source.base_slice == dest.base_slice
                     {
@@ -965,14 +976,14 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
                         aspect_mask: aspect(from.texture.pixel_format()),
                         mip_level: u32::from(source.base_level) + level,
                         base_array_layer: u32::from(source.base_slice),
-                        layer_count: u32::from(source.slice_count),
+                        layer_count: u32::from(slice_count),
                     },
                     src_offset: vk::Offset3D::default(),
                     dst_subresource: vk::ImageSubresourceLayers {
                         aspect_mask: aspect(to.texture.pixel_format()),
                         mip_level: u32::from(dest.base_level) + level,
                         base_array_layer: u32::from(dest.base_slice),
-                        layer_count: u32::from(dest.slice_count),
+                        layer_count: u32::from(slice_count),
                     },
                     dst_offset: vk::Offset3D::default(),
                     extent: vk::Extent3D {
@@ -987,7 +998,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
             // before the first region is built rather than after the last one,
             // because a `Vec` collected and then found to hold one has already
             // paid for itself.
-            let regions = match source.level_count {
+            let regions = match level_count {
                 // Zero was answered before any name was resolved.
                 1 => Regions::One(region(0)?),
                 count => Regions::Many(
@@ -1217,7 +1228,7 @@ fn buffer_image_region(
 mod tests {
     use super::*;
     use ash::vk::Handle;
-    use reims_vgpu_core::blit::{BufferSpan, FillPattern, TextureSpan};
+    use reims_vgpu_core::blit::{BufferSpan, FillPattern, SpanOrigin};
     use reims_vgpu_core::identity::{
         DeviceEpoch, ObjectListRef, ResourceId, SessionGeneration, SlotGeneration, TimelinePoint,
     };
@@ -1689,20 +1700,18 @@ mod tests {
         let residency = populated();
         let planned = plan(
             &BlitOp::TextureSlices {
-                source: TextureSpan {
+                source: SpanOrigin {
                     texture: id(IMAGE_A),
                     base_slice: 0,
                     base_level: 1,
-                    slice_count: 3,
-                    level_count: 3,
                 },
-                dest: TextureSpan {
+                dest: SpanOrigin {
                     texture: id(IMAGE_B),
                     base_slice: 0,
                     base_level: 0,
-                    slice_count: 3,
-                    level_count: 3,
                 },
+                slice_count: 3,
+                level_count: 3,
             },
             &residency,
         )
@@ -1786,19 +1795,16 @@ mod tests {
         // also `layerCount`, which Vulkan forbids being zero, so the second is
         // illegal as well as pointless.
         for (level_count, slice_count) in [(0, 1), (1, 0)] {
-            let span = TextureSpan {
-                texture: id(IMAGE_A),
+            let origin = |texture| SpanOrigin {
+                texture,
                 base_slice: 0,
                 base_level: 0,
-                slice_count,
-                level_count,
             };
             empty.push(BlitOp::TextureSlices {
-                source: span,
-                dest: TextureSpan {
-                    texture: id(IMAGE_B),
-                    ..span
-                },
+                source: origin(id(IMAGE_A)),
+                dest: origin(id(IMAGE_B)),
+                slice_count,
+                level_count,
             });
         }
         for op in empty {
@@ -2516,55 +2522,68 @@ mod tests {
     #[test]
     fn a_slice_span_that_runs_off_either_end_refuses_before_any_region_is_built() {
         let residency = populated();
-        let whole = TextureSpan {
+        let top = SpanOrigin {
             texture: id(IMAGE_A),
             base_level: 0,
-            level_count: 4,
             base_slice: 0,
-            slice_count: 3,
         };
         assert!(plan(
             &BlitOp::TextureSlices {
-                source: whole,
-                dest: TextureSpan {
+                source: top,
+                dest: SpanOrigin {
                     texture: id(IMAGE_B),
-                    ..whole
+                    ..top
                 },
+                level_count: 4,
+                slice_count: 3,
             },
             &residency,
         )
         .is_ok());
-        for (source, dest, axis, named, available) in [
+        // The counts are shared, so an end runs off by starting too high ---
+        // which is the only way it can, and is why one count reaching both
+        // ends cannot hide a destination that does not fit.
+        for (source, dest, level_count, slice_count, axis, named, available) in [
             (
-                TextureSpan {
+                SpanOrigin {
                     base_level: 2,
-                    level_count: 4,
-                    ..whole
+                    ..top
                 },
-                TextureSpan {
+                SpanOrigin {
                     texture: id(IMAGE_B),
-                    ..whole
+                    ..top
                 },
+                4_u16,
+                3_u16,
                 "level",
                 6_u64,
                 4_u64,
             ),
             (
-                whole,
-                TextureSpan {
+                top,
+                SpanOrigin {
                     texture: id(IMAGE_B),
                     base_slice: 1,
-                    slice_count: 3,
-                    ..whole
+                    ..top
                 },
+                4,
+                3,
                 "slice",
                 4,
                 3,
             ),
         ] {
             assert_eq!(
-                plan(&BlitOp::TextureSlices { source, dest }, &residency)
-                    .expect_err("a span off the end"),
+                plan(
+                    &BlitOp::TextureSlices {
+                        source,
+                        dest,
+                        level_count,
+                        slice_count,
+                    },
+                    &residency
+                )
+                .expect_err("a span off the end"),
                 Refusal::OutsideTexture {
                     axis,
                     named,
@@ -2605,21 +2624,21 @@ mod tests {
     /// the same write past the end of an image that a region copy refuses.
     #[test]
     fn a_slice_span_into_a_smaller_destination_level_refuses() {
-        let whole = TextureSpan {
+        let top = SpanOrigin {
             texture: id(IMAGE_A),
             base_level: 0,
-            level_count: 4,
             base_slice: 0,
-            slice_count: 3,
         };
         let span = |residency: &Residency| {
             plan(
                 &BlitOp::TextureSlices {
-                    source: whole,
-                    dest: TextureSpan {
+                    source: top,
+                    dest: SpanOrigin {
                         texture: id(IMAGE_B),
-                        ..whole
+                        ..top
                     },
+                    level_count: 4,
+                    slice_count: 3,
                 },
                 residency,
             )
@@ -2676,20 +2695,20 @@ mod tests {
         // two. Level three is 8x1 in the source and 8x4 in the destination, so
         // a check that stopped at the first level would pass this and a check
         // that runs on all four still passes it.
-        let ok = TextureSpan {
+        let ok = SpanOrigin {
             texture: id(IMAGE_A),
             base_level: 0,
-            level_count: 4,
             base_slice: 0,
-            slice_count: 1,
         };
         assert!(plan(
             &BlitOp::TextureSlices {
                 source: ok,
-                dest: TextureSpan {
+                dest: SpanOrigin {
                     texture: id(IMAGE_B),
                     ..ok
                 },
+                level_count: 4,
+                slice_count: 1,
             },
             &residency,
         )
@@ -2699,16 +2718,14 @@ mod tests {
         assert_eq!(
             plan(
                 &BlitOp::TextureSlices {
-                    source: TextureSpan {
-                        level_count: 2,
-                        ..ok
-                    },
-                    dest: TextureSpan {
+                    source: ok,
+                    dest: SpanOrigin {
                         texture: id(IMAGE_B),
                         base_level: 2,
-                        level_count: 2,
                         ..ok
                     },
+                    level_count: 2,
+                    slice_count: 1,
                 },
                 &residency,
             )

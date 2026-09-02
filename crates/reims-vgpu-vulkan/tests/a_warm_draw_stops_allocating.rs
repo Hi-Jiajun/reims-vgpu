@@ -17,7 +17,7 @@
 use ash::vk;
 use ash::vk::Handle;
 use reims_vgpu_core::bind::{BufferBinding, ObjectBinding};
-use reims_vgpu_core::blit::{BlitOp, ImagePitch, Origin3, Size3, TexturePoint, TextureSpan};
+use reims_vgpu_core::blit::{BlitOp, ImagePitch, Origin3, Size3, SpanOrigin, TexturePoint};
 use reims_vgpu_core::identity::{
     DeviceEpoch, ObjectListRef, ResourceId, SessionGeneration, SlotGeneration, TimelinePoint,
 };
@@ -326,12 +326,10 @@ fn planning_a_transfer_allocates_nothing_per_single_region_record() {
         height: 8,
         depth: 1,
     };
-    let one_level = TextureSpan {
+    let from_top = SpanOrigin {
         texture: id(2),
         base_slice: 0,
         base_level: 0,
-        slice_count: 3,
-        level_count: 1,
     };
     for op in [
         BlitOp::BufferToBuffer {
@@ -364,11 +362,13 @@ fn planning_a_transfer_allocates_nothing_per_single_region_record() {
             options: Default::default(),
         },
         BlitOp::TextureSlices {
-            source: one_level,
-            dest: TextureSpan {
+            source: from_top,
+            dest: SpanOrigin {
                 texture: id(3),
-                ..one_level
+                ..from_top
             },
+            slice_count: 3,
+            level_count: 1,
         },
     ] {
         let kind = op.kind();
@@ -382,16 +382,14 @@ fn planning_a_transfer_allocates_nothing_per_single_region_record() {
 
     // The one shape that really does have several. Its cost is the one `Vec`
     // holding them, and nothing beside it.
-    let four_levels = TextureSpan {
-        level_count: 4,
-        ..one_level
-    };
     let op = BlitOp::TextureSlices {
-        source: four_levels,
-        dest: TextureSpan {
+        source: from_top,
+        dest: SpanOrigin {
             texture: id(3),
-            ..four_levels
+            ..from_top
         },
+        slice_count: 3,
+        level_count: 4,
     };
     let (planned, allocations) = measure(|| transfer::plan(&op, &residency));
     assert_eq!(

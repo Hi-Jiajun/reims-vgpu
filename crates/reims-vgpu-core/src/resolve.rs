@@ -31,8 +31,8 @@
 
 use crate::bind::{BindSpan, BufferBinding, IndirectSource, LodClamp, ObjectBinding};
 use crate::blit::{
-    BlitOp, BlitOptions, BufferSpan, FillPattern, ImagePitch, Origin3, Size3, TexturePoint,
-    TextureSpan,
+    BlitOp, BlitOptions, BufferSpan, FillPattern, ImagePitch, Origin3, Size3, SpanOrigin,
+    TexturePoint,
 };
 use crate::compute::{ComputeExtent, ComputeOp, ComputeOrigin, DispatchOp};
 use crate::exec::{ExecArenas, ResolvedOperation};
@@ -284,20 +284,20 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             slice_count,
             level_count,
         } => BlitOp::TextureSlices {
-            source: TextureSpan {
+            source: SpanOrigin {
                 texture: one(resolver, source_ref)?,
                 base_slice: source_slice,
                 base_level: source_level,
-                slice_count,
-                level_count,
             },
-            dest: TextureSpan {
+            dest: SpanOrigin {
                 texture: one(resolver, dest_ref)?,
                 base_slice: dest_slice,
                 base_level: dest_level,
-                slice_count,
-                level_count,
             },
+            // The record's own single count of each, reaching both ends
+            // because there is one of it. See [`SpanOrigin`].
+            slice_count,
+            level_count,
         },
         BlitRecord::FillBuffer {
             buffer_ref,

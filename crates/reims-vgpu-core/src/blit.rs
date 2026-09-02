@@ -114,6 +114,38 @@ pub struct TextureSpan {
     pub level_count: u16,
 }
 
+/// Where one end of a subresource-span copy starts.
+///
+/// The counts are deliberately not here. The record carries **one** slice count
+/// and **one** level count and both ends copy the same number of subresources
+/// --- `vkCmdCopyImage` requires it of the two `layerCount`s, and a per-level
+/// region built from the source's count while indexed into the destination's
+/// base assumes it besides. Two counts in one operation would be two spellings
+/// of one wire field, and the arithmetic that reads only one of them would be
+/// right by luck. So [`BlitOp::TextureSlices`] holds them once and
+/// [`Self::span`] projects an end into the [`TextureSpan`] a subresource range
+/// is asked of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpanOrigin {
+    pub texture: ResourceId,
+    pub base_slice: u16,
+    pub base_level: u16,
+}
+
+impl SpanOrigin {
+    /// This end, over the operation's counts.
+    #[must_use]
+    pub const fn span(self, slice_count: u16, level_count: u16) -> TextureSpan {
+        TextureSpan {
+            texture: self.texture,
+            base_slice: self.base_slice,
+            base_level: self.base_level,
+            slice_count,
+            level_count,
+        }
+    }
+}
+
 impl TextureSpan {
     #[must_use]
     pub const fn subresource(self) -> SubresourceRange {
@@ -205,9 +237,13 @@ pub enum BlitOp {
     },
     /// Whole subresources of one texture into another, over a slice and level
     /// span.
+    ///
+    /// One count of each for both ends; see [`SpanOrigin`].
     TextureSlices {
-        source: TextureSpan,
-        dest: TextureSpan,
+        source: SpanOrigin,
+        dest: SpanOrigin,
+        slice_count: u16,
+        level_count: u16,
     },
     /// A repeated pattern over a byte range.
     FillBuffer {
@@ -360,15 +396,24 @@ impl BlitOp {
                     AccessMode::Write,
                 ),
             ),
-            Self::TextureSlices { source, dest } => Participations::two(
+            Self::TextureSlices {
+                source,
+                dest,
+                slice_count,
+                level_count,
+            } => Participations::two(
                 part(
                     source.texture,
-                    ParticipationExtent::Subresource(source.subresource()),
+                    ParticipationExtent::Subresource(
+                        source.span(slice_count, level_count).subresource(),
+                    ),
                     AccessMode::Read,
                 ),
                 part(
                     dest.texture,
-                    ParticipationExtent::Subresource(dest.subresource()),
+                    ParticipationExtent::Subresource(
+                        dest.span(slice_count, level_count).subresource(),
+                    ),
                     AccessMode::Write,
                 ),
             ),
@@ -394,6 +439,49 @@ impl BlitOp {
 
 #[cfg(test)]
 mod tests {
+    /// The claim [`SpanOrigin`] exists for, at the boundary that owns it: one
+    /// span copies the same number of subresources at both ends.
+    ///
+    /// `vkCmdCopyImage` requires the two `layerCount`s to be equal, and a
+    /// per-level region built from one end's count while indexed into the
+    /// other end's base assumes the level count too. The wire record carries
+    /// one of each, so the operation holds one of each and the two extents are
+    /// projections of it rather than two fields that happen to agree.
+    #[test]
+    fn a_subresource_span_names_the_same_counts_at_both_ends() {
+        let op = BlitOp::TextureSlices {
+            source: SpanOrigin {
+                texture: res(1),
+                base_slice: 2,
+                base_level: 1,
+            },
+            dest: SpanOrigin {
+                texture: res(2),
+                base_slice: 0,
+                base_level: 3,
+            },
+            slice_count: 4,
+            level_count: 2,
+        };
+        let parts = op.participations();
+        let extents: Vec<_> = parts.iter().map(|p| p.extent).collect();
+        assert_eq!(extents.len(), 2);
+        let [read, write] = [&extents[0], &extents[1]];
+        let (ParticipationExtent::Subresource(read), ParticipationExtent::Subresource(write)) =
+            (read, write)
+        else {
+            panic!("a slice span participates by subresource");
+        };
+        assert_eq!(read.slice_count, write.slice_count);
+        assert_eq!(read.level_count, write.level_count);
+        // And they are the operation's, not a default.
+        assert_eq!(read.slice_count, 4);
+        assert_eq!(read.level_count, 2);
+        // The bases are each end's own, which is the half that does differ.
+        assert_eq!((read.base_slice, read.base_level), (2, 1));
+        assert_eq!((write.base_slice, write.base_level), (0, 3));
+    }
+
     use super::*;
     use crate::identity::{ObjectListRef, SlotGeneration};
     use crate::operation::{classify, OperationClass, OperationHome};
@@ -677,20 +765,18 @@ mod tests {
                 options: BlitOptions(0),
             },
             BlitOp::TextureSlices {
-                source: TextureSpan {
+                source: SpanOrigin {
                     texture: res(1),
                     base_slice: 0,
                     base_level: 0,
-                    slice_count: 1,
-                    level_count: 1,
                 },
-                dest: TextureSpan {
+                dest: SpanOrigin {
                     texture: res(2),
                     base_slice: 0,
                     base_level: 0,
-                    slice_count: 1,
-                    level_count: 1,
                 },
+                slice_count: 1,
+                level_count: 1,
             },
             BlitOp::FillBuffer {
                 dest: BufferSpan {
