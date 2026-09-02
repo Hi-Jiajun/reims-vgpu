@@ -68,7 +68,7 @@
 //! vertex stage gets an execution dependency and no memory one, which is the
 //! whole of what it asked for.
 //!
-//! [`ACCESS_STAGES`] is the table, and it has to cover every access this
+//! `ACCESS_STAGES` is the table, and it has to cover every access this
 //! module emits for the same reason [`BarrierPlan::unmapped_bits`] exists: a
 //! row that is missing does not fail, it silently drops the access.
 //!
@@ -352,9 +352,9 @@ fn access_within(access: vk::AccessFlags2, stages: vk::PipelineStageFlags2) -> v
         .fold(vk::AccessFlags2::empty(), |acc, (bit, _)| acc | *bit)
 }
 
-/// The bits of `access` with no row in [`ACCESS_STAGES`], or zero.
+/// The bits of `access` with no row in `ACCESS_STAGES`, or zero.
 ///
-/// Non-zero would mean an access reaches a plan that [`access_within`] then
+/// Non-zero would mean an access reaches a plan that `access_within` then
 /// discards whatever the stages are — dropped ordering, silently.
 #[must_use]
 pub fn access_without_carrier(access: vk::AccessFlags2) -> u64 {

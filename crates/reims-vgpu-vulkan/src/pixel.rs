@@ -711,26 +711,6 @@ pub fn resident_color(bgra: bool) -> vk::Format {
     }
 }
 
-/// Bytes occupied by one texel of a Vulkan format, for the formats this table
-/// can produce.
-///
-/// The inverse view of [`PixelFormat::bytes_per_texel`], needed once the engine
-/// stores a resolved `VkFormat` rather than a byte-layout enum that carried its
-/// own size. `None` for anything outside the set — including block-compressed
-/// and multi-planar formats, whose footprint is not one number per texel — so a
-/// caller declines by name instead of computing a wrong buffer size.
-///
-/// An sRGB format has the footprint of its linear sibling, which is what makes
-/// flipping a rail to sRGB a pure colour-space change with no allocation
-/// consequences.
-/// Every [`TexelLayout`] answers from the contract's own width, so a layout
-/// added to [`TexelLayout::ALL`] is covered here the moment it exists. This was
-/// a hand-kept second copy of those widths, and it was missing
-/// `R16G16B16A16_UNORM` for as long as that layout had existed — which cost
-/// macOS 26 a hundred and eight draws a boot, because a width this table did not
-/// know is indistinguishable from a block-compressed one and declines by the
-/// same name. Same argument as [`texel_layout_of`] being a search rather than a
-/// second `match`.
 /// The storage **block** grid of a Vulkan format, for the formats this table can
 /// produce.
 ///
@@ -755,6 +735,29 @@ pub fn vk_block_geometry(format: vk::Format) -> Option<reims_vgpu_core::extent::
     })
 }
 
+/// Bytes occupied by one texel of a Vulkan format, for the formats this table
+/// can produce.
+///
+/// The inverse view of [`PixelFormat::bytes_per_texel`], needed once the engine
+/// stores a resolved `VkFormat` rather than a byte-layout enum that carried its
+/// own size. `None` for anything outside the set — including block-compressed
+/// and multi-planar formats, whose footprint is not one number per texel — so a
+/// caller declines by name instead of computing a wrong buffer size.
+/// [`vk_block_geometry`] is what a caller sizing a buffer for one of those asks
+/// instead.
+///
+/// An sRGB format has the footprint of its linear sibling, which is what makes
+/// flipping a rail to sRGB a pure colour-space change with no allocation
+/// consequences.
+///
+/// Every [`TexelLayout`] answers from the contract's own width, so a layout
+/// added to [`TexelLayout::ALL`] is covered here the moment it exists. This was
+/// a hand-kept second copy of those widths, and it was missing
+/// `R16G16B16A16_UNORM` for as long as that layout had existed — which cost
+/// macOS 26 a hundred and eight draws a boot, because a width this table did not
+/// know is indistinguishable from a block-compressed one and declines by the
+/// same name. Same argument as [`texel_layout_of`] being a search rather than a
+/// second `match`.
 pub fn bytes_per_texel(format: vk::Format) -> Option<u32> {
     if let Some(layout) = texel_layout_of(format) {
         return Some(layout.bytes_per_texel());
