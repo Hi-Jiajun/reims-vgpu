@@ -533,6 +533,15 @@ pub enum ResolveRefusal {
     /// sibling, and a caller asking the wrong question rather than a malformed
     /// packet.
     NotAMapNotice { kind: LifecycleKind },
+    /// The command is neither task definition nor task deletion, so there is
+    /// nothing for [`task_lifetime`] to read.
+    ///
+    /// The last of the family to get its own name. This join answered with
+    /// [`NotAnObjectReference`](Self::NotAnObjectReference), so a caller that
+    /// asked the wrong question here reached the failure channel under the
+    /// name of a *different* join and the reader went to look at the
+    /// `{task, object}` record, which the packet does not carry either.
+    NotATaskLifetime { kind: LifecycleKind },
     /// The notice's payload cannot hold its three fields.
     ShortNotice(fifo::ShortPayload),
     /// The record resolved, and the operation is the result of walking a table
@@ -574,6 +583,7 @@ impl ResolveRefusal {
             Self::NotABackingRetirement { .. } => "lifecycle_not_a_backing_retirement",
             Self::UnknownMapping { .. } => "lifecycle_unknown_mapping",
             Self::NotAMapNotice { .. } => "lifecycle_not_a_map_notice",
+            Self::NotATaskLifetime { .. } => "lifecycle_not_a_task_lifetime",
             Self::ShortNotice(_) => fifo::ShortPayload::SLUG,
             Self::NeedsGuestTable { .. } => "lifecycle_needs_guest_table",
             Self::UnestablishedValidityOps { .. } => "lifecycle_unestablished_validity_ops",
@@ -806,7 +816,7 @@ pub fn task_lifetime(kind: LifecycleKind, payload: &[u8]) -> Result<LifecycleOp,
             let task = fifo::decode_delete_task(payload).map_err(ResolveRefusal::ShortNotice)?;
             Ok(LifecycleOp::DeleteTask { task: TaskId(task) })
         }
-        other => Err(ResolveRefusal::NotAnObjectReference { kind: other }),
+        other => Err(ResolveRefusal::NotATaskLifetime { kind: other }),
     }
 }
 
@@ -2927,6 +2937,30 @@ mod tests {
                 LifecycleKind::ReplacePhysical,
             ],
             "the lifecycle commands that still cannot become an operation"
+        );
+
+        // Each join names *itself* when it is the one asked the wrong
+        // question. They are read from one dispatcher, so a refusal that named
+        // a different join sent a reader to look for a record the packet does
+        // not carry either — which is what `task_lifetime` did, borrowing
+        // `object_reference`'s name for want of its own.
+        assert_eq!(
+            task_lifetime(LifecycleKind::MapMemory, &payload),
+            Err(ResolveRefusal::NotATaskLifetime {
+                kind: LifecycleKind::MapMemory
+            })
+        );
+        assert_eq!(
+            object_reference(LifecycleKind::DefineTask, &payload, &Everything),
+            Err(ResolveRefusal::NotAnObjectReference {
+                kind: LifecycleKind::DefineTask
+            })
+        );
+        assert_eq!(
+            map_notice(LifecycleKind::DefineTask, &payload),
+            Err(ResolveRefusal::NotAMapNotice {
+                kind: LifecycleKind::DefineTask
+            })
         );
 
         // And the dispatcher agrees with the sweep, kind for kind. The sweep
