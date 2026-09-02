@@ -2849,23 +2849,29 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
     host: &H,
     packet: &Packet,
 ) -> bool {
-    if packet.payload.len() < CURSOR_GLYPH_PAYLOAD_LEN {
-        return cursor_glyph_fail(
-            "cursor_glyph_short",
-            format!(
-                "cursor_glyph_fail reason=cursor_glyph_short plen={} need={CURSOR_GLYPH_PAYLOAD_LEN}",
-                packet.payload.len()
-            ),
-        );
-    }
-    let task_id = ld32(&packet.payload[0x04..]);
-    let virtual_offset = u64::from_le_bytes(packet.payload[0x08..0x10].try_into().unwrap());
-    let mapped_length = u64::from_le_bytes(packet.payload[0x10..0x18].try_into().unwrap());
-    let stride = u64::from_le_bytes(packet.payload[0x18..0x20].try_into().unwrap()) as u32;
-    let width = ld16(&packet.payload[0x20..]) as u32;
-    let height = ld16(&packet.payload[0x22..]) as u32;
-    let hot_x = ld16(&packet.payload[0x24..]) as u32;
-    let hot_y = ld16(&packet.payload[0x26..]) as u32;
+    // The record's layout is `crate::protocol::fifo`'s. What is *usable* is
+    // this function's, because it is the thing that allocates the sprite and
+    // reads the guest's rows.
+    let record = match crate::protocol::fifo::decode_cursor_glyph(&packet.payload) {
+        Ok(record) => record,
+        Err(short) => {
+            return cursor_glyph_fail(
+                "cursor_glyph_short",
+                format!(
+                    "cursor_glyph_fail reason=cursor_glyph_short plen={} need={}",
+                    short.plen, short.need
+                ),
+            )
+        }
+    };
+    let task_id = record.task_id;
+    let virtual_offset = record.virtual_offset;
+    let mapped_length = record.mapped_length;
+    let stride = record.stride as u32;
+    let width = u32::from(record.width);
+    let height = u32::from(record.height);
+    let hot_x = u32::from(record.hot_x);
+    let hot_y = u32::from(record.hot_y);
 
     if width == 0
         || height == 0
@@ -4318,14 +4324,14 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 }
             }
         }
-        CHILD_OP_CURSOR_SHOW => {
-            if !packet_short("cursor_show", Some(channel_id), packet.payload.len(), 8) {
-                let show = ld32(&packet.payload[4..]) != 0;
+        CHILD_OP_CURSOR_SHOW => match crate::protocol::fifo::decode_cursor_show(&packet.payload) {
+            Ok(show) => {
                 state.cursor.show = show;
                 sample_cursor_position(state, host);
                 host.enqueue(HostAction::cursor(state.cursor.x, state.cursor.y, show));
             }
-        }
+            Err(short) => note_short_payload("cursor_show", Some(channel_id), &short),
+        },
         CHILD_OP_CURSOR_GLYPH => {
             if load_cursor_glyph(state, host, packet) {
                 host.enqueue(HostAction::cursor_glyph());

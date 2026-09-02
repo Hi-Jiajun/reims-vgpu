@@ -1077,7 +1077,6 @@ pub const CURSOR_GLYPH_BPP: u32 = 4;
 /// all — a silent loss in C, which is exactly what this constant existing in
 /// Rust is supposed to prevent.
 pub const CURSOR_MAX_DIM: u32 = 512;
-pub const CURSOR_GLYPH_PAYLOAD_LEN: usize = 0x2c;
 
 pub const MMIO_U32: u32 = 4;
 pub const MMIO_U64: u32 = 8;

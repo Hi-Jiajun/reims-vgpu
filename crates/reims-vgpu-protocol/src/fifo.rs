@@ -17,7 +17,7 @@
 //! reports each failure as a fault. Nothing here touches memory it was not
 //! handed.
 
-use crate::endian::{ld32, ld64, st16, st32, st64};
+use crate::endian::{ld16, ld32, ld64, st16, st32, st64};
 use alloc::string::{String, ToString as _};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -1247,6 +1247,94 @@ pub fn decode_exec_resource_table(
     Ok(descs)
 }
 
+// --- the two cursor commands' records --------------------------------------
+
+/// `CmdSetCursorGlyph`: where the sprite is, and how to read it.
+///
+/// Word zero is not read. The device has never needed it and what it carries is
+/// not established, so it is left unnamed rather than given a speculative name
+/// that a later reader would take for a decoded field. The same is true of the
+/// word at `0x28` that [`CURSOR_GLYPH_LEN`] reaches past `hot_y` to include.
+pub const CURSOR_GLYPH_TASK_ID: usize = 0x04;
+pub const CURSOR_GLYPH_VIRTUAL_OFFSET: usize = 0x08;
+pub const CURSOR_GLYPH_MAPPED_LENGTH: usize = 0x10;
+pub const CURSOR_GLYPH_STRIDE: usize = 0x18;
+pub const CURSOR_GLYPH_WIDTH: usize = 0x20;
+pub const CURSOR_GLYPH_HEIGHT: usize = 0x22;
+pub const CURSOR_GLYPH_HOT_X: usize = 0x24;
+pub const CURSOR_GLYPH_HOT_Y: usize = 0x26;
+pub const CURSOR_GLYPH_LEN: usize = 0x2c;
+
+/// One `CmdSetCursorGlyph` record, as the wire spells it.
+///
+/// `stride` is the field's own width and not the device's. The wire carries
+/// eight bytes; whether a value that does not fit a pixel pitch is usable is
+/// the consumer's question, and narrowing here would answer it by wrapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorGlyphRecord {
+    /// The task whose address space `virtual_offset` is in.
+    pub task_id: u32,
+    pub virtual_offset: u64,
+    pub mapped_length: u64,
+    pub stride: u64,
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+}
+
+/// Decode `CmdSetCursorGlyph` (`0x04`).
+///
+/// Layout only. Every bound that makes a glyph *usable* — the sprite the
+/// consumer will allocate, whether the hotspot is inside the sprite, whether
+/// the mapped length covers the rows — is the consumer's, because the consumer
+/// is the only thing that can refuse.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the record.
+pub fn decode_cursor_glyph(payload: &[u8]) -> Result<CursorGlyphRecord, ShortPayload> {
+    if payload.len() < CURSOR_GLYPH_LEN {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need: CURSOR_GLYPH_LEN,
+        });
+    }
+    Ok(CursorGlyphRecord {
+        task_id: ld32(&payload[CURSOR_GLYPH_TASK_ID..]),
+        virtual_offset: ld64(&payload[CURSOR_GLYPH_VIRTUAL_OFFSET..]),
+        mapped_length: ld64(&payload[CURSOR_GLYPH_MAPPED_LENGTH..]),
+        stride: ld64(&payload[CURSOR_GLYPH_STRIDE..]),
+        width: ld16(&payload[CURSOR_GLYPH_WIDTH..]),
+        height: ld16(&payload[CURSOR_GLYPH_HEIGHT..]),
+        hot_x: ld16(&payload[CURSOR_GLYPH_HOT_X..]),
+        hot_y: ld16(&payload[CURSOR_GLYPH_HOT_Y..]),
+    })
+}
+
+/// `CmdSetCursorShow`: the visibility flag at word one. Word zero is not read,
+/// for [`CURSOR_GLYPH_TASK_ID`]'s reason.
+pub const CURSOR_SHOW_FLAG: usize = 0x04;
+pub const CURSOR_SHOW_LEN: usize = 8;
+
+/// Decode `CmdSetCursorShow` (`0x05`): whether the cursor is drawn.
+///
+/// Any non-zero value shows it. The wire carries a word and the command is a
+/// boolean, so treating one as the other is the whole of the contract.
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the two words.
+pub fn decode_cursor_show(payload: &[u8]) -> Result<bool, ShortPayload> {
+    if payload.len() < CURSOR_SHOW_LEN {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need: CURSOR_SHOW_LEN,
+        });
+    }
+    Ok(ld32(&payload[CURSOR_SHOW_FLAG..]) != 0)
+}
+
 /// Decode `CmdDefineFifo` / `CmdFreeFifo`: the channel id at word zero.
 ///
 /// The two commands share a payload because they are the two ends of one
@@ -1326,6 +1414,93 @@ pub fn decode_synchronize_resources(
         count,
         object_ids,
     })
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    /// The offsets are the record, so a test that rebuilt them from the same
+    /// constants would agree with any layout at all. This spells the bytes.
+    #[test]
+    fn a_glyph_record_decodes_to_the_bytes_the_wire_carried() {
+        let mut payload = vec![0u8; CURSOR_GLYPH_LEN];
+        payload[0x00..0x04].copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+        payload[0x04..0x08].copy_from_slice(&7_u32.to_le_bytes());
+        payload[0x08..0x10].copy_from_slice(&0x1_0000_u64.to_le_bytes());
+        payload[0x10..0x18].copy_from_slice(&0x4000_u64.to_le_bytes());
+        payload[0x18..0x20].copy_from_slice(&256_u64.to_le_bytes());
+        payload[0x20..0x22].copy_from_slice(&64_u16.to_le_bytes());
+        payload[0x22..0x24].copy_from_slice(&32_u16.to_le_bytes());
+        payload[0x24..0x26].copy_from_slice(&3_u16.to_le_bytes());
+        payload[0x26..0x28].copy_from_slice(&5_u16.to_le_bytes());
+        assert_eq!(
+            decode_cursor_glyph(&payload),
+            Ok(CursorGlyphRecord {
+                task_id: 7,
+                virtual_offset: 0x1_0000,
+                mapped_length: 0x4000,
+                stride: 256,
+                width: 64,
+                height: 32,
+                hot_x: 3,
+                hot_y: 5,
+            }),
+            "word zero is not a field, and reading it as one would shift every \
+             other offset by four"
+        );
+    }
+
+    /// The field is eight bytes on the wire. Narrowing it here would wrap a
+    /// stride that does not fit into a small one that passes every bound the
+    /// consumer checks, and the sprite would be read from the wrong rows.
+    #[test]
+    fn a_stride_that_does_not_fit_a_word_is_carried_whole() {
+        let mut payload = vec![0u8; CURSOR_GLYPH_LEN];
+        payload[0x18..0x20].copy_from_slice(&0x1_0000_0100_u64.to_le_bytes());
+        assert_eq!(
+            decode_cursor_glyph(&payload).expect("long enough").stride,
+            0x1_0000_0100
+        );
+    }
+
+    #[test]
+    fn a_glyph_payload_one_byte_short_is_refused() {
+        assert_eq!(
+            decode_cursor_glyph(&vec![0u8; CURSOR_GLYPH_LEN - 1]),
+            Err(ShortPayload {
+                plen: CURSOR_GLYPH_LEN - 1,
+                need: CURSOR_GLYPH_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn any_non_zero_word_shows_the_cursor() {
+        let mut payload = vec![0u8; CURSOR_SHOW_LEN];
+        assert_eq!(decode_cursor_show(&payload), Ok(false));
+        payload[CURSOR_SHOW_FLAG] = 2;
+        assert_eq!(
+            decode_cursor_show(&payload),
+            Ok(true),
+            "the command is a boolean and the wire carries a word"
+        );
+        // And the flag is word one: a value in word zero shows nothing.
+        let mut only_word_zero = vec![0u8; CURSOR_SHOW_LEN];
+        only_word_zero[0] = 0xff;
+        assert_eq!(decode_cursor_show(&only_word_zero), Ok(false));
+    }
+
+    #[test]
+    fn a_show_payload_one_byte_short_is_refused() {
+        assert_eq!(
+            decode_cursor_show(&vec![0u8; CURSOR_SHOW_LEN - 1]),
+            Err(ShortPayload {
+                plen: CURSOR_SHOW_LEN - 1,
+                need: CURSOR_SHOW_LEN,
+            })
+        );
+    }
 }
 
 #[cfg(test)]
