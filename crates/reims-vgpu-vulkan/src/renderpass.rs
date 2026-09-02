@@ -67,10 +67,34 @@ use std::collections::{HashMap, HashSet};
 /// Deliberately holds no operation and no layout: those are not part of
 /// Vulkan's compatibility rule, and including them would make this a second
 /// spelling of [`Signature`].
+///
+/// It does hold [`Self::resolve`], which is not an operation. Vulkan's
+/// compatibility rule names "color, input, **resolve**, and depth/stencil
+/// attachment references", and a reference naming a real attachment is
+/// compatible only with another naming one — never with the null pointer a
+/// subpass without resolve targets has. So two passes that differ only in
+/// whether a colour attachment resolves are *not* compatible, and a pipeline
+/// built for one cannot be bound in the other.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Compatibility {
     /// Colour attachment formats, in the pass's own attachment order.
     pub color: Vec<vk::Format>,
+    /// Whether each colour attachment resolves, in the same order.
+    ///
+    /// A resolve target is an extra attachment in the description and an extra
+    /// reference in the subpass, so it changes both the render pass object and
+    /// the compatibility class — see the type's doc.
+    ///
+    /// Not read by [`Self::rendering_info`], because the dynamic-rendering rung
+    /// has no resolve in the pipeline at all: it is a field of
+    /// `VkRenderingAttachmentInfo`, supplied when the pass is begun. So that
+    /// rung compiles one pipeline where it could have shared one. That is the
+    /// price of one compatibility class serving both carriers, and it is the
+    /// direction the price has to fall — a class loose enough for dynamic
+    /// rendering binds an incompatible pipeline on the render-pass rung, while
+    /// a class tight enough for the render-pass rung merely compiles a second
+    /// one here.
+    pub resolve: Vec<bool>,
     /// `None` when the pass has no depth-stencil attachment, and otherwise the
     /// one format that carries both aspects the guest attached.
     pub depth_stencil: Option<vk::Format>,
@@ -128,9 +152,6 @@ pub struct Signature {
     /// One per colour attachment, in the same order.
     pub color: Vec<AttachmentOps>,
     pub depth_stencil: Option<AttachmentOps>,
-    /// Whether each colour attachment resolves. A resolve target is an extra
-    /// attachment in the description, so this changes the object.
-    pub resolve: Vec<bool>,
 }
 
 /// Everything a `VkFramebuffer` is created from.
@@ -556,6 +577,7 @@ pub fn build(
     let signature = Signature {
         compatibility: Compatibility {
             color: color.iter().map(|b| b.format).collect(),
+            resolve: resolve_flags,
             depth_stencil: depth_stencil_format,
             depth: has_depth,
             stencil: has_stencil,
@@ -563,7 +585,6 @@ pub fn build(
         },
         color: color_ops,
         depth_stencil: depth_stencil_ops,
-        resolve: resolve_flags,
     };
 
     Ok(Build {
@@ -627,7 +648,7 @@ impl Build {
     /// the subpass carries a resolve array at all.
     #[must_use]
     pub fn resolves(&self) -> bool {
-        self.signature.resolve.iter().any(|r| *r)
+        self.signature.compatibility.resolve.iter().any(|r| *r)
     }
 
     /// Hand `f` the `VkRenderPassCreateInfo` this build describes.
@@ -964,6 +985,82 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         value.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// A resolve is not an operation. Vulkan's compatibility rule names
+    /// "color, input, **resolve**, and depth/stencil attachment references",
+    /// and a reference naming a real attachment is compatible only with
+    /// another naming one — never with the null pointer a subpass without
+    /// resolve targets has. So two passes that differ only in whether a colour
+    /// attachment resolves are two render passes *and* two pipeline classes,
+    /// and a class that conflated them would bind a pipeline built against an
+    /// incompatible pass.
+    #[test]
+    fn a_resolve_changes_the_pass_object_and_the_pipeline_key() {
+        // Both plans store; the resolve is injected onto one of them, so it is
+        // the only thing the two differ in.
+        let mut resolving = one_colour(LoadAction::Load, StoreAction::Store);
+        resolving.color[0].resolve = Some(crate::pass::Resolve {
+            texture: resolving.color[0].texture,
+            level: 0,
+            slice: 0,
+        });
+        let plain = one_colour(LoadAction::Load, StoreAction::Store);
+
+        let with = build(
+            &resolving,
+            &[Bound {
+                resolve_view: Some(view(2)),
+                ..bound(1)
+            }],
+            None,
+        )
+        .expect("legal");
+        let without = build(&plain, &[bound(1)], None).expect("legal");
+
+        assert!(with.resolves());
+        assert!(!without.resolves());
+        assert_ne!(with.signature(), without.signature());
+        assert_ne!(
+            with.compatibility(),
+            without.compatibility(),
+            "one pipeline cannot serve both passes"
+        );
+        // And the difference is the resolve flags and nothing else: the
+        // formats, the aspects and the sample count all agree.
+        assert_eq!(with.compatibility().color, without.compatibility().color);
+        assert_eq!(
+            with.compatibility().samples,
+            without.compatibility().samples
+        );
+        assert_eq!(with.compatibility().resolve, vec![true]);
+        assert_eq!(without.compatibility().resolve, vec![false]);
+    }
+
+    /// The dynamic-rendering rung has no resolve in the pipeline — it is a
+    /// field of `VkRenderingAttachmentInfo`, supplied when the pass is begun —
+    /// so the flags must not reach `VkPipelineRenderingCreateInfo`.
+    #[test]
+    fn the_resolve_flags_do_not_reach_the_dynamic_rendering_structure() {
+        let mut compatibility = Compatibility {
+            color: vec![vk::Format::B8G8R8A8_UNORM],
+            resolve: vec![false],
+            depth_stencil: None,
+            depth: false,
+            stencil: false,
+            samples: vk::SampleCountFlags::TYPE_1,
+        };
+        let plain = compatibility.rendering_info();
+        let plain = (plain.color_attachment_count, plain.depth_attachment_format);
+        compatibility.resolve = vec![true];
+        let resolving = compatibility.rendering_info();
+        assert_eq!(
+            (
+                resolving.color_attachment_count,
+                resolving.depth_attachment_format
+            ),
+            plain
+        );
     }
 
     /// The claim the module exists for: two passes that differ only in a load
@@ -1461,6 +1558,7 @@ mod cache_tests {
 
     fn compatibility(color: &[vk::Format]) -> Compatibility {
         Compatibility {
+            resolve: vec![false; color.len()],
             color: color.to_vec(),
             depth_stencil: None,
             depth: false,
@@ -1485,7 +1583,6 @@ mod cache_tests {
             compatibility: compatibility(&[vk::Format::B8G8R8A8_UNORM]),
             color: vec![ops(load)],
             depth_stencil: None,
-            resolve: vec![false],
         }
     }
 

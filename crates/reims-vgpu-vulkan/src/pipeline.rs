@@ -762,6 +762,7 @@ mod tests {
     fn compatibility(colors: usize, depth: bool) -> renderpass::Compatibility {
         renderpass::Compatibility {
             color: vec![vk::Format::B8G8R8A8_UNORM; colors],
+            resolve: vec![false; colors],
             depth_stencil: depth.then_some(vk::Format::D32_SFLOAT_S8_UINT),
             depth,
             stencil: depth,
@@ -1424,6 +1425,7 @@ mod store_tests {
     fn compat() -> renderpass::Compatibility {
         renderpass::Compatibility {
             color: vec![vk::Format::B8G8R8A8_UNORM],
+            resolve: vec![false],
             depth_stencil: None,
             depth: false,
             stencil: false,

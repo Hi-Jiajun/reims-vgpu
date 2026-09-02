@@ -1546,6 +1546,7 @@ fn an_assembled_key_becomes_a_pipeline_this_driver_accepts() {
             .expect("a default attachment needs no feature")],
         compatibility: renderpass::Compatibility {
             color: vec![vk::Format::B8G8R8A8_UNORM],
+            resolve: vec![false],
             depth_stencil: None,
             depth: false,
             stencil: false,
