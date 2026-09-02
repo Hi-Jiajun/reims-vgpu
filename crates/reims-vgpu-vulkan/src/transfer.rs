@@ -154,6 +154,14 @@ pub enum Refusal {
     /// Refused rather than staged. A staging round-trip would define it, and
     /// it needs scratch this signature has no access to --- the same reason
     /// [`plan_fill`] is a separate door.
+    ///
+    /// The *exact* self-copy is not this, for the reason
+    /// [`Self::OverlappingSelfImageCopy`] gives about images: a window copied
+    /// onto itself leaves the buffer holding what it already held, so it is
+    /// answered as nothing to record --- see [`plan`]. The undefined result
+    /// above is a statement about the *shifted* case, where forward and
+    /// backward orders disagree; at zero shift they agree, and there is
+    /// nothing for a driver to get wrong.
     OverlappingSelfCopy {
         source_offset: u64,
         dest_offset: u64,
@@ -748,15 +756,25 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
             // Both windows are inside their buffers, so the sums below cannot
             // wrap. On the native handle rather than the two names: one
             // allocation may answer to several of them.
-            if from.buffer == to.buffer
-                && source_offset < dest_offset + size
-                && dest_offset < source_offset + size
-            {
-                return Err(Refusal::OverlappingSelfCopy {
-                    source_offset,
-                    dest_offset,
-                    size,
-                });
+            if from.buffer == to.buffer {
+                if source_offset == dest_offset {
+                    // A window copied onto itself leaves the buffer holding
+                    // what it already held, so there is nothing to record ---
+                    // the same answer `TextureRegion` gives the equal-origin
+                    // case below, and for the same reason. The undefined
+                    // result the refusal names belongs to the *shifted* case:
+                    // it is forward and backward copy orders disagreeing, and
+                    // at zero shift they agree. Refusing here would report a
+                    // failure for a command the guest saw succeed.
+                    return Ok(None);
+                }
+                if source_offset < dest_offset + size && dest_offset < source_offset + size {
+                    return Err(Refusal::OverlappingSelfCopy {
+                        source_offset,
+                        dest_offset,
+                        size,
+                    });
+                }
             }
             Command::CopyBuffer {
                 source: from.buffer,
@@ -2130,6 +2148,68 @@ mod tests {
         assert_eq!(regions[0].dst_subresource.base_array_layer, 2);
         assert_eq!(regions[0].extent.width, 8);
         assert_eq!(regions[0].extent.height, 4);
+    }
+
+    /// The three arms of "this copy changes nothing" answer alike. The buffer
+    /// one used to refuse, which would report a failure for a command the
+    /// guest saw succeed --- and its refusal's own reason, that forward and
+    /// backward copy orders disagree, is a statement about a shift.
+    #[test]
+    fn a_buffer_window_copied_onto_itself_records_nothing_rather_than_refusing() {
+        let residency = populated();
+        assert!(plan(
+            &BlitOp::BufferToBuffer {
+                source: id(BUFFER_A),
+                source_offset: 64,
+                dest: id(BUFFER_A),
+                dest_offset: 64,
+                size: 32,
+            },
+            &residency,
+        )
+        .expect("a copy onto itself is complete, not invalid")
+        .is_none());
+    }
+
+    /// And the shift is still refused, at one byte either way, so the arm
+    /// above did not widen into the case that has no defined result.
+    #[test]
+    fn a_buffer_window_that_overlaps_without_being_the_same_window_still_refuses() {
+        let residency = populated();
+        for (source_offset, dest_offset) in [(64, 65), (65, 64)] {
+            let refusal = plan(
+                &BlitOp::BufferToBuffer {
+                    source: id(BUFFER_A),
+                    source_offset,
+                    dest: id(BUFFER_A),
+                    dest_offset,
+                    size: 32,
+                },
+                &residency,
+            )
+            .expect_err("a shifted self-copy has no defined result");
+            assert_eq!(
+                refusal,
+                Refusal::OverlappingSelfCopy {
+                    source_offset,
+                    dest_offset,
+                    size: 32,
+                }
+            );
+        }
+        // Disjoint windows of one buffer are an ordinary copy.
+        assert!(plan(
+            &BlitOp::BufferToBuffer {
+                source: id(BUFFER_A),
+                source_offset: 0,
+                dest: id(BUFFER_A),
+                dest_offset: 32,
+                size: 32,
+            },
+            &residency,
+        )
+        .expect("disjoint")
+        .is_some());
     }
 
     #[test]
