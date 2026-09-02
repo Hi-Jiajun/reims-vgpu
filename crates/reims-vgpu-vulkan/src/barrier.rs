@@ -766,6 +766,96 @@ mod tests {
         );
     }
 
+    /// Every barrier this module can translate, over the whole closed input
+    /// space, and the two claims the older path rests on.
+    ///
+    /// The input space really is closed and small: three declared scope bits,
+    /// five declared stage bits on each of two masks plus the "carried none"
+    /// case, three target shapes, and two hosts. So "everything this module
+    /// emits" can be swept rather than sampled --- and the sampled version
+    /// below it was six operations, which is not a covering of 3140.
+    ///
+    /// Two laws, and the second is not implied by the first:
+    ///
+    /// - no bit reaches a plan without an entry in the legacy map, which is
+    ///   what [`BarrierPlan::unmapped_bits`] says;
+    /// - a plan that orders memory still orders memory after the map. A row
+    ///   whose older equivalent were empty would be *mapped* and still drop
+    ///   the access, and a legacy host would be handed a barrier that orders
+    ///   nothing while the `synchronization2` host ordered a write against a
+    ///   read.
+    #[test]
+    fn every_barrier_this_module_can_translate_survives_the_older_vocabulary() {
+        const DECLARED_STAGES: u32 = RenderStages::VERTEX
+            | RenderStages::FRAGMENT
+            | RenderStages::TILE
+            | RenderStages::OBJECT
+            | RenderStages::MESH;
+
+        let mut translated = 0_u32;
+        for support in [RENDER, MESH] {
+            for after in (0..=DECLARED_STAGES).map(Some).chain([None]) {
+                for before in (0..=DECLARED_STAGES).map(Some).chain([None]) {
+                    let targets = [
+                        BarrierTarget::Texture,
+                        BarrierTarget::Resources(ResourceSpan { start: 0, len: 1 }),
+                    ]
+                    .into_iter()
+                    .chain(
+                        (0..=(BarrierScope::BUFFERS
+                            | BarrierScope::TEXTURES
+                            | BarrierScope::RENDER_TARGETS))
+                            .map(|bits| BarrierTarget::Scope(BarrierScope(bits))),
+                    );
+                    for target in targets {
+                        let op = BarrierOp {
+                            target,
+                            after_stages: after.map(RenderStages),
+                            before_stages: before.map(RenderStages),
+                        };
+                        // A decline is this module refusing a stage it cannot
+                        // express, which the tests above cover; there is no
+                        // plan to carry to the older path.
+                        let Ok(plan) = translate(&op, support) else {
+                            continue;
+                        };
+                        translated += 1;
+                        assert_eq!(
+                            plan.unmapped_bits(),
+                            (0, 0),
+                            "a bit with no older equivalent reached the plan for {op:?}"
+                        );
+                        let legacy = plan.legacy();
+                        assert_eq!(
+                            plan.src_access.is_empty(),
+                            legacy.src_access.is_empty(),
+                            "the map emptied a source access for {op:?}"
+                        );
+                        assert_eq!(
+                            plan.dst_access.is_empty(),
+                            legacy.dst_access.is_empty(),
+                            "the map emptied a destination access for {op:?}"
+                        );
+                        assert_eq!(
+                            plan.src_stages.is_empty(),
+                            legacy.src_stages.is_empty(),
+                            "the map emptied a source stage for {op:?}"
+                        );
+                        assert_eq!(
+                            plan.dst_stages.is_empty(),
+                            legacy.dst_stages.is_empty(),
+                            "the map emptied a destination stage for {op:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Stated so a change that empties an arm --- a decline that starts
+        // firing for every input, say --- is a failure and not a sweep that
+        // silently checks nothing.
+        assert_eq!(translated, 3140, "the swept space changed shape");
+    }
+
     /// The legacy path consumes the same plan. A map that dropped a bit would
     /// ask the host on the older path for less ordering than the guest wrote.
     #[test]
