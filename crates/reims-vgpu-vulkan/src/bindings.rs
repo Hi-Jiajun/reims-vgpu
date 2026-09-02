@@ -84,17 +84,11 @@ impl SlotMask {
         self.words.iter_mut().for_each(|w| *w = 0);
     }
 
-    fn fill(&mut self, slots: usize) {
-        self.words.resize(slots.div_ceil(64), 0);
-        for (i, word) in self.words.iter_mut().enumerate() {
-            let remaining = slots.saturating_sub(i * 64);
-            *word = if remaining >= 64 {
-                u64::MAX
-            } else if remaining == 0 {
-                0
-            } else {
-                (1u64 << remaining) - 1
-            };
+    /// Make room for `slots` without disturbing the bits already held.
+    fn reserve(&mut self, slots: usize) {
+        let words = slots.div_ceil(64);
+        if self.words.len() < words {
+            self.words.resize(words, 0);
         }
     }
 
@@ -300,16 +294,26 @@ impl BindingTable {
     }
 }
 
+/// Add every bound slot to `mask`, keeping what it already holds.
+///
+/// A union and not a replacement. A slot the guest unbound since the last
+/// emission is dirty and *not* bound, so a mask built from the bound set alone
+/// would clear it — and the emission that followed would write every bound
+/// slot into a live set and leave the unbound one naming the resource the
+/// guest just released. A disturbance is a claim about what the driver
+/// believes, never permission to forget what the guest did.
+///
+/// A word at a time so the cost is the same as writing the whole mask.
 fn mark_bound<T>(slots: &[Option<T>], mask: &mut SlotMask) {
-    mask.fill(slots.len());
-    for (slot, entry) in slots.iter().enumerate() {
-        if entry.is_none() {
-            // `fill` set every bit; clearing the unbound ones is cheaper than
-            // testing each one before setting it, and the result is the same
-            // set.
-            let word = slot / 64;
-            mask.words[word] &= !(1 << (slot % 64));
+    mask.reserve(slots.len());
+    for (index, chunk) in slots.chunks(64).enumerate() {
+        let mut bound = 0u64;
+        for (bit, entry) in chunk.iter().enumerate() {
+            if entry.is_some() {
+                bound |= 1 << bit;
+            }
         }
+        mask.words[index] |= bound;
     }
 }
 
@@ -488,6 +492,46 @@ mod tests {
         t.reset();
         assert_eq!(t.buffer(1), None);
         assert!(t.is_clean(), "there is nothing left to write");
+    }
+
+    /// A slot the guest unbound is a change, and a disturbance is a claim
+    /// about the driver's belief rather than permission to forget it. The
+    /// disturbance built its mask from the *bound* slots and overwrote the
+    /// dirty set with it, so the unbind's bit was cleared; the emission that
+    /// followed took a live holder, wrote every bound slot into it, and left
+    /// the unbound slot's descriptor naming the released resource.
+    #[test]
+    fn a_disturbance_does_not_swallow_an_unbind_that_has_not_been_emitted() {
+        let mut t = table();
+        t.bind_texture(5, texture(9));
+        t.bind_texture(6, texture(10));
+        emit(&mut t);
+        assert!(t.is_clean());
+
+        assert!(t.bind_texture(5, None), "an unbind is a change");
+        t.disturb_all();
+
+        let dirty = t.take_dirty();
+        assert!(dirty.textures.contains(5), "the unbind still owes a write");
+        assert!(
+            dirty.textures.contains(6),
+            "and so does the slot still bound"
+        );
+    }
+
+    /// The union must not invent slots either: a disturbance still owes
+    /// nothing for a slot that was never bound.
+    #[test]
+    fn a_disturbance_still_marks_only_what_is_bound_or_already_dirty() {
+        let mut t = BindingTable::new(4, 4, 4);
+        t.bind_texture(2, texture(1));
+        emit(&mut t);
+        t.disturb_all();
+
+        let dirty = t.take_dirty();
+        assert_eq!(dirty.textures.slots(), vec![2]);
+        assert!(dirty.buffers.is_empty());
+        assert!(dirty.samplers.is_empty());
     }
 
     /// The argument-table sizes are the guest's own capacity hints. A record
