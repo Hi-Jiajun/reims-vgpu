@@ -378,6 +378,19 @@ fn packet_site(channel: Option<u32>) -> String {
     }
 }
 
+/// Forget everything cached about a child channel whose lifetime just moved.
+///
+/// One function because both ends of the lifetime owe it. An open must forget
+/// as much as a free: the number is reused, and a hold or a cached ring left
+/// over from the previous occupant is the new channel inheriting a decision
+/// nothing made about it.
+fn forget_child_channel(state: &mut DeviceState, channel: u32, bit: u32) {
+    state.translation_deferred_mask &= !bit;
+    state.translation_order_hold_mask &= !bit;
+    state.present_translation_hold_mask &= !bit;
+    state.child_rings[channel as usize] = Default::default();
+}
+
 /// `CmdDeleteTask` (0x20), from either FIFO.
 ///
 /// The guest recycles task ids, so a delete that does not land leaves a later
@@ -2295,46 +2308,29 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 Err(short) => note_short_payload(slug, None, &short),
             }
         }
-        ROOT_OP_DEFINE_FIFO => {
-            if !packet_short(
-                "define_fifo",
-                None,
-                packet.payload.len(),
-                crate::protocol::fifo::CHANNEL_LIFETIME_LEN as usize,
-            ) {
-                let ch = ld32(
-                    &packet.payload[crate::protocol::fifo::CHANNEL_LIFETIME_CHANNEL_ID as usize..],
-                );
-                if is_child_channel(ch) {
+        // The two ends of one channel lifetime. They share a payload because
+        // they share a decoder — `crate::protocol::fifo` owns that layout, and
+        // reading it here with a length check and an `ld32` at a named offset
+        // was a second reading of one record.
+        ROOT_OP_DEFINE_FIFO | ROOT_OP_FREE_FIFO => {
+            let opening = packet.opcode == ROOT_OP_DEFINE_FIFO;
+            let slug = if opening { "define_fifo" } else { "free_fifo" };
+            match crate::protocol::fifo::decode_channel_lifetime(&packet.payload) {
+                Ok(ch) if is_child_channel(ch) => {
                     let bit = 1u32 << ch;
-                    state.active_child_mask |= bit;
-                    state.translation_deferred_mask &= !bit;
-                    state.translation_order_hold_mask &= !bit;
-                    state.present_translation_hold_mask &= !bit;
-                    // Invalidate ring cache for this channel.
-                    state.child_rings[ch as usize] = Default::default();
+                    if opening {
+                        state.active_child_mask |= bit;
+                    } else {
+                        state.active_child_mask &= !bit;
+                        // Only a free clears it: an open is not a claim that
+                        // nothing is pending on the channel, and clearing it
+                        // there would drop a drain the guest is owed.
+                        state.pending.child_mask &= !bit;
+                    }
+                    forget_child_channel(state, ch, bit);
                 }
-            }
-        }
-        ROOT_OP_FREE_FIFO => {
-            if !packet_short(
-                "free_fifo",
-                None,
-                packet.payload.len(),
-                crate::protocol::fifo::CHANNEL_LIFETIME_LEN as usize,
-            ) {
-                let ch = ld32(
-                    &packet.payload[crate::protocol::fifo::CHANNEL_LIFETIME_CHANNEL_ID as usize..],
-                );
-                if is_child_channel(ch) {
-                    let bit = 1u32 << ch;
-                    state.active_child_mask &= !bit;
-                    state.pending.child_mask &= !bit;
-                    state.translation_deferred_mask &= !bit;
-                    state.translation_order_hold_mask &= !bit;
-                    state.present_translation_hold_mask &= !bit;
-                    state.child_rings[ch as usize] = Default::default();
-                }
+                Ok(_) => {}
+                Err(short) => note_short_payload(slug, None, &short),
             }
         }
         ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, None),

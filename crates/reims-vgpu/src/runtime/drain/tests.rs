@@ -1071,6 +1071,51 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     assert_eq!(state.translation_order_hold_mask, 0);
 }
 
+/// The open end of the same lifetime owes the same forgetting, and its
+/// sibling below is the only thing that was ever asserted about it.
+///
+/// A channel number is reused. A hold or a cached ring left over from the
+/// previous occupant is the new channel inheriting a decision nothing made
+/// about it — a deferred translation it never asked for, or a ring whose head
+/// belongs to a producer that is gone.
+///
+/// The one thing an open does *not* clear is `pending.child_mask`. Opening a
+/// channel is not a claim that nothing is pending on it, and clearing it here
+/// would drop a drain the guest is owed.
+#[test]
+fn define_fifo_forgets_the_previous_occupants_translation_state() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let bit = 1 << 1;
+    state.pending.child_mask = bit;
+    state.translation_deferred_mask = bit;
+    state.translation_order_hold_mask = bit;
+    state.present_translation_hold_mask = bit;
+
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_DEFINE_FIFO,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 4,
+            completion_stamp: 0,
+            payload: 1u32.to_le_bytes().to_vec(),
+            next_head: 0,
+        },
+    );
+
+    assert_eq!(state.active_child_mask & bit, bit, "the channel is open");
+    assert_eq!(state.translation_deferred_mask & bit, 0);
+    assert_eq!(state.translation_order_hold_mask & bit, 0);
+    assert_eq!(state.present_translation_hold_mask & bit, 0);
+    assert_eq!(
+        state.pending.child_mask & bit,
+        bit,
+        "an open is not a claim that nothing is pending on the channel"
+    );
+}
+
 /// FIFO redefine/free retires scheduler ownership so a removed producer
 /// cannot strand later display transactions behind a stale bit.
 #[test]
