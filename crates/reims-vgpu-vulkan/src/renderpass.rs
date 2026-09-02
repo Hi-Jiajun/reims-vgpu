@@ -186,6 +186,38 @@ pub struct ResolveTarget {
     pub view: vk::ImageView,
     pub format: vk::Format,
     pub samples: vk::SampleCountFlags,
+    /// What this view covers. See [`Coverage`] --- a resolve target is an
+    /// element of the framebuffer's attachment array like any other, so the
+    /// render area has to fit inside it too.
+    pub coverage: Coverage,
+}
+
+/// What one attachment view actually covers, which the render area must fit
+/// inside.
+///
+/// # Why the view carries this rather than the area assuming it
+///
+/// A `VkFramebuffer` is created with a width, a height and a layer count, and
+/// every view it is given must be at least that large on all three
+/// (VUID-VkFramebufferCreateInfo-flags-04533, -04534 and -04535). The area
+/// comes from the guest's `renderTargetWidth`/`Height`/`ArrayLength`, and the
+/// views come from textures the guest attached; nothing on the wire makes them
+/// agree, and the pass descriptor's own extent is a *separate* declaration the
+/// guest may write anything into.
+///
+/// So this is measured and not assumed, for the reason [`ResolveTarget`]'s own
+/// doc gives about format and samples: describing the view from the area would
+/// state the requirement as a fact instead of checking it, and
+/// `vkCreateFramebuffer` would then refuse it with a message naming neither
+/// the texture nor the field the guest wrote.
+///
+/// The extent is the *view's* --- the mip level it was made over, not level
+/// zero --- because that is what the framebuffer is measured against. Likewise
+/// `layers` is the view's `layerCount` and not the image's array size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Coverage {
+    pub extent: vk::Extent2D,
+    pub layers: u32,
 }
 
 /// One attachment's image, resolved by the caller from the plan's resource
@@ -195,6 +227,8 @@ pub struct Bound {
     pub format: vk::Format,
     pub samples: vk::SampleCountFlags,
     pub view: vk::ImageView,
+    /// What this view covers. See [`Coverage`].
+    pub coverage: Coverage,
     /// The image this attachment resolves into. Required exactly when the
     /// plan's attachment asks to resolve.
     pub resolve: Option<ResolveTarget>,
@@ -252,6 +286,48 @@ pub enum Refusal {
         index: usize,
         samples: vk::SampleCountFlags,
     },
+    /// An attachment view is smaller than the area the pass renders over.
+    ///
+    /// The render area is the guest's `renderTargetWidth`, `Height` and
+    /// `ArrayLength`, written on the pass descriptor; the views are textures
+    /// the guest attached. They are separate declarations and the wire makes
+    /// neither bound the other, so a pass may name an area larger than
+    /// something it renders into --- which is a `vkCreateFramebuffer` every
+    /// one of whose views is too small on that axis
+    /// (VUID-VkFramebufferCreateInfo-flags-04533, -04534 and -04535), and a
+    /// driver that does not check writes past the end of a texture.
+    ///
+    /// One variant with an axis rather than three, because the sentence is the
+    /// same each time. `slot` names which view, since a pass has up to
+    /// seventeen of them and "an attachment" names none.
+    AttachmentSmallerThanArea {
+        slot: AttachmentName,
+        axis: &'static str,
+        covered: u32,
+        area: u32,
+    },
+}
+
+/// Which of a pass's views a refusal is about.
+///
+/// A pass carries up to eight colour attachments, a resolve target for each,
+/// and one depth-stencil attachment. An index alone would name the colour slot
+/// and its resolve identically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentName {
+    Color(usize),
+    ColorResolve(usize),
+    DepthStencil,
+}
+
+impl std::fmt::Display for AttachmentName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Color(index) => write!(f, "color{index}"),
+            Self::ColorResolve(index) => write!(f, "color{index}_resolve"),
+            Self::DepthStencil => f.write_str("depth_stencil"),
+        }
+    }
 }
 
 impl Refusal {
@@ -265,6 +341,7 @@ impl Refusal {
             Self::DepthStencilResolveUnsupported => "vk_renderpass_depth_stencil_resolve",
             Self::ResolveFormatMismatch { .. } => "vk_renderpass_resolve_format",
             Self::ResolveIsMultisampled { .. } => "vk_renderpass_resolve_multisampled",
+            Self::AttachmentSmallerThanArea { .. } => "vk_renderpass_attachment_smaller_than_area",
         }
     }
 }
@@ -304,6 +381,16 @@ impl std::fmt::Display for Refusal {
                 "{} index={index} samples={:?}",
                 self.slug(),
                 samples.as_raw()
+            ),
+            Self::AttachmentSmallerThanArea {
+                slot,
+                axis,
+                covered,
+                area,
+            } => write!(
+                f,
+                "{} slot={slot} axis={axis} covered={covered} area={area}",
+                self.slug()
             ),
             Self::DepthStencilResolveUnsupported => f.write_str(self.slug()),
         }
@@ -478,6 +565,49 @@ pub fn build(
         }
     }
     let samples = samples.unwrap_or(vk::SampleCountFlags::TYPE_1);
+
+    // Every view the framebuffer will be given, against the area it will be
+    // created with. Before any description is written, and over the resolve
+    // targets as well: a resolve target is an element of the same attachment
+    // array, so the requirement is its too. The plan's own extent is already
+    // narrowed and non-zero --- see `crate::pass::plan` --- so what is left is
+    // whether the images the names resolved to are big enough to hold it.
+    let area = Coverage {
+        extent: plan.extent,
+        layers: plan.layers,
+    };
+    let named = color
+        .iter()
+        .enumerate()
+        .flat_map(|(index, bound)| {
+            [Some((AttachmentName::Color(index), bound.coverage))]
+                .into_iter()
+                .chain([bound
+                    .resolve
+                    .map(|target| (AttachmentName::ColorResolve(index), target.coverage))])
+        })
+        .flatten()
+        .chain(
+            depth_stencil
+                .iter()
+                .map(|bound| (AttachmentName::DepthStencil, bound.coverage)),
+        );
+    for (slot, coverage) in named {
+        for (axis, covered, wanted) in [
+            ("width", coverage.extent.width, area.extent.width),
+            ("height", coverage.extent.height, area.extent.height),
+            ("layers", coverage.layers, area.layers),
+        ] {
+            if covered < wanted {
+                return Err(Refusal::AttachmentSmallerThanArea {
+                    slot,
+                    axis,
+                    covered,
+                    area: wanted,
+                });
+            }
+        }
+    }
 
     for (index, (planned, bound)) in plan.color.iter().zip(color).enumerate() {
         if planned.resolve.is_some() != bound.resolve.is_some() {
@@ -1048,11 +1178,22 @@ mod tests {
         plan(&d, |_| MTL_FORMAT_RGBA8_UNORM).expect("a legal descriptor")
     }
 
+    /// A view exactly covering [`descriptor`]'s render area, so a test that
+    /// is not about coverage never trips the coverage check.
+    const COVERS: Coverage = Coverage {
+        extent: vk::Extent2D {
+            width: 128,
+            height: 64,
+        },
+        layers: 1,
+    };
+
     fn bound(view_id: u64) -> Bound {
         Bound {
             format: vk::Format::R8G8B8A8_UNORM,
             samples: vk::SampleCountFlags::TYPE_1,
             view: view(view_id),
+            coverage: COVERS,
             resolve: None,
         }
     }
@@ -1063,6 +1204,7 @@ mod tests {
             view: view(view_id),
             format: vk::Format::R8G8B8A8_UNORM,
             samples: vk::SampleCountFlags::TYPE_1,
+            coverage: COVERS,
         }
     }
 
@@ -1330,6 +1472,7 @@ mod tests {
             format: vk::Format::D32_SFLOAT,
             samples: vk::SampleCountFlags::TYPE_1,
             view: view(30),
+            coverage: COVERS,
             resolve: None,
         };
         let built = build(&plan, &[bound(10), bound(20)], Some(depth)).expect("legal");
@@ -1431,6 +1574,7 @@ mod tests {
             format: vk::Format::D32_SFLOAT,
             samples: vk::SampleCountFlags::TYPE_1,
             view: view(2),
+            coverage: COVERS,
             resolve: None,
         };
         let built = build(&plan, &[bound(1)], Some(depth)).expect("legal");
@@ -1655,6 +1799,144 @@ mod tests {
         );
     }
 
+    /// The failure this exists to prevent: a `VkFramebuffer` is created with a
+    /// width, a height and a layer count, and every view it is given must be
+    /// at least that large on all three. The area is the guest's
+    /// `renderTargetWidth`/`Height`/`ArrayLength` and the views are textures
+    /// the guest attached --- two separate declarations the wire does not make
+    /// agree. `Bound` did not carry what its view covered, so the build had
+    /// nothing to compare and the pass was created against images too small
+    /// for it.
+    #[test]
+    fn an_attachment_smaller_than_the_render_area_refuses_on_its_own_axis() {
+        let plan = one_colour(LoadAction::Clear, StoreAction::Store);
+        assert_eq!(
+            plan.extent,
+            vk::Extent2D {
+                width: 128,
+                height: 64
+            }
+        );
+        assert!(build(&plan, &[bound(10)], None).is_ok(), "exactly covering");
+
+        // Each axis independently, and one texel short on each.
+        for (axis, coverage) in [
+            (
+                "width",
+                Coverage {
+                    extent: vk::Extent2D {
+                        width: 127,
+                        height: 64,
+                    },
+                    layers: 1,
+                },
+            ),
+            (
+                "height",
+                Coverage {
+                    extent: vk::Extent2D {
+                        width: 128,
+                        height: 63,
+                    },
+                    layers: 1,
+                },
+            ),
+            (
+                "layers",
+                Coverage {
+                    extent: vk::Extent2D {
+                        width: 128,
+                        height: 64,
+                    },
+                    layers: 0,
+                },
+            ),
+        ] {
+            let short = Bound {
+                coverage,
+                ..bound(10)
+            };
+            let refusal = build(&plan, &[short], None).expect_err("one axis short");
+            assert!(
+                matches!(
+                    refusal,
+                    Refusal::AttachmentSmallerThanArea {
+                        slot: AttachmentName::Color(0),
+                        axis: named,
+                        ..
+                    } if named == axis
+                ),
+                "{axis}: {refusal}"
+            );
+        }
+
+        // A view larger than the area is legal --- the framebuffer renders
+        // into part of it --- which is what makes the refusal a bound and not
+        // an equality.
+        let larger = Bound {
+            coverage: Coverage {
+                extent: vk::Extent2D {
+                    width: 256,
+                    height: 128,
+                },
+                layers: 4,
+            },
+            ..bound(10)
+        };
+        assert!(build(&plan, &[larger], None).is_ok());
+    }
+
+    /// And the resolve target is measured too: it is an element of the same
+    /// framebuffer attachment array, so the requirement is equally its. The
+    /// colour attachment beside it covers the area, so a check that ran only
+    /// over the attachments would pass this.
+    #[test]
+    fn a_resolve_target_smaller_than_the_render_area_refuses_by_its_own_name() {
+        let mut d = descriptor();
+        d.color[0].texture = Some(id(1));
+        d.color[0].load = LoadAction::Clear;
+        d.color[0].store = StoreAction::MultisampleResolve;
+        d.color[0].resolve_texture = Some(id(2));
+        let plan = plan(&d, |_| MTL_FORMAT_RGBA8_UNORM).expect("a legal descriptor");
+
+        let short = ResolveTarget {
+            coverage: Coverage {
+                extent: vk::Extent2D {
+                    width: 64,
+                    height: 64,
+                },
+                layers: 1,
+            },
+            ..resolve_target(20)
+        };
+        assert_eq!(
+            build(
+                &plan,
+                &[Bound {
+                    resolve: Some(short),
+                    ..bound(10)
+                }],
+                None,
+            )
+            .expect_err("the resolve target is half as wide"),
+            Refusal::AttachmentSmallerThanArea {
+                slot: AttachmentName::ColorResolve(0),
+                axis: "width",
+                covered: 64,
+                area: 128,
+            }
+        );
+        assert!(build(
+            &plan,
+            &[Bound {
+                resolve: Some(resolve_target(20)),
+                ..bound(10)
+            }],
+            None,
+        )
+        .is_ok());
+    }
+
     #[test]
     fn every_refusal_names_itself() {
         let refusals = [
@@ -1683,6 +1965,12 @@ mod tests {
             Refusal::ResolveIsMultisampled {
                 index: 0,
                 samples: vk::SampleCountFlags::TYPE_4,
+            },
+            Refusal::AttachmentSmallerThanArea {
+                slot: AttachmentName::ColorResolve(3),
+                axis: "height",
+                covered: 32,
+                area: 64,
             },
         ];
         let mut slugs: Vec<&str> = refusals.iter().map(|r| r.slug()).collect();
@@ -2246,6 +2534,14 @@ mod cache_tests {
                 format: vk::Format::B8G8R8A8_UNORM,
                 samples: vk::SampleCountFlags::TYPE_1,
                 view: vk::ImageView::from_raw(10),
+                // Exactly the render area declared above.
+                coverage: Coverage {
+                    extent: vk::Extent2D {
+                        width: 64,
+                        height: 32,
+                    },
+                    layers: 1,
+                },
                 resolve: None,
             }],
             None,

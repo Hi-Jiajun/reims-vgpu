@@ -1335,6 +1335,15 @@ fn a_planned_pass_becomes_a_render_pass_and_a_framebuffer_this_driver_accepts() 
             format: vk::Format::R8G8B8A8_UNORM,
             samples: vk::SampleCountFlags::TYPE_1,
             view: image_view,
+            // The view is over the whole of a 64x32 image, which is the render
+            // area the descriptor above declared.
+            coverage: renderpass::Coverage {
+                extent: vk::Extent2D {
+                    width: 64,
+                    height: 32,
+                },
+                layers: 1,
+            },
             resolve: None,
         }],
         None,
