@@ -415,4 +415,23 @@ mod tests {
             }
         }
     }
+
+    /// Every primitive type lands on the Vulkan topology of the same name.
+    ///
+    /// Metal names the primitive and leaves the grouping implicit; Vulkan names
+    /// both, so a guest type that does not say `Strip` is a list. That is the
+    /// whole difference, and it is the one a pipeline once lost --- a `Class`
+    /// key declaring a stand-in topology rasterized every triangle strip as a
+    /// list. A check that reads the guest name rather than the table cannot
+    /// lose it the same way twice.
+    #[test]
+    fn every_primitive_lands_on_the_topology_of_the_same_name() {
+        for guest in PrimitiveType::ALL {
+            assert_eq!(
+                format!("{:?}", topology(guest)),
+                crate::naming::vulkan_topology_spelling(&format!("{guest:?}")),
+                "{guest:?}"
+            );
+        }
+    }
 }

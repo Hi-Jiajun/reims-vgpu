@@ -250,6 +250,22 @@ pub(crate) mod naming {
                 .expect("non-empty")
                 .push(ch.to_ascii_uppercase());
         }
+        // Word-for-word vocabulary, which is what makes this a derivation
+        // rather than a second table: each substitution is a fact about how
+        // the two APIs spell one concept, and every arm containing that word
+        // takes it. Nothing here knows which arm it is looking at.
+        for word in &mut words {
+            *word = match word.as_str() {
+                "SOURCE" => "SRC".to_string(),
+                "SOURCE1" => "SRC1".to_string(),
+                "DESTINATION" => "DST".to_string(),
+                // Metal names the blend constant after the blend; Vulkan names
+                // it after what it is.
+                "BLEND" => "CONSTANT".to_string(),
+                "SATURATED" => "SATURATE".to_string(),
+                other => other.to_string(),
+            };
+        }
         // Metal writes the comparison as one word and Vulkan spells the
         // conjunction; the same for the stencil operations' saturation.
         // `NotEqual` is `NOT_EQUAL` in both, which is why the first rule asks
@@ -264,5 +280,23 @@ pub(crate) mod naming {
             }
         }
         words.join("_")
+    }
+
+    /// The same, for the topology table, whose one difference is a suffix
+    /// rather than a word.
+    ///
+    /// Metal names the primitive and leaves the grouping implicit; Vulkan
+    /// names both. So a guest type that does not say `Strip` is a list, and
+    /// that is the whole rule --- which is exactly the distinction a pipeline
+    /// once lost by declaring a stand-in topology, so it is worth a check that
+    /// does not read the table.
+    #[must_use]
+    pub(crate) fn vulkan_topology_spelling(camel: &str) -> String {
+        let spelled = vulkan_spelling(camel);
+        if spelled.ends_with("_STRIP") {
+            spelled
+        } else {
+            format!("{spelled}_LIST")
+        }
     }
 }
