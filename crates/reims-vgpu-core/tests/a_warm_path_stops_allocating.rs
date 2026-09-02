@@ -380,16 +380,29 @@ fn appending_records_to_a_transaction_does_not_allocate_per_record() {
         allocations
     }
 
-    let small = run(64);
-    let large = run(256);
+    // The slope, measured twice a decade apart rather than once. "Fewer than
+    // sixty-four trips for sixty-four records" reads as "not one per record"
+    // and is not: the fixed cost is three, so that bound had sixty trips of
+    // headroom and a cost of one trip per four records would have satisfied
+    // it.
+    let (four, sixteen) = (run(4), run(16));
+    let (small, large) = (run(64), run(256));
     assert!(
-        small < 64,
-        "{small} trips for sixty-four records is one per record"
+        sixteen - four <= 6,
+        "four records cost {four} and sixteen cost {sixteen}: four times the \
+         records for {} more trips",
+        sixteen - four
     );
     assert!(
-        large <= small + 16,
-        "{large} trips for 256 records against {small} for 64: the cost is \
-         linear in the records rather than logarithmic"
+        large - small <= 8,
+        "64 records cost {small} and 256 cost {large}: four times the records \
+         for {} more trips",
+        large - small
+    );
+    assert!(
+        run(1) <= 8,
+        "{} trips to append one blit to a fresh builder",
+        run(1)
     );
 }
 
