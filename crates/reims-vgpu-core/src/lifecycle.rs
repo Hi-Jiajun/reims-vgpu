@@ -1999,6 +1999,145 @@ mod tests {
         );
     }
 
+    /// The module's "nothing is half-applied" claim, over every content
+    /// command and every position a bad name can sit in.
+    ///
+    /// `a_list_with_one_stale_name_changes_nothing` drives one command with the
+    /// stale name last, which is the position where a loop that applied as it
+    /// resolved would still look right for the *first* resource it touched only
+    /// if it touched none --- and says nothing about the other three commands
+    /// or about a name in the middle. The claim is over all four and over every
+    /// position, so it is driven that way rather than from a hand-picked case:
+    /// a hand-picked case is the second copy of the rule.
+    ///
+    /// The observation is the whole content ledger reachable through its own
+    /// doors, per backing, so a command that moved a version, a freshness run
+    /// or an extent anywhere is caught rather than only one that moved the
+    /// version this test happened to name.
+    #[test]
+    fn no_content_command_applies_any_of_a_list_it_refuses() {
+        const LENGTH: u64 = 256;
+        let build = || {
+            let mut l = Lifecycle::new();
+            apply_inert(
+                &mut l,
+                &LifecycleOp::DefineTask {
+                    task: TASK,
+                    kernel: false,
+                    directory: DirectoryFrame(0x1000),
+                },
+            );
+            for slot in 0..3u32 {
+                apply_inert(
+                    &mut l,
+                    &LifecycleOp::CreateResource {
+                        task: TASK,
+                        slot: ObjectListRef(slot),
+                        storage: dedicated(u64::from(slot) + 10, LENGTH),
+                    },
+                );
+            }
+            // The device produced the back half of each. Without a write there
+            // is nothing to synchronise and nothing to discard, and three of
+            // the four commands would be inert for a reason that has nothing to
+            // do with the rule under test.
+            for slot in 0..3u32 {
+                l.record_write(
+                    TASK,
+                    name(slot),
+                    LENGTH / 2,
+                    LENGTH / 2,
+                    Replica::DeviceOwned,
+                )
+                .expect("inside the resource");
+            }
+            l
+        };
+        // Everything the ledger will say about the three backings, through its
+        // own doors: the newest version, the declared extent, the current
+        // version of the whole span and of each half, and which replicas hold
+        // which bytes fresh.
+        let snapshot = |l: &Lifecycle| -> Vec<String> {
+            // The census leads, because a synchronise's admission leaves no
+            // mark on the versions at all --- what it does is ask
+            // `transfer_for_read`, which counts. Without it a synchronise that
+            // resolved and asked one resource at a time would refuse having
+            // already asked about the ones before the bad name, and every
+            // version would still read as untouched.
+            core::iter::once(format!("{:?}", l.content().census()))
+                .chain((10..13u64).map(|backing| {
+                    let backing = BackingId(backing);
+                    let content = l.content();
+                    format!(
+                        "{backing:?} newest={:?} extent={:?} whole={:?} lo={:?} hi={:?} {:?}",
+                        content.newest_version(backing),
+                        content.extent(backing),
+                        content.version_of(backing, range(0, LENGTH)),
+                        content.version_of(backing, range(0, LENGTH / 2)),
+                        content.version_of(backing, range(LENGTH / 2, LENGTH / 2)),
+                        Replica::BOTH.map(|replica| (
+                            replica,
+                            content.is_fresh(backing, range(0, LENGTH), replica),
+                            content.is_fresh(backing, range(0, LENGTH / 2), replica),
+                        )),
+                    )
+                }))
+                .collect()
+        };
+
+        let stale = ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration::default().next(),
+        };
+        let expected = Refusal::Namespace {
+            task: TASK,
+            refusal: namespace::Refusal::NotDeclared {
+                slot: ObjectListRef(9),
+            },
+        };
+        let commands: [fn(TaskId, Vec<ResourceId>) -> LifecycleOp; 4] = [
+            |task, resources| LifecycleOp::Invalidate { task, resources },
+            |task, resources| LifecycleOp::Synchronize { task, resources },
+            |task, resources| LifecycleOp::SynchronizeAndDiscard { task, resources },
+            |task, resources| LifecycleOp::Discard { task, resources },
+        ];
+        for command in commands {
+            // Each command is first driven with a list that resolves whole, so
+            // a version that never moves because the command does nothing at
+            // all cannot be read as a command that refused cleanly.
+            let mut moves = build();
+            let before = snapshot(&moves);
+            let effects = moves
+                .apply(&command(TASK, (0..3).map(name).collect()))
+                .expect("three live names resolve");
+            let kind = command(TASK, Vec::new()).kind();
+            assert!(
+                snapshot(&moves) != before || effects != Effects::default(),
+                "{kind:?} over three live resources did nothing observable, so \
+                 the refusing runs below prove nothing"
+            );
+
+            for position in 0..4 {
+                let mut resources: Vec<ResourceId> = (0..3).map(name).collect();
+                resources.insert(position, stale);
+                let mut l = build();
+                let before = snapshot(&l);
+                assert_eq!(
+                    l.apply(&command(TASK, resources))
+                        .expect_err("one name never resolved"),
+                    expected,
+                    "{kind:?} with the stale name at {position}"
+                );
+                assert_eq!(
+                    snapshot(&l),
+                    before,
+                    "{kind:?} applied part of a list it refused, with the stale \
+                     name at {position}"
+                );
+            }
+        }
+    }
+
     /// A heap-placed resource does not own pages, so there is nothing to
     /// re-point — and re-pointing the heap's storage would move its neighbours.
     #[test]
