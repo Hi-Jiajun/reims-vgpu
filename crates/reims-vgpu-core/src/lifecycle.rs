@@ -1051,12 +1051,41 @@ impl Task {
     }
 }
 
-/// The resource-lifecycle owner for one session generation.
+/// The resource-lifecycle owner: every task's names and heaps, and the one
+/// session-wide content authority.
 ///
-/// Holds the per-task name and heap owners, and the one session-wide content
-/// authority: content is a property of a backing, and an IOSurface backing is
-/// reachable from more than one task, so a per-task ledger would have two
-/// answers to where the current bytes are.
+/// The authority is session-wide and not per task because content is a
+/// property of a backing, and an IOSurface backing is reachable from more than
+/// one task, so a per-task ledger would have two answers to where the current
+/// bytes are.
+///
+/// # What ends this, and what does not
+///
+/// Deleting a task ends its half — [`Self::apply`]'s `DeleteTask` retires
+/// every name, frees the storage no other task holds, and hands both back in
+/// the [`Effects`]. That is the only door, and it is per task on purpose.
+///
+/// There is deliberately **no** generation door. This used to be described as
+/// the owner "for one session generation", which claimed a scope nothing here
+/// enforces: a reset advances [`crate::identity::SessionGeneration`] and
+/// leaves every task, name, heap and content entry exactly where it was.
+/// Whether that is right is not this module's to decide —
+/// `.agents/paravirt-vulkan-replacement-architecture-plan.md` puts a reset's
+/// "completion and resource consequences" among the terms that must be
+/// *learned* from the ParaVirt contract, and observing that the current device
+/// clears guest-derived state on reset is listed there as evidence for
+/// separating the two lifetimes rather than as proof of the survival rule. A
+/// door that tore down every task on reset would be that guess, and a guest
+/// that resets and keeps using its objects would lose them to it.
+///
+/// Device loss is the other one and is a different question, because there the
+/// plan *is* explicit: content the lost device held is undefined and must not
+/// be promoted to a successful result or copied back. Nothing here drops a
+/// [`crate::content::Replica::DeviceOwned`] claim when an epoch dies, so a
+/// later synchronize can still find the device the only holder of bytes that
+/// no longer exist. What the guest is owed for those bytes is the unrecovered
+/// half, and inventing an answer would put plausible content in guest memory
+/// — which is the one thing the plan says this device does not do.
 #[derive(Debug, Default)]
 pub struct Lifecycle {
     tasks: HashMap<TaskId, Task>,
