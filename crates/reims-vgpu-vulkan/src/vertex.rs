@@ -174,6 +174,26 @@ pub struct VertexFormatSupport {
     bits: u64,
 }
 
+/// The width claim above, checked rather than written down.
+///
+/// Every shift in this bitset is `1u64 << guest.ordinal()`, and the ordinal is
+/// `MTLVertexFormat`'s own value in another crate — not a dense index this
+/// crate controls. A format added there at 64 or beyond does not fail here: on
+/// x86 the shift amount is masked, so ordinal 64 sets ordinal *zero's* bit and
+/// a device declining `UChar2` would report declining the new format as well.
+/// A silently wrong capability answer, from a comment that was true when it was
+/// written.
+const _: () = {
+    let mut index = 0;
+    while index < VertexFormat::ALL.len() {
+        assert!(
+            VertexFormat::ALL[index].ordinal() < u64::BITS,
+            "a vertex format ordinal no longer fits this bitset's word"
+        );
+        index += 1;
+    }
+};
+
 impl VertexFormatSupport {
     /// A device that declined everything. The conservative state, and the one
     /// a `Default` census is in.
