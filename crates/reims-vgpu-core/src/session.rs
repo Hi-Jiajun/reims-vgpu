@@ -206,7 +206,7 @@ pub struct DeviceLoss {
 /// pipelines without the new generation says nothing about what may now be
 /// named.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the closed generation's pipelines are host objects nothing else will destroy"]
+#[must_use = "the closed generation's pipelines are host objects nothing else will destroy, and its stranded work is a channel head nothing else will release"]
 pub struct Reset {
     /// The lifetime the guest may now name things in.
     pub generation: SessionGeneration,
@@ -215,6 +215,20 @@ pub struct Reset {
     /// unnameable — see
     /// [`crate::pipeline::PipelineTable::generation_closed`].
     pub destroy: Vec<ResourceId>,
+    /// Transactions that were waiting for a pipeline the closed generation
+    /// took away, in ingress order and each named once.
+    ///
+    /// Accepted work is not invalidated by a reset — but a transaction parked
+    /// on a pipeline is parked on a name, and the name is what a reset ends.
+    /// The compile that lands afterwards finds no entry and releases nobody,
+    /// so left alone these hold their channels' publication heads forever.
+    ///
+    /// They come back rather than being withdrawn here, which is
+    /// [`SessionModel::pipeline_refused`]'s division of labour and not
+    /// [`SessionModel::device_lost`]'s: the work is not dead, its *lease* is,
+    /// and the caller withdraws each one with a typed reason on its failure
+    /// channel — see [`SessionModel::withdraw`].
+    pub stranded: Vec<IngressOrdinal>,
 }
 
 /// What admitting a packet produced.
@@ -326,17 +340,33 @@ impl SessionModel {
     /// host device, which may be perfectly healthy — recreating it here would
     /// throw away work the host is still executing in order to answer a
     /// question the guest did not ask.
+    /// Work already *running* against a pipeline holds it through the
+    /// executor's own lease and is untouched. Work still *waiting* for one is
+    /// not: its wait was on a name, and the name is what a reset ends, so
+    /// those transactions come back as [`Reset::stranded`] for the caller to
+    /// withdraw.
     pub fn reset(&mut self) -> Reset {
         let closed = self.generation;
         self.generation = self.generation.next();
+        // Accepted work is untouched — that is the whole of what a reset is
+        // not — but the *names* are gone, so nothing may reach these pipelines
+        // again and their host objects are the caller's to destroy.
+        let taken = self.pipelines.generation_closed(closed);
+        // Every removed name, not only the destroyable ones: a `Declared`
+        // pipeline has no host object and a draw can be parked on it just the
+        // same.
+        let mut stranded: Vec<IngressOrdinal> = taken
+            .removed
+            .iter()
+            .flat_map(|id| self.scheduler.pipeline_refused(*id))
+            .collect();
+        // One transaction may have been waiting on several of them.
+        stranded.sort_unstable();
+        stranded.dedup();
         Reset {
             generation: self.generation,
-            // Accepted work is untouched — that is the whole of what a reset
-            // is not — but the *names* are gone, so nothing may reach these
-            // pipelines again and their host objects are the caller's to
-            // destroy. A transaction already admitted against one holds it
-            // through the executor's own lease, not through this table.
-            destroy: self.pipelines.generation_closed(closed),
+            destroy: taken.destroy,
+            stranded,
         }
     }
 
@@ -1188,6 +1218,103 @@ mod tests {
         // nothing, which is what stops a late compile callback resurrecting a
         // pipeline the guest deleted.
         assert!(!s.pipeline_ready(pipeline));
+    }
+
+    /// A reset ends the pipeline's *name*, and a transaction waiting for one
+    /// was waiting on the name.
+    ///
+    /// The compile lands afterwards into a table with no entry for it, so
+    /// nothing releases the waiter: left unnamed it holds its channel's
+    /// publication head and every completion word behind it stops arriving.
+    /// `device_lost` has always answered this for its own lifetime; a reset is
+    /// the other one.
+    #[test]
+    fn a_reset_names_the_work_it_left_waiting_for_a_pipeline() {
+        let mut s = session();
+        // One of each: a pipeline the host had started building, which the
+        // reset also hands back to be destroyed, and one still `Declared`,
+        // which it does not — the waiter is stranded either way, and scoping
+        // the answer to the destroyable ones is what missed the second.
+        let building = ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration(1),
+        };
+        let declared = ResourceId {
+            slot: ObjectListRef(10),
+            generation: SlotGeneration(1),
+        };
+        let gen = s.generation();
+        s.pipelines().declare(building, gen);
+        s.pipelines().declare(declared, gen);
+        s.pipelines()
+            .advance(building, crate::pipeline::PipelineState::Translating);
+
+        let mut waiters = Vec::new();
+        for pipeline in [building, declared] {
+            let mut leased = packet(0x37);
+            let Payload::Exec(work) = &mut leased.payload else {
+                panic!("an EXEC");
+            };
+            work.pipeline_leases.push(pipeline);
+            let admitted = s.admit(&leased).expect("accepted");
+            assert!(!admitted.ready, "parked on {pipeline:?}");
+            waiters.push(admitted.transaction.identity.ingress);
+        }
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 2);
+
+        let reset = s.reset();
+        assert_eq!(
+            reset.destroy,
+            vec![building],
+            "only the one a host object exists for is destroyed"
+        );
+        assert_eq!(
+            reset.stranded, waiters,
+            "and both waiters are named, in ingress order"
+        );
+
+        // The half that makes it a hang: the news the compiling layer is about
+        // to deliver reaches nobody.
+        assert!(
+            !s.pipeline_ready(building),
+            "a compile landing after the reset resurrects nothing"
+        );
+        assert!(s.take_ready().is_empty(), "and releases nobody");
+
+        // So the caller withdrawing them is the only thing that frees the
+        // channel, which is what naming them is for.
+        for ingress in reset.stranded {
+            let _ = s.withdraw(ingress);
+        }
+        assert_eq!(s.scheduler().waiting_on_pipelines(), 0);
+    }
+
+    /// One transaction waiting on two of the closed generation's pipelines is
+    /// named once. A caller withdraws each name it is handed.
+    #[test]
+    fn a_transaction_stranded_by_two_pipelines_is_named_once() {
+        let mut s = session();
+        let gen = s.generation();
+        let mut leases = Vec::new();
+        for slot in [11, 12] {
+            let id = ResourceId {
+                slot: ObjectListRef(slot),
+                generation: SlotGeneration(1),
+            };
+            s.pipelines().declare(id, gen);
+            leases.push(id);
+        }
+        let mut leased = packet(0x37);
+        let Payload::Exec(work) = &mut leased.payload else {
+            panic!("an EXEC");
+        };
+        work.pipeline_leases.extend(leases);
+        let admitted = s.admit(&leased).expect("accepted");
+
+        assert_eq!(
+            s.reset().stranded,
+            vec![admitted.transaction.identity.ingress]
+        );
     }
 
     /// A pipeline that will never build is refused at ingress once it is known,

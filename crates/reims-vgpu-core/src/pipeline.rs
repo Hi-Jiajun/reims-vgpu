@@ -274,6 +274,24 @@ pub struct Census {
     pub leases_ready: usize,
 }
 
+/// What a closed semantic generation left behind.
+///
+/// Two lists over the same removal, because two callers ask different
+/// questions of it and answering only one of them strands the other — see
+/// [`PipelineTable::generation_closed`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[must_use = "a closed generation's pipelines are host objects to destroy and waits to discharge"]
+pub struct Closed {
+    /// Removed pipelines a host object exists for, in id order. Destroyed
+    /// rather than abandoned: a closed generation leaves the handles usable
+    /// and merely unnameable.
+    pub destroy: Vec<ResourceId>,
+    /// Every removed pipeline, in id order — including the ones no host object
+    /// was ever built for. These are the names nothing may reach again, which
+    /// is what a parked transaction was waiting on.
+    pub removed: Vec<ResourceId>,
+}
+
 impl PipelineTable {
     #[must_use]
     pub fn new() -> Self {
@@ -471,13 +489,23 @@ impl PipelineTable {
     /// [`crate::retire::Validity::SemanticallyClosed`]. That is the difference
     /// from [`Self::device_lost`], where the handles are what went.
     ///
-    /// Only the states a host object can exist in come back. `Declared` never
-    /// reached the host, and `Refused` is a build that did not happen; both
-    /// leave the table with the rest and neither is offered to a destroyer
-    /// that has nothing to destroy.
-    #[must_use = "a pipeline nobody destroys is a host object nothing frees"]
-    pub fn generation_closed(&mut self, closed: SessionGeneration) -> Vec<ResourceId> {
-        let mut destroy = Vec::new();
+    /// Only the states a host object can exist in are offered for
+    /// destruction. `Declared` never reached the host, and `Refused` is a
+    /// build that did not happen; both leave the table with the rest and
+    /// neither is offered to a destroyer that has nothing to destroy.
+    ///
+    /// **Removal and destruction are different scopes, and both come back.**
+    /// Every pipeline of the closed generation leaves the table, whatever its
+    /// state, and a transaction parked on one is parked on a wait that nothing
+    /// can now discharge — [`Self::advance`] answers `false` for a pipeline
+    /// with no entry, so the compile that lands afterwards releases nobody.
+    /// Returning only the destroyable ones scoped this answer to whether a
+    /// host object existed, which is the right question for a destroyer and
+    /// the wrong one for the waiters: a `Declared` pipeline has no host object
+    /// and a draw can be parked on it just the same.
+    #[must_use = "a pipeline nobody destroys is a host object nothing frees, and one nobody names is a wait nothing discharges"]
+    pub fn generation_closed(&mut self, closed: SessionGeneration) -> Closed {
+        let mut out = Closed::default();
         self.pipelines.retain(|id, p| {
             if p.generation != closed {
                 return true;
@@ -487,12 +515,14 @@ impl PipelineTable {
                 PipelineState::Translating | PipelineState::Compiling | PipelineState::Ready
             ) {
                 self.census.retired += 1;
-                destroy.push(*id);
+                out.destroy.push(*id);
             }
+            out.removed.push(*id);
             false
         });
-        destroy.sort_unstable();
-        destroy
+        out.destroy.sort_unstable();
+        out.removed.sort_unstable();
+        out
     }
 
     /// The host device incarnation ended: every build it performed is gone.
