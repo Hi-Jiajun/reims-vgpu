@@ -343,13 +343,23 @@ impl Heaps {
     ///
     /// If no live heap has this number, the window does not fit, or this
     /// resource is already placed here.
-    pub fn place(
-        &mut self,
-        heap: u64,
-        resource: ResourceId,
-        offset: u64,
-        length: u64,
-    ) -> Result<HeapPlacement, Refusal> {
+    /// Whether this heap would admit a window of this shape.
+    ///
+    /// The half of [`Self::place`] that does not need a name, so a caller can
+    /// ask before it publishes one. [`crate::lifecycle::Lifecycle`] has to: a
+    /// declaration displaces whatever its slot already held and that is not
+    /// undoable, so a placement still able to refuse afterwards would strand
+    /// the displaced occupant's teardown on an error path that carries no
+    /// effects.
+    ///
+    /// `place` calls this rather than restating it, so there is one window
+    /// rule and not two that can drift.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NoSuchHeap`] when no live heap has this number, and
+    /// [`Refusal::OutOfHeap`] for a window the heap does not contain.
+    pub fn admits(&self, heap: u64, offset: u64, length: u64) -> Result<(), Refusal> {
         let h = self.live(heap)?;
         if offset.checked_add(length).is_none_or(|end| end > h.length) {
             return Err(Refusal::OutOfHeap {
@@ -359,6 +369,17 @@ impl Heaps {
                 heap_length: h.length,
             });
         }
+        Ok(())
+    }
+
+    pub fn place(
+        &mut self,
+        heap: u64,
+        resource: ResourceId,
+        offset: u64,
+        length: u64,
+    ) -> Result<HeapPlacement, Refusal> {
+        self.admits(heap, offset, length)?;
         if let Some(&backing) = self.placed.get(&resource) {
             return Err(Refusal::AlreadyPlaced { resource, backing });
         }

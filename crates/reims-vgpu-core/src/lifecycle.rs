@@ -1536,19 +1536,34 @@ impl Lifecycle {
             .tasks
             .get_mut(&task)
             .ok_or(Refusal::NoSuchTask { task })?;
-        // The heap window is checked before a name is published, so a refused
-        // placement leaves no slot behind for the next declaration to trip on.
+        // The heap window is checked before a name is published, and *all* of
+        // it is: `admits` is the half of `place` that does not need a name. A
+        // declaration displaces whatever the slot already held, which is not
+        // undoable, so a placement still able to refuse afterwards would strand
+        // the displaced occupant's teardown on an error path that carries no
+        // effects at all.
         let backing = match storage {
             Storage::Dedicated { backing, .. } => backing,
-            Storage::Placed { heap, .. } => t
-                .heaps
-                .backing_of(heap)
-                .map_err(|refusal| Refusal::Heap { task, refusal })?,
+            Storage::Placed {
+                heap,
+                offset,
+                length,
+            } => {
+                t.heaps
+                    .admits(heap, offset, length)
+                    .map_err(|refusal| Refusal::Heap { task, refusal })?;
+                t.heaps
+                    .backing_of(heap)
+                    .map_err(|refusal| Refusal::Heap { task, refusal })?
+            }
         };
-        let id = t
-            .namespace
-            .declare(slot, backing)
-            .map_err(|refusal| Refusal::Namespace { task, refusal })?;
+        let crate::namespace::Declared { id, displaced } = t.namespace.declare(slot, backing);
+        // The guest wrote over a slot that still held an object. There is no
+        // delete packet for that — see `Namespace::declare` — so the delete's
+        // obligations are this declaration's, and they are exactly the ones
+        // `delete_resource` discharges once the namespace has answered.
+        let displaced = displaced.map(|d| self.retire_resident(task, d.id, d.teardown));
+        let t = self.tasks.get_mut(&task).expect("resolved above");
         let resident = match storage {
             Storage::Dedicated { backing, extent } => {
                 // Its own pages: the guest supplied them and holds all of the
@@ -1561,16 +1576,15 @@ impl Lifecycle {
                 offset,
                 length,
             } => {
-                let placement = match t.heaps.place(heap, id, offset, length) {
-                    Ok(p) => p,
-                    Err(refusal) => {
-                        // Undo the name. Its generation stays spent, which is
-                        // the same thing a delete leaves behind and is what
-                        // keeps a stale resolution from succeeding later.
-                        let _ = t.namespace.delete(id);
-                        return Err(Refusal::Heap { task, refusal });
-                    }
-                };
+                // Cannot refuse. `admits` cleared the window before the name
+                // was published, and a freshly declared generation has never
+                // been placed — which is what makes the undo this arm used to
+                // perform unnecessary, and its loss of the displaced
+                // occupant's teardown impossible.
+                let placement = t.heaps.place(heap, id, offset, length).expect(
+                    "the window was admitted before the name was published, and a fresh \
+                     generation is unplaced",
+                );
                 // A window of a heap, so the authority is about those bytes
                 // alone: declaring the whole backing would discard the
                 // neighbours' content.
@@ -1581,7 +1595,7 @@ impl Lifecycle {
         };
         let t = self.tasks.get_mut(&task).expect("resolved above");
         t.resident.insert(id, resident);
-        Ok(Effects::default())
+        Ok(displaced.unwrap_or_default())
     }
 
     fn delete_resource(&mut self, task: TaskId, resource: ResourceId) -> Result<Effects, Refusal> {
@@ -1593,6 +1607,33 @@ impl Lifecycle {
             .namespace
             .delete(resource)
             .map_err(|refusal| Refusal::Namespace { task, refusal })?;
+        Ok(self.retire_resident(task, resource, teardown))
+    }
+
+    /// Everything a name's departure owes once the namespace has answered for
+    /// it: its residency, its heap window, and its content authority.
+    ///
+    /// Split out of [`Self::delete_resource`] because a delete is no longer the
+    /// only way a name departs. A guest that writes over a live object-list
+    /// slot replaces its occupant with no packet at all, and that occupant owes
+    /// exactly this — see [`crate::namespace::Declared`]. Left inline, the
+    /// redeclaration path would have had to restate it, and a restatement that
+    /// dropped the heap window would leak a heap allocation per overwritten
+    /// slot while `delete_resource` beside it did not.
+    ///
+    /// Takes the teardown rather than producing it: the two callers reach it
+    /// differently, and a function that decided it as well could not be used by
+    /// the one whose slot has already moved on.
+    fn retire_resident(
+        &mut self,
+        task: TaskId,
+        resource: ResourceId,
+        teardown: Teardown,
+    ) -> Effects {
+        let t = self
+            .tasks
+            .get_mut(&task)
+            .expect("the caller holds the task");
         let resident = t.resident.remove(&resource);
         let mut effects = Effects {
             teardowns: vec![teardown],
@@ -1630,7 +1671,7 @@ impl Lifecycle {
             },
             None => {}
         }
-        Ok(effects)
+        effects
     }
 
     /// Record that a task's translations over `span` have changed.
@@ -2805,9 +2846,9 @@ mod tests {
     #[test]
     fn a_delete_resolves_against_the_namespace_that_declared_the_object() {
         let mut names = crate::namespace::Namespace::new();
-        let id = names
-            .declare(ObjectListRef(7), crate::access::BackingId(10))
-            .expect("a free slot");
+        let declared = names.declare(ObjectListRef(7), crate::access::BackingId(10));
+        assert_eq!(declared.displaced, None, "a free slot");
+        let id = declared.id;
         let mut payload = Vec::new();
         payload.extend_from_slice(&TASK.0.to_le_bytes());
         payload.extend_from_slice(&7u32.to_le_bytes());
@@ -2845,9 +2886,12 @@ mod tests {
             Err(ResolveRefusal::UnknownRef { object_ref: 7 }),
             "a deleted slot stops resolving"
         );
-        let again = names
-            .declare(ObjectListRef(7), crate::access::BackingId(11))
-            .expect("the slot is free");
+        let redeclared = names.declare(ObjectListRef(7), crate::access::BackingId(11));
+        assert_eq!(
+            redeclared.displaced, None,
+            "the slot's occupant was deleted above, so this declaration displaces nothing"
+        );
+        let again = redeclared.id;
         assert_ne!(again, id);
         assert_eq!(
             operation(
@@ -3939,9 +3983,6 @@ mod tests {
         deleted_tasks: u32,
         redefinitions: u32,
         placed: u32,
-        /// Placements refused after their name was published, which spend a
-        /// generation without leaving a resource behind.
-        spent_generations: u32,
         /// Steps where a backing was named by live residents of two tasks at
         /// once, which is the shape the per-task teardown answer cannot see.
         shared_backings: u32,
@@ -4127,31 +4168,13 @@ mod tests {
                             before,
                             "seed {seed}: a refused {op:?} changed the model"
                         );
-                        // One refusal is not a no-op, and the module says so:
-                        // a placement checked after its name was published
-                        // withdraws the name and leaves the generation spent,
-                        // which is exactly what stops a stale resolution from
-                        // succeeding against the slot's next occupant. The
-                        // shadow states the condition for itself rather than
-                        // reading the model's counter.
-                        if let LifecycleOp::CreateResource {
-                            task,
-                            slot,
-                            storage: Storage::Placed { heap, .. },
-                        } = &op
-                        {
-                            let task_exists = live.contains_key(task);
-                            let slot_free = live.get(task).is_none_or(|r| !r.contains_key(slot));
-                            let heap_exists =
-                                storage.get(task).is_some_and(|h| h.contains_key(heap));
-                            if task_exists && slot_free && heap_exists {
-                                census.spent_generations += 1;
-                                let spent = generations
-                                    .get(&(*task, *slot))
-                                    .map_or_else(|| SlotGeneration::default().next(), |g| g.next());
-                                generations.insert((*task, *slot), spent);
-                            }
-                        }
+                        // Every refusal is now a whole no-op, including the
+                        // one that was not. A placement used to be checked
+                        // after its name had been published, so a refused one
+                        // withdrew the name and left the generation spent —
+                        // invisible to the snapshot above and visible to the
+                        // slot's next occupant. `Heaps::admits` clears the
+                        // window first, so there is nothing to withdraw.
                     }
                     Ok(effects) => {
                         census.applied += 1;
@@ -4178,11 +4201,6 @@ mod tests {
         assert!(census.deleted_tasks > 120, "{}", census.deleted_tasks);
         assert!(census.redefinitions > 120, "{}", census.redefinitions);
         assert!(census.placed > 200, "{}", census.placed);
-        assert!(
-            census.spent_generations > 100,
-            "no placement was refused after publishing its name: {}",
-            census.spent_generations
-        );
         // Thin on purpose rather than by accident: a declined discard needs a
         // device write over the resource with no invalidate, synchronise or
         // guest write between, and every one of those restores the guest's

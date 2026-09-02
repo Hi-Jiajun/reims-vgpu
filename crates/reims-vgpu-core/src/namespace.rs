@@ -63,10 +63,6 @@ pub enum Refusal {
     },
     /// The object is deleted. It may still be executing; it may not be named.
     Deleted { id: ResourceId },
-    /// A slot that still holds a live object cannot be redeclared. A guest that
-    /// wants the slot back deletes first, and a device that silently replaced
-    /// would orphan work planned against the previous occupant.
-    SlotOccupied { slot: ObjectListRef },
 }
 
 impl Refusal {
@@ -76,7 +72,6 @@ impl Refusal {
             Self::NotDeclared { .. } => "namespace_not_declared",
             Self::StaleGeneration { .. } => "namespace_stale_generation",
             Self::Deleted { .. } => "namespace_deleted",
-            Self::SlotOccupied { .. } => "namespace_slot_occupied",
         }
     }
 }
@@ -120,6 +115,43 @@ impl Teardown {
             | Self::HeldByAnotherName { backing } => backing,
         }
     }
+}
+
+/// What a declaration produced: the new name, and what the slot's previous
+/// occupant left behind.
+///
+/// The teardown is a field rather than a second return value because the two
+/// are one event. A caller that took the id and dropped the teardown would have
+/// a live name and a backing nothing else will ever free — which is why this
+/// type is `#[must_use]` as well as [`Teardown`]: a `Teardown` inside a struct
+/// is not one the compiler asks about.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "the displaced occupant's backing is one nothing else will free"]
+pub struct Declared {
+    pub id: ResourceId,
+    /// The slot's previous *live* occupant, if it had one.
+    ///
+    /// `None` when the slot was empty, and `None` when its occupant had been
+    /// deleted: [`Namespace::delete`] already answered for that backing, and
+    /// answering twice hands the same storage back twice.
+    pub displaced: Option<Displaced>,
+}
+
+/// The occupant a declaration wrote over.
+///
+/// Both halves, because a caller needs both and neither is derivable from the
+/// other: the [`Teardown`] says what is owed for the storage, and the id is
+/// what everything the caller kept about that object is keyed by. A
+/// declaration that reported only the teardown would leave the previous
+/// occupant's residency, placement and content authority behind under a name
+/// that no longer resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "the displaced occupant's backing is one nothing else will free"]
+pub struct Displaced {
+    /// The name it answered to. Every id equal to this one now resolves
+    /// [`Refusal::StaleGeneration`].
+    pub id: ResourceId,
+    pub teardown: Teardown,
 }
 
 /// A resolved name, and the right to take one claim on the memory it named.
@@ -230,19 +262,44 @@ impl Namespace {
     /// so no live identity ever carries the default generation and a zeroed
     /// structure cannot read as a valid name.
     ///
-    /// # Errors
+    /// # A live slot may be redeclared, because on this interface it is
     ///
-    /// If the slot still holds an undeleted object.
-    pub fn declare(
-        &mut self,
-        slot: ObjectListRef,
-        backing: BackingId,
-    ) -> Result<ResourceId, Refusal> {
-        let generation = match self.slots.get(&slot) {
-            Some(existing) if !existing.deleted => return Err(Refusal::SlotOccupied { slot }),
-            Some(existing) => existing.generation.next(),
-            None => SlotGeneration::default().next(),
-        };
+    /// This used to refuse a slot that still held an undeleted object, on the
+    /// reading that a guest wanting a slot back deletes first. **That is not
+    /// the contract.** There is no creation command on this wire at all: an
+    /// object comes into existence when the guest writes a record into its own
+    /// object-list page, and it is replaced when the guest writes over that
+    /// record — in its own memory, with no packet, and with nothing that
+    /// obliges it to delete first. A model that refuses the overwrite cannot
+    /// describe what the guest actually does, and a device built on it would
+    /// keep resolving the previous occupant: a reference that named a small
+    /// texture early in a boot and a full-screen video plane later would bind
+    /// the small one forever, which is a wrong surface rather than a missing
+    /// one.
+    ///
+    /// So the overwrite is lawful, and it is exactly the event the generation
+    /// exists for. The name moves to a new generation, so every [`ResourceId`]
+    /// naming the previous occupant resolves to
+    /// [`Refusal::StaleGeneration`] instead of to the new object's bytes. Work
+    /// already accepted keeps the backing it was planned against, because a
+    /// [`Claim`] holds a backing and not a slot. And the displaced backing is
+    /// detached exactly as [`Self::delete`] detaches one — which is what stops
+    /// the silent replacement this refusal was guarding against, without
+    /// refusing anything.
+    ///
+    /// It cannot fail, which is why it returns no `Result`: every slot is
+    /// declarable, and the only question a declaration answers is what the
+    /// previous occupant left behind.
+    pub fn declare(&mut self, slot: ObjectListRef, backing: BackingId) -> Declared {
+        let existing = self.slots.get(&slot).copied();
+        let generation =
+            existing.map_or_else(|| SlotGeneration::default().next(), |e| e.generation.next());
+        // Only a *live* occupant is displaced. A deleted one already handed its
+        // backing over.
+        let displaced = existing.filter(|e| !e.deleted);
+        if let Some(old) = displaced {
+            self.leave(old.backing);
+        }
         self.slots.insert(
             slot,
             Slot {
@@ -253,7 +310,21 @@ impl Namespace {
             },
         );
         self.enter(backing);
-        Ok(ResourceId { slot, generation })
+        // Detached *after* the new occupant has entered, as
+        // [`Self::replace_physical`] does and for the same reason: a
+        // redeclaration that points the slot back at the backing it already
+        // held would otherwise be told to free the storage its own new
+        // occupant is using.
+        Declared {
+            id: ResourceId { slot, generation },
+            displaced: displaced.map(|old| Displaced {
+                id: ResourceId {
+                    slot,
+                    generation: old.generation,
+                },
+                teardown: self.detach(old.backing, old.outstanding),
+            }),
+        }
     }
 
     /// Resolve a guest name.
@@ -557,11 +628,23 @@ mod tests {
         BackingId(n)
     }
 
+    /// A declaration into a slot nothing lived in, which is what most of these
+    /// tests set up. Asserts the emptiness rather than assuming it, so a test
+    /// that grew a live occupant by accident fails here instead of quietly
+    /// dropping the teardown it displaced.
+    fn fresh(declared: Declared) -> ResourceId {
+        assert_eq!(
+            declared.displaced, None,
+            "the slot already held a live object"
+        );
+        declared.id
+    }
+
     /// The invariant the module exists for.
     #[test]
     fn deleting_stops_resolution_and_leaves_accepted_work_alone() {
         let mut ns = Namespace::new();
-        let id = ns.declare(slot(1), backing(10)).expect("free slot");
+        let id = fresh(ns.declare(slot(1), backing(10)));
         let lease = ns.resolve(id).expect("live");
         let lease = ns.acquire(lease);
 
@@ -589,7 +672,7 @@ mod tests {
     #[test]
     fn deleting_an_unused_object_frees_it_at_once() {
         let mut ns = Namespace::new();
-        let id = ns.declare(slot(1), backing(10)).expect("free slot");
+        let id = fresh(ns.declare(slot(1), backing(10)));
         assert_eq!(
             ns.delete(id),
             Ok(Teardown::Now {
@@ -611,7 +694,7 @@ mod tests {
     fn a_claim_taken_after_its_name_went_still_holds_the_storage() {
         // Deleted with nothing outstanding, so the namespace kept no counter.
         let mut ns = Namespace::new();
-        let id = ns.declare(slot(1), backing(10)).expect("free slot");
+        let id = fresh(ns.declare(slot(1), backing(10)));
         let lease = ns.resolve(id).expect("live");
         assert_eq!(
             ns.delete(id),
@@ -637,7 +720,7 @@ mod tests {
         // Redeclared into the same storage: the claim is still owed, and the
         // handback is not, because a live name answers for those bytes.
         let mut ns = Namespace::new();
-        let first = ns.declare(slot(1), backing(10)).expect("free slot");
+        let first = fresh(ns.declare(slot(1), backing(10)));
         let lease = ns.resolve(first).expect("live");
         assert_eq!(
             ns.delete(first),
@@ -646,7 +729,7 @@ mod tests {
             })
         );
         let claim = ns.acquire(lease);
-        let _second = ns.declare(slot(1), backing(10)).expect("deleted slot");
+        let _second = fresh(ns.declare(slot(1), backing(10)));
         assert_eq!(
             ns.release(claim),
             None,
@@ -660,14 +743,14 @@ mod tests {
     #[test]
     fn a_reused_slot_refuses_the_name_that_used_to_live_there() {
         let mut ns = Namespace::new();
-        let first = ns.declare(slot(1), backing(10)).expect("free slot");
+        let first = fresh(ns.declare(slot(1), backing(10)));
         assert_eq!(
             ns.delete(first).expect("live"),
             Teardown::Now {
                 backing: backing(10)
             }
         );
-        let second = ns.declare(slot(1), backing(11)).expect("deleted, so free");
+        let second = fresh(ns.declare(slot(1), backing(11)));
         assert_ne!(first.generation, second.generation);
         assert_eq!(
             ns.resolve(first),
@@ -680,23 +763,115 @@ mod tests {
         assert_eq!(ns.resolve(second).expect("live").backing, backing(11));
     }
 
+    /// **The guest overwrites a live slot, with no packet, and this is what
+    /// that is.** There is no creation command on this wire; an object appears
+    /// when the guest writes a record into its own object-list page and is
+    /// replaced when it writes over that record. A model that refused would
+    /// keep resolving the previous occupant forever.
     #[test]
-    fn a_live_slot_cannot_be_redeclared() {
+    fn a_live_slot_is_redeclared_and_its_occupant_is_displaced() {
         let mut ns = Namespace::new();
-        ns.declare(slot(1), backing(10)).expect("free slot");
+        let first = fresh(ns.declare(slot(1), backing(10)));
+
+        let over = ns.declare(slot(1), backing(11));
         assert_eq!(
-            ns.declare(slot(1), backing(11)),
-            Err(Refusal::SlotOccupied { slot: slot(1) }),
-            "silently replacing would orphan work planned against the previous \
-             occupant"
+            over.displaced,
+            Some(Displaced {
+                id: first,
+                // Nothing acquired the previous occupant, so its storage is
+                // owed to nobody and is the caller's to free.
+                teardown: Teardown::Now {
+                    backing: backing(10)
+                },
+            }),
+            "the previous occupant's backing is owed to whoever declared over it"
         );
+
+        // The name moved on, which is what stops the silent replacement the
+        // old refusal was guarding against.
+        assert_ne!(over.id, first);
+        assert_eq!(
+            ns.resolve(first),
+            Err(Refusal::StaleGeneration {
+                slot: slot(1),
+                named: first.generation,
+                current: over.id.generation,
+            })
+        );
+        assert_eq!(ns.resolve(over.id).expect("live").backing(), backing(11));
+    }
+
+    /// Accepted work keeps the bytes it was planned against, exactly as it does
+    /// across a delete or a replacement — a claim holds a backing, not a slot.
+    #[test]
+    fn a_redeclaration_leaves_accepted_work_reading_the_old_backing() {
+        let mut ns = Namespace::new();
+        let first = fresh(ns.declare(slot(1), backing(10)));
+        let held = ns.resolve(first).expect("live");
+        let held = ns.acquire(held);
+        assert_eq!(held.backing(), backing(10));
+
+        let over = ns.declare(slot(1), backing(11));
+        assert_eq!(
+            over.displaced.map(|d| d.teardown),
+            Some(Teardown::WhenUsesRetire {
+                backing: backing(10),
+                outstanding: 1,
+            }),
+            "one accepted use is still reading it"
+        );
+        assert!(ns.holds(backing(10)), "and the namespace says so");
+        assert_eq!(
+            ns.release(held),
+            Some(backing(10)),
+            "the last use retires and the old bytes come back"
+        );
+        assert!(!ns.holds(backing(10)));
+    }
+
+    /// A slot redeclared at the memory it already held is not a handback. The
+    /// detachment happens after the new occupant has entered, so the storage
+    /// its own declaration is using is never reported free.
+    #[test]
+    fn redeclaring_a_slot_at_the_same_backing_frees_nothing() {
+        let mut ns = Namespace::new();
+        let first = fresh(ns.declare(slot(1), backing(10)));
+        let over = ns.declare(slot(1), backing(10));
+        assert_ne!(over.id, first, "a new declaration is a new generation");
+        assert_eq!(
+            over.displaced.map(|d| d.teardown),
+            Some(Teardown::HeldByAnotherName {
+                backing: backing(10)
+            }),
+            "the name that holds it is this slot's own new occupant"
+        );
+        assert!(ns.holds(backing(10)));
+        assert_eq!(ns.resolve(over.id).expect("live").backing(), backing(10));
+    }
+
+    /// A slot whose occupant was deleted owes nothing on the next declaration:
+    /// the delete answered for that backing, and answering twice would hand
+    /// the same storage back to two callers.
+    #[test]
+    fn redeclaring_over_a_deleted_slot_displaces_nothing() {
+        let mut ns = Namespace::new();
+        let first = fresh(ns.declare(slot(1), backing(10)));
+        assert_eq!(
+            ns.delete(first),
+            Ok(Teardown::Now {
+                backing: backing(10)
+            })
+        );
+        let over = ns.declare(slot(1), backing(11));
+        assert_eq!(over.displaced, None);
+        assert_ne!(over.id, first);
     }
 
     /// Work planned against the old bytes keeps reading the old bytes.
     #[test]
     fn replacing_the_memory_moves_the_name_and_not_the_accepted_work() {
         let mut ns = Namespace::new();
-        let id = ns.declare(slot(1), backing(10)).expect("free slot");
+        let id = fresh(ns.declare(slot(1), backing(10)));
         let old = ns.resolve(id).expect("live");
         let old = ns.acquire(old);
 
@@ -724,7 +899,7 @@ mod tests {
     #[test]
     fn a_detached_backing_survives_until_its_last_use_retires() {
         let mut ns = Namespace::new();
-        let id = ns.declare(slot(1), backing(10)).expect("free slot");
+        let id = fresh(ns.declare(slot(1), backing(10)));
         let a = ns.resolve(id).expect("live");
         let a = ns.acquire(a);
         let b = ns.resolve(id).expect("live");
@@ -745,7 +920,7 @@ mod tests {
     #[test]
     fn deleting_twice_is_refused() {
         let mut ns = Namespace::new();
-        let id = ns.declare(slot(1), backing(10)).expect("free slot");
+        let id = fresh(ns.declare(slot(1), backing(10)));
         assert_eq!(
             ns.delete(id).expect("live").backing(),
             backing(10),
@@ -783,7 +958,7 @@ mod tests {
     #[test]
     fn the_first_declaration_does_not_use_the_default_generation() {
         let mut ns = Namespace::new();
-        let id = ns.declare(slot(1), backing(10)).expect("free slot");
+        let id = fresh(ns.declare(slot(1), backing(10)));
         assert_ne!(id.generation, SlotGeneration::default());
     }
 
@@ -797,7 +972,7 @@ mod tests {
     fn a_ref_resolves_to_the_slots_live_occupant_and_its_generation() {
         let mut ns = Namespace::new();
         assert_eq!(ns.resource(1), None, "nothing has been declared");
-        let first = ns.declare(slot(1), backing(10)).expect("free slot");
+        let first = fresh(ns.declare(slot(1), backing(10)));
         assert_eq!(ns.resource(1), Some(first));
 
         assert_eq!(
@@ -813,7 +988,7 @@ mod tests {
             "a delete stops new resolution, which is the module's invariant"
         );
 
-        let second = ns.declare(slot(1), backing(11)).expect("the slot is free");
+        let second = fresh(ns.declare(slot(1), backing(11)));
         assert_eq!(ns.resource(1), Some(second));
         assert_ne!(second, first, "a reused slot is not the same name");
     }
@@ -827,7 +1002,7 @@ mod tests {
     #[test]
     fn resolving_for_identity_is_not_a_lease() {
         let mut ns = Namespace::new();
-        let id = ns.declare(slot(1), backing(10)).expect("free slot");
+        let id = fresh(ns.declare(slot(1), backing(10)));
         let before = ns.census();
         assert_eq!(ns.resource(1), Some(id));
         assert_eq!(ns.census(), before, "identity is not a resolution taken");
@@ -851,8 +1026,8 @@ mod tests {
     fn a_backing_two_names_share_is_not_handed_back_when_one_of_them_goes() {
         let mut ns = Namespace::new();
         let b = backing(7);
-        let a = ns.declare(slot(1), b).expect("free slot");
-        let c = ns.declare(slot(2), b).expect("free slot");
+        let a = fresh(ns.declare(slot(1), b));
+        let c = fresh(ns.declare(slot(2), b));
         let la = ns.resolve(a).expect("live");
         let la = ns.acquire(la);
         let lc = ns.resolve(c).expect("live");
@@ -892,8 +1067,8 @@ mod tests {
     fn a_delete_another_live_name_answers_for_says_so() {
         let mut ns = Namespace::new();
         let b = backing(7);
-        let a = ns.declare(slot(1), b).expect("free slot");
-        let c = ns.declare(slot(2), b).expect("free slot");
+        let a = fresh(ns.declare(slot(1), b));
+        let c = fresh(ns.declare(slot(2), b));
 
         assert_eq!(ns.delete(a), Ok(Teardown::HeldByAnotherName { backing: b }));
         assert_eq!(ns.awaiting_teardown(), 0, "nothing is owed");
@@ -908,7 +1083,7 @@ mod tests {
     fn a_backing_a_name_returns_to_is_handed_back_once() {
         let mut ns = Namespace::new();
         let b = backing(7);
-        let id = ns.declare(slot(1), b).expect("free slot");
+        let id = fresh(ns.declare(slot(1), b));
         let lease = ns.resolve(id).expect("live");
         let lease = ns.acquire(lease);
 
@@ -946,7 +1121,7 @@ mod tests {
     fn a_redeclared_slot_does_not_absorb_the_previous_occupants_release() {
         let mut ns = Namespace::new();
         let b = backing(7);
-        let first = ns.declare(slot(1), b).expect("free slot");
+        let first = fresh(ns.declare(slot(1), b));
         let lease = ns.resolve(first).expect("live");
         let lease = ns.acquire(lease);
         assert_eq!(
@@ -957,7 +1132,7 @@ mod tests {
             })
         );
 
-        let second = ns.declare(slot(1), b).expect("deleted slot");
+        let second = fresh(ns.declare(slot(1), b));
         let fresh = ns.resolve(second).expect("live");
         let _fresh = ns.acquire(fresh);
         assert_eq!(ns.outstanding(second), 1);
@@ -1034,7 +1209,7 @@ mod tests {
         let mut handbacks_on_release = 0usize;
         let mut deletes_that_waited = 0usize;
         let mut held_by_another_name = 0usize;
-        let mut refused_occupied = 0usize;
+        let mut redeclarations = 0usize;
         let mut refused_stale = 0usize;
         let mut refused_deleted = 0usize;
         let mut refused_undeclared = 0usize;
@@ -1076,38 +1251,64 @@ mod tests {
 
             for _ in 0..64 {
                 match rng.below(13) {
-                    // Declare.
+                    // Declare, over a free slot, a deleted one, or a live one
+                    // the guest is writing over.
                     0..=2 => {
                         let sl = slot(rng.below(SLOTS) as u32);
                         let b = backing(rng.below(BACKINGS));
-                        let occupied = shadow.get(&sl).is_some_and(|s| !s.deleted);
-                        match ns.declare(sl, b) {
-                            Ok(id) => {
-                                assert!(!occupied, "seed {seed}: redeclared a live slot");
-                                let generation = shadow.get(&sl).map_or_else(
-                                    || SlotGeneration::default().next(),
-                                    |s| s.generation.next(),
+                        let previous = shadow.get(&sl).copied();
+                        let generation = previous.map_or_else(
+                            || SlotGeneration::default().next(),
+                            |s| s.generation.next(),
+                        );
+                        // Only a live occupant is displaced. A deleted one
+                        // handed its backing over at the delete.
+                        let displaced = previous.filter(|s| !s.deleted);
+                        let declared = ns.declare(sl, b);
+                        assert_eq!(declared.id.slot, sl, "seed {seed}");
+                        assert_eq!(declared.id.generation, generation, "seed {seed}");
+                        // The new occupant lands before the old backing is
+                        // detached, so a slot redeclared at the memory it
+                        // already held is never reported free.
+                        shadow.insert(
+                            sl,
+                            ShadowSlot {
+                                generation,
+                                backing: b,
+                                deleted: false,
+                                claims: 0,
+                            },
+                        );
+                        let expected = displaced.map(|old| Displaced {
+                            id: ResourceId {
+                                slot: sl,
+                                generation: old.generation,
+                            },
+                            teardown: detach_expectation(
+                                &shadow,
+                                &mut detached,
+                                old.backing,
+                                old.claims,
+                            ),
+                        });
+                        assert_eq!(declared.displaced, expected, "seed {seed}: declare");
+                        if let Some(d) = expected {
+                            redeclarations += 1;
+                            account(
+                                d.teardown,
+                                &mut handbacks_now,
+                                &mut deletes_that_waited,
+                                &mut held_by_another_name,
+                            );
+                            if matches!(d.teardown, Teardown::Now { .. }) {
+                                let freed = d.teardown.backing();
+                                assert!(
+                                    unowned(&shadow, &detached, freed),
+                                    "seed {seed}: {freed:?} freed under a live holder"
                                 );
-                                assert_eq!(id.generation, generation, "seed {seed}");
-                                assert_eq!(id.slot, sl);
-                                shadow.insert(
-                                    sl,
-                                    ShadowSlot {
-                                        generation,
-                                        backing: b,
-                                        deleted: false,
-                                        claims: 0,
-                                    },
-                                );
-                                names.push(id);
                             }
-                            Err(Refusal::SlotOccupied { slot: s }) => {
-                                assert!(occupied, "seed {seed}");
-                                assert_eq!(s, sl);
-                                refused_occupied += 1;
-                            }
-                            Err(other) => panic!("seed {seed}: declare refused as {other:?}"),
                         }
+                        names.push(declared.id);
                     }
                     // Resolve a name, possibly a stale one, and acquire it.
                     3..=5 => {
@@ -1357,7 +1558,10 @@ mod tests {
             "claims taken after the name moved: {late_acquires}"
         );
         assert!(replacements > 300, "replacements: {replacements}");
-        assert!(refused_occupied > 200, "slot occupied: {refused_occupied}");
+        assert!(
+            redeclarations > 200,
+            "live slots written over: {redeclarations}"
+        );
         assert!(refused_stale > 200, "stale generation: {refused_stale}");
         assert!(refused_deleted > 200, "deleted: {refused_deleted}");
         assert!(
@@ -1426,7 +1630,6 @@ mod tests {
             Refusal::StaleGeneration { .. } => *stale += 1,
             Refusal::Deleted { .. } => *deleted += 1,
             Refusal::NotDeclared { .. } => *undeclared += 1,
-            Refusal::SlotOccupied { .. } => panic!("resolution cannot refuse as occupied"),
         }
     }
 }
