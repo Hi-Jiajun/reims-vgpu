@@ -336,7 +336,23 @@ impl PipelineTable {
     /// An illegal step is refused rather than applied, and a caller that has to
     /// care can ask. The common illegal step is real: a compile that finishes
     /// after the guest deleted the pipeline, which must not resurrect it.
+    ///
+    /// # `Refused` is not a step this door can take
+    ///
+    /// [`PipelineState::may_become`] says the transition is legal, and it is —
+    /// but the state is not the whole fact. A refused pipeline carries the
+    /// reason it was refused, because a refusal without one is how a guest
+    /// ends up rendering nothing with a clean log, and this door has no reason
+    /// to write. Taking the step here produced `state: Refused, refusal: None`
+    /// — a state the lease answer `expect`s cannot exist, so the next guest draw
+    /// binding that pipeline panicked in the semantic model, and the census
+    /// read zero refusals meanwhile.
+    ///
+    /// So the door that can supply a reason is the only door: [`Self::refuse`].
     pub fn advance(&mut self, id: ResourceId, next: PipelineState) -> bool {
+        if next == PipelineState::Refused {
+            return false;
+        }
         let Some(p) = self.pipelines.get_mut(&id) else {
             return false;
         };
@@ -621,6 +637,29 @@ mod tests {
         assert_eq!(t.lease(id(1), GEN), Lease::Ready);
         assert_eq!(t.census().leases_pending, 1);
         assert_eq!(t.census().leases_ready, 1);
+    }
+
+    /// The rule: a refusal that carries no reason is not a refusal this table
+    /// can hold, so the door that has no reason to write cannot take the step.
+    #[test]
+    fn a_refusal_only_arrives_through_the_door_that_carries_its_reason() {
+        let mut t = PipelineTable::new();
+        t.declare(id(1), GEN);
+        assert!(
+            !t.advance(id(1), PipelineState::Refused),
+            "the step `may_become` calls legal is not one this door can supply"
+        );
+        assert_eq!(
+            t.lease(id(1), GEN),
+            Lease::Pending,
+            "and nothing moved: a draw binding it still waits"
+        );
+        assert_eq!(t.census().refused, 0);
+
+        let reason = RefusalReason::CompilationFailed("no");
+        assert!(t.refuse(id(1), reason));
+        assert_eq!(t.lease(id(1), GEN), Lease::Refused(reason));
+        assert_eq!(t.census().refused, 1);
     }
 
     /// Only the pipelines that are still being built come back as waits.
