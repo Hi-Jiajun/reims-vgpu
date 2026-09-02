@@ -1053,4 +1053,88 @@ mod tests {
         .collect();
         assert_eq!(slugs.len(), 8);
     }
+
+    /// Bytes per element read out of the Vulkan format's own name, which is a
+    /// derivation this crate shares nothing with.
+    ///
+    /// `R8G8B8A8_UINT` is four eight-bit channels however it got chosen, and a
+    /// `_PACK32` format is four bytes by definition. So the width the table
+    /// implies can be recovered from the answer alone, with no reference to
+    /// the guest ordinal that produced it.
+    fn width_from_vulkan_name(f: vk::Format) -> Option<u32> {
+        let name = format!("{f:?}");
+        if let Some(at) = name.find("PACK") {
+            return name[at + 4..].parse::<u32>().ok().map(|bits| bits / 8);
+        }
+        let mut bits = 0u32;
+        let mut digits = String::new();
+        for ch in name.split('_').next()?.chars() {
+            if ch.is_ascii_digit() {
+                digits.push(ch);
+            } else if !digits.is_empty() {
+                bits += digits.parse::<u32>().ok()?;
+                digits.clear();
+            }
+        }
+        if !digits.is_empty() {
+            bits += digits.parse::<u32>().ok()?;
+        }
+        (bits > 0).then_some(bits / 8)
+    }
+
+    /// Every arm of the fifty-three-arm table fetches as many bytes as the
+    /// contract says the guest format occupies.
+    ///
+    /// This is the failure a hand-written mapping table has: not an unknown
+    /// format, which refuses, but a *plausible neighbour* --- `Half3` bound to
+    /// `R16G16_SFLOAT`, `Short4` to `R16G16B16_UINT`. The pipeline builds, the
+    /// draw runs, and every vertex after the first reads from the wrong offset,
+    /// because the attribute's stride advance and the format's fetch width
+    /// stopped agreeing. `attribute`'s own bounds check cannot see it: it
+    /// checks the *widened* width against the stride, and a narrower wrong
+    /// answer fits.
+    ///
+    /// The two sides are independent. One is `VertexFormat::bytes`, from the
+    /// decode contract. The other is read out of the `VkFormat`'s name, so a
+    /// wrong arm has to be wrong in both places by the same amount to survive.
+    #[test]
+    fn every_arm_fetches_the_width_the_contract_declares() {
+        for guest in VertexFormat::ALL {
+            let native = format(guest);
+            assert_eq!(
+                width_from_vulkan_name(native),
+                Some(guest.bytes()),
+                "{guest:?} is {} bytes by the contract and {native:?} on this host",
+                guest.bytes()
+            );
+        }
+    }
+
+    /// `SIGNED_AS_UNSIGNED` is exactly the arms that are signed on one side and
+    /// unsigned on the other.
+    ///
+    /// The list exists so the coupling to the shader translator has a blast
+    /// radius somebody can read, and a list that is merely *near* the truth is
+    /// worse than none: an arm missing from it is a coupling nobody knows
+    /// about, and an arm listed that is not one sends a reader looking for a
+    /// dependency that is not there. Both halves are derived --- signedness
+    /// from the guest format's own name, unsignedness from the Vulkan
+    /// format's --- so the list is checked rather than trusted.
+    #[test]
+    fn the_signed_as_unsigned_list_is_exactly_the_arms_that_are() {
+        for guest in VertexFormat::ALL {
+            let guest_name = format!("{guest:?}");
+            let signed_integer = (guest_name.starts_with("Char")
+                || guest_name.starts_with("Short")
+                || guest_name.starts_with("Int"))
+                && !guest_name.contains("Normalized");
+            let native_unsigned = format!("{:?}", format(guest)).ends_with("_UINT");
+            assert_eq!(
+                SIGNED_AS_UNSIGNED.contains(&guest),
+                signed_integer && native_unsigned,
+                "{guest:?} maps to {:?}",
+                format(guest)
+            );
+        }
+    }
 }
