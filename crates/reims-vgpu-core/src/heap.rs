@@ -45,6 +45,24 @@
 //! here, and a heap that outlives its delete for a long time is a guest that
 //! kept its allocations, not a leak to be capped.
 //!
+//! # A resource is placed once, and that is a claim about the resource
+//!
+//! A placement *is* the resource's storage: the [`BackingId`] it carries is
+//! the answer to where the resource's bytes are. Two placements are two
+//! answers, and the second one leaves the first's compiled coordinates naming
+//! bytes nothing agrees about — in one heap they are the wrong offset, and
+//! across two heaps they are the wrong storage entirely. So
+//! [`Refusal::AlreadyPlaced`] is checked against every heap here, live or
+//! retiring behind a delete, and not against the one being placed into. It is
+//! the same cross-heap closure [`Refusal::StorageInUse`] applies from the
+//! storage's side.
+//!
+//! `placed` is the index that makes the check a lookup rather than a scan of
+//! every placement in every heap, which a resource declaration would otherwise
+//! pay on the way in. It is maintained at the two operations that change
+//! membership and checked against the heaps themselves after every step of the
+//! driven sweep.
+//!
 //! # Membership is recorded, and it is not the aliasing question
 //!
 //! Placing or removing a resource advances the heap's membership generation,
@@ -56,7 +74,7 @@
 
 use crate::access::{BackingId, ByteRange, HeapId, ResourceKey};
 use crate::identity::ResourceId;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Why a heap operation did not happen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,16 +100,48 @@ pub enum Refusal {
         length: u64,
         placement_length: u64,
     },
-    /// This resource is already placed in this heap. A second placement would
-    /// leave the first one's compiled coordinates naming bytes nothing agrees
-    /// about.
-    AlreadyPlaced { resource: ResourceId },
+    /// This resource is already placed, in the storage named. A second
+    /// placement would leave the first one's compiled coordinates naming bytes
+    /// nothing agrees about — and across two heaps the two placements would not
+    /// even agree which storage the resource is in, so this is a claim about the
+    /// resource and not about one heap. See the module doc.
+    AlreadyPlaced {
+        resource: ResourceId,
+        backing: BackingId,
+    },
     /// This resource is not placed in the storage the placement names.
     NotPlaced { resource: ResourceId },
+    /// The resource is placed in this storage, but not at the window the
+    /// placement names — so the placement is a stale one, minted before an
+    /// earlier removal, and the window it names now belongs to a later
+    /// placement somebody else holds. Honouring it would remove that one.
+    StalePlacement {
+        resource: ResourceId,
+        named: ByteRange,
+        placed_at: ByteRange,
+    },
     /// The placement names storage no heap and no retirement holds. Either it
     /// was already removed, or it was minted by a heap whose number has since
     /// been reused for different storage.
     StaleStorage { backing: BackingId },
+    /// A live heap, or storage still retiring behind a deleted one, already
+    /// holds this backing.
+    ///
+    /// Storage is what identifies a heap once its number is gone — a retiring
+    /// heap is reachable only through the placements handed out over it, and
+    /// those name the backing. Two heaps over one backing therefore have one
+    /// retirement between them: the second delete replaces the first's set of
+    /// live allocations, and the last removal of *that* set reports the storage
+    /// free while the first heap's resources are still in it. That is the exact
+    /// failure this module's deletion rule exists to prevent, so it is refused
+    /// at the point the second heap is created rather than diagnosed later.
+    ///
+    /// It would also make the aliasing answer wrong in the other direction:
+    /// a placement is a coordinate in its heap's backing, so two placements at
+    /// one offset in two heaps over one backing *are* the same bytes, while
+    /// [`HeapId::same_heap`] says they are in different heaps and their accesses
+    /// never meet.
+    StorageInUse { backing: BackingId },
 }
 
 impl Refusal {
@@ -104,7 +154,9 @@ impl Refusal {
             Self::OutOfPlacement { .. } => "heap_out_of_placement",
             Self::AlreadyPlaced { .. } => "heap_already_placed",
             Self::NotPlaced { .. } => "heap_not_placed",
+            Self::StalePlacement { .. } => "heap_stale_placement",
             Self::StaleStorage { .. } => "heap_stale_storage",
+            Self::StorageInUse { .. } => "heap_storage_in_use",
         }
     }
 }
@@ -130,8 +182,12 @@ pub enum Retirement {
 ///
 /// The backing travels with it for a second reason. A heap number may be
 /// deleted and reused, and a holder that presented the *number* back would
-/// remove its allocation from whatever now answers to it.
-/// [`Heaps::remove`] takes the placement, so a stale one refuses instead.
+/// remove its allocation from whatever now answers to it. [`Heaps::remove`]
+/// takes the whole placement, so a stale one refuses instead — and a placement
+/// goes stale two ways, not one. Its heap's number can be reused for other
+/// storage, which `backing` answers; and the resource can be removed and placed
+/// in the same heap again, which only `region` answers, because the later
+/// placement equals the earlier one in every other field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeapPlacement {
     pub heap: u64,
@@ -199,7 +255,11 @@ struct Heap {
 /// Storage whose heap number is gone, kept alive by the allocations still in it.
 #[derive(Debug)]
 struct Retiring {
-    allocations: HashSet<ResourceId>,
+    /// The same map a live heap keeps, windows included. A retiring heap
+    /// refuses a stale placement for the reason a live one does — see
+    /// [`Heaps::remove`] — and the window is half of what makes a placement
+    /// stale.
+    allocations: HashMap<ResourceId, ByteRange>,
 }
 
 /// One session generation's heaps.
@@ -213,6 +273,10 @@ struct Retiring {
 pub struct Heaps {
     heaps: HashMap<u64, Heap>,
     retiring: HashMap<BackingId, Retiring>,
+    /// Where each placed resource's bytes are, across every heap and every
+    /// retirement. The index behind [`Refusal::AlreadyPlaced`]; see the module
+    /// doc for why the law is global and why this is not a scan.
+    placed: HashMap<ResourceId, BackingId>,
 }
 
 impl Heaps {
@@ -225,10 +289,17 @@ impl Heaps {
     ///
     /// # Errors
     ///
-    /// If a live heap already has this number.
+    /// If a live heap already has this number, or any heap — live or retiring
+    /// behind a delete — already holds this storage.
     pub fn create(&mut self, heap: u64, backing: BackingId, length: u64) -> Result<(), Refusal> {
         if self.heaps.contains_key(&heap) {
             return Err(Refusal::HeapExists { heap });
+        }
+        // Storage is the key a retirement is held under, and the identity a
+        // placement carries once the number is gone, so one backing may belong
+        // to at most one heap at a time. See [`Refusal::StorageInUse`].
+        if self.holds_storage(backing) {
+            return Err(Refusal::StorageInUse { backing });
         }
         self.heaps.insert(
             heap,
@@ -272,17 +343,24 @@ impl Heaps {
     ///
     /// If no live heap has this number, the window does not fit, or this
     /// resource is already placed here.
-    pub fn place(
-        &mut self,
-        heap: u64,
-        resource: ResourceId,
-        offset: u64,
-        length: u64,
-    ) -> Result<HeapPlacement, Refusal> {
-        let h = self
-            .heaps
-            .get_mut(&heap)
-            .ok_or(Refusal::NoSuchHeap { heap })?;
+    /// Whether this heap would admit a window of this shape.
+    ///
+    /// The half of [`Self::place`] that does not need a name, so a caller can
+    /// ask before it publishes one. [`crate::lifecycle::Lifecycle`] has to: a
+    /// declaration displaces whatever its slot already held and that is not
+    /// undoable, so a placement still able to refuse afterwards would strand
+    /// the displaced occupant's teardown on an error path that carries no
+    /// effects.
+    ///
+    /// `place` calls this rather than restating it, so there is one window
+    /// rule and not two that can drift.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NoSuchHeap`] when no live heap has this number, and
+    /// [`Refusal::OutOfHeap`] for a window the heap does not contain.
+    pub fn admits(&self, heap: u64, offset: u64, length: u64) -> Result<(), Refusal> {
+        let h = self.live(heap)?;
         if offset.checked_add(length).is_none_or(|end| end > h.length) {
             return Err(Refusal::OutOfHeap {
                 heap,
@@ -291,15 +369,29 @@ impl Heaps {
                 heap_length: h.length,
             });
         }
-        if h.placements.contains_key(&resource) {
-            return Err(Refusal::AlreadyPlaced { resource });
+        Ok(())
+    }
+
+    pub fn place(
+        &mut self,
+        heap: u64,
+        resource: ResourceId,
+        offset: u64,
+        length: u64,
+    ) -> Result<HeapPlacement, Refusal> {
+        self.admits(heap, offset, length)?;
+        if let Some(&backing) = self.placed.get(&resource) {
+            return Err(Refusal::AlreadyPlaced { resource, backing });
         }
         let region = ByteRange { offset, length };
+        let h = self.heaps.get_mut(&heap).expect("live above");
         h.placements.insert(resource, region);
         h.membership_generation += 1;
+        let backing = h.backing;
+        self.placed.insert(resource, backing);
         Ok(HeapPlacement {
             heap,
-            backing: h.backing,
+            backing,
             region,
         })
     }
@@ -329,10 +421,17 @@ impl Heaps {
     /// storage the caller was actually given — whether that heap is still named
     /// or is retiring behind a reused number.
     ///
+    /// The window is part of what it was given. A resource removed from a heap
+    /// may be placed in it again at a different offset, and the two placements
+    /// differ in nothing else, so a holder of the first one presenting it back
+    /// would remove the second — leaving its holder unable to retire it and the
+    /// index saying the resource is nowhere. That is the failure the backing
+    /// already prevents for a reused heap number, one field along.
+    ///
     /// # Errors
     ///
-    /// If nothing holds that storage any more, or the resource is not placed in
-    /// it.
+    /// If nothing holds that storage any more, the resource is not placed in
+    /// it, or it is placed at a different window than the one named.
     pub fn remove(
         &mut self,
         placement: HeapPlacement,
@@ -340,10 +439,20 @@ impl Heaps {
     ) -> Result<Retirement, Refusal> {
         if let Some(h) = self.heaps.get_mut(&placement.heap) {
             if h.backing == placement.backing {
-                if h.placements.remove(&resource).is_none() {
-                    return Err(Refusal::NotPlaced { resource });
+                match h.placements.get(&resource) {
+                    None => return Err(Refusal::NotPlaced { resource }),
+                    Some(&placed_at) if placed_at != placement.region => {
+                        return Err(Refusal::StalePlacement {
+                            resource,
+                            named: placement.region,
+                            placed_at,
+                        })
+                    }
+                    Some(_) => {}
                 }
+                h.placements.remove(&resource);
                 h.membership_generation += 1;
+                self.placed.remove(&resource);
                 return Ok(Retirement::Held {
                     allocations: h.placements.len(),
                     named: true,
@@ -355,9 +464,19 @@ impl Heaps {
                 backing: placement.backing,
             });
         };
-        if !r.allocations.remove(&resource) {
-            return Err(Refusal::NotPlaced { resource });
+        match r.allocations.get(&resource) {
+            None => return Err(Refusal::NotPlaced { resource }),
+            Some(&placed_at) if placed_at != placement.region => {
+                return Err(Refusal::StalePlacement {
+                    resource,
+                    named: placement.region,
+                    placed_at,
+                })
+            }
+            Some(_) => {}
         }
+        r.allocations.remove(&resource);
+        self.placed.remove(&resource);
         if r.allocations.is_empty() {
             self.retiring.remove(&placement.backing);
             return Ok(Retirement::StorageFree {
@@ -388,7 +507,7 @@ impl Heaps {
         if h.placements.is_empty() {
             return Ok(Retirement::StorageFree { backing: h.backing });
         }
-        let allocations: HashSet<ResourceId> = h.placements.into_keys().collect();
+        let allocations = h.placements;
         let held = allocations.len();
         self.retiring.insert(h.backing, Retiring { allocations });
         Ok(Retirement::Held {
@@ -434,6 +553,7 @@ mod tests {
     use super::*;
     use crate::access::{AccessKey, HeapId};
     use crate::identity::{ObjectListRef, SlotGeneration};
+    use std::collections::HashSet;
 
     fn res(slot: u32) -> ResourceId {
         ResourceId {
@@ -579,9 +699,60 @@ mod tests {
         let a = heaps.place(7, res(1), 0, 64).expect("fits");
         assert_eq!(
             heaps.place(7, res(1), 128, 64),
-            Err(Refusal::AlreadyPlaced { resource: res(1) }),
+            Err(Refusal::AlreadyPlaced {
+                resource: res(1),
+                backing: BackingId(100)
+            }),
             "a second placement would leave the first one's coordinates unowned"
         );
+        // **And the law is about the resource, not about one heap.** A second
+        // heap is different storage, so the two placements would not even agree
+        // which bytes the resource is made of.
+        heaps
+            .create(8, BackingId(101), 4096)
+            .expect("a second heap");
+        assert_eq!(
+            heaps.place(8, res(1), 0, 64),
+            Err(Refusal::AlreadyPlaced {
+                resource: res(1),
+                backing: BackingId(100)
+            }),
+            "the refusal names the storage the resource is already in"
+        );
+        // It outlives the heap's number, too: a retiring heap still holds the
+        // allocation, and that placement is still the caller's to present.
+        assert_eq!(
+            heaps.delete(7),
+            Ok(Retirement::Held {
+                allocations: 1,
+                named: false
+            })
+        );
+        assert_eq!(
+            heaps.place(8, res(1), 0, 64),
+            Err(Refusal::AlreadyPlaced {
+                resource: res(1),
+                backing: BackingId(100)
+            })
+        );
+        assert_eq!(
+            heaps.remove(a, res(1)),
+            Ok(Retirement::StorageFree {
+                backing: BackingId(100)
+            })
+        );
+        let b = heaps.place(8, res(1), 0, 64).expect("nothing holds it now");
+        assert_eq!(b.backing, BackingId(101));
+        assert_eq!(
+            heaps.remove(b, res(1)),
+            Ok(Retirement::Held {
+                allocations: 0,
+                named: true
+            })
+        );
+
+        heaps.create(7, BackingId(100), 4096).expect("free again");
+        let a = heaps.place(7, res(1), 0, 64).expect("fits");
         assert_eq!(heaps.placement(7, res(1)), Ok(a));
         assert_eq!(
             heaps.placement(7, res(2)),
@@ -656,6 +827,104 @@ mod tests {
         assert!(!heaps.holds_storage(BackingId(100)));
     }
 
+    /// The sibling of the reused-number case below, and the one the backing
+    /// cannot answer: a resource removed from a heap may be placed in it again,
+    /// and the second placement differs from the first only in its window. A
+    /// holder of the first presenting it back would remove the second, leaving
+    /// its holder unable to retire it and the index saying the resource is in
+    /// no heap at all.
+    #[test]
+    fn a_placement_superseded_by_a_later_one_cannot_remove_it() {
+        let mut heaps = heaps_with(4096);
+        let first = heaps.place(7, res(1), 0, 64).expect("fits");
+        assert_eq!(
+            heaps.remove(first, res(1)),
+            Ok(Retirement::Held {
+                allocations: 0,
+                named: true
+            })
+        );
+        let second = heaps
+            .place(7, res(1), 1024, 64)
+            .expect("unplaced, so it fits");
+        assert_eq!(first.heap, second.heap);
+        assert_eq!(first.backing, second.backing);
+        assert_eq!(
+            heaps.remove(first, res(1)),
+            Err(Refusal::StalePlacement {
+                resource: res(1),
+                named: ByteRange {
+                    offset: 0,
+                    length: 64
+                },
+                placed_at: ByteRange {
+                    offset: 1024,
+                    length: 64
+                },
+            })
+        );
+        assert_eq!(
+            heaps.allocations(7),
+            1,
+            "and the live placement is still placed"
+        );
+        assert_eq!(
+            heaps.remove(second, res(1)),
+            Ok(Retirement::Held {
+                allocations: 0,
+                named: true
+            }),
+            "so its holder can still retire it"
+        );
+    }
+
+    /// Storage retiring behind a deleted number refuses a superseded placement
+    /// for the same reason a live heap does. It is reachable only through the
+    /// placements handed out over it, so accepting the wrong one is the last
+    /// removal of storage a live allocation is still in.
+    #[test]
+    fn a_retiring_heap_refuses_a_superseded_placement_too() {
+        let mut heaps = heaps_with(4096);
+        let first = heaps.place(7, res(1), 0, 64).expect("fits");
+        assert_eq!(
+            heaps.remove(first, res(1)),
+            Ok(Retirement::Held {
+                allocations: 0,
+                named: true
+            })
+        );
+        let second = heaps.place(7, res(1), 1024, 64).expect("unplaced");
+        assert_eq!(
+            heaps.delete(7),
+            Ok(Retirement::Held {
+                allocations: 1,
+                named: false
+            })
+        );
+        assert_eq!(
+            heaps.remove(first, res(1)),
+            Err(Refusal::StalePlacement {
+                resource: res(1),
+                named: ByteRange {
+                    offset: 0,
+                    length: 64
+                },
+                placed_at: ByteRange {
+                    offset: 1024,
+                    length: 64
+                },
+            }),
+            "the storage is not free while `second` is in it"
+        );
+        assert!(heaps.holds_storage(BackingId(100)));
+        assert_eq!(
+            heaps.remove(second, res(1)),
+            Ok(Retirement::StorageFree {
+                backing: BackingId(100)
+            })
+        );
+    }
+
     /// A heap number is a guest object reference and gets reused. The retiring
     /// storage behind it must be unreachable from the number, or a holder of an
     /// old placement removes its allocation from the new heap and the old
@@ -674,7 +943,12 @@ mod tests {
         heaps
             .create(7, BackingId(200), 4096)
             .expect("the number is available again");
-        let new = heaps.place(7, res(1), 0, 64).expect("fits");
+        // A different resource, because `res(1)` is still placed in the storage
+        // retiring behind the old number and a resource is placed once — see
+        // [`Refusal::AlreadyPlaced`]. What is being tested is that the *number*
+        // does not reach the old storage, and the old placement is what carries
+        // it there.
+        let new = heaps.place(7, res(2), 0, 64).expect("fits");
         assert_ne!(old.backing, new.backing);
         assert_eq!(
             heaps.remove(old, res(1)),
@@ -689,7 +963,7 @@ mod tests {
             "and left the new heap's membership alone"
         );
         assert_eq!(
-            heaps.remove(new, res(1)),
+            heaps.remove(new, res(2)),
             Ok(Retirement::Held {
                 allocations: 0,
                 named: true
@@ -743,6 +1017,72 @@ mod tests {
         );
     }
 
+    /// One backing belongs to at most one heap, and the second heap over it is
+    /// refused rather than admitted.
+    ///
+    /// Admitted, it produced the failure the deletion rule exists to prevent.
+    /// Two heaps over backing `B`, one resource placed in each, both deleted:
+    /// the second delete's `retiring.insert(B, ...)` replaced the first's set
+    /// of live allocations, so removing the *second* heap's resource emptied
+    /// what was left and reported `StorageFree` while the first heap's resource
+    /// was still in that storage — and the first resource's own removal then
+    /// refused as `StaleStorage`, which is the model saying the memory a live
+    /// placement names is gone.
+    ///
+    /// Refused at creation rather than diagnosed at deletion, because by the
+    /// time the second delete runs there is nothing left to refuse: both heaps
+    /// were legal, both placements were legal, and the retirement map has one
+    /// key for two sets.
+    #[test]
+    fn two_heaps_cannot_be_created_over_one_piece_of_storage() {
+        let mut h = Heaps::new();
+        let b = BackingId(9);
+        h.create(1, b, 100)
+            .expect("the first heap over this storage");
+        assert_eq!(
+            h.create(2, b, 100),
+            Err(Refusal::StorageInUse { backing: b }),
+            "a second heap over one backing gives the two one retirement"
+        );
+        // A different backing under a different number is unaffected.
+        h.create(2, BackingId(10), 100).expect("its own storage");
+
+        // And the storage is free again once the first heap is gone, so the
+        // refusal is about overlap in time and not a permanent claim on a
+        // number.
+        assert!(matches!(
+            h.delete(1).expect("live"),
+            Retirement::StorageFree { backing } if backing == b
+        ));
+        h.create(3, b, 100).expect("the storage was handed back");
+    }
+
+    /// The refusal outlives the delete for as long as the storage does: a heap
+    /// retiring behind its allocations still holds its backing, and a new heap
+    /// over it would inherit the retirement it cannot see.
+    #[test]
+    fn storage_outliving_its_heap_number_is_still_in_use() {
+        let mut h = Heaps::new();
+        let b = BackingId(9);
+        h.create(1, b, 100).expect("live");
+        let p = h.place(1, res(10), 0, 10).expect("placed");
+        assert!(matches!(
+            h.delete(1).expect("live"),
+            Retirement::Held { .. }
+        ));
+        assert_eq!(
+            h.create(2, b, 100),
+            Err(Refusal::StorageInUse { backing: b }),
+            "the number is free and the storage is not"
+        );
+        assert!(matches!(
+            h.remove(p, res(10)).expect("placed"),
+            Retirement::StorageFree { backing } if backing == b
+        ));
+        h.create(2, b, 100)
+            .expect("the last allocation handed it back");
+    }
+
     #[test]
     fn every_refusal_has_its_own_slug() {
         let all = [
@@ -759,9 +1099,15 @@ mod tests {
                 length: 0,
                 placement_length: 0,
             },
-            Refusal::AlreadyPlaced { resource: res(1) },
+            Refusal::AlreadyPlaced {
+                resource: res(1),
+                backing: BackingId(1),
+            },
             Refusal::NotPlaced { resource: res(1) },
             Refusal::StaleStorage {
+                backing: BackingId(1),
+            },
+            Refusal::StorageInUse {
                 backing: BackingId(1),
             },
         ];
@@ -770,5 +1116,399 @@ mod tests {
         let count = slugs.len();
         slugs.dedup();
         assert_eq!(slugs.len(), count);
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// Deliberately tiny pools, so numbers and storage are reused constantly
+    /// and the same resource is placed, removed and placed again. Everything
+    /// interesting here is about a name outliving the thing it named.
+    const NUMBERS: u64 = 4;
+    const BACKINGS: u64 = 3;
+    const RESOURCES: u64 = 6;
+    const HEAP_LEN: u64 = 64;
+
+    /// Whole heap histories, driven, against a shadow that tracks only who
+    /// holds what.
+    ///
+    /// # The property the hand-written cases cannot state
+    ///
+    /// **Storage is handed back exactly once, and never while a placement still
+    /// names it.** Both halves are claims about a *sequence*: a double free is
+    /// two `StorageFree` reports for one backing separated by any amount of
+    /// history, and an early free is a report issued while some placement handed
+    /// out earlier is still outstanding. Every case above drives one heap
+    /// through one shape and can see neither.
+    ///
+    /// This is the sweep that would have caught two heaps sharing one backing —
+    /// the defect `two_heaps_cannot_be_created_over_one_piece_of_storage` now
+    /// refuses at creation — and it is here so the next one of that family is
+    /// caught by a test rather than by reading the code.
+    ///
+    /// # Stale placements are part of the history, not an error case
+    ///
+    /// Removals are drawn from every placement ever handed out, including ones
+    /// whose heap was deleted and whose number has since been reused. That is
+    /// the ordinary shape of this module — a placement outlives its heap's
+    /// number by construction — so a sweep that only removed live placements
+    /// would be testing the easy half.
+    #[test]
+    fn storage_is_handed_back_exactly_once_and_never_under_a_live_placement() {
+        let mut frees = 0usize;
+        let mut refused_number = 0usize;
+        let mut refused_storage = 0usize;
+        let mut stale_removals = 0usize;
+        let mut deletes_that_waited = 0usize;
+        let mut removals_of_a_retiring_heap = 0usize;
+        let mut removals_of_a_superseded_window = 0usize;
+
+        for seed in 0..384u64 {
+            let mut rng = Rng::new(seed);
+            let mut heaps = Heaps::new();
+            // Shadow: which storage each live number is over, and every
+            // placement still outstanding against a piece of storage.
+            let mut number_storage: HashMap<u64, BackingId> = HashMap::new();
+            let mut outstanding: HashMap<BackingId, HashSet<ResourceId>> = HashMap::new();
+            let mut handed_out: Vec<(HeapPlacement, ResourceId)> = Vec::new();
+            // Where each placed resource is, across every heap and every
+            // retirement: the law `AlreadyPlaced` states, stated globally.
+            let mut placed_where: HashMap<ResourceId, BackingId> = HashMap::new();
+            let mut live_placement: HashMap<ResourceId, HeapPlacement> = HashMap::new();
+
+            for _ in 0..64 {
+                match rng.below(10) {
+                    0..=2 => {
+                        let number = rng.below(NUMBERS);
+                        let backing = BackingId(rng.below(BACKINGS));
+                        let result = heaps.create(number, backing, HEAP_LEN);
+                        match result {
+                            Ok(()) => {
+                                assert!(
+                                    !number_storage.contains_key(&number),
+                                    "seed {seed}: number {number} was already live"
+                                );
+                                assert!(
+                                    !number_storage.values().any(|b| *b == backing)
+                                        && !outstanding.contains_key(&backing),
+                                    "seed {seed}: {backing:?} was already held"
+                                );
+                                number_storage.insert(number, backing);
+                            }
+                            Err(Refusal::HeapExists { .. }) => {
+                                refused_number += 1;
+                                assert!(number_storage.contains_key(&number));
+                            }
+                            Err(Refusal::StorageInUse { .. }) => {
+                                refused_storage += 1;
+                                assert!(
+                                    number_storage.values().any(|b| *b == backing)
+                                        || outstanding.contains_key(&backing),
+                                    "seed {seed}: refused storage nothing holds"
+                                );
+                            }
+                            Err(other) => panic!("seed {seed}: create refused as {other:?}"),
+                        }
+                    }
+                    3..=5 => {
+                        let number = rng.below(NUMBERS);
+                        let resource = res(rng.below(RESOURCES) as u32);
+                        let offset = rng.below(HEAP_LEN);
+                        let length = rng.below(HEAP_LEN + 8 - offset);
+                        let membership_before = heaps.membership(number).ok();
+                        match heaps.place(number, resource, offset, length) {
+                            Ok(p) => {
+                                // A placement is a change of membership, and a
+                                // command records which set it was written
+                                // against — so a place that did not advance it
+                                // would let a later declaration claim it was
+                                // written after this resource arrived.
+                                assert!(
+                                    heaps
+                                        .membership(number)
+                                        .expect("live")
+                                        .membership_generation
+                                        > membership_before.expect("live").membership_generation,
+                                    "seed {seed}: a placement did not advance membership"
+                                );
+                                let backing = number_storage[&number];
+                                assert_eq!(p.backing, backing, "seed {seed}");
+                                assert_eq!(p.region.offset, offset);
+                                assert_eq!(p.region.length, length);
+                                assert!(
+                                    offset + length <= HEAP_LEN,
+                                    "seed {seed}: a placement left its heap"
+                                );
+                                assert!(
+                                    outstanding.entry(backing).or_default().insert(resource),
+                                    "seed {seed}: placed twice"
+                                );
+                                assert!(
+                                    placed_where.insert(resource, backing).is_none(),
+                                    "seed {seed}: {resource:?} was placed in a second heap"
+                                );
+                                live_placement.insert(resource, p);
+                                handed_out.push((p, resource));
+                            }
+                            Err(Refusal::NoSuchHeap { .. }) => {
+                                assert!(!number_storage.contains_key(&number))
+                            }
+                            Err(Refusal::OutOfHeap { .. }) => {
+                                assert!(offset + length > HEAP_LEN, "seed {seed}")
+                            }
+                            Err(Refusal::AlreadyPlaced {
+                                resource: named,
+                                backing,
+                            }) => {
+                                assert_eq!(named, resource, "seed {seed}");
+                                assert_eq!(
+                                    placed_where.get(&resource),
+                                    Some(&backing),
+                                    "seed {seed}: refused a resource nothing holds, or named \
+                                     the wrong storage"
+                                );
+                                assert!(outstanding[&backing].contains(&resource));
+                            }
+                            Err(other) => panic!("seed {seed}: place refused as {other:?}"),
+                        }
+                    }
+                    6..=8 if !handed_out.is_empty() => {
+                        let which = rng.below(handed_out.len() as u64) as usize;
+                        let (placement, resource) = handed_out[which];
+                        // Which placement is live is the shadow's own
+                        // bookkeeping: the last one `place` handed out for this
+                        // resource and did not take back. Deriving it instead
+                        // from where the resource can be *found* — its backing
+                        // is still named, or still retiring — is the module's
+                        // lookup rule rather than a property, and a shadow that
+                        // restates the lookup agrees with the module about
+                        // every placement of one resource in one heap at once.
+                        // The sweep hands those out: a resource removed and
+                        // placed again differs only in its window.
+                        let named = number_storage.get(&placement.heap) == Some(&placement.backing);
+                        let held = live_placement.get(&resource) == Some(&placement);
+                        let superseded = !held
+                            && live_placement.get(&resource).is_some_and(|live| {
+                                live.heap == placement.heap && live.backing == placement.backing
+                            });
+                        let retiring_here =
+                            held && !number_storage.values().any(|b| *b == placement.backing);
+                        if !held {
+                            stale_removals += 1;
+                        }
+                        if superseded {
+                            removals_of_a_superseded_window += 1;
+                        }
+                        if retiring_here {
+                            removals_of_a_retiring_heap += 1;
+                        }
+                        let membership_before = heaps.membership(placement.heap).ok();
+                        match heaps.remove(placement, resource) {
+                            Ok(Retirement::StorageFree { backing }) => {
+                                assert_eq!(backing, placement.backing, "seed {seed}");
+                                let set = outstanding
+                                    .get_mut(&backing)
+                                    .expect("a free needs something to have been held");
+                                set.remove(&resource);
+                                assert!(
+                                    set.is_empty(),
+                                    "seed {seed}: {backing:?} freed while {} placements still \
+                                     name it",
+                                    set.len()
+                                );
+                                assert!(
+                                    !number_storage.values().any(|b| *b == backing),
+                                    "seed {seed}: {backing:?} freed while a number still names it"
+                                );
+                                // A second free of this storage cannot pass:
+                                // the shadow now holds nothing under it, so the
+                                // `expect` above fires unless a create hands it
+                                // out again first.
+                                outstanding.remove(&backing);
+                                placed_where.remove(&resource);
+                                live_placement.remove(&resource);
+                                frees += 1;
+                            }
+                            Ok(Retirement::Held {
+                                allocations,
+                                named: n,
+                            }) => {
+                                assert!(held, "seed {seed}: a stale placement was accepted");
+                                assert_eq!(n, named, "seed {seed}: wrong `named`");
+                                if n {
+                                    assert!(
+                                        heaps
+                                            .membership(placement.heap)
+                                            .expect("named")
+                                            .membership_generation
+                                            > membership_before
+                                                .expect("named")
+                                                .membership_generation,
+                                        "seed {seed}: a removal did not advance membership"
+                                    );
+                                }
+                                let set = outstanding.get_mut(&placement.backing).expect("held");
+                                set.remove(&resource);
+                                placed_where.remove(&resource);
+                                live_placement.remove(&resource);
+                                if n {
+                                    // A named heap reports its own allocations,
+                                    // which are the ones in *this* storage.
+                                    assert_eq!(allocations, set.len(), "seed {seed}");
+                                } else {
+                                    assert_eq!(allocations, set.len(), "seed {seed}");
+                                    assert!(!set.is_empty(), "seed {seed}: held nothing");
+                                }
+                            }
+                            Err(
+                                e @ (Refusal::NotPlaced { .. }
+                                | Refusal::StaleStorage { .. }
+                                | Refusal::StalePlacement { .. }),
+                            ) => {
+                                assert!(
+                                    !held,
+                                    "seed {seed}: a live placement was refused as {e:?}; \
+                                     placement={placement:?} resource={resource:?} \
+                                     numbers={number_storage:?} outstanding={outstanding:?}"
+                                );
+                            }
+                            Err(other) => panic!("seed {seed}: remove refused as {other:?}"),
+                        }
+                    }
+                    _ => {
+                        let number = rng.below(NUMBERS);
+                        match heaps.delete(number) {
+                            Ok(Retirement::StorageFree { backing }) => {
+                                assert_eq!(number_storage.remove(&number), Some(backing));
+                                assert!(
+                                    outstanding.get(&backing).is_none_or(|s| s.is_empty()),
+                                    "seed {seed}: an empty-heap delete freed storage a \
+                                     placement names"
+                                );
+                                outstanding.remove(&backing);
+                                frees += 1;
+                            }
+                            Ok(Retirement::Held { allocations, named }) => {
+                                let backing = number_storage
+                                    .remove(&number)
+                                    .expect("a delete that held needs a live heap");
+                                assert!(!named, "seed {seed}: a delete leaves nothing named");
+                                assert_eq!(allocations, outstanding[&backing].len(), "seed {seed}");
+                                assert!(allocations > 0);
+                                deletes_that_waited += 1;
+                            }
+                            Err(Refusal::NoSuchHeap { .. }) => {
+                                assert!(!number_storage.contains_key(&number));
+                            }
+                            Err(other) => panic!("seed {seed}: delete refused as {other:?}"),
+                        }
+                    }
+                }
+
+                // The observers agree with the shadow after every step.
+                assert_eq!(
+                    heaps.live_heaps(),
+                    {
+                        let mut v: Vec<u64> = number_storage.keys().copied().collect();
+                        v.sort_unstable();
+                        v
+                    },
+                    "seed {seed}: live_heaps"
+                );
+                for n in 0..NUMBERS {
+                    let expected = number_storage
+                        .get(&n)
+                        .map_or(0, |b| outstanding.get(b).map_or(0, |s| s.len()));
+                    assert_eq!(
+                        heaps.allocations(n),
+                        expected,
+                        "seed {seed}: allocations({n})"
+                    );
+                }
+                for b in 0..BACKINGS {
+                    let backing = BackingId(b);
+                    let expected = number_storage.values().any(|v| *v == backing)
+                        || outstanding.get(&backing).is_some_and(|s| !s.is_empty());
+                    assert_eq!(
+                        heaps.holds_storage(backing),
+                        expected,
+                        "seed {seed}: holds_storage({backing:?})"
+                    );
+                }
+                assert_eq!(
+                    heaps.retiring_storage(),
+                    outstanding
+                        .iter()
+                        .filter(|(b, s)| {
+                            !s.is_empty() && !number_storage.values().any(|v| *v == **b)
+                        })
+                        .count(),
+                    "seed {seed}: retiring_storage"
+                );
+                // The index behind `AlreadyPlaced` is not a second source of
+                // truth: it says exactly what the heaps and the retirements
+                // say, at every step and not only at the end.
+                assert_eq!(heaps.placed, placed_where, "seed {seed}: the placed index");
+                let derived: HashMap<ResourceId, BackingId> = heaps
+                    .heaps
+                    .values()
+                    .flat_map(|h| h.placements.keys().map(|r| (*r, h.backing)))
+                    .chain(
+                        heaps
+                            .retiring
+                            .iter()
+                            .flat_map(|(b, r)| r.allocations.keys().map(|res| (*res, *b))),
+                    )
+                    .collect();
+                assert_eq!(heaps.placed, derived, "seed {seed}: the index drifted");
+            }
+        }
+
+        // Non-vacuity: every shape an assertion above depends on reaching.
+        assert!(frees > 700, "storage handed back: {frees}");
+        assert!(
+            deletes_that_waited > 150,
+            "deletes that could not free yet: {deletes_that_waited}"
+        );
+        assert!(
+            removals_of_a_retiring_heap > 120,
+            "removals from storage whose number is gone: {removals_of_a_retiring_heap}"
+        );
+        assert!(
+            removals_of_a_superseded_window > 40,
+            "removals naming a window a later placement of the same resource in the same heap \
+             has taken over: {removals_of_a_superseded_window}"
+        );
+        assert!(
+            stale_removals > 1_500,
+            "removals of a placement nothing holds: {stale_removals}"
+        );
+        assert!(
+            refused_number > 1_500,
+            "creates over a live number: {refused_number}"
+        );
+        assert!(
+            refused_storage > 1_000,
+            "creates over held storage: {refused_storage}"
+        );
     }
 }

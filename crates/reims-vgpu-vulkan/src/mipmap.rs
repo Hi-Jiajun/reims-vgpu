@@ -15,26 +15,53 @@
 //! So the plan is a sequence of steps, alternating, and the sequence *is* the
 //! claim this module makes.
 //!
-//! # A filtered reduction needs a filter
+//! # A filtered reduction needs a blittable, filterable format
 //!
-//! `generateMipmapsForTexture:` filters. `vkCmdBlitImage` with
-//! `VK_FILTER_LINEAR` needs the format to report
-//! `SAMPLED_IMAGE_FILTER_LINEAR` for optimal tiling, and not every format
-//! does. Falling back to `VK_FILTER_NEAREST` would produce a chain that
-//! allocates, records and runs, and looks wrong — an aliased, sparkling
-//! texture the guest has no way to attribute. So a format without the
-//! capability refuses by name, and the capability is *measured* off the
-//! physical device rather than assumed from the format.
+//! `generateMipmapsForTexture:` filters, and `vkCmdBlitImage` with
+//! `VK_FILTER_LINEAR` asks three separate things of
+//! `VkFormatProperties::optimalTilingFeatures`, not one:
 //!
-//! Depth and stencil formats refuse for a different reason: linear filtering
-//! of a depth image is invalid usage regardless of what the format reports,
-//! because there is no meaningful average of two depth values.
+//! - `BLIT_SRC` of the source image (VUID-vkCmdBlitImage-srcImage-01999),
+//! - `BLIT_DST` of the destination image (VUID-vkCmdBlitImage-dstImage-02000),
+//! - `SAMPLED_IMAGE_FILTER_LINEAR` of the source when the filter is linear
+//!   (VUID-vkCmdBlitImage-filter-02001).
 //!
-//! # One level is a no-op, not a refusal
+//! This ladder blits an image into itself, so all three are asked of the one
+//! format, and all three are *measured* off the physical device rather than
+//! assumed. They fail differently and so refuse separately: a missing filter
+//! bit would only make `VK_FILTER_NEAREST` legal, and dropping to it would
+//! produce a chain that allocates, records and runs and looks wrong — an
+//! aliased, sparkling texture the guest has no way to attribute. A missing
+//! blit bit is not a quality question at all; the command is invalid use,
+//! which is what a block-compressed format is: filterable, `BLIT_SRC`, and
+//! not `BLIT_DST`, because no host writes filtered blocks.
 //!
-//! A texture with a single level has nothing to generate, and the guest's own
-//! call on one does nothing. An empty plan says exactly that, and a refusal
-//! there would turn a legal guest command into a lost frame.
+//! Depth and stencil formats refuse for a different reason again: linear
+//! filtering of a depth image is invalid usage regardless of what the format
+//! reports, because there is no meaningful average of two depth values.
+//!
+//! # One level is a refusal, not a no-op
+//!
+//! `generateMipmapsForTexture:` requires a `mipmapLevelCount` greater than one
+//! and fails on a texture that declares one — it is not a call that quietly
+//! does nothing. So an empty plan is the wrong answer twice over: it hides a
+//! command the guest's own hardware would have failed, and it drops decoded
+//! guest work off the failure channel entirely, leaving a guest whose upper
+//! levels are undefined with nothing to attribute that to.
+//!
+//! This is also the only way `Multisampled` was ever reached: a multisample
+//! declaration is forced to exactly one level by
+//! `texture_shape::TextureShape::checked`, so before this the same texture
+//! could refuse or silently do nothing depending only on which check ran
+//! first. Both now refuse, and the multisample check stays ahead of the level
+//! check so the guest gets the more specific of the two reasons.
+//!
+//! # Guest-attributable reasons before host-attributable ones
+//!
+//! A single-level or depth texture is refused on every host; a format without
+//! the blit bits is refused on this one. The texture's own facts are therefore
+//! decided first, so that a guest reading the failure channel is told what it
+//! did before it is told what this machine cannot do.
 //!
 //! # Planned, not recorded
 //!
@@ -49,15 +76,24 @@ use reims_vgpu_core::texture_shape::Texture;
 
 use crate::layout::{Contents, Decline, ImageId, LayoutTracker, Subresource, Transition, Use};
 
-/// What this host reports about filtering one format, measured rather than
+/// What this host reports about blitting one format, measured rather than
 /// assumed.
 ///
-/// One bool because one question is asked. It comes from
-/// `VkFormatProperties::optimalTilingFeatures &
-/// VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT`, which is the bit
-/// `vkCmdBlitImage` with a linear filter requires of its *source*.
+/// Three bools because `vkCmdBlitImage` with a linear filter asks three
+/// questions, all of `VkFormatProperties::optimalTilingFeatures` and — because
+/// the ladder blits an image into itself — all of the one format. See the
+/// module doc for why each is separate.
+///
+/// `Default` is every bit clear, which is the answer that refuses. A host that
+/// was never asked cannot be assumed to blit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FilterSupport {
+    /// `VK_FORMAT_FEATURE_BLIT_SRC_BIT`.
+    pub blit_source: bool,
+    /// `VK_FORMAT_FEATURE_BLIT_DST_BIT`. The bit a block-compressed format
+    /// does not have while having the other two.
+    pub blit_dest: bool,
+    /// `VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT`.
     pub linear_blit_source: bool,
 }
 
@@ -67,11 +103,20 @@ pub enum Refusal {
     /// The format cannot be linearly filtered here. Named rather than dropped
     /// to nearest, which would produce a chain that runs and looks wrong.
     NoLinearFilter { format: u16 },
+    /// The format cannot be the source of a blit here, so no rung of the
+    /// ladder can read the level below it.
+    NoBlitSource { format: u16 },
+    /// The format cannot be the destination of a blit here, so no rung can
+    /// write the level above it. What a block-compressed format answers.
+    NoBlitDest { format: u16 },
     /// Depth and stencil have no filtered reduction on any host.
     DepthStencil { format: u16 },
     /// A multisample texture has no mip chain to generate and no blit that
     /// could produce one.
     Multisampled { samples: u32 },
+    /// The texture declares one level, so there is no chain to generate. A
+    /// refusal rather than an empty plan — see the module doc.
+    SingleLevel,
     /// The layout tracker does not know this image or subresource.
     Untracked { decline: Decline },
 }
@@ -81,8 +126,11 @@ impl Refusal {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::NoLinearFilter { .. } => "vk_mipmap_no_linear_filter",
+            Self::NoBlitSource { .. } => "vk_mipmap_no_blit_source",
+            Self::NoBlitDest { .. } => "vk_mipmap_no_blit_dest",
             Self::DepthStencil { .. } => "vk_mipmap_depth_stencil",
             Self::Multisampled { .. } => "vk_mipmap_multisampled",
+            Self::SingleLevel => "vk_mipmap_single_level",
             Self::Untracked { .. } => "vk_mipmap_untracked",
         }
     }
@@ -91,10 +139,14 @@ impl Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoLinearFilter { format } | Self::DepthStencil { format } => {
+            Self::NoLinearFilter { format }
+            | Self::NoBlitSource { format }
+            | Self::NoBlitDest { format }
+            | Self::DepthStencil { format } => {
                 write!(f, "{} format={format}", self.slug())
             }
             Self::Multisampled { samples } => write!(f, "{} samples={samples}", self.slug()),
+            Self::SingleLevel => write!(f, "{}", self.slug()),
             Self::Untracked { decline } => write!(f, "{} {decline}", self.slug()),
         }
     }
@@ -158,7 +210,7 @@ pub enum Step {
 
 /// The steps that build `texture`'s mip chain from its top level.
 ///
-/// Empty when there is nothing to generate.
+/// Never empty on success: a texture with no chain to build refuses.
 ///
 /// # Errors
 ///
@@ -176,14 +228,20 @@ pub fn plan(
             samples: texture.sample_count(),
         });
     }
+    if texture.mip_levels() < 2 {
+        return Err(Refusal::SingleLevel);
+    }
     if format_has_depth_aspect(format) || format_has_stencil_aspect(format) {
         return Err(Refusal::DepthStencil { format });
     }
+    if !support.blit_source {
+        return Err(Refusal::NoBlitSource { format });
+    }
+    if !support.blit_dest {
+        return Err(Refusal::NoBlitDest { format });
+    }
     if !support.linear_blit_source {
         return Err(Refusal::NoLinearFilter { format });
-    }
-    if texture.mip_levels() < 2 {
-        return Ok(Vec::new());
     }
 
     let layers = texture.layers();
@@ -265,6 +323,8 @@ mod tests {
 
     fn filterable() -> FilterSupport {
         FilterSupport {
+            blit_source: true,
+            blit_dest: true,
             linear_blit_source: true,
         }
     }
@@ -430,14 +490,29 @@ mod tests {
     }
 
     #[test]
-    fn a_single_level_texture_generates_nothing_rather_than_refusing() {
+    fn a_single_level_texture_refuses_rather_than_generating_nothing() {
+        // Not a quiet no-op: the reference implementation rejects the call,
+        // and an empty plan would drop decoded guest work with no reason.
         let texture = texture(TextureKind::D2, 16, 1, 1, MTL_FORMAT_RGBA8_UNORM);
         let mut tracker = tracked(texture);
         assert_eq!(
             plan(IMAGE, texture, filterable(), &mut tracker),
-            Ok(Vec::new())
+            Err(Refusal::SingleLevel)
         );
         assert_eq!(tracker.census().transitions, 0);
+    }
+
+    #[test]
+    fn a_texture_this_host_cannot_blit_is_told_what_it_declared_first() {
+        // Guest-attributable before host-attributable: a single-level texture
+        // is refused on every host, so it hears that rather than a capability
+        // this machine happens to lack.
+        let texture = texture(TextureKind::D2, 16, 1, 1, MTL_FORMAT_RGBA8_UNORM);
+        let mut tracker = tracked(texture);
+        assert_eq!(
+            plan(IMAGE, texture, FilterSupport::default(), &mut tracker),
+            Err(Refusal::SingleLevel)
+        );
     }
 
     #[test]
@@ -445,7 +520,15 @@ mod tests {
         let texture = flat();
         let mut tracker = tracked(texture);
         assert_eq!(
-            plan(IMAGE, texture, FilterSupport::default(), &mut tracker),
+            plan(
+                IMAGE,
+                texture,
+                FilterSupport {
+                    linear_blit_source: false,
+                    ..filterable()
+                },
+                &mut tracker
+            ),
             Err(Refusal::NoLinearFilter {
                 format: MTL_FORMAT_RGBA8_UNORM
             })
@@ -453,6 +536,56 @@ mod tests {
         // Nothing was moved: a refused generation is retryable against the
         // same tracker.
         assert_eq!(tracker.census().transitions, 0);
+    }
+
+    #[test]
+    fn each_of_the_three_blit_bits_refuses_by_its_own_name() {
+        // A format the host reports as filterable is still not blittable, and
+        // the ladder is a blit. Each bit is asked, and each answers for itself
+        // rather than through the filter bit's name.
+        for (support, expected) in [
+            (
+                FilterSupport {
+                    blit_source: false,
+                    ..filterable()
+                },
+                Refusal::NoBlitSource {
+                    format: MTL_FORMAT_RGBA8_UNORM,
+                },
+            ),
+            (
+                FilterSupport {
+                    blit_dest: false,
+                    ..filterable()
+                },
+                Refusal::NoBlitDest {
+                    format: MTL_FORMAT_RGBA8_UNORM,
+                },
+            ),
+            (
+                FilterSupport {
+                    linear_blit_source: false,
+                    ..filterable()
+                },
+                Refusal::NoLinearFilter {
+                    format: MTL_FORMAT_RGBA8_UNORM,
+                },
+            ),
+        ] {
+            let texture = flat();
+            let mut tracker = tracked(texture);
+            assert_eq!(plan(IMAGE, texture, support, &mut tracker), Err(expected));
+            assert_eq!(tracker.census().transitions, 0);
+        }
+    }
+
+    #[test]
+    fn a_host_that_was_never_asked_refuses_rather_than_blitting() {
+        // `Default` is every bit clear. A caller that forgot to measure gets a
+        // refusal, not a ladder recorded against capabilities nobody read.
+        let texture = flat();
+        let mut tracker = tracked(texture);
+        assert!(plan(IMAGE, texture, FilterSupport::default(), &mut tracker).is_err());
     }
 
     #[test]
@@ -529,8 +662,11 @@ mod tests {
     fn every_refusal_names_itself() {
         let refusals = [
             Refusal::NoLinearFilter { format: 1 },
+            Refusal::NoBlitSource { format: 1 },
+            Refusal::NoBlitDest { format: 1 },
             Refusal::DepthStencil { format: 1 },
             Refusal::Multisampled { samples: 4 },
+            Refusal::SingleLevel,
             Refusal::Untracked {
                 decline: Decline::UnknownImage { image: IMAGE },
             },

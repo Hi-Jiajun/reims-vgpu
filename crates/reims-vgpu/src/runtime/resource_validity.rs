@@ -47,7 +47,7 @@
 //! [`crate::model::ResourceValidity`] for the boot that measured it.
 
 use crate::model::{DeviceState, ResourceValidity};
-use crate::runtime::decode::fifo::InvalidateValidityOps;
+use crate::protocol::fifo::InvalidateValidityOps;
 
 /// Which producer delivered a quad. Only used to name the counters, so an arm
 /// can tell an exec-table statement from an invalidate-command one.

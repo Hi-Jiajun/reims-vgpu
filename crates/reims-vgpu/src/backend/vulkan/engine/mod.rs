@@ -64,20 +64,19 @@ pub(crate) use facade_decline::EngineFacadeDecline;
 pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
-    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue,
-    ColorWriteMask, ComputeBufferResource, ComputeDispatch, ComputeDispatchPayload,
-    ComputeDispatchRegion, ComputeImageDestination, ComputeImageResult, ComputeOutput,
-    ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
-    ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
-    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
-    GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
-    PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
-    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
-    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
-    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
-    StorageBufferResource, StorageImageFormat, TargetIdentity, TargetKeyDivergence,
-    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
-    VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
+    BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue, ColorWriteMask,
+    ComputeBufferResource, ComputeDispatch, ComputeDispatchPayload, ComputeDispatchRegion,
+    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeRequest,
+    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+    ComputeStorageImageResource, ComputeStorageResidency, DepthState, DrawError, DrawOutput,
+    DrawRequest, GuestRun, GuestRunSource, GuestSampledBacking, GuestTargetBacking,
+    GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
+    PrimitiveTopology, SampledByteOrigin, SampledContentIdentity, SampledImageResource,
+    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
+    SeedOrder, StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
+    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
+    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
+    COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
@@ -3631,12 +3630,7 @@ unsafe fn plan_guest_copy(
             // The relation itself is the caller's to check, because it is the
             // caller that knows what the destination was built from and can name
             // the refusal — see `GuestWriteDecline::WindowTooSmall`.
-            let scratch = pools.acquire_guest_gather(
-                ctx,
-                dst.window_bytes(),
-                ash::vk::BufferUsageFlags::empty(),
-                counters,
-            )?;
+            let scratch = pools.acquire_guest_gather(ctx, dst.window_bytes(), counters)?;
             // The dispatch first, falling back to the regions it replaces —
             // which is the only ordering that keeps the transfer form reachable
             // on every host and for every run shape it still has to serve.
@@ -4315,14 +4309,7 @@ unsafe fn stage_run_tables(
     // kilobytes, which is why this is cheaper than the per-table slots it
     // replaces even with the extra copy.
     let (packed, places) = pack_run_tables(tables, ctx.storage_buffer_offset_align);
-    let slot = unsafe {
-        pools.acquire_staging(
-            ctx,
-            packed.len() as u64,
-            ash::vk::BufferUsageFlags::empty(),
-            counters,
-        )
-    }?;
+    let slot = unsafe { pools.acquire_staging(ctx, packed.len() as u64, counters) }?;
     unsafe { pools.write_staging(ctx, &slot, &packed) }?;
     Ok((slot, places))
 }
@@ -4807,6 +4794,30 @@ fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
         .unwrap_or(RESIDENT_READ_BYTES_PER_TEXEL)
 }
 
+/// The readback slot one draw's colour target needs, or `None` when the
+/// geometry and the attachment's texel width do not describe a length.
+///
+/// **The multiply is checked and that is the whole of this function.** The copy
+/// at the end of a draw names an image extent and no buffer row length, so the
+/// GPU writes `width * height * bytes_per_texel` bytes into the slot this
+/// number sizes. `(w as u64) * (h as u64)` widens its operands, which reads as
+/// safe and is — but only just: two `u32` maxima multiply to a hair under
+/// `u64::MAX`, so [`readback_bytes_per_texel`] is a third factor that
+/// overflows. A wrapped product is a small slot under a device-side write of
+/// the unwrapped length, and in a debug build the multiply panics instead —
+/// out of an `unsafe fn` reached across the FFI boundary.
+///
+/// `validate_v1` states the same reason about the seed on the way in. This is
+/// the same question on the way out, and it was answered with a bare `*`.
+fn readback_slot_bytes(width: u32, height: u32, format: ash::vk::Format) -> Option<u64> {
+    reims_vgpu_protocol::extent::tight_image_bytes(
+        width,
+        height,
+        readback_bytes_per_texel(format) as usize,
+    )
+    .map(|bytes| bytes as u64)
+}
+
 /// The Vulkan spelling of a layout, for a decline that has only the layout.
 fn readback_vk_format(layout: TexelLayout) -> ash::vk::Format {
     crate::backend::vulkan::translate::pixel::vk_texel_layout(layout)
@@ -4884,6 +4895,56 @@ fn feedback_transition_dependency(layout: ash::vk::ImageLayout) -> ash::vk::Depe
         ash::vk::DependencyFlags::FEEDBACK_LOOP_EXT
     } else {
         ash::vk::DependencyFlags::empty()
+    }
+}
+
+#[cfg(test)]
+mod readback_slot_tests {
+    use super::*;
+
+    /// The format this device falls back to, and the one every ordinary
+    /// colour target uses.
+    const RGBA8: ash::vk::Format = ash::vk::Format::R8G8B8A8_UNORM;
+
+    #[test]
+    fn an_ordinary_target_is_its_own_tight_image() {
+        assert_eq!(
+            readback_slot_bytes(1920, 1080, RGBA8),
+            Some(1920 * 1080 * 4)
+        );
+        assert_eq!(readback_slot_bytes(1, 1, RGBA8), Some(4));
+    }
+
+    /// **The reason the function exists.** Two `u32` maxima already fill a
+    /// `u64`; the texel width is the factor that does not fit. Sized with a
+    /// bare multiply, the release build hands back a slot far smaller than the
+    /// bytes the GPU is about to write into it, and the debug build panics out
+    /// of an `unsafe fn` reached across the FFI boundary.
+    #[test]
+    fn a_geometry_whose_length_does_not_fit_is_refused_and_not_wrapped() {
+        let (w, h) = (1u32 << 31, 1u32 << 31);
+        let texel = u64::from(readback_bytes_per_texel(RGBA8));
+        assert!(texel > 1, "a one-byte texel would not overflow anything");
+        assert_eq!(
+            readback_slot_bytes(w, h, RGBA8),
+            None,
+            "the length is unrepresentable and must be refused, not reported small"
+        );
+        assert_eq!(
+            (u64::from(w))
+                .wrapping_mul(u64::from(h))
+                .wrapping_mul(texel),
+            0,
+            "the bare multiply this replaced reports zero bytes for that geometry"
+        );
+    }
+
+    /// A zero axis is not a zero-length slot: every caller of this number
+    /// compares a buffer against it, and `0` passes every such comparison.
+    #[test]
+    fn a_degenerate_geometry_is_refused_rather_than_sized_zero() {
+        assert_eq!(readback_slot_bytes(0, 1080, RGBA8), None);
+        assert_eq!(readback_slot_bytes(1920, 0, RGBA8), None);
     }
 }
 

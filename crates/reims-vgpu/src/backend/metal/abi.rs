@@ -391,8 +391,11 @@ pub struct ReimsVgpuScissor {
 /// a real mode in all four.
 ///
 /// The fifth is line width, which `setLineWidth:` puts on the wire and
-/// `MTLRenderCommandEncoder` has no public setter for; `runtime::exec` still
-/// counts it as `render_line_width_dropped`.
+/// `MTLRenderCommandEncoder` has no public setter for. It reaches this rail in
+/// `DrawEncodeRequest::line_width` and is reported there as
+/// `metal_line_width_unsupported`, once per pipeline and only for a width that
+/// is not Metal's own default. It is not in this structure because there is
+/// nothing for the shim to do with it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReimsVgpuRasterState {

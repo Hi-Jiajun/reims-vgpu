@@ -13,8 +13,7 @@ use super::counters::{CreateSite, EngineCounters};
 use super::digest::Digest128;
 use super::pools::{DeferredHandle, ResourcePools};
 use super::types::{
-    BlendKey, ColorWriteMask, CullMode, DepthClipMode, DrawError, FillMode, PrimitiveTopology,
-    SamplerStateKey, VertexAttributeFormat, VertexStepFunction,
+    BlendKey, ColorWriteMask, DrawError, SamplerStateKey, VertexAttributeFormat, VertexStepFunction,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -575,7 +574,21 @@ pub(crate) struct PipelineKey {
     pub vert: Digest128,
     pub frag: Digest128,
     pub attrs: Vec<AttrKey>,
-    pub topology: PrimitiveTopology,
+    /// What this pipeline is identified by as far as the primitive type is
+    /// concerned — the guest's exact type on a host that bakes it, its
+    /// topology class where `vkCmdSetPrimitiveTopology` may move within a
+    /// class, and one key for everything where the device also reports
+    /// `dynamicPrimitiveTopologyUnrestricted`.
+    ///
+    /// Not the guest's type, for the reason [`Self::raster`] is not the
+    /// guest's ordinals: on a dynamic host a triangle list and a triangle
+    /// strip are one pipeline, and a key holding the type could not say so.
+    /// `reims_vgpu_vulkan::topology::key` is the only place that decides which
+    /// of the three rungs this device is on, and
+    /// `TopologyKey::input_assembly` derives the declared topology back out of
+    /// the key — never out of the guest's type — so two draws sharing a key
+    /// cannot describe two different pipelines.
+    pub topology: reims_vgpu_vulkan::topology::TopologyKey,
     pub blend: Option<BlendKey>,
     /// Per-slot blend for secondary colour attachments, parallel to
     /// `pass.secondary[..pass.secondary_count]`. Entries past the count are
@@ -609,34 +622,42 @@ pub(crate) struct PipelineKey {
     /// is a draw sampling an attachment it is writing with no feedback loop
     /// enabled — undefined behaviour, reported nowhere.
     pub feedback_colors: u8,
-    /// Face culling. `None` (the 2D UI default) keeps the raster state at
-    /// `CULL_NONE`, byte-identical to the pre-cull engine; the key still
-    /// participates in hashing so a later culled draw with the same shaders gets
-    /// its own pipeline rather than aliasing the no-cull one.
-    pub cull_mode: CullMode,
-    /// Metal front-facing winding (`true` = counter-clockwise), mapped to a
-    /// Vulkan `FrontFace` by [`crate::backend::vulkan::translate::raster::vk_front_face`].
-    pub front_face_ccw: bool,
-    /// Metal `MTLTriangleFillMode`, mapped to a `VkPolygonMode`. In the key
-    /// because Vulkan has no dynamic polygon mode below
-    /// `VK_EXT_extended_dynamic_state3`: a wireframe draw and a filled draw
-    /// sharing shaders need different pipelines.
-    pub fill_mode: FillMode,
-    /// Metal `MTLDepthClipMode`, mapped to `depthClampEnable`. In the key for
-    /// the same reason as [`Self::fill_mode`].
-    pub depth_clip: DepthClipMode,
-    /// Depth-test pipeline state. Meaningful only when `pass.depth.is_some()`;
-    /// otherwise all-default (test/write off) and no depth-stencil state is
-    /// attached, so the color-only pipeline is byte-identical to the pre-depth
-    /// engine. Metal `MTLCompareFunction` shares `SamplerCompareFunction`.
-    pub depth_test: bool,
-    pub depth_write: bool,
-    pub depth_compare: super::types::SamplerCompareFunction,
-    /// Front/back stencil op state. `Some` only when `pass.depth` carries a
-    /// stencil aspect; the reference value is *excluded* (dynamic state) so
-    /// distinct references reuse one pipeline. `None` keeps the depth-only /
-    /// no-depth pipelines byte-identical to the pre-stencil engine.
-    pub stencil: Option<StencilKey>,
+    /// The rasterization state this pipeline is built with — already parsed,
+    /// already normalized against this host.
+    ///
+    /// The one member of this key that is **not** the guest's raw ordinals,
+    /// and deliberately: on a host that supplies the cull mode, the winding,
+    /// the fill mode or the depth-clip mode per draw, those members carry
+    /// their baked default here and the guest's values ride to the encoder
+    /// instead. Two draws differing only in a dynamic member are then the same
+    /// key and share one pipeline, which is the whole payoff — a key holding
+    /// the ordinals could not express that, because it could not tell which of
+    /// them this device still bakes.
+    ///
+    /// `reims_vgpu_vulkan::raster::plan` is still the one layer that decides
+    /// what an ordinal means; it is called at the draw seam that builds this
+    /// key rather than here, because the same call produces the encoder half.
+    /// So this field cannot hold an ordinal nobody parsed.
+    pub raster: reims_vgpu_vulkan::raster::RasterizationState,
+    /// The depth-stencil state this pipeline is built with — already
+    /// translated, already placed against this host and this pass.
+    ///
+    /// Four key terms before this: a test flag, a write flag, a compare
+    /// function and an optional stencil-op pair. They are one value now for the
+    /// reason [`Self::raster`] is: on a host with
+    /// `VK_EXT_extended_dynamic_state` the guest's whole
+    /// `MTLDepthStencilState` rides to the encoder and this carries a fixed
+    /// placeholder, so every depth-stencil state a guest can bind is one
+    /// pipeline. Four separate terms could not express that, because none of
+    /// them knows whether this device still bakes it.
+    ///
+    /// Meaningful only when `pass.has_depth()`; Vulkan attaches no
+    /// depth-stencil state to a pipeline whose subpass has no depth
+    /// attachment, and `reims_vgpu_vulkan::depth_stencil::plan` is told so and
+    /// makes nothing dynamic there. The reference value is excluded on both
+    /// rungs — it is a separate Metal encoder command — so distinct references
+    /// have always reused one pipeline.
+    pub depth_stencil: reims_vgpu_vulkan::depth_stencil::DepthStencilPlan,
     /// How many viewport/scissor slots the pipeline declares.
     ///
     /// In the key because `VkPipelineViewportStateCreateInfo::viewportCount` is
@@ -650,14 +671,6 @@ pub(crate) struct PipelineKey {
     /// decides it.
     pub viewport_slots: u32,
     pub layout: LayoutKey,
-}
-
-/// Front/back stencil op state baked into the pipeline (everything but the
-/// dynamic reference value). See [`super::types::StencilFaceOps`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct StencilKey {
-    pub front: super::types::StencilFaceOps,
-    pub back: super::types::StencilFaceOps,
 }
 
 /// Lc: compute pipeline cache key — SPIR-V content digest + entry name + layout
@@ -1363,68 +1376,61 @@ fn pass_exit_scope_narrow() -> bool {
     })
 }
 
-/// The guest's sampler request, made legal for `vkCreateSampler`.
+/// The guest's sampler declaration, in the vocabulary of the layer that owns
+/// what a wire tag means.
 ///
-/// # Why this exists
-///
-/// Metal lets `coord::pixel` sit beside any filter, any address mode, any
-/// anisotropy and any compare function. Vulkan makes six of those combinations
-/// **invalid usage** — undefined behaviour inside the driver, not an error code
-/// this device gets to see. Only the LOD pair was honoured here, so a guest
-/// sampler with pixel coordinates and, say, `address::repeat` or a linear mip
-/// filter built an invalid `VkSampler` on every host and every rail.
-///
-/// # Why conforming is correct for five of the six, and not a silent degradation
-///
-/// Vulkan also forbids an unnormalized sampler being reached by any
-/// implicit-LOD, `Proj` or `Dref` instruction
-/// (`VUID-vkCmdDispatch-None-08610`). What is left can only sample at an
-/// explicit level 0 with no derivatives, so each of these five changes nothing
-/// the guest can observe:
-///
-/// - `-01072` `minFilter == magFilter` — no minification path exists, so
-///   `magFilter` is the filter that ever applies;
-/// - `-01073` `mipmapMode == NEAREST` and `-01074` `minLod == maxLod == 0` —
-///   only level 0 is reachable (the LOD pair is forced by the caller);
-/// - `-01076` `anisotropyEnable == VK_FALSE` — anisotropy is computed from
-///   derivatives such a sample cannot carry;
-/// - `-01075` `addressModeU`/`V` must clamp — Metal restricts `coord::pixel` to
-///   `clamp_to_edge`/`clamp_to_zero` itself, so any other mode is a descriptor
-///   Metal would not have honoured either.
-///
-/// `addressModeW` is left alone on purpose: `-01075` names U and V only, because
-/// an unnormalized sampler may only read a 2D view.
-///
-/// The sixth is `compareEnable`, and it is **not** in that class — dropping the
-/// compare returns the sampled value instead of the comparison, which is a
-/// different picture. That one is returned as a typed refusal.
-///
-/// A normalized sampler is returned unchanged; every branch here is gated on
-/// `unnormalized_coordinates`.
-fn vulkan_conformed_sampler(
-    key: &SamplerStateKey,
-) -> Result<SamplerStateKey, super::reason::DrawReason> {
-    use super::types::{SamplerAddressMode as A, SamplerCompareFunction, SamplerMipFilter};
-    if !key.unnormalized_coordinates {
-        return Ok(*key);
+/// `key` is the guest's request and stays the cache index, so the cache and the
+/// negative cache still answer for what was asked for; this is a projection of
+/// it and is never written back.
+fn sampler_shape(key: &SamplerStateKey) -> reims_vgpu_core::sampler::SamplerShape {
+    reims_vgpu_core::sampler::SamplerShape {
+        min_filter: key.min_filter,
+        mag_filter: key.mag_filter,
+        mip_filter: key.mip_filter,
+        s_address: key.address_mode_u,
+        t_address: key.address_mode_v,
+        r_address: key.address_mode_w,
+        max_anisotropy: key.max_anisotropy,
+        lod_min_clamp: f32::from_bits(key.lod_min),
+        lod_max_clamp: f32::from_bits(key.lod_max),
+        compare_function: key.compare_function.mtl_ordinal(),
+        // Metal's descriptor has no separate flag and this key does not either:
+        // a sampler that compares with `Never` and one that does not compare
+        // are indistinguishable by the time they reach here, and `Never` is
+        // Metal's own default for the field.
+        compare_enabled: key.compare_function != super::types::SamplerCompareFunction::Never,
+        border_color: key.border_color,
+        normalized_coordinates: !key.unnormalized_coordinates,
     }
-    if key.compare_function != SamplerCompareFunction::Never {
-        return Err(super::reason::DrawReason::SamplerUnnormalizedCompare);
+}
+
+/// One colour attachment's blend terms, in the vocabulary of the layer that
+/// owns what they mean.
+///
+/// `None` is `blendingEnabled` clear, which is the whole of what the flag
+/// means: with it clear Metal evaluates no equation, so the six ordinals it
+/// left behind are not parsed and cannot refuse anything. The mask is outside
+/// that, because `MTLColorWriteMask` applies whether or not the slot blends.
+///
+/// Unlike [`depth_stencil_state`] this one can genuinely fail. The ordinals
+/// travel from the guest unparsed, so a value outside `MTLBlendFactor` or
+/// `MTLBlendOperation` arrives here rather than at the decoder — see
+/// [`super::types::BlendStateResource`] for why that is the arrangement.
+fn color_attachment_state(
+    blend: Option<BlendKey>,
+    mask: ColorWriteMask,
+) -> Result<reims_vgpu_core::blend::ColorAttachmentState, reims_vgpu_core::blend::BlendRefusal> {
+    reims_vgpu_core::blend::ColorAttachmentShape {
+        blending_enabled: blend.is_some(),
+        src_rgb: blend.map_or(0, |b| b.src_rgb),
+        dst_rgb: blend.map_or(0, |b| b.dst_rgb),
+        op_rgb: blend.map_or(0, |b| b.op_rgb),
+        src_alpha: blend.map_or(0, |b| b.src_alpha),
+        dst_alpha: blend.map_or(0, |b| b.dst_alpha),
+        op_alpha: blend.map_or(0, |b| b.op_alpha),
+        write_mask: mask,
     }
-    let clamped = |mode: A| match mode {
-        A::ClampToEdge | A::ClampToZero | A::ClampToBorderColor => mode,
-        _ => A::ClampToEdge,
-    };
-    Ok(SamplerStateKey {
-        min_filter: key.mag_filter,
-        mip_filter: SamplerMipFilter::Nearest,
-        address_mode_u: clamped(key.address_mode_u),
-        address_mode_v: clamped(key.address_mode_v),
-        max_anisotropy: 1,
-        lod_min: 0.0f32.to_bits(),
-        lod_max: 0.0f32.to_bits(),
-        ..*key
-    })
+    .checked()
 }
 
 impl ObjectCaches {
@@ -2025,74 +2031,44 @@ impl ObjectCaches {
             return Ok(s);
         }
         counters.sampler_misses.fetch_add(1, Ordering::Relaxed);
-        // Everything below is built from the *conformed* key, never from `key`
-        // itself; `key` stays the guest's request so the cache and the negative
-        // cache still index what was asked for.
-        let conformed = match vulkan_conformed_sampler(key) {
-            Ok(k) => k,
-            Err(reason) => {
-                crate::observe::Emit::decline("vk_engine_sampler", &reason)
-                    .field("compare_function", format!("{:?}", key.compare_function))
-                    .fail();
-                let err = DrawError::Unsupported(reason);
+        let shape = sampler_shape(key);
+        let state = match shape.checked() {
+            Ok(state) => state,
+            Err(refusal) => {
+                crate::observe::Emit::decline("vk_engine_sampler", &refusal).fail();
+                let err =
+                    DrawError::Unsupported(super::reason::DrawReason::SamplerDeclaration(refusal));
                 self.samplers.insert_negative(*key, err.clone());
                 return Err(err);
             }
         };
-        // One line per distinct unnormalized sampler this boot creates — the
-        // cache is what bounds it, so a workload with three such samplers logs
-        // three lines however many million binds it does.
+        // One line per distinct conformed sampler this boot creates — the cache
+        // is what bounds it, so a workload with three of them logs three lines
+        // however many million binds it does.
         //
         // # What this is measuring, and why it is not a decline
         //
-        // `VUID-vkCmdDispatch-None-08610`/`-08611` forbid an unnormalized sampler
-        // being *used* by an implicit-LOD, `Proj`, `Dref`, `Bias` or `Offset`
-        // sample, and `-08611` is the one violation a driven macos-11 boot under
-        // the Khronos validation layer still reports after every other one here
-        // was fixed. That is a property of the SPIR-V instruction, so this device
-        // cannot repair it — but it can say which samplers are candidates.
-        //
-        // `metal2vulkan` already emulates pixel-coordinate sampling in-shader
-        // rather than emitting `OpImageSample`, on three arms — a per-tap
-        // fetch-and-lerp for linear, a bicubic one, and a plain fetch for
-        // integer/nearest/arrayed. **All three of its predicates require
-        // `min_filter == mag_filter`**, so a pixel-coordinate sampler with
-        // *mixed* filters matches none of them and falls through to a real
-        // `OpImageSample` against the unnormalized sampler. `min_mag_differed`
-        // is therefore the field to read: a boot that logs it has the shape that
-        // produces the VUID, and a boot that never does has ruled it out.
-        // Logged for *every* unnormalized sampler and not only the conformed
-        // ones, so a boot's line count is the population and the `conformed`
-        // field splits it. Reading only the conformed ones would miss exactly
-        // the samplers the translator handles correctly, which is the control.
+        // `VUID-vkCmdDispatch-None-08610`/`-08611` forbid an unnormalized
+        // sampler being *used* by an implicit-LOD, `Proj`, `Dref`, `Bias` or
+        // `Offset` sample, and `-08611` is the one violation a driven macos-11
+        // boot under the Khronos validation layer still reports after every
+        // other one here was fixed. That is a property of the SPIR-V
+        // instruction, so this device cannot repair it — but it can say which
+        // samplers are candidates.
         //
         // # The VUID is real and it is **not** what hangs this GPU
         //
-        // Both halves are measured, and the second one is why this stayed a
-        // census rather than becoming a repair. A driven macos-11 boot logs
-        // `min_mag_differed=false` on every unnormalized sampler it creates, so
-        // the mixed-filter shape above is not how this workload reaches the
-        // VUID — a *dynamically* bound `MTLSamplerState` is, because
-        // `metal2vulkan` intercepts only samplers whose state it knows at
-        // translate time and a runtime-bound one is invisible to it.
-        //
-        // A probe then forced `unnormalized_coordinates` false here, which makes
-        // `-08611` unreachable by construction: Maps froze anyway, with the same
-        // two device recreates. So the violation is a passenger. Do not spend
-        // another boot treating it as the hang, and do not read a future
-        // `sampler_unnormalized` line as one — it says a sampler exists, not
-        // that a frame was lost.
-        //
-        // Repairing it properly still needs the offset folded into the
-        // coordinate, which is exact only for an unnormalized sampler and so
-        // needs the normalization known at translate time. That is a
-        // `metal2vulkan` input this device does not currently supply.
-        if key.unnormalized_coordinates {
+        // A probe forced `unnormalized_coordinates` false here, which makes
+        // `-08611` unreachable by construction: the workload froze anyway, with
+        // the same two device recreates. So the violation is a passenger. Do not
+        // read a future `sampler_unnormalized` line as a lost frame — it says a
+        // sampler exists whose declaration was brought inside the restriction
+        // both APIs place on it, and nothing about what was drawn with it.
+        if state.unnormalized_conformed() {
             crate::observe::off(format!(
-                "sampler_unnormalized min_mag_differed={} conformed={} \
-                 min={:?} mag={:?} mip={:?} address_u={:?} address_v={:?} aniso={}",
+                "sampler_unnormalized min_mag_differed={} \
+                 min={} mag={} mip={} address_u={} address_v={} aniso={}",
                 key.min_filter != key.mag_filter,
-                conformed != *key,
                 key.min_filter,
                 key.mag_filter,
                 key.mip_filter,
@@ -2101,96 +2077,26 @@ impl ObjectCaches {
                 key.max_anisotropy,
             ));
         }
-        let not_mipmapped = conformed.mip_filter == super::types::SamplerMipFilter::NotMipmapped;
-        let (min_lod, max_lod) = if conformed.unnormalized_coordinates || not_mipmapped {
-            (0.0, 0.0)
-        } else {
-            (
-                f32::from_bits(conformed.lod_min),
-                f32::from_bits(conformed.lod_max),
-            )
+        let plan = match reims_vgpu_vulkan::sampler::plan(state, ctx.sampler_cell()) {
+            Ok(plan) => plan,
+            Err(refusal) => {
+                // Fail-visible here, at the check, and exactly once per sampler
+                // key: the negative cache means a replay returns without
+                // reaching this line, and the returned `DrawError` reaches the
+                // log only if some caller happens to render it.
+                crate::observe::Emit::decline("vk_engine_sampler", &refusal).fail();
+                // The negative cache stores the typed `DrawError`, so a replay
+                // returns this exact decline — slug and all — not a re-rendered
+                // `Vulkan(String)` that would drop the reason to
+                // `vk_engine_vk_untyped`.
+                let err = DrawError::Unsupported(super::reason::DrawReason::SamplerDevice(refusal));
+                self.samplers.insert_negative(*key, err.clone());
+                return Err(err);
+            }
         };
-        let unnorm = conformed.unnormalized_coordinates;
-        let mag_filter = conformed.mag_filter;
-        let min_filter = conformed.min_filter;
-        let mip_filter = conformed.mip_filter;
-        let address_mode_u = conformed.address_mode_u;
-        let address_mode_v = conformed.address_mode_v;
-        let max_anisotropy_req = conformed.max_anisotropy;
-        let compare_function = conformed.compare_function;
-        // `address_mode_w` is deliberately not clamped: `-01075` names U and V
-        // only, because an unnormalized sampler may only read a 2D view.
-        let address_uses_zero = [address_mode_u, address_mode_v, conformed.address_mode_w]
-            .contains(&super::types::SamplerAddressMode::ClampToZero);
-        if max_anisotropy_req > 1 && !ctx.sampler_anisotropy {
-            let reason = super::reason::DrawReason::SamplerAnisotropyUnsupported;
-            // Fail-visible here, at the check, and exactly once per sampler key:
-            // the negative cache means a replay returns without reaching this
-            // line, and the returned `DrawError` reaches the log only if some
-            // caller happens to render it. A capability the host GPU lacks is
-            // precisely the class says must
-            // never surface as a silently different sampler.
-            crate::observe::Emit::decline("vk_engine_sampler", &reason)
-                .field("max_anisotropy", max_anisotropy_req)
-                .fail();
-            // The negative cache stores the typed `DrawError`, so a replay
-            // returns this exact decline — slug and all — not a re-rendered
-            // `Vulkan(String)` that would drop the reason to `vk_engine_vk_untyped`.
-            let err = DrawError::Unsupported(reason);
-            self.samplers.insert_negative(*key, err.clone());
-            return Err(err);
-        }
-        // `MTLSamplerAddressModeMirrorClampToEdge` translates to
-        // `MIRROR_CLAMP_TO_EDGE`, which needs either the Vulkan 1.2 feature or
-        // `VK_KHR_sampler_mirror_clamp_to_edge`. Until this check existed the
-        // mode was bound with neither requested — the sampler was created with
-        // something the device had not been asked for. Same shape as the
-        // anisotropy check above: capability question, typed decline, cached.
-        //
-        // Read against the conformed modes, not the requested ones: an
-        // unnormalized sampler's U and V are already clamped above, so declining
-        // there would refuse a mode this device is not going to bind.
-        let uses_mirror_clamp = [address_mode_u, address_mode_v, conformed.address_mode_w]
-            .contains(&super::types::SamplerAddressMode::MirrorClampToEdge);
-        if uses_mirror_clamp && !ctx.features.mirror_clamp_to_edge.is_available() {
-            let reason = super::reason::DrawReason::SamplerMirrorClampToEdgeUnsupported;
-            crate::observe::Emit::decline("vk_engine_sampler", &reason)
-                .field("address_u", format!("{address_mode_u:?}"))
-                .field("address_v", format!("{address_mode_v:?}"))
-                .field("address_w", format!("{:?}", conformed.address_mode_w))
-                .fail();
-            let err = DrawError::Unsupported(reason);
-            self.samplers.insert_negative(*key, err.clone());
-            return Err(err);
-        }
-        // Not floored here: every producer of this key either writes a literal
-        // 1 (the reflected static sampler) or carries a decoded
-        // `SamplerDescriptor`, which `decode_sampler_descriptor` already floors.
-        let max_anisotropy = (max_anisotropy_req as f32).min(ctx.max_sampler_anisotropy);
         let sampler = ctx
             .device
-            .create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(mag_filter.vk())
-                    .min_filter(min_filter.vk())
-                    .mipmap_mode(mip_filter.vk())
-                    .address_mode_u(address_mode_u.vk())
-                    .address_mode_v(address_mode_v.vk())
-                    .address_mode_w(conformed.address_mode_w.vk())
-                    .mip_lod_bias(0.0)
-                    .anisotropy_enable(max_anisotropy_req > 1)
-                    .max_anisotropy(max_anisotropy)
-                    .compare_enable(compare_function != super::types::SamplerCompareFunction::Never)
-                    .compare_op(compare_function.vk())
-                    .min_lod(min_lod)
-                    .max_lod(max_lod)
-                    .border_color(translate::sampler::vk_border_color_with_clamp_to_zero(
-                        conformed.border_color,
-                        address_uses_zero,
-                    ))
-                    .unnormalized_coordinates(unnorm),
-                None,
-            )
+            .create_sampler(&plan.create_info(), None)
             .map_err(|e| {
                 let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateSampler, e));
                 self.samplers.insert_negative(*key, err.clone());
@@ -2252,56 +2158,104 @@ impl ObjectCaches {
         }
         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
 
-        // `MTLBlendFactor` 15-18 are the dual-source factors; Vulkan spells them
-        // `SRC1_*` and gates them behind `VkPhysicalDeviceFeatures::dualSrcBlend`.
-        // Same shape as the sampler's mirror-clamp check: capability question,
-        // typed decline, cached negatively so a replay returns this exact reason.
+        // Every colour attachment, parsed once and planned once.
         //
-        // Every attachment is checked, not just slot 0 — the secondaries carry
-        // their own decoded blend, and a pipeline is invalid if *any* attachment
-        // names a `SRC1_*` factor without the feature.
-        if !ctx.features.dual_src_blend {
-            let uses_dual_source = std::iter::once(&key.blend)
-                .chain(key.secondary_blend.iter())
-                .flatten()
-                .any(|b| {
-                    [b.src_color, b.dst_color, b.src_alpha, b.dst_alpha]
-                        .iter()
-                        .any(|f| f.is_dual_source())
-                });
-            if uses_dual_source {
-                let reason = super::reason::DrawReason::DualSourceBlendUnsupported;
+        // Built here rather than beside the create-info below because both
+        // things that can go wrong are refusals of the whole pipeline, and a
+        // refusal belongs with the other capability checks in this run: typed
+        // decline, cached negatively so a replay returns this exact reason.
+        //
+        // Every attachment participates, not just slot 0. The secondaries
+        // carry their own decoded blend, and both questions are asked of the
+        // set: a pipeline is invalid if *any* attachment names a `SRC1_*`
+        // factor without `dualSrcBlend`, and invalid if they *disagree*
+        // without `independentBlend` — which no single attachment can be
+        // blamed for, which is why the second check takes the list.
+        let blend_cell = reims_vgpu_vulkan::blend::BlendCell {
+            dual_source: ctx.features.dual_src_blend,
+            independent: ctx.features.independent_blend,
+        };
+        let mut blend_plans = Vec::with_capacity(1 + key.pass.secondary_count());
+        {
+            let refuse = |reason: super::reason::DrawReason| {
                 crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
-                let err = DrawError::Unsupported(reason);
+                DrawError::Unsupported(reason)
+            };
+            for slot in 0..=key.pass.secondary_count() {
+                let blend = if slot == 0 {
+                    key.blend
+                } else {
+                    key.secondary_blend[slot - 1]
+                };
+                let attempt = color_attachment_state(blend, key.color_write_mask[slot])
+                    .map_err(|r| refuse(super::reason::DrawReason::BlendDeclaration(r)))
+                    .and_then(|state| {
+                        reims_vgpu_vulkan::blend::plan(&state, blend_cell)
+                            .map_err(|r| refuse(super::reason::DrawReason::BlendDevice(r)))
+                    });
+                match attempt {
+                    Ok(plan) => blend_plans.push(plan),
+                    Err(err) => {
+                        self.pipelines.insert_negative(key.clone(), err.clone());
+                        return Err(err);
+                    }
+                }
+            }
+            if let Err(r) = reims_vgpu_vulkan::blend::independent(&blend_plans, blend_cell) {
+                let err = refuse(super::reason::DrawReason::BlendDevice(r));
                 self.pipelines.insert_negative(key.clone(), err.clone());
                 return Err(err);
             }
         }
 
-        // `MTLTriangleFillModeLines` and `MTLDepthClipModeClamp` are the two
-        // rasterization states whose non-default arm Vulkan makes optional:
-        // `VK_POLYGON_MODE_LINE` needs `fillModeNonSolid` and
-        // `depthClampEnable` needs `depthClamp`, and naming either without its
-        // feature makes the pipeline invalid. Same shape as the two checks
-        // above — capability question, typed decline, cached negatively.
+        // Every colour attachment, parsed once and planned once.
         //
-        // Refused rather than rasterized the other way, because the other way
-        // is a whole pass rendered wrong with nothing to say so: a wireframe
-        // filled in, or the geometry a clamped pass wanted kept discarded at
-        // the near plane.
-        if key.fill_mode != FillMode::default() && !ctx.features.fill_mode_non_solid {
-            let reason = super::reason::DrawReason::FillModeNonSolidUnsupported;
-            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
-            let err = DrawError::Unsupported(reason);
-            self.pipelines.insert_negative(key.clone(), err.clone());
-            return Err(err);
-        }
-        if key.depth_clip != DepthClipMode::default() && !ctx.features.depth_clamp {
-            let reason = super::reason::DrawReason::DepthClampUnsupported;
-            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
-            let err = DrawError::Unsupported(reason);
-            self.pipelines.insert_negative(key.clone(), err.clone());
-            return Err(err);
+        // Built here rather than beside the create-info below because both
+        // things that can go wrong are refusals of the whole pipeline, and a
+        // refusal belongs with the other capability checks in this run: typed
+        // decline, cached negatively so a replay returns this exact reason.
+        //
+        // Every attachment participates, not just slot 0. The secondaries
+        // carry their own decoded blend, and both questions are asked of the
+        // set: a pipeline is invalid if *any* attachment names a `SRC1_*`
+        // factor without `dualSrcBlend`, and invalid if they *disagree*
+        // without `independentBlend` — which no single attachment can be
+        // blamed for, which is why the second check takes the list.
+        let blend_cell = reims_vgpu_vulkan::blend::BlendCell {
+            dual_source: ctx.features.dual_src_blend,
+            independent: ctx.features.independent_blend,
+        };
+        let mut blend_plans = Vec::with_capacity(1 + key.pass.secondary_count());
+        {
+            let refuse = |reason: super::reason::DrawReason| {
+                crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+                DrawError::Unsupported(reason)
+            };
+            for slot in 0..=key.pass.secondary_count() {
+                let blend = if slot == 0 {
+                    key.blend
+                } else {
+                    key.secondary_blend[slot - 1]
+                };
+                let attempt = color_attachment_state(blend, key.color_write_mask[slot])
+                    .map_err(|r| refuse(super::reason::DrawReason::BlendDeclaration(r)))
+                    .and_then(|state| {
+                        reims_vgpu_vulkan::blend::plan(&state, blend_cell)
+                            .map_err(|r| refuse(super::reason::DrawReason::BlendDevice(r)))
+                    });
+                match attempt {
+                    Ok(plan) => blend_plans.push(plan),
+                    Err(err) => {
+                        self.pipelines.insert_negative(key.clone(), err.clone());
+                        return Err(err);
+                    }
+                }
+            }
+            if let Err(r) = reims_vgpu_vulkan::blend::independent(&blend_plans, blend_cell) {
+                let err = refuse(super::reason::DrawReason::BlendDevice(r));
+                self.pipelines.insert_negative(key.clone(), err.clone());
+                return Err(err);
+            }
         }
 
         // Resolve every attribute against what this device accepts as a vertex
@@ -2318,29 +2272,34 @@ impl ObjectCaches {
         // on — `vert_spirv` is never read at all.
         let mut shader_inputs: Option<VertexInputWidths> = None;
         let mut attribute_formats = Vec::with_capacity(key.attrs.len());
+        let mut binding_rates = Vec::with_capacity(key.attrs.len());
+        let mut binding_divisors: Vec<Option<vk::VertexInputBindingDivisorDescriptionKHR>> =
+            Vec::with_capacity(key.attrs.len());
         for attr in &key.attrs {
-            let binding =
-                match ctx
-                    .vertex_formats
-                    .resolve(attr.format, attr.offset, attr.stride, || {
-                        shader_inputs
-                            .get_or_insert_with(|| VertexInputWidths::from_spirv(vert_spirv))
-                            .at(attr.location)
-                    }) {
-                    Ok(binding) => binding,
-                    Err(translate_reason) => {
-                        let err = DrawError::Unsupported(super::reason::DrawReason::VertexFormat(
-                            translate_reason,
-                        ));
-                        crate::observe::Emit::decline("vk_engine_vertex_format", &translate_reason)
-                            .fail_once(
-                                (u64::from(attr.location) << 32)
-                                    | u64::from(translate_reason.value()),
-                            );
-                        self.pipelines.insert_negative(key.clone(), err.clone());
-                        return Err(err);
-                    }
-                };
+            let binding = match translate::support::resolve(
+                ctx.vertex_formats,
+                attr.format,
+                attr.offset,
+                attr.stride,
+                || {
+                    shader_inputs
+                        .get_or_insert_with(|| VertexInputWidths::from_spirv(vert_spirv))
+                        .at(attr.location)
+                },
+            ) {
+                Ok(binding) => binding,
+                Err(translate_reason) => {
+                    let err = DrawError::Unsupported(super::reason::DrawReason::VertexFormat(
+                        translate_reason,
+                    ));
+                    crate::observe::Emit::decline("vk_engine_vertex_format", &translate_reason)
+                        .fail_once(
+                            (u64::from(attr.location) << 32) | u64::from(translate_reason.value()),
+                        );
+                    self.pipelines.insert_negative(key.clone(), err.clone());
+                    return Err(err);
+                }
+            };
             if let Some(narrow) = binding.widened_from {
                 // Fail-visible because a widened attribute is a device-specific
                 // difference from what the guest asked for, even though
@@ -2359,12 +2318,39 @@ impl ObjectCaches {
                 );
             }
             attribute_formats.push(binding.format);
+            // Vulkan has `VERTEX` and `INSTANCE` and nothing else, so the two
+            // tessellation step functions have no rate here at all. They are
+            // declined before a request reaches the engine — the translation
+            // layer refuses them by name — and the arm is a refusal rather
+            // than a panic because "unreachable" is a claim about a call site
+            // and this one is reached from two.
             let divisor = match attr.step_function {
                 VertexStepFunction::Constant => Some(0),
                 VertexStepFunction::PerVertex => None,
                 VertexStepFunction::PerInstance if attr.step_rate == 1 => None,
                 VertexStepFunction::PerInstance => Some(attr.step_rate),
+                step
+                @ (VertexStepFunction::PerPatch | VertexStepFunction::PerPatchControlPoint) => {
+                    let reason = super::reason::DrawReason::VertexStep(
+                        reims_vgpu_vulkan::vertex::Refusal::TessellationStep { step },
+                    );
+                    crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+                    let err = DrawError::Unsupported(reason);
+                    self.pipelines.insert_negative(key.clone(), err.clone());
+                    return Err(err);
+                }
             };
+            binding_divisors.push(divisor.map(|divisor| {
+                vk::VertexInputBindingDivisorDescriptionKHR::default()
+                    .binding(attr.binding)
+                    .divisor(divisor)
+            }));
+            // The rate the binding is created with, from the layer that owns
+            // which step functions have one.
+            binding_rates.push(
+                reims_vgpu_vulkan::vertex::input_rate(attr.step_function)
+                    .unwrap_or(vk::VertexInputRate::VERTEX),
+            );
             if divisor == Some(0) && !ctx.vertex_divisor.zero_divisor {
                 let err =
                     DrawError::Unsupported(super::reason::DrawReason::ConstantVertexAttribute);
@@ -2405,33 +2391,24 @@ impl ObjectCaches {
                 .module(frag_module)
                 .name(&main_c),
         ];
+        // Both lists were rebuilt here from `key.attrs` with the step function
+        // matched a second and a third time. They are built once, in the loop
+        // that already refused every step function without a rate, so the two
+        // spellings cannot answer differently for one attribute.
         let vertex_binding_descs: Vec<_> = key
             .attrs
             .iter()
-            .map(|attribute| {
+            .zip(&binding_rates)
+            .map(|(attribute, rate)| {
                 vk::VertexInputBindingDescription::default()
                     .binding(attribute.binding)
                     .stride(attribute.stride)
-                    .input_rate(translate::vertex::vk_input_rate(attribute.step_function))
+                    .input_rate(*rate)
             })
             .collect();
-        let vertex_binding_divisors: Vec<_> = key
-            .attrs
-            .iter()
-            .filter_map(|attribute| {
-                let divisor = match attribute.step_function {
-                    VertexStepFunction::Constant => 0,
-                    VertexStepFunction::PerVertex => return None,
-                    VertexStepFunction::PerInstance if attribute.step_rate == 1 => return None,
-                    VertexStepFunction::PerInstance => attribute.step_rate,
-                };
-                Some(
-                    vk::VertexInputBindingDivisorDescriptionKHR::default()
-                        .binding(attribute.binding)
-                        .divisor(divisor),
-                )
-            })
-            .collect();
+        // A divisor of one is what Vulkan already does, so declaring it would
+        // pull in the extension structure for nothing.
+        let vertex_binding_divisors: Vec<_> = binding_divisors.iter().flatten().copied().collect();
         let vertex_attribute_descs: Vec<_> = key
             .attrs
             .iter()
@@ -2455,16 +2432,55 @@ impl ObjectCaches {
         if !vertex_binding_divisors.is_empty() {
             vtx_input = vtx_input.push_next(&mut vertex_divisor_state);
         }
-        let input_asm =
-            vk::PipelineInputAssemblyStateCreateInfo::default().topology(key.topology.vk());
+        // Derived from the key, never from the guest's primitive type: the
+        // key is what two draws share, so the declared topology has to be a
+        // function of it or one cache entry would describe two pipelines. On
+        // the baseline rung the key *is* the guest's type and this is the
+        // topology it always was.
+        let input_asm_plan = key.topology.input_assembly();
+        let input_asm = input_asm_plan.native();
         // Dynamic viewport/scissor so L5 key need not include extent (flip flag is static).
         // Stencil reference is dynamic (Metal's `SetStencilReferenceValue` is a
         // command distinct from the state object) so distinct references reuse
         // one pipeline; only listed for stencil pipelines.
-        let mut dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        if key.stencil.is_some() {
-            dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
-        }
+        // The blend colour is dynamic on every graphics pipeline this cache
+        // builds, whether or not any attachment names a constant factor.
+        // Metal sets it on the encoder, so it changes without the pipeline
+        // changing: baking it in would key this cache on a value that is not
+        // part of a pipeline, and a guest animating a fade would compile one
+        // per frame. Unconditional rather than keyed on whether a factor reads
+        // it, because a key dimension that only decides which dynamic states
+        // are declared is a second way to spell the same pipeline.
+        let mut dynamic_states = vec![
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::BLEND_CONSTANTS,
+        ];
+        // `DEPTH_BIAS`, and whichever rasterization members this host supplies
+        // per draw — the cull mode and winding under
+        // `VK_EXT_extended_dynamic_state`, the fill mode and depth-clip mode
+        // under `…_state3`, and none of them on a host with neither. Metal has
+        // no way to say "this pipeline cannot be biased", so the pipeline
+        // always enables biasing and always takes the three values
+        // dynamically; see `reims_vgpu_vulkan::raster`.
+        //
+        // Read off the key rather than recomputed, because the key *is* the
+        // plan's baked half: the states listed here and the placeholders in
+        // `key.raster` are two readings of one `RasterDynamic`, and a second
+        // derivation could disagree with it.
+        dynamic_states.extend(key.raster.dynamic.states());
+        // `PRIMITIVE_TOPOLOGY` where the input assembly above declared a
+        // stand-in for a class rather than the guest's own type. Taken from
+        // the same plan that chose the stand-in: a pipeline that declares one
+        // without declaring the state rasterizes the stand-in, and on a host
+        // with no validation layers nothing says so.
+        dynamic_states.extend_from_slice(input_asm_plan.states());
+        // The stencil reference, and on a host that supplies the whole
+        // `MTLDepthStencilState` per draw the eight states that go with it.
+        // Read off the key's own state rather than re-derived from the host,
+        // for the reason above: the placeholder and the list that replaces it
+        // are two readings of one decision.
+        dynamic_states.extend_from_slice(key.depth_stencil.states());
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         // Both counts are the key's one number: the viewports and scissors
@@ -2473,15 +2489,7 @@ impl ObjectCaches {
         let vp_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(key.viewport_slots)
             .scissor_count(key.viewport_slots);
-        // Cull mode, winding, fill mode and depth clip mode all come from the
-        // guest; the last two were refused above where the host cannot spell
-        // them, so reaching here means both are bindable.
-        let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(translate::raster::vk_polygon_mode(key.fill_mode))
-            .depth_clamp_enable(translate::raster::vk_depth_clamp_enable(key.depth_clip))
-            .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
-            .front_face(translate::raster::vk_front_face(key.front_face_ccw))
-            .line_width(1.0);
+        let raster = key.raster.native();
         // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
         // so it reaches this device inside the serializer-object pipeline's own
         // compact-TLV block. The pass key carries that decoded count, and the
@@ -2505,66 +2513,18 @@ impl ObjectCaches {
         // both arms because `MTLColorWriteMask` is independent of
         // `blendingEnabled` — an unblended masked attachment still leaves its
         // unwritten channels alone. Metal's bits are alpha-first and Vulkan's
-        // are red-first, so the exchange goes through `vk_color_write_mask`
-        // rather than a cast.
-        let attachment_blend = |blend: Option<BlendKey>, mask: ColorWriteMask| {
-            let write = translate::blend::vk_color_write_mask(mask);
-            match blend {
-                Some(b) => vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(write)
-                    .blend_enable(true)
-                    .src_color_blend_factor(b.src_color.vk())
-                    .dst_color_blend_factor(b.dst_color.vk())
-                    .color_blend_op(b.color_op.vk())
-                    .src_alpha_blend_factor(b.src_alpha.vk())
-                    .dst_alpha_blend_factor(b.dst_alpha.vk())
-                    .alpha_blend_op(b.alpha_op.vk()),
-                None => vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(write)
-                    .blend_enable(false),
-            }
-        };
-        let mut blend_att = vec![attachment_blend(key.blend, key.color_write_mask[0])];
-        for slot in 0..key.pass.secondary_count() {
-            blend_att.push(attachment_blend(
-                key.secondary_blend[slot],
-                key.color_write_mask[slot + 1],
-            ));
-        }
-        let blend_constants = key
-            .blend
-            .map(|b| b.constants.map(f32::from_bits))
-            .unwrap_or([0.0; 4]);
-        let blend = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(&blend_att)
-            .blend_constants(blend_constants);
+        // are red-first, so the exchange is a reordering rather than a cast;
+        // `reims_vgpu_vulkan::blend` performs it, above.
+        let blend_att: Vec<vk::PipelineColorBlendAttachmentState> =
+            blend_plans.iter().map(|p| p.native()).collect();
+        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_att);
         // Depth-stencil state: attached ONLY when the pass carries a depth
         // attachment (Vulkan requires the pipeline's depth-stencil state to be
         // consistent with the subpass). Without it the color-only pipeline is
-        // byte-identical to the pre-depth engine. Stencil is enabled only when
-        // the bound state requested it (`key.stencil`); the reference field is
-        // left 0 here and supplied dynamically per draw.
-        let stencil_face = |ops: super::types::StencilFaceOps| {
-            vk::StencilOpState::default()
-                .fail_op(ops.fail_op.vk())
-                .pass_op(ops.pass_op.vk())
-                .depth_fail_op(ops.depth_fail_op.vk())
-                .compare_op(ops.compare.vk())
-                .compare_mask(ops.read_mask)
-                .write_mask(ops.write_mask)
-                .reference(0)
-        };
-        let mut depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(key.depth_test)
-            .depth_write_enable(key.depth_write)
-            .depth_compare_op(key.depth_compare.vk())
-            .depth_bounds_test_enable(false)
-            .stencil_test_enable(key.stencil.is_some());
-        if let Some(s) = key.stencil {
-            depth_stencil = depth_stencil
-                .front(stencil_face(s.front))
-                .back(stencil_face(s.back));
-        }
+        // byte-identical to the pre-depth engine. The reference field is left 0
+        // here and supplied dynamically per draw, and on a dynamic host so is
+        // everything else — see the key's own doc.
+        let depth_stencil = key.depth_stencil.native();
         let mut gpci = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vtx_input)
@@ -3111,19 +3071,16 @@ mod object_cache_tests {
     }
 
     fn unnormalized_key() -> SamplerStateKey {
-        use super::super::types::{
-            SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-            SamplerMipFilter,
-        };
+        use reims_vgpu_core::sampler as mtl;
         SamplerStateKey {
-            min_filter: SamplerFilter::Nearest,
-            mag_filter: SamplerFilter::Linear,
-            mip_filter: SamplerMipFilter::Linear,
-            address_mode_u: SamplerAddressMode::Repeat,
-            address_mode_v: SamplerAddressMode::MirrorRepeat,
-            address_mode_w: SamplerAddressMode::Repeat,
-            border_color: SamplerBorderColor::TransparentBlack,
-            compare_function: SamplerCompareFunction::Never,
+            min_filter: mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+            mag_filter: mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+            mip_filter: mtl::MTL_SAMPLER_MIP_FILTER_LINEAR,
+            address_mode_u: mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+            address_mode_v: mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT,
+            address_mode_w: mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+            border_color: mtl::MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK,
+            compare_function: super::super::types::SamplerCompareFunction::Never,
             lod_min: 1.0f32.to_bits(),
             lod_max: 8.0f32.to_bits(),
             max_anisotropy: 16,
@@ -3131,77 +3088,201 @@ mod object_cache_tests {
         }
     }
 
-    /// Every constraint `vkCreateSampler` puts on `unnormalizedCoordinates`, on a
-    /// key that violates all of them at once. Without the conform this builds a
-    /// sampler whose behaviour is undefined rather than wrong, so there is no
-    /// error code and no log line to notice it by.
+    /// Every constraint `vkCreateSampler` puts on `unnormalizedCoordinates`, on
+    /// a key that violates all of them at once.
+    ///
+    /// This site owns neither the conformance nor the Vulkan spelling any more
+    /// — `reims_vgpu_core::sampler` conforms the declaration and
+    /// `reims_vgpu_vulkan::sampler` plans it, and each has its own tests. What
+    /// it owns is the *join*: that the key this cache is indexed by reaches
+    /// those two as the declaration the guest actually wrote. A projection that
+    /// silently swapped two axes would pass every test on either side of it.
     #[test]
-    fn an_unnormalized_sampler_is_conformed_on_every_constraint_vulkan_states() {
-        use super::super::types::{SamplerAddressMode, SamplerFilter, SamplerMipFilter};
-        let got = vulkan_conformed_sampler(&unnormalized_key()).expect("no compare function");
-        // -01072: minFilter == magFilter, and it is magFilter that survives.
-        assert_eq!(got.min_filter, SamplerFilter::Linear);
-        assert_eq!(got.mag_filter, SamplerFilter::Linear);
-        // -01073
-        assert_eq!(got.mip_filter, SamplerMipFilter::Nearest);
-        // -01074
-        assert_eq!(f32::from_bits(got.lod_min), 0.0);
-        assert_eq!(f32::from_bits(got.lod_max), 0.0);
-        // -01075, U and V only.
-        assert_eq!(got.address_mode_u, SamplerAddressMode::ClampToEdge);
-        assert_eq!(got.address_mode_v, SamplerAddressMode::ClampToEdge);
-        assert_eq!(got.address_mode_w, SamplerAddressMode::Repeat);
-        // -01076
-        assert_eq!(got.max_anisotropy, 1);
-        assert!(got.unnormalized_coordinates);
+    fn the_key_reaches_the_owning_layers_as_a_plannable_sampler() {
+        let plan = reims_vgpu_vulkan::sampler::plan(
+            sampler_shape(&unnormalized_key())
+                .checked()
+                .expect("an unnormalized declaration is conformed, not refused"),
+            reims_vgpu_vulkan::sampler::SamplerCell {
+                mirror_clamp_to_edge: true,
+                anisotropy: true,
+                max_anisotropy: 16.0,
+            },
+        )
+        .expect("a plannable sampler");
+        assert!(plan.unnormalized_coordinates);
+        // -01072, and it is magFilter that survives.
+        assert_eq!(plan.min_filter, ash::vk::Filter::LINEAR);
+        assert_eq!(plan.mag_filter, ash::vk::Filter::LINEAR);
+        // -01073, -01074, -01076.
+        assert_eq!(plan.mipmap_mode, ash::vk::SamplerMipmapMode::NEAREST);
+        assert_eq!((plan.min_lod, plan.max_lod), (0.0, 0.0));
+        assert!(!plan.anisotropy_enable);
+        // -01075, U and V.
+        assert_eq!(plan.address[0], ash::vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        assert_eq!(plan.address[1], ash::vk::SamplerAddressMode::CLAMP_TO_EDGE);
     }
 
-    /// A clamping mode the guest chose deliberately is kept, so the conform
-    /// cannot be read as "unnormalized means clamp-to-edge".
+    /// The six blend ordinals reach the six fields of their own names.
+    ///
+    /// They are interchangeable `u32`s three-for-three, so a swap between the
+    /// RGB and alpha halves produces a perfectly valid blend that composites
+    /// the wrong channel set — no refusal, no log line. A test on either side
+    /// of this projection alone cannot see it: the key would still hold what it
+    /// was given and the shape would still parse. Distinct values in all six
+    /// positions is the only arrangement that can.
     #[test]
-    fn a_conformed_unnormalized_sampler_keeps_a_clamp_mode_that_was_already_legal() {
-        use super::super::types::SamplerAddressMode;
+    fn the_six_blend_ordinals_do_not_cross_on_the_way_to_the_owning_layer() {
+        use reims_vgpu_core::blend::{
+            BlendFactor, BlendOperation, MTL_BLEND_FACTOR_DESTINATION_ALPHA, MTL_BLEND_FACTOR_ONE,
+            MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA, MTL_BLEND_FACTOR_SOURCE_ALPHA,
+            MTL_BLEND_OPERATION_MAX, MTL_BLEND_OPERATION_REVERSE_SUBTRACT,
+        };
+        let key = BlendKey {
+            src_rgb: MTL_BLEND_FACTOR_SOURCE_ALPHA,
+            dst_rgb: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+            op_rgb: MTL_BLEND_OPERATION_REVERSE_SUBTRACT,
+            src_alpha: MTL_BLEND_FACTOR_ONE,
+            dst_alpha: MTL_BLEND_FACTOR_DESTINATION_ALPHA,
+            op_alpha: MTL_BLEND_OPERATION_MAX,
+        };
+        let blend = color_attachment_state(Some(key), ColorWriteMask::ALL)
+            .expect("every ordinal is one the guest API declares")
+            .blend()
+            .expect("the key carried a blend");
+        assert_eq!(blend.src_color, BlendFactor::SourceAlpha);
+        assert_eq!(blend.dst_color, BlendFactor::OneMinusSourceAlpha);
+        assert_eq!(blend.color_operation, BlendOperation::ReverseSubtract);
+        assert_eq!(blend.src_alpha, BlendFactor::One);
+        assert_eq!(blend.dst_alpha, BlendFactor::DestinationAlpha);
+        assert_eq!(blend.alpha_operation, BlendOperation::Max);
+    }
+
+    /// `blendingEnabled` clear is the absence of a blend, and the mask is not
+    /// part of it.
+    ///
+    /// Both halves matter. Parsing the six ordinals behind a clear flag would
+    /// refuse a pipeline over a value that can never reach a pixel; dropping
+    /// the mask with them would make an unblended attachment that writes only
+    /// alpha write everything, which is a colour channel the guest asked to
+    /// keep.
+    #[test]
+    fn an_unblended_attachment_keeps_its_mask_and_parses_no_equation() {
+        let masked = color_attachment_state(
+            None,
+            ColorWriteMask::new(reims_vgpu_core::blend::MTL_COLOR_WRITE_MASK_ALPHA)
+                .expect("in range"),
+        )
+        .expect("nothing to parse");
+        assert!(masked.blend().is_none());
+        assert!(!masked.write_mask().red());
+        assert!(masked.write_mask().alpha());
+    }
+
+    /// An ordinal the guest API does not declare refuses the pipeline by name.
+    ///
+    /// It used to make the *slot* unblended and let the pipeline build, which
+    /// is a compositing attachment silently becoming a raw store.
+    #[test]
+    fn an_ordinal_outside_the_guest_api_refuses_rather_than_unblending() {
+        let refusal = color_attachment_state(
+            Some(BlendKey {
+                src_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ONE,
+                dst_rgb: 99,
+                op_rgb: 0,
+                src_alpha: 1,
+                dst_alpha: 0,
+                op_alpha: 0,
+            }),
+            ColorWriteMask::ALL,
+        )
+        .expect_err("99 is not an MTLBlendFactor");
+        assert_eq!(
+            refusal,
+            reims_vgpu_core::blend::BlendRefusal::UnknownOrdinal {
+                field: "dst_rgb",
+                ordinal: 99,
+            }
+        );
+    }
+
+    /// The projection carries the guest's axes in the guest's order.
+    ///
+    /// Three distinct modes, because a swap of two axes is the failure this
+    /// catches and a key whose axes agree could not show one.
+    #[test]
+    fn the_projection_carries_each_axis_to_the_field_that_means_it() {
+        use reims_vgpu_core::sampler as mtl;
         let mut key = unnormalized_key();
-        key.address_mode_u = SamplerAddressMode::ClampToZero;
-        key.address_mode_v = SamplerAddressMode::ClampToBorderColor;
-        let got = vulkan_conformed_sampler(&key).expect("no compare function");
-        assert_eq!(got.address_mode_u, SamplerAddressMode::ClampToZero);
-        assert_eq!(got.address_mode_v, SamplerAddressMode::ClampToBorderColor);
+        key.unnormalized_coordinates = false;
+        key.address_mode_u = mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT;
+        key.address_mode_v = mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT;
+        key.address_mode_w = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        let shape = sampler_shape(&key);
+        assert_eq!(shape.s_address, mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT);
+        assert_eq!(shape.t_address, mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT);
+        assert_eq!(shape.r_address, mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        assert!(shape.normalized_coordinates);
+        assert_eq!(shape.min_filter, key.min_filter);
+        assert_eq!(shape.mag_filter, key.mag_filter);
+        assert_eq!(shape.lod_min_clamp, 1.0);
+        assert_eq!(shape.lod_max_clamp, 8.0);
+    }
+
+    /// This key has no separate "compares" flag and the protocol shape does, so
+    /// the projection has to supply one. `Never` is Metal's default for a
+    /// sampler that does not compare, and it is the only value that may mean
+    /// "off" — every other function is a comparison the guest asked for.
+    #[test]
+    fn a_comparison_is_enabled_for_every_function_except_metals_default() {
+        use super::super::types::SamplerCompareFunction as C;
+        for function in [
+            C::Never,
+            C::Less,
+            C::Equal,
+            C::LessEqual,
+            C::Greater,
+            C::NotEqual,
+            C::GreaterEqual,
+            C::Always,
+        ] {
+            let mut key = unnormalized_key();
+            key.unnormalized_coordinates = false;
+            key.compare_function = function;
+            let shape = sampler_shape(&key);
+            assert_eq!(shape.compare_enabled, function != C::Never, "{function:?}");
+            assert_eq!(shape.compare_function, function.mtl_ordinal());
+        }
     }
 
     /// `-01077` is the one constraint that is not observationally neutral, so it
-    /// is a named refusal and not a repair.
+    /// stays a named refusal and never becomes a repair.
     #[test]
     fn an_unnormalized_sampler_with_a_compare_function_is_refused_by_name() {
-        use super::super::types::SamplerCompareFunction;
         use crate::observe::Decline as _;
         let mut key = unnormalized_key();
-        key.compare_function = SamplerCompareFunction::LessEqual;
-        let reason = vulkan_conformed_sampler(&key).expect_err("compare is refused");
-        assert_eq!(reason.slug(), "sampler_unnormalized_compare");
-    }
-
-    /// The conform is gated on the unnormalized bit and touches nothing else — a
-    /// normalized sampler with mips, anisotropy, repeat addressing and a compare
-    /// function is what the great majority of guest binds are.
-    #[test]
-    fn a_normalized_sampler_passes_through_the_conform_untouched() {
-        use super::super::types::SamplerCompareFunction;
-        let mut key = unnormalized_key();
-        key.unnormalized_coordinates = false;
-        key.compare_function = SamplerCompareFunction::Less;
-        assert_eq!(vulkan_conformed_sampler(&key).expect("normalized"), key);
+        key.compare_function = super::super::types::SamplerCompareFunction::LessEqual;
+        let refusal = sampler_shape(&key)
+            .checked()
+            .expect_err("a comparison under pixel coordinates is refused");
+        assert_eq!(
+            super::super::reason::DrawReason::SamplerDeclaration(refusal).slug(),
+            "sampler_unnormalized_restriction"
+        );
     }
 
     #[test]
     fn vertex_format_widening_names_both_formats_and_attribute() {
         use crate::observe::Decline as _;
-        let narrow = translate::vertex::vertex_layout(VertexAttributeFormat::UChar3Normalized).vk;
-        let binding = translate::VertexFormatSupport::with_unsupported(&[narrow])
-            .resolve(VertexAttributeFormat::UChar3Normalized, 12, 32, || {
-                crate::runtime::spirv_vertex_input::InputWidth::Components(3)
-            })
-            .unwrap();
+        let guest = VertexAttributeFormat::UChar3Normalized;
+        let binding = translate::support::resolve(
+            translate::VertexFormatSupport::all().without(guest),
+            guest,
+            12,
+            32,
+            || crate::runtime::spirv_vertex_input::InputWidth::Components(3),
+        )
+        .unwrap();
         let decline = VertexFormatWidenDecline {
             from: binding.widened_from.unwrap(),
             to: binding.format,

@@ -10,7 +10,9 @@
 
 use super::*;
 
-use crate::backend::vulkan::engine::{resource_lease, DrawError, DrawPreparationDecline};
+use crate::backend::vulkan::engine::{
+    resource_lease, BlendStateResource, DrawError, DrawPreparationDecline,
+};
 use crate::backend::vulkan::translate;
 use crate::backend::PlaneDrawReader;
 use crate::runtime::census::srgb_census;
@@ -6543,7 +6545,6 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     primary: &crate::backend::vulkan::engine::TargetIdentity,
     fb_w: u32,
     fb_h: u32,
-    blend_constants: [f32; 4],
 ) -> Result<
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
@@ -6750,26 +6751,23 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             .find(|a| a.slot == c.slot)
             .map(|a| a.write_mask)
             .unwrap_or_default();
+        // The six ordinals travel to the engine as the guest wrote them. An
+        // out-of-contract factor or op used to make *this slot* unblended with
+        // a decline of its own, which is a compositing attachment quietly
+        // becoming a raw store; the pipeline refuses it now, once, where the
+        // same declaration is also weighed against what the device can blend.
         let blend = pipeline
             .color_attachments
             .iter()
             .find(|a| a.slot == c.slot)
             .filter(|a| a.blending_enabled)
-            .and_then(|a| {
-                match translate::blend::state(a, blend_constants) {
-                    Ok(state) => Some(state),
-                    // An out-of-contract blend factor or op on a secondary
-                    // slot: the attachment still renders, unblended, and the
-                    // decline says which value refused rather than the slot
-                    // quietly becoming a raw store the way every slot used to.
-                    Err(reason) => {
-                        crate::observe::fail(format!(
-                            "secondary_blend_unmapped {reason} slot={} {}x{}",
-                            c.slot, c.width, c.height
-                        ));
-                        None
-                    }
-                }
+            .map(|a| BlendStateResource {
+                src_rgb: a.src_rgb,
+                dst_rgb: a.dst_rgb,
+                op_rgb: a.op_rgb,
+                src_alpha: a.src_alpha,
+                dst_alpha: a.dst_alpha,
+                op_alpha: a.op_alpha,
             });
         out.push(SecondaryColorTarget {
             identity,
@@ -6793,14 +6791,14 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
 pub(super) fn prepare_vertex_attribute_format(
     attribute: &crate::runtime::decode::resource::VertexAttribute,
 ) -> Result<crate::backend::vulkan::engine::VertexAttributeFormat, DrawPreparationDecline> {
-    translate::vertex::attribute_format(attribute.format).map_err(|reason| {
+    reims_vgpu_core::vertex_format::VertexFormat::parse(attribute.format).ok_or(
         DrawPreparationDecline::VertexAttributeFormat {
             location: attribute.location,
             buffer_index: attribute.buffer_index,
             raw_format: attribute.format,
-            reason,
-        }
-    })
+            reason: translate::reason::TranslateReason::UnknownVertexFormat(attribute.format),
+        },
+    )
 }
 
 pub(super) fn prepare_vertex_step_function(
@@ -8594,47 +8592,41 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
             pipeline_object: resolved.pipeline_object.clone(),
-            // Honor the guest's face-culling state, its winding, and its
-            // primitive type. All three come from `translate::raster`, and all
-            // three fall back to a Metal default when the guest bound nothing —
-            // but an out-of-contract *value* is a different thing from an unbound
-            // one, and it says its own name before falling back. Silently
-            // coercing here is how a guest that asked for lines got triangles
-            // with nothing in the log to say so.
-            cull_mode: raster_or_default(
-                req.cull_mode,
-                translate::raster::cull_mode,
-                crate::backend::vulkan::engine::CullMode::None,
-                req.pipeline_ref,
-                "cull_mode_unmapped",
-            ),
-            // MTLWinding: CounterClockwise == 1; Metal defaults to Clockwise.
-            front_face_ccw: raster_or_default(
-                req.front_facing,
-                translate::raster::front_face_ccw,
-                false,
-                req.pipeline_ref,
-                "winding_unmapped",
-            ),
-            // MTLTriangleFillMode / MTLDepthClipMode, both defaulting to 0.
-            // Unlike the two above, the non-default arm of each needs a device
-            // feature, so the engine may still decline the pipeline by name
-            // after this maps cleanly: the mapping says what the guest asked
-            // for, the capability check says whether the host can spell it.
-            fill_mode: raster_or_default(
-                req.fill_mode,
-                translate::raster::fill_mode,
-                crate::backend::vulkan::engine::FillMode::Fill,
-                req.pipeline_ref,
-                "fill_mode_unmapped",
-            ),
-            depth_clip: raster_or_default(
-                req.depth_clip_mode,
-                translate::raster::depth_clip_mode,
-                crate::backend::vulkan::engine::DepthClipMode::Clip,
-                req.pipeline_ref,
-                "depth_clip_mode_unmapped",
-            ),
+            // The four fixed-function encoder states, as the guest wrote
+            // them. `None` is the state it never set, which takes Metal's own
+            // default — and an out-of-contract *value* is a different thing
+            // from an unset one.
+            //
+            // It used to be the same thing here: an unrecognised ordinal
+            // logged a line and then took the default too, so a guest that
+            // asked for a wireframe got solid triangles. That substitution is
+            // gone. `reims_vgpu_vulkan::raster::plan` refuses the pipeline for
+            // the ordinal it cannot place, which is the answer this device
+            // gives for every other closed set the guest can write.
+            raster: reims_vgpu_vulkan::raster::GuestRasterState {
+                cull_mode: req.cull_mode.map_or(
+                    reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.cull_mode,
+                    u64::from,
+                ),
+                winding: req.front_facing.map_or(
+                    reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.winding,
+                    u64::from,
+                ),
+                depth_clip_mode: req.depth_clip_mode.map_or(
+                    reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.depth_clip_mode,
+                    u64::from,
+                ),
+                fill_mode: req.fill_mode.map_or(
+                    reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.fill_mode,
+                    u64::from,
+                ),
+            },
+            // `setLineWidth:`, passed through unparsed like the four above.
+            // `None` is the stream that set none, and the engine's draw seam
+            // is where that becomes Metal's default — it is also the only
+            // place that knows whether this draw rasterizes any lines for the
+            // width to apply to, which is what the answer depends on.
+            line_width: req.line_width,
             first_vertex: req.first_vertex,
             // Passed through. `decode::render`'s `wire_instance_count` is where
             // a zero instance count is decided, and it is decided once — a
@@ -8642,10 +8634,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // so a change made at the decode site would appear to take effect
             // everywhere while this path quietly kept the old answer.
             instance_count: Some(req.instance_count),
+            // The ordinal is parsed by the layer that owns `MTLPrimitiveType`.
+            //
+            // The last caller of `raster_or_default`, and the one it was never
+            // right for: the four rasterizer states it also served are
+            // descriptor properties with genuine Metal defaults, and a
+            // primitive type is an argument to `drawPrimitives:` that every
+            // draw states. There is no unset state for it to default to, so
+            // the substitution below is a guess at what the guest meant.
+            // Removing it means giving `decode::render` somewhere to refuse,
+            // which is a decode-side change rather than this one.
             primitive_topology: raster_or_default(
                 Some(req.primitive_type),
-                translate::raster::primitive_topology,
-                crate::backend::vulkan::engine::PrimitiveTopology::Triangle,
+                |ordinal| {
+                    reims_vgpu_core::topology::PrimitiveType::parse(ordinal)
+                        .map(crate::backend::vulkan::engine::PrimitiveTopology)
+                        .ok_or(())
+                },
+                crate::backend::vulkan::engine::PrimitiveTopology::default(),
                 req.pipeline_ref,
                 "primitive_type_unmapped",
             ),
@@ -8990,19 +8996,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // guest is replacing rather than compositing.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.color_write_mask = pd.color0.write_mask;
+        // The encoder's blend colour, unconditionally: it is one value per
+        // draw whether or not any attachment names a constant factor. The
+        // substitution for a guest that issued no `setBlendColorRed:` is the
+        // one this device has always made.
+        resources.blend_color = req.blend_color.unwrap_or([0.0; 4]);
         if pd.color0.blending_enabled {
-            let constants = req.blend_color.unwrap_or([0.0; 4]);
-            match translate::blend::state(&pd.color0, constants) {
-                Ok(b) => {
-                    resources.blend = Some(b);
-                }
-                Err(e) => {
-                    crate::observe::fail(format!(
-                        "m2v_blend_map_fail pipe={} {e}",
-                        req.pipeline_ref
-                    ));
-                }
-            }
+            resources.blend = Some(BlendStateResource {
+                src_rgb: pd.color0.src_rgb,
+                dst_rgb: pd.color0.dst_rgb,
+                op_rgb: pd.color0.op_rgb,
+                src_alpha: pd.color0.src_alpha,
+                dst_alpha: pd.color0.dst_alpha,
+                op_alpha: pd.color0.op_alpha,
+            });
         }
 
         // The engine ignores this when the draw is indexed (the index count
@@ -9367,29 +9374,33 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.samplers.iter().collect();
         smp_by_binding.sort_unstable_by_key(|s| s.binding);
         for (slot, smp) in sampler_notes.iter_mut().zip(smp_by_binding.iter()) {
-            use crate::backend::vulkan::engine::{
-                SamplerAddressMode as A, SamplerFilter as F, SamplerMipFilter as M,
+            // The ordinals as the guest wrote them, parsed here rather than
+            // carried pre-parsed: `?` is then a real reading — an ordinal
+            // outside the enum — and not a shape this trail cannot express.
+            use reims_vgpu_core::sampler::{AddressMode as A, Filter as F, MipFilter as M};
+            let filter = |ordinal: u32| match F::parse(ordinal) {
+                Some(F::Nearest) => b'N',
+                Some(F::Linear) => b'L',
+                None => b'?',
             };
-            let filter = |f: F| match f {
-                F::Nearest => b'N',
-                F::Linear => b'L',
-            };
-            let address = |a: A| match a {
-                A::ClampToEdge => b'e',
-                A::MirrorClampToEdge => b'E',
-                A::Repeat => b'r',
-                A::MirrorRepeat => b'R',
-                A::ClampToZero => b'z',
-                A::ClampToBorderColor => b'b',
+            let address = |ordinal: u32| match A::parse(ordinal) {
+                Some(A::ClampToEdge) => b'e',
+                Some(A::MirrorClampToEdge) => b'E',
+                Some(A::Repeat) => b'r',
+                Some(A::MirrorRepeat) => b'R',
+                Some(A::ClampToZero) => b'z',
+                Some(A::ClampToBorderColor) => b'b',
+                None => b'?',
             };
             *slot = crate::runtime::gpu_hang_trail::SamplerNote {
                 binding: smp.binding,
                 min_filter: filter(smp.min_filter),
                 mag_filter: filter(smp.mag_filter),
-                mip_filter: match smp.mip_filter {
-                    M::NotMipmapped => b'n',
-                    M::Nearest => b'N',
-                    M::Linear => b'L',
+                mip_filter: match M::parse(smp.mip_filter) {
+                    Some(M::NotMipmapped) => b'n',
+                    Some(M::Nearest) => b'N',
+                    Some(M::Linear) => b'L',
+                    None => b'?',
                 },
                 address_u: address(smp.address_mode_u),
                 address_v: address(smp.address_mode_v),
@@ -9493,7 +9504,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 &primary_id,
                 w,
                 h,
-                req.blend_color.unwrap_or([0.0; 4]),
             );
             // Second half of the census: `built` vs `refused` separates "the
             // guest issued an MRT draw and we render every attachment" from
@@ -13146,7 +13156,7 @@ mod vulkan_split_tests {
 
         let mut gen_of = |host: &mut FakeHost| {
             let secs = super::build_secondary_targets(
-                &mut state, host, 1, &colors, &pipeline, &primary, 8, 8, [0.0; 4],
+                &mut state, host, 1, &colors, &pipeline, &primary, 8, 8,
             )
             .expect("slot 1 is a resolvable secondary");
             assert_eq!(secs.len(), 1, "slot 1 is a resolvable secondary");
@@ -13606,18 +13616,19 @@ pub(super) fn linux_m2v_draw_failure(
 pub(super) fn vulkan_fixed_state_gap(req: &DrawEncodeRequest) -> String {
     let mut gaps = Vec::new();
     // Cull mode and front-facing winding ARE honored by the Vulkan raster state
-    // (see the pipeline builder). Only an out-of-contract value is still a gap —
-    // those stay fail-visible rather than being coerced to a face that silently
-    // draws or drops geometry. What counts as out-of-contract is
-    // `translate::raster`'s answer, not a local bound: a second copy of the
-    // SDK's range here would silently disagree the moment one of them changed.
+    // (see the pipeline builder). Only an out-of-contract value is still a gap
+    // — and it is no longer coerced to a face that silently draws or drops
+    // geometry; the pipeline refuses it. What counts as out-of-contract is
+    // `reims_vgpu_vulkan::raster`'s answer, not a local bound: a second copy
+    // of the SDK's range here would silently disagree the moment one of them
+    // changed.
     if let Some(value) = req.cull_mode {
-        if translate::raster::cull_mode(value).is_err() {
+        if reims_vgpu_vulkan::raster::cull_mode(u64::from(value)).is_err() {
             gaps.push(format!("cull:{value}"));
         }
     }
     if let Some(value) = req.front_facing {
-        if translate::raster::front_face_ccw(value).is_err() {
+        if reims_vgpu_vulkan::raster::front_face(u64::from(value)).is_err() {
             gaps.push(format!("front:{value}"));
         }
     }
@@ -13812,57 +13823,19 @@ pub(super) fn vulkan_sampler_resource(
 ) -> Result<crate::backend::vulkan::engine::SamplerResource, DrawPreparationDecline> {
     use crate::backend::vulkan::engine::SamplerResource;
 
+    // The ordinals travel as the guest wrote them. `SamplerShape::checked` in
+    // `reims_vgpu_core::sampler` is the one parse and the one refusal, so a
+    // second decode here would be a second table saying which ordinal means
+    // what — and the two could disagree.
     Ok(SamplerResource {
         binding,
-        min_filter: translate::sampler::filter(sampler.min_filter).map_err(|reason| {
-            DrawPreparationDecline::SamplerMinFilterTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        mag_filter: translate::sampler::filter(sampler.mag_filter).map_err(|reason| {
-            DrawPreparationDecline::SamplerMagFilterTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        mip_filter: translate::sampler::mip_filter(sampler.mip_filter).map_err(|reason| {
-            DrawPreparationDecline::SamplerMipFilterTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        address_mode_u: translate::sampler::address_mode(sampler.s_address).map_err(|reason| {
-            DrawPreparationDecline::SamplerAddressSTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        address_mode_v: translate::sampler::address_mode(sampler.t_address).map_err(|reason| {
-            DrawPreparationDecline::SamplerAddressTTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        address_mode_w: translate::sampler::address_mode(sampler.r_address).map_err(|reason| {
-            DrawPreparationDecline::SamplerAddressRTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
-        border_color: translate::sampler::border_color(sampler.border_color).map_err(|reason| {
-            DrawPreparationDecline::SamplerBorderColorTranslation {
-                sampler_ref,
-                binding,
-                reason,
-            }
-        })?,
+        min_filter: sampler.min_filter,
+        mag_filter: sampler.mag_filter,
+        mip_filter: sampler.mip_filter,
+        address_mode_u: sampler.s_address,
+        address_mode_v: sampler.t_address,
+        address_mode_w: sampler.r_address,
+        border_color: sampler.border_color,
         // Metal reuses `MTLCompareFunction` for depth, stencil and sampler
         // compare, so this is `raster`'s table rather than `sampler`'s — one
         // Metal enum, one home.
@@ -13885,15 +13858,16 @@ pub fn reflected_static_sampler_resource(
     binding: u32,
     sampler: metal2vulkan::reflect::StaticSamplerState,
 ) -> Result<crate::backend::vulkan::engine::SamplerResource, DrawPreparationDecline> {
-    use crate::backend::vulkan::engine::{
-        SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-        SamplerMipFilter, SamplerResource,
-    };
+    use crate::backend::vulkan::engine::{SamplerCompareFunction, SamplerResource};
+    // The reflected state becomes the same `MTLSampler*` ordinals a guest
+    // descriptor carries, so both routes into `SamplerResource` reach the one
+    // parse in `reims_vgpu_core::sampler` rather than each carrying its own.
     use metal2vulkan::reflect::{
         SamplerAddressMode as ReflectedAddress, SamplerBorderColor as ReflectedBorder,
         SamplerCompareFunction as ReflectedCompare, SamplerCoordinates,
         SamplerFilter as ReflectedFilter, SamplerMipFilter as ReflectedMip, SamplerReduction,
     };
+    use reims_vgpu_core::sampler as mtl;
 
     if sampler.reduction != SamplerReduction::WeightedAverage {
         return Err(DrawPreparationDecline::StaticSamplerReductionUnsupported {
@@ -13912,8 +13886,8 @@ pub fn reflected_static_sampler_resource(
         });
     }
     let filter = |filter, min| match filter {
-        ReflectedFilter::Nearest => Ok(SamplerFilter::Nearest),
-        ReflectedFilter::Linear => Ok(SamplerFilter::Linear),
+        ReflectedFilter::Nearest => Ok(mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST),
+        ReflectedFilter::Linear => Ok(mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR),
         ReflectedFilter::Bicubic if min => {
             Err(DrawPreparationDecline::StaticSamplerMinFilterUnsupported { stage, binding })
         }
@@ -13922,21 +13896,21 @@ pub fn reflected_static_sampler_resource(
         }
     };
     let mip_filter = match sampler.mip_filter {
-        ReflectedMip::None => SamplerMipFilter::NotMipmapped,
-        ReflectedMip::Nearest => SamplerMipFilter::Nearest,
-        ReflectedMip::Linear => SamplerMipFilter::Linear,
+        ReflectedMip::None => mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        ReflectedMip::Nearest => mtl::MTL_SAMPLER_MIP_FILTER_NEAREST,
+        ReflectedMip::Linear => mtl::MTL_SAMPLER_MIP_FILTER_LINEAR,
     };
     let address = |address| match address {
-        ReflectedAddress::ClampToZero => SamplerAddressMode::ClampToZero,
-        ReflectedAddress::ClampToEdge => SamplerAddressMode::ClampToEdge,
-        ReflectedAddress::Repeat => SamplerAddressMode::Repeat,
-        ReflectedAddress::MirroredRepeat => SamplerAddressMode::MirrorRepeat,
-        ReflectedAddress::ClampToBorder => SamplerAddressMode::ClampToBorderColor,
+        ReflectedAddress::ClampToZero => mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO,
+        ReflectedAddress::ClampToEdge => mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        ReflectedAddress::Repeat => mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+        ReflectedAddress::MirroredRepeat => mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT,
+        ReflectedAddress::ClampToBorder => mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR,
     };
     let border_color = match sampler.border_color {
-        ReflectedBorder::TransparentBlack => SamplerBorderColor::TransparentBlack,
-        ReflectedBorder::OpaqueBlack => SamplerBorderColor::OpaqueBlack,
-        ReflectedBorder::OpaqueWhite => SamplerBorderColor::OpaqueWhite,
+        ReflectedBorder::TransparentBlack => mtl::MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK,
+        ReflectedBorder::OpaqueBlack => mtl::MTL_SAMPLER_BORDER_COLOR_OPAQUE_BLACK,
+        ReflectedBorder::OpaqueWhite => mtl::MTL_SAMPLER_BORDER_COLOR_OPAQUE_WHITE,
     };
     let compare_function = match sampler.compare_function {
         ReflectedCompare::None | ReflectedCompare::Never => SamplerCompareFunction::Never,

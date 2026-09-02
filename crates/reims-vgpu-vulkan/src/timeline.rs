@@ -24,14 +24,26 @@
 //! that reason, and it is why `TimelinePoint::default()` — which is zero — is a
 //! value nothing here produces.
 //!
-//! # A counter that went backwards is refused, never clamped
+//! # A reading this rail cannot have produced is refused, never clamped
 //!
-//! `vkGetSemaphoreCounterValue` on a healthy timeline is monotone. A value
-//! below what was already observed means the handle is not the timeline the
-//! caller thinks it is, or the device is in a state this rail cannot reason
-//! about. Taking the larger of the two would hide it and keep retiring objects
-//! against a fiction; [`Backwards`] names it, and the caller's answer is device
-//! loss rather than a smaller number.
+//! `vkGetSemaphoreCounterValue` on a healthy timeline is monotone, and every
+//! value on *this* timeline was handed out by [`TimelineCursor::reserve`]. So a
+//! reading is unreadable in **two** directions, and they are one fact: a value
+//! below what was already observed, and a value above everything ever reserved.
+//! Either means the handle is not the timeline the caller thinks it is, or the
+//! device is in a state this rail cannot reason about.
+//!
+//! The second direction is the dangerous one, because believing it is silent
+//! and destructive rather than merely wrong. `reserve` continues from
+//! `reserved` and not from `reached`, so a reading above `reserved` makes every
+//! point handed out afterwards *born already reached* — and a retirement queue
+//! collecting against it hands back objects for destruction while the
+//! submissions naming them are still executing. That is the same failure the
+//! section above about zero exists to prevent, arriving from the other side.
+//!
+//! Taking either reading would hide it and keep retiring objects against a
+//! fiction; [`Unreadable`] names both, and the caller's answer is device loss
+//! rather than a number this rail invented.
 //!
 //! # Reserving is not signalling
 //!
@@ -43,33 +55,47 @@
 use ash::vk;
 use reims_vgpu_core::identity::TimelinePoint;
 
-/// A timeline counter that went backwards.
+/// A timeline reading this rail cannot have produced.
 ///
-/// Not recoverable by taking the larger value: the two readings cannot both
-/// have come from a healthy timeline, so continuing would mean retiring
-/// objects against a counter this rail has already been lied to about.
+/// Neither is recoverable by taking one of the two numbers: the readings cannot
+/// both have come from a healthy timeline this rail owns, so continuing would
+/// mean retiring objects against a counter it has already been lied to about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Backwards {
-    pub observed: u64,
-    pub previously: u64,
+pub enum Unreadable {
+    /// Below what was already observed. A monotone counter does not do this.
+    Backwards { observed: u64, previously: u64 },
+    /// Above every value this rail has handed out. Nothing else signals this
+    /// timeline, so there is no submission that could have advanced it here —
+    /// and believing it would mark every point reserved afterwards as already
+    /// reached.
+    AheadOfReservation { observed: u64, reserved: u64 },
 }
 
-impl Backwards {
+impl Unreadable {
     #[must_use]
     pub const fn slug(self) -> &'static str {
-        "vk_timeline_counter_went_backwards"
+        match self {
+            Self::Backwards { .. } => "vk_timeline_counter_went_backwards",
+            Self::AheadOfReservation { .. } => "vk_timeline_counter_ahead_of_reservation",
+        }
     }
 }
 
-impl std::fmt::Display for Backwards {
+impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} observed={} previously={}",
-            self.slug(),
-            self.observed,
-            self.previously
-        )
+        match *self {
+            Self::Backwards {
+                observed,
+                previously,
+            } => write!(
+                f,
+                "{} observed={observed} previously={previously}",
+                self.slug()
+            ),
+            Self::AheadOfReservation { observed, reserved } => {
+                write!(f, "{} observed={observed} reserved={reserved}", self.slug())
+            }
+        }
     }
 }
 
@@ -120,12 +146,21 @@ impl TimelineCursor {
     ///
     /// # Errors
     ///
-    /// If the reading is below what was already observed.
-    pub fn observe(&mut self, counter: u64) -> Result<TimelinePoint, Backwards> {
+    /// If the reading is below what was already observed, or above everything
+    /// this cursor has handed out. Both are [`Unreadable`], and the second is
+    /// what keeps [`Self::has_reached`]'s answer about an unreserved point
+    /// true.
+    pub fn observe(&mut self, counter: u64) -> Result<TimelinePoint, Unreadable> {
         if counter < self.reached {
-            return Err(Backwards {
+            return Err(Unreadable::Backwards {
                 observed: counter,
                 previously: self.reached,
+            });
+        }
+        if counter > self.reserved {
+            return Err(Unreadable::AheadOfReservation {
+                observed: counter,
+                reserved: self.reserved,
             });
         }
         self.reached = counter;
@@ -136,7 +171,9 @@ impl TimelineCursor {
     ///
     /// False for a point that was never reserved, which is the safe answer: a
     /// caller asking about a value nothing will signal must not be told the
-    /// work is done.
+    /// work is done. [`Self::observe`] is what makes it so — every value up to
+    /// `reserved` was handed out, and a reading past `reserved` is refused, so
+    /// `reached` can never run ahead of the points that exist.
     #[must_use]
     pub const fn has_reached(&self, point: TimelinePoint) -> bool {
         self.reached >= point.0
@@ -204,8 +241,8 @@ impl Timeline {
     ///
     /// # Errors
     ///
-    /// The driver's own error, or [`Backwards`] when the reading is below one
-    /// already taken.
+    /// The driver's own error, or [`Unreadable`] when the reading is one this
+    /// rail cannot have produced.
     ///
     /// # Safety
     ///
@@ -214,7 +251,7 @@ impl Timeline {
     pub unsafe fn poll(&mut self, device: &ash::Device) -> Result<TimelinePoint, PollFailure> {
         let counter = unsafe { device.get_semaphore_counter_value(self.semaphore) }
             .map_err(PollFailure::Driver)?;
-        self.cursor.observe(counter).map_err(PollFailure::Backwards)
+        self.cursor.observe(counter).map_err(PollFailure::Counter)
     }
 
     /// Wait for the host to reach a point, and record where it got to.
@@ -226,7 +263,7 @@ impl Timeline {
     /// # Errors
     ///
     /// The driver's error — including `TIMEOUT`, which is not a failure of this
-    /// rail and is passed through so the caller can decide — or [`Backwards`].
+    /// rail and is passed through so the caller can decide — or [`Unreadable`].
     ///
     /// # Safety
     ///
@@ -248,9 +285,7 @@ impl Timeline {
         unsafe { device.wait_semaphores(&info, timeout_ns) }.map_err(PollFailure::Driver)?;
         // The wait succeeded, so the host is at least here. Recording it means
         // the next `has_reached` for this point answers without a call.
-        self.cursor
-            .observe(point.0)
-            .map_err(PollFailure::Backwards)?;
+        self.cursor.observe(point.0).map_err(PollFailure::Counter)?;
         Ok(())
     }
 }
@@ -261,7 +296,7 @@ pub enum PollFailure {
     /// The driver refused. `TIMEOUT` arrives here too and is the caller's to
     /// interpret: a wait that timed out is not a device that failed.
     Driver(vk::Result),
-    Backwards(Backwards),
+    Counter(Unreadable),
 }
 
 impl PollFailure {
@@ -269,7 +304,7 @@ impl PollFailure {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Driver(_) => "vk_timeline_driver_error",
-            Self::Backwards(b) => b.slug(),
+            Self::Counter(u) => u.slug(),
         }
     }
 }
@@ -278,7 +313,7 @@ impl std::fmt::Display for PollFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::Driver(r) => write!(f, "{} result={r:?}", self.slug()),
-            Self::Backwards(b) => b.fmt(f),
+            Self::Counter(u) => u.fmt(f),
         }
     }
 }
@@ -362,7 +397,7 @@ mod tests {
         c.observe(7).expect("forwards");
         assert_eq!(
             c.observe(4),
-            Err(Backwards {
+            Err(Unreadable::Backwards {
                 observed: 4,
                 previously: 7
             })
@@ -429,17 +464,78 @@ mod tests {
     }
 
     #[test]
-    fn a_backwards_reading_names_itself_distinctly() {
-        let b = Backwards {
+    fn each_unreadable_reading_names_itself_distinctly() {
+        let backwards = Unreadable::Backwards {
             observed: 1,
             previously: 2,
         };
+        let ahead = Unreadable::AheadOfReservation {
+            observed: 9,
+            reserved: 1,
+        };
         assert_ne!(
             PollFailure::Driver(vk::Result::TIMEOUT).slug(),
-            PollFailure::Backwards(b).slug()
+            PollFailure::Counter(backwards).slug()
         );
-        assert!(PollFailure::Backwards(b)
+        assert_ne!(
+            backwards.slug(),
+            ahead.slug(),
+            "two different faults, and the log line is all a reader has"
+        );
+        assert!(PollFailure::Counter(backwards)
             .to_string()
             .contains("previously=2"));
+        assert!(PollFailure::Counter(ahead)
+            .to_string()
+            .contains("reserved=1"));
+    }
+
+    /// The mirror of the backwards reading, and the destructive one.
+    ///
+    /// Every value on this timeline is handed out by `reserve`, so a counter
+    /// above `reserved` cannot have come from a submission this rail made. It
+    /// used to be believed — and `reserve` continues from `reserved`, not from
+    /// `reached`, so every point handed out afterwards was born already
+    /// reached. A retirement queue collecting against that hands objects back
+    /// for destruction while the submissions naming them are still executing.
+    #[test]
+    fn a_reading_past_everything_reserved_is_refused_and_does_not_move_the_cursor() {
+        let mut c = TimelineCursor::new();
+        let submitted = c.reserve();
+        assert_eq!(
+            c.observe(9),
+            Err(Unreadable::AheadOfReservation {
+                observed: 9,
+                reserved: 1,
+            })
+        );
+        assert_eq!(c.reached(), TimelinePoint(0), "nothing was believed");
+        assert!(
+            !c.has_reached(submitted),
+            "and the submission is still owed"
+        );
+        assert_eq!(c.outstanding(), 1);
+
+        // And the next point handed out is not born reached.
+        let next = c.reserve();
+        assert!(!c.has_reached(next));
+    }
+
+    /// `Timeline::adopt` states an initial value of zero as a precondition and
+    /// cannot check it without a device. The refusal is what turns a violated
+    /// one into a report at the first poll instead of a queue that collects
+    /// everything it holds.
+    #[test]
+    fn adopting_a_semaphore_that_was_not_at_zero_is_reported_and_not_absorbed() {
+        let mut c = TimelineCursor::new();
+        for _ in 0..3 {
+            c.reserve();
+        }
+        assert!(matches!(
+            c.observe(100),
+            Err(Unreadable::AheadOfReservation { .. })
+        ));
+        assert_eq!(c.outstanding(), 3, "all three are still waited on");
+        assert!(!c.has_reached(TimelinePoint(3)));
     }
 }

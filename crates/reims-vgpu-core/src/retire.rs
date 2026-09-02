@@ -126,6 +126,7 @@ impl Lifetime {
 /// An object whose last use has completed. Its handles are live and it must be
 /// destroyed through the device that made them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a retired object nothing destroys is a handle the device never gets back"]
 pub struct Retired<T> {
     pub lifetime: Lifetime,
     pub last_use: TimelinePoint,
@@ -135,6 +136,7 @@ pub struct Retired<T> {
 /// An object whose device incarnation ended. Its handles went with it and it
 /// must be dropped without being touched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "an abandoned object is still the caller's to drop, and to drop without touching"]
 pub struct Abandoned<T> {
     pub lifetime: Lifetime,
     pub object: T,
@@ -196,6 +198,12 @@ impl<T> NativeRetirement<T> {
     /// are unrelated numbers, and comparing one against the other would retire
     /// live objects whenever a new device's timeline started behind an old
     /// one's.
+    ///
+    /// `#[must_use]` on the method and not only on [`Retired`]: the lint does
+    /// not look inside a `Vec`, so the annotation on the element type says
+    /// nothing at all about a call whose result is dropped — which is the exact
+    /// call that leaks every handle it just took out of the queue.
+    #[must_use = "objects taken out of the queue and not destroyed are handles nothing will ever destroy"]
     pub fn reached(&mut self, epoch: DeviceEpoch, at: TimelinePoint) -> Vec<Retired<T>> {
         let mut out = Vec::new();
         let mut i = 0;
@@ -220,6 +228,9 @@ impl<T> NativeRetirement<T> {
     /// No timeline is consulted, because the thing that would advance it is
     /// what was lost. Waiting for a point a dead device will never reach is how
     /// a device loss becomes a leak and a hang instead of a transition.
+    ///
+    /// `#[must_use]` for the reason [`Self::reached`] gives.
+    #[must_use = "objects taken out of the queue are the caller's to drop"]
     pub fn epoch_lost(&mut self, epoch: DeviceEpoch) -> Vec<Abandoned<T>> {
         let mut out = Vec::new();
         let mut i = 0;
@@ -401,5 +412,198 @@ mod tests {
             // `destroy(object)` does not compile here, which is the test.
             assert_eq!(object.object, "dead");
         }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// Deliberately few epochs and a short timeline, so an object queued under
+    /// one epoch is constantly asked about by another's points and the two
+    /// timelines overlap numerically.
+    const EPOCHS: u64 = 3;
+    const POINTS: u64 = 6;
+
+    /// **Every queued object leaves exactly once, and never before its last
+    /// use — on its own epoch's timeline.**
+    ///
+    /// The shadow is a flat list of `(epoch, last_use, id)` with a released
+    /// set beside it, which has no notion of a timeline at all: what may be
+    /// taken is stated as the predicate "this epoch, and this point is at or
+    /// past the last use", and what a loss takes is stated as "this epoch",
+    /// full stop. A queue that consulted a timeline on a device-loss path, or
+    /// compared one epoch's point against another's, cannot agree with it.
+    #[test]
+    fn every_queued_object_leaves_once_at_its_own_epochs_point() {
+        let mut retired = 0usize;
+        let mut abandoned = 0usize;
+        let mut sweeps_that_took_nothing = 0usize;
+        let mut losses_that_took_nothing = 0usize;
+        let mut queued_after_a_loss = 0usize;
+
+        for seed in 0..512u64 {
+            let mut rng = Rng::new(seed);
+            let mut r: NativeRetirement<u64> = NativeRetirement::new();
+            // Shadow: what is still held, and what has left.
+            let mut held: Vec<(DeviceEpoch, TimelinePoint, u64)> = Vec::new();
+            let mut left: Vec<u64> = Vec::new();
+            let mut lost: Vec<DeviceEpoch> = Vec::new();
+            let mut next_id = 0u64;
+            let mut retired_here = 0usize;
+            let mut abandoned_here = 0usize;
+
+            for _ in 0..48 {
+                let e = epoch(rng.below(EPOCHS) + 1);
+                match rng.below(6) {
+                    // Queue an object.
+                    0..=2 => {
+                        let point = at(rng.below(POINTS) + 1);
+                        let id = next_id;
+                        next_id += 1;
+                        if lost.contains(&e) {
+                            queued_after_a_loss += 1;
+                        }
+                        r.queue(Lifetime::new(session(rng.below(3) + 1), e), point, id);
+                        held.push((e, point, id));
+                    }
+                    // One epoch's timeline reached a point.
+                    3..=4 => {
+                        let point = at(rng.below(POINTS + 2));
+                        let got = r.reached(e, point);
+                        let mut expected: Vec<u64> = held
+                            .iter()
+                            .filter(|(he, hp, _)| *he == e && point.reached(*hp))
+                            .map(|(_, _, id)| *id)
+                            .collect();
+                        let mut names: Vec<u64> = got.iter().map(|o| o.object).collect();
+                        expected.sort_unstable();
+                        names.sort_unstable();
+                        assert_eq!(names, expected, "seed {seed}: reached({e:?}, {point:?})");
+                        for o in &got {
+                            assert_eq!(o.lifetime.epoch, e, "seed {seed}: wrong epoch retired");
+                            assert!(
+                                point.reached(o.last_use),
+                                "seed {seed}: {:?} retired before its last use",
+                                o.object
+                            );
+                            assert!(
+                                !left.contains(&o.object),
+                                "seed {seed}: {} left twice",
+                                o.object
+                            );
+                            left.push(o.object);
+                        }
+                        held.retain(|(he, hp, _)| !(*he == e && point.reached(*hp)));
+                        if got.is_empty() {
+                            sweeps_that_took_nothing += 1;
+                        }
+                        retired += got.len();
+                        retired_here += got.len();
+                    }
+                    // An epoch ended.
+                    _ => {
+                        let got = r.epoch_lost(e);
+                        let mut expected: Vec<u64> = held
+                            .iter()
+                            .filter(|(he, _, _)| *he == e)
+                            .map(|(_, _, id)| *id)
+                            .collect();
+                        let mut names: Vec<u64> = got.iter().map(|o| o.object).collect();
+                        expected.sort_unstable();
+                        names.sort_unstable();
+                        assert_eq!(names, expected, "seed {seed}: epoch_lost({e:?})");
+                        for o in &got {
+                            assert_eq!(o.lifetime.epoch, e, "seed {seed}: wrong epoch abandoned");
+                            assert!(
+                                !left.contains(&o.object),
+                                "seed {seed}: {} left twice",
+                                o.object
+                            );
+                            left.push(o.object);
+                        }
+                        held.retain(|(he, _, _)| *he != e);
+                        if got.is_empty() {
+                            losses_that_took_nothing += 1;
+                        }
+                        if !lost.contains(&e) {
+                            lost.push(e);
+                        }
+                        abandoned += got.len();
+                        abandoned_here += got.len();
+                    }
+                }
+
+                // The observers agree with the shadow after every step.
+                assert_eq!(r.outstanding(), held.len(), "seed {seed}: outstanding");
+                for n in 1..=EPOCHS {
+                    let e = epoch(n);
+                    assert_eq!(
+                        r.outstanding_in(e),
+                        held.iter().filter(|(he, _, _)| *he == e).count(),
+                        "seed {seed}: outstanding_in({e:?})"
+                    );
+                }
+                assert_eq!(
+                    r.census(),
+                    (retired_here, abandoned_here),
+                    "seed {seed}: census"
+                );
+                assert_eq!(
+                    left.len() + held.len(),
+                    next_id as usize,
+                    "seed {seed}: an object is neither held nor gone"
+                );
+            }
+        }
+
+        // Non-vacuity: every shape an assertion above depends on reaching.
+        assert!(retired > 2_000, "objects retired: {retired}");
+        assert!(abandoned > 1_000, "objects abandoned: {abandoned}");
+        assert!(
+            sweeps_that_took_nothing > 1_000,
+            "timeline points that released nothing: {sweeps_that_took_nothing}"
+        );
+        assert!(
+            losses_that_took_nothing > 500,
+            "losses of an epoch holding nothing: {losses_that_took_nothing}"
+        );
+        assert!(
+            queued_after_a_loss > 300,
+            "objects queued under an epoch already lost: {queued_after_a_loss}"
+        );
+    }
+
+    fn session(n: u64) -> SessionGeneration {
+        let mut s = SessionGeneration::FIRST;
+        for _ in 1..n {
+            s = s.next();
+        }
+        s
+    }
+
+    fn epoch(n: u64) -> DeviceEpoch {
+        let mut e = DeviceEpoch::FIRST;
+        for _ in 1..n {
+            e = e.next();
+        }
+        e
     }
 }

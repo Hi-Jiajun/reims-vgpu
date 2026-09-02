@@ -31,8 +31,8 @@
 
 use crate::bind::{BindSpan, BufferBinding, IndirectSource, LodClamp, ObjectBinding};
 use crate::blit::{
-    BlitOp, BlitOptions, BufferSpan, FillPattern, ImagePitch, Origin3, Size3, TexturePoint,
-    TextureSpan,
+    BlitOp, BlitOptions, BufferSpan, FillPattern, ImagePitch, Origin3, Size3, SpanOrigin,
+    TexturePoint,
 };
 use crate::compute::{ComputeExtent, ComputeOp, ComputeOrigin, DispatchOp};
 use crate::exec::{ExecArenas, ResolvedOperation};
@@ -40,8 +40,8 @@ use crate::icb::{CommandRange, IcbOp};
 use crate::identity::ResourceId;
 use crate::operation::{classify, OperationClass, OperationHome};
 use crate::pass::{
-    Attachment, AttachmentSlot, LoadAction, PassDescriptor, RenderTargetExtent, StoreAction,
-    VisibilityResultBuffer,
+    Attachment, AttachmentSlot, DepthResolveFilter, LoadAction, PassDescriptor, RenderTargetExtent,
+    StencilResolveFilter, StoreAction, StoreActionOptions, VisibilityResultBuffer,
 };
 use crate::render::{
     DrawOp, FloatBits, IndexSource, Instancing, PassDescriptorSlot, PrimitiveType, RenderOp,
@@ -79,6 +79,20 @@ use reims_vgpu_protocol::decode::{
 pub trait RefResolver {
     /// The live resource a ref names, or `None` when the slot holds nothing.
     fn resource(&self, object_ref: u32) -> Option<ResourceId>;
+}
+
+/// Which backing a guest mapping's surface currently occupies.
+///
+/// **A separate trait from [`RefResolver`] because it answers about a separate
+/// namespace.** A mapping id and an object-list ref arrive as `u32`s that
+/// overlap numerically and name unrelated things — see
+/// [`crate::identity::MappingId`] — so a resolver that answered both from one
+/// method would let a caller ask the wrong question and get a plausible answer.
+/// The mapper owns this one; the object list owns the other.
+pub trait MappingResolver {
+    /// The backing a mapping's surface is resolved to, or `None` when the
+    /// mapping names no live surface.
+    fn backing(&self, mapping: crate::identity::MappingId) -> Option<crate::access::BackingId>;
 }
 
 /// Why a record could not become an operation.
@@ -141,6 +155,12 @@ fn one(resolver: &impl RefResolver, object_ref: u32) -> Result<ResourceId, Resol
 /// in the middle would otherwise leave half of itself in the arena behind a
 /// window nobody names — harmless today and exactly the kind of thing that
 /// stops being harmless when an arena is reused.
+///
+/// Entries resolve through [`one`] rather than [`bound`], even though they
+/// arrive in the same `RefBind` shape a texture bind uses. A residency list has
+/// no slot to clear: an entry is a resource the following work will touch, so
+/// there is nothing for a nil entry to mean and reading one as an unbind would
+/// silently shorten the list a barrier orders over.
 fn append_refs(
     arenas: &mut ExecArenas,
     resolver: &impl RefResolver,
@@ -264,20 +284,20 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             slice_count,
             level_count,
         } => BlitOp::TextureSlices {
-            source: TextureSpan {
+            source: SpanOrigin {
                 texture: one(resolver, source_ref)?,
                 base_slice: source_slice,
                 base_level: source_level,
-                slice_count,
-                level_count,
             },
-            dest: TextureSpan {
+            dest: SpanOrigin {
                 texture: one(resolver, dest_ref)?,
                 base_slice: dest_slice,
                 base_level: dest_level,
-                slice_count,
-                level_count,
             },
+            // The record's own single count of each, reaching both ends
+            // because there is one of it. See [`SpanOrigin`].
+            slice_count,
+            level_count,
         },
         BlitRecord::FillBuffer {
             buffer_ref,
@@ -740,11 +760,33 @@ fn attachment(
     prefix: &AttachmentPrefix,
     clear_bits: [u64; 4],
 ) -> Result<Attachment, ResolveRefusal> {
+    // Refused rather than folded, for the reason the two beside it give. The
+    // fold `LoadAction::from_declared` performs is written for a caller with no
+    // refusal channel; this one has one, and a value outside the closed set
+    // here is a corrupt record or a wrong offset. Folding it to `DontCare`
+    // silently composites onto whatever was in the attachment.
+    let raw_load = prefix.load_action.get();
+    let load = LoadAction::parse(raw_load).ok_or(ResolveRefusal::UndefinedOrdinal {
+        field: "load_action",
+        value: u32::from(raw_load),
+    })?;
     let raw_store = prefix.store_action.get();
     let store = StoreAction::parse(raw_store).ok_or(ResolveRefusal::UndefinedOrdinal {
         field: "store_action",
         value: u32::from(raw_store),
     })?;
+    // The word beside the store action, which nothing read until now. An
+    // undeclared value refuses for the reason the store action's does: the set
+    // has one flag, so a value outside it is a corrupt record or a wrong
+    // offset, and folding it onto the flag would claim the guest asked for
+    // programmable sample positions it never asked for.
+    let raw_options = prefix.store_action_options.get();
+    let store_options = StoreActionOptions::parse(u64::from(raw_options)).ok_or(
+        ResolveRefusal::UndefinedOrdinal {
+            field: "store_action_options",
+            value: u32::from(raw_options),
+        },
+    )?;
     Ok(Attachment {
         slot,
         texture: bound(resolver, prefix.texture_ref.get())?,
@@ -755,8 +797,9 @@ fn attachment(
         resolve_level: prefix.resolve_level.get(),
         resolve_slice: prefix.resolve_slice.get(),
         resolve_depth_plane: prefix.resolve_depth_plane.get(),
-        load: LoadAction::from_declared(prefix.load_action.get()),
+        load,
         store,
+        store_options,
         clear_bits,
     })
 }
@@ -790,6 +833,24 @@ pub fn pass_descriptor(
         AttachmentSlot::Stencil,
         &body.stencil.prefix,
         [u64::from(body.stencil.clear_stencil.get()), 0, 0, 0],
+    )?;
+    // The two words beside the depth and stencil clear values, which nothing
+    // read until now. An undeclared ordinal refuses for the reason the store
+    // action's does: both sets are closed, so a value outside one is a corrupt
+    // record or a wrong offset, and folding it onto a neighbour resolves at a
+    // filter the guest did not ask for.
+    let raw_depth_filter = body.depth.resolve_filter.get();
+    descriptor.depth_resolve_filter =
+        DepthResolveFilter::parse(raw_depth_filter).ok_or(ResolveRefusal::UndefinedOrdinal {
+            field: "depth_resolve_filter",
+            value: u32::from(raw_depth_filter),
+        })?;
+    let raw_stencil_filter = body.stencil.resolve_filter.get();
+    descriptor.stencil_resolve_filter = StencilResolveFilter::parse(raw_stencil_filter).ok_or(
+        ResolveRefusal::UndefinedOrdinal {
+            field: "stencil_resolve_filter",
+            value: u32::from(raw_stencil_filter),
+        },
     )?;
     descriptor.visibility_result_buffer = bound(resolver, body.visibility_result_buffer_ref.get())?
         .map(|buffer| VisibilityResultBuffer { buffer });
@@ -894,6 +955,7 @@ pub fn render(
             slope_scale: FloatBits(slope_scale_bits),
             clamp: FloatBits(clamp_bits),
         },
+        RenderRecord::SetLineWidth { width_bits } => RenderOp::SetLineWidth(FloatBits(width_bits)),
         RenderRecord::SetBlendColor {
             red_bits,
             green_bits,
@@ -1612,6 +1674,148 @@ mod tests {
         );
     }
 
+    /// And the load action beside them, which was the one field of the three
+    /// that folded.
+    ///
+    /// `LoadAction::from_declared` is total on purpose and its doc leaves the
+    /// *reporting* of an out-of-contract ordinal to the caller, because its
+    /// callers are the ones with no packet to refuse. This resolver has one.
+    /// Folded to `DontCare` a corrupt ordinal means "composite onto whatever
+    /// was there", with nothing on the failure channel to say the record was
+    /// not read as written.
+    #[test]
+    fn an_undefined_load_action_refuses_like_the_store_action_beside_it() {
+        let live = Live(vec![4242]);
+        let mut body = pass_body();
+        body.color[0].prefix.texture_ref = u32le(4242);
+        body.color[0].prefix.load_action = u16le(7);
+        assert_eq!(
+            pass_descriptor(&body, &live),
+            Err(ResolveRefusal::UndefinedOrdinal {
+                field: "load_action",
+                value: 7,
+            })
+        );
+    }
+
+    /// Each slot's store-action options are its own, and an undeclared value
+    /// refuses.
+    ///
+    /// The word sat in the wire prefix from the day the layout was measured and
+    /// nothing read it, so a pass asking for a resolve at programmable sample
+    /// positions was indistinguishable from one asking for the ordinary
+    /// resolve. Driven per slot because the guest sets it per slot — a resolver
+    /// that read one slot's word for every slot would pass a test that only set
+    /// one.
+    #[test]
+    fn each_slots_store_action_options_are_read_from_its_own_prefix() {
+        let live = Live(vec![4242]);
+        let mut body = pass_body();
+        body.color[0].prefix.texture_ref = u32le(4242);
+        body.color[1].prefix.texture_ref = u32le(4242);
+        body.color[0].prefix.store_action_options = u16le(1);
+        body.depth.prefix.store_action_options = u16le(1);
+        let descriptor = pass_descriptor(&body, &live).expect("resolved");
+        assert_eq!(
+            descriptor.color[0].store_options,
+            StoreActionOptions::CustomSamplePositions
+        );
+        assert_eq!(descriptor.color[1].store_options, StoreActionOptions::None);
+        assert_eq!(
+            descriptor.depth.store_options,
+            StoreActionOptions::CustomSamplePositions
+        );
+        assert_eq!(descriptor.stencil.store_options, StoreActionOptions::None);
+
+        // The set has one declared flag, so a value outside it is a corrupt
+        // record or a wrong offset. Folding it onto the flag would claim the
+        // guest asked for programmable sample positions it never asked for.
+        for raw in [2u16, 3, 0x1111] {
+            let mut body = pass_body();
+            body.stencil.prefix.store_action_options = u16le(raw);
+            assert_eq!(
+                pass_descriptor(&body, &live),
+                Err(ResolveRefusal::UndefinedOrdinal {
+                    field: "store_action_options",
+                    value: u32::from(raw),
+                }),
+                "{raw:#x}"
+            );
+        }
+    }
+
+    /// The depth and stencil slots each carry a resolve filter, and they are
+    /// two ordinal spaces.
+    ///
+    /// The words sat on the two attachment bodies from the day the layout was
+    /// measured and nothing read them, so a pass asking to resolve depth at the
+    /// furthest sample was indistinguishable from one asking for sample zero —
+    /// and the guest reads a resolved depth buffer back as geometry, so that
+    /// difference surfaces as wrong occlusion somewhere later rather than as a
+    /// wrong frame now.
+    ///
+    /// Both slots are driven with the *same* ordinal, because that is the
+    /// arrangement a shared filter type would pass: `1` is `Min` on the depth
+    /// slot and `DepthResolvedSample` on the stencil one.
+    #[test]
+    fn each_slots_resolve_filter_is_read_in_its_own_ordinal_space() {
+        let live = Live(Vec::new());
+        let mut body = pass_body();
+        body.depth.resolve_filter = u16le(1);
+        body.stencil.resolve_filter = u16le(1);
+        let descriptor = pass_descriptor(&body, &live).expect("resolved");
+        assert_eq!(descriptor.depth_resolve_filter, DepthResolveFilter::Min);
+        assert_eq!(
+            descriptor.stencil_resolve_filter,
+            StencilResolveFilter::DepthResolvedSample
+        );
+
+        // And the value the capture carries on each, which is not the same
+        // ordinal on the two slots.
+        let mut body = pass_body();
+        body.depth.resolve_filter = u16le(2);
+        let descriptor = pass_descriptor(&body, &live).expect("resolved");
+        assert_eq!(descriptor.depth_resolve_filter, DepthResolveFilter::Max);
+        assert_eq!(
+            descriptor.stencil_resolve_filter,
+            StencilResolveFilter::Sample0,
+            "a slot whose word is zero carries what the API starts at"
+        );
+    }
+
+    /// Both sets are closed, so a value outside one is a corrupt record or a
+    /// wrong offset rather than a filter with no contract yet. `2` is declared
+    /// on the depth slot and not on the stencil one, which is what makes the
+    /// pair worth driving separately.
+    #[test]
+    fn an_undeclared_resolve_filter_refuses_by_name() {
+        let live = Live(Vec::new());
+        for raw in [3u16, 4, 0xffff] {
+            let mut body = pass_body();
+            body.depth.resolve_filter = u16le(raw);
+            assert_eq!(
+                pass_descriptor(&body, &live),
+                Err(ResolveRefusal::UndefinedOrdinal {
+                    field: "depth_resolve_filter",
+                    value: u32::from(raw),
+                }),
+                "{raw:#x}"
+            );
+        }
+        for raw in [2u16, 3, 0xffff] {
+            let mut body = pass_body();
+            body.stencil.resolve_filter = u16le(raw);
+            assert_eq!(
+                pass_descriptor(&body, &live),
+                Err(ResolveRefusal::UndefinedOrdinal {
+                    field: "stencil_resolve_filter",
+                    value: u32::from(raw),
+                }),
+                "{raw:#x}"
+            );
+        }
+    }
+
     /// The visibility buffer lives on the pass and nowhere else, so a pass
     /// without one resolves to `None` rather than to a resource named zero.
     #[test]
@@ -1840,18 +2044,23 @@ mod tests {
                 row.rail
             );
         }
-        // The census the vocabulary prints is 101 stream operations. Six of
+        // The census the vocabulary prints is 105 stream operations. Six of
         // them carry no opcode at all — the four `beginSegment:` boundaries,
         // and the blit `withCommand:` selectors that write their command
         // argument into the record's opcode field, so they *are* whichever
         // opcode they emitted. Neither shape is dispatched by opcode, so
-        // neither reaches this path, and 95 is what remains.
+        // neither reaches this path, and 99 is what remains.
         //
-        // Two of those 95 are settled refusals, counted apart rather than
-        // folded into either total: a refusal that reads as an unwritten path
-        // would send someone to write it.
-        assert_eq!(seen + refused, 95);
-        assert_eq!(refused, 2);
+        // This total grows as the ledger closes rows: an unresolved row is not
+        // a judged operation and reaches neither counter, so a row settling
+        // either way moves it. That is the intent — it is the number of
+        // operations the model claims a path for.
+        //
+        // Five of the 99 are settled refusals, counted apart rather than folded
+        // into either total: a refusal that reads as an unwritten path would
+        // send someone to write it.
+        assert_eq!(seen + refused, 99);
+        assert_eq!(refused, 5);
     }
 
     /// An opcode the ledger has never heard of stops at the dispatcher, and an
@@ -1916,13 +2125,550 @@ mod tests {
         );
         let mine = [
             ResolveRefusal::UnknownRef { object_ref: 1 },
+            ResolveRefusal::UndefinedOrdinal {
+                field: "store_action",
+                value: 9,
+            },
             ResolveRefusal::ArenaOverflow { wanted: 2 },
         ];
+        // The list above must name every variant this module raises. Spelled
+        // out here without a wildcard so that adding a variant stops the build
+        // on this arm rather than quietly leaving its reason unchecked.
+        for refusal in mine {
+            match refusal {
+                ResolveRefusal::Decode(_)
+                | ResolveRefusal::UnknownRef { .. }
+                | ResolveRefusal::UndefinedOrdinal { .. }
+                | ResolveRefusal::ArenaOverflow { .. } => {}
+            }
+        }
         let mut seen: Vec<&str> = mine.iter().map(|r| r.reason()).collect();
         seen.push(ResolveRefusal::from(decode).reason());
         seen.sort_unstable();
         let before = seen.len();
         seen.dedup();
         assert_eq!(seen.len(), before);
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// Deliberately tiny, so the nil ref, a live ref and a dead ref all appear
+    /// in the same list constantly.
+    const REF_POOL: u32 = 5;
+
+    fn some_ref(rng: &mut Rng) -> u32 {
+        rng.below(u64::from(REF_POOL)) as u32
+    }
+
+    fn some_refs(rng: &mut Rng) -> Vec<u32> {
+        (0..rng.below(4)).map(|_| some_ref(rng)).collect()
+    }
+
+    /// What the shadow says a record should have appended.
+    ///
+    /// A plain list per arena: no window arithmetic, no reservation, no mark,
+    /// no rollback. That is the whole point — the shadow resolves a record's
+    /// refs to completion *before* it appends anything, which is the opposite
+    /// shape from resolution's append-and-unwind, so a rollback that misses an
+    /// entry disagrees.
+    #[derive(Debug)]
+    enum Appended {
+        Nothing,
+        Resources(Vec<ResourceId>),
+        Buffers(Vec<BufferBinding>),
+        Objects(Vec<ObjectBinding>),
+        Viewports(Vec<Viewport>),
+        Scissors(Vec<ScissorRect>),
+        /// The descriptor arena, named by the two refs the sweep varies.
+        Descriptor {
+            color0: Option<ResourceId>,
+            depth: Option<ResourceId>,
+        },
+    }
+
+    /// The nil rule, stated here rather than read out of [`bound`].
+    ///
+    /// A bind entry naming zero unbinds the slot, whether or not slot zero
+    /// happens to hold a live object.
+    fn shadow_bound(live: &Live, object_ref: u32) -> Result<Option<ResourceId>, u32> {
+        if object_ref == 0 {
+            return Ok(None);
+        }
+        live.resource(object_ref).map(Some).ok_or(object_ref)
+    }
+
+    /// A ref in a position that has no way to spell "nothing".
+    fn shadow_one(live: &Live, object_ref: u32) -> Result<ResourceId, u32> {
+        live.resource(object_ref).ok_or(object_ref)
+    }
+
+    #[derive(Default)]
+    struct Census {
+        resolved: u32,
+        refused: u32,
+        /// Records whose first dead ref was not their first ref, which is the
+        /// only shape a partial append can be seen in.
+        refused_past_the_first_ref: u32,
+        /// Bind entries that named zero.
+        unbound_slots: u32,
+        /// Bind entries that named zero while slot zero held a live object.
+        unbound_over_a_live_zero: u32,
+        families: [u32; 11],
+    }
+
+    /// **A refused record leaves every arena exactly as it found it, and an
+    /// accepted one names a window holding exactly the guest's list in the
+    /// guest's order.**
+    ///
+    /// The shadow is six plain `Vec`s and a resolution that scans a record's
+    /// refs to completion before appending anything. It has no `mark`, no
+    /// `truncate` and no `reserve`, so it cannot make resolution's mistake of
+    /// leaving a partial list behind — the one [`append_refs`]'s doc names.
+    /// It states the nil rule for itself too: resolution splits ref zero two
+    /// ways, an unbind in a bind entry and a name everywhere else, and a sweep
+    /// that asked [`bound`] which position it was in would agree with any split
+    /// at all.
+    #[test]
+    fn a_record_appends_its_whole_list_or_none_of_it() {
+        let mut census = Census::default();
+        for seed in 0..600u64 {
+            let mut rng = Rng::new(seed + 1);
+            // A fresh live set per seed, including a slot zero that is
+            // sometimes occupied.
+            let live = Live((0..REF_POOL).filter(|_| rng.below(2) == 0).collect());
+            let zero_is_live = live.resource(0).is_some();
+            let mut arenas = ExecArenas::default();
+            let mut shadow = ExecArenas::default();
+
+            for _ in 0..12 {
+                let before = arenas.clone();
+                let family = rng.below(11) as usize;
+                census.families[family] += 1;
+                // Every ref the record names, in the order resolution reads
+                // them, and whether they sit in bind positions.
+                let named: Vec<u32>;
+                let binds;
+
+                let (got, want): (Result<Option<ResourceSpan>, ResolveRefusal>, _) = match family {
+                    // A barrier's residency list. Its entries are `RefBind`,
+                    // the same shape a texture bind uses, and they are *not*
+                    // bind entries: a residency list has no slot to clear, so
+                    // zero names nothing and refuses.
+                    0 => {
+                        named = some_refs(&mut rng);
+                        binds = false;
+                        let refs: Vec<RefBind> = named
+                            .iter()
+                            .map(|&v| RefBind {
+                                object_ref: u32le(v),
+                            })
+                            .collect();
+                        let want = named
+                            .iter()
+                            .map(|&v| shadow_one(&live, v))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(Appended::Resources);
+                        let record = BarrierRecord::Resources {
+                            refs: &refs,
+                            after_stages: None,
+                            before_stages: None,
+                        };
+                        let got = barrier(&record, &live, &mut arenas).map(|op| match op.target {
+                            BarrierTarget::Resources(span) => Some(span),
+                            other => panic!("a resource barrier resolved to {other:?}"),
+                        });
+                        (got, want)
+                    }
+                    1 => {
+                        named = Vec::new();
+                        binds = false;
+                        let record = BarrierRecord::Scope {
+                            scope: BarrierScope(BarrierScope::BUFFERS),
+                            after_stages: None,
+                            before_stages: None,
+                            unidentified_u8: None,
+                        };
+                        let got = barrier(&record, &live, &mut arenas).map(|_| None);
+                        (got, Ok(Appended::Nothing))
+                    }
+                    2 => {
+                        named = some_refs(&mut rng);
+                        binds = true;
+                        let entries: Vec<BufferBind> =
+                            named.iter().map(|&v| buffer_entry(v, 0x10)).collect();
+                        let want = entries
+                            .iter()
+                            .map(|e| {
+                                shadow_bound(&live, e.buffer_ref.get()).map(|buffer| {
+                                    BufferBinding {
+                                        buffer,
+                                        offset: e.offset.get(),
+                                        stride: None,
+                                    }
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(Appended::Buffers);
+                        let record = ComputeRecord::BindBuffers {
+                            first: 0,
+                            entries: &entries,
+                        };
+                        let got = compute(&record, &live, &mut arenas).map(|op| match op {
+                            ComputeOp::BindBuffers { entries, .. } => Some(entries),
+                            other => panic!("a buffer bind resolved to {other:?}"),
+                        });
+                        (got, want)
+                    }
+                    3 => {
+                        named = some_refs(&mut rng);
+                        binds = true;
+                        let entries: Vec<BufferStrideBind> = named
+                            .iter()
+                            .map(|&v| BufferStrideBind {
+                                buffer_ref: u32le(v),
+                                offset: u64le(0x20),
+                                attribute_stride: u64le(0x30),
+                            })
+                            .collect();
+                        let want = entries
+                            .iter()
+                            .map(|e| {
+                                shadow_bound(&live, e.buffer_ref.get()).map(|buffer| {
+                                    BufferBinding {
+                                        buffer,
+                                        offset: e.offset.get(),
+                                        stride: Some(e.attribute_stride.get()),
+                                    }
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(Appended::Buffers);
+                        let record = ComputeRecord::BindBuffersWithStride {
+                            first: 0,
+                            entries: &entries,
+                        };
+                        let got = compute(&record, &live, &mut arenas).map(|op| match op {
+                            ComputeOp::BindBuffersWithStride { entries, .. } => Some(entries),
+                            other => panic!("a strided bind resolved to {other:?}"),
+                        });
+                        (got, want)
+                    }
+                    4 => {
+                        named = some_refs(&mut rng);
+                        binds = true;
+                        let entries: Vec<RefBind> = named
+                            .iter()
+                            .map(|&v| RefBind {
+                                object_ref: u32le(v),
+                            })
+                            .collect();
+                        let want = entries
+                            .iter()
+                            .map(|e| {
+                                shadow_bound(&live, e.object_ref.get()).map(|object| {
+                                    ObjectBinding {
+                                        object,
+                                        lod_clamps: None,
+                                    }
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(Appended::Objects);
+                        let record = ComputeRecord::BindTextures {
+                            first: 0,
+                            entries: &entries,
+                        };
+                        let got = compute(&record, &live, &mut arenas).map(|op| match op {
+                            ComputeOp::BindTextures { entries, .. } => Some(entries),
+                            other => panic!("a texture bind resolved to {other:?}"),
+                        });
+                        (got, want)
+                    }
+                    5 => {
+                        named = some_refs(&mut rng);
+                        binds = true;
+                        let entries: Vec<SamplerLodBind> = named
+                            .iter()
+                            .map(|&v| SamplerLodBind {
+                                sampler_ref: u32le(v),
+                                lod_min_clamp: reims_vgpu_protocol::decode::F32le::new(0.25),
+                                lod_max_clamp: reims_vgpu_protocol::decode::F32le::new(8.0),
+                            })
+                            .collect();
+                        let want = entries
+                            .iter()
+                            .map(|e| {
+                                shadow_bound(&live, e.sampler_ref.get()).map(|object| {
+                                    ObjectBinding {
+                                        object,
+                                        lod_clamps: Some((
+                                            LodClamp::from_f32(e.lod_min_clamp.get()),
+                                            LodClamp::from_f32(e.lod_max_clamp.get()),
+                                        )),
+                                    }
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(Appended::Objects);
+                        let record = ComputeRecord::BindSamplersWithLod {
+                            first: 0,
+                            entries: &entries,
+                        };
+                        let got = compute(&record, &live, &mut arenas).map(|op| match op {
+                            ComputeOp::BindSamplersWithLod { entries, .. } => Some(entries),
+                            other => panic!("a sampler bind resolved to {other:?}"),
+                        });
+                        (got, want)
+                    }
+                    // The two state arenas, which name no ref at all and so
+                    // can never refuse — but still share the arena discipline.
+                    6 => {
+                        named = Vec::new();
+                        binds = false;
+                        let ports: Vec<WireViewport> = (0..rng.below(4))
+                            .map(|i| wire_viewport(i as f64, 2.0, 3.0, 4.0, 0.0, 1.0))
+                            .collect();
+                        let want = Ok(Appended::Viewports(
+                            ports
+                                .iter()
+                                .map(|p| Viewport {
+                                    origin_x_bits: p.origin_x.get().to_bits(),
+                                    origin_y_bits: p.origin_y.get().to_bits(),
+                                    width_bits: p.width.get().to_bits(),
+                                    height_bits: p.height.get().to_bits(),
+                                    z_near_bits: p.znear.get().to_bits(),
+                                    z_far_bits: p.zfar.get().to_bits(),
+                                })
+                                .collect(),
+                        ));
+                        let record = RenderRecord::SetViewports(&ports);
+                        let got = render(&record, &live, &mut arenas).map(|op| match op {
+                            RenderOp::SetViewports(span) => Some(span),
+                            other => panic!("viewports resolved to {other:?}"),
+                        });
+                        (got, want)
+                    }
+                    7 => {
+                        named = Vec::new();
+                        binds = false;
+                        let rects: Vec<WireScissorRect> = (0..rng.below(4))
+                            .map(|i| WireScissorRect {
+                                x: u64le(i),
+                                y: u64le(i + 1),
+                                width: u64le(16),
+                                height: u64le(32),
+                            })
+                            .collect();
+                        let want = Ok(Appended::Scissors(
+                            rects
+                                .iter()
+                                .map(|s| ScissorRect {
+                                    x: s.x.get(),
+                                    y: s.y.get(),
+                                    width: s.width.get(),
+                                    height: s.height.get(),
+                                })
+                                .collect(),
+                        ));
+                        let record = RenderRecord::SetScissorRects(&rects);
+                        let got = render(&record, &live, &mut arenas).map(|op| match op {
+                            RenderOp::SetScissorRects(span) => Some(span),
+                            other => panic!("scissors resolved to {other:?}"),
+                        });
+                        (got, want)
+                    }
+                    // A single ref in a position with no unbind spelling.
+                    8 => {
+                        named = vec![some_ref(&mut rng)];
+                        binds = false;
+                        let want = shadow_one(&live, named[0]).map(|_| Appended::Nothing);
+                        let record = RenderRecord::SetPipeline {
+                            pipeline_ref: named[0],
+                        };
+                        let got = render(&record, &live, &mut arenas).map(|_| None);
+                        (got, want)
+                    }
+                    // Two refs, so a record can refuse on its second with its
+                    // first already resolved.
+                    9 => {
+                        named = vec![some_ref(&mut rng), some_ref(&mut rng)];
+                        binds = false;
+                        let want = shadow_one(&live, named[0])
+                            .and_then(|_| shadow_one(&live, named[1]))
+                            .map(|_| Appended::Nothing);
+                        let record = BlitRecord::BufferToBuffer {
+                            source_ref: named[0],
+                            source_offset: 0,
+                            dest_ref: named[1],
+                            dest_offset: 0,
+                            size: 64,
+                        };
+                        let got = blit(&record, &live).map(|_| None);
+                        (got, want)
+                    }
+                    // A pass descriptor: ten bind-shaped refs resolved into one
+                    // value, appended to an arena of its own.
+                    _ => {
+                        named = vec![some_ref(&mut rng), some_ref(&mut rng)];
+                        binds = true;
+                        let mut body = pass_body();
+                        body.color[0].prefix.texture_ref = u32le(named[0]);
+                        body.depth.prefix.texture_ref = u32le(named[1]);
+                        let want = shadow_bound(&live, named[0]).and_then(|color0| {
+                            shadow_bound(&live, named[1])
+                                .map(|depth| Appended::Descriptor { color0, depth })
+                        });
+                        let record = RenderRecord::WriteDescriptor { descriptor: &body };
+                        let got = render(&record, &live, &mut arenas).map(|op| match op {
+                            RenderOp::WriteDescriptor { descriptor } => Some(ResourceSpan {
+                                start: descriptor.0,
+                                len: 1,
+                            }),
+                            other => panic!("a descriptor resolved to {other:?}"),
+                        });
+                        (got, want)
+                    }
+                };
+
+                match (got, want) {
+                    (Err(refusal), Err(object_ref)) => {
+                        census.refused += 1;
+                        assert_eq!(
+                            refusal,
+                            ResolveRefusal::UnknownRef { object_ref },
+                            "the refusal must name the guest's first dead ref"
+                        );
+                        // Every ref before the dead one resolved, so a record
+                        // refusing past its first ref had already done work.
+                        let at = named
+                            .iter()
+                            .position(|&v| v == object_ref)
+                            .expect("the refusal names a ref the record carried");
+                        if at > 0 {
+                            census.refused_past_the_first_ref += 1;
+                        }
+                        assert_eq!(
+                            arenas, before,
+                            "a refused record left something in an arena"
+                        );
+                    }
+                    (Ok(span), Ok(appended)) => {
+                        census.resolved += 1;
+                        if binds {
+                            let zeros = named.iter().filter(|&&v| v == 0).count() as u32;
+                            census.unbound_slots += zeros;
+                            if zero_is_live {
+                                census.unbound_over_a_live_zero += zeros;
+                            }
+                        }
+                        apply(&mut shadow, &arenas, span, appended);
+                        assert_eq!(
+                            arenas, shadow,
+                            "the arenas and the shadow disagree after a resolve"
+                        );
+                    }
+                    (got, want) => panic!("resolution said {got:?}, the shadow said {want:?}"),
+                }
+            }
+        }
+
+        for (family, count) in census.families.iter().enumerate() {
+            assert!(*count > 400, "family {family} drove {count} records");
+        }
+        assert!(census.resolved > 2000, "{}", census.resolved);
+        assert!(census.refused > 1000, "{}", census.refused);
+        assert!(
+            census.refused_past_the_first_ref > 200,
+            "nothing refused past its first ref: {}",
+            census.refused_past_the_first_ref
+        );
+        assert!(census.unbound_slots > 200, "{}", census.unbound_slots);
+        assert!(
+            census.unbound_over_a_live_zero > 50,
+            "slot zero was never live while a bind named it: {}",
+            census.unbound_over_a_live_zero
+        );
+    }
+
+    /// Push what the shadow expected, checking that the window resolution
+    /// returned names exactly those entries in the real arena.
+    fn apply(
+        shadow: &mut ExecArenas,
+        arenas: &ExecArenas,
+        span: Option<ResourceSpan>,
+        appended: Appended,
+    ) {
+        /// The window `count` entries would occupy, given what is already
+        /// there. The shadow's whole arithmetic.
+        fn expected(at: usize, count: usize) -> ResourceSpan {
+            ResourceSpan {
+                start: u32::try_from(at).expect("arena fits"),
+                len: u32::try_from(count).expect("list fits"),
+            }
+        }
+        match appended {
+            Appended::Nothing => assert!(span.is_none(), "a record with no list named {span:?}"),
+            Appended::Resources(entries) => {
+                let want = expected(shadow.resources.len(), entries.len());
+                assert_eq!(span, Some(want));
+                assert_eq!(&arenas.resources[want.range()], &entries[..]);
+                shadow.resources.extend(entries);
+            }
+            Appended::Buffers(entries) => {
+                let want = expected(shadow.buffer_bindings.len(), entries.len());
+                assert_eq!(span, Some(want));
+                assert_eq!(&arenas.buffer_bindings[want.range()], &entries[..]);
+                shadow.buffer_bindings.extend(entries);
+            }
+            Appended::Objects(entries) => {
+                let want = expected(shadow.object_bindings.len(), entries.len());
+                assert_eq!(span, Some(want));
+                assert_eq!(&arenas.object_bindings[want.range()], &entries[..]);
+                shadow.object_bindings.extend(entries);
+            }
+            Appended::Viewports(entries) => {
+                let want = expected(shadow.viewports.len(), entries.len());
+                assert_eq!(span, Some(want));
+                assert_eq!(&arenas.viewports[want.range()], &entries[..]);
+                shadow.viewports.extend(entries);
+            }
+            Appended::Scissors(entries) => {
+                let want = expected(shadow.scissors.len(), entries.len());
+                assert_eq!(span, Some(want));
+                assert_eq!(&arenas.scissors[want.range()], &entries[..]);
+                shadow.scissors.extend(entries);
+            }
+            Appended::Descriptor { color0, depth } => {
+                let want = expected(shadow.pass_descriptors.len(), 1);
+                assert_eq!(span, Some(want));
+                let landed = arenas.pass_descriptors[want.start as usize];
+                // The two refs the sweep varies. The rest of the descriptor is
+                // the fixed shape `pass_body` builds and the named tests pin,
+                // so it is carried across rather than restated.
+                assert_eq!(landed.color[0].texture, color0);
+                assert_eq!(landed.depth.texture, depth);
+                shadow.pass_descriptors.push(landed);
+            }
+        }
     }
 }

@@ -4,16 +4,20 @@
 //! Apple host routine reconstructs an `MTLTextureDescriptor` and returns the
 //! device's `MTLSizeAndAlign` as two little-endian `u64`s.
 
-use crate::protocol::endian::{ld32, ld64, st64};
+use crate::protocol::fifo;
 use reims_vgpu_wire::ops::texture as wire;
 
-pub const REQUEST_HEADER_LEN: usize = 24;
-pub const REPLY_LEN: usize = 16;
-/// The embedded record is `heapTextureSizeAndAlignWithDescriptor:`, so its tag
-/// is that selector's opcode and its length is that record's length. Both come
-/// from the crate that derived them rather than being written again here.
-pub const SERIALIZED_TEXTURE_TAG: u32 = wire::OPCODE_HEAP_TEXTURE_SIZE_AND_ALIGN;
-pub const SERIALIZED_TEXTURE_LEN: usize = wire::HEAP_TEXTURE_SIZE_AND_ALIGN_TOTAL_LEN as usize;
+/// The request's framing — its three words, the reply floor, and the embedded
+/// record's tag — belongs to [`crate::protocol::fifo`], which derives each
+/// offset from the one before it. Re-exported rather than restated so the
+/// callers that bound this command keep one set of numbers.
+pub use fifo::{
+    SizeAndAlign, HEAP_TEXTURE_REPLY_LEN as REPLY_LEN,
+    HEAP_TEXTURE_REQUEST_HEADER_LEN as REQUEST_HEADER_LEN,
+    HEAP_TEXTURE_SERIALIZED_LEN as SERIALIZED_TEXTURE_LEN,
+    HEAP_TEXTURE_SERIALIZED_TAG as SERIALIZED_TEXTURE_TAG,
+};
+
 pub const TEXTURE_BODY_LEN: usize = wire::TEXTURE_DESCRIPTOR_LEN;
 /// The same descriptor once the guest's serializer has a texture-descriptor
 /// capability on: eight bytes wider, with `usage` promoted out of the packed
@@ -63,21 +67,6 @@ pub struct Request {
     pub reply_gva: u64,
     pub reply_len: u64,
     pub descriptor: TextureDescriptor,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SizeAndAlign {
-    pub size: u64,
-    pub align: u64,
-}
-
-impl SizeAndAlign {
-    pub fn encode(self) -> [u8; REPLY_LEN] {
-        let mut out = [0u8; REPLY_LEN];
-        st64(&mut out[0..8], self.size);
-        st64(&mut out[8..16], self.align);
-        out
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,38 +120,40 @@ impl crate::observe::Decline for QueryError {
     }
 }
 
+impl From<fifo::HeapTextureRefusal> for QueryError {
+    /// The framing refusals, named in this vocabulary.
+    ///
+    /// The mapping is total and one-to-one; it exists only because the reasons
+    /// this command reports under are `heap_query_`-prefixed at crate scope
+    /// (see [`QueryError::slug`]) while the framing that produces them is the
+    /// protocol's. `HeapTextureRefusal::slug` states the same four slugs, so a
+    /// caller on either side of the boundary logs one name for one fact.
+    fn from(refusal: fifo::HeapTextureRefusal) -> Self {
+        match refusal {
+            fifo::HeapTextureRefusal::Short(_) => Self::ShortPayload,
+            fifo::HeapTextureRefusal::ReplyDestination { .. } => Self::BadReplyLength,
+            fifo::HeapTextureRefusal::SerializerLength { .. } => Self::BadSerializerLength,
+            fifo::HeapTextureRefusal::SerializerTag { .. } => Self::UnknownSerializerTag,
+        }
+    }
+}
+
+/// Decode a `CmdHeapTextureSizeAndAlign` request.
+///
+/// The framing is the protocol's; what is left here is turning the embedded
+/// body into fields, which is this device's reading of the descriptor.
+///
+/// # Errors
+///
+/// [`QueryError`] for a request whose framing does not hold, or a body this
+/// device cannot read.
 pub fn decode_request(payload: &[u8]) -> Result<Request, QueryError> {
-    if payload.len() < REQUEST_HEADER_LEN {
-        return Err(QueryError::ShortPayload);
-    }
-    let task_id = ld32(&payload[0..]);
-    let reply_gva = ld64(&payload[4..]);
-    let reply_len = ld64(&payload[12..]);
-    if reply_gva == 0 || reply_len < REPLY_LEN as u64 {
-        return Err(QueryError::BadReplyLength);
-    }
-    let serializer_len = ld32(&payload[20..]) as usize;
-    if serializer_len != SERIALIZED_TEXTURE_LEN
-        || payload.len() != REQUEST_HEADER_LEN + serializer_len
-    {
-        return Err(QueryError::BadSerializerLength);
-    }
-    let serialized = &payload[REQUEST_HEADER_LEN..];
-    if ld32(serialized) != SERIALIZED_TEXTURE_TAG {
-        return Err(QueryError::UnknownSerializerTag);
-    }
-    if ld32(&serialized[4..]) as usize != SERIALIZED_TEXTURE_LEN
-        || serialized.len() != SERIALIZED_TEXTURE_LEN
-    {
-        return Err(QueryError::BadDescriptorLength);
-    }
-    let body = &serialized[8..];
-    let descriptor = decode_serialized_texture_descriptor(body)?;
+    let request = fifo::decode_heap_texture_query(payload)?;
     Ok(Request {
-        task_id,
-        reply_gva,
-        reply_len,
-        descriptor,
+        task_id: request.raw_task,
+        reply_gva: request.reply_gva,
+        reply_len: request.reply_len,
+        descriptor: decode_serialized_texture_descriptor(request.descriptor)?,
     })
 }
 
@@ -303,17 +294,6 @@ mod tests {
             decode_request(&payload),
             Err(QueryError::UnknownSerializerTag)
         );
-    }
-
-    #[test]
-    fn encodes_two_u64_reply_fields() {
-        let reply = SizeAndAlign {
-            size: 0x78000,
-            align: 0x80,
-        }
-        .encode();
-        assert_eq!(ld64(&reply[0..]), 0x78000);
-        assert_eq!(ld64(&reply[8..]), 0x80);
     }
 
     /// The wire decode above, carried through to the host driver.

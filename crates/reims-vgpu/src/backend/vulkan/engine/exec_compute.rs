@@ -539,12 +539,7 @@ pub(crate) unsafe fn execute_compute_inner(
     // Storage buffers: host-visible staging used as SSBOs (same as draw path).
     let mut storage_slots = Vec::new();
     for resource in &req.storage_buffers {
-        let slot = pools.acquire_staging(
-            ctx,
-            resource.bytes.len() as u64,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            counters,
-        )?;
+        let slot = pools.acquire_staging(ctx, resource.bytes.len() as u64, counters)?;
         pools.write_staging(ctx, &slot, &resource.bytes)?;
         storage_slots.push((
             resource.binding,
@@ -712,12 +707,7 @@ pub(crate) unsafe fn execute_compute_inner(
             let ComputeSampledSource::Bytes(bytes) = &resource.source else {
                 unreachable!("the resident and multisample sources are handled above")
             };
-            let st = pools.acquire_staging(
-                ctx,
-                bytes.len() as u64,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                counters,
-            )?;
+            let st = pools.acquire_staging(ctx, bytes.len() as u64, counters)?;
             pools.write_staging(ctx, &st, bytes)?;
             counters.note_compute_sampled_upload(bytes.len() as u64);
             (Some(st), None)
@@ -793,12 +783,7 @@ pub(crate) unsafe fn execute_compute_inner(
         let st = if generation_match {
             None
         } else {
-            let staging = pools.acquire_staging(
-                ctx,
-                resource.bytes.len() as u64,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                counters,
-            )?;
+            let staging = pools.acquire_staging(ctx, resource.bytes.len() as u64, counters)?;
             pools.write_staging(ctx, &staging, &resource.bytes)?;
             counters.note_compute_storage_seed_upload(resource.bytes.len() as u64);
             Some(staging)

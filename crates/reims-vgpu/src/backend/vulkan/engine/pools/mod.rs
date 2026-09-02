@@ -847,6 +847,59 @@ pub(crate) struct CbGraphicsState {
     scissors: Vec<vk::Rect2D>,
     /// The front/back references last handed to `vkCmdSetStencilReference`.
     stencil: Option<(u32, u32)>,
+    /// Whether `vkCmdSetDepthBias` has been recorded into this command buffer.
+    ///
+    /// Not a value, because there is only one this device asks for: the
+    /// pipeline always enables biasing — Metal has no way to say a pipeline
+    /// cannot be biased — and the guest's own bias is not yet translated, so
+    /// the three values are always zero. What must not happen is the state
+    /// going *unset*, which is undefined for a pipeline that declares it
+    /// dynamic.
+    depth_bias_set: bool,
+    /// The width last handed to `vkCmdSetLineWidth`, by bit pattern.
+    ///
+    /// A value and not a flag, unlike [`Self::depth_bias_set`] beside it: the
+    /// bias this device asks for is always zero, and the width is the guest's
+    /// wherever the draw rasterizes lines and the default wherever it does
+    /// not. Held by bits for the reason [`Self::blend_constants`] is.
+    ///
+    /// `VK_DYNAMIC_STATE_LINE_WIDTH` is Vulkan 1.0 core, so every pipeline
+    /// declares it and every draw must set it — a pipeline that declares a
+    /// state and never receives it draws undefined.
+    line_width: Option<u32>,
+    /// The rasterization members last handed to `vkCmdSetCullModeEXT`,
+    /// `vkCmdSetFrontFaceEXT`, `vkCmdSetPolygonModeEXT` and
+    /// `vkCmdSetDepthClampEnableEXT`.
+    ///
+    /// The whole `DynamicRaster` rather than four fields, so the held value is
+    /// exactly what was recorded and cannot describe half a set. `None` is a
+    /// command buffer nothing has been recorded into yet; on a host that bakes
+    /// all four members the recorded value is all-`None` and this holds from
+    /// the second draw onwards, which costs four comparisons and no calls.
+    raster: Option<reims_vgpu_vulkan::raster::DynamicRaster>,
+    /// The primitive topology last handed to `vkCmdSetPrimitiveTopology`.
+    ///
+    /// `Some(None)` is a host that bakes the topology and recorded nothing;
+    /// `None` is a command buffer no draw has reached yet. Two states rather
+    /// than one because "nothing was asked" and "nothing has happened" are
+    /// different, and collapsing them would re-record on the first draw of
+    /// every command buffer on a baking host.
+    topology: Option<Option<vk::PrimitiveTopology>>,
+    /// The depth-stencil state last handed to the eight `vkCmdSet*` commands
+    /// that carry it, on a host that supplies it per draw.
+    ///
+    /// The whole state rather than a field per command, so what is held is
+    /// exactly what was recorded and cannot describe half of one
+    /// `MTLDepthStencilState`. `Some(None)` is a host that bakes it and
+    /// recorded nothing; `None` is a command buffer no draw has reached yet.
+    depth_stencil: Option<Option<reims_vgpu_vulkan::depth_stencil::DynamicDepthStencil>>,
+    /// The four floats last handed to `vkCmdSetBlendConstants`, by bit pattern.
+    ///
+    /// Compared as bits rather than as floats so the cache is a plain equality
+    /// on what was recorded. `f32` equality would re-record on every draw for a
+    /// guest that set a NaN component — which cannot reach here, because the
+    /// draw is refused for it — and would call two distinct zeroes equal.
+    blend_constants: Option<[u32; 4]>,
     /// The push-descriptor layout and exact descriptor values last recorded.
     push_layout: Option<vk::PipelineLayout>,
     push_bindings: Vec<PushDescriptorBinding>,
@@ -858,6 +911,61 @@ pub(crate) struct CbGraphicsState {
     vertex_scratch: Vec<VertexBufferBinding>,
     vertex_buffers: Vec<vk::Buffer>,
     vertex_offsets: Vec<vk::DeviceSize>,
+}
+
+impl CbGraphicsState {
+    /// Forget every value recorded into the command buffer this state
+    /// describes, leaving only [`Self::cb`] and the scratch buffers.
+    ///
+    /// One method rather than an assignment list at each site, because there
+    /// are two sites — [`ResourcePools::forget_pass_echo`] and the
+    /// recycled-handle branch of `bind_graphics_pipeline` — and they are
+    /// the *same* claim: nothing recorded into the previous command buffer is
+    /// known any more. A field added to this struct and remembered at only one
+    /// of them is a draw that skips a real `vkCmdSet*` on a handle whose
+    /// `vkBeginCommandBuffer` made that state undefined, which is wrong
+    /// rendering reported nowhere.
+    ///
+    /// The scratch vectors are not state: they are rebuilt from scratch by the
+    /// draw that asks for them, and clearing them here would say they carried
+    /// something.
+    fn forget_recorded(&mut self) {
+        let Self {
+            cb: _,
+            pipeline,
+            pipeline_layout,
+            viewports,
+            scissors,
+            stencil,
+            depth_bias_set,
+            line_width,
+            raster,
+            topology,
+            depth_stencil,
+            blend_constants,
+            push_layout,
+            push_bindings,
+            vp_scratch: _,
+            sc_scratch: _,
+            push_scratch: _,
+            vertex_scratch: _,
+            vertex_buffers: _,
+            vertex_offsets: _,
+        } = self;
+        *pipeline = None;
+        *pipeline_layout = None;
+        viewports.clear();
+        scissors.clear();
+        *stencil = None;
+        *depth_bias_set = false;
+        *line_width = None;
+        *raster = None;
+        *topology = None;
+        *depth_stencil = None;
+        *blend_constants = None;
+        *push_layout = None;
+        push_bindings.clear();
+    }
 }
 
 /// One normalized fixed-function vertex-buffer binding.
@@ -3791,7 +3899,6 @@ pub(super) unsafe fn invalidate_slot_for_read(
 mod staging_mapping_tests {
     use super::{readback_leases_outstanding, return_readback_lease, DeviceContext, ResourcePools};
     use crate::backend::vulkan::engine::counters::EngineCounters;
-    use ash::vk;
 
     /// A staging slot carries its own host mapping, and keeps it across recycle.
     ///
@@ -3815,9 +3922,8 @@ mod staging_mapping_tests {
         };
         let counters = EngineCounters::default();
         let mut pools = ResourcePools::new();
-        let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
 
-        let first = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }
+        let first = unsafe { pools.acquire_staging(&ctx, 4096, &counters) }
             .expect("a 4 KiB staging slot must be available");
         assert_ne!(first.mapped, 0, "a fresh staging slot must be mapped");
 
@@ -3828,7 +3934,7 @@ mod staging_mapping_tests {
         assert_eq!(seen, &payload[..], "the mapping does not observe the write");
 
         pools.recycle_staging();
-        let again = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }
+        let again = unsafe { pools.acquire_staging(&ctx, 4096, &counters) }
             .expect("the recycled slot must come back");
         assert_eq!(again.buffer, first.buffer, "expected the recycled slot");
         assert_eq!(
@@ -3867,7 +3973,6 @@ mod staging_mapping_tests {
         };
         let counters = EngineCounters::default();
         let mut pools = ResourcePools::new();
-        let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
 
         // Two passes over eleven distinct buckets from 64 B to 64 KiB. The
         // second pass re-requests each bucket while the first pass's slot is
@@ -3877,8 +3982,7 @@ mod staging_mapping_tests {
         for _ in 0..2 {
             let mut size = 64u64;
             while size <= 64 << 10 {
-                unsafe { pools.acquire_staging(&ctx, size, usage, &counters) }
-                    .expect("staging slot");
+                unsafe { pools.acquire_staging(&ctx, size, &counters) }.expect("staging slot");
                 acquires += 1;
                 size <<= 1;
             }
@@ -3924,10 +4028,9 @@ mod staging_mapping_tests {
         };
         let counters = EngineCounters::default();
         let mut pools = ResourcePools::new();
-        let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
 
-        let a = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }.expect("slot a");
-        let b = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }.expect("slot b");
+        let a = unsafe { pools.acquire_staging(&ctx, 4096, &counters) }.expect("slot a");
+        let b = unsafe { pools.acquire_staging(&ctx, 4096, &counters) }.expect("slot b");
         assert_ne!(a.buffer, b.buffer, "two live acquires must be two buffers");
 
         let pa: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();

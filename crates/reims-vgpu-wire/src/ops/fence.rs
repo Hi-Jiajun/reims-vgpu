@@ -14,7 +14,7 @@
 //! selector has no argument but the allocator, so the shortest record this
 //! serializer emits is exactly a ref, and any future build that made it longer
 //! would be carrying something a guest could set and this crate could not see.
-//! [`crate::ops::fence::tests::the_record_is_a_header_and_a_ref_and_nothing_else`]
+//! `tests::the_record_is_a_header_and_a_ref_and_nothing_else`
 //! is what would say so.
 //!
 //! # What reads it today

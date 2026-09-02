@@ -7,14 +7,20 @@ use crate::backend::{Backend as _, RetainedObject};
 use crate::model::*;
 use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, UnimplementedCommand};
 use crate::observe::Emit;
-use crate::protocol::endian::{ld16, ld32, ld64, st16, st32};
+use crate::protocol::endian::{ld16, ld32, st16, st32};
+use crate::protocol::fifo::{decode_device_info, DeviceInfoForm};
+use crate::protocol::fifo::{
+    display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
+    DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
+};
+use crate::protocol::info_reply::{self, ReplyBounds};
 use crate::protocol::iosurface_pages::{
     MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP, MAPPER_REQUEST_MAPPING_ID, MAPPER_REQUEST_TYPE,
     MAPPER_REQUEST_UNMAP,
 };
-use crate::runtime::decode::fifo::{
-    display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
-    DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
+use crate::protocol::packets::Channel as WireChannel;
+use crate::protocol::present::{
+    self, trailer as present_trailer, PresentForm, Trailer as PresentTrailer,
 };
 use crate::runtime::gpa_map;
 use crate::runtime::heap_query::QueryError;
@@ -263,9 +269,13 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 ///
 /// Other kinds remain fail-visible until this device owns a corresponding
 /// per-kind object registry. Their counters say which contract gap is active.
-fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8], packet: &Packet) {
-    let task_id = ld32(&payload[0..]);
-    let record = &payload[4..];
+fn apply_delete_object(
+    state: &mut DeviceState,
+    channel_id: u32,
+    command: &crate::protocol::fifo::DeleteObjectCommand<'_>,
+    packet: &Packet,
+) {
+    let crate::protocol::fifo::DeleteObjectCommand { task_id, record } = *command;
     let Ok(op) = reims_vgpu_wire::op::op(record, 0) else {
         Emit::decline(
             "child_delete_object",
@@ -343,17 +353,6 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
     );
 }
 
-fn packet_short(op: &'static str, channel: Option<u32>, have: usize, need: usize) -> bool {
-    if have >= need {
-        return false;
-    }
-    crate::observe::fail(format!(
-        "packet_short reason={op}_short site={} plen={have} need={need}",
-        packet_site(channel)
-    ));
-    true
-}
-
 /// Which FIFO a packet arrived on, for a log line.
 ///
 /// One spelling, because several opcodes are carried on **both** the root FIFO
@@ -366,6 +365,19 @@ fn packet_site(channel: Option<u32>) -> String {
         Some(ch) => format!("ch{ch}"),
         None => "root".to_string(),
     }
+}
+
+/// Forget everything cached about a child channel whose lifetime just moved.
+///
+/// One function because both ends of the lifetime owe it. An open must forget
+/// as much as a free: the number is reused, and a hold or a cached ring left
+/// over from the previous occupant is the new channel inheriting a decision
+/// nothing made about it.
+fn forget_child_channel(state: &mut DeviceState, channel: u32, bit: u32) {
+    state.translation_deferred_mask &= !bit;
+    state.translation_order_hold_mask &= !bit;
+    state.present_translation_hold_mask &= !bit;
+    state.child_rings[channel as usize] = Default::default();
 }
 
 /// `CmdDeleteTask` (0x20), from either FIFO.
@@ -394,16 +406,15 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
     // A short SETUP_SHARED_STATE drops display registration:
     // shared_gpa/index never latch, so the display NEVER onlines and the
     // boot wedges on a blank/console frame. The loudest of this class.
-    if packet_short(
-        "setup_shared_state",
-        channel,
-        payload.len(),
-        CHILD_SHARED_STATE_LEN,
-    ) {
-        return;
-    }
-    let index = ld32(&payload[CHILD_SHARED_STATE_INDEX..]);
-    let pfn = ld32(&payload[CHILD_SHARED_STATE_PFN..]);
+    let page = match crate::protocol::fifo::decode_shared_state(payload) {
+        Ok(page) => page,
+        Err(short) => {
+            note_short_payload("setup_shared_state", channel, &short);
+            return;
+        }
+    };
+    let index = page.index;
+    let pfn = page.pfn;
     // reinit=1 means the guest tears down + re-registers the display
     // shared page while it was already ONLINE — the AppleParavirtDisplayPipe
     // setupSharedState/teardownSharedState re-init that makes WindowServer
@@ -430,10 +441,15 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
 }
 
 fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
-    let task_id = if payload.len() >= 4 {
-        ld32(&payload[0..])
-    } else {
-        0
+    // A payload too short to hold an id used to default to `0`, which is the
+    // **kernel task** — so a truncated delete retired the resolutions of the
+    // one slot whose teardown costs the most, and did it silently.
+    let task_id = match crate::protocol::fifo::decode_delete_task(payload) {
+        Ok(task_id) => task_id,
+        Err(short) => {
+            note_short_payload("delete_task", channel, &short);
+            return;
+        }
     };
     // The task's GVA space goes with it, so every bind resolution keyed on it
     // names bytes that are no longer this task's. Here rather than at the two
@@ -482,17 +498,17 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
 /// lifecycle packet the guest re-sends, and the reading wanted is which distinct
 /// triples a boot produces, not how often.
 fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
-    if packet_short(
-        "set_object_list",
-        channel,
-        payload.len(),
-        SET_OBJECT_LIST_LEN,
-    ) {
-        return;
-    }
-    let task_id = ld32(&payload[SET_OBJECT_LIST_TASK_ID..]);
-    let pfn = ld32(&payload[SET_OBJECT_LIST_PFN..]);
-    let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
+    let crate::protocol::fifo::SetObjectListCommand {
+        task_id,
+        pfn,
+        count,
+    } = match crate::protocol::fifo::decode_set_object_list(payload) {
+        Ok(command) => command,
+        Err(short) => {
+            note_short_payload("set_object_list", channel, &short);
+            return;
+        }
+    };
     // A new object list changes the construction input for references this
     // device has not constructed yet. Exact-window buffer resolutions are not
     // object states and therefore retire here. Typed objects already
@@ -525,19 +541,22 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     payload: &[u8],
     channel: Option<u32>,
 ) {
-    if packet_short("define_task2", channel, payload.len(), DEFINE_TASK_LEN) {
-        return;
-    }
-    let raw_id = ld32(&payload[DEFINE_TASK_RAW_ID..]);
-    let length = define_task_length(payload);
-    let dir = ld32(&payload[DEFINE_TASK_DIRECTORY_PFN..]);
-    // `raw_id` is `(task_id << 1) | is_kernel_task`: the guest's kernel-task and
-    // user-task registrations differ only in that low bit, and the kernel task's
-    // own id is 0, so `0x1` is the kernel task and not user task 1. Both halves
-    // are decoded — the id to index the slot, the flag so the log says which
-    // class registered rather than leaving the bit unaccounted for.
-    let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
-    let kernel_task = raw_id & 1 != 0;
+    // The floor, the four offsets and the split of the first word are the
+    // command's owner's. Both halves of that word are decoded — the id to index
+    // the slot, the class bit so the log says which of the two registered
+    // rather than leaving it unaccounted for.
+    let command = match crate::protocol::fifo::decode_define_task(payload) {
+        Ok(command) => command,
+        Err(short) => {
+            note_short_payload("define_task2", channel, &short);
+            return;
+        }
+    };
+    let raw_id = command.id.to_raw();
+    let length = command.length;
+    let dir = command.directory_pfn;
+    let task_id = command.id.task_id;
+    let kernel_task = command.id.kernel;
     // The page-table root is replaced here, so every GVA this task resolved
     // through the old one may translate elsewhere now. Keyed on the shifted
     // `task_id`, not `raw_id` — the registry is keyed the way the draw path
@@ -563,77 +582,6 @@ fn apply_define_task2<H: HostMemory + HostOps>(
         kernel_task as u8,
         state.page_shift
     ));
-}
-
-/// The task's address-space length from a `DefineTask2` payload.
-///
-/// The field is 64 bits wide, and the payload layout says so: it sits at
-/// `DEFINE_TASK_LENGTH` (0x04) and the next field, `DEFINE_TASK_DIRECTORY_PFN`,
-/// is at 0x0c — eight bytes later. Callers must have already checked
-/// `payload.len() >= DEFINE_TASK_LEN` (16), which covers the whole field.
-///
-/// The root and child arms decode the same wire field, and read it the same
-/// way here. The child arm used to take only the low 32 bits, which truncated
-/// the length of any task spanning 4 GiB or more.
-fn define_task_length(payload: &[u8]) -> u64 {
-    ld64(&payload[DEFINE_TASK_LENGTH..])
-}
-
-/// Trailer size `submitTransaction` appends after serializing the transaction's
-/// resource list: `[pipe][task][surface][gamma…]` for the gamma command,
-/// `[pipe][surface][task]` otherwise.
-fn display_txn_trailer_len(opcode: u16) -> usize {
-    if opcode == CHILD_OP_DISPLAY_TRANSACTION3 {
-        0x24
-    } else {
-        0x0c
-    }
-}
-
-/// Word slots of the surface id and the task field within the trailer, keyed on
-/// the command that emitted it.
-///
-/// These are three different FIFO commands, not one shape with variations, so
-/// nothing here may be assumed from one opcode to another:
-///
-/// - op6 `CmdDisplayTransaction2_DEPRECATED` — `[pipe][surface][task]`.
-/// - op7 `CmdDisplayTransaction3` — `[pipe][task][surface][gamma…]`; the first
-///   two words are swapped relative to op6, and the gamma table follows. The two
-///   are separate commands with separate handlers, not one command with a
-///   variant flag, which is why the trailer differs at all.
-/// - op8 `CmdDisplaySwapMapping` — `[display][_][mapping]`. This one names a
-///   single mapping instead of serializing a transaction, so its surface word
-///   is `DISPLAY_SWAP_MAPPING` (0x08), *not* op6's 0x04, and it has no known
-///   task field at all. Reading it at op6's slot would return the unidentified
-///   word between the display index and the mapping.
-///
-/// Slots are `regs.rs`'s `PRESENT_*` / `DISPLAY_SWAP_*` byte offsets divided by
-/// four; this is the only place either reading of those offsets is spelled out,
-/// so the present path and the payload census cannot decode the field
-/// differently.
-fn display_txn_trailer_slots(opcode: u16) -> (usize, Option<usize>) {
-    match opcode {
-        CHILD_OP_DISPLAY_TRANSACTION3 => (DISPLAY_TRANSACTION3_SURFACE_ID / 4, Some(1)),
-        CHILD_OP_DISPLAY_SWAP => (DISPLAY_SWAP_MAPPING / 4, None),
-        _ => (DISPLAY_TRANSACTION2_SURFACE_ID / 4, Some(2)),
-    }
-}
-
-/// The surface id a display-present payload names, read from offset zero.
-///
-/// The slot is the one `display_txn_trailer_slots` gives for the emitting
-/// command, so this head-relative reading and the tail-relative reading the
-/// census takes cannot drift apart.
-///
-/// `None` is a payload too short to hold the command's own trailer. That loses
-/// the present outright, so callers must name it rather than presenting mapping
-/// zero and completing the packet in silence.
-fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
-    let trailer = display_txn_trailer_len(opcode);
-    (payload.len() >= trailer).then(|| {
-        let off = display_txn_trailer_slots(opcode).0 * 4;
-        ld32(&payload[off..])
-    })
 }
 
 /// Alarm for a display-transaction payload longer than its command declares.
@@ -743,7 +691,7 @@ fn note_resource_list_decode_fail(
     op: &'static str,
     opcode: u16,
     channel_id: u32,
-    error: crate::runtime::decode::fifo::ResourceListDecodeError,
+    error: crate::protocol::fifo::ResourceListDecodeError,
 ) {
     crate::observe::Emit::decline("map_family", &error)
         .field("op", op)
@@ -752,12 +700,50 @@ fn note_resource_list_decode_fail(
         .fail_once(u64::from(opcode));
 }
 
-fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &Packet) {
+/// A fixed-size FIFO payload the guest sent short, reported the way
+/// [`packet_short`] reports one.
+///
+/// **The same line, deliberately.** Twelve arms report a short payload and ten
+/// of them still do it by calling `packet_short` with their own literal floor;
+/// a reader greps `reason=<command>_short`, and two arms emitting a different
+/// slug because their floor moved into a decoder would be a log split down a
+/// line nobody drew. What changed for those arms is which code owns the bound,
+/// not what the guest's operator sees.
+///
+/// (The `{op}_short` slugs are *computed*, so `reims-vgpu-observe`'s registry
+/// cannot see any of the twelve and the crate-wide "no two checks share a slug"
+/// claim excludes them. Fixing that is a change to all twelve at once, not to
+/// the two that happen to have decoders.)
+/// Report a payload too short for the command it claims to be.
+///
+/// Takes no opcode. It used to, and no arm ever read it: the reason stem `op`
+/// already names the command, and an unused parameter is one every call site
+/// has to fill with something a compiler cannot check — three of them would
+/// have had to invent a zero.
+fn note_short_payload(
+    op: &'static str,
+    channel: Option<u32>,
+    short: &crate::protocol::fifo::ShortPayload,
+) {
+    crate::observe::fail(format!(
+        "packet_short reason={op}_short site={} plen={} need={}",
+        packet_site(channel),
+        short.plen,
+        short.need
+    ));
+}
+
+fn note_display_txn_payload(
+    state: &mut DeviceState,
+    channel_id: u32,
+    packet: &Packet,
+    decoded: &PresentTrailer,
+) {
     let plen = packet.payload.len();
-    let trailer = display_txn_trailer_len(packet.opcode);
-    if plen <= trailer {
+    if decoded.undecoded_tail == 0 {
         return;
     }
+    let trailer = decoded.form.trailer_len();
     crate::runtime::drain::note_store_route("display_txn_payload_overlong");
     // Latched per (opcode, length): a guest that grew this command grew it for
     // every frame, and the thousandth line says nothing the first did not.
@@ -1829,12 +1815,20 @@ pub fn write_stamp<H: HostMemory + HostOps>(
 /// answering too little is a zero it also acts on.
 fn reply_device_info<H: HostMemory + HostOps>(
     host: &mut H,
-    key_table_len: u32,
-    count: u32,
-    reply_pfn: u32,
+    request: &crate::protocol::fifo::DeviceInfoRequest,
     page_shift: u32,
     version: u32,
 ) -> Result<(), MemError> {
+    // The two bounds are the request's, derived once by the form that knows
+    // which of them it carries. The two arms that reach here used to spell the
+    // ceiling-less reading twice — `unwrap_or(u32::MAX)` at one, a bare
+    // `u32::MAX` at the other — for a field only one of the forms has.
+    let bounds = request.reply_bounds();
+    let ReplyBounds {
+        key_table_len,
+        count,
+    } = bounds;
+    let reply_pfn = request.reply_pfn;
     if reply_pfn == 0 {
         return Ok(());
     }
@@ -1863,7 +1857,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
     let caps: Vec<(u32, u32)> = served
         .iter()
         .copied()
-        .filter(|&(key, _)| key < key_table_len)
+        .filter(|&(key, _)| bounds.parses(key))
         .collect();
     let above_ceiling = served.len() - caps.len();
     // The mirror of `above_ceiling`, and the direction that can cost guest work.
@@ -1954,10 +1948,17 @@ fn reply_device_info<H: HostMemory + HostOps>(
         u8::from(limits.native_fp16),
         derived.join(" ")
     ));
-    let n = (caps.len() as u32).min(count).min(max_pairs);
-    // When guest asks for more than one page of pairs, still write at most a
-    // page of caps + optional sentinel only if room remains.
-    let write_sentinel = n < count && n.saturating_add(1) <= max_pairs;
+    // The reply is built once, in the layout's owner, and written once.
+    //
+    // Three bounds decide it — the guest's parse ceiling, the pair count it
+    // sent, and the page the reply lands in — and this arm used to apply them
+    // as its own `min` chain while the sibling compute-info reply applied two
+    // of the three as its own loop conditions. The staging page is the
+    // destination bound made explicit: a buffer exactly as large as the page
+    // cannot overrun it, so there is no arithmetic left that could.
+    let mut reply = vec![0u8; page_size];
+    let written = info_reply::encode(bounds, &served, &mut reply);
+    let n = written.pairs;
     if count > max_pairs {
         crate::observe::fail(format!(
             "device_info cap reason=reply_page count={count} max_pairs={max_pairs} page={page_size:#x}"
@@ -1971,34 +1972,17 @@ fn reply_device_info<H: HostMemory + HostOps>(
     // never emits this: the guest's buffer is a whole page, 512 pairs against a
     // table of a few dozen. A firing *is* the bug, which is the only reason a
     // line that has never been seen is worth carrying.
-    if (n as usize) < caps.len() {
+    if written.dropped > 0 {
         let dropped: Vec<u32> = caps[n as usize..].iter().map(|&(key, _)| key).collect();
         crate::observe::fail(format!(
             "device_info truncated reason=reply_pairs_exhausted key_table_len={key_table_len} count={count} max_pairs={max_pairs} wrote={n} have={} dropped={dropped:?}",
             caps.len()
         ));
     }
-    for i in 0..n {
-        let (key, value) = caps[i as usize];
-        let mut pair = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
-        st32(&mut pair[0..4], key);
-        st32(&mut pair[4..8], value);
-        gpa_map::write_bytes(
-            host,
-            gpa + (i as u64) * DEVICE_INFO_REPLY_PAIR_LEN as u64,
-            &pair,
-            page_size,
-        )?;
-    }
-    if write_sentinel {
-        let sentinel = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
-        gpa_map::write_bytes(
-            host,
-            gpa + (n as u64) * DEVICE_INFO_REPLY_PAIR_LEN as u64,
-            &sentinel,
-            page_size,
-        )?;
-    }
+    // `written.bytes` covers the pairs and the terminator if one was needed, so
+    // nothing past the reply is disturbed — the same span the pair-at-a-time
+    // loop used to cover, in one write instead of one per key.
+    gpa_map::write_bytes(host, gpa, &reply[..written.bytes], page_size)?;
     Ok(())
 }
 
@@ -2042,6 +2026,13 @@ const COMPUTE_INFO_KEY_SUPPORTS_ICB: u32 = 2;
 
 const COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
 const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
+
+/// How many keys [`compute_info_caps`] answers.
+///
+/// Named because it sizes the reply's staging buffer, and a buffer sized one
+/// short of the table would silently drop the last answer rather than fail to
+/// compile.
+const COMPUTE_INFO_ANSWERS: usize = 3;
 
 /// What this host answers for a compute pipeline's threadgroup limits.
 ///
@@ -2088,7 +2079,7 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// open question rather than a known cost. What is established is that the 0 is
 /// wrong for any kernel that declares threadgroup memory, and that only
 /// reflection can make it right.
-fn compute_info_caps() -> [(u32, u32); 3] {
+fn compute_info_caps() -> [(u32, u32); COMPUTE_INFO_ANSWERS] {
     let (max_total_threads, thread_execution_width) =
         crate::backend::selected().compute_threadgroup_limits();
     [
@@ -2107,16 +2098,15 @@ fn compute_info_caps() -> [(u32, u32); 3] {
 fn reply_compute_info<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
-    payload: &[u8],
+    request: &crate::protocol::fifo::ComputeInfoRequest,
 ) -> bool {
-    if payload.len() < 24 {
-        return false;
-    }
-    let raw_task = ld32(&payload[0..]);
-    let pipeline_ref = ld32(&payload[4..]);
-    let key_table_len = ld32(&payload[8..]);
-    let count = ld32(&payload[12..]);
-    let reply_gva = u64::from_le_bytes(payload[16..24].try_into().unwrap_or([0; 8]));
+    let crate::protocol::fifo::ComputeInfoRequest {
+        raw_task,
+        pipeline_ref,
+        key_table_len,
+        pair_capacity: count,
+        reply_gva,
+    } = *request;
     if reply_gva == 0 || count == 0 {
         crate::observe::fail(format!(
             "get_compute_info empty task={raw_task} pipe={pipeline_ref} key_table_len={key_table_len} count={count} gva={reply_gva:#x}"
@@ -2131,55 +2121,55 @@ fn reply_compute_info<H: HostMemory + HostOps>(
         ));
         return false;
     };
-    let mut wrote = 0u32;
-    for (key, value) in compute_info_caps() {
-        // Exclusive, like its device-info twin: the guest writes
-        // `highest_key_it_parses + 1` here, and its parser's own table stops one
-        // below. It sends 5 against a table whose arms are keys 1..=4, so an
-        // inclusive read would spend a pair slot on a key 5 that guest discards.
-        // See `DEVICE_INFO_TAHOE_KEY_TABLE_LEN`, which carries the argument for both.
-        if key >= key_table_len {
-            continue;
-        }
-        if wrote >= count {
-            break;
-        }
-        let mut pair = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
-        st32(&mut pair[0..4], key);
-        st32(&mut pair[4..8], value);
-        let off = (wrote as u64) * DEVICE_INFO_REPLY_PAIR_LEN as u64;
-        if crate::runtime::gva_mem::write_task_gva_product_within(
-            state,
-            host,
-            task_id,
-            reply_gva + off,
-            &pair,
-            // One reply pair at a fixed offset, not a row loop: the span is
-            // re-derived from `wrote` rather than from a destination that can
-            // move, and the packet being retired is what authorises it.
-            None,
-        )
-        .is_err()
-        {
-            crate::observe::fail(format!(
-                "get_compute_info write_fail task={task_id} gva={reply_gva:#x} wrote={wrote}"
-            ));
-            return false;
-        }
-        wrote += 1;
+    let served = compute_info_caps();
+    // The staging buffer is every answer plus the terminator, and that is the
+    // only bound available here.
+    //
+    // Unlike its device-info twin this request carries **no reply length**: the
+    // guest sends a pair count and an address, and nothing on the wire says how
+    // large the buffer at that address is. So the destination cannot bound the
+    // encode, and `count` — a guest word — must not: sizing the staging buffer
+    // from it would let a request asking for 2^32 pairs allocate 32 GiB. What
+    // this device could ever write is `served.len()` pairs and one stop word,
+    // so that is the buffer, and the encoder's own capacity rule turns the
+    // guest's count into the terminator decision it already owns.
+    let mut reply = [0u8; (COMPUTE_INFO_ANSWERS + 1) * info_reply::PAIR_LEN];
+    let bounds = request.reply_bounds();
+    let written = info_reply::encode(bounds, &served, &mut reply);
+    let wrote = written.pairs;
+    // An answer this device has and the guest's own count could not carry. It
+    // cannot fire on a healthy guest — the count a live guest sends is a page
+    // of pair slots against three answers — so a firing is the request being
+    // wrong, and the three keys are named because each one is a compute limit
+    // the guest then sizes dispatches without.
+    if written.dropped > 0 {
+        let dropped: Vec<u32> = served
+            .iter()
+            .filter(|&&(key, _)| bounds.parses(key))
+            .map(|&(key, _)| key)
+            .skip(wrote as usize)
+            .collect();
+        crate::observe::fail(format!(
+            "get_compute_info truncated reason=reply_pairs_exhausted task={task_id} pipe={pipeline_ref} key_table_len={key_table_len} count={count} wrote={wrote} dropped={dropped:?}"
+        ));
     }
-    if wrote < count {
-        let sentinel = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
-        let off = (wrote as u64) * DEVICE_INFO_REPLY_PAIR_LEN as u64;
-        let _ = crate::runtime::gva_mem::write_task_gva_product_within(
-            state,
-            host,
-            task_id,
-            reply_gva + off,
-            &sentinel,
-            // The terminating pair of the same reply, on the same authority.
-            None,
-        );
+    if crate::runtime::gva_mem::write_task_gva_product_within(
+        state,
+        host,
+        task_id,
+        reply_gva,
+        &reply[..written.bytes],
+        // The whole reply at the address the request named, not a row loop: the
+        // span is the encoder's byte count and the packet being retired is what
+        // authorises it.
+        None,
+    )
+    .is_err()
+    {
+        crate::observe::fail(format!(
+            "get_compute_info write_fail task={task_id} gva={reply_gva:#x} wrote={wrote}"
+        ));
+        return false;
     }
     // Success census — the reply landed. Route to `off()` so it stays always-on
     // in the log but leaves the curated real-error view clean; the genuine
@@ -2287,75 +2277,48 @@ fn process_root_packet<H: HostMemory + HostOps>(
     packet: &Packet,
 ) {
     match packet.opcode {
-        ROOT_OP_DEVICE_INFO_TAHOE => {
-            if !packet_short(
-                "device_info_tahoe",
-                None,
-                packet.payload.len(),
-                DEVICE_INFO_TAHOE_REPLY_PFN + 4,
-            ) {
-                let key_table_len = ld32(&packet.payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..]);
-                let count = ld32(&packet.payload[DEVICE_INFO_TAHOE_COUNT..]);
-                let pfn = ld32(&packet.payload[DEVICE_INFO_TAHOE_REPLY_PFN..]);
-                let _ = reply_device_info(
-                    host,
-                    key_table_len,
-                    count,
-                    pfn,
-                    state.page_shift,
-                    state.gfx.version,
-                );
-            }
-        }
-        ROOT_OP_DEVICE_INFO_MONTEREY => {
-            if !packet_short(
-                "device_info_monterey",
-                None,
-                packet.payload.len(),
-                DEVICE_INFO_MONTEREY_REPLY_PFN + 4,
-            ) {
-                let count = ld32(&packet.payload[DEVICE_INFO_MONTEREY_COUNT..]);
-                let pfn = ld32(&packet.payload[DEVICE_INFO_MONTEREY_REPLY_PFN..]);
-                // This record carries no parse ceiling — see
-                // `DEVICE_INFO_MONTEREY_COUNT` — so the reply names every key the
-                // table holds and the count alone bounds it, which is what this
-                // arm has always done.
-                let _ = reply_device_info(
-                    host,
-                    u32::MAX,
-                    count,
-                    pfn,
-                    state.page_shift,
-                    state.gfx.version,
-                );
-            }
-        }
-        ROOT_OP_DEFINE_FIFO => {
-            if !packet_short("define_fifo", None, packet.payload.len(), 4) {
-                let ch = ld32(&packet.payload[0..]);
-                if is_child_channel(ch) {
-                    let bit = 1u32 << ch;
-                    state.active_child_mask |= bit;
-                    state.translation_deferred_mask &= !bit;
-                    state.translation_order_hold_mask &= !bit;
-                    state.present_translation_hold_mask &= !bit;
-                    // Invalidate ring cache for this channel.
-                    state.child_rings[ch as usize] = Default::default();
+        // The two device-info opcodes, one arm. They differ only in which form
+        // their payload is — the newer one prepends a parse ceiling — and
+        // reading either at the other's offsets would take the count for a page
+        // frame and write the reply wherever that landed. Which form an opcode
+        // carries was the one thing the two arms did not share, so it is now
+        // the only thing that differs between them.
+        ROOT_OP_DEVICE_INFO_TAHOE | ROOT_OP_DEVICE_INFO_MONTEREY => {
+            let (form, slug) = if packet.opcode == ROOT_OP_DEVICE_INFO_TAHOE {
+                (DeviceInfoForm::WithKeyLimit, "device_info_tahoe")
+            } else {
+                (DeviceInfoForm::WithoutKeyLimit, "device_info_monterey")
+            };
+            match decode_device_info(form, &packet.payload) {
+                Ok(request) => {
+                    let _ = reply_device_info(host, &request, state.page_shift, state.gfx.version);
                 }
+                Err(short) => note_short_payload(slug, None, &short),
             }
         }
-        ROOT_OP_FREE_FIFO => {
-            if !packet_short("free_fifo", None, packet.payload.len(), 4) {
-                let ch = ld32(&packet.payload[0..]);
-                if is_child_channel(ch) {
+        // The two ends of one channel lifetime. They share a payload because
+        // they share a decoder — `crate::protocol::fifo` owns that layout, and
+        // reading it here with a length check and an `ld32` at a named offset
+        // was a second reading of one record.
+        ROOT_OP_DEFINE_FIFO | ROOT_OP_FREE_FIFO => {
+            let opening = packet.opcode == ROOT_OP_DEFINE_FIFO;
+            let slug = if opening { "define_fifo" } else { "free_fifo" };
+            match crate::protocol::fifo::decode_channel_lifetime(&packet.payload) {
+                Ok(ch) if is_child_channel(ch) => {
                     let bit = 1u32 << ch;
-                    state.active_child_mask &= !bit;
-                    state.pending.child_mask &= !bit;
-                    state.translation_deferred_mask &= !bit;
-                    state.translation_order_hold_mask &= !bit;
-                    state.present_translation_hold_mask &= !bit;
-                    state.child_rings[ch as usize] = Default::default();
+                    if opening {
+                        state.active_child_mask |= bit;
+                    } else {
+                        state.active_child_mask &= !bit;
+                        // Only a free clears it: an open is not a claim that
+                        // nothing is pending on the channel, and clearing it
+                        // there would drop a drain the guest is owed.
+                        state.pending.child_mask &= !bit;
+                    }
+                    forget_child_channel(state, ch, bit);
                 }
+                Ok(_) => {}
+                Err(short) => note_short_payload(slug, None, &short),
             }
         }
         ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, None),
@@ -2874,29 +2837,42 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
     host: &H,
     packet: &Packet,
 ) -> bool {
-    if packet.payload.len() < CURSOR_GLYPH_PAYLOAD_LEN {
-        return cursor_glyph_fail(
-            "cursor_glyph_short",
-            format!(
-                "cursor_glyph_fail reason=cursor_glyph_short plen={} need={CURSOR_GLYPH_PAYLOAD_LEN}",
-                packet.payload.len()
-            ),
-        );
-    }
-    let task_id = ld32(&packet.payload[0x04..]);
-    let virtual_offset = u64::from_le_bytes(packet.payload[0x08..0x10].try_into().unwrap());
-    let mapped_length = u64::from_le_bytes(packet.payload[0x10..0x18].try_into().unwrap());
-    let stride = u64::from_le_bytes(packet.payload[0x18..0x20].try_into().unwrap()) as u32;
-    let width = ld16(&packet.payload[0x20..]) as u32;
-    let height = ld16(&packet.payload[0x22..]) as u32;
-    let hot_x = ld16(&packet.payload[0x24..]) as u32;
-    let hot_y = ld16(&packet.payload[0x26..]) as u32;
+    // The record's layout is `crate::protocol::fifo`'s. What is *usable* is
+    // this function's, because it is the thing that allocates the sprite and
+    // reads the guest's rows.
+    let record = match crate::protocol::fifo::decode_cursor_glyph(&packet.payload) {
+        Ok(record) => record,
+        Err(short) => {
+            return cursor_glyph_fail(
+                "cursor_glyph_short",
+                format!(
+                    "cursor_glyph_fail reason=cursor_glyph_short plen={} need={}",
+                    short.plen, short.need
+                ),
+            )
+        }
+    };
+    let task_id = record.task_id;
+    let virtual_offset = record.virtual_offset;
+    let mapped_length = record.mapped_length;
+    // Whole, not narrowed. The wire's stride is eight bytes, and taking the
+    // low four of it turns a pitch that does not fit into a small one that
+    // passes every bound below — the glyph is then read at the wrong pitch and
+    // the guest gets a garbled pointer with nothing on the failure channel. It
+    // is compared and multiplied in its own width, and the bounds it has to
+    // pass — `cursor_glyph_geom`, `cursor_glyph_mapped_len`,
+    // `cursor_glyph_alloc` — are what refuse an unusable one.
+    let stride = record.stride;
+    let width = u32::from(record.width);
+    let height = u32::from(record.height);
+    let hot_x = u32::from(record.hot_x);
+    let hot_y = u32::from(record.hot_y);
 
     if width == 0
         || height == 0
         || width > CURSOR_MAX_DIM
         || height > CURSOR_MAX_DIM
-        || stride < width.saturating_mul(CURSOR_GLYPH_BPP)
+        || stride < u64::from(width.saturating_mul(CURSOR_GLYPH_BPP))
         || hot_x >= width
         || hot_y >= height
     {
@@ -2905,9 +2881,9 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
             format!("cursor_glyph_fail reason=cursor_glyph_geom {width}x{height} stride={stride} hot=({hot_x},{hot_y}) max={CURSOR_MAX_DIM}"),
         );
     }
-    let need = (height as u64 - 1)
-        .saturating_mul(stride as u64)
-        .saturating_add(width as u64 * CURSOR_GLYPH_BPP as u64);
+    let need = u64::from(height - 1)
+        .saturating_mul(stride)
+        .saturating_add(u64::from(width) * u64::from(CURSOR_GLYPH_BPP));
     if mapped_length < need {
         return cursor_glyph_fail(
             "cursor_glyph_mapped_len",
@@ -2940,10 +2916,13 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
 
     let mut pixels = Vec::with_capacity((width * height) as usize);
     for y in 0..height {
-        let row = (y as usize).saturating_mul(stride as usize);
+        // `need` bounded the last row's start and `host_alloc_len` accepted it,
+        // so the product fits; `try_from` rather than `as` because a cast here
+        // would be the narrowing this function just stopped doing.
+        let row = usize::try_from(u64::from(y).saturating_mul(stride)).unwrap_or(usize::MAX);
         for x in 0..width {
-            let px = row + (x as usize) * CURSOR_GLYPH_BPP as usize;
-            if px + 4 > src.len() {
+            let px = row.saturating_add((x as usize) * CURSOR_GLYPH_BPP as usize);
+            if px.saturating_add(4) > src.len() {
                 return cursor_glyph_fail(
                     "cursor_glyph_bounds",
                     format!("cursor_glyph_fail reason=cursor_glyph_bounds px={px} src_len={} {width}x{height} stride={stride}", src.len()),
@@ -3463,6 +3442,24 @@ impl MapFamily {
             Self::DeleteIOSurfaceBacking2 => "DeleteIOSurfaceBacking2",
         }
     }
+
+    /// The lowercase reason stem this command reports refusals under.
+    ///
+    /// Separate from [`Self::name`], which is the human column of the census
+    /// line: a `reason=` slug is grepped for and every other one in this file
+    /// is lowercase, so `reason=MapMemory2_short` would be the one nobody
+    /// finds. The map pair's stems were already written as two literals at the
+    /// view-retire site; this is that pair, extended to the family.
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::MapMemory2 => "map_memory2",
+            Self::UnmapMemory => "unmap_memory",
+            Self::InvalidateResources => "invalidate_resources",
+            Self::SynchronizeResources => "synchronize_resources",
+            Self::SynchronizeAndDiscardResources => "synchronize_and_discard_resources",
+            Self::DeleteIOSurfaceBacking2 => "delete_iosurface_backing2",
+        }
+    }
 }
 
 /// Record the page-table nodes `gva` descends through under `task_id`, and say
@@ -3666,10 +3663,45 @@ fn apply_map_family<H: HostMemory + HostOps>(
     //   task_id@0 u32, gva@4 u64, length@12 u64  (matches fifo MapMemoryCommand).
     let plen = packet.payload.len();
     let name = family.name();
-    if matches!(family, MapFamily::MapMemory2 | MapFamily::UnmapMemory) && plen >= 20 {
-        let task_id = crate::protocol::endian::ld32(&packet.payload[0..]);
-        let gva = crate::protocol::endian::ld64(&packet.payload[4..]);
-        let length = crate::protocol::endian::ld64(&packet.payload[12..]);
+    // The floor and the three offsets are the record's owner's. They were four
+    // literals here — a `20` beside a `0`, a `4` and a `12` — and the two
+    // eight-byte fields are exactly the shape a reader gets wrong: an address
+    // read as a `u32` puts the length word in the middle of the address.
+    let notice = match matches!(family, MapFamily::MapMemory2 | MapFamily::UnmapMemory)
+        .then(|| crate::protocol::fifo::decode_map_memory(&packet.payload))
+        .transpose()
+    {
+        Ok(notice) => notice,
+        // A notice too short to read is one whose interval this device does not
+        // know, and every response below is keyed on that interval: the bind
+        // resolutions and host views retired are exactly the ones overlapping
+        // it. Reported by name rather than falling through to the generic
+        // census line, which prints two words of a record it could not read.
+        Err(short) => {
+            note_short_payload(family.slug(), Some(channel_id), &short);
+            return;
+        }
+    };
+    // The same, for the retirement that shares this arm. A payload too short to
+    // name the surface is one whose backing this device cannot condemn, and the
+    // id is reused within tens of milliseconds under scroll — so a dropped
+    // retirement is later pixels written into pages the guest has recycled.
+    let retire = match matches!(family, MapFamily::DeleteIOSurfaceBacking2)
+        .then(|| crate::protocol::fifo::decode_delete_backing(&packet.payload))
+        .transpose()
+    {
+        Ok(retire) => retire,
+        Err(short) => {
+            note_short_payload(family.slug(), Some(channel_id), &short);
+            return;
+        }
+    };
+    if let Some(crate::protocol::fifo::MapMemoryCommand {
+        task_id,
+        gva,
+        length,
+    }) = notice
+    {
         // Audit the interval against what this task already has live: a range
         // mapped twice or unmapped without a map is a disagreement the guest's
         // own teardown assertion will eventually find.
@@ -3795,12 +3827,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
             );
             let n =
                 crate::runtime::gva_view::retire_gva_views_overlapping(state, task_id, gva, length);
-            let op = if family == MapFamily::UnmapMemory {
-                "unmap_memory"
-            } else {
-                "map_memory2"
-            };
-            crate::runtime::gva_view::log_retire(op, task_id, gva, length, n);
+            crate::runtime::gva_view::log_retire(family.slug(), task_id, gva, length, n);
         }
         // Deferred GVA render-Store windows overlapping the notified
         // VA range land **cache-only**: on Unmap the PTEs are already
@@ -3817,14 +3844,15 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // (exact-base only, no multi-key heap maps) and RE-justified, so
         // the broad implementation is not kept around to be switched
         // back on. See kb map-memory2 / xnu-pte-corruption-windowserver.
-    } else if family == MapFamily::DeleteIOSurfaceBacking2 && plen >= 8 {
+    } else if let Some(retire) = retire {
         // The live Ventura payload agrees with the resource contract:
-        // `{objectID, taskID}`. This is the lifetime
-        // boundary for the host IOSurface backing, not stamp-only
-        // bookkeeping. Keeping page_entries after it lets later id
-        // reuse/clear write pixels into pages the guest has recycled.
-        let object_id = crate::protocol::endian::ld32(&packet.payload[0..]);
-        let task_id = crate::protocol::endian::ld32(&packet.payload[4..]);
+        // `{objectID, taskID}` — **the reverse** of the `{task, object}` pair
+        // `CmdDeleteResource` and `CmdReplacePhysical` carry, which is why the
+        // offsets are the decoder's and not two `ld32`s here. This is the
+        // lifetime boundary for the host IOSurface backing, not stamp-only
+        // bookkeeping. Keeping page_entries after it lets later id reuse/clear
+        // write pixels into pages the guest has recycled.
+        let crate::protocol::fifo::DeleteBackingCommand { object_id, task_id } = retire;
         // Never write guest pages here — the delete trails the guest's
         // CPU-side release asynchronously and the pages may already be
         // recycled (boot-16 PTE-corruption panic: a 14.7 MB delete-time
@@ -3860,9 +3888,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // through the same consumer: this producer's records are 8 bytes
         // and that one's are 24, but the quad is one contract and must
         // not acquire two meanings.
-        use crate::runtime::decode::fifo::{
-            decode_invalidate_resources, CHILD_INVALIDATE_PAGEON_FLAGS,
-        };
+        use crate::protocol::fifo::{decode_invalidate_resources, CHILD_INVALIDATE_PAGEON_FLAGS};
         use crate::runtime::resource_validity::{apply, ValiditySite};
         match decode_invalidate_resources(&packet.payload) {
             Ok(cmd) => {
@@ -3964,7 +3990,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // host does instead. A boot where this arm starts firing is a
         // boot where the deferral described there has a real land point,
         // so the count is worth watching rather than assuming zero.
-        use crate::runtime::decode::fifo::decode_synchronize_resources;
+        use crate::protocol::fifo::decode_synchronize_resources;
         match decode_synchronize_resources(&packet.payload) {
             Ok(cmd) => {
                 // Synchronization is resource-scoped. Apple batches the named
@@ -4098,25 +4124,34 @@ fn process_child_packet<H: HostMemory + HostOps>(
             apply_set_object_list(state, &packet.payload, Some(channel_id));
         }
         CHILD_OP_DELETE_RESOURCE => {
-            if !packet_short("delete_resource", Some(channel_id), packet.payload.len(), 8) {
-                let task_id = ld32(&packet.payload[0..]);
-                let id = ld32(&packet.payload[4..]);
-                // Which references resolved through this object is not knowable
-                // from the packet, so the task's resolutions go together.
-                // Scoped to the reference the packet names, like every other
-                // response to this opcode — `objects`, the host copies and
-                // `texture_to_mapping` are all keyed `(task, ref)`. Retiring
-                // the whole task here was the outlier and the device's largest
-                // source of re-walks: 54 109 resolutions dropped on one driven
-                // boot, 95% of every bind miss.
-                note_bb_retired(
-                    "bb_retire_delete_resource",
-                    state.retire_bound_buffers_for_ref(task_id, id),
-                );
-                if crate::runtime::writeback_debt::retire_gva_resource(state, task_id, id) {
-                    note_store_route("gva_resource_retired");
+            // The same `{task_id, object_id}` record `CmdReplacePhysical`
+            // carries, through the same decode. This arm had its own literal
+            // `8` and its own two `ld32`s at literal offsets, which is a fourth
+            // spelling of one pair — and the third command with these two words
+            // carries them the other way round.
+            match crate::protocol::fifo::decode_task_object(&packet.payload) {
+                Err(short) => note_short_payload("delete_resource", Some(channel_id), &short),
+                Ok(crate::protocol::fifo::TaskObjectCommand {
+                    task_id,
+                    object_id: id,
+                }) => {
+                    // Which references resolved through this object is not knowable
+                    // from the packet, so the task's resolutions go together.
+                    // Scoped to the reference the packet names, like every other
+                    // response to this opcode — `objects`, the host copies and
+                    // `texture_to_mapping` are all keyed `(task, ref)`. Retiring
+                    // the whole task here was the outlier and the device's largest
+                    // source of re-walks: 54 109 resolutions dropped on one driven
+                    // boot, 95% of every bind miss.
+                    note_bb_retired(
+                        "bb_retire_delete_resource",
+                        state.retire_bound_buffers_for_ref(task_id, id),
+                    );
+                    if crate::runtime::writeback_debt::retire_gva_resource(state, task_id, id) {
+                        note_store_route("gva_resource_retired");
+                    }
+                    let _ = state.delete_object(task_id, id);
                 }
-                let _ = state.delete_object(task_id, id);
             }
         }
         // PVG CmdDeleteTask (0x20) on child channels too (was SMALL_ID alias only in decode).
@@ -4171,16 +4206,25 @@ fn process_child_packet<H: HostMemory + HostOps>(
         opcode @ (CHILD_OP_DISPLAY_SWAP
         | CHILD_OP_DISPLAY_TRANSACTION2
         | CHILD_OP_DISPLAY_TRANSACTION3) => {
-            note_display_txn_payload(state, channel_id, packet);
-            let Some(mapping) = present_surface_id(opcode, &packet.payload) else {
-                crate::observe::fail(format!(
-                    "packet_short reason=display_present_short ch={channel_id} op={opcode:#x} \
-                     plen={} need={}",
-                    packet.payload.len(),
-                    display_txn_trailer_len(opcode)
-                ));
-                return ChildPacketDisposition::Complete;
+            // Which of the three, and therefore where every word is, is
+            // `reims_vgpu_protocol::present`'s: three commands with three
+            // trailers, and one place that says so.
+            let form = PresentForm::of(WireChannel::Child, opcode)
+                .expect("the three present opcodes are this arm's own pattern");
+            let decoded = match present_trailer(form, &packet.payload) {
+                Ok(decoded) => decoded,
+                Err(refusal) => {
+                    let present::Refusal::Short { have, need } = refusal;
+                    crate::observe::fail(format!(
+                        "packet_short reason={} ch={channel_id} op={opcode:#x} plen={have} \
+                         need={need}",
+                        refusal.slug()
+                    ));
+                    return ChildPacketDisposition::Complete;
+                }
             };
+            let mapping = decoded.target;
+            note_display_txn_payload(state, channel_id, packet, &decoded);
             // Per-present decode census (~30k/session under animation); the
             // present rate lives in the present_proxy summary, so gate the
             // per-packet line behind REIMS_VGPU_DRAW_LOG. `pipe` is the display
@@ -4188,14 +4232,13 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // both. `task` is op6/7's task field, which is the submitting task's
             // and not a completion stamp; the packet's own stamp lives in the
             // FIFO header. op8 has no such word, and prints `-`.
-            let (_, task_slot) = display_txn_trailer_slots(opcode);
-            let task = task_slot
-                .map(|slot| format!("{:#x}", ld32(&packet.payload[slot * 4..])))
-                .unwrap_or_else(|| "-".to_string());
+            let task = decoded
+                .task
+                .map_or_else(|| "-".to_string(), |task| format!("{task:#x}"));
             crate::observe::line(format!(
                 "present_txn op={opcode:#x} ch={channel_id} pipe={} sid={mapping} task={task} \
                  plen={} unpainted={} prior_present_mapping={}",
-                ld32(&packet.payload[0..]),
+                decoded.pipe,
                 packet.payload.len(),
                 state.present.unpainted_presents,
                 state.present.present_mapping
@@ -4223,20 +4266,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // as a command this device merely has not implemented — those are
             // different problems and only one of them is closed by writing a
             // handler.
-            let plen = packet.payload.len();
-            if !packet_short("delete_object", Some(channel_id), plen, 12) {
-                let record_len = ld32(&packet.payload[8..]) as usize;
-                // The record starts one word in, so it is `record_len + 4` that
-                // has to fit. Saturating, because the guest's length is an
-                // arbitrary `u32` and the sum is what overflows.
-                if !packet_short(
-                    "delete_object_record",
-                    Some(channel_id),
-                    plen,
-                    record_len.saturating_add(4),
-                ) {
-                    apply_delete_object(state, channel_id, &packet.payload, packet);
-                }
+            match crate::protocol::fifo::decode_delete_object(&packet.payload) {
+                Ok(command) => apply_delete_object(state, channel_id, &command, packet),
+                Err(error) => note_short_payload(error.slug(), Some(channel_id), &error.short()),
             }
         }
         // `CmdDebug`, a host-side trace marker. Nothing is owed to the guest, but
@@ -4277,23 +4309,27 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // `present-frame-flush` is the recovered legacy name for the same wire
         // opcode, and it is wrong.
         CHILD_OP_GET_COMPUTE_INFO => {
-            if packet.payload.len() >= 24 {
-                let _ = reply_compute_info(state, host, &packet.payload);
-            } else {
-                crate::observe::fail(format!(
-                    "get_compute_info short ch={channel_id} len={}",
-                    packet.payload.len()
-                ));
+            // The floor is the decoder's, and it is the only one. This arm and
+            // `reply_compute_info` each carried their own literal `24`, so
+            // neither check could be wrong without the other being wrong too —
+            // and no test built a request at all, so neither was exercised.
+            match crate::protocol::fifo::decode_compute_info(&packet.payload) {
+                Ok(request) => {
+                    let _ = reply_compute_info(state, host, &request);
+                }
+                Err(short) => {
+                    note_short_payload("get_compute_info", Some(channel_id), &short);
+                }
             }
         }
-        CHILD_OP_CURSOR_SHOW => {
-            if !packet_short("cursor_show", Some(channel_id), packet.payload.len(), 8) {
-                let show = ld32(&packet.payload[4..]) != 0;
+        CHILD_OP_CURSOR_SHOW => match crate::protocol::fifo::decode_cursor_show(&packet.payload) {
+            Ok(show) => {
                 state.cursor.show = show;
                 sample_cursor_position(state, host);
                 host.enqueue(HostAction::cursor(state.cursor.x, state.cursor.y, show));
             }
-        }
+            Err(short) => note_short_payload("cursor_show", Some(channel_id), &short),
+        },
         CHILD_OP_CURSOR_GLYPH => {
             if load_cursor_glyph(state, host, packet) {
                 host.enqueue(HostAction::cursor_glyph());
@@ -4438,15 +4474,13 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // surface and no packet said so" is what a lost half of it looks like
         // from the far end.
         CHILD_OP_REPLACE_PHYSICAL => {
-            if !packet_short(
-                "replace_physical",
-                Some(channel_id),
-                packet.payload.len(),
-                crate::runtime::decode::fifo::CHILD_REPLACE_PHYSICAL_LEN as usize,
-            ) {
-                if let Some(cmd) =
-                    crate::runtime::decode::fifo::decode_replace_physical(&packet.payload)
-                {
+            // One bounds check, in the decoder that owns the layout. This arm
+            // used to make its own with the command's length constant and then
+            // call a decoder that checked the same floor again — so the second
+            // check was unreachable, and its `None` arm would have dropped the
+            // packet in silence if it ever were reached.
+            match crate::protocol::fifo::decode_task_object(&packet.payload) {
+                Ok(cmd) => {
                     // The GPA behind this resource changes here. The command is
                     // scoped to one task-local resource id, so unrelated
                     // resources on the same task keep both their authoritative
@@ -4468,6 +4502,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         cmd.task_id,
                         cmd.object_id,
                     );
+                }
+                Err(short) => {
+                    note_short_payload("replace_physical", Some(channel_id), &short);
                 }
             }
         }
@@ -4542,7 +4579,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // the guest and this device disagree about the record layout, which the
         // two commands that *do* act on it share.
         CHILD_OP_DISCARD_RESOURCES => {
-            use crate::runtime::decode::fifo::decode_synchronize_resources;
+            use crate::protocol::fifo::decode_synchronize_resources;
             match decode_synchronize_resources(&packet.payload) {
                 Ok(cmd) => {
                     let discarded = crate::runtime::writeback_debt::discard_gva_resources(

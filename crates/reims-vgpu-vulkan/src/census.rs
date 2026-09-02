@@ -147,6 +147,23 @@ pub struct Reported<'a> {
     pub depth_clamp: bool,
     /// `VkPhysicalDeviceFeatures::fillModeNonSolid`.
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::wideLines`.
+    pub wide_lines: bool,
+    /// `VkPhysicalDeviceLimits::lineWidthRange`, `[min, max]`.
+    ///
+    /// A limit rather than a feature, so it is always reported --- and it is
+    /// required to contain 1.0 on every device, which is why a guest that
+    /// never sets a width needs no capability. See
+    /// [`crate::raster::LineWidthCell`].
+    pub line_width_range: [f32; 2],
+    /// `VkPhysicalDeviceFeatures::multiViewport`.
+    pub multi_viewport: bool,
+    /// `VkPhysicalDeviceLimits::maxViewports`.
+    ///
+    /// A limit rather than a feature, so it is always reported --- and it is
+    /// one exactly where the feature above is off, which is why both travel:
+    /// see [`crate::raster::ViewportCell`].
+    pub max_viewports: u32,
     /// `VkPhysicalDeviceFeatures::samplerAnisotropy`.
     pub sampler_anisotropy: bool,
     /// `VkPhysicalDeviceLimits::maxSamplerAnisotropy`.
@@ -206,6 +223,23 @@ pub struct Reported<'a> {
     /// device reported one. See [`crate::buffer::BufferLimits`] for why the
     /// absence is carried rather than substituted.
     pub max_buffer_size: Option<u64>,
+    /// Whether `vkGetPhysicalDeviceExternalBufferProperties` reported
+    /// `VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT` for
+    /// `HOST_ALLOCATION_EXT`.
+    ///
+    /// `VK_EXT_external_memory_host` has no feature structure, so this is the
+    /// only thing that plays the part one would: the extension name says the
+    /// entry points resolve, and this says the handle type can actually be
+    /// imported. Measured by the caller because the census asks no driver
+    /// anything, exactly like `vertex_formats`.
+    pub host_pointer_importable: bool,
+    /// `VkPhysicalDeviceExternalMemoryHostPropertiesEXT::minImportedHostPointerAlignment`.
+    ///
+    /// The granularity a host pointer and an allocation size must both meet.
+    /// It is a device fact and not a page size — MoltenVK reports Apple's and
+    /// a Linux driver may report more — so it is asked for rather than
+    /// assumed. Zero means the device never filled it in.
+    pub min_imported_host_pointer_alignment: u64,
     pub memory: &'a vk::PhysicalDeviceMemoryProperties,
     pub queue_families: &'a [vk::QueueFamilyProperties],
 }
@@ -236,6 +270,15 @@ pub enum Floor {
     NoUsableQueue { decline: queues::Decline },
     /// The device cannot present.
     NoSwapchain,
+    /// The device's extension list could not be read, so no fact about it was
+    /// ever reported.
+    ///
+    /// Every other variant names a fact the device reported and this rail
+    /// needs. This one names the absence of the report itself: a judgement
+    /// built on an empty list would refuse the device for missing whichever
+    /// extension is checked first, which is a reason the device never gave.
+    /// See the module doc.
+    Unenumerable { result: vk::Result },
 }
 
 impl Floor {
@@ -246,6 +289,7 @@ impl Floor {
             Self::NoTimelineSemaphores { .. } => "vk_census_no_timeline_semaphores",
             Self::NoUsableQueue { .. } => "vk_census_no_usable_queue",
             Self::NoSwapchain => "vk_census_no_swapchain",
+            Self::Unenumerable { .. } => "vk_census_unenumerable",
         }
     }
 }
@@ -258,6 +302,7 @@ impl std::fmt::Display for Floor {
             }
             Self::NoUsableQueue { decline } => write!(f, "{} {decline}", self.slug()),
             Self::NoSwapchain => f.write_str(self.slug()),
+            Self::Unenumerable { result } => write!(f, "{} result={result:?}", self.slug()),
         }
     }
 }
@@ -364,6 +409,8 @@ pub struct Census {
     blend: crate::blend::BlendCell,
     topology: crate::topology::TopologyCell,
     vertex: crate::vertex::VertexCell,
+    viewports: crate::raster::ViewportCell,
+    line_widths: crate::raster::LineWidthCell,
     host_pointer_import: bool,
     synchronization2: bool,
     can_present: bool,
@@ -419,6 +466,31 @@ impl Census {
         // the two facts was missing.
         let push_descriptor = reported.has(extension::PUSH_DESCRIPTOR) || api.at_least(1, 4);
 
+        // `VK_EXT_external_memory_host` publishes no feature structure, so the
+        // extension list is the whole of what a name can say about it --- and
+        // the module's rule is that a name is not a capability. Two measured
+        // facts stand in for the missing feature bit, and both are needed:
+        //
+        // - the device reports the host-allocation handle type as importable
+        //   at all, which is a `vkGetPhysicalDeviceExternalBufferProperties`
+        //   answer and not an entry-point question;
+        // - it states an alignment a pointer can actually meet. Zero is a
+        //   device that never filled the property in, and a value that is not
+        //   a power of two is one no pointer is aligned to and no span mask
+        //   can round to.
+        //
+        // Without these this rail would offer `Route::DirectAlias` on the
+        // strength of a name, and the refusal would arrive at
+        // `vkAllocateMemory` --- after placement had already promised the
+        // guest's pages *are* the resource, which is the one route with no
+        // copy to fall back to.
+        let host_pointer_import = reported.has(extension::EXTERNAL_MEMORY_HOST)
+            && reported.host_pointer_importable
+            && reported.min_imported_host_pointer_alignment != 0
+            && reported
+                .min_imported_host_pointer_alignment
+                .is_power_of_two();
+
         Ok(Self {
             api,
             memory: classify_memory(reported.memory),
@@ -452,6 +524,18 @@ impl Census {
                     && reported.extended_dynamic_state3_polygon_mode,
                 dynamic_depth_clamp: dynamic_state_3
                     && reported.extended_dynamic_state3_depth_clamp_enable,
+            },
+            viewports: crate::raster::ViewportCell {
+                multi_viewport: reported.multi_viewport,
+                max_viewports: reported.max_viewports,
+            },
+            // Carried as reported, like `max_sampler_anisotropy`: the range a
+            // device states is the range a width is admitted against, and a
+            // floor substituted here would hide a driver that reported one
+            // not containing 1.0.
+            line_widths: crate::raster::LineWidthCell {
+                wide_lines: reported.wide_lines,
+                range: reported.line_width_range,
             },
             buffers: crate::buffer::BufferLimits {
                 max_buffer_size: reported.max_buffer_size,
@@ -493,7 +577,7 @@ impl Census {
                 // a driver that reported less than one.
                 max_anisotropy: reported.max_sampler_anisotropy,
             },
-            host_pointer_import: reported.has(extension::EXTERNAL_MEMORY_HOST),
+            host_pointer_import,
             // 1.3 promoted it to core, so a 1.3 device has it whether or not it
             // enumerates the extension. Below that both facts are needed, for
             // the reason above.
@@ -508,7 +592,12 @@ impl Census {
                 push_descriptor: reported.has(extension::PUSH_DESCRIPTOR) && !api.at_least(1, 4),
                 descriptor_buffer,
                 mesh_shader,
-                external_memory_host: reported.has(extension::EXTERNAL_MEMORY_HOST),
+                // The qualified answer, like `descriptor_buffer` and
+                // `mesh_shader` above: an extension enabled for a capability
+                // this device does not offer is a name in
+                // `ppEnabledExtensionNames` that no decision here will ever
+                // read.
+                external_memory_host: host_pointer_import,
                 synchronization2: reported.has(extension::SYNCHRONIZATION_2)
                     && reported.synchronization2
                     && !api.at_least(1, 3),
@@ -654,6 +743,20 @@ impl Census {
         self.synchronization2
     }
 
+    /// How many viewports a pipeline built here may declare. See
+    /// [`crate::raster::viewport_slots`].
+    #[must_use]
+    pub const fn viewports(&self) -> crate::raster::ViewportCell {
+        self.viewports
+    }
+
+    /// What width a draw that rasterizes lines may be given. See
+    /// [`crate::raster::line_width`].
+    #[must_use]
+    pub const fn line_widths(&self) -> crate::raster::LineWidthCell {
+        self.line_widths
+    }
+
     #[must_use]
     pub const fn can_present(&self) -> bool {
         self.can_present
@@ -679,7 +782,8 @@ impl Census {
              dyn_topology={} topology_unrestricted={} vertex_formats={} \
              vertex_divisor={} vertex_zero_divisor={} vertex_max_divisor={} \
              depth_clamp={} fill_non_solid={} dyn_cull_winding={} dyn_polygon={} \
-             dyn_depth_clamp={}",
+             dyn_depth_clamp={} multi_viewport={} max_viewports={} wide_lines={} \
+             line_width_max={}",
             self.api,
             self.memory.topology.slug(),
             self.memory.signal.slug(),
@@ -708,6 +812,10 @@ impl Census {
             self.raster.dynamic_cull_and_winding,
             self.raster.dynamic_polygon_mode,
             self.raster.dynamic_depth_clamp,
+            self.viewports.multi_viewport,
+            self.viewports.max_viewports,
+            self.line_widths.wide_lines,
+            self.line_widths.range[1],
         )
     }
 }
@@ -772,6 +880,10 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
+            multi_viewport: false,
+            max_viewports: 1,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
@@ -789,6 +901,11 @@ mod tests {
             descriptor_buffer: false,
             max_push_descriptors: 0,
             max_buffer_size: None,
+            // The two facts that qualify the import capability, at the values
+            // an import-capable device reports. A test that wants the
+            // extension present and the capability absent clears one of them.
+            host_pointer_importable: true,
+            min_imported_host_pointer_alignment: 4096,
             memory,
             queue_families: families,
         }
@@ -952,6 +1069,140 @@ mod tests {
         );
     }
 
+    /// The extension name is not the capability, and this is the one
+    /// capability with no feature bit to say so.
+    ///
+    /// The regression: `host_pointer_import` was `has(EXTERNAL_MEMORY_HOST)`
+    /// alone, so a device that enumerates the extension and declines the
+    /// handle type --- or states an alignment no pointer can meet --- was
+    /// offered `Route::DirectAlias`, which is the one route with no copy to
+    /// fall back to once the allocation refuses.
+    #[test]
+    fn the_import_capability_needs_the_two_facts_the_extension_name_does_not_carry() {
+        let memory = mem::apple_m3_max();
+        let families = integrated_families();
+        let named = &[extension::SWAPCHAIN, extension::EXTERNAL_MEMORY_HOST];
+        let taken = |mutate: &dyn Fn(&mut Reported<'_>)| {
+            let mut r = reported(packed(1, 2), named, &memory, &families);
+            mutate(&mut r);
+            Census::take(r).expect("admitted")
+        };
+
+        // All three facts: the capability, and the extension asked for.
+        let whole = taken(&|_| {});
+        assert!(whole.host_cell().host_pointer_import);
+        assert!(whole
+            .extensions()
+            .names()
+            .contains(&extension::EXTERNAL_MEMORY_HOST));
+
+        // Each fact alone withdraws it, and withdraws the extension with it:
+        // a name enabled for a capability this device does not offer is one
+        // no decision here would read.
+        /// A named way for one reported fact to fall short.
+        type Withdraws<'a> = (&'a str, &'a dyn Fn(&mut Reported<'_>));
+        let cases: [Withdraws<'_>; 3] = [
+            ("the handle type is not importable", &|r| {
+                r.host_pointer_importable = false;
+            }),
+            ("the device stated no alignment", &|r| {
+                r.min_imported_host_pointer_alignment = 0;
+            }),
+            ("the alignment is not a power of two", &|r| {
+                r.min_imported_host_pointer_alignment = 3072;
+            }),
+        ];
+        for (what, mutate) in cases {
+            let census = taken(mutate);
+            assert!(
+                !census.host_cell().host_pointer_import,
+                "admitted when {what}"
+            );
+            assert!(
+                !census
+                    .extensions()
+                    .names()
+                    .contains(&extension::EXTERNAL_MEMORY_HOST),
+                "enabled the extension when {what}"
+            );
+        }
+
+        // And the two facts do not admit it without the extension: there are
+        // no entry points to import through.
+        let mut unnamed = reported(packed(1, 2), BASELINE, &memory, &families);
+        unnamed.host_pointer_importable = true;
+        unnamed.min_imported_host_pointer_alignment = 4096;
+        assert!(
+            !Census::take(unnamed)
+                .expect("admitted")
+                .host_cell()
+                .host_pointer_import
+        );
+    }
+
+    /// The viewport limits reach the cell `raster::viewport_slots` is asked
+    /// against, both halves, unchanged.
+    ///
+    /// A limit and its feature that the census did not carry is a check no
+    /// caller could have made: the census is the only thing the rest of the
+    /// crate is given.
+    #[test]
+    fn the_viewport_limits_reach_the_cell_that_admits_a_count() {
+        let memory = mem::nvidia_discrete();
+        let families = discrete_families();
+        let mut r = reported(packed(1, 2), BASELINE, &memory, &families);
+        r.multi_viewport = true;
+        r.max_viewports = 16;
+        let census = Census::take(r).expect("admitted");
+        assert_eq!(
+            census.viewports(),
+            crate::raster::ViewportCell {
+                multi_viewport: true,
+                max_viewports: 16,
+            }
+        );
+        assert!(crate::raster::viewport_slots(16, census.viewports()).is_ok());
+        assert!(crate::raster::viewport_slots(17, census.viewports()).is_err());
+
+        // And a device that reports neither admits exactly one, which is the
+        // cell every device answers.
+        let bare =
+            Census::take(reported(packed(1, 2), BASELINE, &memory, &families)).expect("admitted");
+        assert_eq!(bare.viewports(), crate::raster::ViewportCell::SINGLE);
+        assert!(crate::raster::viewport_slots(2, bare.viewports()).is_err());
+    }
+
+    /// The line-width facts reach the cell `raster::line_width` is asked
+    /// against, and a device that reports neither admits exactly the width
+    /// that needs no feature.
+    #[test]
+    fn the_line_width_limits_reach_the_cell_that_admits_a_width() {
+        let memory = mem::nvidia_discrete();
+        let families = discrete_families();
+        let mut r = reported(packed(1, 2), BASELINE, &memory, &families);
+        r.wide_lines = true;
+        r.line_width_range = [0.5, 8.0];
+        let census = Census::take(r).expect("admitted");
+        assert!(census.line_widths().wide_lines);
+        assert_eq!(census.line_widths().range, [0.5, 8.0]);
+        assert_eq!(
+            crate::raster::line_width(Some(4.0), true, census.line_widths()),
+            Ok(4.0)
+        );
+        assert!(crate::raster::line_width(Some(9.0), true, census.line_widths()).is_err());
+
+        // A device that reports no `wideLines` rasterizes lines at exactly the
+        // one width every device carries, and refuses any other.
+        let bare =
+            Census::take(reported(packed(1, 2), BASELINE, &memory, &families)).expect("admitted");
+        assert_eq!(bare.line_widths(), crate::raster::LineWidthCell::NARROW);
+        assert_eq!(
+            crate::raster::line_width(Some(1.0), true, bare.line_widths()),
+            Ok(1.0)
+        );
+        assert!(crate::raster::line_width(Some(2.0), true, bare.line_widths()).is_err());
+    }
+
     #[test]
     fn a_probe_cannot_qualify_what_the_device_does_not_report() {
         let memory = mem::intel_igpu();
@@ -1043,6 +1294,10 @@ mod tests {
             "vertex_max_divisor=0",
             "depth_clamp=false",
             "fill_non_solid=false",
+            "multi_viewport=false",
+            "max_viewports=1",
+            "wide_lines=false",
+            "line_width_max=1",
             "dyn_cull_winding=false",
             "dyn_polygon=false",
             "dyn_depth_clamp=false",
@@ -1446,9 +1701,15 @@ mod tests {
         assert!(census.vertex().formats.has(VertexFormat::Short4));
 
         // The declined format widens where the shader reads three.
-        let widened = attribute(0, 0, VertexFormat::Short3, 0, 8, census.vertex(), || {
-            ShaderInput::Channels(3)
-        })
+        let widened = attribute(
+            0,
+            0,
+            VertexFormat::Short3,
+            0,
+            8,
+            census.vertex().formats,
+            || ShaderInput::Channels(3),
+        )
         .expect("the wider sibling is mandatory");
         assert_eq!(widened.widened_from, Some(VertexFormat::Short3));
 
@@ -1458,9 +1719,15 @@ mod tests {
         let empty = Census::take(r).expect("admitted");
         assert_eq!(empty.vertex().formats.count(), 0);
         assert_eq!(
-            attribute(0, 0, VertexFormat::Short3, 0, 8, empty.vertex(), || {
-                ShaderInput::Channels(3)
-            }),
+            attribute(
+                0,
+                0,
+                VertexFormat::Short3,
+                0,
+                8,
+                empty.vertex().formats,
+                || { ShaderInput::Channels(3) }
+            ),
             Err(Refusal::NoFormat {
                 guest: VertexFormat::Short3
             })

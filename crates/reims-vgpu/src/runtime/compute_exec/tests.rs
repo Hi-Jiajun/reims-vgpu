@@ -1570,6 +1570,63 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
     }
 }
 
+/// **What a heap-placed texture's heap reference names, measured.**
+///
+/// The device checks the reference against zero, logs it, and resolves it no
+/// further — so a heap has no identity here and two placements sharing bytes
+/// are two independent host images. Closing that needs a value to be canonical
+/// about, and whether the reference names a decodable object is what says
+/// whether one is already on the wire. This pins both readings so the answer a
+/// boot gives is a change to a test rather than a line nobody compares.
+#[test]
+fn a_heap_reference_is_probed_against_the_object_list() {
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::objects::{note_heap_reference, HeapReference};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    let heap_ref = 19u32;
+    assert_eq!(
+        note_heap_reference(&state, &host, 1, heap_ref),
+        HeapReference::Unlisted,
+        "an empty slot is not an object, and saying so is not the same as \
+         saying the heap is unresolved"
+    );
+
+    // Plant something at the slot. Which type a real heap uses is the open
+    // question; that a planted entry is seen is what makes the answer above a
+    // reading rather than a probe that never reaches the list.
+    let entry_offset = list_object_entry_offset(heap_ref, 32).unwrap();
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let desc_gva = (4u64 + 3) << PAGE_SHIFT_ARM64E;
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (24u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], entry_offset, &entry);
+
+    assert_eq!(
+        note_heap_reference(&state, &host, 1, heap_ref),
+        HeapReference::Listed {
+            object_type: OBJECT_TYPE_BUFFER,
+            descriptor_length: 24,
+        }
+    );
+
+    // A task that does not list it at all, which is the other way the reading
+    // can be empty and must not read as an object of type zero.
+    assert_eq!(
+        note_heap_reference(&state, &host, 7, heap_ref),
+        HeapReference::Unlisted
+    );
+}
+
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn stage_heap_texture_uses_host_only_residency_identity() {

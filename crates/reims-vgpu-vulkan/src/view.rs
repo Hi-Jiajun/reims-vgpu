@@ -34,6 +34,22 @@
 //! [`crate::image::plan`] sets it for a volume declared as a render target.
 //! It is a property of the image and cannot be added later.
 //!
+//! # A sampled view names one plane; an attachment names what the format is
+//!
+//! A descriptor's image view may name at most one of `DEPTH` and `STENCIL`
+//! (VUID-VkDescriptorImageInfo-imageView-01976), while an attachment over a
+//! combined format names both. So the two views this module produces do not
+//! share an aspect rule, and [`aspect`] — which answers what a format is made
+//! of — is the attachment's answer and the transfer paths', not the sampled
+//! one's.
+//!
+//! Which plane a sampled binding wants is not a guess: the guest says it in
+//! the *view's* pixel format rather than the texture's, and
+//! `MTLPixelFormatX32_Stencil8` / `X24_Stencil8` exist for no other purpose.
+//! Both translate to the same `VkFormat` as the combined spelling they view,
+//! so the plane survives only in the guest ordinal, which is why [`whole`]
+//! takes it.
+//!
 //! # No Vulkan call
 //!
 //! Every function here produces a create info and none of them creates
@@ -49,6 +65,8 @@ use reims_vgpu_core::texture_shape::{Dimensions, Texture, TextureKind};
 /// Depth and stencil together for a combined format: a view used as an
 /// attachment names both, and the transfer paths that want one plane pick it
 /// from here rather than re-deriving it from the format code.
+///
+/// Not the answer for a sampled view — see [`sampled_aspect`].
 #[must_use]
 pub fn aspect(guest_format: u16) -> vk::ImageAspectFlags {
     let mut aspect = vk::ImageAspectFlags::empty();
@@ -60,6 +78,30 @@ pub fn aspect(guest_format: u16) -> vk::ImageAspectFlags {
     }
     if aspect.is_empty() {
         vk::ImageAspectFlags::COLOR
+    } else {
+        aspect
+    }
+}
+
+/// The single aspect a *sampled* binding reads, from the guest format of the
+/// view rather than of the texture.
+///
+/// [`aspect`]'s answer for a combined format is not a legal sampled view:
+/// VUID-VkDescriptorImageInfo-imageView-01976 allows a descriptor's view at
+/// most one of `DEPTH` and `STENCIL`. The rejection lands when the view is
+/// written into a set, not when it is created, so the mistake would surface as
+/// a validation failure about a texture the shader merely reads.
+///
+/// The narrowing is not a choice made here. `MTLPixelFormatX32_Stencil8` and
+/// `X24_Stencil8` are the guest's only spelling for "the stencil plane of this
+/// combined texture", and [`aspect`] already reads them as stencil alone. So a
+/// bind that named a combined format named the depth plane, by having declined
+/// the spelling that names the other one.
+#[must_use]
+pub fn sampled_aspect(guest_view_format: u16) -> vk::ImageAspectFlags {
+    let aspect = aspect(guest_view_format);
+    if aspect.contains(vk::ImageAspectFlags::DEPTH) {
+        vk::ImageAspectFlags::DEPTH
     } else {
         aspect
     }
@@ -134,13 +176,18 @@ impl ViewPlan {
 }
 
 /// The view covering the whole texture, which is what a sampled binding uses.
+///
+/// `guest_view_format` is the format the *bind* named, not the texture's: it
+/// is the only thing that says which plane of a combined depth-stencil texture
+/// is being read, because both spellings translate to one `VkFormat`. See
+/// [`sampled_aspect`].
 #[must_use]
-pub fn whole(texture: Texture, format: vk::Format) -> ViewPlan {
+pub fn whole(texture: Texture, guest_view_format: u16, format: vk::Format) -> ViewPlan {
     ViewPlan {
         view_type: view_type(texture.kind()),
         format,
         range: SubresourceRange {
-            aspect_mask: aspect(texture.pixel_format()),
+            aspect_mask: sampled_aspect(guest_view_format),
             base_mip_level: 0,
             level_count: texture.mip_levels(),
             base_array_layer: 0,
@@ -219,8 +266,9 @@ pub fn attachments(texture: Texture, format: vk::Format) -> Vec<AttachmentView> 
 mod tests {
     use super::*;
     use reims_vgpu_core::pixel_format::{
-        MTL_FORMAT_DEPTH24_UNORM_STENCIL8, MTL_FORMAT_DEPTH32_FLOAT, MTL_FORMAT_RGBA8_UNORM,
-        MTL_FORMAT_STENCIL8,
+        MTL_FORMAT_DEPTH24_UNORM_STENCIL8, MTL_FORMAT_DEPTH32_FLOAT,
+        MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, MTL_FORMAT_RGBA8_UNORM, MTL_FORMAT_STENCIL8,
+        MTL_FORMAT_X24_STENCIL8, MTL_FORMAT_X32_STENCIL8,
     };
     use reims_vgpu_core::texture_shape::{TextureShape, TextureUsage, CUBE_FACES};
 
@@ -303,7 +351,7 @@ mod tests {
         }
         .checked()
         .expect("a cube array");
-        let plan = whole(cube, COLOR);
+        let plan = whole(cube, MTL_FORMAT_RGBA8_UNORM, COLOR);
         assert_eq!(plan.view_type, vk::ImageViewType::CUBE_ARRAY);
         assert_eq!(plan.range.level_count, 7);
         assert_eq!(plan.range.layer_count, 2 * CUBE_FACES);
@@ -313,7 +361,7 @@ mod tests {
 
     #[test]
     fn a_volume_is_one_layer_in_the_whole_view_however_deep_it_is() {
-        let plan = whole(texture(TextureKind::D3), COLOR);
+        let plan = whole(texture(TextureKind::D3), MTL_FORMAT_RGBA8_UNORM, COLOR);
         assert_eq!(plan.view_type, vk::ImageViewType::TYPE_3D);
         assert_eq!(plan.range.layer_count, 1);
     }
@@ -396,14 +444,80 @@ mod tests {
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].plan.range.aspect_mask, vk::ImageAspectFlags::DEPTH);
         assert_eq!(
-            whole(depth, vk::Format::D32_SFLOAT).range.aspect_mask,
+            whole(depth, MTL_FORMAT_DEPTH32_FLOAT, vk::Format::D32_SFLOAT)
+                .range
+                .aspect_mask,
             vk::ImageAspectFlags::DEPTH
         );
     }
 
     #[test]
+    fn a_sampled_view_of_a_combined_texture_names_one_plane_and_the_bind_says_which() {
+        // Both binds are over the same texture and translate to the same
+        // `VkFormat`; the guest ordinal is the only thing that separates them.
+        let combined = TextureShape {
+            pixel_format: MTL_FORMAT_DEPTH32_FLOAT_STENCIL8,
+            ..shape(TextureKind::D2)
+        }
+        .checked()
+        .expect("a combined depth-stencil texture");
+        let native = vk::Format::D32_SFLOAT_S8_UINT;
+
+        // What the texture is made of, which is the attachment's answer and
+        // an illegal sampled view.
+        assert_eq!(
+            aspect(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8),
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        );
+        assert_eq!(
+            attachments(combined, native)[0].plan.range.aspect_mask,
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        );
+
+        // A bind that named the combined format declined the spelling that
+        // names stencil, so it reads depth.
+        assert_eq!(
+            whole(combined, MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, native)
+                .range
+                .aspect_mask,
+            vk::ImageAspectFlags::DEPTH
+        );
+        // And the spelling that exists for no other purpose reads stencil,
+        // over the very same texture.
+        assert_eq!(
+            whole(combined, MTL_FORMAT_X32_STENCIL8, native)
+                .range
+                .aspect_mask,
+            vk::ImageAspectFlags::STENCIL
+        );
+        assert_eq!(
+            whole(combined, MTL_FORMAT_X24_STENCIL8, native)
+                .range
+                .aspect_mask,
+            vk::ImageAspectFlags::STENCIL
+        );
+    }
+
+    #[test]
+    fn no_sampled_aspect_names_two_planes() {
+        // The rule a descriptor write enforces, asserted over every format the
+        // guest can name rather than the four this module happens to import.
+        for format in 0..=u16::MAX {
+            let sampled = sampled_aspect(format);
+            assert_eq!(
+                sampled.as_raw().count_ones(),
+                1,
+                "format {format} sampled as {sampled:?}"
+            );
+            // And it is one of the aspects the format actually has: narrowing,
+            // never inventing.
+            assert!(aspect(format).contains(sampled), "format {format}");
+        }
+    }
+
+    #[test]
     fn a_create_info_carries_the_plan_and_the_identity_swizzle() {
-        let plan = whole(texture(TextureKind::D2), COLOR);
+        let plan = whole(texture(TextureKind::D2), MTL_FORMAT_RGBA8_UNORM, COLOR);
         let image = vk::Image::null();
         let info = plan.create_info(image);
         assert_eq!(info.view_type, plan.view_type);

@@ -38,7 +38,7 @@
 //! representable, and a model that carried the narrow one would take a loss
 //! the wire did not.
 
-use crate::access::{AccessMode, ByteRange};
+use crate::access::{ByteRange, Participation, Participations};
 use crate::bind::{BindSpan, IndirectSource};
 use crate::identity::ResourceId;
 pub use reims_vgpu_protocol::render::{
@@ -308,6 +308,12 @@ pub enum RenderOp {
         slope_scale: FloatBits,
         clamp: FloatBits,
     },
+    /// `setLineWidth:`. One float, and unlike the four ordinals above it is
+    /// not a pipeline decision on any host: `VK_DYNAMIC_STATE_LINE_WIDTH` is
+    /// Vulkan 1.0 core and Metal sets it on the encoder, so it is per-draw
+    /// state everywhere. Whether a draw uses it at all is a joint fact of the
+    /// fill mode and the topology, which only the executor holds.
+    SetLineWidth(FloatBits),
     SetBlendColor {
         red: FloatBits,
         green: FloatBits,
@@ -350,38 +356,6 @@ pub enum RenderOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PassDescriptorSlot(pub u32);
 
-/// The memory a render record names in its own payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecordAccess {
-    pub buffer: ResourceId,
-    pub offset: u64,
-    /// The byte length, when the record's own fields establish one.
-    pub length: Option<u64>,
-    pub mode: AccessMode,
-}
-
-/// Up to two reads: an index buffer and an argument buffer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RecordAccesses {
-    items: [Option<RecordAccess>; 2],
-}
-
-impl RecordAccesses {
-    pub fn iter(&self) -> impl Iterator<Item = &RecordAccess> {
-        self.items.iter().flatten()
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.iter().count()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 impl RenderOp {
     /// Whether this record draws.
     #[must_use]
@@ -395,32 +369,32 @@ impl RenderOp {
     /// [`crate::compute`] gives at length: a bind writes a slot and touches no
     /// memory, and what a draw reads through those slots belongs to the
     /// encoder. What is here is only what the record's own fields name.
+    ///
+    /// A pass descriptor's own footprint is **not** here either, and that is
+    /// not an omission: [`Self::WriteDescriptor`] carries a
+    /// [`PassDescriptorSlot`], so the descriptor is in the transaction's arena
+    /// and only [`crate::exec::ResolvedOperation::participations`] — which
+    /// holds the arena — can reach it.
     #[must_use]
-    pub fn record_accesses(&self) -> RecordAccesses {
+    pub fn participations(&self) -> Participations {
         let Self::Draw(draw) = self else {
-            return RecordAccesses::default();
+            return Participations::NONE;
         };
-        let index = draw.index_read().map(|(source, range)| RecordAccess {
-            buffer: source.buffer,
-            offset: source.offset,
-            length: range.map(|r| r.length),
-            mode: AccessMode::Read,
-        });
-        let arguments = draw.indirect_read().map(|(source, bytes)| RecordAccess {
-            buffer: source.buffer,
-            offset: source.offset,
-            length: Some(bytes),
-            mode: AccessMode::Read,
-        });
-        RecordAccesses {
-            items: [index, arguments],
-        }
+        Participations::pair(
+            draw.index_read().map(|(source, range)| {
+                Participation::buffer_read(source.buffer, source.offset, range.map(|r| r.length))
+            }),
+            draw.indirect_read().map(|(source, bytes)| {
+                Participation::buffer_read(source.buffer, source.offset, Some(bytes))
+            }),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::{AccessMode, ParticipationExtent};
     use crate::identity::{ObjectListRef, SlotGeneration};
     use crate::operation::{classify, OperationClass, OperationHome};
     use reims_vgpu_protocol::closure::{Rail, LEDGER};
@@ -482,15 +456,20 @@ mod tests {
         assert_eq!(from_ledger, from_kinds);
     }
 
-    /// The one refused render-class row keeps its class and its route and has
-    /// no payload.
+    /// Every settled refusal on this rail keeps its class and its route and
+    /// gains no payload.
     ///
-    /// `writeDescriptor` emits the pass's default raster sample count as a
-    /// record of its own, and this rail renders at one sample. Any other value
-    /// is refused by name rather than rendered at the wrong rate — so the
-    /// vocabulary must not be able to represent it.
+    /// A refusal is a record the device declines by name, so the vocabulary
+    /// must not be able to represent it: a `RenderKind` for one would let a
+    /// resolver build an operation for work that is refused, and the refusal
+    /// would then have to be found again somewhere downstream.
+    ///
+    /// The four are the pass's default raster sample count, which this rail
+    /// renders at one and refuses above, and the three store-action options
+    /// records, whose only declared flag asks for programmable sample positions
+    /// this rail does not set.
     #[test]
-    fn the_refused_raster_sample_count_gains_no_payload() {
+    fn every_refused_render_row_gains_no_payload() {
         let refused: Vec<_> = LEDGER
             .iter()
             .filter(|o| {
@@ -498,15 +477,32 @@ mod tests {
                     && is_refused(o)
                     && classify(o) == Some(OperationHome::Stream(OperationClass::Render))
             })
+            .map(|o| {
+                let reims_vgpu_protocol::closure::Closure::Refused { route, .. } = o.closure else {
+                    unreachable!("filtered")
+                };
+                (
+                    o.opcode.expect("a refused render record carries an opcode"),
+                    route,
+                )
+            })
             .collect();
-        assert_eq!(refused.len(), 1);
-        let only = refused[0];
-        assert_eq!(only.opcode, Some(0x1e));
-        assert_eq!(RenderKind::of_opcode(0x1e), None);
-        let reims_vgpu_protocol::closure::Closure::Refused { route, .. } = only.closure else {
-            unreachable!("filtered")
-        };
-        assert_eq!(route, "render_pass_raster_sample_count_dropped");
+        assert_eq!(
+            refused,
+            [
+                (0x1e, "render_pass_raster_sample_count_dropped"),
+                (0x67, "render_store_action_options_dropped"),
+                (0x6a, "render_store_action_options_dropped"),
+                (0x79, "render_store_action_options_dropped"),
+            ]
+        );
+        for (opcode, _) in refused {
+            assert_eq!(
+                RenderKind::of_opcode(opcode),
+                None,
+                "{opcode:#x} is refused and the vocabulary can represent it"
+            );
+        }
     }
 
     /// Every draw shape is reachable from the payload, and the instancing
@@ -654,11 +650,12 @@ mod tests {
         let (source, range) = draw.index_read().expect("reads the index buffer");
         assert_eq!(source.buffer, res(5));
         assert_eq!(range, None);
-        let accesses = RenderOp::Draw(draw).record_accesses();
+        let accesses = RenderOp::Draw(draw).participations();
         assert_eq!(accesses.len(), 2);
-        let index_access = accesses.iter().next().expect("index");
-        assert_eq!(index_access.length, None);
-        assert_eq!(index_access.mode, AccessMode::Read);
+        // No index count in the record, so the claim widens to the whole
+        // buffer rather than narrowing on a guessed span.
+        assert_eq!(accesses[0].extent, ParticipationExtent::Whole);
+        assert_eq!(accesses[0].mode, AccessMode::Read);
     }
 
     /// Both argument blocks are public structures, so both extents are exact
@@ -696,7 +693,7 @@ mod tests {
             vertex_count: 3,
             instances: Instancing::default(),
         };
-        assert!(RenderOp::Draw(draw).record_accesses().is_empty());
+        assert!(RenderOp::Draw(draw).participations().is_empty());
         assert_eq!(draw.index_read(), None);
         assert_eq!(draw.indirect_read(), None);
     }
@@ -723,7 +720,7 @@ mod tests {
             },
         ];
         for op in ops {
-            assert!(op.record_accesses().is_empty());
+            assert!(op.participations().is_empty());
             assert!(!op.is_draw());
         }
     }

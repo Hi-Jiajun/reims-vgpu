@@ -402,6 +402,33 @@ pub const fn effective_api(device: u32, requested: u32) -> u32 {
     }
 }
 
+/// The extension names a device enumerated, or the floor it failed by not
+/// answering.
+///
+/// A driver may fail this query for host or device memory rather than answer
+/// an empty list, and the two are not the same fact. Treating a failure as an
+/// empty list refuses the device for missing whichever extension is checked
+/// first — a reason it never gave — and the operator reading the failure
+/// channel then debugs a swapchain that works. So the failure is its own
+/// floor, and it is the reason this step is separated from the unsafe call
+/// that produces its input.
+fn enumerated_names(
+    enumerated: Result<Vec<vk::ExtensionProperties>, vk::Result>,
+) -> Result<Vec<String>, Floor> {
+    let properties = enumerated.map_err(|result| Floor::Unenumerable { result })?;
+    Ok(properties
+        .iter()
+        .filter_map(|e| {
+            // SAFETY: the driver fills `extension_name` with a NUL-terminated
+            // name; the array is the storage it was written into.
+            unsafe { CStr::from_ptr(e.extension_name.as_ptr()) }
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        })
+        .collect())
+}
+
 /// Read one physical device and hand it to the census.
 ///
 /// `requested` is the instance's `VkApplicationInfo::apiVersion`. It is not
@@ -422,19 +449,12 @@ unsafe fn judge(
     let effective = effective_api(properties.api_version, requested);
     let api = ApiVersion::decode(effective);
 
-    let extension_properties =
-        unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
-    let names: Vec<String> = extension_properties
-        .iter()
-        .filter_map(|e| {
-            // SAFETY: the driver fills `extension_name` with a NUL-terminated
-            // name; the array is the storage it was written into.
-            unsafe { CStr::from_ptr(e.extension_name.as_ptr()) }
-                .to_str()
-                .ok()
-                .map(str::to_owned)
-        })
-        .collect();
+    let names =
+        match enumerated_names(unsafe { instance.enumerate_device_extension_properties(physical) })
+        {
+            Ok(names) => names,
+            Err(floor) => return (class, Err(floor)),
+        };
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let has = |name: &str| names.contains(&name);
 
@@ -556,6 +576,46 @@ unsafe fn judge(
             .contains(vk::FormatFeatureFlags::VERTEX_BUFFER)
     });
 
+    // The two facts that stand in for the feature bit
+    // `VK_EXT_external_memory_host` does not have, asked only where the
+    // extension is present --- a device that does not enumerate it has no
+    // structure to fill in and no handle type to be asked about, exactly as
+    // for the dynamic-state-3 property above.
+    //
+    // `vkGetPhysicalDeviceExternalBufferProperties` is Vulkan 1.1 core and the
+    // baseline is 1.2, so once the handle type is spelled by an advertised
+    // extension the question is always answerable. It takes a usage, and the
+    // usage asked is [`crate::buffer::EVERY_CLASS`], which is exactly what it
+    // says: a `Route::DirectAlias` makes the guest's own pages the resource,
+    // so the import has to serve whichever class that resource turns out to
+    // be. A narrower question would admit a device for a binding it declines.
+    let (host_pointer_importable, min_imported_host_pointer_alignment) =
+        if has(extension::EXTERNAL_MEMORY_HOST) {
+            let info = vk::PhysicalDeviceExternalBufferInfo::default()
+                .usage(crate::buffer::EVERY_CLASS)
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+            let mut external = vk::ExternalBufferProperties::default();
+            unsafe {
+                instance.get_physical_device_external_buffer_properties(
+                    physical,
+                    &info,
+                    &mut external,
+                );
+            }
+            let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
+            unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+            (
+                external
+                    .external_memory_properties
+                    .external_memory_features
+                    .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE),
+                host.min_imported_host_pointer_alignment,
+            )
+        } else {
+            (false, 0)
+        };
+
     let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
     let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
 
@@ -567,6 +627,13 @@ unsafe fn judge(
         dynamic_rendering: dynamic_rendering.dynamic_rendering == vk::TRUE,
         depth_clamp: core_features.depth_clamp == vk::TRUE,
         fill_mode_non_solid: core_features.fill_mode_non_solid == vk::TRUE,
+        wide_lines: core_features.wide_lines == vk::TRUE,
+        line_width_range: properties.limits.line_width_range,
+        multi_viewport: core_features.multi_viewport == vk::TRUE,
+        // Reported by every device and required to be one exactly where the
+        // feature above is off, so the two are read from the same properties
+        // and carried together --- see `crate::raster::ViewportCell`.
+        max_viewports: properties.limits.max_viewports,
         sampler_anisotropy: core_features.sampler_anisotropy == vk::TRUE,
         extended_dynamic_state: extended_dynamic_state.extended_dynamic_state == vk::TRUE,
         dynamic_primitive_topology_unrestricted,
@@ -591,6 +658,8 @@ unsafe fn judge(
         descriptor_buffer: descriptor_buffer.descriptor_buffer == vk::TRUE,
         max_push_descriptors: push.max_push_descriptors,
         max_buffer_size,
+        host_pointer_importable,
+        min_imported_host_pointer_alignment,
         memory: &memory,
         queue_families: &queue_families,
     });
@@ -601,6 +670,60 @@ unsafe fn judge(
 mod tests {
     use super::*;
     use crate::census::DescriptorBufferProbe;
+
+    fn extension(name: &str) -> vk::ExtensionProperties {
+        let mut properties = vk::ExtensionProperties::default();
+        for (slot, byte) in properties
+            .extension_name
+            .iter_mut()
+            .zip(name.as_bytes().iter().copied().chain(std::iter::once(0)))
+        {
+            *slot = byte as std::ffi::c_char;
+        }
+        properties
+    }
+
+    /// The rule: a driver that could not answer said nothing, and nothing is
+    /// not "no extensions".
+    #[test]
+    fn an_unreadable_extension_list_is_its_own_floor() {
+        assert_eq!(
+            enumerated_names(Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)),
+            Err(Floor::Unenumerable {
+                result: vk::Result::ERROR_OUT_OF_HOST_MEMORY
+            }),
+            "the query failing is the fact, not the empty list it would have produced"
+        );
+        assert_ne!(
+            Floor::Unenumerable {
+                result: vk::Result::ERROR_OUT_OF_HOST_MEMORY
+            }
+            .slug(),
+            Floor::NoSwapchain.slug(),
+            "an operator must not read a presentable device as one that cannot present"
+        );
+    }
+
+    /// The other half: a device that genuinely enumerated nothing is judged,
+    /// not refused here.
+    #[test]
+    fn an_empty_extension_list_is_an_answer() {
+        assert_eq!(enumerated_names(Ok(Vec::new())), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn enumerated_names_decodes_what_the_driver_wrote() {
+        assert_eq!(
+            enumerated_names(Ok(vec![
+                extension(extension::SWAPCHAIN),
+                extension(extension::MESH_SHADER),
+            ])),
+            Ok(vec![
+                extension::SWAPCHAIN.to_owned(),
+                extension::MESH_SHADER.to_owned(),
+            ])
+        );
+    }
 
     fn admitted(index: usize, class: DeviceClass) -> Candidate {
         let memory = crate::memory::fixtures::nvidia_discrete();
@@ -622,6 +745,10 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
+            multi_viewport: false,
+            max_viewports: 1,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
@@ -639,6 +766,8 @@ mod tests {
             descriptor_buffer: false,
             max_push_descriptors: 0,
             max_buffer_size: None,
+            host_pointer_importable: false,
+            min_imported_host_pointer_alignment: 0,
             memory: &memory,
             queue_families: &families,
         });
@@ -856,6 +985,10 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
+            multi_viewport: false,
+            max_viewports: 1,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
@@ -873,6 +1006,8 @@ mod tests {
             descriptor_buffer: false,
             max_push_descriptors: 0,
             max_buffer_size: None,
+            host_pointer_importable: false,
+            min_imported_host_pointer_alignment: 0,
             memory: &memory,
             queue_families: &families,
         })

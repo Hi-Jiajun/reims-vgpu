@@ -75,7 +75,8 @@ pub const QUERY_TOTAL_LEN: u32 = 24;
 ///   including `info_buffer_host_resource` — where the queried object **is** a
 ///   buffer, at ref 5151, sitting in `object_ref`. A field that stays 8181 while
 ///   the object's own ref is 5151 is not that object's backing buffer.
-/// * 8181 and `reply_offset`'s `0x9999` are [`STUB_STAGING_REF`-shaped]: they
+/// * 8181 and `reply_offset`'s `0x9999` are `STUB_STAGING_REF`-shaped — the
+///   oracle's `encoder.h` defines both constants — in that they
 ///   are returned only by the capture stream's
 ///   `-getBufferBytes:alignment:buffer:offset:` scratch allocator, from an
 ///   out-parameter Apple's own selector spells `offset:`.
@@ -106,8 +107,6 @@ pub const QUERY_TOTAL_LEN: u32 = 24;
 /// instrument's `UNCOVERED_CLASSES`, which is why the one class where the two
 /// crates provably disagreed is the one it did not check — the disagreement was
 /// found by reading, not by the instrument.
-///
-/// [`STUB_STAGING_REF`-shaped]: the oracle's `encoder.h` defines both constants.
 #[repr(C)]
 #[derive(Debug)]
 pub struct Query {

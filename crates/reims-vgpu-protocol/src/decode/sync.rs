@@ -193,7 +193,7 @@ fn barrier<'a>(
         (BarrierKind::Texture, _) => BarrierRecord::Texture,
         (BarrierKind::Resources, Rail::Render) => {
             let (head, refs) = wire_render::memory_barrier_resources(op).map_err(|_| {
-                overrun(
+                super::counted_head(
                     rail,
                     op,
                     core::mem::size_of::<wire_render::MemoryBarrierResources>(),
@@ -207,7 +207,7 @@ fn barrier<'a>(
         }
         (BarrierKind::Resources, _) => {
             let (_, refs) = wire_compute::memory_barrier_resources(op).map_err(|_| {
-                overrun(
+                super::counted_head(
                     rail,
                     op,
                     core::mem::size_of::<wire_compute::MemoryBarrierResources>(),
@@ -252,28 +252,6 @@ fn barrier<'a>(
             }
         }
     })
-}
-
-/// A counted barrier list that did not fit its record.
-///
-/// The head is read again here rather than threaded out of the failed call: a
-/// list that overruns has a head that parsed, and reporting the guest's count
-/// beside the bytes available is what identifies which of the two is wrong. If
-/// even the head did not fit, the record was short, and that is what is
-/// reported instead.
-fn overrun(rail: Rail, op: &Op<'_>, head_len: usize) -> DecodeRefusal {
-    let have = op.payload.len();
-    if have < head_len {
-        return short(rail, op.opcode(), have, head_len);
-    }
-    let mut count = [0u8; 4];
-    count.copy_from_slice(&op.payload[..4]);
-    DecodeRefusal::CountOverruns {
-        rail,
-        opcode: op.opcode(),
-        count: u32::from_le_bytes(count),
-        have,
-    }
 }
 
 #[cfg(test)]

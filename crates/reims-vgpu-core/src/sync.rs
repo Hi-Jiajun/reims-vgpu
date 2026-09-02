@@ -37,6 +37,7 @@
 //! prerequisite, not a refusal. [`crate::ready`] already draws exactly that
 //! distinction for stamp waits, and an event wait joins it.
 
+use crate::access::Participations;
 use crate::identity::ResourceId;
 /// Re-exported because a barrier's stage mask is part of this vocabulary, and
 /// the executor that has to translate it sees this crate and not the protocol
@@ -57,6 +58,22 @@ pub struct FenceOp {
     /// guest passed zero, and the two mean different things: one is a selector
     /// without the field, the other is a guest declining to use it.
     pub stages: Option<RenderStages>,
+}
+
+impl FenceOp {
+    /// The memory this record names: none.
+    ///
+    /// A fence is an ordering object, not memory. The `ResourceId` it carries
+    /// names the fence itself, and declaring a participation on it would put
+    /// the ordering primitive into the hazard graph as though it were bytes a
+    /// draw could race against — an edge built for the wrong reason, and one
+    /// that would make two waits on one fence look like a write conflict.
+    /// What a fence orders is [`crate::depend`]'s to model, from the fence's
+    /// own semantics.
+    #[must_use]
+    pub const fn participations(&self) -> Participations {
+        Participations::NONE
+    }
 }
 
 /// An event signal or wait.
@@ -88,6 +105,15 @@ impl EventOp {
     #[must_use]
     pub const fn satisfied_by(&self, generation: u64) -> bool {
         matches!(self.kind, EventKind::Wait) && generation >= self.value
+    }
+}
+
+impl EventOp {
+    /// The memory this record names: none, for the reason
+    /// [`FenceOp::participations`] gives.
+    #[must_use]
+    pub const fn participations(&self) -> Participations {
+        Participations::NONE
     }
 }
 
@@ -156,6 +182,22 @@ impl BarrierOp {
             BarrierTarget::Scope(_) => BarrierKind::Scope,
             BarrierTarget::Texture => BarrierKind::Texture,
         }
+    }
+
+    /// The memory this record names: none, and the list it carries is why
+    /// that has to be said rather than assumed.
+    ///
+    /// A `BarrierTarget::Resources` span names resources, and it would be easy
+    /// to read that list as participation. It is not: a barrier neither reads
+    /// nor writes the resources it names, it declares an ordering *about*
+    /// them. Turning the list into read-write accesses would make every
+    /// barrier conflict with every access to everything it named, which is a
+    /// serialisation the guest did not ask for and a publication claim the
+    /// barrier never made. The ordering it does ask for is
+    /// [`Self::orders_anything`] and the dependency layer's to act on.
+    #[must_use]
+    pub const fn participations(&self) -> Participations {
+        Participations::NONE
     }
 
     /// Whether this barrier asks for any ordering at all.

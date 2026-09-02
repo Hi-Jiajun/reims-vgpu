@@ -19,9 +19,10 @@ pub use state::{
     FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView,
     HostLinearTexture, HostSurface, MapperCapture, MappingEntry, PacketFault, PresentBacking,
     PresentState, RailDeviceState, RailResourceState, RenderFlushWitness, ResourceValidity,
-    SurfaceWriteKind, TaskEntry, TaskReferenceStates, TaskResource, TaskResourceLifetimeRef,
-    TaskSamplerState, TaskTable, UnimplementedCommand, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
-    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
+    StorageIncarnation, SurfaceWriteKind, TaskEntry, TaskReferenceStates, TaskResource,
+    TaskResourceLifetimeRef, TaskSamplerState, TaskTable, UnimplementedCommand, FENCE_DOMAIN_BLIT,
+    FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
+    GVA_EVICTION_WITNESS_KEYS,
 };
 
 use crate::backend::Backend;
@@ -126,6 +127,11 @@ mod tests {
 
     use super::*;
     use crate::protocol::endian::st32;
+    use crate::protocol::fifo::DeviceInfoForm;
+
+    /// The request form these tests build. Named once so a test cannot pin an
+    /// offset the decoder does not read.
+    const TAHOE: DeviceInfoForm = DeviceInfoForm::WithKeyLimit;
     use crate::runtime::host::{HostActionKind, HostMemory};
     use crate::runtime::FakeHost;
 
@@ -369,17 +375,19 @@ mod tests {
         // 13.7.8 guest writes. It read 0 here for as long as the offset was
         // thought to be unused, and a ceiling of 0 admits no key at all.
         st32(
-            &mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..],
+            &mut payload[TAHOE
+                .key_table_len_offset()
+                .expect("the newer form carries one")..],
             DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE + 1,
         );
         // A whole page of pair slots, as the guest sends. A short count here
         // would make this test emit the reply-truncated alarm every run, and a
         // standing false alarm in the suite's own log is one nobody reads.
         st32(
-            &mut payload[DEVICE_INFO_TAHOE_COUNT..],
+            &mut payload[TAHOE.pair_capacity_offset()..],
             (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32,
         );
-        st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
+        st32(&mut payload[TAHOE.reply_pfn_offset()..], reply_pfn);
         write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
         d.state
             .gfx
@@ -431,12 +439,17 @@ mod tests {
             0xee,
         );
         let mut payload = vec![0u8; 12];
-        st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], 45);
         st32(
-            &mut payload[DEVICE_INFO_TAHOE_COUNT..],
+            &mut payload[TAHOE
+                .key_table_len_offset()
+                .expect("the newer form carries one")..],
+            45,
+        );
+        st32(
+            &mut payload[TAHOE.pair_capacity_offset()..],
             (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32,
         );
-        st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
+        st32(&mut payload[TAHOE.reply_pfn_offset()..], reply_pfn);
         write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
         d.state
             .gfx
@@ -505,14 +518,16 @@ mod tests {
             );
             let mut payload = vec![0u8; 12];
             st32(
-                &mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..],
+                &mut payload[TAHOE
+                    .key_table_len_offset()
+                    .expect("the newer form carries one")..],
                 key_table_len,
             );
             st32(
-                &mut payload[DEVICE_INFO_TAHOE_COUNT..],
+                &mut payload[TAHOE.pair_capacity_offset()..],
                 (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32,
             );
-            st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
+            st32(&mut payload[TAHOE.reply_pfn_offset()..], reply_pfn);
             write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
             d.state
                 .gfx

@@ -24,7 +24,7 @@
 //! stale ring on a real wire. The body below therefore stops at 20 bytes rather
 //! than covering the record, which is why this module has no
 //! `size_of + OP_HEADER_LEN == TOTAL_LEN` assertion and has
-//! [`the_body_stops_where_the_serializer_stopped_writing`] instead.
+//! `tests::the_body_stops_where_the_serializer_stopped_writing` instead.
 //!
 //! The same measurement is why [`SamplerBody::flags`] is a `u8` and not the
 //! `u32` its slot is: bits `[3:0]` of that byte are written and everything

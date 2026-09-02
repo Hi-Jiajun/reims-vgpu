@@ -40,9 +40,10 @@
 //! for the ordinary case of one encoder updating a fence a later encoder in
 //! the same packet waits on.
 
-use crate::exec::{ExecTransaction, Prerequisite, ResolvedOperation};
+use crate::exec::{Prerequisite, ResolvedOperation};
 use crate::identity::{IngressOrdinal, ResourceId, StampSlot, StampValue};
 use crate::sync::EventKind;
+use crate::transaction::DeviceTransaction;
 use std::collections::HashMap;
 
 /// A point a transaction waits for, in the two device-scoped flavours that
@@ -97,6 +98,11 @@ impl Production {
 pub enum Diagnosis {
     /// A waiter names a point that nothing admitted, and nothing already
     /// published, produces.
+    ///
+    /// The waiter's own productions do not count — see
+    /// `WaitGraph::produced_by_another` — so a packet that waits only for a
+    /// point it alone publishes lands here, which is what it is: no packet that
+    /// could run first produces it.
     Unproduced {
         waiter: IngressOrdinal,
         point: WaitPoint,
@@ -104,6 +110,16 @@ pub enum Diagnosis {
     /// A set of transactions wait on each other, so none of them can run
     /// first. Members are in ingress order and the cycle is reported once,
     /// keyed on its lowest member.
+    ///
+    /// **Not a deadlock proof, and no caller may treat it as one.** A wait with
+    /// several producers is answered by *any* of them, so the edge set is a
+    /// choice and this search treats it as an obligation: two packets that each
+    /// publish and wait for the same stamp slot are a cycle here even when an
+    /// earlier packet publishes that point and answers them both. Making
+    /// `schedule::eligible` refuse on this refused ordinary batches, which is
+    /// how the gap was found. What `eligible` refuses instead is a wait whose
+    /// *earliest* producer is not earlier than the waiter, which is sound and
+    /// which every real cycle also fails.
     Cycle {
         members: Vec<IngressOrdinal>,
         /// One wait that closes the cycle, so the report names a resource and
@@ -182,48 +198,80 @@ impl WaitGraph {
         }
     }
 
-    /// Admit a transaction: its packet-level prerequisites become waits and
-    /// its stamp and event signals become productions.
+    /// Whether some transaction *other than* `waiter` produces `wait`.
+    ///
+    /// **The one place the self rule lives.** A packet-level prerequisite is
+    /// checked before any of the packet's own records run, so the packet's own
+    /// signal or completion stamp cannot answer it — the packet is not a
+    /// producer for its own wait, in this graph's edges or in its diagnosis.
+    /// Spelled once because the two used to disagree: [`Self::edges`] counted
+    /// the waiter as its own producer while its documentation said it did not,
+    /// and [`Self::diagnose`] counted it too, so a packet that waited only for
+    /// a point it alone published was never reported as unproduced.
+    #[must_use]
+    fn produced_by_another(&self, waiter: IngressOrdinal, wait: WaitPoint) -> bool {
+        self.nodes
+            .iter()
+            .filter(|n| n.ordinal != waiter)
+            .any(|n| n.produces.iter().any(|p| p.discharges(wait)))
+    }
+
+    /// Admit a transaction: its prerequisites become waits and its stamp and
+    /// event signals become productions.
+    ///
+    /// Takes the envelope, not the EXEC view, because a completion stamp and a
+    /// stamp wait belong to every class of packet. A graph that only saw EXECs
+    /// would find a wait unproduced whenever the packet that publishes it is a
+    /// control command or a present.
     ///
     /// A signal record is a production even though it happens partway through
     /// the packet, because the packet's completion is the earliest point at
     /// which any *other* packet may rely on it. Treating it as available
     /// earlier would be a claim about record-level publication that no
     /// cross-packet consumer can observe.
-    pub fn admit(&mut self, tx: &ExecTransaction) {
-        let mut waits = Vec::new();
-        for prerequisite in &tx.prerequisites {
-            match *prerequisite {
-                Prerequisite::Stamp(w) => waits.push(WaitPoint::Stamp {
-                    slot: w.slot,
-                    value: w.value,
-                }),
-                Prerequisite::Event { event, value } => {
-                    waits.push(WaitPoint::Event { event, value });
-                }
-                // Encoder-scoped. See the module documentation.
-                Prerequisite::Fence { .. } => {}
-            }
-        }
+    pub fn admit(&mut self, tx: &DeviceTransaction) {
+        // The envelope's waits, which every class of packet has, and then the
+        // records', which only an EXEC has. One list, from two sources that
+        // decode at different times: the stamp waits before any side effect at
+        // ingress, the event waits as the records resolve.
+        let mut waits: Vec<WaitPoint> = tx
+            .stamp_waits
+            .iter()
+            .map(|w| WaitPoint::Stamp {
+                slot: w.slot,
+                value: w.value,
+            })
+            .collect();
         let mut produces = Vec::new();
-        if let Some(stamp) = tx.publication.stamp {
+        if let Some(stamp) = tx.completion {
             produces.push(Production::Stamp {
                 slot: stamp.slot,
                 value: stamp.value,
             });
         }
-        for record in tx.records() {
-            if let ResolvedOperation::Event(event) = record.op {
-                if event.kind == EventKind::Signal {
-                    produces.push(Production::Event {
-                        event: event.event,
-                        value: event.value,
-                    });
+        if let Some(exec) = tx.exec() {
+            for prerequisite in exec.prerequisites() {
+                match *prerequisite {
+                    Prerequisite::Event { event, value } => {
+                        waits.push(WaitPoint::Event { event, value });
+                    }
+                    // Encoder-scoped. See the module documentation.
+                    Prerequisite::Fence { .. } => {}
+                }
+            }
+            for record in exec.records() {
+                if let ResolvedOperation::Event(event) = record.op {
+                    if event.kind == EventKind::Signal {
+                        produces.push(Production::Event {
+                            event: event.event,
+                            value: event.value,
+                        });
+                    }
                 }
             }
         }
         self.nodes.push(Node {
-            ordinal: tx.ingress,
+            ordinal: tx.identity.ingress,
             waits,
             produces,
         });
@@ -259,10 +307,16 @@ impl WaitGraph {
     /// Waiter-to-producer edges, one per (waiter, wait, producer) triple.
     ///
     /// A wait already discharged by [`Self::satisfy`] produces no edge, and a
-    /// transaction never depends on itself: a packet-level prerequisite is
-    /// checked before the packet's own records run, so its own signal cannot
-    /// answer it. A self-wait is therefore reported by [`Self::diagnose`] as a
-    /// one-member cycle rather than as an edge.
+    /// transaction never depends on itself — see `Self::produced_by_another`,
+    /// which is the one place that rule lives.
+    ///
+    /// A self-wait used to be an edge, `(n, wait, n)`, which the doc here had
+    /// always denied. A consumer that read it as an ordering constraint had one
+    /// transaction waiting for itself: `schedule::eligible` refused the batch,
+    /// but as a wait on a *later* producer whose ordinal was the waiter's own,
+    /// which names the wrong problem. It is now [`Diagnosis::Unproduced`],
+    /// because a point no packet other than the waiter produces is a point
+    /// nothing that could run first produces.
     #[must_use]
     pub fn edges(&self) -> Vec<(IngressOrdinal, WaitPoint, IngressOrdinal)> {
         let mut out = Vec::new();
@@ -271,7 +325,7 @@ impl WaitGraph {
                 if self.already_published(wait) {
                     continue;
                 }
-                for other in &self.nodes {
+                for other in self.nodes.iter().filter(|o| o.ordinal != node.ordinal) {
                     if other.produces.iter().any(|p| p.discharges(wait)) {
                         out.push((node.ordinal, wait, other.ordinal));
                     }
@@ -300,11 +354,7 @@ impl WaitGraph {
                 if self.already_published(wait) {
                     continue;
                 }
-                if !self
-                    .nodes
-                    .iter()
-                    .any(|n| n.produces.iter().any(|p| p.discharges(wait)))
-                {
+                if !self.produced_by_another(self.nodes[i].ordinal, wait) {
                     out.push(Diagnosis::Unproduced {
                         waiter: self.nodes[i].ordinal,
                         point: wait,
@@ -389,12 +439,9 @@ enum Colour {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::ExecBuilder;
-    use crate::identity::{
-        ChannelId, ChannelSequence, CompletionStamp, ObjectListRef, SessionGeneration,
-        SlotGeneration, StampWait,
-    };
-    use crate::stream::SegmentKind;
+    use crate::access::StubRegistry;
+    use crate::identity::{ChannelId, CompletionStamp, ObjectListRef, SlotGeneration, StampWait};
+    use crate::stream::{SegmentKind, SegmentLifetime};
     use crate::sync::EventOp;
 
     fn res(slot: u32) -> ResourceId {
@@ -404,17 +451,16 @@ mod tests {
         }
     }
 
-    fn builder(ingress: u64) -> ExecBuilder {
-        ExecBuilder::new(
-            SessionGeneration::FIRST,
-            ChannelId(1),
-            ChannelSequence(ingress),
-            IngressOrdinal(ingress),
-        )
+    fn builder(ingress: u64) -> crate::testing::At {
+        crate::testing::At::new(1, ingress)
     }
 
     /// A packet that waits for `waits` (event, value) and signals `signals`.
-    fn packet(ingress: u64, waits: &[(u32, u64)], signals: &[(u32, u64)]) -> ExecTransaction {
+    fn packet(
+        ingress: u64,
+        waits: &[(u32, u64)],
+        signals: &[(u32, u64)],
+    ) -> crate::transaction::DeviceTransaction {
         let mut b = builder(ingress);
         for &(event, value) in waits {
             b.require(Prerequisite::Event {
@@ -423,14 +469,20 @@ mod tests {
             });
         }
         if !signals.is_empty() {
-            b.begin_segment(SegmentKind::Event.wire_type(), false)
-                .expect("segment opens");
+            b.begin_segment(
+                SegmentKind::Event.wire_type(),
+                SegmentLifetime::SELF_CONTAINED,
+            )
+            .expect("segment opens");
             for &(event, value) in signals {
-                b.record(ResolvedOperation::Event(EventOp {
-                    kind: EventKind::Signal,
-                    event: res(event),
-                    value,
-                }))
+                b.record(
+                    ResolvedOperation::Event(EventOp {
+                        kind: EventKind::Signal,
+                        event: res(event),
+                        value,
+                    }),
+                    &mut StubRegistry(ChannelId(1)),
+                )
                 .expect("a signal records");
             }
             b.end_segment().expect("segment closes");
@@ -506,21 +558,64 @@ mod tests {
         assert_eq!(members, &[IngressOrdinal(1), IngressOrdinal(2)]);
     }
 
+    /// A packet's own signal is not a producer for its own prerequisite, so a
+    /// wait only it answers is a wait nothing that could run first answers.
     #[test]
-    fn a_packet_waiting_for_its_own_signal_is_a_one_member_cycle() {
+    fn a_packet_waiting_for_its_own_signal_has_no_producer() {
         let mut g = WaitGraph::new();
         g.admit(&packet(1, &[(7, 1)], &[(7, 1)]));
+        assert!(
+            g.edges().is_empty(),
+            "a transaction never depends on itself"
+        );
         assert_eq!(
             g.diagnose(),
-            vec![Diagnosis::Cycle {
-                members: vec![IngressOrdinal(1)],
-                closed_by: WaitPoint::Event {
+            vec![Diagnosis::Unproduced {
+                waiter: IngressOrdinal(1),
+                point: WaitPoint::Event {
                     event: res(7),
                     value: 1
                 },
             }],
             "a packet-level prerequisite is checked before the packet's own \
              records run, so its own signal cannot answer it"
+        );
+        assert_eq!(
+            crate::schedule::eligible(&[packet(1, &[(7, 1)], &[(7, 1)])])
+                .unwrap_err()
+                .slug(),
+            "schedule_unanswered_wait",
+            "and the refusal names that, not a producer that is merely later"
+        );
+    }
+
+    /// **A wait with several producers is answered by any of them.**
+    ///
+    /// Two packets that each publish and wait for the same point close a
+    /// circuit in the edge set, and the cycle search reports it — but an
+    /// earlier packet publishing that point answers them both, and the batch
+    /// runs. Pinned because making `schedule::eligible` refuse on
+    /// [`Diagnosis::Cycle`] refused batches of exactly this shape.
+    #[test]
+    fn a_cycle_in_the_edges_is_not_a_deadlock_when_something_earlier_answers_it() {
+        let mut g = WaitGraph::new();
+        g.admit(&packet(1, &[], &[(7, 1)]));
+        g.admit(&packet(2, &[(7, 1)], &[(7, 1)]));
+        g.admit(&packet(3, &[(7, 1)], &[(7, 1)]));
+        assert!(
+            g.diagnose()
+                .iter()
+                .any(|d| matches!(d, Diagnosis::Cycle { .. })),
+            "the search reports the circuit between 2 and 3"
+        );
+        assert!(
+            crate::schedule::eligible(&[
+                packet(1, &[], &[(7, 1)]),
+                packet(2, &[(7, 1)], &[(7, 1)]),
+                packet(3, &[(7, 1)], &[(7, 1)]),
+            ])
+            .is_ok(),
+            "and the batch is ordinary: packet 1 answers both waits"
         );
     }
 
@@ -551,10 +646,10 @@ mod tests {
     #[test]
     fn a_stamp_wait_participates_and_a_wrapped_value_still_discharges_it() {
         let mut b = builder(1);
-        b.require(Prerequisite::Stamp(StampWait {
+        b.wait_for(StampWait {
             slot: StampSlot(2),
             value: StampValue(1),
-        }));
+        });
         let waiter = b.finish().expect("frozen");
         let mut g = WaitGraph::new();
         g.satisfy(Production::Stamp {
@@ -590,10 +685,10 @@ mod tests {
     #[test]
     fn a_completion_stamp_answers_a_stamp_wait_from_another_packet() {
         let mut waiter = builder(1);
-        waiter.require(Prerequisite::Stamp(StampWait {
+        waiter.wait_for(StampWait {
             slot: StampSlot(2),
             value: StampValue(5),
-        }));
+        });
         let waiter = waiter.finish().expect("frozen");
         let mut producer = builder(2);
         producer.publish_stamp(CompletionStamp {

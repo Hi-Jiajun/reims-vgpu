@@ -47,8 +47,9 @@ Persist only the resulting field, layout, lifetime, ordering, or calling-convent
   capabilities into placement and transfer policy. It sees `ash`, the semantic
   model, the refusal vocabulary and the operator switches, and nothing of QEMU,
   the device model, guest-RAM ownership or decode.
-- `crates/reims-vgpu-testkit`: shared behavioral fixtures — where the oracle's
-  capture is, whether it is there, and how the suites that read it read it.
+- `crates/reims-vgpu-testkit`: shared behavioral fixtures and test instruments —
+  where the oracle's capture is, whether it is there, how the suites that read it
+  read it, and the allocation counter the structural-zero suites measure with.
 - `conformance`: native-oracle and guest-visible compatibility cases.
 - `vm`: rail-selected, snapshot-reverting boot harnesses.
 
@@ -98,6 +99,37 @@ Do not generalize observations between architectures, backends, memory topologie
 classes, or guest rails. Vulkan 1.2 is the baseline; newer functionality requires a
 capability-gated fallback. Host-pointer import is optional, and guest-visible semantics must be the
 same on imported and copying paths.
+
+## Wire a finished subsystem immediately
+
+The replacement architecture is landing subsystem by subsystem, and each one **joins production in
+the commit that finishes it**. A subsystem that exists but is reachable only from its own tests has
+not been verified against a guest; a release that switches thirty of them at once has no bisect
+that can attribute a regression to one. So a subsystem is done when its legacy counterpart is gone
+or delegates to it — not when it compiles.
+
+What this does *not* license is two semantic models running at once. No per-packet feature switch
+choosing between executors, no shadow execution that mutates state twice, no adapter translating
+between an old model and a new one. A call site that *replaces* its own logic with a call into the
+owning crate creates no second model, and is the shape to reach for.
+
+Wire in order of how little state moves. A pure translation or plan module — a function of its
+inputs returning a value — wires first: the caller keeps its ownership and loses only its duplicate
+arithmetic, so a regression points at one table. Modules owning handles, caches, or submission
+lifetimes wire once the model that owns those lifetimes is in place, because they cannot be split.
+
+The same rule decides how the final ingress switch is cut. **A packet class moves to the new model
+alone exactly when nothing it owns is ordered against, or shares mutable state with, anything still
+on the legacy path. Classes that do share such state move together, and that group — not
+"everything" — is the atomic unit.** Two models are dangerous because they can disagree about one
+piece of state; where there is no shared state there is nothing to disagree about, and holding a
+disjoint class back buys no safety while costing the bisect it could have provided.
+
+State the disjointness before moving a group and make it hold structurally — named owners, not an
+argument that the current call sites happen not to overlap. If it cannot be made to hold, the group
+is larger than it looked: enlarge it rather than move anyway. Within a group the switch is atomic
+and the legacy counterpart is deleted in the same commit. Order the groups by how little state they
+move; the ordering and publication core is last, and carries the scheduler's deletion.
 
 ## Working and verification
 

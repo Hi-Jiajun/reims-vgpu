@@ -26,10 +26,14 @@
 //! the closure ledger: every packet class the ledger has judged maps to exactly
 //! one payload, and every class it has *not* judged maps to none.
 
-use crate::access::AccessIntent;
-use crate::identity::{
-    ChannelId, ChannelSequence, CompletionStamp, IngressOrdinal, SessionGeneration, StampWait,
-};
+use crate::access::{AccessIntent, AccessKey, AccessMode, ResourceKey};
+use crate::control::ControlOp;
+use crate::exec::ExecWork;
+use crate::identity::{ChannelId, ResourceId};
+use crate::identity::{CompletionStamp, StampWait, TransactionIdentity};
+use crate::lifecycle::LifecycleOp;
+use crate::present::PresentPacket;
+use crate::query::QueryRequest;
 use reims_vgpu_protocol::closure::Closure;
 use reims_vgpu_protocol::packets::{find, Channel};
 
@@ -138,6 +142,348 @@ pub fn is_acknowledged_noop(channel: Channel, opcode: u16) -> bool {
     )
 }
 
+/// What a transaction carries, and what it touches.
+///
+/// # The class was a discriminant, and a discriminant executes nothing
+///
+/// [`PayloadClass`] answers "which kind of work is this" at ingress, before
+/// anything is decoded. It is not the work. A `DeviceTransaction` that carried
+/// only the class named a packet it could not describe: an executor holding one
+/// had to go back to the bytes, and every access the packet made had to be
+/// stated *beside* the class in a list nothing tied to it.
+///
+/// That "beside" is the defect. An envelope with its own `accesses` field and a
+/// payload with its own contents are two descriptions of one packet that can
+/// disagree — a delete whose envelope named a backing its op did not, an EXEC
+/// whose envelope listed accesses its records never made. Both were
+/// representable, and a hazard edge built from the wrong one is a race rather
+/// than a slowdown.
+///
+/// So the payload owns what it touches, and [`Self::accesses`] is the only way
+/// to ask. There is one list per transaction and the payload is holding it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Payload {
+    /// The GPU-work transaction. Its accesses are its records', collected by
+    /// [`crate::exec::ExecBuilder`] as they resolved; nothing else may add to
+    /// them.
+    Exec(ExecWork),
+    /// One lifetime operation, and the resources it touches as the namespace
+    /// that owns them resolved.
+    ResourceLifecycle(LifecyclePayload),
+    /// A question, and the write its answer will make.
+    Query(QueryPayload),
+    /// What the guest asked to show, and the frame reading it.
+    Present(PresentPayload),
+    /// A control operation. **No access list, and that is a contract claim
+    /// rather than an omission**: opening a channel, moving a cursor, acking a
+    /// display and doing nothing all touch no guest resource, so a control
+    /// packet that appeared to have one would be a decode error somewhere
+    /// upstream. Held to by `control_transactions_touch_no_resource`.
+    Control(ControlOp),
+}
+
+/// A lifetime operation and the accesses that resolve it.
+///
+/// **The two have to describe the same work, and until this type they did not
+/// have to.** `Payload`'s own doc says the payload owns what it touches so an
+/// envelope and its operation cannot disagree; a `Synchronize` naming three
+/// resources beside an access list naming two others was representable, and the
+/// hazard edges built from the list would order the operation against memory it
+/// does not use while leaving the memory it does use unordered.
+///
+/// [`LifecycleOp::resources`] is the operation's own statement. When it is
+/// non-empty, [`Self::new`] requires the accesses to name exactly that set —
+/// every one of them, and nothing else. When it is empty the operation makes no
+/// per-resource statement (a task teardown, a map notice) and the access list is
+/// the only one there is, so nothing here constrains it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LifecyclePayload {
+    op: LifecycleOp,
+    accesses: Vec<AccessIntent>,
+}
+
+/// Why an operation and the accesses offered for it do not describe the same
+/// work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessMismatch {
+    /// An access names a resource the operation does not. The edges it builds
+    /// order this operation against memory it never touches.
+    Unnamed { resource: ResourceId },
+    /// A resource the operation names has no access. Nothing orders the
+    /// operation against work still reading it, which for a delete or a discard
+    /// is a use-after-free.
+    Unaccessed { resource: ResourceId },
+}
+
+impl AccessMismatch {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Unnamed { .. } => "lifecycle_access_names_unnamed_resource",
+            Self::Unaccessed { .. } => "lifecycle_resource_has_no_access",
+        }
+    }
+}
+
+impl LifecyclePayload {
+    /// Build the payload, holding the accesses to the operation's own resource
+    /// list.
+    ///
+    /// `resolved` pairs each access with the resource it was resolved for,
+    /// because the two live in different name spaces: an operation names
+    /// [`ResourceId`]s and an access names a backing. Only the resolver knows
+    /// which is which, so it says so here rather than leaving the join to be
+    /// re-derived — or not made at all.
+    ///
+    /// # Errors
+    ///
+    /// [`AccessMismatch`] when the two sets differ in either direction.
+    pub fn new(
+        op: LifecycleOp,
+        resolved: Vec<(ResourceId, AccessIntent)>,
+    ) -> Result<Self, AccessMismatch> {
+        if !op.resources().is_empty() {
+            for (resource, _) in &resolved {
+                if !op.resources().contains(resource) {
+                    return Err(AccessMismatch::Unnamed {
+                        resource: *resource,
+                    });
+                }
+            }
+            for resource in op.resources() {
+                if !resolved.iter().any(|(named, _)| named == resource) {
+                    return Err(AccessMismatch::Unaccessed {
+                        resource: *resource,
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            op,
+            accesses: resolved.into_iter().map(|(_, access)| access).collect(),
+        })
+    }
+
+    #[must_use]
+    pub const fn op(&self) -> &LifecycleOp {
+        &self.op
+    }
+
+    #[must_use]
+    pub fn accesses(&self) -> &[AccessIntent] {
+        &self.accesses
+    }
+}
+
+/// A present and the reads it makes of what it shows.
+///
+/// Two claims the free `{ packet, accesses }` pair could not make.
+///
+/// **Every access is for the mapping the packet names.** A present shows one
+/// thing — the guest's display pipe serializes plane 0's surface into a
+/// fixed-size command and there is no plane list on the wire — so an access
+/// resolved for a different mapping is an envelope describing a frame the
+/// packet did not ask for. More than one access is still legitimate: a
+/// biplanar surface is two planes of one mapping.
+///
+/// **No access writes.** A present reads what the guest already produced; the
+/// writer is the EXEC the present waits for. Modelled as a writer it would
+/// reserve a content version, beat the real writer's, and publish bytes nothing
+/// produced.
+///
+/// The list may not be empty. A present that names nothing is ordered against
+/// nothing and shows whatever happens to be at the surface — the stale-frame
+/// class. A target that could not be resolved says so with
+/// [`AccessKey::DomainOnly`], which is the vocabulary for exactly that and
+/// which still buys submission-domain ordering.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PresentPayload {
+    packet: PresentPacket,
+    accesses: Vec<AccessIntent>,
+}
+
+/// Why a present's accesses do not describe the frame its packet asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentMismatch {
+    /// An access was resolved for a mapping this packet does not show.
+    NotTheTarget {
+        shown: crate::identity::MappingId,
+        named: crate::identity::MappingId,
+    },
+    /// An access writes. A present reads.
+    Writes { mode: AccessMode },
+    /// No access at all, so nothing orders the present against the work that
+    /// draws the frame.
+    NothingNamed,
+}
+
+impl PresentMismatch {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::NotTheTarget { .. } => "present_access_names_another_mapping",
+            Self::Writes { .. } => "present_access_writes",
+            Self::NothingNamed => "present_names_nothing",
+        }
+    }
+}
+
+impl PresentPayload {
+    /// Build the payload, holding the accesses to the packet's own target.
+    ///
+    /// `resolved` pairs each access with the mapping it was resolved for, for
+    /// [`LifecyclePayload::new`]'s reason: a packet names a mapping and an
+    /// access names a backing, and only the mapper knows which is which.
+    ///
+    /// # Errors
+    ///
+    /// [`PresentMismatch`] when an access names another mapping, writes, or
+    /// when there are none.
+    pub fn new(
+        packet: PresentPacket,
+        resolved: Vec<(crate::identity::MappingId, AccessIntent)>,
+    ) -> Result<Self, PresentMismatch> {
+        if resolved.is_empty() {
+            return Err(PresentMismatch::NothingNamed);
+        }
+        for (named, access) in &resolved {
+            if *named != packet.mapping {
+                return Err(PresentMismatch::NotTheTarget {
+                    shown: packet.mapping,
+                    named: *named,
+                });
+            }
+            if access.mode.writes() {
+                return Err(PresentMismatch::Writes { mode: access.mode });
+            }
+        }
+        Ok(Self {
+            packet,
+            accesses: resolved.into_iter().map(|(_, access)| access).collect(),
+        })
+    }
+
+    #[must_use]
+    pub const fn packet(&self) -> &PresentPacket {
+        &self.packet
+    }
+
+    #[must_use]
+    pub fn accesses(&self) -> &[AccessIntent] {
+        &self.accesses
+    }
+}
+
+/// A query and the one access it makes.
+///
+/// **The access is not a field beside the request; it is derived from it.** A
+/// query touches exactly one thing — the window its reply is written into — and
+/// that window is already named by [`QueryRequest::destination`]. Held as a
+/// `Vec<AccessIntent>` beside the request, as the other classes hold theirs, it
+/// was free to be empty or to name something else, and either is a real defect:
+/// an answer the dependency graph does not know about is content a later
+/// transfer may overwrite between the write and the guest's read, which is
+/// exactly what [`crate::query::ReplyWrite`]'s `#[must_use]` says.
+///
+/// So the fields are private and [`Self::new`] is the only way in. The
+/// alternative — a public pair and a test that they agree — is a rule someone
+/// has to remember at each construction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryPayload {
+    request: QueryRequest,
+    access: AccessIntent,
+}
+
+impl QueryPayload {
+    /// Build the payload for a query, deriving its access from its destination.
+    ///
+    /// `output` is the content version the write reserves, `None` when the
+    /// destination's content is not versioned. The mode is
+    /// [`AccessMode::Write`] and never read-modify-write: a reply is written
+    /// whole and this device reads nothing at the destination — a guest's
+    /// previous contents there are what it would see if no answer landed, which
+    /// is the failure this write exists to prevent, not an input to it.
+    #[must_use]
+    pub fn new(
+        request: QueryRequest,
+        domain: ChannelId,
+        output: Option<crate::access::ContentVersion>,
+    ) -> Self {
+        let destination = request.destination;
+        Self {
+            request,
+            access: AccessIntent {
+                domain,
+                key: AccessKey::Range(
+                    ResourceKey {
+                        backing: destination.backing,
+                        // A reply destination is a guest buffer the request
+                        // named, not a window of a heap this device placed.
+                        heap: None,
+                    },
+                    destination.bytes,
+                ),
+                mode: AccessMode::Write,
+                // A reply is written by the device, not by a pipeline stage.
+                api_stages: 0,
+                input_content_version: None,
+                output_content_version: output,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &QueryRequest {
+        &self.request
+    }
+
+    /// The write the answer will make. There is exactly one.
+    #[must_use]
+    pub const fn access(&self) -> &AccessIntent {
+        &self.access
+    }
+}
+
+impl Payload {
+    /// Which class this is.
+    #[must_use]
+    pub const fn class(&self) -> PayloadClass {
+        match self {
+            Self::Exec(_) => PayloadClass::Exec,
+            Self::ResourceLifecycle(_) => PayloadClass::ResourceLifecycle,
+            Self::Query(_) => PayloadClass::Query,
+            Self::Present(_) => PayloadClass::Present,
+            Self::Control(_) => PayloadClass::Control,
+        }
+    }
+
+    /// Everything this transaction touches, at the precision the contract
+    /// supplied.
+    ///
+    /// Empty is a claim — that the transaction touches no resource — and not an
+    /// absence of information; imprecision is
+    /// [`crate::access::AccessKey::DomainOnly`].
+    #[must_use]
+    pub fn accesses(&self) -> &[AccessIntent] {
+        match self {
+            Self::Exec(work) => &work.accesses,
+            Self::ResourceLifecycle(lifecycle) => lifecycle.accesses(),
+            Self::Present(present) => present.accesses(),
+            Self::Query(query) => std::slice::from_ref(query.access()),
+            Self::Control(_) => &[],
+        }
+    }
+
+    /// The EXEC work, for the executor that is the only reader entitled to it.
+    #[must_use]
+    pub const fn exec(&self) -> Option<&ExecWork> {
+        match self {
+            Self::Exec(work) => Some(work),
+            _ => None,
+        }
+    }
+}
+
 /// One accepted packet, with everything the model needs and nothing a host
 /// would.
 ///
@@ -148,16 +494,10 @@ pub fn is_acknowledged_noop(channel: Channel, opcode: u16) -> bool {
 /// [`Self::accesses`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeviceTransaction {
-    /// The semantic lifetime this was accepted in. A reset opens a new one and
-    /// does not invalidate this.
-    pub session: SessionGeneration,
-    /// The submission ordering domain.
-    pub channel: ChannelId,
-    /// Position within that domain.
-    pub channel_sequence: ChannelSequence,
-    /// Position in the device's single arrival order. Assigned once and never
-    /// re-derived; see [`crate::depend`] for what that buys.
-    pub ingress: IngressOrdinal,
+    /// Where this packet sits, in every order the device keeps. Assigned by
+    /// [`crate::session::SessionModel::admit`], which is the only service that
+    /// observes arrival — see [`TransactionIdentity`].
+    pub identity: TransactionIdentity,
     /// Points that must be published before this may begin. Decoded at ingress
     /// and before any packet side effect, because a packet that acted and then
     /// discovered it had to wait has already happened.
@@ -165,18 +505,283 @@ pub struct DeviceTransaction {
     /// What this publishes when its work has completed, if it publishes
     /// anything.
     pub completion: Option<CompletionStamp>,
-    pub payload: PayloadClass,
-    /// Everything this transaction touches, at the precision the contract
-    /// supplied. Empty is a claim — that the transaction touches no resource —
-    /// and not an absence of information; imprecision is
-    /// [`crate::access::AccessKey::DomainOnly`].
-    pub accesses: Vec<AccessIntent>,
+    /// The work, and everything it touches. There is no access list beside it;
+    /// see [`Payload`].
+    pub payload: Payload,
+}
+
+impl DeviceTransaction {
+    /// Everything this transaction touches.
+    #[must_use]
+    pub fn accesses(&self) -> &[AccessIntent] {
+        self.payload.accesses()
+    }
+
+    /// Which class of work this is.
+    #[must_use]
+    pub const fn class(&self) -> PayloadClass {
+        self.payload.class()
+    }
+
+    /// This transaction as the executor sees it, when it is GPU work.
+    ///
+    /// Derived, not stored. The identity is this envelope's and the work is
+    /// this envelope's payload, so there is no copy to keep in step — which is
+    /// the whole reason [`crate::exec::ExecTransaction`] borrows.
+    #[must_use]
+    pub const fn exec(&self) -> Option<crate::exec::ExecTransaction<'_>> {
+        match self.payload.exec() {
+            Some(work) => Some(work.stamp(self.identity)),
+            None => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use reims_vgpu_protocol::packets::LEDGER;
+
+    fn resource(slot: u32) -> ResourceId {
+        ResourceId {
+            slot: crate::identity::ObjectListRef(slot),
+            generation: crate::identity::SlotGeneration(1),
+        }
+    }
+
+    fn whole(backing: u64) -> AccessIntent {
+        AccessIntent {
+            domain: ChannelId(1),
+            key: AccessKey::Whole(ResourceKey {
+                backing: crate::access::BackingId(backing),
+                heap: None,
+            }),
+            mode: AccessMode::ReadWrite,
+            api_stages: 0,
+            input_content_version: None,
+            output_content_version: None,
+        }
+    }
+
+    /// An operation that names resources and an envelope that names others
+    /// used to be representable, and the edges built from the envelope would
+    /// have ordered the operation against memory it does not touch.
+    #[test]
+    fn a_lifecycle_envelope_must_name_the_operations_own_resources() {
+        let op = crate::lifecycle::LifecycleOp::Synchronize {
+            task: crate::identity::TaskId(1),
+            resources: vec![resource(1), resource(2)],
+        };
+        assert!(LifecyclePayload::new(
+            op.clone(),
+            vec![(resource(1), whole(10)), (resource(2), whole(11))],
+        )
+        .is_ok());
+
+        // A third resource nobody synchronised.
+        assert_eq!(
+            LifecyclePayload::new(
+                op.clone(),
+                vec![
+                    (resource(1), whole(10)),
+                    (resource(2), whole(11)),
+                    (resource(3), whole(12)),
+                ],
+            ),
+            Err(AccessMismatch::Unnamed {
+                resource: resource(3)
+            })
+        );
+
+        // And the direction that is a use-after-free: a resource the operation
+        // acts on with nothing ordering it against work still reading it.
+        assert_eq!(
+            LifecyclePayload::new(op, vec![(resource(1), whole(10))]),
+            Err(AccessMismatch::Unaccessed {
+                resource: resource(2)
+            })
+        );
+    }
+
+    /// An operation that names no resource constrains nothing, because its
+    /// access list is the only statement there is.
+    ///
+    /// A task teardown retires everything in the task and names none of it; a
+    /// map notice names an address interval. Requiring an empty access list for
+    /// either would say the transaction touches nothing, which is the opposite
+    /// of true.
+    #[test]
+    fn an_operation_naming_no_resource_leaves_its_accesses_alone() {
+        for op in [
+            crate::lifecycle::LifecycleOp::DeleteTask {
+                task: crate::identity::TaskId(1),
+            },
+            crate::lifecycle::LifecycleOp::UnmapMemory {
+                task: crate::identity::TaskId(1),
+                span: crate::access::GuestSpan {
+                    base: 0x1000,
+                    length: 0x1000,
+                },
+            },
+        ] {
+            assert!(op.resources().is_empty(), "{:?}", op.kind());
+            let payload =
+                LifecyclePayload::new(op, vec![(resource(7), whole(10)), (resource(8), whole(11))])
+                    .expect("no per-resource statement to disagree with");
+            assert_eq!(payload.accesses().len(), 2);
+        }
+    }
+
+    /// Every kind's `resources()` is its own operation's list, and the two
+    /// single-resource kinds are not "no resources".
+    #[test]
+    fn a_single_resource_operation_names_that_resource() {
+        let one = crate::lifecycle::LifecycleOp::DeleteResource {
+            task: crate::identity::TaskId(1),
+            resource: resource(4),
+        };
+        assert_eq!(one.resources(), &[resource(4)]);
+        assert_eq!(
+            LifecyclePayload::new(one, Vec::new()),
+            Err(AccessMismatch::Unaccessed {
+                resource: resource(4)
+            }),
+            "a delete with nothing ordering it is the use-after-free case"
+        );
+    }
+
+    fn present_packet(mapping: u32) -> crate::present::PresentPacket {
+        crate::present::PresentPacket {
+            form: crate::present::PresentForm::SwapMapping,
+            mapping: crate::identity::MappingId(mapping),
+            task: None,
+        }
+    }
+
+    fn reads(backing: u64) -> AccessIntent {
+        AccessIntent {
+            domain: ChannelId(1),
+            key: AccessKey::Whole(ResourceKey {
+                backing: crate::access::BackingId(backing),
+                heap: None,
+            }),
+            mode: AccessMode::Read,
+            api_stages: 0,
+            input_content_version: None,
+            output_content_version: None,
+        }
+    }
+
+    /// A present shows one mapping, and every access it carries is for that
+    /// one. More than one is still legitimate — a biplanar surface is two
+    /// planes of one mapping.
+    #[test]
+    fn a_present_reads_the_mapping_it_shows_and_no_other() {
+        let packet = present_packet(7);
+        let two_planes = PresentPayload::new(
+            packet,
+            vec![(packet.mapping, reads(10)), (packet.mapping, reads(11))],
+        )
+        .expect("two planes of one surface");
+        assert_eq!(two_planes.accesses().len(), 2);
+
+        assert_eq!(
+            PresentPayload::new(packet, vec![(crate::identity::MappingId(8), reads(10))]),
+            Err(PresentMismatch::NotTheTarget {
+                shown: crate::identity::MappingId(7),
+                named: crate::identity::MappingId(8),
+            }),
+            "an envelope describing a frame the packet did not ask for"
+        );
+    }
+
+    /// A present reads. The writer is the EXEC it waits for, and a present
+    /// modelled as a writer reserves a version, beats the real writer's and
+    /// publishes bytes nothing produced.
+    #[test]
+    fn a_present_never_writes_what_it_shows() {
+        let packet = present_packet(7);
+        for mode in [
+            AccessMode::Write,
+            AccessMode::ReadWrite,
+            AccessMode::Unknown,
+        ] {
+            let mut access = reads(10);
+            access.mode = mode;
+            assert_eq!(
+                PresentPayload::new(packet, vec![(packet.mapping, access)]),
+                Err(PresentMismatch::Writes { mode }),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// A present that names nothing is ordered against nothing. An unresolved
+    /// target says so with `DomainOnly`, which still buys domain ordering.
+    #[test]
+    fn a_present_that_names_nothing_is_refused_rather_than_unordered() {
+        let packet = present_packet(7);
+        assert_eq!(
+            PresentPayload::new(packet, Vec::new()),
+            Err(PresentMismatch::NothingNamed)
+        );
+        let mut unresolved = reads(0);
+        unresolved.key = AccessKey::DomainOnly;
+        assert!(PresentPayload::new(packet, vec![(packet.mapping, unresolved)]).is_ok());
+    }
+
+    /// A query's access is exactly the window its reply goes to.
+    ///
+    /// The one thing this class cannot get wrong any more. An answer the
+    /// dependency graph does not know about is content a later transfer may
+    /// overwrite between the write and the guest's read — and the guest is
+    /// blocked on the completion word, so it reads whatever is there the moment
+    /// the word advances.
+    #[test]
+    fn a_query_touches_its_reply_window_and_nothing_else() {
+        let destination = crate::query::ReplyDestination {
+            backing: crate::access::BackingId(9),
+            bytes: crate::access::ByteRange {
+                offset: 0x200,
+                length: 4096,
+            },
+        };
+        let payload = Payload::Query(QueryPayload::new(
+            crate::query::QueryRequest {
+                kind: crate::query::QueryKind::DeviceInfo,
+                destination,
+                reply: crate::query::ReplyShape::Fixed { bytes: 16 },
+            },
+            ChannelId(2),
+            Some(crate::access::ContentVersion(7)),
+        ));
+        let accesses = payload.accesses();
+        assert_eq!(accesses.len(), 1, "one window, not a list");
+        let access = accesses[0];
+        assert_eq!(
+            access.key,
+            AccessKey::Range(
+                ResourceKey {
+                    backing: destination.backing,
+                    heap: None,
+                },
+                destination.bytes,
+            ),
+            "the destination the request named, at byte precision"
+        );
+        assert_eq!(access.domain, ChannelId(2));
+        assert_eq!(
+            access.mode,
+            AccessMode::Write,
+            "a reply is written whole; the bytes already there are the failure \
+             this write prevents, not an input to it"
+        );
+        assert_eq!(
+            access.output_content_version,
+            Some(crate::access::ContentVersion(7))
+        );
+        assert_eq!(access.input_content_version, None);
+    }
 
     /// The claim the module docs make and cannot check by being read: the
     /// classification is total over everything the ledger has judged, and empty
@@ -296,10 +901,9 @@ mod tests {
                 PayloadClass::ResourceLifecycle => LifecycleKind::of(p.channel, p.opcode).is_some(),
                 PayloadClass::Query => QueryKind::of(p.channel, p.opcode).is_some(),
                 PayloadClass::Control => ControlKind::of(p.channel, p.opcode).is_some(),
-                // The present forms are enumerated in `classify` itself and
-                // their behavior is `crate::present`'s stream rather than a
-                // per-opcode meaning, so reaching the class is the whole claim.
-                PayloadClass::Present => true,
+                PayloadClass::Present => {
+                    crate::present::PresentForm::of(p.channel, p.opcode).is_some()
+                }
             };
             assert!(
                 named,

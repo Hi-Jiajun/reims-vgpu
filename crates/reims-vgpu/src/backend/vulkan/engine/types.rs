@@ -7,6 +7,7 @@ use ash::vk;
 
 use crate::backend::vulkan::translate;
 pub use crate::runtime::decode::resource::ColorWriteMask;
+use reims_vgpu_core::sampler;
 
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,47 +215,6 @@ pub enum VisibilityResultMode {
     Counting,
 }
 
-/// Face-culling mode (Metal `MTLCullMode`). The macOS 2D compositor issues no
-/// draw that binds a cull mode, so `None` (the default) keeps the whole UI path
-/// byte-identical to the pre-cull engine — the raster state stays `CULL_NONE`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
-pub enum CullMode {
-    #[default]
-    None,
-    Front,
-    Back,
-}
-
-/// Triangle rasterization mode (Metal `MTLTriangleFillMode`).
-///
-/// Metal has two: fill the interior, or rasterize the edges as lines. Vulkan
-/// spells the second as `VK_POLYGON_MODE_LINE`, which is gated on the
-/// `fillModeNonSolid` device feature — so unlike [`CullMode`] the non-default
-/// arm can be refused by the host, and `engine::caches` declines the pipeline
-/// rather than filling a wireframe.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
-pub enum FillMode {
-    #[default]
-    Fill,
-    Lines,
-}
-
-/// What happens to a fragment outside the depth range (Metal
-/// `MTLDepthClipMode`).
-///
-/// `Clip` discards it, which is Metal's default and Vulkan's unconditional
-/// behaviour with `depthClampEnable` clear. `Clamp` pins its depth to the near
-/// or far plane and keeps it — Vulkan's `depthClampEnable`, gated on the
-/// `depthClamp` device feature. A shadow-map or skybox pass that asked for
-/// `Clamp` and got `Clip` loses the geometry nearest the camera, so the absent
-/// feature is a refusal rather than a fallback.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
-pub enum DepthClipMode {
-    #[default]
-    Clip,
-    Clamp,
-}
-
 /// Per-draw depth-test state (Metal `MTLDepthStencilState` + depth attachment).
 /// When a `DrawRequest` carries `Some`, the engine attaches a depth buffer to
 /// the pass and enables the depth test; `None` (the default) means no depth
@@ -282,6 +242,13 @@ pub struct DepthState {
     /// `false` disables the test (draw always passes) — used only when a bound
     /// depth-stencil is non-trivial in some *other* way (e.g. a write with
     /// compare Always); the plain trivial state never reaches here.
+    ///
+    /// **Not a pipeline dimension.** Metal has no depth-test enable, so a draw
+    /// that reaches the engine with this clear is exactly `compare = Always,
+    /// write = false`, which tests nothing and writes nothing under either
+    /// spelling — see `super::exec::depth_stencil_state`. It used to be a term
+    /// of the pipeline key, where it produced two byte-identical pipelines for
+    /// one state.
     pub test_enable: bool,
     pub write_enable: bool,
     /// Metal `MTLCompareFunction` — the same enum Metal uses for sampler
@@ -317,8 +284,15 @@ pub enum StencilOp {
 }
 
 impl StencilOp {
-    pub(crate) fn vk(self) -> vk::StencilOp {
-        translate::raster::vk_stencil_op(self)
+    /// The `MTLStencilOperation` ordinal this was decoded from.
+    ///
+    /// Declaration order is the ABI order, asserted against the wire in
+    /// `translate::raster`'s own tests, so the discriminant is the ordinal.
+    /// The Vulkan spelling is not here: `reims_vgpu_vulkan::depth_stencil`
+    /// owns it, and a second copy of a total mapping is a second thing that
+    /// can come to disagree with the first.
+    pub(crate) fn mtl_ordinal(self) -> u32 {
+        self as u32
     }
 }
 
@@ -552,6 +526,21 @@ pub struct DrawRequest {
     /// materialize a converted frame to seed a draw with them.
     pub target_seed_order: SeedOrder,
     pub blend: Option<BlendStateResource>,
+    /// `setBlendColorRed:green:blue:alpha:`, which the four
+    /// `MTLBlendFactorBlendColor` factors read.
+    ///
+    /// Encoder state, not pipeline state: the guest changes it without
+    /// changing the pipeline, and one encoder has one of it however many
+    /// attachments name a constant factor. So it is here rather than inside
+    /// `blend`, it is not part of the pipeline key, and the rail supplies it
+    /// through `VK_DYNAMIC_STATE_BLEND_CONSTANTS` per draw. A guest animating
+    /// a fade used to compile a pipeline per frame.
+    ///
+    /// Unconditional rather than `Option`, because there is no state in which
+    /// an encoder does not have one. A guest that issued no
+    /// `setBlendColorRed:` reaches here as the all-zero value the runtime
+    /// substitutes, which is what this device has always used for it.
+    pub blend_color: [f32; 4],
     /// Which channels the primary colour attachment writes.
     ///
     /// Separate from `blend` because `MTLColorWriteMask` is independent of
@@ -640,24 +629,34 @@ pub struct DrawRequest {
     /// is produced instead of silently discarded. Requires `target_identity`
     /// (the resident path); the pooled single-RT path never carries secondaries.
     pub secondary_targets: Vec<SecondaryColorTarget>,
-    /// Face culling (Metal `MTLCullMode`). `None` (default) draws both faces —
-    /// the 2D UI path. `Front`/`Back` reproduce Metal culling; which winding is
-    /// "front" is `front_face_ccw`, mapped to a Vulkan winding by
-    /// [`crate::backend::vulkan::translate::raster::vk_front_face`].
-    pub cull_mode: CullMode,
-    /// Metal front-facing winding: `true` = counter-clockwise (`MTLWinding`
-    /// CounterClockwise), `false` = the Metal default clockwise. Only affects
-    /// rasterization when `cull_mode` culls a face.
-    pub front_face_ccw: bool,
-    /// Triangle fill mode (Metal `setTriangleFillMode:`). `Fill` (the default)
-    /// is Metal's own and needs no device feature; `Lines` names
-    /// `VK_POLYGON_MODE_LINE` and is refused where `fillModeNonSolid` is not
-    /// advertised.
-    pub fill_mode: FillMode,
-    /// Depth clip mode (Metal `setDepthClipMode:`). `Clip` (the default) is
-    /// Metal's own; `Clamp` sets `depthClampEnable` and is refused where the
-    /// `depthClamp` feature is not advertised.
-    pub depth_clip: DepthClipMode,
+    /// The four fixed-function states a guest sets on the render command
+    /// encoder — `setCullMode:`, `setFrontFacingWinding:`,
+    /// `setTriangleFillMode:` and `setDepthClipMode: `— as the ordinals it
+    /// wrote, defaulting to Metal's own where it set nothing.
+    ///
+    /// One aggregate rather than four fields, because four raw states in a row
+    /// is a struct literal that compiles with two of them transposed. The
+    /// ordinals travel unparsed for the reason
+    /// [`BlendStateResource`]'s do; `reims_vgpu_vulkan::raster::plan` is the
+    /// one place that decides what they mean and whether this device can
+    /// serve them.
+    pub raster: reims_vgpu_vulkan::raster::GuestRasterState,
+    /// `setLineWidth:` — the width the stream last set, `None` where it set
+    /// none and Metal's own default stands.
+    ///
+    /// Beside [`Self::raster`] rather than inside it, because it is not the
+    /// same kind of state: those four are closed ordinals that decide how a
+    /// pipeline is built, and this is a float that decides nothing about the
+    /// pipeline at all — `VK_DYNAMIC_STATE_LINE_WIDTH` is 1.0 core, so it is
+    /// dynamic on every host and never a cache dimension. Folding it into that
+    /// aggregate would also cost it `Ord` and `Hash`, which the pipeline key
+    /// needs and a float cannot give.
+    ///
+    /// Unparsed, like the ordinals beside it:
+    /// `reims_vgpu_vulkan::raster::line_width` is the one place that decides
+    /// whether this device can serve it, and it needs the draw's topology to
+    /// decide — which only exists here.
+    pub line_width: Option<f32>,
     /// Depth test + transient depth attachment. `None` (default) = no depth
     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
     /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).
@@ -894,19 +893,22 @@ pub struct ScissorResource {
     pub height: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum PrimitiveTopology {
-    Point,
-    Line,
-    LineStrip,
-    #[default]
-    Triangle,
-    TriangleStrip,
-}
+/// The `MTLPrimitiveType` a draw names, with this engine's answer for a request
+/// that names none.
+///
+/// A newtype over [`reims_vgpu_core::topology::PrimitiveType`] rather than a
+/// second enum beside it, and it exists only for the `Default`. Metal has no
+/// default primitive type — `drawPrimitives:` states one on every call — so
+/// there is no wire fact for the protocol layer to record, and the value a
+/// zero-built [`DrawRequest`] carries is this crate's convention rather than
+/// anything the guest declared. Keeping the convention here is what lets the
+/// enum itself stay a statement about `MTLPrimitiveType` and nothing else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct PrimitiveTopology(pub reims_vgpu_core::topology::PrimitiveType);
 
-impl PrimitiveTopology {
-    pub(crate) fn vk(self) -> vk::PrimitiveTopology {
-        translate::raster::vk_topology(self)
+impl Default for PrimitiveTopology {
+    fn default() -> Self {
+        Self(reims_vgpu_core::topology::PrimitiveType::Triangle)
     }
 }
 
@@ -938,107 +940,26 @@ pub struct IndexedDrawResource {
     pub content: BufferContent,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum VertexAttributeFormat {
-    UChar2,
-    UChar3,
-    UChar4,
-    Char2,
-    Char3,
-    Char4,
-    UChar2Normalized,
-    UChar3Normalized,
-    UChar4Normalized,
-    Char2Normalized,
-    Char3Normalized,
-    Char4Normalized,
-    UShort2,
-    UShort3,
-    UShort4,
-    Short2,
-    Short3,
-    Short4,
-    UShort2Normalized,
-    UShort3Normalized,
-    UShort4Normalized,
-    Short2Normalized,
-    Short3Normalized,
-    Short4Normalized,
-    Half2,
-    Half3,
-    Half4,
-    Float,
-    Float2,
-    Float3,
-    Float4,
-    Int,
-    Int2,
-    Int3,
-    Int4,
-    UInt,
-    UInt2,
-    UInt3,
-    UInt4,
-    Int1010102Normalized,
-    UInt1010102Normalized,
-    UChar4NormalizedBgra,
-    UChar,
-    Char,
-    UCharNormalized,
-    CharNormalized,
-    UShort,
-    Short,
-    UShortNormalized,
-    ShortNormalized,
-    Half,
-    FloatRg11B10,
-    FloatRgb9E5,
-}
+/// `MTLVertexFormat`, parsed.
+///
+/// [`reims_vgpu_core::vertex_format::VertexFormat`] under this crate's name for
+/// it. It used to be a second fifty-three-arm enumeration beside that one, with
+/// the byte size and the Vulkan spelling in a table of its own — and those two
+/// are the same fact stated twice, because a `Short3` occupies six bytes
+/// *because* it is three 16-bit components, which is also why it is
+/// `R16G16B16_UINT`. The owning layer states the size and the component count;
+/// [`reims_vgpu_vulkan::vertex::format`] states the spelling.
+pub use reims_vgpu_core::vertex_format::VertexFormat as VertexAttributeFormat;
 
-impl VertexAttributeFormat {
-    /// Deliberately no `vk_format()` here. An attribute's Vulkan format is not
-    /// a property of the attribute alone: Vulkan makes the three-component
-    /// 8/16-bit formats optional, so the bindable format depends on the device
-    /// and on whether the attribute's stride leaves room for a wider
-    /// substitute. Ask `translate::support::VertexFormatSupport::resolve`,
-    /// which answers both at once; `translate::vertex::vk_format` gives the
-    /// device-independent spelling for tables and tests.
-    ///
-    /// Bytes this attribute occupies in the guest's vertex buffer.
-    ///
-    /// Stated beside the Vulkan format in one table so the two cannot drift —
-    /// they are the same fact twice, and held apart they diverge into a stride
-    /// bug nobody is looking for.
-    pub fn byte_size(self) -> u32 {
-        translate::vertex::byte_size(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum VertexStepFunction {
-    Constant,
-    #[default]
-    PerVertex,
-    PerInstance,
-}
-
-impl VertexStepFunction {
-    /// The `MTLVertexStepFunction` ordinal this engine step came from.
-    ///
-    /// The inverse of [`translate::vertex::step_function`], which is where the
-    /// three accepted ordinals are chosen and where the round trip is pinned.
-    /// It exists so a rule stated over the *wire* value — the step/rate pair in
-    /// [`crate::protocol::vertex_step`] — can be asked on this side without a
-    /// second copy of the mapping.
-    pub fn mtl_ordinal(self) -> u32 {
-        use crate::protocol::vertex_step as step;
-        match self {
-            Self::Constant => step::MTL_VERTEX_STEP_FUNCTION_CONSTANT,
-            Self::PerVertex => step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
-            Self::PerInstance => step::MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE,
-        }
-    }
-}
+/// `MTLVertexStepFunction`, parsed.
+///
+/// All five of them, where this crate's own enumeration held three and the
+/// tessellation pair were refusals in the translation table. They are
+/// recognised values that this rail declines — see
+/// [`reims_vgpu_vulkan::vertex::input_rate`], which is where the decline
+/// happens now, because whether a step function has a `VkVertexInputRate` is a
+/// fact about Vulkan and not about `MTLVertexStepFunction`.
+pub use reims_vgpu_core::vertex_step::StepFunction as VertexStepFunction;
 
 #[derive(Debug)]
 pub struct VertexAttributeResource {
@@ -1232,62 +1153,16 @@ pub enum SampledByteOrigin {
     LinearTexture,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerFilter {
-    #[default]
-    Nearest,
-    Linear,
-}
-
-impl SamplerFilter {
-    pub(crate) fn vk(self) -> vk::Filter {
-        translate::sampler::vk_filter(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerMipFilter {
-    #[default]
-    NotMipmapped,
-    Nearest,
-    Linear,
-}
-
-impl SamplerMipFilter {
-    pub(crate) fn vk(self) -> vk::SamplerMipmapMode {
-        translate::sampler::vk_mipmap_mode(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerAddressMode {
-    #[default]
-    ClampToEdge,
-    MirrorClampToEdge,
-    Repeat,
-    MirrorRepeat,
-    ClampToZero,
-    ClampToBorderColor,
-}
-
-impl SamplerAddressMode {
-    pub(crate) fn vk(self) -> vk::SamplerAddressMode {
-        translate::sampler::vk_address_mode(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum SamplerBorderColor {
-    #[default]
-    TransparentBlack,
-    OpaqueBlack,
-    OpaqueWhite,
-}
-
-// Deliberately no `vk()` here. A sampler's border colour is not a property of
-// the declared colour alone: Metal's `ClampToZero` address mode forces
-// transparent black whatever the descriptor says, so the two must be decided
-// together — see `translate::sampler::vk_border_color_with_clamp_to_zero`.
+// A sampler's filters, mip filter, address modes and border colour are not
+// spelled as engine enums. They travel as the guest's own `MTLSampler*`
+// ordinals to `reims_vgpu_core::sampler::SamplerShape`, whose `checked()` is
+// the one parse and the one place a declaration is admitted or refused. A
+// second set of names here would be a second table to keep in step with it,
+// and the one thing the two could disagree about is which ordinal means what.
+//
+// `SamplerCompareFunction` below is the exception, and not because samplers
+// are special: `MTLCompareFunction` is also the depth test and the stencil
+// test, which are decoded on a different path and have their own owner.
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum SamplerCompareFunction {
@@ -1303,21 +1178,31 @@ pub enum SamplerCompareFunction {
 }
 
 impl SamplerCompareFunction {
-    pub(crate) fn vk(self) -> vk::CompareOp {
-        translate::raster::vk_compare_op(self)
+    /// The `MTLCompareFunction` ordinal this was decoded from.
+    ///
+    /// Declaration order is the ABI order, asserted against the wire in
+    /// `translate::raster`'s own tests, so the discriminant is the ordinal and
+    /// a second table would be a second thing to keep in step with it.
+    pub(crate) fn mtl_ordinal(self) -> u32 {
+        self as u32
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct SamplerResource {
     pub binding: u32,
-    pub min_filter: SamplerFilter,
-    pub mag_filter: SamplerFilter,
-    pub mip_filter: SamplerMipFilter,
-    pub address_mode_u: SamplerAddressMode,
-    pub address_mode_v: SamplerAddressMode,
-    pub address_mode_w: SamplerAddressMode,
-    pub border_color: SamplerBorderColor,
+    /// `MTLSamplerMinMagFilter`, as the guest wrote it. See the note above
+    /// [`SamplerCompareFunction`] for why these are ordinals.
+    pub min_filter: u32,
+    pub mag_filter: u32,
+    /// `MTLSamplerMipFilter`.
+    pub mip_filter: u32,
+    /// `MTLSamplerAddressMode`, one per axis.
+    pub address_mode_u: u32,
+    pub address_mode_v: u32,
+    pub address_mode_w: u32,
+    /// `MTLSamplerBorderColor`.
+    pub border_color: u32,
     pub compare_function: SamplerCompareFunction,
     pub lod_min: u32, // f32 bits for Hash
     pub lod_max: u32,
@@ -1329,13 +1214,13 @@ impl SamplerResource {
     pub fn normalized_default(binding: u32) -> Self {
         Self {
             binding,
-            min_filter: SamplerFilter::Linear,
-            mag_filter: SamplerFilter::Linear,
-            mip_filter: SamplerMipFilter::NotMipmapped,
-            address_mode_u: SamplerAddressMode::ClampToEdge,
-            address_mode_v: SamplerAddressMode::ClampToEdge,
-            address_mode_w: SamplerAddressMode::ClampToEdge,
-            border_color: SamplerBorderColor::TransparentBlack,
+            min_filter: sampler::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+            mag_filter: sampler::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+            mip_filter: sampler::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+            address_mode_u: sampler::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            address_mode_v: sampler::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            address_mode_w: sampler::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            border_color: sampler::MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK,
             compare_function: SamplerCompareFunction::Never,
             lod_min: 0.0f32.to_bits(),
             lod_max: f32::MAX.to_bits(),
@@ -1373,13 +1258,13 @@ impl SamplerResource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct SamplerStateKey {
-    pub min_filter: SamplerFilter,
-    pub mag_filter: SamplerFilter,
-    pub mip_filter: SamplerMipFilter,
-    pub address_mode_u: SamplerAddressMode,
-    pub address_mode_v: SamplerAddressMode,
-    pub address_mode_w: SamplerAddressMode,
-    pub border_color: SamplerBorderColor,
+    pub min_filter: u32,
+    pub mag_filter: u32,
+    pub mip_filter: u32,
+    pub address_mode_u: u32,
+    pub address_mode_v: u32,
+    pub address_mode_w: u32,
+    pub border_color: u32,
     pub compare_function: SamplerCompareFunction,
     pub lod_min: u32,
     pub lod_max: u32,
@@ -1387,99 +1272,61 @@ pub(crate) struct SamplerStateKey {
     pub unnormalized_coordinates: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum BlendFactor {
-    Zero,
-    One,
-    SrcColor,
-    OneMinusSrcColor,
-    SrcAlpha,
-    OneMinusSrcAlpha,
-    DstColor,
-    OneMinusDstColor,
-    DstAlpha,
-    OneMinusDstAlpha,
-    SrcAlphaSaturated,
-    ConstantColor,
-    OneMinusConstantColor,
-    ConstantAlpha,
-    OneMinusConstantAlpha,
-    /// `MTLBlendFactorSource1Color` and its three siblings — the dual-source
-    /// factors, which read the fragment shader's *second* colour output.
-    ///
-    /// Separated from the fifteen above by [`BlendFactor::is_dual_source`]
-    /// because Vulkan gates exactly these four behind the `dualSrcBlend` device
-    /// feature, and a pipeline naming one without it is invalid.
-    Src1Color,
-    OneMinusSrc1Color,
-    Src1Alpha,
-    OneMinusSrc1Alpha,
-}
-
-impl BlendFactor {
-    pub(crate) fn vk(self) -> vk::BlendFactor {
-        translate::blend::vk_factor(self)
-    }
-
-    /// Whether this factor reads the second fragment output, and so needs
-    /// `VkPhysicalDeviceFeatures::dualSrcBlend`.
-    pub(crate) fn is_dual_source(self) -> bool {
-        matches!(
-            self,
-            Self::Src1Color | Self::OneMinusSrc1Color | Self::Src1Alpha | Self::OneMinusSrc1Alpha
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum BlendOp {
-    Add,
-    Subtract,
-    ReverseSubtract,
-    Min,
-    Max,
-}
-
-impl BlendOp {
-    pub(crate) fn vk(self) -> vk::BlendOp {
-        translate::blend::vk_operation(self)
-    }
-}
-
+/// One colour attachment's blend declaration, as the six `MTLBlendFactor` and
+/// `MTLBlendOperation` ordinals the guest serialized.
+///
+/// The blend colour is **not** here. `setBlendColorRed:green:blue:alpha:` is a
+/// command on the render command encoder, not a property of the pipeline
+/// descriptor, so it is one value per draw rather than one per attachment —
+/// see [`DrawRequest::blend_color`]. Carrying it per attachment made four
+/// floats that could disagree with each other and could not, and put a value
+/// the guest animates into the pipeline cache key.
+///
+/// The ordinals travel **unparsed**. Which nineteen values are factors, which
+/// five are operations, and which four of the factors need the second fragment
+/// output are all statements about `MTLRenderPipeline.h`, and this crate is
+/// not where that is decided: `reims_vgpu_core::blend::ColorAttachmentShape`
+/// owns the parse and `reims_vgpu_vulkan::blend` owns the spelling. Carrying a
+/// pair of local enums between the two would be a third table that has to
+/// agree with both, and the way it disagreed last time was by stopping at
+/// `MTLBlendFactorOneMinusBlendAlpha = 14` while Apple's enum ran to 18.
+///
+/// A consequence worth stating: an ordinal outside the guest API no longer
+/// refuses the *slot* at translation time, it refuses the *pipeline* at build
+/// time, which is where the same declaration is also weighed against what this
+/// device can blend. There is one answer per pipeline rather than one per
+/// attachment reached by two different paths.
 #[derive(Clone, Copy, Debug)]
 pub struct BlendStateResource {
-    pub src_color: BlendFactor,
-    pub dst_color: BlendFactor,
-    pub color_op: BlendOp,
-    pub src_alpha: BlendFactor,
-    pub dst_alpha: BlendFactor,
-    pub alpha_op: BlendOp,
-    pub constants: [f32; 4],
+    pub src_rgb: u32,
+    pub dst_rgb: u32,
+    pub op_rgb: u32,
+    pub src_alpha: u32,
+    pub dst_alpha: u32,
+    pub op_alpha: u32,
 }
 
 impl BlendStateResource {
     pub(crate) fn key(&self) -> BlendKey {
         BlendKey {
-            src_color: self.src_color,
-            dst_color: self.dst_color,
-            color_op: self.color_op,
+            src_rgb: self.src_rgb,
+            dst_rgb: self.dst_rgb,
+            op_rgb: self.op_rgb,
             src_alpha: self.src_alpha,
             dst_alpha: self.dst_alpha,
-            alpha_op: self.alpha_op,
-            constants: self.constants.map(|c| c.to_bits()),
+            op_alpha: self.op_alpha,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct BlendKey {
-    pub src_color: BlendFactor,
-    pub dst_color: BlendFactor,
-    pub color_op: BlendOp,
-    pub src_alpha: BlendFactor,
-    pub dst_alpha: BlendFactor,
-    pub alpha_op: BlendOp,
-    pub constants: [u32; 4],
+    pub src_rgb: u32,
+    pub dst_rgb: u32,
+    pub op_rgb: u32,
+    pub src_alpha: u32,
+    pub dst_alpha: u32,
+    pub op_alpha: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,146 +1727,13 @@ pub enum ComputeSampledSource {
     MultisampleTarget(TargetIdentity),
 }
 
-/// Pixel formats the product compute path maps. Storage and sampled images
-/// share this type; access is carried separately by the request resource.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub enum StorageImageFormat {
-    #[default]
-    Rgba32Float,
-    Rgba16Float,
-    R16Float,
-    Rgba16Uint,
-    Rgba8Uint,
-    Rgba8Sint,
-    Rgba8Unorm,
-    Bgra8Unorm,
-    Rg16Float,
-    R8Unorm,
-    /// Metal `A8Unorm`: one byte, presenting `(0, 0, 0, a)`.
-    ///
-    /// Its own member rather than [`Self::R8Unorm`], which it shares a
-    /// `VkFormat` with, because the difference between them is not the format
-    /// but the component mapping its view needs — and
-    /// `translate::pixel::vk_component_mapping` states the rule this follows: the
-    /// plan is a property of the *Metal* format, so a rail that has reduced a
-    /// format to a host one can no longer derive it. This enum is that
-    /// reduction, so the distinction has to survive it.
-    ///
-    /// Sampled only. `protocol::pixel_format::storage_selector` has no entry for
-    /// this format, and a Vulkan storage-image view must carry an identity
-    /// mapping, so a storage image of it is refused rather than built.
-    A8Unorm,
-    Rg8Unorm,
-    Rgba32Uint,
-    R32Uint,
-    R32Sint,
-    R32Float,
-    /// Packed three-channel shared-exponent float; sampled-image only on the
-    /// product path (`MTLPixelFormatRGB9E5Float`).
-    Rgb9e5Ufloat,
-    /// Single-channel sixteen-bit normalized; **sampled-image only**, for
-    /// `Rgb9e5Ufloat`'s reason and one more.
-    ///
-    /// This is the ten-bit biplanar video luma plane
-    /// (`MTLPixelFormatR16Unorm`). macOS 14 and macOS 15 each bind one to a
-    /// `DispatchThreadgroups` and lost the whole dispatch to
-    /// `sampled_format_unsupported` until it was named here.
-    ///
-    /// It must **not** reach a storage bind. Vulkan mandates `R16_UNORM` for
-    /// `SAMPLED_IMAGE` and `SAMPLED_IMAGE_FILTER_LINEAR` and does *not* mandate
-    /// it for `STORAGE_IMAGE`, so admitting it to a storage image would claim a
-    /// capability the host may not have — which is why it is reachable through
-    /// [`translate::pixel::sampled_image`] and not through
-    /// `translate::pixel::storage_image`.
-    R16Unorm,
-    /// Two-channel sixteen-bit normalized; **sampled-image only**, and
-    /// [`Self::R16Unorm`]'s other half.
-    ///
-    /// A ten-bit biplanar video texture is two planes, and this is the chroma
-    /// one (`MTLPixelFormatRG16Unorm`) to that one's luma. A shader sampling such
-    /// a frame binds both planes, so admitting only the luma one still loses the
-    /// whole dispatch — the refusal moves to the other binding rather than going
-    /// away.
-    ///
-    /// `STORAGE_IMAGE` is no more mandatory for `R16G16_UNORM` than for
-    /// `R16_UNORM`, so it is reachable by the same single route for the same
-    /// reason.
-    Rg16Unorm,
-    /// Two-channel sixteen-bit **unsigned integer**; **sampled-image only**, on
-    /// [`Self::Rg16Unorm`]'s terms and for a different guest.
-    ///
-    /// `MTLPixelFormatRG16Uint`. A macos-15 guest renders into linear textures
-    /// of this format, so a shader that reads one back binds it here. It shares
-    /// its bytes with the normalized member above and nothing else: an integer
-    /// texel is a count, so it is neither blended as an attachment nor filtered
-    /// when sampled, and both of `DeviceCapabilitySnapshot`'s per-layout masks
-    /// skip it for that reason.
-    ///
-    /// `STORAGE_IMAGE` is not mandatory for `R16G16_UINT`, so it is reachable
-    /// by the same single route as the normalized members and for the same
-    /// reason.
-    Rg16Uint,
-    /// Four-channel sixteen-bit normalized; **sampled-image only**, the widest
-    /// member of the same family.
-    ///
-    /// `SAMPLED_IMAGE` with `SAMPLED_IMAGE_FILTER_LINEAR` is mandatory for
-    /// `R16G16B16A16_UNORM` and `STORAGE_IMAGE` is not, which is the whole of why
-    /// it sits here rather than in the storage selector.
-    Rgba16Unorm,
-    /// Ten bits per colour channel and two of alpha in one packed word, red in
-    /// the low bits (`MTLPixelFormatRGB10A2Unorm`); **sampled-image only**.
-    ///
-    /// Here for [`Self::R16Unorm`]'s reason: Vulkan mandates
-    /// `A2B10G10R10_UNORM_PACK32` for `SAMPLED_IMAGE` and
-    /// `SAMPLED_IMAGE_FILTER_LINEAR` and mandates nothing for `STORAGE_IMAGE`,
-    /// so it is reachable through `translate::pixel::sampled_image` and not
-    /// through `translate::pixel::storage_image`.
-    Rgb10a2Unorm,
-    /// [`Self::Rgb10a2Unorm`] with the colour channels the other way round in
-    /// the word (`MTLPixelFormatBGR10A2Unorm`); **sampled-image only**.
-    ///
-    /// One caveat its two neighbours do not carry:
-    /// `A2R10G10B10_UNORM_PACK32` is **not** in Vulkan's mandatory format
-    /// table at all, where `A2B10G10R10_UNORM_PACK32` and
-    /// `B10G11R11_UFLOAT_PACK32` are. A host without it fails image creation
-    /// and declines by name, which is the same work the guest lost when the
-    /// format was refused at decode — but a capability gate would say so before
-    /// the allocation rather than after it, and that gate is not written.
-    Bgr10a2Unorm,
-    /// Eleven bits of red and green, ten of blue, no alpha, in one packed word
-    /// (`MTLPixelFormatRG11B10Float`); **sampled-image only**, for
-    /// [`Self::Rgb10a2Unorm`]'s reason.
-    Rg11b10Float,
-}
-
-impl StorageImageFormat {
-    pub(crate) fn vk_format(self) -> vk::Format {
-        translate::pixel::vk_storage_image(self)
-    }
-
-    pub fn bytes_per_texel(self) -> usize {
-        match self {
-            Self::Rgba32Float | Self::Rgba32Uint => 16,
-            Self::Rgba16Float | Self::Rgba16Uint => 8,
-            Self::Rg16Float => 4,
-            Self::Rgba16Unorm => 8,
-            Self::Rg16Unorm | Self::Rg16Uint => 4,
-            Self::R16Float | Self::Rg8Unorm | Self::R16Unorm => 2,
-            Self::R8Unorm | Self::A8Unorm => 1,
-            Self::Rgba8Uint
-            | Self::Rgba8Sint
-            | Self::Rgba8Unorm
-            | Self::Bgra8Unorm
-            | Self::R32Uint
-            | Self::R32Sint
-            | Self::R32Float
-            | Self::Rgb9e5Ufloat
-            | Self::Rgb10a2Unorm
-            | Self::Bgr10a2Unorm
-            | Self::Rg11b10Float => 4,
-        }
-    }
-}
+/// Pixel formats the product compute path maps, re-exported from the rail that
+/// owns them.
+///
+/// The enum names Vulkan formats and nothing else — no engine object, no pool,
+/// no request — so it belongs beside the table that resolves it. It is named
+/// here because the engine's request types are built out of it.
+pub use reims_vgpu_vulkan::pixel::StorageImageFormat;
 
 // ---------------------------------------------------------------------------
 // Draw residency (workstream D)
@@ -2775,7 +2489,7 @@ mod tests {
         assert_eq!(first.lod_min_f32(), 0.0);
         assert_eq!(first.lod_max_f32(), f32::MAX);
 
-        rebound.address_mode_v = SamplerAddressMode::Repeat;
+        rebound.address_mode_v = sampler::MTL_SAMPLER_ADDRESS_MODE_REPEAT;
         assert_ne!(first.state_key(), rebound.state_key());
     }
 
@@ -2953,8 +2667,14 @@ mod tests {
     fn default_requests_keep_optional_product_paths_disabled() {
         let draw = DrawRequest::default();
         assert_eq!((draw.width, draw.height, draw.vertex_count), (0, 0, 0));
-        assert_eq!(draw.primitive_topology, PrimitiveTopology::Triangle);
-        assert_eq!(draw.cull_mode, CullMode::None);
+        assert_eq!(
+            draw.primitive_topology,
+            PrimitiveTopology(reims_vgpu_core::topology::PrimitiveType::Triangle)
+        );
+        assert_eq!(
+            draw.raster,
+            reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT
+        );
         assert!(draw.target_identity.is_none());
         assert!(draw.depth.is_none());
         assert!(!draw.skip_readback);

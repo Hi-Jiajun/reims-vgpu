@@ -34,16 +34,22 @@
 //!   on them.
 //! - [`extent`] — the guest API's three-dimensional extent, its mip-level
 //!   dimensions, and the byte arithmetic of a tightly-packed image.
+//! - [`fifo`] — the FIFO packet payload layouts: the resource-list, invalidate,
+//!   synchronize and replace-physical records, the `EXEC_INDIRECT2` header and
+//!   its per-resource table, and the display descriptor's timing entries.
 //! - [`sync`] — which opcode is a fence, an event or a barrier, on which rail,
 //!   and what a barrier's scope word names.
-//! - [`segment`] — what a segment-type byte means: which encoder wrote it, and
-//!   which rail its records are read on.
+//! - [`segment`] — what a segment-type byte means: which encoder wrote it and
+//!   which rail its records are read on, and how a command stream divides into
+//!   the segments carrying them.
 //! - [`resource_state`] — what the content-representation records ask for:
 //!   which directive, at which granularity.
 //! - [`info_reply`] — the key/value table an info query is answered with, and
 //!   the three separate bounds on how much of it may be written.
 //! - [`storage_mode`] — which storage mode a resource declares, and the one
 //!   thing this wire's use of it does not license.
+//! - [`present`] — which of the three present commands a packet is, and where
+//!   its trailer keeps the target it names.
 //! - [`render`] — which render-encoder record an opcode names, the eight draw
 //!   shapes behind its fourteen draw opcodes, and the stage no wire field
 //!   carries.
@@ -115,6 +121,7 @@ pub mod dispatch;
 pub mod draw;
 pub mod endian;
 pub mod extent;
+pub mod fifo;
 pub mod fnv;
 pub mod gva;
 pub mod gva_resolve;
@@ -124,11 +131,13 @@ pub mod mipmap;
 pub mod packets;
 pub mod pass_action;
 pub mod pixel_format;
+pub mod present;
 pub mod render;
 pub mod residency;
 pub mod resource_state;
 pub mod sampler;
 pub mod segment;
+pub mod serializer_object;
 pub mod storage_mode;
 pub mod sync;
 pub mod texture_shape;

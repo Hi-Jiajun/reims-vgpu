@@ -43,15 +43,12 @@
 
 use reims_vgpu_wire::ops::blit as wire;
 
-// MTLBlitOption (Metal.framework Headers/MTLBlitCommandEncoder.h).
-pub const MTL_BLIT_OPTION_NONE: u32 = 0;
-pub const MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL: u32 = 1 << 0;
-pub const MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL: u32 = 1 << 1;
-pub const MTL_BLIT_OPTION_ROW_LINEAR_PVRTC: u32 = 1 << 2;
-/// All bits defined by the Metal SDK for `MTLBlitOption`.
-pub const MTL_BLIT_OPTION_KNOWN_MASK: u32 = MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL
-    | MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL
-    | MTL_BLIT_OPTION_ROW_LINEAR_PVRTC;
+// `MTLBlitOption`, owned by `reims-vgpu-protocol` — the layer that assigns
+// meaning to a wire tag — and named here because this is where it is read.
+pub use reims_vgpu_protocol::blit::{
+    MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL, MTL_BLIT_OPTION_KNOWN_MASK, MTL_BLIT_OPTION_NONE,
+    MTL_BLIT_OPTION_ROW_LINEAR_PVRTC, MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL,
+};
 
 /// Selected texture aspect for a buffer↔texture / options-bearing copy.
 ///
@@ -84,24 +81,22 @@ impl crate::observe::Decline for BlitOptionError {
 /// - Depth and stencil bits are mutually exclusive
 /// - `RowLinearPVRTC` and unknown bits fail (no PVRTC rail; unknown stays unknown)
 pub fn parse_blit_options(has_options: bool, options: u32) -> Result<BlitAspect, BlitOptionError> {
-    if !has_options || options == 0 {
+    if !has_options {
         return Ok(BlitAspect::Full);
     }
-    if options & !MTL_BLIT_OPTION_KNOWN_MASK != 0 {
-        return Err(BlitOptionError::UnknownBits);
-    }
-    if options & MTL_BLIT_OPTION_ROW_LINEAR_PVRTC != 0 {
-        // Compressed PVRTC row-linear layout is not on the product path.
-        return Err(BlitOptionError::RowLinearPvrtc);
-    }
-    let depth = options & MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL != 0;
-    let stencil = options & MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL != 0;
-    match (depth, stencil) {
-        (true, false) => Ok(BlitAspect::Depth),
-        (false, true) => Ok(BlitAspect::Stencil),
-        (false, false) => Ok(BlitAspect::Full),
-        (true, true) => Err(BlitOptionError::ConflictingAspects),
-    }
+    // The rule itself belongs to the layer that owns the tag, and both rails
+    // ask it there. What stays here is the "no options word at all" case,
+    // which is a fact about the *record shape* this decoder read and not about
+    // the word.
+    reims_vgpu_protocol::blit::select_aspect(options).map_err(|refusal| match refusal {
+        reims_vgpu_protocol::blit::OptionRefusal::UnknownBits { .. } => {
+            BlitOptionError::UnknownBits
+        }
+        reims_vgpu_protocol::blit::OptionRefusal::RowLinearPvrtc => BlitOptionError::RowLinearPvrtc,
+        reims_vgpu_protocol::blit::OptionRefusal::ConflictingAspects => {
+            BlitOptionError::ConflictingAspects
+        }
+    })
 }
 
 /// Why the blit decoder refused a command.

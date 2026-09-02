@@ -67,10 +67,34 @@ use std::collections::{HashMap, HashSet};
 /// Deliberately holds no operation and no layout: those are not part of
 /// Vulkan's compatibility rule, and including them would make this a second
 /// spelling of [`Signature`].
+///
+/// It does hold [`Self::resolve`], which is not an operation. Vulkan's
+/// compatibility rule names "color, input, **resolve**, and depth/stencil
+/// attachment references", and a reference naming a real attachment is
+/// compatible only with another naming one — never with the null pointer a
+/// subpass without resolve targets has. So two passes that differ only in
+/// whether a colour attachment resolves are *not* compatible, and a pipeline
+/// built for one cannot be bound in the other.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Compatibility {
     /// Colour attachment formats, in the pass's own attachment order.
     pub color: Vec<vk::Format>,
+    /// Whether each colour attachment resolves, in the same order.
+    ///
+    /// A resolve target is an extra attachment in the description and an extra
+    /// reference in the subpass, so it changes both the render pass object and
+    /// the compatibility class — see the type's doc.
+    ///
+    /// Not read by [`Self::rendering_info`], because the dynamic-rendering rung
+    /// has no resolve in the pipeline at all: it is a field of
+    /// `VkRenderingAttachmentInfo`, supplied when the pass is begun. So that
+    /// rung compiles one pipeline where it could have shared one. That is the
+    /// price of one compatibility class serving both carriers, and it is the
+    /// direction the price has to fall — a class loose enough for dynamic
+    /// rendering binds an incompatible pipeline on the render-pass rung, while
+    /// a class tight enough for the render-pass rung merely compiles a second
+    /// one here.
+    pub resolve: Vec<bool>,
     /// `None` when the pass has no depth-stencil attachment, and otherwise the
     /// one format that carries both aspects the guest attached.
     pub depth_stencil: Option<vk::Format>,
@@ -128,9 +152,6 @@ pub struct Signature {
     /// One per colour attachment, in the same order.
     pub color: Vec<AttachmentOps>,
     pub depth_stencil: Option<AttachmentOps>,
-    /// Whether each colour attachment resolves. A resolve target is an extra
-    /// attachment in the description, so this changes the object.
-    pub resolve: Vec<bool>,
 }
 
 /// Everything a `VkFramebuffer` is created from.
@@ -145,6 +166,60 @@ pub struct FramebufferKey {
     pub layers: u32,
 }
 
+/// The single-sampled image a multisample attachment resolves into.
+///
+/// Carries its own format and sample count, because they are not the
+/// attachment's to assume. Vulkan requires a resolve attachment to have the
+/// *same* format as the colour attachment it resolves
+/// (VUID-VkSubpassDescription-pResolveAttachments-00866) and a sample count of
+/// exactly one (VUID-VkSubpassDescription-pResolveAttachments-00869), and both
+/// are properties of a different guest texture that the guest chose
+/// independently.
+///
+/// Describing it from the attachment's own [`Bound`] would state those two
+/// requirements as facts instead of checking them. The attachment description
+/// would then claim a format the view does not have, and `vkCreateFramebuffer`
+/// would refuse it with a message naming neither texture — a driver error
+/// standing in for a refusal this rail can give by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolveTarget {
+    pub view: vk::ImageView,
+    pub format: vk::Format,
+    pub samples: vk::SampleCountFlags,
+    /// What this view covers. See [`Coverage`] --- a resolve target is an
+    /// element of the framebuffer's attachment array like any other, so the
+    /// render area has to fit inside it too.
+    pub coverage: Coverage,
+}
+
+/// What one attachment view actually covers, which the render area must fit
+/// inside.
+///
+/// # Why the view carries this rather than the area assuming it
+///
+/// A `VkFramebuffer` is created with a width, a height and a layer count, and
+/// every view it is given must be at least that large on all three
+/// (VUID-VkFramebufferCreateInfo-flags-04533, -04534 and -04535). The area
+/// comes from the guest's `renderTargetWidth`/`Height`/`ArrayLength`, and the
+/// views come from textures the guest attached; nothing on the wire makes them
+/// agree, and the pass descriptor's own extent is a *separate* declaration the
+/// guest may write anything into.
+///
+/// So this is measured and not assumed, for the reason [`ResolveTarget`]'s own
+/// doc gives about format and samples: describing the view from the area would
+/// state the requirement as a fact instead of checking it, and
+/// `vkCreateFramebuffer` would then refuse it with a message naming neither
+/// the texture nor the field the guest wrote.
+///
+/// The extent is the *view's* --- the mip level it was made over, not level
+/// zero --- because that is what the framebuffer is measured against. Likewise
+/// `layers` is the view's `layerCount` and not the image's array size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Coverage {
+    pub extent: vk::Extent2D,
+    pub layers: u32,
+}
+
 /// One attachment's image, resolved by the caller from the plan's resource
 /// names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,9 +227,11 @@ pub struct Bound {
     pub format: vk::Format,
     pub samples: vk::SampleCountFlags,
     pub view: vk::ImageView,
-    /// The resolve target's view. Required exactly when the plan's attachment
-    /// asks to resolve.
-    pub resolve_view: Option<vk::ImageView>,
+    /// What this view covers. See [`Coverage`].
+    pub coverage: Coverage,
+    /// The image this attachment resolves into. Required exactly when the
+    /// plan's attachment asks to resolve.
+    pub resolve: Option<ResolveTarget>,
 }
 
 /// Why a pass cannot be built here.
@@ -175,6 +252,82 @@ pub enum Refusal {
     /// The plan asks this attachment to resolve and no resolve image was
     /// supplied — or one was supplied for an attachment that does not resolve.
     ResolveMismatch { index: usize, planned: bool },
+    /// The plan asks for a depth or stencil multisample resolve, and this rail
+    /// has no path that performs one.
+    ///
+    /// A depth-stencil resolve is `VK_KHR_depth_stencil_resolve`, core from
+    /// Vulkan 1.2: `VkSubpassDescriptionDepthStencilResolve` on the
+    /// render-pass rung — which also requires `VkRenderPass2` and
+    /// `VkSubpassDescription2`, neither of which is built here — and
+    /// `resolveMode` on the dynamic rung. Both need the device's reported
+    /// `depthResolveModes` and `stencilResolveModes`, because which reductions
+    /// a host performs is not fixed and `SAMPLE_ZERO` is the only one every
+    /// implementation must offer.
+    ///
+    /// Refused by name rather than dropped. The information reaches here —
+    /// [`crate::pass::plan`] produces the [`crate::pass::Resolve`] — and
+    /// building the pass without it produces a pass that runs and never writes
+    /// the guest's resolved depth image, which is exactly what
+    /// [`Self::ResolveMismatch`] exists to prevent on the colour side.
+    DepthStencilResolveUnsupported,
+    /// A resolve target's format differs from the attachment it resolves.
+    ///
+    /// Vulkan admits only the same format, and the two are different guest
+    /// textures — so this is the guest naming a pair no host can resolve
+    /// between, and the refusal names both.
+    ResolveFormatMismatch {
+        index: usize,
+        attachment: vk::Format,
+        resolve: vk::Format,
+    },
+    /// A resolve target is itself multisampled. It is where a resolve *lands*,
+    /// so it is single-sampled or it is not a resolve target.
+    ResolveIsMultisampled {
+        index: usize,
+        samples: vk::SampleCountFlags,
+    },
+    /// An attachment view is smaller than the area the pass renders over.
+    ///
+    /// The render area is the guest's `renderTargetWidth`, `Height` and
+    /// `ArrayLength`, written on the pass descriptor; the views are textures
+    /// the guest attached. They are separate declarations and the wire makes
+    /// neither bound the other, so a pass may name an area larger than
+    /// something it renders into --- which is a `vkCreateFramebuffer` every
+    /// one of whose views is too small on that axis
+    /// (VUID-VkFramebufferCreateInfo-flags-04533, -04534 and -04535), and a
+    /// driver that does not check writes past the end of a texture.
+    ///
+    /// One variant with an axis rather than three, because the sentence is the
+    /// same each time. `slot` names which view, since a pass has up to
+    /// seventeen of them and "an attachment" names none.
+    AttachmentSmallerThanArea {
+        slot: AttachmentName,
+        axis: &'static str,
+        covered: u32,
+        area: u32,
+    },
+}
+
+/// Which of a pass's views a refusal is about.
+///
+/// A pass carries up to eight colour attachments, a resolve target for each,
+/// and one depth-stencil attachment. An index alone would name the colour slot
+/// and its resolve identically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentName {
+    Color(usize),
+    ColorResolve(usize),
+    DepthStencil,
+}
+
+impl std::fmt::Display for AttachmentName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Color(index) => write!(f, "color{index}"),
+            Self::ColorResolve(index) => write!(f, "color{index}_resolve"),
+            Self::DepthStencil => f.write_str("depth_stencil"),
+        }
+    }
 }
 
 impl Refusal {
@@ -185,6 +338,10 @@ impl Refusal {
             Self::DepthStencilMismatch { .. } => "vk_renderpass_depth_stencil_count",
             Self::SampleCountMismatch { .. } => "vk_renderpass_sample_count",
             Self::ResolveMismatch { .. } => "vk_renderpass_resolve",
+            Self::DepthStencilResolveUnsupported => "vk_renderpass_depth_stencil_resolve",
+            Self::ResolveFormatMismatch { .. } => "vk_renderpass_resolve_format",
+            Self::ResolveIsMultisampled { .. } => "vk_renderpass_resolve_multisampled",
+            Self::AttachmentSmallerThanArea { .. } => "vk_renderpass_attachment_smaller_than_area",
         }
     }
 }
@@ -208,6 +365,34 @@ impl std::fmt::Display for Refusal {
             Self::ResolveMismatch { index, planned } => {
                 write!(f, "{} index={index} planned={planned}", self.slug())
             }
+            Self::ResolveFormatMismatch {
+                index,
+                attachment,
+                resolve,
+            } => write!(
+                f,
+                "{} index={index} attachment={:?} resolve={:?}",
+                self.slug(),
+                attachment.as_raw(),
+                resolve.as_raw()
+            ),
+            Self::ResolveIsMultisampled { index, samples } => write!(
+                f,
+                "{} index={index} samples={:?}",
+                self.slug(),
+                samples.as_raw()
+            ),
+            Self::AttachmentSmallerThanArea {
+                slot,
+                axis,
+                covered,
+                area,
+            } => write!(
+                f,
+                "{} slot={slot} axis={axis} covered={covered} area={area}",
+                self.slug()
+            ),
+            Self::DepthStencilResolveUnsupported => f.write_str(self.slug()),
         }
     }
 }
@@ -284,6 +469,29 @@ fn ops_of(
     }
 }
 
+/// What a render pass does with an aspect of its depth-stencil attachment that
+/// the guest did not attach: preserve it.
+///
+/// `DepthStencilPlan::depth` is `None` when the guest attached *only stencil*,
+/// and `stencil` is `None` when it attached only depth — one image with two
+/// aspects, of which this pass uses one. That is not permission to throw the
+/// other away, and `DONT_CARE` as a store op is exactly that permission: on a
+/// combined format the driver may discard the aspect, and a later pass that
+/// attaches it reads whatever is left.
+///
+/// It is also what made the two rungs of one [`Build`] disagree about guest
+/// pixels. Dynamic rendering attaches nothing for an unplanned aspect, so it
+/// leaves it untouched; the render-pass object has one attachment carrying both
+/// pairs of operations and cannot say "not attached" — the nearest thing it can
+/// say is load it and store it back, which is what leaving it alone means here.
+///
+/// Ignored by the driver for a format that has no such aspect, so a pure-depth
+/// attachment pays nothing for the stencil pair.
+const UNATTACHED_ASPECT: Ops = Ops {
+    load: vk::AttachmentLoadOp::LOAD,
+    store: vk::AttachmentStoreOp::STORE,
+};
+
 fn attachment_description(
     format: vk::Format,
     samples: vk::SampleCountFlags,
@@ -302,8 +510,16 @@ fn attachment_description(
     }
 }
 
+/// One attachment for the dynamic-rendering rung.
+///
+/// `format` is the attachment's, and it is here for one reason: a resolve mode
+/// is not a constant. An integer colour attachment must resolve by sample zero
+/// — see [`crate::pixel::color_resolve_mode`] — and the render-pass rung, which
+/// has no mode field, already does. A hardcoded `AVERAGE` made the two rungs
+/// disagree with one of them invalid.
 fn rendering_attachment(
     view: vk::ImageView,
+    format: vk::Format,
     layout: vk::ImageLayout,
     load: vk::AttachmentLoadOp,
     store: vk::AttachmentStoreOp,
@@ -318,7 +534,7 @@ fn rendering_attachment(
         .clear_value(clear);
     if let Some(target) = resolve {
         info = info
-            .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+            .resolve_mode(crate::pixel::color_resolve_mode(format))
             .resolve_image_view(target)
             .resolve_image_layout(layout);
     }
@@ -381,13 +597,91 @@ pub fn build(
     }
     let samples = samples.unwrap_or(vk::SampleCountFlags::TYPE_1);
 
+    // Every view the framebuffer will be given, against the area it will be
+    // created with. Before any description is written, and over the resolve
+    // targets as well: a resolve target is an element of the same attachment
+    // array, so the requirement is its too. The plan's own extent is already
+    // narrowed and non-zero --- see `crate::pass::plan` --- so what is left is
+    // whether the images the names resolved to are big enough to hold it.
+    let area = Coverage {
+        extent: plan.extent,
+        layers: plan.layers,
+    };
+    let named = color
+        .iter()
+        .enumerate()
+        .flat_map(|(index, bound)| {
+            [Some((AttachmentName::Color(index), bound.coverage))]
+                .into_iter()
+                .chain([bound
+                    .resolve
+                    .map(|target| (AttachmentName::ColorResolve(index), target.coverage))])
+        })
+        .flatten()
+        .chain(
+            depth_stencil
+                .iter()
+                .map(|bound| (AttachmentName::DepthStencil, bound.coverage)),
+        );
+    for (slot, coverage) in named {
+        for (axis, covered, wanted) in [
+            ("width", coverage.extent.width, area.extent.width),
+            ("height", coverage.extent.height, area.extent.height),
+            ("layers", coverage.layers, area.layers),
+        ] {
+            if covered < wanted {
+                return Err(Refusal::AttachmentSmallerThanArea {
+                    slot,
+                    axis,
+                    covered,
+                    area: wanted,
+                });
+            }
+        }
+    }
+
     for (index, (planned, bound)) in plan.color.iter().zip(color).enumerate() {
-        if planned.resolve.is_some() != bound.resolve_view.is_some() {
+        if planned.resolve.is_some() != bound.resolve.is_some() {
             return Err(Refusal::ResolveMismatch {
                 index,
                 planned: planned.resolve.is_some(),
             });
         }
+        // The two requirements a resolve target carries in its own right,
+        // checked before its description is written rather than asserted by
+        // writing one. See [`ResolveTarget`].
+        if let Some(target) = bound.resolve {
+            if target.format != bound.format {
+                return Err(Refusal::ResolveFormatMismatch {
+                    index,
+                    attachment: bound.format,
+                    resolve: target.format,
+                });
+            }
+            if target.samples != vk::SampleCountFlags::TYPE_1 {
+                return Err(Refusal::ResolveIsMultisampled {
+                    index,
+                    samples: target.samples,
+                });
+            }
+        }
+    }
+    // The depth-stencil pair, which the loop above does not reach. A resolve
+    // the plan asks for has no path here; a resolve image the caller supplied
+    // for an attachment the plan does not resolve is the colour side's own
+    // mismatch, at the index one past the last colour attachment.
+    if plan
+        .depth_stencil
+        .as_ref()
+        .is_some_and(|planned| planned.resolve.is_some())
+    {
+        return Err(Refusal::DepthStencilResolveUnsupported);
+    }
+    if depth_stencil.is_some_and(|bound| bound.resolve.is_some()) {
+        return Err(Refusal::ResolveMismatch {
+            index: plan.color.len(),
+            planned: false,
+        });
     }
 
     let mut attachments = Vec::new();
@@ -413,30 +707,32 @@ pub fn build(
         resolve_flags.push(planned.resolve.is_some());
         color_rendering.push(rendering_attachment(
             bound.view,
+            bound.format,
             color_layout(),
             planned.load,
             planned.store,
             clear,
-            bound.resolve_view,
+            bound.resolve.map(|target| target.view),
         ));
 
-        if let Some(target) = bound.resolve_view {
+        if let Some(target) = bound.resolve {
             resolve_refs.push(vk::AttachmentReference {
                 attachment: u32::try_from(attachments.len()).unwrap_or(u32::MAX),
                 layout: color_layout(),
             });
-            // A resolve target is written and not read, and it is always
-            // single-sampled whatever the pass is.
+            // The target's own format and sample count, both already checked
+            // against what Vulkan admits. Taking the attachment's instead
+            // would describe an image nobody looked at.
             attachments.push(attachment_description(
-                bound.format,
-                vk::SampleCountFlags::TYPE_1,
+                target.format,
+                target.samples,
                 ops_of(
                     vk::AttachmentLoadOp::DONT_CARE,
                     vk::AttachmentStoreOp::STORE,
                     color_layout(),
                 ),
             ));
-            views.push(target);
+            views.push(target.view);
             clears.push(vk::ClearValue {
                 color: vk::ClearColorValue { float32: [0.0; 4] },
             });
@@ -461,14 +757,8 @@ pub fn build(
     let (mut has_depth, mut has_stencil) = (false, false);
 
     if let (Some(planned), Some(bound)) = (plan.depth_stencil.as_ref(), depth_stencil) {
-        let depth = planned.depth.unwrap_or(Ops {
-            load: vk::AttachmentLoadOp::DONT_CARE,
-            store: vk::AttachmentStoreOp::DONT_CARE,
-        });
-        let stencil = planned.stencil.unwrap_or(Ops {
-            load: vk::AttachmentLoadOp::DONT_CARE,
-            store: vk::AttachmentStoreOp::DONT_CARE,
-        });
+        let depth = planned.depth.unwrap_or(UNATTACHED_ASPECT);
+        let stencil = planned.stencil.unwrap_or(UNATTACHED_ASPECT);
         let ops = AttachmentOps {
             load: depth.load,
             store: depth.store,
@@ -497,6 +787,7 @@ pub fn build(
         if has_depth {
             depth_rendering = Some(rendering_attachment(
                 bound.view,
+                bound.format,
                 depth_stencil_layout(),
                 depth.load,
                 depth.store,
@@ -507,6 +798,7 @@ pub fn build(
         if has_stencil {
             stencil_rendering = Some(rendering_attachment(
                 bound.view,
+                bound.format,
                 depth_stencil_layout(),
                 stencil.load,
                 stencil.store,
@@ -519,6 +811,7 @@ pub fn build(
     let signature = Signature {
         compatibility: Compatibility {
             color: color.iter().map(|b| b.format).collect(),
+            resolve: resolve_flags,
             depth_stencil: depth_stencil_format,
             depth: has_depth,
             stencil: has_stencil,
@@ -526,7 +819,6 @@ pub fn build(
         },
         color: color_ops,
         depth_stencil: depth_stencil_ops,
-        resolve: resolve_flags,
     };
 
     Ok(Build {
@@ -590,7 +882,7 @@ impl Build {
     /// the subpass carries a resolve array at all.
     #[must_use]
     pub fn resolves(&self) -> bool {
-        self.signature.resolve.iter().any(|r| *r)
+        self.signature.compatibility.resolve.iter().any(|r| *r)
     }
 
     /// Hand `f` the `VkRenderPassCreateInfo` this build describes.
@@ -881,7 +1173,9 @@ mod tests {
     use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
     use reims_vgpu_core::pass::{LoadAction, StoreAction};
     use reims_vgpu_core::pass::{PassDescriptor, RenderTargetExtent};
-    use reims_vgpu_core::pixel_format::{MTL_FORMAT_DEPTH32_FLOAT, MTL_FORMAT_RGBA8_UNORM};
+    use reims_vgpu_core::pixel_format::{
+        MTL_FORMAT_DEPTH32_FLOAT, MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, MTL_FORMAT_RGBA8_UNORM,
+    };
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -914,12 +1208,33 @@ mod tests {
         plan(&d, |_| MTL_FORMAT_RGBA8_UNORM).expect("a legal descriptor")
     }
 
+    /// A view exactly covering [`descriptor`]'s render area, so a test that
+    /// is not about coverage never trips the coverage check.
+    const COVERS: Coverage = Coverage {
+        extent: vk::Extent2D {
+            width: 128,
+            height: 64,
+        },
+        layers: 1,
+    };
+
     fn bound(view_id: u64) -> Bound {
         Bound {
             format: vk::Format::R8G8B8A8_UNORM,
             samples: vk::SampleCountFlags::TYPE_1,
             view: view(view_id),
-            resolve_view: None,
+            coverage: COVERS,
+            resolve: None,
+        }
+    }
+
+    /// A legal resolve target for [`bound`]: its format, and one sample.
+    fn resolve_target(view_id: u64) -> ResolveTarget {
+        ResolveTarget {
+            view: view(view_id),
+            format: vk::Format::R8G8B8A8_UNORM,
+            samples: vk::SampleCountFlags::TYPE_1,
+            coverage: COVERS,
         }
     }
 
@@ -927,6 +1242,134 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         value.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// A resolve target is a different guest texture, so the two facts Vulkan
+    /// demands of it — the attachment's format, and exactly one sample — are
+    /// its own and not the attachment's. Checked here, where the refusal can
+    /// name both, rather than asserted by writing a description and letting
+    /// `vkCreateFramebuffer` refuse a view whose format it does not match.
+    #[test]
+    fn a_resolve_target_answers_for_its_own_format_and_sample_count() {
+        let mut plan = one_colour(LoadAction::Load, StoreAction::Store);
+        plan.color[0].resolve = Some(crate::pass::Resolve {
+            texture: plan.color[0].texture,
+            level: 0,
+            slice: 0,
+        });
+
+        let legal = Bound {
+            resolve: Some(resolve_target(2)),
+            ..bound(1)
+        };
+        assert!(build(&plan, &[legal], None).is_ok());
+
+        let wrong_format = Bound {
+            resolve: Some(ResolveTarget {
+                format: vk::Format::B8G8R8A8_UNORM,
+                ..resolve_target(2)
+            }),
+            ..bound(1)
+        };
+        assert_eq!(
+            build(&plan, &[wrong_format], None).expect_err("two formats"),
+            Refusal::ResolveFormatMismatch {
+                index: 0,
+                attachment: vk::Format::R8G8B8A8_UNORM,
+                resolve: vk::Format::B8G8R8A8_UNORM,
+            }
+        );
+
+        let multisampled = Bound {
+            resolve: Some(ResolveTarget {
+                samples: vk::SampleCountFlags::TYPE_4,
+                ..resolve_target(2)
+            }),
+            ..bound(1)
+        };
+        assert_eq!(
+            build(&plan, &[multisampled], None).expect_err("a multisample target"),
+            Refusal::ResolveIsMultisampled {
+                index: 0,
+                samples: vk::SampleCountFlags::TYPE_4,
+            }
+        );
+    }
+
+    /// A resolve is not an operation. Vulkan's compatibility rule names
+    /// "color, input, **resolve**, and depth/stencil attachment references",
+    /// and a reference naming a real attachment is compatible only with
+    /// another naming one — never with the null pointer a subpass without
+    /// resolve targets has. So two passes that differ only in whether a colour
+    /// attachment resolves are two render passes *and* two pipeline classes,
+    /// and a class that conflated them would bind a pipeline built against an
+    /// incompatible pass.
+    #[test]
+    fn a_resolve_changes_the_pass_object_and_the_pipeline_key() {
+        // Both plans store; the resolve is injected onto one of them, so it is
+        // the only thing the two differ in.
+        let mut resolving = one_colour(LoadAction::Load, StoreAction::Store);
+        resolving.color[0].resolve = Some(crate::pass::Resolve {
+            texture: resolving.color[0].texture,
+            level: 0,
+            slice: 0,
+        });
+        let plain = one_colour(LoadAction::Load, StoreAction::Store);
+
+        let with = build(
+            &resolving,
+            &[Bound {
+                resolve: Some(resolve_target(2)),
+                ..bound(1)
+            }],
+            None,
+        )
+        .expect("legal");
+        let without = build(&plain, &[bound(1)], None).expect("legal");
+
+        assert!(with.resolves());
+        assert!(!without.resolves());
+        assert_ne!(with.signature(), without.signature());
+        assert_ne!(
+            with.compatibility(),
+            without.compatibility(),
+            "one pipeline cannot serve both passes"
+        );
+        // And the difference is the resolve flags and nothing else: the
+        // formats, the aspects and the sample count all agree.
+        assert_eq!(with.compatibility().color, without.compatibility().color);
+        assert_eq!(
+            with.compatibility().samples,
+            without.compatibility().samples
+        );
+        assert_eq!(with.compatibility().resolve, vec![true]);
+        assert_eq!(without.compatibility().resolve, vec![false]);
+    }
+
+    /// The dynamic-rendering rung has no resolve in the pipeline — it is a
+    /// field of `VkRenderingAttachmentInfo`, supplied when the pass is begun —
+    /// so the flags must not reach `VkPipelineRenderingCreateInfo`.
+    #[test]
+    fn the_resolve_flags_do_not_reach_the_dynamic_rendering_structure() {
+        let mut compatibility = Compatibility {
+            color: vec![vk::Format::B8G8R8A8_UNORM],
+            resolve: vec![false],
+            depth_stencil: None,
+            depth: false,
+            stencil: false,
+            samples: vk::SampleCountFlags::TYPE_1,
+        };
+        let plain = compatibility.rendering_info();
+        let plain = (plain.color_attachment_count, plain.depth_attachment_format);
+        compatibility.resolve = vec![true];
+        let resolving = compatibility.rendering_info();
+        assert_eq!(
+            (
+                resolving.color_attachment_count,
+                resolving.depth_attachment_format
+            ),
+            plain
+        );
     }
 
     /// The claim the module exists for: two passes that differ only in a load
@@ -1059,7 +1502,8 @@ mod tests {
             format: vk::Format::D32_SFLOAT,
             samples: vk::SampleCountFlags::TYPE_1,
             view: view(30),
-            resolve_view: None,
+            coverage: COVERS,
+            resolve: None,
         };
         let built = build(&plan, &[bound(10), bound(20)], Some(depth)).expect("legal");
 
@@ -1110,7 +1554,7 @@ mod tests {
         let plan = plan(&d, |_| MTL_FORMAT_RGBA8_UNORM).expect("a legal descriptor");
 
         let resolving = Bound {
-            resolve_view: Some(view(99)),
+            resolve: Some(resolve_target(99)),
             samples: vk::SampleCountFlags::TYPE_4,
             ..bound(2)
         };
@@ -1160,7 +1604,8 @@ mod tests {
             format: vk::Format::D32_SFLOAT,
             samples: vk::SampleCountFlags::TYPE_1,
             view: view(2),
-            resolve_view: None,
+            coverage: COVERS,
+            resolve: None,
         };
         let built = build(&plan, &[bound(1)], Some(depth)).expect("legal");
 
@@ -1271,7 +1716,7 @@ mod tests {
             build(
                 &plan,
                 &[Bound {
-                    resolve_view: Some(view(9)),
+                    resolve: Some(resolve_target(9)),
                     ..bound(1)
                 }],
                 None
@@ -1310,6 +1755,331 @@ mod tests {
         .collect();
         assert_eq!(slugs.len(), 4);
     }
+    /// A depth-stencil plan that asks to resolve. The `Resolve` reaches here
+    /// --- `pass::plan` produced it from the guest's store action --- and
+    /// nothing in `build` reads it, so before this refusal existed the pass was
+    /// built without one and the guest's resolved depth image was never
+    /// written.
+    fn depth_stencil_that_resolves(resolves: bool) -> PassPlan {
+        let mut d = descriptor();
+        d.color[0].texture = Some(id(1));
+        d.color[0].load = LoadAction::Load;
+        d.color[0].store = StoreAction::Store;
+        d.depth.texture = Some(id(2));
+        d.depth.load = LoadAction::Load;
+        d.depth.store = if resolves {
+            StoreAction::StoreAndMultisampleResolve
+        } else {
+            StoreAction::Store
+        };
+        if resolves {
+            d.depth.resolve_texture = Some(id(3));
+        }
+        plan(&d, |_| MTL_FORMAT_DEPTH32_FLOAT).expect("a legal descriptor")
+    }
+
+    /// One image, two aspects, and this pass uses one of them. The other is not
+    /// this pass's to throw away.
+    ///
+    /// `DepthStencilPlan::depth` is `None` when the guest attached only
+    /// stencil, and `stencil` is `None` when it attached only depth. Both used
+    /// to become `DONT_CARE`, which on a combined format licenses the driver to
+    /// discard an aspect of a texture the guest still owns — so a depth prepass
+    /// on a `Depth32Float_Stencil8` target destroyed the stencil mask a later
+    /// pass tested against.
+    ///
+    /// The two rungs disagreed about it, which is the sharper form of the same
+    /// claim: dynamic rendering attaches nothing for an unplanned aspect and so
+    /// leaves it alone, while the render-pass object discarded it. One `Build`
+    /// producing two different guest-visible results is what the fourth
+    /// supported pathway exists to measure, and it would have been read as a
+    /// metal2vulkan difference.
+    #[test]
+    fn an_aspect_this_pass_does_not_attach_is_preserved_on_both_rungs() {
+        let mut d = descriptor();
+        d.color[0].texture = Some(id(1));
+        d.color[0].load = LoadAction::Load;
+        d.color[0].store = StoreAction::Store;
+        // Depth attached, stencil not — the depth-prepass shape.
+        d.depth.texture = Some(id(2));
+        d.depth.load = LoadAction::Clear;
+        d.depth.store = StoreAction::Store;
+        let planned = plan(&d, |_| MTL_FORMAT_DEPTH32_FLOAT_STENCIL8).expect("a legal descriptor");
+        let ds = planned.depth_stencil.as_ref().expect("attached");
+        assert!(ds.depth.is_some());
+        assert!(
+            ds.stencil.is_none(),
+            "the guest attached no stencil, which is what this is about"
+        );
+
+        let combined = Bound {
+            format: vk::Format::D32_SFLOAT_S8_UINT,
+            ..bound(2)
+        };
+        let built = build(&planned, &[bound(1)], Some(combined)).expect("builds");
+
+        let ds_attachment = built
+            .attachments()
+            .iter()
+            .find(|a| a.format == vk::Format::D32_SFLOAT_S8_UINT)
+            .expect("the depth-stencil attachment is described");
+        assert_ne!(
+            ds_attachment.stencil_store_op,
+            vk::AttachmentStoreOp::DONT_CARE,
+            "the render pass may not discard an aspect this pass never touched"
+        );
+        assert_eq!(ds_attachment.stencil_store_op, vk::AttachmentStoreOp::STORE);
+        assert_eq!(ds_attachment.stencil_load_op, vk::AttachmentLoadOp::LOAD);
+        // And the aspect this pass *does* use keeps what the guest asked for.
+        assert_eq!(ds_attachment.load_op, vk::AttachmentLoadOp::CLEAR);
+        assert_eq!(ds_attachment.store_op, vk::AttachmentStoreOp::STORE);
+
+        // The other rung's answer to the same question, which is what the two
+        // have to agree about: no stencil attachment at all.
+        built.with_rendering_info(|info| {
+            assert!(
+                info.p_stencil_attachment.is_null(),
+                "dynamic rendering attaches no aspect the guest did not"
+            );
+            assert!(!info.p_depth_attachment.is_null());
+        });
+    }
+
+    #[test]
+    fn a_depth_stencil_resolve_is_refused_and_not_quietly_left_out() {
+        let asking = depth_stencil_that_resolves(true);
+        assert!(
+            asking
+                .depth_stencil
+                .as_ref()
+                .expect("attached")
+                .resolve
+                .is_some(),
+            "the plan really does carry the resolve this build cannot make"
+        );
+        let depth = Bound {
+            format: vk::Format::D32_SFLOAT,
+            ..bound(2)
+        };
+        assert_eq!(
+            build(&asking, &[bound(1)], Some(depth)).expect_err("no path for it"),
+            Refusal::DepthStencilResolveUnsupported
+        );
+
+        // The same pass without the resolve builds, so the refusal is about the
+        // resolve and not about attaching depth at all.
+        assert!(build(
+            &depth_stencil_that_resolves(false),
+            &[bound(1)],
+            Some(depth)
+        )
+        .is_ok());
+    }
+
+    /// The other direction: a resolve image supplied for a depth-stencil
+    /// attachment the plan does not resolve was ignored, exactly as a colour
+    /// attachment's would not have been.
+    #[test]
+    fn a_depth_stencil_resolve_image_nobody_asked_for_is_a_mismatch() {
+        let quiet = depth_stencil_that_resolves(false);
+        let depth = Bound {
+            format: vk::Format::D32_SFLOAT,
+            resolve: Some(resolve_target(7)),
+            ..bound(2)
+        };
+        assert_eq!(
+            build(&quiet, &[bound(1)], Some(depth)).expect_err("nothing asked for it"),
+            Refusal::ResolveMismatch {
+                index: 1,
+                planned: false,
+            }
+        );
+    }
+
+    /// The failure this exists to prevent: a `VkFramebuffer` is created with a
+    /// width, a height and a layer count, and every view it is given must be
+    /// at least that large on all three. The area is the guest's
+    /// `renderTargetWidth`/`Height`/`ArrayLength` and the views are textures
+    /// the guest attached --- two separate declarations the wire does not make
+    /// agree. `Bound` did not carry what its view covered, so the build had
+    /// nothing to compare and the pass was created against images too small
+    /// for it.
+    #[test]
+    fn an_attachment_smaller_than_the_render_area_refuses_on_its_own_axis() {
+        let plan = one_colour(LoadAction::Clear, StoreAction::Store);
+        assert_eq!(
+            plan.extent,
+            vk::Extent2D {
+                width: 128,
+                height: 64
+            }
+        );
+        assert!(build(&plan, &[bound(10)], None).is_ok(), "exactly covering");
+
+        // Each axis independently, and one texel short on each.
+        for (axis, coverage) in [
+            (
+                "width",
+                Coverage {
+                    extent: vk::Extent2D {
+                        width: 127,
+                        height: 64,
+                    },
+                    layers: 1,
+                },
+            ),
+            (
+                "height",
+                Coverage {
+                    extent: vk::Extent2D {
+                        width: 128,
+                        height: 63,
+                    },
+                    layers: 1,
+                },
+            ),
+            (
+                "layers",
+                Coverage {
+                    extent: vk::Extent2D {
+                        width: 128,
+                        height: 64,
+                    },
+                    layers: 0,
+                },
+            ),
+        ] {
+            let short = Bound {
+                coverage,
+                ..bound(10)
+            };
+            let refusal = build(&plan, &[short], None).expect_err("one axis short");
+            assert!(
+                matches!(
+                    refusal,
+                    Refusal::AttachmentSmallerThanArea {
+                        slot: AttachmentName::Color(0),
+                        axis: named,
+                        ..
+                    } if named == axis
+                ),
+                "{axis}: {refusal}"
+            );
+        }
+
+        // A view larger than the area is legal --- the framebuffer renders
+        // into part of it --- which is what makes the refusal a bound and not
+        // an equality.
+        let larger = Bound {
+            coverage: Coverage {
+                extent: vk::Extent2D {
+                    width: 256,
+                    height: 128,
+                },
+                layers: 4,
+            },
+            ..bound(10)
+        };
+        assert!(build(&plan, &[larger], None).is_ok());
+    }
+
+    /// And the resolve target is measured too: it is an element of the same
+    /// framebuffer attachment array, so the requirement is equally its. The
+    /// colour attachment beside it covers the area, so a check that ran only
+    /// over the attachments would pass this.
+    #[test]
+    fn a_resolve_target_smaller_than_the_render_area_refuses_by_its_own_name() {
+        let mut d = descriptor();
+        d.color[0].texture = Some(id(1));
+        d.color[0].load = LoadAction::Clear;
+        d.color[0].store = StoreAction::MultisampleResolve;
+        d.color[0].resolve_texture = Some(id(2));
+        let plan = plan(&d, |_| MTL_FORMAT_RGBA8_UNORM).expect("a legal descriptor");
+
+        let short = ResolveTarget {
+            coverage: Coverage {
+                extent: vk::Extent2D {
+                    width: 64,
+                    height: 64,
+                },
+                layers: 1,
+            },
+            ..resolve_target(20)
+        };
+        assert_eq!(
+            build(
+                &plan,
+                &[Bound {
+                    resolve: Some(short),
+                    ..bound(10)
+                }],
+                None,
+            )
+            .expect_err("the resolve target is half as wide"),
+            Refusal::AttachmentSmallerThanArea {
+                slot: AttachmentName::ColorResolve(0),
+                axis: "width",
+                covered: 64,
+                area: 128,
+            }
+        );
+        assert!(build(
+            &plan,
+            &[Bound {
+                resolve: Some(resolve_target(20)),
+                ..bound(10)
+            }],
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn every_refusal_names_itself() {
+        let refusals = [
+            Refusal::ColorCountMismatch {
+                planned: 1,
+                bound: 0,
+            },
+            Refusal::DepthStencilMismatch {
+                planned: true,
+                bound: false,
+            },
+            Refusal::SampleCountMismatch {
+                first: vk::SampleCountFlags::TYPE_1,
+                found: vk::SampleCountFlags::TYPE_4,
+            },
+            Refusal::ResolveMismatch {
+                index: 0,
+                planned: true,
+            },
+            Refusal::DepthStencilResolveUnsupported,
+            Refusal::ResolveFormatMismatch {
+                index: 0,
+                attachment: vk::Format::R8G8B8A8_UNORM,
+                resolve: vk::Format::B8G8R8A8_UNORM,
+            },
+            Refusal::ResolveIsMultisampled {
+                index: 0,
+                samples: vk::SampleCountFlags::TYPE_4,
+            },
+            Refusal::AttachmentSmallerThanArea {
+                slot: AttachmentName::ColorResolve(3),
+                axis: "height",
+                covered: 32,
+                area: 64,
+            },
+        ];
+        let mut slugs: Vec<&str> = refusals.iter().map(|r| r.slug()).collect();
+        let count = slugs.len();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), count, "two refusals share a slug");
+        for refusal in refusals {
+            assert!(refusal.to_string().starts_with(refusal.slug()));
+            assert!(refusal.slug().starts_with("vk_renderpass_"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1319,6 +2089,7 @@ mod cache_tests {
 
     fn compatibility(color: &[vk::Format]) -> Compatibility {
         Compatibility {
+            resolve: vec![false; color.len()],
             color: color.to_vec(),
             depth_stencil: None,
             depth: false,
@@ -1343,7 +2114,6 @@ mod cache_tests {
             compatibility: compatibility(&[vk::Format::B8G8R8A8_UNORM]),
             color: vec![ops(load)],
             depth_stencil: None,
-            resolve: vec![false],
         }
     }
 
@@ -1372,6 +2142,212 @@ mod cache_tests {
             self.0.set(self.0.get() + 1);
             Ok(vk::Framebuffer::from_raw(raw))
         }
+    }
+
+    /// A driven history of the cache against a shadow that owns no index.
+    ///
+    /// The shadow is one map from key to handle, written only when a `create`
+    /// closure actually returned a handle and read only to say what a
+    /// `forget_view` should have handed back. It has no reverse index at all,
+    /// which is the point: the reverse index is the thing under test, and a
+    /// shadow that kept one would go wrong in the same way.
+    ///
+    /// Three laws, and every one of them is a native object's lifetime:
+    ///
+    /// - **No handle comes back twice.** A framebuffer handed to the caller
+    ///   twice is destroyed twice, and the second destroy is on a handle the
+    ///   driver has already reused. Held over the whole history, across
+    ///   `forget_view` and `retire` together, not per call.
+    /// - **No handle is lost.** Everything created and not forgotten comes back
+    ///   from `retire`. A framebuffer the cache forgot about is one the epoch
+    ///   ends without destroying.
+    /// - **The index says exactly what is live.** `indexed_views` counts the
+    ///   distinct views of the live framebuffers and nothing else — an index
+    ///   that keeps a dead key hands the same handle back on a later forget,
+    ///   which is the first law again by a longer route.
+    ///
+    /// `forget_view` is driven mostly on views something actually names, and
+    /// the counter below says how often, because a sweep that forgets views
+    /// nobody used proves only that the empty case returns nothing.
+    ///
+    /// A `create` that fails is driven too. Its key must stay a miss: a cached
+    /// failure turns one driver refusal into a permanent one, and an *indexed*
+    /// failure would hand back a handle that was never made.
+    #[test]
+    fn a_driven_history_hands_every_framebuffer_back_exactly_once() {
+        use std::collections::{HashMap as Map, HashSet as Set};
+
+        let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let (mut created, mut hits, mut refused_creates) = (0u64, 0u64, 0u64);
+        let (mut forgets_that_dropped, mut empty_forgets, mut retires) = (0u64, 0u64, 0u64);
+        let (mut pass_hits, mut pass_misses) = (0u64, 0u64);
+
+        for _ in 0..400 {
+            let mut cache = Cache::new();
+            // What the sweep believes is live, and every handle ever returned
+            // to the caller. Both are written from the calls alone.
+            let mut live: Map<FramebufferKey, vk::Framebuffer> = Map::new();
+            let mut returned: Set<u64> = Set::new();
+            let mut handles = 1u64;
+
+            for _ in 0..40 {
+                match next() % 10 {
+                    // A framebuffer, from a small pool of views so that one
+                    // view names several framebuffers and several views name
+                    // one.
+                    0..=4 => {
+                        let count = 1 + (next() % 2) as usize;
+                        let views: Vec<vk::ImageView> = (0..count)
+                            .map(|_| vk::ImageView::from_raw(1 + next() % 3))
+                            .collect();
+                        let key = FramebufferKey {
+                            render_pass: vk::RenderPass::from_raw(1),
+                            views,
+                            width: 64,
+                            height: 32,
+                            layers: 1,
+                        };
+                        let fail = next() % 8 == 0;
+                        let expected = live.get(&key).copied();
+                        let mut ran = false;
+                        let answer = cache.framebuffer(&key, || {
+                            ran = true;
+                            if fail {
+                                Err(())
+                            } else {
+                                handles += 1;
+                                Ok(vk::Framebuffer::from_raw(handles))
+                            }
+                        });
+                        match (expected, answer) {
+                            (Some(known), Ok(got)) => {
+                                assert_eq!(got, known, "a hit answered with another handle");
+                                assert!(!ran, "a hit called the driver");
+                                hits += 1;
+                            }
+                            (None, Ok(got)) => {
+                                assert!(ran);
+                                created += 1;
+                                live.insert(key, got);
+                            }
+                            (None, Err(())) => {
+                                assert!(ran);
+                                refused_creates += 1;
+                            }
+                            (Some(_), Err(())) => panic!("a live key reached the driver"),
+                        }
+                    }
+                    5..=7 => {
+                        // Mostly a view something names, so the interesting
+                        // half of `forget_view` is actually driven.
+                        let view = vk::ImageView::from_raw(if next() % 8 == 0 {
+                            90 + next() % 4
+                        } else {
+                            1 + next() % 3
+                        });
+                        let mut expected: Vec<vk::Framebuffer> = Vec::new();
+                        live.retain(|key, framebuffer| {
+                            if key.views.contains(&view) {
+                                expected.push(*framebuffer);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        let mut dropped = cache.forget_view(view);
+                        dropped.sort_by_key(|f| f.as_raw());
+                        expected.sort_by_key(|f| f.as_raw());
+                        assert_eq!(dropped, expected, "forget_view answered the wrong set");
+                        if dropped.is_empty() {
+                            empty_forgets += 1;
+                        } else {
+                            forgets_that_dropped += 1;
+                        }
+                        for framebuffer in dropped {
+                            assert!(
+                                returned.insert(framebuffer.as_raw()),
+                                "a framebuffer came back twice"
+                            );
+                        }
+                    }
+                    8 => {
+                        let signature = signature(if next() % 2 == 0 {
+                            vk::AttachmentLoadOp::CLEAR
+                        } else {
+                            vk::AttachmentLoadOp::LOAD
+                        });
+                        let before = cache.census();
+                        let _ = cache.render_pass(&signature, || {
+                            handles += 1;
+                            Ok::<_, ()>(vk::RenderPass::from_raw(handles))
+                        });
+                        let after = cache.census();
+                        pass_hits += after.render_pass_hits - before.render_pass_hits;
+                        pass_misses += after.render_pass_misses - before.render_pass_misses;
+                    }
+                    // Gated inside the arm rather than given a narrower
+                    // range: a retirement empties the cache, and too many of
+                    // them leave every history too short for one view to name
+                    // several framebuffers.
+                    _ if next() % 3 == 0 => {
+                        let retired = cache.retire();
+                        retires += 1;
+                        let mut got: Vec<u64> =
+                            retired.framebuffers.iter().map(|f| f.as_raw()).collect();
+                        let mut want: Vec<u64> = live.values().map(|f| f.as_raw()).collect();
+                        got.sort_unstable();
+                        want.sort_unstable();
+                        assert_eq!(got, want, "retire lost or invented a framebuffer");
+                        for raw in got {
+                            assert!(returned.insert(raw), "a framebuffer came back twice");
+                        }
+                        live.clear();
+                        assert_eq!(cache.indexed_views(), 0, "an index survived retirement");
+                    }
+                    _ => {}
+                }
+
+                // The index holds exactly the live framebuffers' views, after
+                // every operation. An index entry for a framebuffer that is
+                // gone is how the same handle comes back a second time.
+                let distinct: Set<vk::ImageView> =
+                    live.keys().flat_map(|k| k.views.iter().copied()).collect();
+                assert_eq!(
+                    cache.indexed_views(),
+                    distinct.len(),
+                    "the reverse index and the live set disagree"
+                );
+                assert_eq!(cache.census().framebuffers, live.len());
+            }
+
+            // Nothing is lost at the end of the history either.
+            let retired = cache.retire();
+            for framebuffer in retired.framebuffers {
+                assert!(
+                    returned.insert(framebuffer.as_raw()),
+                    "a framebuffer came back twice"
+                );
+            }
+        }
+
+        assert!(created > 5_000, "created={created}");
+        assert!(hits > 1_500, "hits={hits}");
+        assert!(refused_creates > 500, "refused={refused_creates}");
+        assert!(
+            forgets_that_dropped > 2_000,
+            "forgets_that_dropped={forgets_that_dropped}"
+        );
+        assert!(empty_forgets > 2_000, "empty_forgets={empty_forgets}");
+        assert!(retires > 400, "retires={retires}");
+        assert!(pass_hits > 500, "pass_hits={pass_hits}");
+        assert!(pass_misses > 800, "pass_misses={pass_misses}");
     }
 
     /// A repeated signature is one object, and the driver is asked once.
@@ -1655,7 +2631,15 @@ mod cache_tests {
                 format: vk::Format::B8G8R8A8_UNORM,
                 samples: vk::SampleCountFlags::TYPE_1,
                 view: vk::ImageView::from_raw(10),
-                resolve_view: None,
+                // Exactly the render area declared above.
+                coverage: Coverage {
+                    extent: vk::Extent2D {
+                        width: 64,
+                        height: 32,
+                    },
+                    layers: 1,
+                },
+                resolve: None,
             }],
             None,
         )

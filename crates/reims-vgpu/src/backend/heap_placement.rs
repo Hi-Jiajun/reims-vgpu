@@ -24,23 +24,34 @@ use crate::runtime::heap_query::{QueryError, SizeAndAlign, TextureDescriptor};
 
 #[cfg(target_os = "macos")]
 pub fn heap_texture_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
+    use crate::protocol::texture_shape::TextureKind;
     use metal::{
         MTLResourceOptions, MTLTextureType, MTLTextureUsage, TextureDescriptor as MtlDescriptor,
     };
     use objc::runtime::{NO, YES};
     use objc::{msg_send, sel, sel_impl};
 
-    let texture_type = match desc.texture_type {
-        0 => MTLTextureType::D1,
-        1 => MTLTextureType::D1Array,
-        2 => MTLTextureType::D2,
-        3 => MTLTextureType::D2Array,
-        4 => MTLTextureType::D2Multisample,
-        5 => MTLTextureType::Cube,
-        6 => MTLTextureType::CubeArray,
-        7 => MTLTextureType::D3,
-        8 => MTLTextureType::D2MultisampleArray,
-        _ => return Err(QueryError::UnknownTextureType),
+    // Which types exist and which ordinal names each one is the guest ABI's,
+    // and `protocol::texture_shape` is where this device says so. Read as a
+    // bare ordinal match here, it was the same nine-row table written twice —
+    // and the copy a guest actually reaches for a heap placement is this one,
+    // so a tenth type added to the owner would have silently kept refusing
+    // here while every other reader accepted it.
+    let kind =
+        crate::protocol::texture_shape::TextureKind::from_ordinal(u32::from(desc.texture_type))
+            .ok_or(QueryError::UnknownTextureType)?;
+    // The ordinal is parsed once above; this is the driver's spelling of the
+    // type it named, and nothing but a rename.
+    let texture_type = match kind {
+        TextureKind::D1 => MTLTextureType::D1,
+        TextureKind::D1Array => MTLTextureType::D1Array,
+        TextureKind::D2 => MTLTextureType::D2,
+        TextureKind::D2Array => MTLTextureType::D2Array,
+        TextureKind::D2Multisample => MTLTextureType::D2Multisample,
+        TextureKind::Cube => MTLTextureType::Cube,
+        TextureKind::CubeArray => MTLTextureType::CubeArray,
+        TextureKind::D3 => MTLTextureType::D3,
+        TextureKind::D2MultisampleArray => MTLTextureType::D2MultisampleArray,
     };
     let pixel_format =
         pixel_format_from_wire(desc.pixel_format).ok_or(QueryError::UnknownPixelFormat)?;

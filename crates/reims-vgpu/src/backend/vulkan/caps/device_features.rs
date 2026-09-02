@@ -329,6 +329,24 @@ pub struct DeviceFeatures {
     /// an extension, but not mandatory either — so it is asked rather than
     /// assumed, and the pipeline path declines by name where it is absent.
     pub dual_src_blend: bool,
+    /// `VkPhysicalDeviceFeatures::independentBlend` — whether the colour
+    /// attachments of one pipeline may declare *different* blend states.
+    ///
+    /// Metal places no such restriction: every
+    /// `MTLRenderPipelineColorAttachmentDescriptor` carries its own six
+    /// factors, its own two operations and its own write mask, and a guest MRT
+    /// pipeline routinely blends one slot and replaces another. Vulkan without
+    /// this feature requires every element of
+    /// `VkPipelineColorBlendStateCreateInfo::pAttachments` to be identical, so
+    /// a pipeline the guest may lawfully declare is one this device may be
+    /// unable to build.
+    ///
+    /// Asked and enabled rather than assumed, for the same reason as
+    /// [`Self::dual_src_blend`]: building a pipeline whose attachments
+    /// disagree without it is invalid use, not a slower path. Where it is
+    /// absent the pipeline path declines by name — see
+    /// `reims_vgpu_vulkan::blend::independent`.
+    pub independent_blend: bool,
     /// `VkPhysicalDeviceFeatures::fillModeNonSolid` — whether a pipeline may
     /// name `VK_POLYGON_MODE_LINE` or `_POINT`.
     ///
@@ -338,6 +356,84 @@ pub struct DeviceFeatures {
     /// pipeline invalid. Same shape as [`Self::dual_src_blend`] — optional
     /// core, asked rather than assumed, declined by name where absent.
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::wideLines` — whether `vkCmdSetLineWidth` may
+    /// be given anything but 1.0.
+    ///
+    /// `setLineWidth:` is a Metal render-encoder command and the width is
+    /// dynamic state on every host this rail admits, so unlike its neighbours
+    /// this bit gates no pipeline member: it gates a *value*. Without it, a
+    /// width other than the default is invalid use rather than a thin line, so
+    /// `reims_vgpu_vulkan::raster::line_width` refuses by name — and only for
+    /// a draw that rasterizes lines, which is why the refusal is at the draw
+    /// seam and not in the pipeline plan.
+    pub wide_lines: bool,
+    /// `VkPhysicalDeviceLimits::lineWidthRange`, `[min, max]`.
+    ///
+    /// The bound [`Self::wide_lines`] admits widths within. Vulkan requires it
+    /// to contain 1.0, which is what makes a device with neither the feature
+    /// nor a useful range still able to serve every guest that never calls
+    /// `setLineWidth:`. `lineWidthGranularity` is deliberately absent: the
+    /// spec asks nothing of the caller for it and the implementation rounds
+    /// within its own range, so a limit recorded here would gate nothing.
+    pub line_width_range: [f32; 2],
+    /// `VK_EXT_extended_dynamic_state`'s `extendedDynamicState`.
+    ///
+    /// **The feature bit, not what any one layer does with it.** It reaches
+    /// `vkCmdSetCullMode`, `vkCmdSetFrontFace` and `vkCmdSetPrimitiveTopology`
+    /// alike, and those are two different subsystems: the cull mode and
+    /// winding are `reims_vgpu_vulkan::raster`'s, the primitive topology is
+    /// `reims_vgpu_vulkan::topology`'s. Each projects this one bit into its own
+    /// cell at the draw seam; a field per command would be three spellings of
+    /// one fact, and a field named after one of the three would make the other
+    /// two read like they were borrowing it.
+    ///
+    /// All three are Metal encoder state the guest changes between draws.
+    /// Without this they are pipeline-creation members, so a guest that toggles
+    /// culling around a draw — or draws lines and then triangles from one
+    /// render pipeline state — compiles a second pipeline for it.
+    ///
+    /// Reached through the extension rather than 1.3 core, per
+    /// [`super::api_floor`]: a capability promoted into 1.3 is taken by its
+    /// `EXT` name and gated on runtime presence, so the 1.2 baseline stays the
+    /// path that is actually exercised.
+    pub extended_dynamic_state: bool,
+    /// `VK_EXT_extended_dynamic_state3`'s `extendedDynamicState3PolygonMode` —
+    /// whether `vkCmdSetPolygonModeEXT` exists. Metal's
+    /// `setTriangleFillMode:`.
+    ///
+    /// Never promoted to core, so this one is only ever the extension's. The
+    /// extension groups some thirty dynamic members behind individual feature
+    /// bits and a device may offer any subset, which is why this and
+    /// [`Self::dynamic_depth_clamp`] are asked separately rather than derived
+    /// from the extension string.
+    pub dynamic_polygon_mode: bool,
+    /// `VK_EXT_extended_dynamic_state3`'s
+    /// `extendedDynamicState3DepthClampEnable` — whether
+    /// `vkCmdSetDepthClampEnableEXT` exists. Metal's `setDepthClipMode:`.
+    ///
+    /// Making the state dynamic does **not** make [`Self::depth_clamp`] free:
+    /// a device still needs the feature to clamp at all, and
+    /// `reims_vgpu_vulkan::raster::plan` refuses `MTLDepthClipModeClamp`
+    /// without it on the dynamic path too.
+    pub dynamic_depth_clamp: bool,
+    /// `VkPhysicalDeviceExtendedDynamicState3PropertiesEXT::dynamicPrimitiveTopologyUnrestricted`.
+    ///
+    /// A **property**, not a feature: a device reports whether
+    /// `vkCmdSetPrimitiveTopology` may move across topology classes, rather
+    /// than being asked to lift the restriction. So it needs no enable and
+    /// adds no extension string — only `VK_EXT_extended_dynamic_state3` being
+    /// *advertised*, which is what makes the property answerable at all.
+    ///
+    /// Meaningless without [`Self::extended_dynamic_state`], which is the
+    /// feature that makes the topology dynamic in the first place;
+    /// `reims_vgpu_vulkan::topology::key` is where the two combine into the
+    /// three rungs a pipeline may be cached under, and a device that was not
+    /// asked reads `false`, which is the conservative rung.
+    ///
+    /// Getting this wrong is not a validation failure on a device that happens
+    /// to allow a cross-class change — it just runs — which is exactly why it
+    /// is asked structurally.
+    pub dynamic_primitive_topology_unrestricted: bool,
     /// `VkPhysicalDeviceFeatures::textureCompressionBC` — whether this device
     /// can sample the BC (DXT / S3TC) block-compressed families.
     ///
@@ -449,7 +545,9 @@ impl DeviceFeatures {
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
             .shader_storage_image_read_without_format(self.storage_image_read_without_format)
             .dual_src_blend(self.dual_src_blend)
+            .independent_blend(self.independent_blend)
             .fill_mode_non_solid(self.fill_mode_non_solid)
+            .wide_lines(self.wide_lines)
             .texture_compression_bc(self.texture_compression_bc)
             .depth_clamp(self.depth_clamp)
             .multi_viewport(self.multi_viewport)
@@ -518,6 +616,32 @@ impl DeviceFeatures {
             .attachment_feedback_loop_layout(self.attachment_feedback_loop_layout)
     }
 
+    /// The `VK_EXT_extended_dynamic_state` feature struct to chain, for the
+    /// rung that took the extension. Chained only when the flag is set —
+    /// asking a device for a feature it declined fails `vkCreateDevice`.
+    pub fn enabled_extended_dynamic_state(
+        &self,
+    ) -> vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'static> {
+        vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
+            .extended_dynamic_state(self.extended_dynamic_state)
+    }
+
+    /// The `VK_EXT_extended_dynamic_state3` feature struct to chain. Two
+    /// members of one structure, each enabled only where it was reported.
+    pub fn enabled_extended_dynamic_state3(
+        &self,
+    ) -> vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT<'static> {
+        vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default()
+            .extended_dynamic_state3_polygon_mode(self.dynamic_polygon_mode)
+            .extended_dynamic_state3_depth_clamp_enable(self.dynamic_depth_clamp)
+    }
+
+    /// Whether anything asked for `VK_EXT_extended_dynamic_state3`, and so
+    /// whether its feature struct belongs on the device chain.
+    pub fn wants_extended_dynamic_state3(&self) -> bool {
+        self.dynamic_polygon_mode || self.dynamic_depth_clamp
+    }
+
     /// 16-bit storage-buffer access, for shaders that pack half-precision data.
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
@@ -578,7 +702,14 @@ impl DeviceFeatures {
             attachment_feedback_loop_layout,
             image_drm_format_modifier,
             dual_src_blend,
+            independent_blend,
             fill_mode_non_solid,
+            wide_lines,
+            line_width_range,
+            extended_dynamic_state,
+            dynamic_polygon_mode,
+            dynamic_depth_clamp,
+            dynamic_primitive_topology_unrestricted,
             depth_clamp,
             multi_viewport,
             max_viewports,
@@ -625,7 +756,13 @@ impl DeviceFeatures {
              timeline_semaphore={timeline_semaphore} \
              descriptor_binding_partially_bound={descriptor_binding_partially_bound} \
              mirror_clamp_to_edge={mirror_clamp_to_edge:?} \
-             dual_src_blend={dual_src_blend} fill_mode_non_solid={fill_mode_non_solid} \
+             dual_src_blend={dual_src_blend} independent_blend={independent_blend} \
+             fill_mode_non_solid={fill_mode_non_solid} \
+             wide_lines={wide_lines} line_width_range={line_width_range:?} \
+             extended_dynamic_state={extended_dynamic_state} \
+             dyn_polygon_mode={dynamic_polygon_mode} \
+             dyn_depth_clamp={dynamic_depth_clamp} \
+             dyn_topology_unrestricted={dynamic_primitive_topology_unrestricted} \
              depth_clamp={depth_clamp} multi_viewport={multi_viewport} max_viewports={max_viewports} \
              occlusion_query_precise={occlusion_query_precise}",
             missing(sampled_linear_filter),
@@ -648,6 +785,15 @@ impl DeviceFeatures {
         }
         if self.image_drm_format_modifier {
             out.push(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr());
+        }
+        if self.extended_dynamic_state {
+            out.push(vk::EXT_EXTENDED_DYNAMIC_STATE_NAME.as_ptr());
+        }
+        // One string for both members, and named only when at least one of
+        // them came back set: enabling an extension whose every feature is off
+        // buys nothing and still has to be reported as enabled.
+        if self.dynamic_polygon_mode || self.dynamic_depth_clamp {
+            out.push(vk::EXT_EXTENDED_DYNAMIC_STATE3_NAME.as_ptr());
         }
         out
     }
@@ -789,6 +935,47 @@ pub unsafe fn query(
         };
     let image_drm_format_modifier = has_extension(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME);
 
+    // The same rule as `attachment_feedback_loop_layout` above: a structure
+    // that exists only with its extension is chained only on a device that
+    // advertised it. Both are asked by their `EXT` name rather than through
+    // 1.3 core — see [`super::api_floor`] — so the 1.2 baseline is the path
+    // that runs.
+    let extended_dynamic_state = if has_extension(vk::EXT_EXTENDED_DYNAMIC_STATE_NAME) {
+        let mut eds = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
+        let mut chained = vk::PhysicalDeviceFeatures2::default().push_next(&mut eds);
+        unsafe { instance.get_physical_device_features2(pd, &mut chained) };
+        eds.extended_dynamic_state == vk::TRUE
+    } else {
+        false
+    };
+    let (dynamic_polygon_mode, dynamic_depth_clamp) =
+        if has_extension(vk::EXT_EXTENDED_DYNAMIC_STATE3_NAME) {
+            let mut eds3 = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default();
+            let mut chained = vk::PhysicalDeviceFeatures2::default().push_next(&mut eds3);
+            unsafe { instance.get_physical_device_features2(pd, &mut chained) };
+            (
+                eds3.extended_dynamic_state3_polygon_mode == vk::TRUE,
+                eds3.extended_dynamic_state3_depth_clamp_enable == vk::TRUE,
+            )
+        } else {
+            (false, false)
+        };
+    // A property rather than a feature, so it is read from `Properties2` and
+    // never enabled. Advertised is all it takes to be answerable — the
+    // extension does not have to be *enabled* for the device to have told the
+    // truth about how its `vkCmdSetPrimitiveTopology` behaves. A device that
+    // does not carry the extension is left restricted, which is the rung every
+    // host meets.
+    let dynamic_primitive_topology_unrestricted =
+        if has_extension(vk::EXT_EXTENDED_DYNAMIC_STATE3_NAME) {
+            let mut eds3 = vk::PhysicalDeviceExtendedDynamicState3PropertiesEXT::default();
+            let mut chained = vk::PhysicalDeviceProperties2::default().push_next(&mut eds3);
+            unsafe { instance.get_physical_device_properties2(pd, &mut chained) };
+            eds3.dynamic_primitive_topology_unrestricted == vk::TRUE
+        } else {
+            false
+        };
+
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         image_robustness,
@@ -796,7 +983,18 @@ pub unsafe fn query(
         image_drm_format_modifier,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
+        independent_blend: supported.independent_blend == vk::TRUE,
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
+        wide_lines: supported.wide_lines == vk::TRUE,
+        // Taken as reported. No `max`/`min` correction: a device out of spec
+        // here would be one whose own bound is wrong, and substituting a
+        // guessed range would turn a refusal this device can explain into
+        // invalid use it cannot.
+        line_width_range: props.limits.line_width_range,
+        extended_dynamic_state,
+        dynamic_polygon_mode,
+        dynamic_depth_clamp,
+        dynamic_primitive_topology_unrestricted,
         texture_compression_bc: supported.texture_compression_bc == vk::TRUE,
         depth_clamp: supported.depth_clamp == vk::TRUE,
         multi_viewport: supported.multi_viewport == vk::TRUE,
@@ -864,6 +1062,12 @@ mod tests {
     fn all_supported() -> DeviceFeatures {
         DeviceFeatures {
             occlusion_query_precise: true,
+            extended_dynamic_state: true,
+            dynamic_polygon_mode: true,
+            dynamic_depth_clamp: true,
+            dynamic_primitive_topology_unrestricted: true,
+            wide_lines: true,
+            line_width_range: [1.0, 8.0],
             robust_buffer_access: true,
             texture_compression_bc: true,
             sampler_anisotropy: true,
@@ -901,6 +1105,7 @@ mod tests {
             attachment_feedback_loop_layout: true,
             image_drm_format_modifier: true,
             dual_src_blend: true,
+            independent_blend: true,
             fill_mode_non_solid: true,
             depth_clamp: true,
             multi_viewport: true,
@@ -921,15 +1126,128 @@ mod tests {
         assert_eq!(all_supported().enabled_features().dual_src_blend, vk::TRUE);
         let without = DeviceFeatures {
             dual_src_blend: false,
-            attachment_feedback_loop_layout: false,
-            image_drm_format_modifier: false,
             ..all_supported()
         };
         assert_eq!(without.enabled_features().dual_src_blend, vk::FALSE);
-        assert!(without.required_extensions().is_empty());
+        assert_eq!(
+            without.required_extensions(),
+            all_supported().required_extensions(),
+            "a plain optional-core feature names no extension string either way"
+        );
         // The default is "not supported", so a `DeviceFeatures` built without a
         // query never claims a capability it has not checked for.
         assert!(!DeviceFeatures::default().dual_src_blend);
+    }
+
+    /// `independentBlend` under the same rule, and it is the one feature here
+    /// whose absence is reachable from an ordinary guest pipeline rather than
+    /// from an unusual one: any MRT pipeline that blends one slot and replaces
+    /// another declares attachments that disagree.
+    #[test]
+    fn independent_blend_is_enabled_only_where_the_device_advertises_it() {
+        assert_eq!(
+            all_supported().enabled_features().independent_blend,
+            vk::TRUE
+        );
+        let without = DeviceFeatures {
+            independent_blend: false,
+            ..all_supported()
+        };
+        assert_eq!(without.enabled_features().independent_blend, vk::FALSE);
+        assert_eq!(
+            without.required_extensions(),
+            all_supported().required_extensions(),
+            "a plain optional-core feature names no extension string either way"
+        );
+        assert!(!DeviceFeatures::default().independent_blend);
+    }
+
+    /// The three dynamic-rasterization bits, under the rule that binds this
+    /// module to `engine::context`: a bit that names an extension string must
+    /// also set that extension's feature, and a bit that sets neither must
+    /// leave the string off — because `engine::context` loads the entry points
+    /// from these same three answers. Disagreement here is a null function
+    /// pointer at draw time, not a slower device.
+    ///
+    /// Two extension strings for three bits, because
+    /// `VK_EXT_extended_dynamic_state3` carries the polygon-mode and
+    /// depth-clamp members together and is named where *either* was reported.
+    #[test]
+    fn the_dynamic_raster_bits_name_the_extensions_whose_features_they_set() {
+        let eds = vk::EXT_EXTENDED_DYNAMIC_STATE_NAME.as_ptr();
+        let eds3 = vk::EXT_EXTENDED_DYNAMIC_STATE3_NAME.as_ptr();
+
+        let all = all_supported();
+        assert!(all.required_extensions().contains(&eds));
+        assert!(all.required_extensions().contains(&eds3));
+        assert_eq!(
+            all.enabled_extended_dynamic_state().extended_dynamic_state,
+            vk::TRUE
+        );
+        let all3 = all.enabled_extended_dynamic_state3();
+        assert_eq!(all3.extended_dynamic_state3_polygon_mode, vk::TRUE);
+        assert_eq!(all3.extended_dynamic_state3_depth_clamp_enable, vk::TRUE);
+        assert!(all.wants_extended_dynamic_state3());
+
+        // Each of the three, alone. The `_3` string appears for either of its
+        // two members and for neither of the first, and the feature struct
+        // sets only the member that was reported — asking for one a device
+        // declined fails `vkCreateDevice`.
+        for (cull, polygon, clamp) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let caps = DeviceFeatures {
+                extended_dynamic_state: cull,
+                dynamic_polygon_mode: polygon,
+                dynamic_depth_clamp: clamp,
+                ..all_supported()
+            };
+            let names = caps.required_extensions();
+            assert_eq!(names.contains(&eds), cull);
+            assert_eq!(names.contains(&eds3), polygon || clamp);
+            assert_eq!(caps.wants_extended_dynamic_state3(), polygon || clamp);
+            assert_eq!(
+                caps.enabled_extended_dynamic_state().extended_dynamic_state == vk::TRUE,
+                cull
+            );
+            let s3 = caps.enabled_extended_dynamic_state3();
+            assert_eq!(s3.extended_dynamic_state3_polygon_mode == vk::TRUE, polygon);
+            assert_eq!(
+                s3.extended_dynamic_state3_depth_clamp_enable == vk::TRUE,
+                clamp
+            );
+        }
+
+        // The unrestricted topology *property* is not a feature: it names no
+        // extension and enables nothing, however it reads. A device is asked
+        // whether its `vkCmdSetPrimitiveTopology` may cross a topology class;
+        // it is never asked to make it so.
+        for unrestricted in [false, true] {
+            let caps = DeviceFeatures {
+                extended_dynamic_state: false,
+                dynamic_polygon_mode: false,
+                dynamic_depth_clamp: false,
+                dynamic_primitive_topology_unrestricted: unrestricted,
+                ..all_supported()
+            };
+            assert!(!caps.required_extensions().contains(&eds));
+            assert!(!caps.required_extensions().contains(&eds3));
+            assert!(!caps.wants_extended_dynamic_state3());
+        }
+
+        // Never claimed without a query, like every other capability here. A
+        // device that was not asked bakes all four members, which is what
+        // every host below these extensions has always done.
+        let none = DeviceFeatures::default();
+        assert!(!none.extended_dynamic_state);
+        assert!(!none.dynamic_polygon_mode);
+        assert!(!none.dynamic_depth_clamp);
+        assert!(!none.wants_extended_dynamic_state3());
+        assert!(!none.required_extensions().contains(&eds));
+        assert!(!none.required_extensions().contains(&eds3));
+        assert!(!none.dynamic_primitive_topology_unrestricted);
     }
 
     /// The two rasterization features the guest's `setTriangleFillMode:` and
@@ -961,16 +1279,14 @@ mod tests {
     /// The 1.2 rung sets the core feature bit and asks for no extension.
     #[test]
     fn the_core_rung_needs_no_extension_string() {
-        let caps = DeviceFeatures {
-            attachment_feedback_loop_layout: false,
-            image_drm_format_modifier: false,
-            ..all_supported()
-        };
+        let caps = all_supported();
         assert_eq!(
             caps.enabled_vulkan12().sampler_mirror_clamp_to_edge,
             vk::TRUE
         );
-        assert!(caps.required_extensions().is_empty());
+        assert!(!caps
+            .required_extensions()
+            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
     }
 
     /// The extension rung is the mirror image: extension string, no core bit.
@@ -981,15 +1297,15 @@ mod tests {
     fn the_extension_rung_asks_for_the_extension_and_not_the_core_bit() {
         let caps = DeviceFeatures {
             mirror_clamp_to_edge: MirrorClampToEdge::KhrExtension,
-            attachment_feedback_loop_layout: false,
-            image_drm_format_modifier: false,
             ..all_supported()
         };
         assert_eq!(
             caps.enabled_vulkan12().sampler_mirror_clamp_to_edge,
             vk::FALSE
         );
-        assert_eq!(caps.required_extensions().len(), 1);
+        assert!(caps
+            .required_extensions()
+            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
     }
 
     /// Neither rung: nothing is requested. The sampler path must decline the
@@ -999,15 +1315,15 @@ mod tests {
     fn without_support_nothing_is_requested() {
         let caps = DeviceFeatures {
             mirror_clamp_to_edge: MirrorClampToEdge::Unsupported,
-            attachment_feedback_loop_layout: false,
-            image_drm_format_modifier: false,
             ..all_supported()
         };
         assert_eq!(
             caps.enabled_vulkan12().sampler_mirror_clamp_to_edge,
             vk::FALSE
         );
-        assert!(caps.required_extensions().is_empty());
+        assert!(!caps
+            .required_extensions()
+            .contains(&vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr()));
         assert!(!caps.mirror_clamp_to_edge.is_available());
     }
 

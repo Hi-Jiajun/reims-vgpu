@@ -35,20 +35,28 @@ use reims_vgpu_wire::OP_HEADER_LEN;
 /// `useResources:count:usage:` an eight-byte head and the same refs — which is
 /// exactly [`COUNT_BASE`] and [`BIND_BASE`] below.
 ///
-/// # The render rail is the one with the gap
+/// # The render rail had the same gap, and it is closed
 ///
 /// `runtime::decode::render` carried `0x86`/`0x87` as its residency pair until a
 /// capture replaced them with `0x1b`/`0x89`. That replacement was right for the
 /// records it measured — those are the `stages:`-qualified forms — but it left
 /// the render rail knowing only half the family, because a render encoder
-/// inherits the unqualified pair too. An unqualified `useResources:count:usage:`
-/// on a render encoder therefore reaches no render arm and is reported as
-/// `render_unimplemented reason=accepted_without_executor` rather than counted
-/// with its siblings under the render rail's residency routes. Whether guest
-/// work is lost depends on the declaration: this device answers a *read*
-/// residency declaration by doing nothing, for the reason `runtime::exec`
-/// states, and a *write* one is content it never produces — which is why the
-/// classification, not the count, is what the routes carry.
+/// inherits the unqualified pair too, and an unqualified
+/// `useResources:count:usage:` on a render encoder reached no render arm at all.
+///
+/// It now carries all four: `wire::OPCODE_USE_RESOURCES_NO_STAGES` and
+/// `wire::OPCODE_USE_HEAPS_NO_STAGES` decode beside the qualified pair, with the
+/// usage read at the wider width the unqualified form writes it and the stages
+/// left at zero because that selector has none, and `runtime::exec` routes all
+/// four through `note_residency_declaration`. Recorded here rather than deleted
+/// because this module is where the inheritance argument is written down, and a
+/// reader who follows it needs to know which rail it has already been applied
+/// to.
+///
+/// Whether guest work is lost depends on the declaration, on either rail: this
+/// device answers a *read* residency declaration by doing nothing, for the
+/// reason `runtime::exec` states, and a *write* one is content it never produces
+/// — which is why the classification, not the count, is what the routes carry.
 pub const OP_USE_HEAPS: u32 = 0x86;
 pub const OP_USE_RESOURCES: u32 = 0x87;
 

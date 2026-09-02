@@ -164,7 +164,9 @@ pub const SERIALIZER_OBJECT_RENDER_PIPELINE: u32 = 0x0e;
 pub const SERIALIZER_OBJECT_ICB: u32 = w_icb::OPCODE_NEW_INDIRECT_COMMAND_BUFFER;
 /// End of the 16-byte serializer-object header, which is also where its first TLV
 /// starts — one boundary, so one name.
-pub const SERIALIZER_OBJECT_FIRST_TLVS: usize = 16;
+/// Where a serializer object's first TLV sits: immediately after the four-word
+/// header, so it is the header's length and not a second `16`.
+pub const SERIALIZER_OBJECT_FIRST_TLVS: usize = reims_vgpu_protocol::serializer_object::HEADER_LEN;
 /// Serialized ICB descriptor length (allocateOperationBytes 0x58).
 pub const ICB_DESC_LEN: usize = w_icb::NEW_INDIRECT_COMMAND_BUFFER_TOTAL_LEN as usize;
 /// Per-stage max bind counts are single bytes (PGSerializer create body).
@@ -797,41 +799,14 @@ impl VertexAttribute {
 
 /// `MTLColorWriteMask` for one attachment, in Metal's own bit order.
 ///
-/// A newtype rather than a bare `u32` for one reason: the value that means
-/// "write every channel" is `0xf`, and the value a derived `Default` would
-/// produce is `0` — which means *write nothing*. `PipelineColorAttachment` is
-/// built with `..Default::default()` in the decoder and defaulted outright at
-/// several call sites, so a bare field would make an omitted mask a black
-/// attachment. Here the omission is unwritable: `Default` is `all`, which is
-/// also what an entry that does not carry tag `0x09` means on the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ColorWriteMask {
-    /// Private so the only ways to obtain one are [`ColorWriteMask::new`],
-    /// which range-checks, and `Default`, which is `all`. A `pub` field would
-    /// also make this a decode field needing its own coverage disposition,
-    /// when the disposition that matters is `PipelineColorAttachment`'s.
-    bits: u32,
-}
-
-impl Default for ColorWriteMask {
-    fn default() -> Self {
-        Self {
-            bits: MTL_COLOR_WRITE_MASK_ALL,
-        }
-    }
-}
-
-impl ColorWriteMask {
-    /// `None` for a value outside `MTLColorWriteMask`'s four bits — see
-    /// [`ColorWriteMaskOutOfRange`], which is what the decoder reports for it.
-    pub fn new(bits: u32) -> Option<Self> {
-        (bits <= MTL_COLOR_WRITE_MASK_ALL).then_some(Self { bits })
-    }
-
-    pub fn bits(self) -> u32 {
-        self.bits
-    }
-}
+/// The type is [`reims_vgpu_protocol::blend::ColorWriteMask`], re-exported so
+/// the decoder and the layer that assigns the mask its meaning range-check one
+/// value once. It used to be declared here as well, which made "which four
+/// bits are a mask" a fact stated twice — and the value that means "write
+/// every channel" is `0xf` while the value a derived `Default` would produce
+/// is `0`, so the two statements disagreeing would make an omitted mask a
+/// black attachment on one side and an opaque one on the other.
+pub use reims_vgpu_protocol::blend::ColorWriteMask;
 
 /// One pipeline color-attachment entry (format + blend) from the serializer-object color section.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1346,16 +1321,13 @@ pub const BLEND_OP_ADD: u32 = 0;
 // run alpha-first from the low end, which is the reverse of the RGBA reading
 // order the name suggests — `Red` is `1 << 3`, not `1 << 0`.
 //
-// This is an SDK mirror, so the table is the whole enum and stays `pub` even
-// where a member has no reader. `_NONE` has one on the Vulkan arm only, and
-// gating it on that arm would make the mirror's completeness depend on which
-// backend is compiled — which is the property a mirror exists to not have.
-pub const MTL_COLOR_WRITE_MASK_NONE: u32 = 0;
-pub const MTL_COLOR_WRITE_MASK_ALPHA: u32 = 1 << 0;
-pub const MTL_COLOR_WRITE_MASK_BLUE: u32 = 1 << 1;
-pub const MTL_COLOR_WRITE_MASK_GREEN: u32 = 1 << 2;
-pub const MTL_COLOR_WRITE_MASK_RED: u32 = 1 << 3;
-pub const MTL_COLOR_WRITE_MASK_ALL: u32 = 0xf;
+// The mirror lives beside [`ColorWriteMask`] in the protocol crate and is
+// re-exported whole, so the constants and the newtype that range-checks
+// against them cannot drift apart.
+pub use reims_vgpu_protocol::blend::{
+    MTL_COLOR_WRITE_MASK_ALL, MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE,
+    MTL_COLOR_WRITE_MASK_GREEN, MTL_COLOR_WRITE_MASK_NONE, MTL_COLOR_WRITE_MASK_RED,
+};
 
 /// Where the sampler-creation record (serializer-object subtype 0x03) puts each field, for
 /// the synthetic buffers the tests below assemble.
@@ -2968,7 +2940,8 @@ pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 /// * [`PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY`] declares the *class* of primitive
 ///   the pipeline is compiled for. It does not select one: every draw record
 ///   carries its own `MTLPrimitiveType`, which
-///   `translate::raster::primitive_topology` turns into the
+///   `reims_vgpu_core::topology::PrimitiveType` parses and
+///   `reims_vgpu_vulkan::topology` plans into the
 ///   `VkPipelineInputAssemblyStateCreateInfo` topology, so the class restates
 ///   what the draw already names — the same relationship the two attachment
 ///   formats above have with the pass descriptor. Metal requires a draw's
@@ -3409,23 +3382,51 @@ fn report_tlv_shape(
     unknown.len()
 }
 
+/// The three refusal slugs a serializer-object subtype reports its header's
+/// failures under.
+///
+/// The header is one layout and its refusals are one set, but the slugs are
+/// per-subtype: a reader greps `res_render_pipeline_tag` to find records handed
+/// to the render decoder, and one shared `res_serializer_object_tag` would give
+/// no way to tell which decoder said it.
+struct HeaderSlugs {
+    short: &'static str,
+    tag: &'static str,
+    declared_len: &'static str,
+}
+
+/// Read a serializer object's header at the layout's owner and map its refusal
+/// to this subtype's slugs.
+fn serializer_object_header(
+    bytes: &[u8],
+    expected: u32,
+    slugs: HeaderSlugs,
+) -> Result<reims_vgpu_protocol::serializer_object::Header, DecodeStatus> {
+    use reims_vgpu_protocol::serializer_object::Refusal;
+    reims_vgpu_protocol::serializer_object::decode(bytes, expected).map_err(|refusal| match refusal
+    {
+        Refusal::Short { .. } => DecodeStatus::ErrShort(slugs.short),
+        Refusal::WrongType { .. } => DecodeStatus::ErrUnsupported(slugs.tag),
+        Refusal::DeclaredLength { .. } => DecodeStatus::ErrShort(slugs.declared_len),
+    })
+}
+
 pub fn decode_render_pipeline_descriptor(
     bytes: &[u8],
 ) -> Result<RenderPipelineDescriptor, DecodeStatus> {
-    if bytes.len() < TYPE7_MIN_LEN {
-        return Err(DecodeStatus::ErrShort("res_render_pipeline_short"));
-    }
-    let obj_type = ld32(&bytes[0..]);
-    let declared = ld32(&bytes[4..]) as usize;
-    if obj_type != SERIALIZER_OBJECT_RENDER_PIPELINE {
-        return Err(DecodeStatus::ErrUnsupported("res_render_pipeline_tag"));
-    }
-    if declared != bytes.len() || declared < TYPE7_MIN_LEN {
-        return Err(DecodeStatus::ErrShort("res_render_pipeline_declared_len"));
-    }
+    let header = serializer_object_header(
+        bytes,
+        SERIALIZER_OBJECT_RENDER_PIPELINE,
+        HeaderSlugs {
+            short: "res_render_pipeline_short",
+            tag: "res_render_pipeline_tag",
+            declared_len: "res_render_pipeline_declared_len",
+        },
+    )?;
+    let declared = header.declared as usize;
     let mut out = RenderPipelineDescriptor {
-        object_id: ld32(&bytes[8..]),
-        serialized_payload_len: ld32(&bytes[12..]),
+        object_id: header.object_id,
+        serialized_payload_len: header.serialized_payload_len,
         ..Default::default()
     };
     note_serializer_object_payload_len("render", out.serialized_payload_len, declared);
@@ -4487,8 +4488,6 @@ pub fn texture_view_opcode(bytes: &[u8]) -> Option<u32> {
     texture_view_header(bytes).map(|(opcode, _)| opcode)
 }
 
-const TYPE7_MIN_LEN: usize = 17;
-
 /// **Unused on the x86 PCI pathway.** A probe placed at the top of this function
 /// — before the length check, so a short record would also report — emitted
 /// nothing across a full interactive session. Mapper-ref-texture geometry on that pathway
@@ -4858,21 +4857,21 @@ pub fn parse_compute_stage_input_block(
 pub fn decode_compute_pipeline_descriptor(
     bytes: &[u8],
 ) -> Result<ComputePipelineDescriptor, DecodeStatus> {
-    if bytes.len() < TYPE7_MIN_LEN {
-        return Err(DecodeStatus::ErrShort("res_compute_pipeline_short"));
-    }
-    if ld32(&bytes[0..]) != SERIALIZER_OBJECT_COMPUTE_PIPELINE {
-        return Err(DecodeStatus::ErrUnsupported("res_compute_pipeline_tag"));
-    }
-    let declared = ld32(&bytes[4..]) as usize;
-    if declared != bytes.len() || declared < TYPE7_MIN_LEN {
-        return Err(DecodeStatus::ErrShort("res_compute_pipeline_declared_len"));
-    }
-    // The same four-word header its render sibling carries, so the same relation
-    // between its two lengths holds. Checked rather than stored: this descriptor
-    // has no consumer for the value, and the walks below bound themselves on the
+    let header = serializer_object_header(
+        bytes,
+        SERIALIZER_OBJECT_COMPUTE_PIPELINE,
+        HeaderSlugs {
+            short: "res_compute_pipeline_short",
+            tag: "res_compute_pipeline_tag",
+            declared_len: "res_compute_pipeline_declared_len",
+        },
+    )?;
+    let declared = header.declared as usize;
+    // The same four-word header its render sibling carries, and now literally
+    // the same read of it. Checked rather than stored: this descriptor has no
+    // consumer for the value, and the walks below bound themselves on the
     // declared length.
-    note_serializer_object_payload_len("compute", ld32(&bytes[12..]), declared);
+    note_serializer_object_payload_len("compute", header.serialized_payload_len, declared);
     let (fields, consumed) = decode_compact_tlv_record(bytes, SERIALIZER_OBJECT_FIRST_TLVS)?;
     note_pipeline_tlv_fields(
         "compute",

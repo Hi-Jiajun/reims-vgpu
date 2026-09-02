@@ -596,14 +596,54 @@ engine_counters! {
         /// near zero is a boot where consecutive draws never share a pipeline
         /// and this whole cache is inert.
         ///
-        /// `dynstate_stencil_held` is out of the *stencil* draws rather than all
-        /// of them — a draw with no stencil state asks nothing and counts
-        /// nowhere — so it is the one that does not belong to the same
-        /// denominator.
+        /// `dynstate_stencil_held` is the one that does not belong to the same
+        /// denominator, and what its denominator *is* depends on the host. A
+        /// draw is asked for a stencil reference exactly where its pipeline
+        /// declared `STENCIL_REFERENCE`, which is the stencil draws on a host
+        /// that bakes the depth-stencil state and every draw whose pass carries
+        /// depth on a host that supplies it per draw — because there the
+        /// stencil *test enable* is itself dynamic, so the reference is
+        /// declared whatever any one draw's state says. See
+        /// `reims_vgpu_vulkan::depth_stencil::DepthStencilPlan::states`.
         dynstate_pipeline_held,
         dynstate_viewport_held,
         dynstate_scissor_held,
         dynstate_stencil_held,
+        /// The blend colour a draw did not re-record. Out of every draw, like
+        /// the viewport and scissor pair and unlike `dynstate_stencil_held`:
+        /// every encoder has a blend colour whether or not any factor reads it.
+        dynstate_blend_constants_held,
+        /// The depth bias a draw did not re-record. One call per command
+        /// buffer and held for every draw after it, because the value this
+        /// device sets does not vary.
+        dynstate_depth_bias_held,
+        /// The line width a draw did not re-record. Out of every draw, like
+        /// the depth bias above and unlike `dynstate_raster_held`: the width
+        /// is `VK_DYNAMIC_STATE_LINE_WIDTH`, which is 1.0 core, so every
+        /// pipeline this rail builds declares it and every draw is asked. A
+        /// boot where this is far below the draw count is one whose guest
+        /// alternates between line and non-line draws — the recorded width is
+        /// the guest's where the draw rasterizes lines and 1.0 where it does
+        /// not, so the two alternate rather than one being held.
+        dynstate_line_width_held,
+        /// The rasterization members a draw did not re-record, counted per
+        /// draw and not per member: the cull mode, winding, fill mode and
+        /// depth-clip mode are one Metal encoder state set, and a draw either
+        /// left all of them alone or changed some. Out of every draw on a host
+        /// that made any of them dynamic, and never counted on a host that
+        /// bakes all four — where it reads zero because nothing was ever
+        /// asked, not because nothing was held.
+        dynstate_raster_held,
+        /// The primitive topology a draw did not re-record. Out of every draw
+        /// on a host that made it dynamic; on a host that bakes it this counts
+        /// every draw after the first of each command buffer, because nothing
+        /// is asked and nothing changes.
+        dynstate_topology_held,
+        /// The depth-stencil state a draw did not re-record. Out of every draw
+        /// on a host that supplies it per draw; on a host that bakes it this
+        /// counts every draw after the first of each command buffer, because
+        /// nothing is asked and nothing changes.
+        dynstate_depth_stencil_held,
         /// Vertex-buffer binding slots requested by draws. This must equal
         /// `vertex_buffer_bind_emitted`; compare either with
         /// `vertex_buffer_bind_calls` to measure contiguous bulk encoding.

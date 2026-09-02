@@ -1,6 +1,15 @@
 use super::*;
 
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
+use crate::protocol::fifo::{
+    DeviceInfoForm, CHILD_SHARED_STATE_INDEX, CHILD_SHARED_STATE_LEN, CHILD_SHARED_STATE_PFN,
+    DEFINE_TASK_LEN, SET_OBJECT_LIST_LEN,
+};
+
+/// The two device-info request forms these tests build, named once so a test
+/// cannot pin an offset the decoder does not read.
+const TAHOE: DeviceInfoForm = DeviceInfoForm::WithKeyLimit;
+const MONTEREY: DeviceInfoForm = DeviceInfoForm::WithoutKeyLimit;
 
 /// I2's carve-out, asserted rather than trusted: a partial packet is the
 /// normal state of a ring whose producer is mid-write, so it must not reach
@@ -119,18 +128,30 @@ use crate::runtime::host::{FakeHost, HostActionKind};
 /// A display-present packet naming `mapping`.
 ///
 /// The surface id goes at the offset the emitting command's trailer puts it,
-/// read from `display_txn_trailer_slots` — the same table the decoder uses, so a
-/// test cannot pin an offset the product code does not read. The payload is the
+/// read from `reims_vgpu_protocol::present` — the same table the decoder uses,
+/// so a test cannot pin an offset the product code does not read. The payload is the
 /// command's own trailer length and nothing else, which is what the guest sends:
 /// `kb/pvg-display-contract.md` §8.1 measured every op6 payload as trailer-only.
 ///
 /// Every present test built this same eight-field `Packet` by hand; only the
 /// opcode and the named mapping ever differed. A test that varies the payload
 /// length on purpose builds its own rather than calling this.
+/// The overlong alarm, driven the way the present arm drives it: decode the
+/// trailer first, then hand the decode to the alarm. The alarm no longer works
+/// out the trailer width itself — `reims_vgpu_protocol::present` owns that — so
+/// a test that skipped the decode would be testing a call production cannot
+/// make.
+fn note(state: &mut DeviceState, channel_id: u32, packet: &Packet) {
+    let form = PresentForm::of(WireChannel::Child, packet.opcode).expect("a present opcode");
+    let decoded = present_trailer(form, &packet.payload).expect("long enough for its trailer");
+    note_display_txn_payload(state, channel_id, packet, &decoded);
+}
+
 fn present_packet(opcode: u16, mapping: u32) -> Packet {
-    let len = display_txn_trailer_len(opcode);
+    let form = PresentForm::of(WireChannel::Child, opcode).expect("a present opcode");
+    let len = form.trailer_len();
     let mut payload = vec![0u8; len];
-    let off = display_txn_trailer_slots(opcode).0 * 4;
+    let off = form.target_offset();
     payload[off..off + 4].copy_from_slice(&mapping.to_le_bytes());
     Packet {
         opcode,
@@ -551,6 +572,63 @@ fn replace_physical_drops_the_cached_page_list() {
         "dropping the list must bump the incarnation, which is what retires the \
          backing walk latch and any state keyed on it"
     );
+}
+
+/// A `CmdReplacePhysical` too short to hold its eight bytes reports, and does
+/// not act.
+///
+/// The arm checked the floor itself and then called a decoder that checked it
+/// again and returned a bare `Option`. The second check could not fire, and if
+/// it ever had, its `None` arm dropped the packet without a word — on the
+/// command that re-points a resource at different host frames, where a dropped
+/// one leaves this device resolving a stale address.
+#[test]
+fn a_short_replace_physical_is_reported_and_not_acted_on() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::default();
+    // Two mappings: the one a well-formed packet would name, and the one a
+    // decoder that zero-filled the words it could not read would name instead.
+    // Nothing may touch either.
+    for object in [0u32, 7] {
+        state.mappings.insert(object, Default::default());
+        if let Some(m) = state.mappings.get_mut(&object) {
+            m.page_entries = vec![0x11, 0x22, 0x33];
+        }
+    }
+    let short = |plen: usize| Packet {
+        opcode: CHILD_OP_REPLACE_PHYSICAL,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + plen as u32,
+        completion_stamp: 0,
+        payload: vec![0u8; plen],
+        next_head: 0,
+    };
+    // Seven bytes first, and alone in its own capture. It is the length a
+    // decoder that read what it could and zero-filled the rest would accept —
+    // the line is latched per opcode, so a later length reporting instead of
+    // this one would look identical from outside.
+    let cap = crate::observe::FailCapture::start();
+    process_child_packet(&mut state, &mut host, 2, &short(7));
+    let lines = cap.lines();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("reason=replace_physical_short"))
+        .unwrap_or_else(|| panic!("a short replace-physical said nothing: {lines:?}"));
+    assert!(
+        line.contains("need=8") && line.contains("plen=7"),
+        "the line must say what it needed and what it got: {line}"
+    );
+    for plen in 0..7usize {
+        process_child_packet(&mut state, &mut host, 2, &short(plen));
+    }
+    for object in [0u32, 7] {
+        assert_eq!(
+            state.mappings.get(&object).map(|m| m.page_entries.len()),
+            Some(3),
+            "a packet with nothing to read must not re-point anything, least of \
+             all whatever holds slot zero"
+        );
+    }
 }
 
 /// A re-point naming a mapper-ref-texture resource reaches the mapping associated with its
@@ -996,6 +1074,114 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     assert_eq!(state.translation_order_hold_mask, 0);
 }
 
+/// A cursor pitch that does not fit a word must be refused, not wrapped.
+///
+/// `CmdSetCursorGlyph` carries `stride` in eight bytes and the drain wanted
+/// four. Taking the low four of `0x1_0000_0100` gives `0x100`, which clears the
+/// geometry bound for a 64-pixel-wide sprite and makes `need` small enough that
+/// a modest `mapped_length` covers it — so the glyph was accepted and then read
+/// at a pitch of 256 bytes when the guest laid it out at four gigabytes and a
+/// bit. A garbled pointer, and nothing on the failure channel to say why.
+///
+/// Compared in its own width the same record does not survive: `need` is the
+/// height times the real pitch, `mapped_length` does not cover it, and
+/// `cursor_glyph_mapped_len` says so.
+#[test]
+fn a_cursor_pitch_wider_than_a_word_is_refused_rather_than_truncated() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut payload = vec![0u8; crate::protocol::fifo::CURSOR_GLYPH_LEN];
+    let put32 =
+        |p: &mut Vec<u8>, at: usize, v: u32| p[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 =
+        |p: &mut Vec<u8>, at: usize, v: u64| p[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    put32(&mut payload, crate::protocol::fifo::CURSOR_GLYPH_TASK_ID, 1);
+    put64(
+        &mut payload,
+        crate::protocol::fifo::CURSOR_GLYPH_MAPPED_LENGTH,
+        0x4000,
+    );
+    // Low word `0x100`, which is exactly the pitch a 64-wide sprite needs.
+    put64(
+        &mut payload,
+        crate::protocol::fifo::CURSOR_GLYPH_STRIDE,
+        0x1_0000_0100,
+    );
+    payload[crate::protocol::fifo::CURSOR_GLYPH_WIDTH..][..2].copy_from_slice(&64u16.to_le_bytes());
+    payload[crate::protocol::fifo::CURSOR_GLYPH_HEIGHT..][..2]
+        .copy_from_slice(&32u16.to_le_bytes());
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &Packet {
+            opcode: CHILD_OP_CURSOR_GLYPH,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert!(
+        !state.cursor.glyph_ready,
+        "a sprite read at a pitch the guest did not use is not a glyph"
+    );
+    assert!(state.cursor.pixels.is_empty());
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("reason=cursor_glyph_mapped_len"),
+        "the refusal names the bound the real pitch failed, not silence: {log}"
+    );
+}
+
+/// The open end of the same lifetime owes the same forgetting, and its
+/// sibling below is the only thing that was ever asserted about it.
+///
+/// A channel number is reused. A hold or a cached ring left over from the
+/// previous occupant is the new channel inheriting a decision nothing made
+/// about it — a deferred translation it never asked for, or a ring whose head
+/// belongs to a producer that is gone.
+///
+/// The one thing an open does *not* clear is `pending.child_mask`. Opening a
+/// channel is not a claim that nothing is pending on it, and clearing it here
+/// would drop a drain the guest is owed.
+#[test]
+fn define_fifo_forgets_the_previous_occupants_translation_state() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let bit = 1 << 1;
+    state.pending.child_mask = bit;
+    state.translation_deferred_mask = bit;
+    state.translation_order_hold_mask = bit;
+    state.present_translation_hold_mask = bit;
+
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_DEFINE_FIFO,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 4,
+            completion_stamp: 0,
+            payload: 1u32.to_le_bytes().to_vec(),
+            next_head: 0,
+        },
+    );
+
+    assert_eq!(state.active_child_mask & bit, bit, "the channel is open");
+    assert_eq!(state.translation_deferred_mask & bit, 0);
+    assert_eq!(state.translation_order_hold_mask & bit, 0);
+    assert_eq!(state.present_translation_hold_mask & bit, 0);
+    assert_eq!(
+        state.pending.child_mask & bit,
+        bit,
+        "an open is not a claim that nothing is pending on the channel"
+    );
+}
+
 /// FIFO redefine/free retires scheduler ownership so a removed producer
 /// cannot strand later display transactions behind a stale bit.
 #[test]
@@ -1353,9 +1539,9 @@ fn child_drain_yields_after_present_for_display_consumer() {
     assert!(state.map_surface(4));
     assert!(state.set_mapping_geom(4, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
-    let mut payload = vec![0u8; display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION2)];
-    payload[DISPLAY_TRANSACTION2_SURFACE_ID..DISPLAY_TRANSACTION2_SURFACE_ID + 4]
-        .copy_from_slice(&4u32.to_le_bytes());
+    let form = PresentForm::Transaction2;
+    let mut payload = vec![0u8; form.trailer_len()];
+    payload[form.target_offset()..form.target_offset() + 4].copy_from_slice(&4u32.to_le_bytes());
     let first = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 21, &payload);
     let second = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 22, &payload);
     let mut ring = first.clone();
@@ -3562,7 +3748,7 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
 fn invalidate_resources_bumps_mapping_content_generation() {
     use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
     use crate::protocol::endian::st32;
-    use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
+    use crate::protocol::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -4094,9 +4280,9 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // Every command at exactly its declared trailer is conformant and silent.
     let quiet = store_route_count("display_txn_payload_overlong");
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x0c));
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION3, 0x24));
-    note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 0x0c));
+    note(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x0c));
+    note(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION3, 0x24));
+    note(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 0x0c));
     assert_eq!(
         store_route_count("display_txn_payload_overlong"),
         quiet,
@@ -4106,7 +4292,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // A payload past the trailer is the one thing that falsifies the decode.
     for _ in 0..8 {
-        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 64));
+        note(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 64));
     }
     assert_eq!(
         store_route_count("display_txn_payload_overlong"),
@@ -4121,7 +4307,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
 
     // The gamma variant's trailer is larger, so 0x24 is conformant there while
     // the same length would be overlong for op6 - the sizes are per command.
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x24));
+    note(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, 0x24));
     assert_eq!(
         state.display.txn_payload_samples.len(),
         2,
@@ -4158,7 +4344,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     let mut body = vec![0u8; 12];
     body.extend((0..28u8).map(|i| 0xa0 + i));
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, body));
+    note(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, body));
     let lines = cap.lines();
     let line = lines
         .iter()
@@ -4191,7 +4377,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     // op6 does serialize a transaction, so the plane-list reading is its own
     // and must survive. Same alarm, different explanation.
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(
+    note(
         &mut state,
         5,
         &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]),
@@ -4210,7 +4396,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     // The dump is bounded: the length is guest-controlled, so a pathological
     // payload must not turn one latched line into an unbounded one.
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(
+    note(
         &mut state,
         5,
         &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![0u8; 4096]),
@@ -4229,95 +4415,6 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
         "a guest-sized payload must not produce a guest-sized log line: {}",
         line.len()
     );
-}
-
-/// The gamma command swaps the surface id and the task field relative to the
-/// plain one.
-///
-/// Both words are u32s in adjacent slots, so reading them at the wrong offsets
-/// still yields plausible-looking values — the probe would key its budget on the
-/// surface id and re-arm every frame, and the emitted `task=` would be a surface
-/// id. Nothing downstream would report an error.
-#[test]
-fn display_txn_trailer_slots_follow_the_emitting_command() {
-    // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
-    assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_DISPLAY_TRANSACTION2),
-        (1, Some(2))
-    );
-    // command 7: [pipe][task][surface][gamma…] — the two are swapped.
-    assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_DISPLAY_TRANSACTION3),
-        (2, Some(1))
-    );
-    // command 8 `CmdDisplaySwapMapping` is not a transaction at all: it names
-    // one mapping, at DISPLAY_SWAP_MAPPING (0x08) = slot 2, and carries no task
-    // word. Borrowing op6's (1, 2) here would make the census report the
-    // unidentified middle word as the surface and the mapping as a task.
-    assert_eq!(
-        display_txn_trailer_slots(CHILD_OP_DISPLAY_SWAP),
-        (DISPLAY_SWAP_MAPPING / 4, None)
-    );
-    // The present path reads the same field the census does, for every command.
-    for (op, off) in [
-        (
-            CHILD_OP_DISPLAY_TRANSACTION2,
-            DISPLAY_TRANSACTION2_SURFACE_ID,
-        ),
-        (
-            CHILD_OP_DISPLAY_TRANSACTION3,
-            DISPLAY_TRANSACTION3_SURFACE_ID,
-        ),
-        (CHILD_OP_DISPLAY_SWAP, DISPLAY_SWAP_MAPPING),
-    ] {
-        let mut p = vec![0u8; display_txn_trailer_len(op)];
-        p[off..off + 4].copy_from_slice(&0x5eu32.to_le_bytes());
-        assert_eq!(present_surface_id(op, &p), Some(0x5e), "op {op:#x}");
-        // One byte short of the command's own trailer is not a present.
-        assert_eq!(
-            present_surface_id(op, &p[..p.len() - 1]),
-            None,
-            "op {op:#x}"
-        );
-    }
-
-    // The swap is between two adjacent u32s, so reading either at the other's
-    // offset yields a plausible value and nothing downstream would complain.
-    // Pin both directions on a payload where the two differ.
-    let mut gamma = Vec::new();
-    gamma.extend_from_slice(&7u32.to_le_bytes()); // pipe
-    gamma.extend_from_slice(&9u32.to_le_bytes()); // task
-    gamma.extend_from_slice(&0x2au32.to_le_bytes()); // surface
-    gamma.resize(0x24, 0);
-    assert_eq!(
-        present_surface_id(CHILD_OP_DISPLAY_TRANSACTION3, &gamma),
-        Some(0x2a),
-        "gamma's surface is the third word; the second is its task"
-    );
-
-    let mut plain = Vec::new();
-    plain.extend_from_slice(&7u32.to_le_bytes()); // pipe
-    plain.extend_from_slice(&0x2au32.to_le_bytes()); // surface
-    plain.extend_from_slice(&9u32.to_le_bytes()); // task
-    plain.resize(0x0c, 0);
-    assert_eq!(
-        present_surface_id(CHILD_OP_DISPLAY_TRANSACTION2, &plain),
-        Some(0x2a),
-        "the plain command's surface is the second word; the third is its task"
-    );
-}
-
-/// The trailer the guest appends after serializing the transaction's resource
-/// list is 0x24 bytes for the gamma command and 0x0c for the plain one.
-///
-/// The probe reports the trailer read from *both* ends of the payload, and the
-/// tail reading is only meaningful at the right width — get this wrong and a
-/// payload that does carry an inline plane list would still look trailer-only.
-#[test]
-fn display_txn_trailer_width_matches_the_emitting_command() {
-    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION2), 0x0c);
-    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_TRANSACTION3), 0x24);
-    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_SWAP), 0x0c);
 }
 
 /// A present a resident carried is not a black present.
@@ -4348,33 +4445,6 @@ fn a_resident_carried_present_is_unsampled_not_black() {
     );
 }
 
-/// Root and child `DefineTask2` decode one wire field one way.
-///
-/// The length lives at `DEFINE_TASK_LENGTH` (0x04) and the next field,
-/// `DEFINE_TASK_DIRECTORY_PFN`, is at 0x0c — so the field is eight bytes, not
-/// four. The child arm used to read only the low 32 bits with `ld32`, which
-/// truncated any task spanning 4 GiB or more to its low half while the root
-/// arm, decoding the same packet layout, kept the full value. A guest whose
-/// task address space crosses that line had its span silently shortened on
-/// one path and not the other.
-#[test]
-fn a_define_task_length_is_the_full_eight_byte_field_on_both_arms() {
-    // The layout is what makes the field eight bytes wide; assert it rather
-    // than restating the width.
-    assert_eq!(DEFINE_TASK_DIRECTORY_PFN - DEFINE_TASK_LENGTH, 8);
-
-    let mut payload = vec![0u8; DEFINE_TASK_LEN];
-    // 6 GiB: past u32, with a non-zero low half so a truncation is not a zero.
-    let length = 6u64 << 30;
-    payload[DEFINE_TASK_LENGTH..DEFINE_TASK_LENGTH + 8].copy_from_slice(&length.to_le_bytes());
-    assert_eq!(define_task_length(&payload), length);
-    assert_ne!(
-        define_task_length(&payload),
-        u64::from(ld32(&payload[DEFINE_TASK_LENGTH..])),
-        "a low-32 read would have lost the high half"
-    );
-}
-
 /// Send a device-info request and read back the pairs the guest would parse.
 ///
 /// `max_key` is exclusive and `count` is a pair capacity — the two words the
@@ -4386,10 +4456,15 @@ fn device_info_reply(max_key: u32, count: u32) -> Vec<(u32, u32)> {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
 
-    let mut payload = vec![0u8; DEVICE_INFO_TAHOE_REPLY_PFN + 4];
-    st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], max_key);
-    st32(&mut payload[DEVICE_INFO_TAHOE_COUNT..], count);
-    st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], REPLY_PFN);
+    let mut payload = vec![0u8; TAHOE.reply_pfn_offset() + 4];
+    st32(
+        &mut payload[TAHOE
+            .key_table_len_offset()
+            .expect("the newer form carries one")..],
+        max_key,
+    );
+    st32(&mut payload[TAHOE.pair_capacity_offset()..], count);
+    st32(&mut payload[TAHOE.reply_pfn_offset()..], REPLY_PFN);
     process_root_packet(
         &mut state,
         &mut host,
@@ -4460,6 +4535,56 @@ fn the_device_info_reply_stops_below_the_guests_key_table_length() {
     assert!(
         !full.contains(&(DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE + 1)),
         "and nothing at or above it: the guest discards those on arrival"
+    );
+}
+
+/// A `CmdGetComputeInfo` too short to hold its request reports, and does not
+/// answer.
+///
+/// The arm carried its own literal floor and `reply_compute_info` carried the
+/// same one, so neither could be wrong without the other being wrong too — and
+/// no test built a request at all, so neither was ever exercised. The command
+/// is one the guest blocks on: `createComputePipeline` stalls until the reply
+/// lands, so a request this device cannot read has to say so.
+#[test]
+fn a_short_compute_info_request_is_reported_and_not_answered() {
+    use crate::protocol::fifo::COMPUTE_INFO_REQUEST_LEN;
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let short = |plen: usize| Packet {
+        opcode: CHILD_OP_GET_COMPUTE_INFO,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + plen as u32,
+        completion_stamp: 0,
+        // Non-zero, so a decoder that read past the end of a shorter payload
+        // would find a reply address rather than zero and try to use it.
+        payload: vec![0xffu8; plen],
+        next_head: 0,
+    };
+    // One byte under, alone in its own capture: the largest length a decoder
+    // that read what it could would still accept.
+    let cap = crate::observe::FailCapture::start();
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &short(COMPUTE_INFO_REQUEST_LEN - 1),
+    );
+    let lines = cap.lines();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("reason=get_compute_info_short"))
+        .unwrap_or_else(|| panic!("a short compute-info said nothing: {lines:?}"));
+    assert!(
+        line.contains("need=24") && line.contains("plen=23"),
+        "the line must say what it needed and what it got: {line}"
+    );
+    for plen in 0..COMPUTE_INFO_REQUEST_LEN - 1 {
+        process_child_packet(&mut state, &mut host, 4, &short(plen));
+    }
+    assert!(
+        host.actions.is_empty(),
+        "a request with nothing to read must not answer into guest memory"
     );
 }
 
@@ -4563,6 +4688,159 @@ fn a_device_info_reply_cut_short_by_the_guests_count_names_the_keys_it_lost() {
     );
 }
 
+/// Send a compute-info request under a live task and read the reply page back.
+///
+/// Returns `(pairs_the_guest_would_parse, the_byte_after_the_reply)`. The
+/// second is the point: the guest's walker stops at the zero pair, so a reply
+/// that ran one pair long would be invisible to a reader that only checks the
+/// pairs.
+#[cfg(test)]
+fn compute_info_reply(key_table_len: u32, count: u32) -> (Vec<(u32, u32)>, u8) {
+    use crate::runtime::host::FakeHost;
+    /// Inside the first data page the task fixture maps, and non-zero because
+    /// `reply_gva == 0` is the request's own "nothing to answer into".
+    const REPLY_GVA: u64 = 0x100;
+    const POISON: u8 = 0xa5;
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    crate::runtime::gva_mem::define_task_pages_arm64e(&mut host, &mut state, 0x40, 1);
+    let data_gpa = 0x40u64 << PAGE_SHIFT_ARM64E;
+    let poison = vec![POISON; PAGE_SIZE_ARM64E as usize];
+    host.write_gpa(data_gpa, &poison).expect("data page");
+
+    let mut payload = vec![0u8; crate::protocol::fifo::COMPUTE_INFO_REQUEST_LEN];
+    st32(&mut payload[0..], 1); // the task the fixture defined
+    st32(&mut payload[4..], 7); // a pipeline ref; the reply does not read it
+    st32(&mut payload[8..], key_table_len);
+    st32(&mut payload[12..], count);
+    st32(&mut payload[16..], REPLY_GVA as u32);
+    assert_eq!(
+        process_child_packet(
+            &mut state,
+            &mut host,
+            4,
+            &Packet {
+                opcode: CHILD_OP_GET_COMPUTE_INFO,
+                stamp_waits: Vec::new(),
+                total_size: PACKET_HEADER_LEN + payload.len() as u32,
+                completion_stamp: 0,
+                payload,
+                next_head: 0,
+            },
+        ),
+        ChildPacketDisposition::Complete,
+        "the guest blocks on this stamp"
+    );
+
+    let at = data_gpa + REPLY_GVA;
+    let mut out = Vec::new();
+    let mut pairs = 0u64;
+    while pairs < u64::from(count) {
+        let mut pair = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
+        host.read_gpa(at + pairs * DEVICE_INFO_REPLY_PAIR_LEN as u64, &mut pair)
+            .expect("reply page is readable");
+        let key = ld32(&pair[0..4]);
+        if key == 0 {
+            break;
+        }
+        out.push((key, ld32(&pair[4..8])));
+        pairs += 1;
+    }
+    // One byte past everything the reply could legitimately have written: the
+    // answers, plus the stop word when there was room and reason for one.
+    let terminated = out.len() < count as usize;
+    let span = (out.len() + usize::from(terminated)) * DEVICE_INFO_REPLY_PAIR_LEN;
+    let mut after = [0u8; 1];
+    host.read_gpa(at + span as u64, &mut after)
+        .expect("reply page is readable");
+    (out, after[0])
+}
+
+/// The compute-info reply, driven end to end: what the guest reads back, the
+/// stop word it walks to, and the byte past it that must still be untouched.
+///
+/// Every other test of this command asserts on `compute_info_caps()` — the
+/// table, not the reply. The reply was built by a hand-rolled loop that applied
+/// the guest's parse ceiling and its pair count as its own two conditions and
+/// wrote one pair per guest-memory call, and nothing drove it. It now goes
+/// through the same encoder as its device-info twin, which is exactly the kind
+/// of change a table-only test cannot see.
+#[test]
+fn the_compute_info_reply_stops_at_the_terminator_and_writes_nothing_past_it() {
+    const POISON: u8 = 0xa5;
+    let answers = compute_info_caps();
+    let ceiling = COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY + 1;
+
+    // A page of pair slots, as a live guest sends: every answer fits, and the
+    // guest asked for more than it got, so it gets the stop word.
+    let (pairs, after) = compute_info_reply(ceiling, 512);
+    assert_eq!(
+        pairs,
+        answers.to_vec(),
+        "the reply is the table, in table order"
+    );
+    assert_eq!(
+        after, POISON,
+        "the stop word is the last thing written; the slot after it is the \
+         guest's"
+    );
+
+    // The ceiling is exclusive, and one arm shorter drops the last answer
+    // rather than keeping it.
+    let (short_ceiling, _) = compute_info_reply(COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY, 512);
+    assert_eq!(short_ceiling, answers[..2].to_vec());
+
+    // A guest that says it will consume exactly as many pairs as there are
+    // answers needs no stop word, and must not be written one.
+    let (exact, after_exact) = compute_info_reply(ceiling, answers.len() as u32);
+    assert_eq!(exact, answers.to_vec());
+    assert_eq!(
+        after_exact, POISON,
+        "a full reply carries no terminator, so the pair after the last answer \
+         is untouched"
+    );
+}
+
+/// A compute-info reply its guest's own count cut short names the keys it lost.
+///
+/// The sibling device-info reply has said so since the loss was found to be
+/// silent there; this one broke out of its loop and said nothing. Each key it
+/// drops is a compute limit the guest then sizes dispatches without, and the
+/// command is issued once per pipeline creation with no larger re-ask.
+#[test]
+fn a_compute_info_reply_cut_short_by_the_guests_count_names_the_keys_it_lost() {
+    const ASKED: u32 = 2;
+    let answers = compute_info_caps();
+    let (pairs, _) = compute_info_reply(COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY + 1, ASKED);
+    assert_eq!(pairs.len(), ASKED as usize, "a two-pair ask carries two");
+
+    let dropped: Vec<u32> = answers
+        .iter()
+        .map(|&(key, _)| key)
+        .skip(ASKED as usize)
+        .collect();
+    assert!(
+        !dropped.is_empty(),
+        "a two-pair ask must drop an answer, or this proves nothing"
+    );
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let line = log
+        .lines()
+        .rfind(|l| {
+            l.contains("get_compute_info truncated") && l.contains(&format!("count={ASKED}"))
+        })
+        .expect("a truncated compute-info reply names itself and the count that bound it");
+    assert!(
+        line.contains(&format!("wrote={ASKED}")),
+        "and how many pairs it managed: {line}"
+    );
+    assert!(
+        line.contains(&format!("dropped={dropped:?}")),
+        "and every key it could not carry: {line}"
+    );
+}
+
 /// `CmdGetComputeInfo` answers the keys the guest asked about, and its
 /// threadgroup limits are the host's rather than a fixed pair.
 ///
@@ -4637,10 +4915,10 @@ fn every_short_control_packet_names_itself() {
 
     let before_mask = state.active_child_mask;
     for (opcode, need) in [
-        (ROOT_OP_DEVICE_INFO_TAHOE, DEVICE_INFO_TAHOE_REPLY_PFN + 4),
+        (ROOT_OP_DEVICE_INFO_TAHOE, TAHOE.reply_pfn_offset() + 4),
         (
             ROOT_OP_DEVICE_INFO_MONTEREY,
-            DEVICE_INFO_MONTEREY_REPLY_PFN + 4,
+            MONTEREY.reply_pfn_offset() + 4,
         ),
         (ROOT_OP_DEFINE_FIFO, 4),
         (ROOT_OP_FREE_FIFO, 4),
@@ -4662,6 +4940,26 @@ fn every_short_control_packet_names_itself() {
         // Both FIFOs carry DEFINE_TASK2 and one function handles both, so the
         // root case above does not cover the child site.
         (CHILD_OP_DEFINE_TASK2, DEFINE_TASK_LEN),
+        // The map pair reaches the same handler and used to fall through a
+        // `plen >= 20` guard into the family's generic census line, which
+        // prints the first two words of a record it could not read.
+        (CHILD_OP_MAP_MEMORY2, crate::protocol::fifo::MAP_MEMORY_LEN),
+        (CHILD_OP_UNMAP_MEMORY, crate::protocol::fifo::MAP_MEMORY_LEN),
+        // A delete with no id used to default to task `0`, which is the kernel
+        // task, and retire its resolutions without a line.
+        (CHILD_OP_DELETE_TASK, crate::protocol::fifo::DELETE_TASK_LEN),
+        // A retirement too short to name a surface is one whose backing stays
+        // live while the guest recycles the id.
+        (
+            CHILD_OP_DELETE_IOSURFACE_BACKING2,
+            crate::protocol::fifo::DELETE_BACKING_LEN,
+        ),
+        // The two framing bounds of a destroy command; the record-length one is
+        // driven below, where a record can claim more than the payload holds.
+        (
+            CHILD_OP_DELETE_OBJECT,
+            crate::protocol::fifo::DELETE_OBJECT_LEN,
+        ),
     ] {
         process_child_packet(&mut state, &mut host, 4, &short(opcode, need - 1));
     }
@@ -4686,6 +4984,11 @@ fn every_short_control_packet_names_itself() {
         "reason=cursor_show_short site=ch4",
         "reason=setup_shared_state_short site=ch4",
         "reason=define_task2_short site=ch4",
+        "reason=map_memory2_short site=ch4",
+        "reason=unmap_memory_short site=ch4",
+        "reason=delete_task_short site=ch4",
+        "reason=delete_iosurface_backing2_short site=ch4",
+        "reason=delete_object_short site=ch4",
     ] {
         assert!(
             log.contains(reason),
@@ -5773,7 +6076,7 @@ fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
 /// reached the shared decoder.
 #[test]
 fn the_discarding_commands_share_the_synchronize_record_layout() {
-    use crate::runtime::decode::fifo::ResourceListDecodeError;
+    use crate::protocol::fifo::ResourceListDecodeError;
     let mut host = FakeHost::new();
     // One record: header plus a single four-byte object id.
     let mut good = vec![0u8; 12];
@@ -5854,7 +6157,7 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
 #[test]
 fn each_map_family_command_takes_its_own_branch() {
     use crate::protocol::endian::st32;
-    use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
+    use crate::protocol::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
 
     const MAPPING: u32 = 0x2a;
 

@@ -27,7 +27,7 @@
 //! `object_ref` is a payload field, not a header one. Object-creation records
 //! carry it first and encoder records do not carry it at all, so a header that
 //! claimed it would eat the first four bytes of every render command's payload.
-//! See [`crate::op`] for the derivation.
+//! See [`mod@crate::op`] for the derivation.
 //!
 //! # How the layout was derived
 //!
@@ -490,7 +490,13 @@ pub fn new_texture_wide<'a>(op: &Op<'a>) -> Result<&'a NewTextureWideBody, WireE
 // --- 0x16 heapTextureSizeAndAlignWithDescriptor:allocator: -----------------
 
 pub const OPCODE_HEAP_TEXTURE_SIZE_AND_ALIGN: u32 = 0x16;
-pub const HEAP_TEXTURE_SIZE_AND_ALIGN_TOTAL_LEN: u32 = 40;
+/// The whole record: the shared head, then a bare [`TextureDescriptorBody`].
+///
+/// Derived rather than written, because it is not an independent fact — the
+/// record is its header plus its body, and a `40` beside a 32-byte body and an
+/// 8-byte head is one number restating two.
+pub const HEAP_TEXTURE_SIZE_AND_ALIGN_TOTAL_LEN: u32 =
+    (crate::op::OP_HEADER_LEN + TEXTURE_DESCRIPTOR_LEN) as u32;
 
 /// The heap sizing query: [`OPCODE_NEW_TEXTURE`]'s record without the ref.
 ///

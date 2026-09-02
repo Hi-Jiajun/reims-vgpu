@@ -785,9 +785,9 @@ pub const LEDGER: &[Op] = &[
         rail: Rail::Render,
         opcode: Some(0x0067),
         selector: "setColorStoreActionOptions:atIndex:",
-        closure: Closure::Unresolved {
-            question: "store-action options carry custom sample positions, which this rail neither sets nor resolves against; dropped with a count",
-        },
+        closure: Closure::Refused {
+            route: "render_store_action_options_dropped",
+            evidence: "store-action options carry only MTLStoreActionOptionCustomSamplePositions, which asks a multisample resolve to use the pass's programmable sample positions; this rail sets none, so the none value is honoured because it is the API default and asks for nothing, and every other value — including the undeclared bits a mask would fold onto the flag — is refused by name rather than counted",        },
     },
     Op {
         rail: Rail::Render,
@@ -809,9 +809,9 @@ pub const LEDGER: &[Op] = &[
         rail: Rail::Render,
         opcode: Some(0x006a),
         selector: "setDepthStoreActionOptions:",
-        closure: Closure::Unresolved {
-            question: "depth store-action options; as 0x67",
-        },
+        closure: Closure::Refused {
+            route: "render_store_action_options_dropped",
+            evidence: "depth store-action options; as 0x67",        },
     },
     Op {
         rail: Rail::Render,
@@ -929,9 +929,9 @@ pub const LEDGER: &[Op] = &[
         rail: Rail::Render,
         opcode: Some(0x0079),
         selector: "setStencilStoreActionOptions:",
-        closure: Closure::Unresolved {
-            question: "stencil store-action options; as 0x67",
-        },
+        closure: Closure::Refused {
+            route: "render_store_action_options_dropped",
+            evidence: "stencil store-action options; as 0x67",        },
     },
     Op {
         rail: Rail::Render,
@@ -1034,8 +1034,8 @@ pub const LEDGER: &[Op] = &[
         rail: Rail::Render,
         opcode: Some(0x0088),
         selector: "setLineWidth:",
-        closure: Closure::Unresolved {
-            question: "line width; dropped with a count whenever it is not the 1.0 default",
+        closure: Closure::Implemented {
+            evidence: "line width, latched per encoder and set per draw by the running rail; the Vulkan rail sets it wherever the draw rasterizes lines and refuses a width its host cannot serve, and the Metal rail names the loss its encoder has no setter for",
         },
     },
     Op {
@@ -1043,7 +1043,7 @@ pub const LEDGER: &[Op] = &[
         opcode: Some(0x0089),
         selector: "useResource:usage:stages:; useResources:count:usage:stages:",
         closure: Closure::Unresolved {
-            question: "useResource: usage and stages are lifted and classified. A read declaration is the case a per-draw binder owes nothing on; a write declaration is content the GPU never produces, and it is now counted and named apart. The row closes when a driven boot shows which classes a guest issues",
+            question: "useResource: usage and stages are lifted and classified, and a read declaration is the case a per-draw binder owes nothing on. What is not established is what the record obliges: whether an indirectly-referenced resource the guest never declares is legal to touch, and whether a write declaration orders the GPU's writes against a later read this device would not otherwise order. Both are terms of the residency contract; neither can be read off which declarations a guest happens to make",
         },
     },
     Op {
@@ -1059,7 +1059,7 @@ pub const LEDGER: &[Op] = &[
         opcode: Some(0x009a),
         selector: "setVertexAmplificationCount:viewMappings:",
         closure: Closure::Unresolved {
-            question: "vertex amplification count; as 0x99",
+            question: "vertex amplification count; as 0x99, and the record's view mappings are a second loss counted apart from it — they offset the viewport and render-target array indices a view rasterises into, so a count of one whose mapping is not the identity is a draw aimed at a slice this rail does not aim it at",
         },
     },
     Op {
@@ -2031,6 +2031,51 @@ mod tests {
                 o.rail,
                 o.opcode
             );
+        }
+    }
+
+    /// **Neither unspellable outcome may be spelled, in any row.**
+    ///
+    /// The module doc names two: "the current workload does not issue it" and
+    /// "the old backend drops it too". Both are easy to write into a row's
+    /// reasoning without noticing, because both feel like evidence — and both
+    /// would let the cutover gate pass on a claim about behaviour rather than
+    /// about the contract. A ledger closed on either is a ledger that says
+    /// nothing about the records a guest has not made yet, which is the whole
+    /// reason it exists.
+    ///
+    /// An `Unresolved` row's `question` is checked for the same words, because
+    /// a question that names a workload as its closing condition is that
+    /// outcome written down in advance — which is how `0x0089` had it.
+    #[test]
+    fn no_row_rests_on_a_workload_or_on_the_backend_being_replaced() {
+        const UNSPELLABLE: &[&str] = &[
+            "workload",
+            "driven boot",
+            "boot shows",
+            "guest issues",
+            "old backend",
+            "legacy backend",
+            "previous backend",
+        ];
+        for o in LEDGER {
+            let reasoning = match o.closure {
+                Closure::Implemented { evidence } | Closure::Refused { evidence, .. } => {
+                    [evidence, ""]
+                }
+                Closure::ProvenNoOp { cell, evidence } => [cell, evidence],
+                Closure::Unresolved { question } => [question, ""],
+            };
+            for text in reasoning {
+                for bad in UNSPELLABLE {
+                    assert!(
+                        !text.contains(bad),
+                        "{:?} {:#x?} rests on `{bad}`, which is not an outcome: {text}",
+                        o.rail,
+                        o.opcode
+                    );
+                }
+            }
         }
     }
 

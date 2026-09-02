@@ -10,12 +10,16 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState,
-    DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
-    SampledImageResource, SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource,
-    SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
-    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
-    ViewportResource, VisibilityResultMode, MAX_DEVICE_RECREATES,
+    self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
+    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
+    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
+    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
+    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
+    VisibilityResultMode, MAX_DEVICE_RECREATES,
+};
+use reims_vgpu_core::blend::{
+    MTL_BLEND_FACTOR_BLEND_COLOR, MTL_BLEND_FACTOR_ONE, MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+    MTL_BLEND_FACTOR_SOURCE_ALPHA, MTL_BLEND_FACTOR_ZERO, MTL_BLEND_OPERATION_ADD,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -138,7 +142,7 @@ fn engine_req(vert: &[u32], frag: &[u32], w: u32, h: u32) -> DrawRequest {
         first_vertex: 0,
         instance_count: Some(1),
         base_instance: 0,
-        primitive_topology: PrimitiveTopology::Triangle,
+        primitive_topology: PrimitiveTopology(reims_vgpu_core::topology::PrimitiveType::Triangle),
         ..Default::default()
     }
 }
@@ -217,6 +221,142 @@ fn plain_triangle_known_color() {
 /// zero leaves three standard 4x sample locations inside and one outside, so
 /// the resolved red channel must lie strictly between clear black and the
 /// fragment's red value. A one-sample redirect can only produce an endpoint.
+/// The five Metal primitive types collapse onto exactly the number of
+/// pipelines this host's topology rung admits — five, three, or one.
+///
+/// `reims_vgpu_vulkan::topology::key` has three rungs and this is the only
+/// place they are measured against a real driver. Which one this host is on is
+/// not asserted, because it is a property of the driver; what is asserted is
+/// that the count is *one of the three* and that the collapse is the right
+/// shape for it. A key that forgot the class rule would collapse a line onto a
+/// triangle and land on one; a key that never consulted the cell would stay at
+/// five on a host that reports `extendedDynamicState`; a key that used the
+/// guest's type where it meant the class would produce four.
+///
+/// Every draw is also checked to have run, so a rung that collapses is not one
+/// that stopped drawing.
+#[test]
+fn the_primitive_types_collapse_onto_one_of_the_three_topology_rungs() {
+    use reims_vgpu_core::topology::PrimitiveType;
+
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 16, 16);
+
+    // A first draw to build everything that is not the pipeline — shader
+    // modules, layout, render pass, the target — so the deltas below are the
+    // pipeline and nothing else.
+    if draw_or_skip("topology_warm", &req).is_none() {
+        return;
+    }
+
+    let mut created = Vec::new();
+    for guest in PrimitiveType::ALL {
+        req.primitive_topology = PrimitiveTopology(guest);
+        engine::reset_draw_counters();
+        let before = engine::counter_snapshot();
+        draw_or_skip("topology_rung", &req).expect("a GPU was already found");
+        let d = engine::counter_snapshot().delta_since(&before);
+        if d.creates > 0 {
+            created.push(guest);
+        }
+    }
+
+    // The warm draw above was a triangle list, so it already built whatever
+    // pipeline that type needs. What is counted here is therefore what the
+    // *other* four types cost on top of it, which is what distinguishes the
+    // rungs.
+    let names: Vec<&str> = created.iter().map(|p| p.name()).collect();
+    match created.len() {
+        // The baseline: no dynamic topology, a pipeline per type, so the four
+        // that are not a triangle list each build their own.
+        4 => assert_eq!(
+            created,
+            vec![
+                PrimitiveType::Point,
+                PrimitiveType::Line,
+                PrimitiveType::LineStrip,
+                PrimitiveType::TriangleStrip
+            ],
+            "{names:?}"
+        ),
+        // `extendedDynamicState` and nothing more: one pipeline per class. The
+        // triangle class is already built, so the point and line classes are
+        // what is left — and the strips join the pipelines their lists made.
+        2 => assert_eq!(
+            created,
+            vec![PrimitiveType::Point, PrimitiveType::Line],
+            "a classed host builds one pipeline per class and no more: {names:?}"
+        ),
+        // `dynamicPrimitiveTopologyUnrestricted` as well: the warm draw's
+        // pipeline serves every type, so nothing else is built at all.
+        0 => {}
+        n => panic!("{n} further pipelines is not a rung `topology::key` can produce: {names:?}"),
+    }
+
+    // And the triangle list still covers the target, so nothing above was
+    // achieved by declining to draw.
+    req.primitive_topology = PrimitiveTopology(PrimitiveType::Triangle);
+    let px = draw_or_skip("topology_triangle", &req).expect("a GPU was already found");
+    assert_fullscreen_fragment_color("topology_triangle", &px, 16, 16);
+}
+
+/// The depth compare function reaches the draw, and two draws that differ only
+/// in it may still be one pipeline.
+///
+/// `setDepthStencilState:` is a Metal encoder command, so a guest changes the
+/// whole depth-stencil state between draws of one pipeline. On a host with
+/// `VK_EXT_extended_dynamic_state` this device keeps it that way: the pipeline
+/// holds `reims_vgpu_vulkan::depth_stencil`'s placeholder — which tests
+/// nothing and writes nothing — and the guest's state rides to the encoder.
+///
+/// That collapse is invisible from a cache-hit count and catastrophic if the
+/// encoder half is missing: every draw would silently run the placeholder. So
+/// this asserts pixels. `Always` fills the target and `Never` rejects every
+/// fragment, and the two requests differ in nothing else — on a dynamic host
+/// they are the same pipeline, and a placeholder left unreplaced would fill the
+/// target both times.
+#[test]
+fn the_depth_compare_function_separates_two_draws_of_one_pipeline() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let depth = |compare| {
+        Some(DepthState {
+            identity: None,
+            test_enable: true,
+            write_enable: true,
+            compare,
+            clear_value: 1.0,
+            load: false,
+            stencil: None,
+        })
+    };
+
+    let mut req = engine_req(&v, &f, 16, 16);
+    req.depth = depth(SamplerCompareFunction::Always);
+    let Some(passed) = draw_or_skip("depth_always", &req) else {
+        return;
+    };
+    assert_fullscreen_fragment_color("depth_always", &passed, 16, 16);
+
+    req.depth = depth(SamplerCompareFunction::Never);
+    let rejected = draw_or_skip("depth_never", &req).expect("the first draw already found a GPU");
+    assert!(
+        rejected
+            .chunks_exact(4)
+            .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0),
+        "`Never` must reject every fragment; got {:?}",
+        &rejected[..16]
+    );
+
+    // And back, in the same session and against the same pipeline where this
+    // host has one, so the second state cannot have won by being the one that
+    // built it.
+    req.depth = depth(SamplerCompareFunction::Always);
+    let again = draw_or_skip("depth_always_again", &req).expect("a GPU was already found");
+    assert_eq!(again, passed, "returning to `Always` must fill the target");
+}
+
 #[test]
 fn multisample_resolve_preserves_subpixel_coverage() {
     let _g = engine_test_session();
@@ -514,15 +654,26 @@ fn cull_mode_honored_and_winding_correct() {
     let (v, f) = triangle_spirv();
     let (w, h) = (16u32, 16u32);
 
-    let variant = |cull: CullMode, ccw: bool| -> Option<bool> {
+    use reims_vgpu_vulkan::raster::{
+        GuestRasterState, MTL_CULL_MODE_BACK, MTL_CULL_MODE_FRONT, MTL_CULL_MODE_NONE,
+        MTL_WINDING_CLOCKWISE, MTL_WINDING_COUNTER_CLOCKWISE,
+    };
+    let variant = |cull: u64, ccw: bool| -> Option<bool> {
         let mut req = engine_req(&v, &f, w, h);
-        req.cull_mode = cull;
-        req.front_face_ccw = ccw;
+        req.raster = GuestRasterState {
+            cull_mode: cull,
+            winding: if ccw {
+                MTL_WINDING_COUNTER_CLOCKWISE
+            } else {
+                MTL_WINDING_CLOCKWISE
+            },
+            ..GuestRasterState::DEFAULT
+        };
         draw_or_skip("cull", &req).map(|px| triangle_covered(&px, w, h))
     };
 
     // cull=None must stay byte-identical to the no-cull path: full coverage.
-    let Some(none_cov) = variant(CullMode::None, false) else {
+    let Some(none_cov) = variant(MTL_CULL_MODE_NONE, false) else {
         return; // no GPU
     };
     assert!(
@@ -530,10 +681,10 @@ fn cull_mode_honored_and_winding_correct() {
         "cull=None must draw both faces (fullscreen coverage)"
     );
 
-    let back_cw = variant(CullMode::Back, false).unwrap();
-    let front_cw = variant(CullMode::Front, false).unwrap();
-    let back_ccw = variant(CullMode::Back, true).unwrap();
-    let front_ccw = variant(CullMode::Front, true).unwrap();
+    let back_cw = variant(MTL_CULL_MODE_BACK, false).unwrap();
+    let front_cw = variant(MTL_CULL_MODE_FRONT, false).unwrap();
+    let back_ccw = variant(MTL_CULL_MODE_BACK, true).unwrap();
+    let front_ccw = variant(MTL_CULL_MODE_FRONT, true).unwrap();
 
     // A single triangle presents one face to the viewer: culling Front and Back
     // are complementary — exactly one keeps it. If cull were ignored, both would
@@ -552,6 +703,132 @@ fn cull_mode_honored_and_winding_correct() {
     assert_eq!(
         front_ccw, back_cw,
         "flipping winding must swap Front into Back behavior (winding not wired?)"
+    );
+}
+
+/// The guest's line width reaches the rasterizer, and only where the draw
+/// rasterizes lines.
+///
+/// Two claims, and neither can be made by either half alone. Wireframing the
+/// fixture triangle turns a fullscreen fill into its three edges, so widening
+/// the width must cover *more* pixels than the default did — that is
+/// `vkCmdSetLineWidth` carrying the guest's own number to the driver, and a
+/// rail that declared `LINE_WIDTH` dynamic and never set it would draw at an
+/// undefined width rather than at the two this compares.
+///
+/// The second claim is the conditional one, and it is measured by a refusal
+/// rather than by pixels: an absurd width is refused for the wireframe draw
+/// and accepted for the filled one, from the same request and the same host.
+/// A rail that asked `raster::line_width` without the topology — or that put
+/// the check in the pipeline plan, where the topology is not known — would
+/// refuse both, and every guest that ever set a width would lose every filled
+/// draw after it.
+///
+/// Skipped where the host has neither `fillModeNonSolid` nor `wideLines`;
+/// there is nothing to measure on a device that cannot draw a wide wireframe.
+#[test]
+fn line_width_widens_a_wireframe_and_is_not_asked_of_a_filled_draw() {
+    use reims_vgpu_vulkan::raster::{GuestRasterState, MTL_TRIANGLE_FILL_MODE_LINES};
+
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (64u32, 64u32);
+
+    // The fixture triangle covers its viewport, so its three edges lie on the
+    // viewport's own border. At full size that border is the target's, and a
+    // one-pixel wireframe of it rasterizes nothing: the line's half-pixel
+    // extent straddles the edge of the image. Inset the viewport by a half
+    // pixel and the same edges fall on pixel centres inside the target, where
+    // both a thin line and a wide one can be counted. The scissor stays the
+    // full target, so nothing clips what a wider line adds.
+    let inset = 8.5f32;
+    let run = |wireframe: bool, width: Option<f32>| -> Result<Vec<u8>, String> {
+        let mut req = engine_req(&v, &f, w, h);
+        req.viewports = vec![ViewportResource {
+            x: inset,
+            y: inset,
+            width: w as f32 - 2.0 * inset,
+            height: h as f32 - 2.0 * inset,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        req.scissors = vec![ScissorResource {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }];
+        if wireframe {
+            req.raster = GuestRasterState {
+                fill_mode: MTL_TRIANGLE_FILL_MODE_LINES,
+                ..GuestRasterState::DEFAULT
+            };
+        }
+        req.line_width = width;
+        engine::execute_draw_request(&req)
+            .map(|o| semantic_rgba(&o))
+            .map_err(|e| e.to_string())
+    };
+    // Fragment is ~(64,128,191) and the clear is black, so the green channel
+    // says covered — the same discriminator `triangle_covered` uses, counted
+    // rather than sampled at one point.
+    let covered = |px: &[u8]| px.chunks_exact(4).filter(|p| p[1] > 32).count();
+
+    let thin = match run(true, None) {
+        Ok(px) => px,
+        Err(e) => {
+            if skip_if_no_gpu(&e) || e.contains("vk_raster_no_non_solid_fill") {
+                eprintln!("SKIP line_width: {e}");
+                return;
+            }
+            panic!("line_width thin wireframe: {e}");
+        }
+    };
+    let filled = run(false, None).expect("a filled draw needs no capability");
+    let thin_covered = covered(&thin);
+    let filled_covered = covered(&filled);
+    assert_eq!(
+        filled_covered,
+        ((w as f32 - 2.0 * inset) * (h as f32 - 2.0 * inset)) as usize,
+        "the fixture triangle covers its viewport and nothing outside it"
+    );
+    assert!(
+        thin_covered > 0 && thin_covered < filled_covered,
+        "a wireframe must draw its edges and nothing else ({thin_covered} of \
+         {filled_covered}); is the polygon mode reaching the pipeline?"
+    );
+
+    // The same draw at a width the host can serve. Four is inside every
+    // `lineWidthRange` a device with `wideLines` reports (the guaranteed
+    // minimum maximum is 8).
+    match run(true, Some(4.0)) {
+        Ok(wide) => assert!(
+            covered(&wide) > thin_covered,
+            "a wider line must cover more pixels ({} vs {thin_covered}); \
+             is vkCmdSetLineWidth being given the guest\'s width?",
+            covered(&wide)
+        ),
+        Err(e) if e.contains("vk_raster_no_wide_lines") => {
+            eprintln!("SKIP line_width wide arm: no wideLines");
+        }
+        Err(e) => panic!("line_width wide wireframe: {e}"),
+    }
+
+    // The conditional half. A width no device serves is refused for the draw
+    // that would rasterize lines with it, and never asked of the draw that
+    // would not — the joint fact, measured against a real driver's limits.
+    let absurd = 1.0e9f32;
+    let refused = run(true, Some(absurd)).expect_err("an absurd width must be refused");
+    assert!(
+        refused.contains("vk_raster_line_width_out_of_range")
+            || refused.contains("vk_raster_no_wide_lines"),
+        "expected a line-width refusal, got {refused}"
+    );
+    let ignored = run(false, Some(absurd)).expect("a filled draw uses no line width");
+    assert_eq!(
+        covered(&ignored),
+        filled_covered,
+        "a filled draw must rasterize identically whatever width preceded it"
     );
 }
 
@@ -973,18 +1250,79 @@ fn blend_src_alpha_known_color() {
     let mut req = engine_req(&v, &f, 8, 8);
     req.target_rgba8 = Some(std::sync::Arc::new([0, 0, 0, 255].repeat(8 * 8)));
     req.blend = Some(BlendStateResource {
-        src_color: BlendFactor::SrcAlpha,
-        dst_color: BlendFactor::OneMinusSrcAlpha,
-        color_op: BlendOp::Add,
-        src_alpha: BlendFactor::One,
-        dst_alpha: BlendFactor::OneMinusSrcAlpha,
-        alpha_op: BlendOp::Add,
-        constants: [0.0; 4],
+        src_rgb: MTL_BLEND_FACTOR_SOURCE_ALPHA,
+        dst_rgb: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+        op_rgb: MTL_BLEND_OPERATION_ADD,
+        src_alpha: MTL_BLEND_FACTOR_ONE,
+        dst_alpha: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+        op_alpha: MTL_BLEND_OPERATION_ADD,
     });
     if let Some(px) = draw_or_skip("blend_src_alpha", &req) {
         // Fragment alpha=1 → same as replace over black seed.
         assert_fullscreen_fragment_color("blend_src_alpha", &px, 8, 8);
     }
+}
+
+/// The encoder's blend colour reaches the GPU, and one pipeline serves two of
+/// them.
+///
+/// `MTLBlendFactorBlendColor` reads a value `setBlendColorRed:` sets on the
+/// encoder, so it is `VK_DYNAMIC_STATE_BLEND_CONSTANTS` here and no longer part
+/// of the pipeline key. That makes this the load-bearing case: with the
+/// constants dropped from `VkPipelineColorBlendStateCreateInfo` and no
+/// `vkCmdSetBlendConstants` recorded, both draws below would composite against
+/// Vulkan's all-zero default and come out black — which is a whole surface
+/// rendered wrong with nothing to say so.
+///
+/// The equation is `src * blendColor + dst * 0`, so the pixel is the fragment
+/// colour scaled by the constant and the two draws must differ by exactly the
+/// factor between their constants.
+#[test]
+fn the_blend_colour_is_dynamic_state_and_two_of_them_share_a_pipeline() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let scaled = |constant: [f32; 4]| -> Option<Vec<u8>> {
+        let mut req = engine_req(&v, &f, 8, 8);
+        req.target_rgba8 = Some(std::sync::Arc::new([0, 0, 0, 255].repeat(8 * 8)));
+        req.blend = Some(BlendStateResource {
+            src_rgb: MTL_BLEND_FACTOR_BLEND_COLOR,
+            dst_rgb: MTL_BLEND_FACTOR_ZERO,
+            op_rgb: MTL_BLEND_OPERATION_ADD,
+            src_alpha: MTL_BLEND_FACTOR_ONE,
+            dst_alpha: MTL_BLEND_FACTOR_ZERO,
+            op_alpha: MTL_BLEND_OPERATION_ADD,
+        });
+        req.blend_color = constant;
+        draw_or_skip("blend_colour_dynamic", &req)
+    };
+    let center = |px: &[u8]| {
+        let i = ((8 / 2) * 8 + 8 / 2) as usize * 4;
+        (px[i], px[i + 1], px[i + 2], px[i + 3])
+    };
+
+    // A white constant is the identity, which is the assertion that the value
+    // arrived at all: the default this device would otherwise supply is zero.
+    let Some(full) = scaled([1.0, 1.0, 1.0, 1.0]) else {
+        return;
+    };
+    assert_eq!(
+        center(&full).0 as i32 - 64,
+        0,
+        "blend colour did not reach the draw: center={:?}",
+        center(&full)
+    );
+    assert_fullscreen_fragment_color("blend_colour_one", &full, 8, 8);
+
+    // Half the constant is half the pixel, through the same pipeline: nothing
+    // in the key changed between the two draws.
+    let Some(half) = scaled([0.5, 0.5, 0.5, 1.0]) else {
+        return;
+    };
+    let (r, g, b, a) = center(&half);
+    assert!(
+        near(r, 32) && near(g, 64) && near(b, 96) && near(a, 255),
+        "a halved blend colour must halve the pixel; got ({r},{g},{b},{a})"
+    );
 }
 
 #[test]
@@ -2822,13 +3160,12 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
     let mut gpu = engine_req(&v, &f, w, h);
     gpu.target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
     gpu.blend = Some(BlendStateResource {
-        src_color: BlendFactor::One,
-        dst_color: BlendFactor::OneMinusSrcAlpha,
-        color_op: BlendOp::Add,
-        src_alpha: BlendFactor::One,
-        dst_alpha: BlendFactor::OneMinusSrcAlpha,
-        alpha_op: BlendOp::Add,
-        constants: [0.0; 4],
+        src_rgb: MTL_BLEND_FACTOR_ONE,
+        dst_rgb: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+        op_rgb: MTL_BLEND_OPERATION_ADD,
+        src_alpha: MTL_BLEND_FACTOR_ONE,
+        dst_alpha: MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+        op_alpha: MTL_BLEND_OPERATION_ADD,
     });
     let gpu_px = match engine::execute_draw_request(&gpu) {
         Ok(o) => o.pixels,

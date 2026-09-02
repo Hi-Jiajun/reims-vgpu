@@ -34,6 +34,41 @@ pub(crate) struct ReadbackLease {
     pub slot_size: u64,
 }
 
+/// Every operation class a pooled buffer slot can be bound as.
+///
+/// One constant rather than a set each acquire assembles from a caller's
+/// argument, because **these slots are recycled by size bucket and not by
+/// usage.** A slot handed back to the free list is handed out again to whoever
+/// asks for that bucket next, so it has to be legal for whatever that caller
+/// binds it as — and a slot created with a narrower set is one that works until
+/// the bucket happens to be reused for something else, which is a fault
+/// arbitrarily far from the creation that decided it.
+///
+/// That is not hypothetical here. `acquire_guest_gather` used to OR
+/// `TRANSFER_SRC` in by hand with a comment recording exactly this bug: the
+/// sampled rail gathers into a slot and then copies it into an image, so a slot
+/// first created for a vertex window was an invalid copy source the second time
+/// it came out of the free list. Naming the set once is what stops the next one.
+///
+/// Both pools take the same set. A draw deduplicates its binds by content — the
+/// same window bound as a vertex stream and as a storage buffer resolves to one
+/// buffer — so a staging slot and a gather slot are interchangeable by
+/// construction and a difference between their usages would be a crossover that
+/// misses.
+///
+/// It is deliberately *not* `reims_vgpu_vulkan::buffer::EVERY_CLASS`, which is
+/// wider: that constant answers what a **guest** buffer must admit, and a guest
+/// buffer is created once for a lifetime the guest owns. These are host-visible
+/// pool slots, and widening a pool slot's usage is a change to what memory the
+/// driver will place it in — a measurement nobody has taken.
+const POOL_SLOT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
+        | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
+        | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
+        | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw(),
+);
+
 /// Whether the identity-only lookup runs, given what the environment said.
 ///
 /// Split from the read below so the one thing left to get wrong is testable
@@ -1862,13 +1897,7 @@ impl ResourcePools {
         debug_assert!(self.open_pass.is_none(), "forgetting an open render pass");
         self.last_pass = None;
         self.cb_graphics.cb = None;
-        self.cb_graphics.pipeline = None;
-        self.cb_graphics.pipeline_layout = None;
-        self.cb_graphics.viewports.clear();
-        self.cb_graphics.scissors.clear();
-        self.cb_graphics.stencil = None;
-        self.cb_graphics.push_layout = None;
-        self.cb_graphics.push_bindings.clear();
+        self.cb_graphics.forget_recorded();
     }
 
     fn install_open_batch(&mut self, batch: OpenBatch) {
@@ -2232,15 +2261,12 @@ impl ResourcePools {
         let g = &mut self.cb_graphics;
         if g.cb != Some(cb) {
             // A recycled handle: everything the previous user of it bound was
-            // made undefined by the `vkBeginCommandBuffer` in between.
+            // made undefined by the `vkBeginCommandBuffer` in between. Every
+            // field, through the one method that knows what all of them are —
+            // this branch used to list them by hand and had fallen three
+            // behind.
             g.cb = Some(cb);
-            g.pipeline = None;
-            g.pipeline_layout = None;
-            g.viewports.clear();
-            g.scissors.clear();
-            g.stencil = None;
-            g.push_layout = None;
-            g.push_bindings.clear();
+            g.forget_recorded();
         }
         if g.pipeline == Some(pipeline) {
             counters
@@ -2256,9 +2282,36 @@ impl ResourcePools {
         }
         // Static state on the incoming pipeline may have replaced any of these,
         // so none of them is known any more.
+        //
+        // A bind makes a state undefined exactly where the incoming pipeline
+        // does *not* declare it dynamic, which is why this list is not
+        // `forget_recorded`:
+        //
+        // - The viewport, scissor, blend colour, depth bias and line width are
+        //   declared by every graphics pipeline this cache builds, so clearing
+        //   them is conservative rather than required. Kept, because it costs
+        //   one re-record per pipeline change and the alternative is a claim
+        //   about an unconditional list that a future conditional would break.
+        // - The stencil reference and the depth-stencil state are declared
+        //   *conditionally* — see `DepthStencilPlan::states`, which lists the
+        //   reference only for a pipeline whose stencil test is on, and the
+        //   eight dynamic members only for a pipeline whose pass carries depth.
+        //   So a bind genuinely can make either undefined, and clearing them is
+        //   required rather than conservative.
+        // - The rasterizer members and the primitive topology are *not* here.
+        //   Whether they are dynamic is `RasterDynamic::of(cell)` and
+        //   `TopologyCell::dynamic`, both pure functions of this device's
+        //   feature bits — so on any one device either every pipeline declares
+        //   them or none does, and a bind can never turn one static. Clearing
+        //   them would re-record five commands per pipeline change that no
+        //   pipeline could have disturbed.
         g.viewports.clear();
         g.scissors.clear();
         g.stencil = None;
+        g.depth_stencil = None;
+        g.blend_constants = None;
+        g.depth_bias_set = false;
+        g.line_width = None;
         unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline) };
     }
 
@@ -2439,6 +2492,274 @@ impl ResourcePools {
             device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT, front);
             device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::BACK, back);
         }
+    }
+
+    /// Record `vkCmdSetDepthBias` unless this command buffer already carries it.
+    ///
+    /// Every graphics pipeline this engine builds sets `depthBiasEnable` —
+    /// Metal has no enable bit for it, so a pipeline that cleared it would
+    /// silently drop the bias of a guest that calls `setDepthBias:` — and a
+    /// pipeline that enables it and declares the state dynamic must be given
+    /// values before it draws, or the result is undefined rather than unbiased.
+    ///
+    /// The values are zero. The guest's own `setDepthBias:` is *not* translated
+    /// yet and is still counted as a gap by `vulkan_fixed_state_gap`: Metal's
+    /// constant is an absolute depth offset and Vulkan's
+    /// `depthBiasConstantFactor` is scaled by the format's minimum resolvable
+    /// difference, so passing the guest's number through would be wrong by a
+    /// factor this device has not recovered. Zero bias with the enable on
+    /// rasterizes identically to the enable off, so this costs nothing and
+    /// leaves the translation to whoever recovers that factor.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_depth_bias(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.depth_bias_set {
+            counters
+                .dynstate_depth_bias_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.depth_bias_set = true;
+        unsafe { device.cmd_set_depth_bias(cb, 0.0, 0.0, 0.0) };
+    }
+
+    /// Record whichever rasterization members this host supplies per draw,
+    /// unless this command buffer already carries exactly these values.
+    ///
+    /// `values` is `Some` in exactly the members
+    /// `reims_vgpu_vulkan::raster::plan` left as placeholders in the pipeline,
+    /// so setting every `Some` reproduces the guest's state and setting none of
+    /// them is a host that baked all four. A pipeline that declares a state
+    /// dynamic and never receives it draws undefined, which is why the caller
+    /// asks on every draw rather than on the ones it thinks changed.
+    ///
+    /// Each member is guarded by the loader that carries its entry point, and
+    /// both loaders are `Some` on exactly the devices whose feature bits put a
+    /// `Some` in `values` — so an entry point the device never enabled cannot
+    /// be reached from here.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_raster(
+        &mut self,
+        ctx: &super::super::context::DeviceContext,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        values: reims_vgpu_vulkan::raster::DynamicRaster,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.raster == Some(values) {
+            counters
+                .dynstate_raster_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.raster = Some(values);
+        if let Some(eds) = ctx.extended_dynamic_state.as_ref() {
+            if let Some(cull) = values.cull_mode {
+                unsafe { eds.cmd_set_cull_mode(cb, cull) };
+            }
+            if let Some(front) = values.front_face {
+                unsafe { eds.cmd_set_front_face(cb, front) };
+            }
+        }
+        if let Some(eds3) = ctx.extended_dynamic_state3.as_ref() {
+            if let Some(mode) = values.polygon_mode {
+                unsafe { eds3.cmd_set_polygon_mode(cb, mode) };
+            }
+            if let Some(clamp) = values.depth_clamp_enable {
+                unsafe { eds3.cmd_set_depth_clamp_enable(cb, clamp) };
+            }
+        }
+    }
+
+    /// Record the line width this draw rasterizes with, unless this command
+    /// buffer already carries exactly it.
+    ///
+    /// `width` is `reims_vgpu_vulkan::raster::line_width`'s answer, and never
+    /// the guest's number unchecked: that function is where a width this host
+    /// cannot serve is refused and where a draw that rasterizes no lines is
+    /// given the default. Recording anything else would be invalid use on a
+    /// device without `wideLines` — undefined behaviour, not a thin line.
+    ///
+    /// Every pipeline this rail builds declares `VK_DYNAMIC_STATE_LINE_WIDTH`
+    /// — it is 1.0 core, so there is no baking rung and no cell to ask — which
+    /// is why this is unconditional like the depth bias and unlike the four
+    /// members beside it. Held by value rather than by a `bool`, because
+    /// unlike the bias the value varies: a guest that draws a wireframe and
+    /// then a filled mesh alternates between its width and the default.
+    ///
+    /// Compared by bit pattern, for the reason
+    /// [`CbGraphicsState::blend_constants`] is: the cache is an equality on
+    /// what was recorded, and a float comparison would call two distinct
+    /// zeroes equal.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_line_width(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        width: f32,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.line_width == Some(width.to_bits()) {
+            counters
+                .dynstate_line_width_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.line_width = Some(width.to_bits());
+        unsafe { device.cmd_set_line_width(cb, width) };
+    }
+
+    /// Record the guest's whole `MTLDepthStencilState` unless this command
+    /// buffer already carries exactly it.
+    ///
+    /// `wanted` is `Some` exactly when the pipeline about to be bound holds
+    /// `reims_vgpu_vulkan::depth_stencil`'s placeholder — which is the same
+    /// condition that collapsed every guest depth-stencil state onto one cache
+    /// entry. A pipeline that declares these states and never receives them
+    /// draws undefined; a host that bakes the state asks nothing here and pays
+    /// one comparison.
+    ///
+    /// Eight commands and not nine: the reference is a separate Metal encoder
+    /// command with its own held value, and it is recorded on the baking rung
+    /// too.
+    ///
+    /// The masks go through `vkCmdSetStencilCompareMask` and
+    /// `vkCmdSetStencilWriteMask` rather than through `vkCmdSetStencilOp`,
+    /// which does not carry them. All three were dynamic in Vulkan 1.0, so
+    /// they need no loader — unlike the five that came with
+    /// `VK_EXT_extended_dynamic_state`, whose loader is `Some` on exactly the
+    /// devices whose feature bit put a `Some` in `wanted`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_depth_stencil(
+        &mut self,
+        ctx: &super::super::context::DeviceContext,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        wanted: Option<reims_vgpu_vulkan::depth_stencil::DynamicDepthStencil>,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.depth_stencil == Some(wanted) {
+            counters
+                .dynstate_depth_stencil_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.depth_stencil = Some(wanted);
+        let (Some(eds), Some(state)) = (ctx.extended_dynamic_state.as_ref(), wanted) else {
+            return;
+        };
+        unsafe {
+            eds.cmd_set_depth_test_enable(cb, state.depth_test_enable);
+            eds.cmd_set_depth_write_enable(cb, state.depth_write_enable);
+            eds.cmd_set_depth_compare_op(cb, state.depth_compare_op);
+            eds.cmd_set_depth_bounds_test_enable(cb, state.depth_bounds_test_enable);
+            eds.cmd_set_stencil_test_enable(cb, state.stencil_test_enable);
+        }
+        for (faces, face) in [
+            (vk::StencilFaceFlags::FRONT, state.front),
+            (vk::StencilFaceFlags::BACK, state.back),
+        ] {
+            unsafe {
+                eds.cmd_set_stencil_op(
+                    cb,
+                    faces,
+                    face.fail_op,
+                    face.pass_op,
+                    face.depth_fail_op,
+                    face.compare_op,
+                );
+                ctx.device
+                    .cmd_set_stencil_compare_mask(cb, faces, face.compare_mask);
+                ctx.device
+                    .cmd_set_stencil_write_mask(cb, faces, face.write_mask);
+            }
+        }
+    }
+
+    /// Record `vkCmdSetPrimitiveTopology` unless this command buffer already
+    /// carries exactly this topology.
+    ///
+    /// `wanted` is `Some` exactly when the pipeline about to be bound declares
+    /// `PRIMITIVE_TOPOLOGY` dynamic, which is the same condition
+    /// `reims_vgpu_vulkan::topology::key` used to collapse a list and its strip
+    /// onto one cache entry. A pipeline that declares the state and never
+    /// receives it draws undefined; a host that bakes the topology asks
+    /// nothing here and pays one comparison.
+    ///
+    /// The entry point comes from the `VK_EXT_extended_dynamic_state` loader,
+    /// which is `Some` on exactly the devices whose feature bit put a `Some`
+    /// in `wanted` — so an entry point the device never enabled cannot be
+    /// reached from here.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_topology(
+        &mut self,
+        ctx: &super::super::context::DeviceContext,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        wanted: Option<vk::PrimitiveTopology>,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.topology == Some(wanted) {
+            counters
+                .dynstate_topology_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.topology = Some(wanted);
+        if let (Some(eds), Some(topology)) = (ctx.extended_dynamic_state.as_ref(), wanted) {
+            unsafe { eds.cmd_set_primitive_topology(cb, topology) };
+        }
+    }
+
+    /// Record `vkCmdSetBlendConstants` unless this command buffer already
+    /// carries exactly this value.
+    ///
+    /// Asked on every draw rather than only on the ones whose pipeline names a
+    /// constant factor. Which factors a pipeline names is not something this
+    /// layer holds, the held-value comparison makes a repeat free, and a guest
+    /// that never blends against a constant pays one call per command buffer.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_blend_constants(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        constants: [f32; 4],
+    ) {
+        let bits = constants.map(f32::to_bits);
+        let g = &mut self.cb_graphics;
+        if g.blend_constants == Some(bits) {
+            counters
+                .dynstate_blend_constants_held
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.blend_constants = Some(bits);
+        unsafe { device.cmd_set_blend_constants(cb, &constants) };
     }
 
     /// Clear the guest-read debt and answer whether there was one.
@@ -2773,12 +3094,13 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
         size: u64,
-        usage: vk::BufferUsageFlags,
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
         let need = size.max(4);
         let bucket = Self::bucket(need);
-        // Prefer exact-usage free slots in this bucket; usage is OR'd broadly so reuse is fine.
+        // Free slots in this bucket, whatever the caller is about to bind them
+        // as: every slot carries [`POOL_SLOT_USAGE`], so there is no usage for
+        // this list to be keyed by.
         if let Some(list) = self.staging_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
                 self.note_staging_hit();
@@ -2793,14 +3115,7 @@ impl ResourcePools {
             .create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(bucket)
-                    .usage(
-                        usage
-                            | vk::BufferUsageFlags::TRANSFER_SRC
-                            | vk::BufferUsageFlags::TRANSFER_DST
-                            | vk::BufferUsageFlags::VERTEX_BUFFER
-                            | vk::BufferUsageFlags::INDEX_BUFFER
-                            | vk::BufferUsageFlags::STORAGE_BUFFER,
-                    )
+                    .usage(POOL_SLOT_USAGE)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )
@@ -2900,7 +3215,6 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
         size: u64,
-        usage: vk::BufferUsageFlags,
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
         let bucket = Self::bucket(size.max(4));
@@ -2912,20 +3226,7 @@ impl ResourcePools {
             .create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(bucket)
-                    .usage(
-                        usage
-                            | vk::BufferUsageFlags::TRANSFER_DST
-                            // TRANSFER_SRC unconditionally, because these slots
-                            // are recycled by size bucket and not by usage: the
-                            // sampled rail gathers into one and then copies it
-                            // into an image, so a slot first created for a
-                            // vertex window would be an invalid copy source the
-                            // second time it came out of `gather_free`.
-                            | vk::BufferUsageFlags::TRANSFER_SRC
-                            | vk::BufferUsageFlags::VERTEX_BUFFER
-                            | vk::BufferUsageFlags::INDEX_BUFFER
-                            | vk::BufferUsageFlags::STORAGE_BUFFER,
-                    )
+                    .usage(POOL_SLOT_USAGE)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )

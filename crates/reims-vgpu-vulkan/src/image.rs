@@ -165,6 +165,23 @@ pub struct ImagePlan {
 ///
 /// The only thing that carries a `VkImageCreateInfo`, so an allocation cannot
 /// be made from a plan that skipped the query.
+///
+/// # The compression `MUTABLE_FORMAT` costs, and what it would take to keep it
+///
+/// A driver may disable lossless framebuffer compression for a mutable image,
+/// because it cannot know which reinterpretations are coming.
+/// `VkImageFormatListCreateInfo` — core in Vulkan 1.2, so always available on
+/// this rail's baseline — is how that is recovered: naming the exact formats up
+/// front lets the driver keep compression that is valid for all of them.
+///
+/// No list is promised here, and the reason is that a list is a *promise*. A
+/// view naming a format outside it is invalid usage, so an incomplete list is
+/// worse than none at all. The set is bounded only if allocations really are
+/// keyed on [`crate::pixel::storage_format`], because then every bind reaching
+/// one image shares its stored texel and differs only in the transfer function
+/// — making the set exactly `{linear, srgb}`. That keying is a property of the
+/// caller that owns residency, and no such caller exists yet. When one does,
+/// this is where the list goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admitted {
     plan: ImagePlan,
@@ -186,7 +203,14 @@ pub fn plan(texture: Texture, format: vk::Format, route: Route) -> Result<ImageP
     // Zero means "any" and is the widest declaration, not the narrowest.
     let any = declared.is_unknown();
     let wants = |bit: TextureUsage| any || declared.contains(bit);
-    if !any && declared.contains(TextureUsage::SHADER_WRITE) && depth_stencil {
+    // Both spellings of a shader store. `SHADER_ATOMIC` is the other one --- an
+    // atomic *is* a store, which is why the usage below asks for one storage
+    // image for either bit --- so a depth declaration carrying it is the same
+    // declaration this refuses, and answering only the first spelling dropped
+    // the second quietly, which is the thing the refusal exists to not do.
+    let stores = declared.contains(TextureUsage::SHADER_WRITE)
+        || declared.contains(TextureUsage::SHADER_ATOMIC);
+    if !any && stores && depth_stencil {
         return Err(Refusal::DepthShaderWrite {
             format: guest_format,
         });
@@ -218,7 +242,26 @@ pub fn plan(texture: Texture, format: vk::Format, route: Route) -> Result<ImageP
         // this the layers exist and no cube sampler can address them.
         flags |= vk::ImageCreateFlags::CUBE_COMPATIBLE;
     }
-    if !any && declared.contains(TextureUsage::PIXEL_FORMAT_VIEW) {
+    // Mutable whenever a `VkImageView` of a *different* format may be made over
+    // this image, which is two questions and not one.
+    //
+    // The guest's own declaration is the first, and it is read through `wants`
+    // rather than `declared.contains`: `MTLTextureUsageUnknown` enables every
+    // usage, so reading the bit literally here while reading zero as "any"
+    // twenty lines up made one declaration mean two different things.
+    //
+    // The second is this rail's own sampling. `crate::pixel::storage_format`
+    // keys an allocation on the spelling with no transfer function on it, and
+    // `crate::pixel::sample_view_format` then answers a sampled bind with the
+    // bind's spelling of that same stored texel — one surface serving both
+    // `BGRA8Unorm` and `BGRA8Unorm_sRGB` through one image and two views, which
+    // `storage_format`'s own documentation states is why the allocation folds.
+    // That view is invalid usage without this flag, whatever the guest
+    // declared, so a format with a second spelling gets it unasked.
+    let reinterpretable = crate::pixel::texel_layout_of(format)
+        .and_then(crate::pixel::srgb_texel_layout)
+        .is_some_and(|srgb| srgb != crate::pixel::storage_format(format));
+    if wants(TextureUsage::PIXEL_FORMAT_VIEW) || reinterpretable {
         flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
     }
     if kind.dimensions() == Dimensions::Three && wants(TextureUsage::RENDER_TARGET) {
@@ -546,10 +589,56 @@ mod tests {
         ] {
             assert!(plan.usage.contains(capability), "{capability:?}");
         }
-        // Not the mutable-format flag: that one changes what views are legal
-        // rather than what the image can do, and turning it on unasked costs
-        // compression on hosts that key it off the flag.
-        assert!(!plan.flags.contains(vk::ImageCreateFlags::MUTABLE_FORMAT));
+        // Including the pixel-format view. Reading zero as "any" for the usage
+        // bits and as "not asked" for this one made one declaration mean two
+        // different things.
+        assert!(plan.flags.contains(vk::ImageCreateFlags::MUTABLE_FORMAT));
+    }
+
+    /// The failure this exists to prevent: `pixel::sample_view_format` answers
+    /// a sampled bind with the bind's spelling of a texel the allocation holds
+    /// under the other one, which is how one surface serves `BGRA8Unorm` and
+    /// `BGRA8Unorm_sRGB` through one image. That view is invalid usage on an
+    /// image without `MUTABLE_FORMAT`, and no guest usage bit says so.
+    #[test]
+    fn a_format_with_a_second_spelling_is_mutable_whatever_the_guest_declared() {
+        let colour = plan(
+            texture(TextureKind::D2, TextureUsage::SHADER_READ),
+            COLOR,
+            optimal(),
+        )
+        .expect("plannable");
+        assert!(!colour.usage.contains(vk::ImageUsageFlags::STORAGE));
+        assert!(
+            colour.flags.contains(vk::ImageCreateFlags::MUTABLE_FORMAT),
+            "the sRGB view this rail samples through would be invalid usage"
+        );
+        // And the two spellings really are the pair the flag is for.
+        assert_eq!(crate::pixel::storage_format(COLOR), COLOR);
+        assert_eq!(
+            crate::pixel::texel_layout_of(COLOR).and_then(crate::pixel::srgb_texel_layout),
+            Some(vk::Format::R8G8B8A8_SRGB)
+        );
+
+        // A depth format has no second spelling, so nothing may reinterpret it
+        // and the flag stays off --- which is where the compression is kept.
+        let depth = TextureShape {
+            pixel_format: MTL_FORMAT_DEPTH32_FLOAT,
+            kind: TextureKind::D2.ordinal(),
+            width: 64,
+            height: 64,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            usage: TextureUsage::RENDER_TARGET,
+        }
+        .checked()
+        .expect("a depth target");
+        assert!(!plan(depth, DEPTH, optimal())
+            .expect("plannable")
+            .flags
+            .contains(vk::ImageCreateFlags::MUTABLE_FORMAT));
     }
 
     #[test]
@@ -578,25 +667,33 @@ mod tests {
 
     #[test]
     fn shader_writes_to_a_depth_format_refuse_rather_than_being_dropped() {
-        let depth = TextureShape {
-            pixel_format: MTL_FORMAT_DEPTH32_FLOAT,
-            kind: TextureKind::D2.ordinal(),
-            width: 64,
-            height: 64,
-            depth: 1,
-            mipmap_level_count: 1,
-            sample_count: 1,
-            array_length: 1,
-            usage: TextureUsage::SHADER_WRITE,
+        // Both spellings, because the usage below asks for one storage image
+        // for either bit --- an atomic is a store --- so a depth declaration
+        // carrying `SHADER_ATOMIC` is the same declaration, and answering it
+        // with a plan that has no storage image is the quiet drop this refusal
+        // was written against.
+        for usage in [TextureUsage::SHADER_WRITE, TextureUsage::SHADER_ATOMIC] {
+            let depth = TextureShape {
+                pixel_format: MTL_FORMAT_DEPTH32_FLOAT,
+                kind: TextureKind::D2.ordinal(),
+                width: 64,
+                height: 64,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                usage,
+            }
+            .checked()
+            .expect("a declaration");
+            assert_eq!(
+                plan(depth, DEPTH, optimal()),
+                Err(Refusal::DepthShaderWrite {
+                    format: MTL_FORMAT_DEPTH32_FLOAT
+                }),
+                "{usage:?}"
+            );
         }
-        .checked()
-        .expect("a declaration");
-        assert_eq!(
-            plan(depth, DEPTH, optimal()),
-            Err(Refusal::DepthShaderWrite {
-                format: MTL_FORMAT_DEPTH32_FLOAT
-            })
-        );
     }
 
     #[test]

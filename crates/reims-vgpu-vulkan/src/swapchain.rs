@@ -32,7 +32,7 @@
 //! the plan records that it was used; here there is no sibling that preserves
 //! the picture, so there is nothing to record and the answer is no.
 //!
-//! # One more image than the minimum, on purpose
+//! # One more image than the minimum, on purpose — and three under `MAILBOX`
 //!
 //! With exactly `minImageCount` images, `vkAcquireNextImageKHR` may have to
 //! wait for the presentation engine to release one — and waiting on a host
@@ -41,6 +41,18 @@
 //! holds the last. `maxImageCount` of zero means unbounded, which is a real
 //! answer and not a missing one, so the clamp only applies where the surface
 //! named a maximum.
+//!
+//! `MAILBOX` needs a third: one image queued for display, one being drawn, and
+//! one for the queued image to be *replaced* with. That replacement is the
+//! whole reason to be on the rung — with two images the mode still works and
+//! degrades to waiting for the queued frame, which is the behaviour `FIFO`
+//! already had. So [`MAILBOX_MIN_IMAGES`] is a floor on that arm only, and the
+//! surface's own maximum still wins over it: a surface that caps at two cannot
+//! be argued with.
+//!
+//! The floor is also the depth a presenter can usefully run at, which is why it
+//! is public. A presenter with more presents in flight than the swapchain has
+//! images has slots that can never be filled.
 //!
 //! The count requested is still only a request: `vkGetSwapchainImagesKHR`
 //! reports what the driver actually made, and that number is the one
@@ -78,6 +90,18 @@ use ash::vk;
 /// whole choice is testable against surfaces that do not exist.
 #[derive(Clone, Debug)]
 pub struct Surface<'a> {
+    /// `vkGetPhysicalDeviceSurfaceSupportKHR` for the queue family this rail
+    /// presents on.
+    ///
+    /// Separate from every other answer here because it is the only one that
+    /// is about the *pairing* rather than about the surface: the other three
+    /// describe what the surface offers, and this says whether this device's
+    /// present queue can address it at all. `VK_KHR_swapchain` being
+    /// enumerated does not imply it --- a host whose display is driven by a
+    /// different adapter enumerates the extension and supports no family for
+    /// the window's surface --- and it cannot be answered by
+    /// [`crate::census::Census`], which is taken before any surface exists.
+    pub supported_by_present_family: bool,
     pub capabilities: vk::SurfaceCapabilitiesKHR,
     pub formats: &'a [vk::SurfaceFormatKHR],
     pub present_modes: &'a [vk::PresentModeKHR],
@@ -172,6 +196,14 @@ pub enum Refusal {
     },
     /// The surface reported no formats at all.
     NoFormats,
+    /// No queue family this rail presents on supports this surface.
+    ///
+    /// `VkSwapchainCreateInfoKHR`'s surface must be one the device supports as
+    /// determined by `vkGetPhysicalDeviceSurfaceSupportKHR`
+    /// (VUID-VkSwapchainCreateInfoKHR-surface-01270). A refusal rather than
+    /// [`NotReady`]: nothing about this pairing changes when the window comes
+    /// back.
+    NotSupportedByPresentFamily,
 }
 
 impl Refusal {
@@ -183,6 +215,7 @@ impl Refusal {
             Self::NoTransferDestination { .. } => "vk_swapchain_no_transfer_destination",
             Self::NoOpaqueComposite { .. } => "vk_swapchain_no_opaque_composite",
             Self::NoFormats => "vk_swapchain_no_formats",
+            Self::NotSupportedByPresentFamily => "vk_swapchain_family_cannot_present",
         }
     }
 }
@@ -208,7 +241,7 @@ impl std::fmt::Display for Refusal {
             Self::NoOpaqueComposite { supported } => {
                 write!(f, "{} supported={supported:?}", self.slug())
             }
-            Self::NoFormats => f.write_str(self.slug()),
+            Self::NoFormats | Self::NotSupportedByPresentFamily => f.write_str(self.slug()),
         }
     }
 }
@@ -302,9 +335,13 @@ fn extent(capabilities: &vk::SurfaceCapabilitiesKHR, wanted: vk::Extent2D) -> (v
     )
 }
 
-/// One more than the minimum, bounded by a maximum where the surface named one.
-fn image_count(capabilities: &vk::SurfaceCapabilitiesKHR) -> u32 {
-    let wanted = capabilities.min_image_count.saturating_add(1);
+/// One more than the minimum — three under `MAILBOX` — bounded by a maximum
+/// where the surface named one. See the module doc for both floors.
+fn image_count(capabilities: &vk::SurfaceCapabilitiesKHR, mode: vk::PresentModeKHR) -> u32 {
+    let mut wanted = capabilities.min_image_count.saturating_add(1);
+    if mode == vk::PresentModeKHR::MAILBOX {
+        wanted = wanted.max(MAILBOX_MIN_IMAGES);
+    }
     // Zero means unbounded, which is an answer and not an absent one.
     if capabilities.max_image_count == 0 {
         wanted
@@ -312,6 +349,10 @@ fn image_count(capabilities: &vk::SurfaceCapabilitiesKHR) -> u32 {
         wanted.min(capabilities.max_image_count)
     }
 }
+
+/// The images `MAILBOX` needs to be `MAILBOX`: one queued, one being drawn, one
+/// to replace the queued one with. See the module doc.
+pub const MAILBOX_MIN_IMAGES: u32 = 3;
 
 /// The best present mode this surface offers, under `narrowing`.
 fn present_mode(offered: &[vk::PresentModeKHR], narrowing: Narrowing) -> vk::PresentModeKHR {
@@ -335,6 +376,14 @@ pub fn plan(
     wanted: Wanted,
     narrowing: Narrowing,
 ) -> Result<Outcome, Refusal> {
+    // Before anything the surface offers is read, because none of it is a
+    // property of a pairing this device cannot make: a surface the present
+    // family does not support may still answer formats and present modes, and
+    // choosing among them would be planning a swapchain that
+    // `vkCreateSwapchainKHR` is not permitted to build.
+    if !surface.supported_by_present_family {
+        return Err(Refusal::NotSupportedByPresentFamily);
+    }
     if surface.formats.is_empty() {
         return Err(Refusal::NoFormats);
     }
@@ -401,11 +450,18 @@ pub fn plan(
         }));
     }
 
+    // The mode is chosen before the count because the count depends on it, and
+    // the two used to be computed apart: the mode was picked, the count derived
+    // from it, and then a literal `FIFO` handed to the create info — so a log
+    // read `present_mode=mailbox` beside a swapchain that was not, and the
+    // change that introduced the choice measured no effect because it never
+    // reached the driver. One value, decided once, in one structure.
+    let present_mode = present_mode(surface.present_modes, narrowing);
     Ok(Outcome::Ready(Plan {
         format,
-        present_mode: present_mode(surface.present_modes, narrowing),
+        present_mode,
         extent,
-        requested_images: image_count(&surface.capabilities),
+        requested_images: image_count(&surface.capabilities, present_mode),
         usage,
         composite_alpha,
         // The surface's own transform, so the image is never rotated. Asking
@@ -475,6 +531,7 @@ mod tests {
         narrowing: Narrowing,
     ) -> Plan {
         let surface = Surface {
+            supported_by_present_family: true,
             capabilities,
             formats,
             present_modes: modes,
@@ -491,11 +548,60 @@ mod tests {
         wanted: Wanted,
     ) -> Refusal {
         let surface = Surface {
+            supported_by_present_family: true,
             capabilities,
             formats,
             present_modes: &[vk::PresentModeKHR::FIFO],
         };
         plan(&surface, wanted, Narrowing::default()).expect_err("refused")
+    }
+
+    /// A surface no present family supports is refused before anything it
+    /// offers is read.
+    ///
+    /// The regression: the pairing was never asked about. `VK_KHR_swapchain`
+    /// being enumerated says the entry points resolve, not that this device
+    /// can address this window --- on a host whose display is driven by a
+    /// different adapter it is enumerated and no family supports the surface
+    /// --- and the census cannot answer it, being taken before any surface
+    /// exists. So a perfectly ordinary-looking surface produced a plan and
+    /// `vkCreateSwapchainKHR` was handed a surface
+    /// VUID-VkSwapchainCreateInfoKHR-surface-01270 forbids.
+    #[test]
+    fn a_surface_the_present_family_cannot_address_is_refused_before_it_is_read() {
+        // Everything else about this surface is as ordinary as it gets: the
+        // format, the colour space and the composite alpha all match, so the
+        // only thing left to refuse on is the pairing.
+        let surface = Surface {
+            supported_by_present_family: false,
+            capabilities: capabilities(),
+            formats: &[vk::SurfaceFormatKHR {
+                format: BGRA,
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            }],
+            present_modes: &[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX],
+        };
+        let refused = plan(&surface, wanted(), Narrowing::default()).expect_err("refused");
+        assert_eq!(refused, Refusal::NotSupportedByPresentFamily);
+        assert_eq!(refused.slug(), "vk_swapchain_family_cannot_present");
+
+        // And it is not a not-ready: a minimized window comes back, an
+        // unsupported pairing does not. Checked with a zero extent, which is
+        // the one input that would otherwise produce `NotReady`.
+        let minimized = Surface {
+            capabilities: vk::SurfaceCapabilitiesKHR {
+                current_extent: vk::Extent2D {
+                    width: 0,
+                    height: 0,
+                },
+                ..capabilities()
+            },
+            ..surface
+        };
+        assert_eq!(
+            plan(&minimized, wanted(), Narrowing::default()).expect_err("refused"),
+            Refusal::NotSupportedByPresentFamily
+        );
     }
 
     #[test]
@@ -510,7 +616,10 @@ mod tests {
         assert_eq!(plan.format, srgb_space(BGRA));
         assert_eq!(plan.present_mode, vk::PresentModeKHR::MAILBOX);
         // One more than the minimum, so an acquire has somewhere to go while
-        // the presentation engine still holds the last image.
+        // the presentation engine still holds the last image. Also the
+        // `MAILBOX` floor, which this surface reaches without it — see
+        // `only_the_mailbox_rung_asks_for_a_third_image` for the case that
+        // separates them.
         assert_eq!(plan.requested_images, 3);
         assert_eq!(plan.extent, capabilities().current_extent);
         assert!(plan.extent_from_surface);
@@ -667,6 +776,7 @@ mod tests {
             ..capabilities()
         };
         let surface = Surface {
+            supported_by_present_family: true,
             capabilities,
             formats: &[srgb_space(BGRA)],
             present_modes: &[vk::PresentModeKHR::FIFO],
@@ -689,6 +799,7 @@ mod tests {
         assert!(matches!(
             plan(
                 &Surface {
+                    supported_by_present_family: true,
                     capabilities: one_zero,
                     ..surface.clone()
                 },
@@ -817,6 +928,60 @@ mod tests {
         assert_eq!(count(u32::MAX, 0), u32::MAX);
     }
 
+    /// `MAILBOX` asks for a third image, and only `MAILBOX` does.
+    ///
+    /// The mode's whole advantage is replacing the queued frame rather than
+    /// queueing behind it, and with two images there is nothing to replace it
+    /// with — the rung is taken and its behaviour is `FIFO`'s. So the floor is
+    /// on that arm alone, which is the half a single fixture cannot show: a
+    /// floor applied to both modes and a floor applied to neither both pass a
+    /// test that only ever asks one of them.
+    #[test]
+    fn only_the_mailbox_rung_asks_for_a_third_image() {
+        let count = |min, max, offered: &[vk::PresentModeKHR]| {
+            ready(
+                vk::SurfaceCapabilitiesKHR {
+                    min_image_count: min,
+                    max_image_count: max,
+                    ..capabilities()
+                },
+                &[srgb_space(BGRA)],
+                offered,
+                wanted(),
+                Narrowing::default(),
+            )
+            .requested_images
+        };
+        let fifo: &[vk::PresentModeKHR] = &[vk::PresentModeKHR::FIFO];
+        let mailbox: &[vk::PresentModeKHR] =
+            &[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX];
+
+        // One spare would be two; the rung asks for the third.
+        assert_eq!(count(1, 0, fifo), 2);
+        assert_eq!(count(1, 0, mailbox), MAILBOX_MIN_IMAGES);
+        // Above the floor the ordinary rule governs both.
+        assert_eq!(count(4, 0, fifo), 5);
+        assert_eq!(count(4, 0, mailbox), 5);
+        // A surface that caps at two cannot be argued with, on either rung.
+        assert_eq!(count(1, 2, mailbox), 2);
+        // And the switch down to FIFO takes the floor away with the rung.
+        assert_eq!(
+            ready(
+                vk::SurfaceCapabilitiesKHR {
+                    min_image_count: 1,
+                    max_image_count: 0,
+                    ..capabilities()
+                },
+                &[srgb_space(BGRA)],
+                mailbox,
+                wanted(),
+                Narrowing { fifo_only: true },
+            )
+            .requested_images,
+            2
+        );
+    }
+
     /// Transfer destination is asked for only when the composition copies, and
     /// refused rather than dropped when the surface will not allow it.
     #[test]
@@ -865,6 +1030,7 @@ mod tests {
         assert!(matches!(
             plan(
                 &Surface {
+                    supported_by_present_family: true,
                     capabilities: no_transfer,
                     formats: &[srgb_space(BGRA)],
                     present_modes: &[vk::PresentModeKHR::FIFO],
@@ -886,6 +1052,7 @@ mod tests {
                 ..capabilities()
             };
             let surface = Surface {
+                supported_by_present_family: true,
                 capabilities,
                 formats: &[srgb_space(BGRA)],
                 present_modes: &[vk::PresentModeKHR::FIFO],

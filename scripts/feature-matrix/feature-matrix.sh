@@ -12,8 +12,9 @@
 # arm but is cfg'd out still tests nothing, so the script also reports how many
 # tests each arm actually runs.
 #
-# It also gates formatting, which is arm-independent and which nothing else in
-# the toolchain can see — rustc and clippy are both silent on it.
+# It also gates formatting and rustdoc, both arm-independent and neither visible
+# to anything else in the toolchain — rustc and clippy are silent on formatting,
+# and rustdoc's broken-link lints are warnings that no ordinary build runs.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -202,6 +203,49 @@ fmt_cell() {
   rm -f "$log"
 }
 
+# Every crate whose rustdoc must resolve. The replacement crates plus the rail:
+# their documentation *is* where this project keeps its contracts, so a link
+# that names nothing is a contract term pointing at nothing. `reims-vgpu` is
+# deliberately absent — it carries the legacy device model and is not clean yet,
+# and a cell that listed it would be a cell nobody could keep green.
+DOC_CRATES=(
+  reims-vgpu-wire
+  reims-vgpu-protocol
+  reims-vgpu-paging
+  reims-vgpu-memory
+  reims-vgpu-config
+  reims-vgpu-observe
+  reims-vgpu-core
+  reims-vgpu-vulkan
+  reims-vgpu-testkit
+)
+
+# Documentation, one question for the whole set rather than one per arm — none
+# of these crates has a backend feature, so there is no arm for their docs to
+# differ on. `-D warnings` is what makes it a gate: rustdoc's broken-link and
+# private-link lints are warnings by default, so without it the check passes
+# while the links stay dead. Shaped after `fmt_cell` for its reason too — a
+# missing rustdoc is a FAIL, not a SKIP.
+doc_cell() {
+  local label="doc / replacement crates"
+  local log pkgs=()
+  local crate
+  for crate in "${DOC_CRATES[@]}"; do pkgs+=(-p "$crate"); done
+  log="$(mktemp)"
+  if (cd "$WORKSPACE_DIR" && RUSTDOCFLAGS="-D warnings" \
+    cargo doc --no-deps "${pkgs[@]}") >"$log" 2>&1; then
+    RESULTS+=("$(printf '%-4s %-46s %s' "PASS" "$label" \
+      "${#DOC_CRATES[@]} crates, links resolve")")
+  else
+    FAILED=1
+    RESULTS+=("$(printf '%-4s %-46s %s' "FAIL" "$label" \
+      "run: RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps")")
+    echo "--- $label ---" >&2
+    head -40 "$log" >&2
+  fi
+  rm -f "$log"
+}
+
 # Enumerate an arm's tests without running them. `--list` makes the libtest
 # harness print one `path::name: test` line per test and exit, so the count is
 # what that arm would actually execute — cfg'd-out tests are simply absent.
@@ -246,6 +290,10 @@ echo "[feature-matrix] host=$HOST_TRIPLE cross=$CROSS_TARGET cargo=$CARGO_CMD"
 # is the one failure a reviewer should never have to read a compile log to find.
 fmt_cell "rustfmt / workspace" "$WORKSPACE_DIR"
 fmt_cell "rustfmt / reims-vgpu-efi" "$REPO/crates/reims-vgpu-efi"
+
+# Cell 0c — rustdoc over the replacement crates. Also arm-independent, and also
+# a failure a reviewer should not have to read a compile log to find.
+doc_cell
 
 # Arm 1 — Metal. Native on Apple, cross-checked everywhere else: lib.rs gates
 # backend-metal on target_os, so an Apple *target* is all the arm needs. Only
@@ -399,7 +447,9 @@ if [ "${#COUNTS[@]}" -gt 0 ]; then
 fi
 
 if [ "$FAILED" -ne 0 ]; then
-  echo "[feature-matrix] FAILED: an arm does not compile, or the tree is unformatted" >&2
+  echo "[feature-matrix] FAILED: an arm does not compile, the tree is unformatted," >&2
+  echo "[feature-matrix] or a documentation link resolves to nothing" >&2
   exit 1
 fi
-echo "[feature-matrix] all supported arms compile; both workspaces are rustfmt-clean"
+echo "[feature-matrix] all supported arms compile; both workspaces are rustfmt-clean;"
+echo "[feature-matrix] the replacement crates' documentation links all resolve"

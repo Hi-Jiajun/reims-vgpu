@@ -116,7 +116,7 @@ fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
 /// too, so the assertion names the object id.
 #[test]
 fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
-    use crate::runtime::decode::fifo::{
+    use crate::protocol::fifo::{
         CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_TAIL, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
     };
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -790,6 +790,112 @@ fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws()
         log.contains("length=6"),
         "the line must carry the declared layer count: 2 layers and 6 are \
          different readings, and it is the whole of what this arm reports"
+    );
+}
+
+/// An attachment's store-action options asking for programmable sample
+/// positions refuse the stream's draws.
+///
+/// `MTLStoreActionOptions` declares exactly one flag,
+/// `CustomSamplePositions`, and it changes where the samples a resolve reads
+/// were taken. This device sets no programmable sample positions, so a resolve
+/// it produces reads the default ones — and that is byte-for-byte what a guest
+/// asking for the default also gets, which is why this used to be a count
+/// nothing downstream could act on.
+///
+/// `MTLStoreActionOptionNone` is honoured. It is the API default, it asks for
+/// nothing, and the resolve this device already performs is the one it names.
+///
+/// The three forms are driven separately because they do not share a record:
+/// the colour options are a `u64` followed by an index in a 20-byte record, and
+/// the depth and stencil forms are 16 bytes with no index at all. An arm
+/// reading the wrong one would take the index for the options.
+#[test]
+fn store_action_options_asking_for_custom_sample_positions_refuse_the_draws() {
+    use crate::protocol::endian::{st32, st64};
+
+    let record = |opcode: u32, options: u64| {
+        let total = if opcode == wire_render::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS {
+            wire_render::SET_COLOR_STORE_ACTION_OPTIONS_TOTAL_LEN
+        } else {
+            wire_render::SET_STORE_ACTION_OPTIONS_TOTAL_LEN
+        } as usize;
+        let mut cmd = vec![0u8; total];
+        st32(&mut cmd[0..], opcode);
+        st32(&mut cmd[4..], total as u32);
+        st64(&mut cmd[OP_HEADER_LEN..], options);
+        if opcode == wire_render::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS {
+            st32(&mut cmd[OP_HEADER_LEN + 8..], 3);
+        }
+        cmd
+    };
+    let run = |opcode: u32, options: u64| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            opcode,
+            &record(opcode, options),
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    for opcode in [
+        wire_render::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
+        wire_render::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
+        wire_render::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
+    ] {
+        assert!(
+            run(opcode, 0).bind_snapshot().is_ok(),
+            "op {opcode:#x}: the none option asks for nothing and is what this \
+             device already does; nothing is refused"
+        );
+        // Which attachment asked, and — for the colour form alone — which slot.
+        // Read off the refusal rather than off the shared fail log: three other
+        // arms report an `aspect` too, so a log line saying `aspect=stencil`
+        // does not say that *this* record named the stencil attachment.
+        let (expected_aspect, expected_slot) = match opcode {
+            wire_render::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS => ("depth", 0),
+            wire_render::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS => ("stencil", 0),
+            _ => ("color", 3),
+        };
+        // The declared flag, and three values the SDK does not declare — the
+        // ones the capture's own fixtures carry. A parse that masked to the low
+        // bit would read `0x1111` as the flag and `0x2222` as none, from two
+        // values that are equally undeclared.
+        for requested in [1u64, 0x1111, 0x2222, 0x3333] {
+            let Err(StreamRefusal::Pass(StreamDrawDrop::StoreActionOptionsUnsupported {
+                aspect,
+                slot,
+                options,
+            })) = run(opcode, requested).bind_snapshot()
+            else {
+                panic!(
+                    "op {opcode:#x} options={requested:#x}: a resolve taken at \
+                     the default sample positions is what a guest asking for \
+                     the default also gets, so this must refuse rather than \
+                     count"
+                );
+            };
+            assert_eq!(
+                (aspect, slot, options),
+                (expected_aspect, expected_slot, requested),
+                "op {opcode:#x}: the refusal named a different record than the \
+                 one that produced it"
+            );
+        }
+    }
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("stream_store_action_options_unsupported"),
+        "an attachment asking for programmable sample positions said nothing"
     );
 }
 
@@ -2281,6 +2387,7 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         front_facing: None,
         fill_mode: None,
         depth_clip_mode: None,
+        line_width: None,
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -2389,6 +2496,7 @@ fn nometal_draw_falls_back_to_backing_clear() {
         front_facing: None,
         fill_mode: None,
         depth_clip_mode: None,
+        line_width: None,
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -4293,14 +4401,12 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
     let float_non_default: Writer = |p| st32(p, 2.5f32.to_bits());
     let float_at_default: Writer = |p| st32(p, 1.0f32.to_bits());
 
+    // `OPCODE_SET_LINE_WIDTH` is no longer here: it shares the float record's
+    // decode arm with the tessellation scale below, but it is now latched into
+    // the stream's state and carried to the running rail, so it drops nothing
+    // and counts nothing. See
+    // `a_line_width_reaches_the_stream_state_and_a_draw`.
     let cases: &[(u32, usize, Writer, Option<Writer>, &str)] = &[
-        (
-            wire_render::OPCODE_SET_LINE_WIDTH,
-            12,
-            float_non_default,
-            Some(float_at_default),
-            "render_line_width_dropped",
-        ),
         (
             wire_render::OPCODE_SET_TESSELLATION_FACTOR_SCALE,
             12,
@@ -4454,7 +4560,9 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         ),
         // The store-action options. Their record is four bytes longer on
         // the colour form than on the other two, so a route reached from
-        // the wrong arm would have had to accept the wrong length first.
+        // the wrong arm would have had to accept the wrong length first. The
+        // default arm is `MTLStoreActionOptionNone`, which asks for nothing and
+        // must not count.
         (
             wire_render::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
             20,
@@ -4462,21 +4570,24 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
                 st64(p, 0x1111);
                 st32(&mut p[8..], 3);
             },
-            None,
+            Some(|p| {
+                st64(p, 0);
+                st32(&mut p[8..], 3);
+            }),
             "render_store_action_options_dropped",
         ),
         (
             wire_render::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
             16,
             |p| st64(p, 0x2222),
-            None,
+            Some(|p| st64(p, 0)),
             "render_store_action_options_dropped",
         ),
         (
             wire_render::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
             16,
             |p| st64(p, 0x3333),
-            None,
+            Some(|p| st64(p, 0)),
             "render_store_action_options_dropped",
         ),
         (
@@ -4633,6 +4744,62 @@ fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
     fill_draw_binds_from_pending(&mut req, &pd);
     assert_eq!(req.fill_mode, Some(1));
     assert_eq!(req.depth_clip_mode, Some(1));
+}
+
+/// `setLineWidth:` lands in the stream's state and travels to a draw, bit for
+/// bit.
+///
+/// The fifth encoder raster state, and it used to be dropped with a count
+/// whenever it was not 1.0. It shares its decode arm and its wire form with
+/// `setTessellationFactorScale:`, which still has no carrier — so the opcode
+/// is the only thing separating a state that is now honoured from one that is
+/// still lost, and an arm that latched the wrong one would compile and would
+/// widen every line by the tessellation scale.
+///
+/// The default is latched too, for the reason the fill mode's is: a stream
+/// that widens a line and then narrows it again is asking for the narrow one,
+/// and an arm that skipped 1.0 would leave the rest of the pass thick.
+#[test]
+fn a_line_width_reaches_the_stream_state_and_a_draw() {
+    let drive = |op: u32, width: f32| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let mut command = vec![0u8; 12];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], 12);
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN..],
+            width.to_bits(),
+        );
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        acc
+    };
+
+    for width in [1.0f32, 2.5, 0.5] {
+        let acc = drive(wire_render::OPCODE_SET_LINE_WIDTH, width);
+        assert_eq!(
+            acc.line_width.map(f32::to_bits),
+            Some(width.to_bits()),
+            "line width {width}"
+        );
+    }
+
+    // The sibling opcode must not reach the same slot. Both are one `f32` in
+    // one twelve-byte record; only the opcode tells them apart.
+    let acc = drive(wire_render::OPCODE_SET_TESSELLATION_FACTOR_SCALE, 2.5);
+    assert_eq!(acc.line_width, None);
+
+    // And a draw carries it — `bind_snapshot` builds with
+    // `..Default::default()`, so a field added to the accumulator and not to
+    // the snapshot reaches no draw at all.
+    let acc = drive(wire_render::OPCODE_SET_LINE_WIDTH, 2.5);
+    let pd = acc.bind_snapshot().expect("state is representable");
+    assert_eq!(pd.line_width, Some(2.5));
+    let mut req = crate::runtime::draw::DrawEncodeRequest::default();
+    fill_draw_binds_from_pending(&mut req, &pd);
+    assert_eq!(req.line_width, Some(2.5));
 }
 
 /// Every command buffer the submission declares is visited, however many
@@ -5569,6 +5736,191 @@ fn a_ledger_row_the_rail_cannot_honour_reports_the_disagreement() {
         "the line must carry what the ledger claimed, or the reader cannot tell \
          which of the two is wrong: {fields:?}"
     );
+}
+
+/// A vertex-amplification count of one whose view mapping is not the identity
+/// is a loss, and it is not the same loss as a count above one.
+///
+/// The mappings offset the viewport and render-target *array indices* the views
+/// rasterise into. A count of one with a zero mapping is the API default and
+/// asks for what this rail already does; a count of one with a non-zero offset
+/// asks for a draw aimed at a different array slice, and this rail aims it at
+/// slice zero. Until the mappings were lifted, `count > 1` reported those two
+/// as the same record and the second cost the guest a wrongly-targeted draw
+/// with nothing said.
+///
+/// The two routes are pinned apart because the losses are different: one
+/// renders one view where several were asked for, and the other renders the
+/// right number of views into the wrong slice.
+#[test]
+fn a_view_mapping_that_offsets_a_view_is_named_apart_from_a_count_above_one() {
+    use crate::runtime::decode::render;
+    use crate::runtime::drain::store_route_count;
+
+    let record = |count: u32, viewport: u32, render_target: u32| {
+        let total = reims_vgpu_wire::OP_HEADER_LEN + 4 + count as usize * 8;
+        let mut v = vec![0u8; total];
+        st32(
+            &mut v[0..],
+            wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
+        );
+        st32(&mut v[4..], total as u32);
+        st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], count);
+        for i in 0..count as usize {
+            let e = reims_vgpu_wire::OP_HEADER_LEN + 4 + i * 8;
+            st32(&mut v[e..], viewport);
+            st32(&mut v[e + 4..], render_target);
+        }
+        v
+    };
+
+    let run = |command: Vec<u8>| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        render::decode(&command).expect("a well-formed amplification count decodes");
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
+            &command,
+            &mut out,
+            &mut acc,
+        );
+    };
+
+    let dropped = "render_vertex_amplification_dropped";
+    let mapping = "render_vertex_amplification_view_mapping_dropped";
+
+    // One view, identity mapping: the API default, and neither route moves.
+    let (a, b) = (store_route_count(dropped), store_route_count(mapping));
+    run(record(1, 0, 0));
+    assert_eq!(store_route_count(dropped), a, "one view is not a loss");
+    assert_eq!(
+        store_route_count(mapping),
+        b,
+        "and the identity mapping asks for nothing"
+    );
+
+    // One view, offset mapping: the mapping route alone.
+    run(record(1, 2, 3));
+    assert_eq!(
+        store_route_count(dropped),
+        a,
+        "the count is still the default, so the count route must not move"
+    );
+    assert_eq!(
+        store_route_count(mapping) - b,
+        1,
+        "a draw aimed at a different array slice is a loss and must be named"
+    );
+
+    // Two views, identity mappings: the count route alone.
+    run(record(2, 0, 0));
+    assert_eq!(store_route_count(dropped) - a, 1);
+    assert_eq!(
+        store_route_count(mapping) - b,
+        1,
+        "an identity mapping is not a second loss"
+    );
+
+    // Two views, offset mappings: both.
+    run(record(2, 4, 5));
+    assert_eq!(store_route_count(dropped) - a, 2);
+    assert_eq!(store_route_count(mapping) - b, 2);
+}
+
+/// All four residency forms reach the residency routes, including the two the
+/// render encoder inherits rather than declares.
+///
+/// `useHeaps:count:` and `useResources:count:usage:` are declared on the shared
+/// encoder base class, so they are absent from the serializer manifest while
+/// being callable on a render encoder — the worked example the closure ledger's
+/// `OFF_MANIFEST` names. The render rail once knew only the two
+/// `stages:`-qualified overrides, and an unqualified record reached no arm and
+/// was reported as `accepted_without_executor`: a residency declaration whose
+/// class nothing classified, sitting in a counter that says only "some opcode".
+///
+/// The decoder's own tests pin that all four decode. This is the other half:
+/// that the executor routes all four by *class* rather than dropping half the
+/// family into the unimplemented counter. Driven per opcode, because that is the
+/// axis the regression ran along.
+#[test]
+fn every_residency_form_reaches_a_residency_route_and_not_the_unimplemented_one() {
+    use crate::runtime::decode::render;
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::residency::ResourceUsage;
+
+    // Each form's refs start at its own offset — the heads are three different
+    // sizes — so the record is built from the decoder's own constants rather
+    // than from one literal that would be wrong for three of the four.
+    let record = |op: u32, refs_at: usize| {
+        let total = reims_vgpu_wire::OP_HEADER_LEN + refs_at + 4;
+        let mut v = vec![0u8; total];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total as u32);
+        st32(
+            &mut v[reims_vgpu_wire::OP_HEADER_LEN + render::RESIDENCY_COUNT..],
+            1,
+        );
+        v
+    };
+
+    let forms = [
+        (
+            wire_render::OPCODE_USE_RESOURCE,
+            render::USE_RESOURCE_REFS,
+            "render_residency_empty",
+        ),
+        (
+            wire_render::OPCODE_USE_HEAP,
+            render::USE_HEAP_REFS,
+            "render_residency_heap",
+        ),
+        (
+            wire_render::OPCODE_USE_RESOURCES_NO_STAGES,
+            render::USE_RESOURCES_NO_STAGES_REFS,
+            "render_residency_empty",
+        ),
+        (
+            wire_render::OPCODE_USE_HEAPS_NO_STAGES,
+            render::USE_HEAPS_NO_STAGES_REFS,
+            "render_residency_heap",
+        ),
+    ];
+
+    for (op, refs_at, route) in forms {
+        let command = record(op, refs_at);
+        let decoded = render::decode(&command).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
+        assert_eq!(
+            decoded.residency_usage,
+            ResourceUsage(0),
+            "op {op:#x}: the fixture declares no usage"
+        );
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let before = store_route_count(route);
+        let cap = crate::observe::sink::FailCapture::start();
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            store_route_count(route) - before,
+            1,
+            "op {op:#x} did not reach {route}"
+        );
+        assert!(
+            !cap.lines()
+                .iter()
+                .any(|l| l.contains("accepted_without_executor")),
+            "op {op:#x} was reported as an opcode with no arm rather than as a \
+             residency declaration: {:?}",
+            cap.lines()
+        );
+    }
 }
 
 /// A residency declaration that names a GPU **write** is not the record the

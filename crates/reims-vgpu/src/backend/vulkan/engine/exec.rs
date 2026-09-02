@@ -670,7 +670,6 @@ fn used_binding_absent_from_layout(
 
 #[derive(Clone, Copy)]
 struct StageBufferUse {
-    usage: vk::BufferUsageFlags,
     snapshot_volatile: bool,
     gather_role: BufferGatherRole,
 }
@@ -684,7 +683,6 @@ unsafe fn stage_buffer_content(
     gathers: &mut Vec<PendingGuestGather>,
 ) -> Result<BoundBuffer, DrawError> {
     let StageBufferUse {
-        usage,
         snapshot_volatile,
         gather_role,
     } = use_;
@@ -712,7 +710,7 @@ unsafe fn stage_buffer_content(
         BufferContent::Bytes(b) => {
             let slot = {
                 let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                pools.acquire_staging(ctx, b.len() as u64, usage, counters)?
+                pools.acquire_staging(ctx, b.len() as u64, counters)?
             };
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, b.len() as u64);
             pools.write_staging(ctx, &slot, b)?;
@@ -734,7 +732,7 @@ unsafe fn stage_buffer_content(
                 counters.note_buffer_guest_import(src.total_len, gather_role);
                 bound
             } else if let Some((bound, pending)) =
-                unsafe { gather_guest_buffer_window(ctx, pools, counters, src, usage)? }
+                unsafe { gather_guest_buffer_window(ctx, pools, counters, src)? }
             {
                 // The copies read guest RAM when the CB executes, exactly as a
                 // direct bind does, so this owes the same quiesce.
@@ -763,7 +761,7 @@ unsafe fn stage_buffer_content(
                 // deferred-submit hot path, ~4.8 binds/draw under compositing).
                 let slot = {
                     let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                    pools.acquire_staging(ctx, src.total_len, usage, counters)?
+                    pools.acquire_staging(ctx, src.total_len, counters)?
                 };
                 let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
                 pools.write_staging_from_runs(
@@ -901,7 +899,6 @@ unsafe fn gather_guest_buffer_window(
     pools: &mut ResourcePools,
     counters: &EngineCounters,
     src: &super::types::GuestRunSource,
-    usage: vk::BufferUsageFlags,
 ) -> Result<Option<(BoundBuffer, PendingGuestGather)>, DrawError> {
     if !ctx.caps.host_pointer.is_available() {
         return Ok(None);
@@ -948,7 +945,7 @@ unsafe fn gather_guest_buffer_window(
         .fail_once(src.total_len);
         return Ok(None);
     }
-    let slot = pools.acquire_guest_gather(ctx, src.total_len, usage, counters)?;
+    let slot = pools.acquire_guest_gather(ctx, src.total_len, counters)?;
     Ok(Some((
         BoundBuffer::from(slot),
         PendingGuestGather {
@@ -1345,14 +1342,7 @@ unsafe fn import_sampled_guest_window(
         .fail_once(src.total_len);
         return Ok(None);
     }
-    let slot = unsafe {
-        pools.acquire_guest_gather(
-            ctx,
-            src.total_len,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            counters,
-        )?
-    };
+    let slot = unsafe { pools.acquire_guest_gather(ctx, src.total_len, counters)? };
     gathers.push(PendingGuestGather {
         dst: slot.buffer,
         sources,
@@ -1500,12 +1490,10 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
     }
-    if let Some(blend) = req.blend {
-        if blend.constants.iter().any(|c| !c.is_finite()) {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::NonFiniteBlendConstants,
-            ));
-        }
+    if req.blend_color.iter().any(|c| !c.is_finite()) {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::NonFiniteBlendConstants,
+        ));
     }
     if let Some(target) = &req.target_rgba8 {
         // The seed is one tightly-packed RGBA8 slice of the target, and the
@@ -1701,7 +1689,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // Asking `rate == 0` alone declined that guest's draw outright, for a
         // field nothing downstream reads. `protocol::vertex_step` owns the pair.
         if !crate::protocol::vertex_step::step_rate_in_contract(
-            attribute.step_function.mtl_ordinal(),
+            attribute.step_function.ordinal(),
             attribute.step_rate,
         ) {
             return Err(DrawError::DrawValidation(
@@ -1710,7 +1698,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        let format_size = attribute.format.byte_size();
+        let format_size = attribute.format.bytes();
         if attribute.stride < format_size {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::VertexStrideTooSmall {
@@ -1762,6 +1750,13 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                         })
                     })? as usize
                 }
+                // A tessellation step function fetches from a patch this rail
+                // never assembles, so there is no last element for it and no
+                // byte range to bound. The pipeline that would have bound it
+                // is refused before a draw reaches here; treating it as one
+                // record keeps the bound below the tightest one that is
+                // definitely safe rather than inventing a wider span.
+                VertexStepFunction::PerPatch | VertexStepFunction::PerPatchControlPoint => 0,
             }
         };
         let required = (attribute.stride as usize)
@@ -2616,6 +2611,49 @@ fn guest_store_footprint_to_record(
     (requested && guest_backed).then_some(footprint).flatten()
 }
 
+/// A draw's depth and stencil state, in the vocabulary of the layer that owns
+/// what it means.
+///
+/// The request's `test_enable` flag has no counterpart here and needs none.
+/// Metal has no depth-test enable — depth is always tested and "off" is
+/// `Always` with writes clear — so a draw that reaches this with `test_enable`
+/// false is exactly `compare = Always, write = false`, which tests nothing and
+/// writes nothing under either spelling. See
+/// [`reims_vgpu_vulkan::depth_stencil`] for why the rail then sets
+/// `depthTestEnable` unconditionally rather than carrying the flag.
+///
+/// A draw with no depth state at all projects to the inert declaration, which
+/// is what a pass with no depth attachment would ignore anyway.
+fn depth_stencil_state(
+    depth: Option<&super::types::DepthState>,
+) -> reims_vgpu_core::depth_stencil::DepthStencilState {
+    let face =
+        |ops: super::types::StencilFaceOps| reims_vgpu_core::depth_stencil::StencilFaceShape {
+            compare_function: ops.compare.mtl_ordinal(),
+            stencil_failure_operation: ops.fail_op.mtl_ordinal(),
+            depth_failure_operation: ops.depth_fail_op.mtl_ordinal(),
+            depth_stencil_pass_operation: ops.pass_op.mtl_ordinal(),
+            read_mask: ops.read_mask,
+            write_mask: ops.write_mask,
+        };
+    let stencil = depth.and_then(|d| d.stencil);
+    reims_vgpu_core::depth_stencil::DepthStencilShape {
+        depth_compare_function: depth
+            .map_or(super::types::SamplerCompareFunction::Always, |d| d.compare)
+            .mtl_ordinal(),
+        depth_write_enabled: depth.is_some_and(|d| d.write_enable),
+        // A draw carries both faces or neither: the decode layer already
+        // substituted a pass-through for a face the guest left disabled, so
+        // there is no third state for this to lose.
+        front_stencil_enabled: stencil.is_some(),
+        back_stencil_enabled: stencil.is_some(),
+        front: stencil.map_or_else(Default::default, |s| face(s.front)),
+        back: stencil.map_or_else(Default::default, |s| face(s.back)),
+    }
+    .checked()
+    .expect("every ordinal in a draw request was parsed from an enum on the way in")
+}
+
 pub(crate) unsafe fn execute_draw_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
@@ -3177,62 +3215,142 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(mode)),
     };
-    let pipeline_key =
-        PipelineKey {
-            vert: vert_digest,
-            frag: frag_digest,
-            attrs: attr_keys,
-            topology: req.primitive_topology,
-            blend: req.blend.map(|b| b.key()),
-            secondary_blend: {
-                let mut per_slot = [None; MAX_SECONDARY_ATTACH];
-                for (slot, target) in req
-                    .secondary_targets
-                    .iter()
-                    .take(MAX_SECONDARY_ATTACH)
-                    .enumerate()
-                {
-                    per_slot[slot] = target.blend.map(|b| b.key());
-                }
-                per_slot
-            },
-            color_write_mask: {
-                let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
-                per_slot[0] = req.color_write_mask;
-                for (slot, target) in req
-                    .secondary_targets
-                    .iter()
-                    .take(MAX_SECONDARY_ATTACH)
-                    .enumerate()
-                {
-                    per_slot[slot + 1] = target.color_write_mask;
-                }
-                per_slot
-            },
-            pass: pass_key.compatibility(),
-            // Taken from the pass key this draw built, not from `pass`, which
-            // erases it once feedback stops changing the render pass.
-            feedback_colors: pass_key.feedback_colors,
-            cull_mode: req.cull_mode,
-            front_face_ccw: req.front_face_ccw,
-            fill_mode: req.fill_mode,
-            depth_clip: req.depth_clip,
-            depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
-            depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
-            depth_compare: req
-                .depth
-                .as_ref()
-                .map(|d| d.compare)
-                .unwrap_or(super::types::SamplerCompareFunction::Always),
-            stencil: req.depth.as_ref().and_then(|d| d.stencil).map(|s| {
-                super::caches::StencilKey {
-                    front: s.front,
-                    back: s.back,
-                }
-            }),
-            viewport_slots: slot_count_u32,
-            layout: layout_key.clone(),
-        };
+    // The four fixed-function encoder states, parsed and placed in one call
+    // before anything is recorded, for the reason the occlusion query above is:
+    // an ordinal this device cannot serve refuses the draw rather than being
+    // folded onto a neighbour.
+    //
+    // One call, two halves. Whichever members this host supplies per draw carry
+    // their baked default in `state` — which is the pipeline key below — and the
+    // guest's own values in `dynamic`, which the encoder records further down.
+    // A member is in exactly one half, so a guest that toggles culling around a
+    // draw stops compiling a second pipeline for it wherever the host offers
+    // `VK_EXT_extended_dynamic_state`.
+    //
+    // Making a state dynamic does not make its capability free: `plan` still
+    // refuses `MTLDepthClipModeClamp` without `depthClamp` and
+    // `MTLTriangleFillModeLines` without `fillModeNonSolid`, on both paths.
+    let raster_cell = reims_vgpu_vulkan::raster::RasterCell {
+        depth_clamp: ctx.features.depth_clamp,
+        fill_mode_non_solid: ctx.features.fill_mode_non_solid,
+        dynamic_cull_and_winding: ctx.features.extended_dynamic_state,
+        dynamic_polygon_mode: ctx.features.dynamic_polygon_mode,
+        dynamic_depth_clamp: ctx.features.dynamic_depth_clamp,
+    };
+    let raster_plan = match reims_vgpu_vulkan::raster::plan(req.raster, raster_cell) {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            let reason = super::reason::DrawReason::Raster(refusal);
+            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            return Err(DrawError::Unsupported(reason));
+        }
+    };
+    // The primitive type, under the same split. `extendedDynamicState` is the
+    // same feature bit the cull mode and winding above ride on — it reaches
+    // `vkCmdSetPrimitiveTopology` too — and the unrestricted property says
+    // whether a draw may then move across topology classes rather than only
+    // between a list and its strip.
+    let topology_cell = reims_vgpu_vulkan::topology::TopologyCell {
+        dynamic: ctx.features.extended_dynamic_state,
+        unrestricted: ctx.features.dynamic_primitive_topology_unrestricted,
+    };
+    // Computed once and used twice — as the pipeline key's pass term below and
+    // as the question the depth-stencil plan is asked. Two calls would be two
+    // copies of one value, and the second could drift from the first.
+    let pass_compatibility = pass_key.compatibility();
+    let topology_key = reims_vgpu_vulkan::topology::key(req.primitive_topology.0, topology_cell);
+    // The guest's whole `MTLDepthStencilState`, under the same split. It is
+    // encoder state on Metal — `setDepthStencilState:` binds it between draws
+    // of one pipeline — and `extendedDynamicState` is what lets it stay that
+    // way here, so on a capable host every state the guest can bind is one
+    // pipeline instead of one each.
+    //
+    // The pass is asked as well as the host: Vulkan attaches no depth-stencil
+    // state to a pipeline whose subpass has no depth attachment, and a dynamic
+    // state declared for a structure nothing reads is one nothing would set.
+    let depth_stencil_plan = reims_vgpu_vulkan::depth_stencil::plan(
+        &depth_stencil_state(req.depth.as_ref()),
+        reims_vgpu_vulkan::depth_stencil::DepthStencilCell {
+            extended_dynamic_state: ctx.features.extended_dynamic_state,
+        },
+        pass_compatibility.has_depth(),
+    );
+    let topology_dynamic =
+        reims_vgpu_vulkan::topology::dynamic(req.primitive_topology.0, topology_cell);
+    // The line width: the one rasterization state neither the raster plan nor
+    // the topology can decide alone. Vulkan applies it to line primitives and
+    // to `POLYGON_MODE_LINE` and to nothing else, so a guest that sets a width
+    // and then draws filled triangles has asked this device for nothing — and
+    // refusing that draw would be refusing it for a state it never uses. Both
+    // halves meet here and nowhere else, which is why the joint question is
+    // asked at the draw seam rather than inside either plan.
+    //
+    // The effective polygon mode is read off the plan rather than off
+    // `req.raster.fill_mode`: on a host with `vkCmdSetPolygonModeEXT` the
+    // pipeline's member is a placeholder, and a second reading of the guest's
+    // ordinal here could disagree with the one the plan made.
+    //
+    // Decided before anything is recorded, like the occlusion query and the
+    // four ordinals above: a width this host cannot serve refuses the draw
+    // rather than reaching `vkCmdSetLineWidth` as invalid use.
+    let line_width = match reims_vgpu_vulkan::raster::line_width(
+        req.line_width,
+        reims_vgpu_vulkan::raster::rasterizes_lines(
+            raster_plan.polygon_mode(),
+            req.primitive_topology.0.class(),
+        ),
+        reims_vgpu_vulkan::raster::LineWidthCell {
+            wide_lines: ctx.features.wide_lines,
+            range: ctx.features.line_width_range,
+        },
+    ) {
+        Ok(width) => width,
+        Err(refusal) => {
+            let reason = super::reason::DrawReason::Raster(refusal);
+            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            return Err(DrawError::Unsupported(reason));
+        }
+    };
+    let pipeline_key = PipelineKey {
+        vert: vert_digest,
+        frag: frag_digest,
+        attrs: attr_keys,
+        topology: topology_key,
+        blend: req.blend.map(|b| b.key()),
+        secondary_blend: {
+            let mut per_slot = [None; MAX_SECONDARY_ATTACH];
+            for (slot, target) in req
+                .secondary_targets
+                .iter()
+                .take(MAX_SECONDARY_ATTACH)
+                .enumerate()
+            {
+                per_slot[slot] = target.blend.map(|b| b.key());
+            }
+            per_slot
+        },
+        color_write_mask: {
+            let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
+            per_slot[0] = req.color_write_mask;
+            for (slot, target) in req
+                .secondary_targets
+                .iter()
+                .take(MAX_SECONDARY_ATTACH)
+                .enumerate()
+            {
+                per_slot[slot + 1] = target.color_write_mask;
+            }
+            per_slot
+        },
+        pass: pass_compatibility,
+        // Taken from the pass key this draw built, not from `pass`, which
+        // erases it once feedback stops changing the render pass.
+        feedback_colors: pass_key.feedback_colors,
+        raster: raster_plan.state,
+        depth_stencil: depth_stencil_plan.state,
+        viewport_slots: slot_count_u32,
+        layout: layout_key.clone(),
+    };
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
     // and already checks the negative entry for a key that failed to compile.
     phase.enter(super::draw_phase::Phase::PipelineCompile);
@@ -3310,12 +3428,7 @@ pub(crate) unsafe fn execute_draw_inner(
             };
             let slot = {
                 let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                pools.acquire_staging(
-                    ctx,
-                    shifted.len() as u64,
-                    vk::BufferUsageFlags::VERTEX_BUFFER,
-                    counters,
-                )?
+                pools.acquire_staging(ctx, shifted.len() as u64, counters)?
             };
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, shifted.len() as u64);
             pools.write_staging(ctx, &slot, &shifted)?;
@@ -3328,7 +3441,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 counters,
                 &resource.content,
                 StageBufferUse {
-                    usage: vk::BufferUsageFlags::VERTEX_BUFFER,
                     snapshot_volatile: batch_eligible,
                     gather_role: gather_roles
                         .role(CbBind::key_of(&resource.content))
@@ -3351,7 +3463,6 @@ pub(crate) unsafe fn execute_draw_inner(
             counters,
             &indexed.content,
             StageBufferUse {
-                usage: vk::BufferUsageFlags::INDEX_BUFFER,
                 snapshot_volatile: batch_eligible,
                 gather_role: gather_roles
                     .role(CbBind::key_of(&indexed.content))
@@ -3363,8 +3474,9 @@ pub(crate) unsafe fn execute_draw_inner(
     };
 
     // Storage buffers (deduplicated by content with the vertex streams: a
-    // stage-in buffer doubling as a storage bind reuses the same slot —
-    // staging slots always carry the full usage superset).
+    // stage-in buffer doubling as a storage bind reuses the same slot — every
+    // pooled slot carries `POOL_SLOT_USAGE`, so there is no usage for that
+    // reuse to be wrong about).
     phase.enter(super::draw_phase::Phase::StageStorage);
     let mut storage_slots = Vec::new();
     for resource in &req.storage_buffers {
@@ -3374,7 +3486,6 @@ pub(crate) unsafe fn execute_draw_inner(
             counters,
             &resource.content,
             StageBufferUse {
-                usage: vk::BufferUsageFlags::STORAGE_BUFFER,
                 snapshot_volatile: batch_eligible,
                 gather_role: gather_roles
                     .role(CbBind::key_of(&resource.content))
@@ -3434,12 +3545,7 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         let slot = {
             let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-            pools.acquire_staging(
-                ctx,
-                wide.len() as u64,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                counters,
-            )?
+            pools.acquire_staging(ctx, wide.len() as u64, counters)?
         };
         {
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, wide.len() as u64);
@@ -3450,12 +3556,7 @@ pub(crate) unsafe fn execute_draw_inner(
     } else if let Some(rgba8) = seed_bytes {
         let slot = {
             let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-            pools.acquire_staging(
-                ctx,
-                rgba8.len() as u64,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                counters,
-            )?
+            pools.acquire_staging(ctx, rgba8.len() as u64, counters)?
         };
         // Vulkan buffer→image copies do not perform format conversion, so the
         // staged bytes must already be in the attachment's physical order —
@@ -3710,12 +3811,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 None => {
                     let slot = {
                         let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                        pools.acquire_staging(
-                            ctx,
-                            seed.source.total_len,
-                            vk::BufferUsageFlags::TRANSFER_SRC,
-                            counters,
-                        )?
+                        pools.acquire_staging(ctx, seed.source.total_len, counters)?
                     };
                     {
                         let _s = stage_phase::Span::moving(
@@ -3812,12 +3908,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     continue;
                 }
                 let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
-                let st = pools.acquire_staging(
-                    ctx,
-                    bytes.len() as u64,
-                    vk::BufferUsageFlags::TRANSFER_SRC,
-                    counters,
-                )?;
+                let st = pools.acquire_staging(ctx, bytes.len() as u64, counters)?;
                 pools.write_staging(ctx, &st, bytes)?;
                 counters.note_sampled_reupload(bytes.len() as u64, resource.byte_origin);
                 sampled.push(PreparedSampled::Upload {
@@ -4085,12 +4176,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         imported
                     }
                     None => {
-                        let scratch = pools.acquire_staging(
-                            ctx,
-                            src.total_len,
-                            vk::BufferUsageFlags::TRANSFER_SRC,
-                            counters,
-                        )?;
+                        let scratch = pools.acquire_staging(ctx, src.total_len, counters)?;
                         pools.write_staging_from_runs(
                             ctx,
                             &scratch,
@@ -4129,9 +4215,24 @@ pub(crate) unsafe fn execute_draw_inner(
     // over a four-byte slot is a device-side write past the slot, not a short
     // read. The seed path above answers the same question on the way in, and
     // states the same reason.
-    let rb_texel = u64::from(super::readback_bytes_per_texel(color0_format));
-    let rb_size = (req.width as u64) * (req.height as u64) * rb_texel;
     let do_readback = !req.skip_readback;
+    let rb_size = match super::readback_slot_bytes(req.width, req.height, color0_format) {
+        Some(bytes) => bytes,
+        // A draw that reads nothing back allocates no slot, so a geometry
+        // whose length cannot be represented is only this draw's problem when
+        // this draw would have taken one.
+        None if !do_readback => 0,
+        None => {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::UnrepresentableImageBytes {
+                    width: req.width,
+                    height: req.height,
+                    layers: 1,
+                    bytes_per_texel: super::readback_bytes_per_texel(color0_format),
+                },
+            ))
+        }
+    };
     phase.note_target(req.width, req.height, if do_readback { rb_size } else { 0 });
     let readback = if do_readback {
         Some(pools.acquire_readback(ctx, rb_size, counters)?)
@@ -5187,20 +5288,54 @@ pub(crate) unsafe fn execute_draw_inner(
         }
     }));
     unsafe { pools.set_dynamic_viewport_scissor(&ctx.device, cb, counters) };
+    // Dynamic blend colour (Metal `setBlendColorRed:green:blue:alpha:`) — one
+    // encoder value, so one call per draw whatever the attachments declare,
+    // held against the last one recorded.
+    unsafe { pools.set_dynamic_blend_constants(&ctx.device, cb, counters, req.blend_color) };
+    // Every pipeline enables depth biasing and declares the state dynamic, so
+    // every draw must have been given values — see `set_dynamic_depth_bias`
+    // for why they are zero.
+    unsafe { pools.set_dynamic_depth_bias(&ctx.device, cb, counters) };
+    // The line width, on every pipeline for the same reason: `LINE_WIDTH` is
+    // 1.0 core dynamic state, so every pipeline this rail builds declares it.
+    // `line_width` above already answered "does this draw rasterize lines" and
+    // "can this host serve that width", so what arrives here is a width the
+    // device will take.
+    unsafe { pools.set_dynamic_line_width(&ctx.device, cb, counters, line_width) };
+    // The rasterization members this host supplies per draw, `Some` exactly
+    // where the pipeline above baked a placeholder. A pipeline that declares a
+    // state dynamic and never receives it draws undefined, so the same `Plan`
+    // that decided which members are dynamic is the one that supplies them.
+    unsafe { pools.set_dynamic_raster(ctx, cb, counters, raster_plan.dynamic) };
+    // The primitive type, `Some` exactly where the pipeline above declared a
+    // stand-in for its class. The pipeline that will be bound declares
+    // `PRIMITIVE_TOPOLOGY` dynamic under the same condition, so this is asked
+    // whenever that is true and never otherwise.
+    unsafe { pools.set_dynamic_topology(ctx, cb, counters, topology_dynamic) };
+    // The guest's depth-stencil state, on a host that supplies it per draw.
+    // `None` is a pipeline that baked it, and then this records nothing.
+    unsafe { pools.set_dynamic_depth_stencil(ctx, cb, counters, depth_stencil_plan.dynamic) };
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
-    // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
-    // dynamic state; front/back set together because Metal's split refs are one
-    // guest state and a cache that held half of it would be two.
-    if let Some(s) = req.depth.as_ref().and_then(|d| d.stencil) {
-        unsafe {
-            pools.set_dynamic_stencil_reference(
-                &ctx.device,
-                cb,
-                counters,
-                s.reference_front,
-                s.reference_back,
-            )
-        };
+    // — front/back set together because Metal's split refs are one guest state
+    // and a cache that held half of it would be two.
+    //
+    // Asked exactly where the pipeline declared `STENCIL_REFERENCE`, read off
+    // the same state the pipeline was keyed on rather than from the request:
+    // on the dynamic rung the stencil *test enable* is itself supplied per
+    // draw, so the reference is declared whatever this draw's state says and
+    // must be supplied whatever it says. A draw with no stencil state supplies
+    // zero, which is the reference Metal starts an encoder with.
+    if depth_stencil_plan
+        .state
+        .states()
+        .contains(&vk::DynamicState::STENCIL_REFERENCE)
+    {
+        let (front, back) = req
+            .depth
+            .as_ref()
+            .and_then(|d| d.stencil)
+            .map_or((0, 0), |s| (s.reference_front, s.reference_back));
+        unsafe { pools.set_dynamic_stencil_reference(&ctx.device, cb, counters, front, back) };
     }
 
     if push_descriptors {
@@ -7990,5 +8125,89 @@ mod depth_load_tests {
             content_ready: false,
         };
         assert!(!transient.honours_load(true));
+    }
+
+    /// Every state a draw request can hold is one the owning layer admits.
+    ///
+    /// [`depth_stencil_state`] ends in an `expect`, and this is the claim that
+    /// makes it a fact rather than a hope: a request carries decoded enums, so
+    /// its ordinals are exactly the declared ones and the parse on the other
+    /// side cannot refuse any of them. A sweep rather than a case, because the
+    /// way this breaks is a *new* variant added to one of the two enums
+    /// without a counterpart on the other side, which no single fixture would
+    /// notice.
+    ///
+    /// It reaches this projection from two call sites — the pipeline key and
+    /// the encoder half of the same plan — which is why the totality is proved
+    /// rather than an `unreachable!` claimed about one of them.
+    #[test]
+    fn every_state_a_draw_request_can_hold_is_one_the_owning_layer_admits() {
+        use super::super::types::{
+            DepthState, SamplerCompareFunction as C, StencilFaceOps, StencilOp as O, StencilState,
+        };
+        const COMPARES: [C; 8] = [
+            C::Never,
+            C::Less,
+            C::Equal,
+            C::LessEqual,
+            C::Greater,
+            C::NotEqual,
+            C::GreaterEqual,
+            C::Always,
+        ];
+        const OPS: [O; 8] = [
+            O::Keep,
+            O::Zero,
+            O::Replace,
+            O::IncrementClamp,
+            O::DecrementClamp,
+            O::Invert,
+            O::IncrementWrap,
+            O::DecrementWrap,
+        ];
+        // A draw with no depth state at all is admissible too, and is the one
+        // input that reaches none of the enums below.
+        assert!(!depth_stencil_state(None).stencil_engaged());
+
+        let mut checked = 0usize;
+        for compare in COMPARES {
+            for op in OPS {
+                let face = StencilFaceOps {
+                    compare,
+                    fail_op: op,
+                    depth_fail_op: op,
+                    pass_op: op,
+                    read_mask: 0xff,
+                    write_mask: 0xff,
+                };
+                for stencil in [
+                    None,
+                    Some(StencilState {
+                        front: face,
+                        back: face,
+                        reference_front: 0,
+                        reference_back: 0,
+                        clear_value: 0,
+                    }),
+                ] {
+                    let depth = DepthState {
+                        identity: None,
+                        test_enable: true,
+                        write_enable: false,
+                        compare,
+                        clear_value: 1.0,
+                        load: false,
+                        stencil,
+                    };
+                    // Would panic inside the projection if any ordinal were
+                    // outside the enum the owning layer parses.
+                    let state = depth_stencil_state(Some(&depth));
+                    assert_eq!(state.stencil_engaged(), stencil.is_some());
+                    assert_eq!(state.depth_compare().ordinal(), compare.mtl_ordinal());
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, COMPARES.len() * OPS.len() * 2);
     }
 }

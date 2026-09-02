@@ -545,6 +545,19 @@ pub(crate) struct DeviceContext {
     /// `VK_KHR_push_descriptor` entry points, present only when the extension
     /// was advertised, queried, and enabled for this device.
     pub push_descriptor: Option<ash::khr::push_descriptor::Device>,
+    /// `VK_EXT_extended_dynamic_state` entry points — `vkCmdSetCullModeEXT`
+    /// and `vkCmdSetFrontFaceEXT` — present only where
+    /// [`crate::backend::vulkan::caps::DeviceFeatures::extended_dynamic_state`]
+    /// admitted them and the extension was therefore enabled.
+    ///
+    /// `None` is not a degraded rung: the pipeline bakes those two members
+    /// instead, which is what every host below this extension has always done.
+    pub extended_dynamic_state: Option<ash::ext::extended_dynamic_state::Device>,
+    /// `VK_EXT_extended_dynamic_state3` entry points. `Some` when *either*
+    /// polygon mode or depth-clamp enable was admitted, because one extension
+    /// string carries both; which of the two may actually be recorded is the
+    /// feature flag, not this option.
+    pub extended_dynamic_state3: Option<ash::ext::extended_dynamic_state3::Device>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -720,6 +733,20 @@ mod storage_buffer_alignment_tests {
 unsafe impl Send for DeviceContext {}
 
 impl DeviceContext {
+    /// What this device offers for the parts of a sampler that are not
+    /// mappings, as the rail that plans one asks for them.
+    ///
+    /// Projected rather than stored: the three facts already live on this
+    /// context because device creation read them there, and a second copy is
+    /// a second thing that can be stale by the time a sampler is planned.
+    pub(crate) fn sampler_cell(&self) -> reims_vgpu_vulkan::sampler::SamplerCell {
+        reims_vgpu_vulkan::sampler::SamplerCell {
+            mirror_clamp_to_edge: self.features.mirror_clamp_to_edge.is_available(),
+            anisotropy: self.sampler_anisotropy,
+            max_anisotropy: self.max_sampler_anisotropy,
+        }
+    }
+
     pub(crate) unsafe fn create() -> Result<Self, DrawError> {
         let entry = ash::Entry::load().map_err(|e| {
             DrawError::Init(InitDecline::LoadVulkanLoader {
@@ -1022,8 +1049,7 @@ impl DeviceContext {
             zero_divisor: divisor_features.vertex_attribute_instance_rate_zero_divisor == vk::TRUE,
             max_divisor: divisor_properties.max_vertex_attrib_divisor,
         };
-        let vertex_formats =
-            crate::backend::vulkan::translate::VertexFormatSupport::probe(&instance, pd);
+        let vertex_formats = crate::backend::vulkan::translate::support::probe(&instance, pd);
         let mut enabled_device_extensions = Vec::new();
         if portability_subset {
             enabled_device_extensions.push(vk::KHR_PORTABILITY_SUBSET_NAME.as_ptr());
@@ -1063,6 +1089,8 @@ impl DeviceContext {
         // asking for a feature a device declined fails `vkCreateDevice`.
         let mut en_image_robustness = features.enabled_image_robustness();
         let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
+        let mut en_extended_dynamic_state = features.enabled_extended_dynamic_state();
+        let mut en_extended_dynamic_state3 = features.enabled_extended_dynamic_state3();
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -1079,6 +1107,12 @@ impl DeviceContext {
         }
         if features.attachment_feedback_loop_layout {
             dci = dci.push_next(&mut en_attachment_feedback);
+        }
+        if features.extended_dynamic_state {
+            dci = dci.push_next(&mut en_extended_dynamic_state);
+        }
+        if features.wants_extended_dynamic_state3() {
+            dci = dci.push_next(&mut en_extended_dynamic_state3);
         }
         let device = instance
             .create_device(pd, &dci, None)
@@ -1182,6 +1216,12 @@ impl DeviceContext {
             .push_descriptor
             .is_available()
             .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+        let extended_dynamic_state = features
+            .extended_dynamic_state
+            .then(|| ash::ext::extended_dynamic_state::Device::new(&instance, &device));
+        let extended_dynamic_state3 = features
+            .wants_extended_dynamic_state3()
+            .then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device));
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
@@ -1284,6 +1324,8 @@ impl DeviceContext {
             memory_properties,
             external_memory_host,
             push_descriptor,
+            extended_dynamic_state,
+            extended_dynamic_state3,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,

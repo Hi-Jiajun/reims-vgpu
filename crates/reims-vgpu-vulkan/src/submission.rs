@@ -172,7 +172,19 @@ pub struct Census {
 /// can be wrong, and they are testable without a queue. The caller holds the
 /// `VkQueue` — through a [`crate::queues::QueueOwner`], which is what makes the
 /// submission order singular — and the semaphore.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **Not `Clone`.** [`crate::queues::QueueOwner`] is not `Clone` so that a
+/// `VkQueue` cannot have two submission orders; a ledger that recorded that
+/// order and could be copied puts the second one back. Two copies of a ledger
+/// carrying the same outstanding points each believe they are the one that
+/// decides what is next, which is the "two independently prepared callers"
+/// case the module documentation says cannot reorder each other's signals —
+/// and their `undischarged` counts diverge, so the one number that says the
+/// timeline is stuck is read off whichever copy the caller happens to hold.
+/// [`Reserved`] and [`Skip`] are not `Clone` for the same reason; the ledger
+/// they come from is the thing it would have been cheapest to leave copyable
+/// and the least obvious to have got wrong.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Submitter {
     /// Points reserved and not yet resolved, oldest first.
     outstanding: std::collections::VecDeque<TimelinePoint>,

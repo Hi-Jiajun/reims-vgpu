@@ -1204,6 +1204,34 @@ pub struct MapperCapture {
     pub mapping_internal: u64,
 }
 
+/// Which incarnation of the pages behind a task-local name a value describes.
+///
+/// A pair rather than one number, because the two things that can make a name
+/// describe different pages live at two scopes: a re-point or a release names
+/// one reference, and a task teardown or redefinition ends every name in the
+/// task at once. Summing them would collide, and walking every name at teardown
+/// would miss the references this device has never touched — which is most of
+/// them, since the guest publishes objects by writing its own object-list page.
+///
+/// Opaque on purpose. It is an identity component and never an amount: nothing
+/// may subtract two of these, order them, or use one half alone. See
+/// [`DeviceState::storage_incarnation`] for what advances each.
+///
+/// Both halves wrap at `u32`, exactly as [`MappingEntry::map_generation`] does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct StorageIncarnation {
+    epoch: u32,
+    count: u32,
+}
+
+impl StorageIncarnation {
+    /// The pair as one value, for mixing into a canonical backing identity.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        ((self.epoch as u64) << 32) | self.count as u64
+    }
+}
+
 /// The guest page table and GPU-VA base a mapping's [`MappingEntry::
 /// page_entries`] were walked from, when the list came from a backing record
 /// plan.
@@ -2381,6 +2409,11 @@ pub struct DeviceState {
     rail: OnceLock<Box<dyn RailDeviceState>>,
     /// Mapper-ref-texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
+    /// Per-name half of [`StorageIncarnation`]. Reset for a task whenever its
+    /// epoch moves, which is what keeps it bounded by the live namespace.
+    storage_incarnations: BTreeMap<(u32, u32), u32>,
+    /// Per-task half of [`StorageIncarnation`].
+    task_storage_epochs: BTreeMap<u32, u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
     /// Host render-cache keyed by surface_id / mapping_id (Linux/Vulkan rail).
     /// See [`crate::runtime::surface_cache`] and kb tahoe-x86-host-reims_vgpu §8.5.
@@ -2739,6 +2772,8 @@ impl DeviceState {
             task_depth_stencil_states: TaskDepthStencilStates::default(),
             rail: OnceLock::new(),
             texture_to_mapping: BTreeMap::new(),
+            storage_incarnations: BTreeMap::new(),
+            task_storage_epochs: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
             host_texture_surfaces: BTreeMap::new(),
@@ -3170,6 +3205,14 @@ impl DeviceState {
             });
         }
         // Drop objects for this task on redefine.
+        //
+        // The incarnation epoch moves only when there was a task here to end.
+        // A first definition has no prior storage to be told apart from, and
+        // bumping then would make the first incarnation of a name depend on
+        // whether anything else had happened to its task.
+        if self.tasks.is_active(task_id) {
+            self.bump_task_storage_incarnations(task_id);
+        }
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
         self.task_sampler_states.delete_task(task_id);
@@ -3240,6 +3283,7 @@ impl DeviceState {
         self.host_texture_surfaces.retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
         self.texture_to_mapping.retain(|&(t, _), _| t != task_id);
+        self.bump_task_storage_incarnations(task_id);
         // GVA encode cache retained until Unmap of that range.
         // Task teardown ≡ all GPU VA maps for this task go away — retire any
         // HostOps views we held (does not touch host_gva_surfaces encode).
@@ -3341,6 +3385,9 @@ impl DeviceState {
         if removed || resource_removed {
             self.invalidate_object_host_copies(task_id, ref_);
             self.texture_to_mapping.remove(&(task_id, ref_));
+            // The name is released. Whatever the guest puts at this reference
+            // next is other storage, and must not compare equal to this.
+            self.bump_storage_incarnation(task_id, ref_);
         }
         removed || resource_removed
     }
@@ -3376,6 +3423,82 @@ impl DeviceState {
             None => false,
         };
         (had_texture, had_linear)
+    }
+
+    /// Which incarnation of the pages behind a task-local name this is.
+    ///
+    /// The other half of [`MappingEntry::map_generation`]. Storage this device
+    /// reaches through a mapping has that counter; storage named only by an
+    /// address in a task — a plain object-list reference, resolved through the
+    /// task's page directory — had none, and a canonical backing identity built
+    /// from the address window alone would then be *wrong in the dangerous
+    /// direction*. A physical replacement re-points the same guest-virtual
+    /// window at different host frames, work already accepted was planned
+    /// against the old frames and must keep reading them, and two incarnations
+    /// sharing an identity would let a claim on the old storage be satisfied by
+    /// the new — handing the old frames back under a live reader. So the
+    /// identity is a window *and* this value.
+    ///
+    /// # What advances it, and why that list is complete
+    ///
+    /// Two events at the name's own scope, and two at its task's:
+    ///
+    /// * `CmdReplacePhysical`, which by its own contract says the PFNs under
+    ///   this window have already changed. It is the only announcement there
+    ///   is — the address, geometry and length are all unchanged.
+    /// * [`Self::delete_object`], releasing the name, after which anything at
+    ///   that reference is other storage.
+    /// * [`Self::delete_task`] and [`Self::define_task`] on a redefine, which
+    ///   end the task's whole address space: the objects are dropped and a new
+    ///   directory root puts different physical pages under the same addresses.
+    ///
+    /// The remaining candidate is the guest overwriting its own object-list
+    /// slot in place, which is how objects are replaced on this interface and
+    /// which no packet announces. It needs nothing here: an overwrite that
+    /// changes the storage changes the descriptor's window with it, and the
+    /// window half of the identity separates them. An overwrite that leaves the
+    /// window alone names the same pages, which is the same backing — unless
+    /// the guest also re-pointed them, and then it emitted the packet above.
+    #[must_use]
+    pub fn storage_incarnation(&self, task_id: u32, ref_: u32) -> StorageIncarnation {
+        StorageIncarnation {
+            epoch: self.task_storage_epochs.get(&task_id).copied().unwrap_or(0),
+            count: self
+                .storage_incarnations
+                .get(&(task_id, ref_))
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    /// Say that the pages behind this task-local name may now be different
+    /// pages. See [`Self::storage_incarnation`] for the closed list of callers.
+    pub fn bump_storage_incarnation(&mut self, task_id: u32, ref_: u32) {
+        let slot = self
+            .storage_incarnations
+            .entry((task_id, ref_))
+            .or_insert(0);
+        *slot = slot.wrapping_add(1);
+    }
+
+    /// Say that every name in this task now describes different pages, for the
+    /// two events that end a task's address space.
+    ///
+    /// One counter for the whole task rather than a walk over its names, and
+    /// that is not only an optimisation: a name this device never touched has
+    /// no per-name entry to bump, so a walk would leave exactly the references
+    /// the guest published and never re-pointed — the common case — comparing
+    /// equal across a teardown. The epoch covers them without having to have
+    /// seen them.
+    ///
+    /// The per-name counts go with it. They are re-based by the new epoch, so
+    /// dropping them cannot make two incarnations collide, and it is what keeps
+    /// [`Self::storage_incarnations`] bounded by the live namespace instead of
+    /// by how long the device has run.
+    fn bump_task_storage_incarnations(&mut self, task_id: u32) {
+        let slot = self.task_storage_epochs.entry(task_id).or_insert(0);
+        *slot = slot.wrapping_add(1);
+        self.storage_incarnations.retain(|&(t, _), _| t != task_id);
     }
 
     /// Bump [`MappingEntry::map_generation`] (never 0 after first bump).

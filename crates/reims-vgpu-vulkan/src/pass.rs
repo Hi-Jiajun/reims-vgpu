@@ -164,10 +164,49 @@ pub enum Refusal {
     },
     /// A store action that resolves, with no resolve target named.
     ResolveWithoutTarget { slot: AttachmentSlot },
+    /// The guest attached depth and stencil to one texture but disagreed about
+    /// which part of it, or about where it resolves.
+    ///
+    /// One Vulkan depth-stencil attachment has one subresource and one resolve
+    /// target, so there is nowhere to put a second answer. Taking the depth
+    /// slot's and dropping the stencil slot's runs the pass and silently writes
+    /// nothing where the guest expected the stencil's resolve --- which is the
+    /// failure [`Self::ResolveWithoutTarget`] exists to prevent, reached from
+    /// the other side. `field` is the one the two slots differ on, so a report
+    /// says whether the guest asked for two subresources or two resolves.
+    DepthStencilDisagree { field: &'static str },
+    /// The depth slot clears to a value no depth buffer can hold.
+    ///
+    /// `VkClearDepthStencilValue::depth` is an `f32` and Vulkan requires it in
+    /// `[0, 1]`; a NaN or an infinity is neither, and it is what every
+    /// fragment's depth test in the pass is then against. The colour side
+    /// cannot reach this --- a colour clear is read through its format, and
+    /// every member of `VkClearColorValue` is a value conversion that
+    /// saturates. A depth clear is one number and this is its only door.
+    ///
+    /// The *range* is deliberately not narrowed here, for the reason
+    /// [`crate::raster::viewport`] gives about a depth range: both models use
+    /// `[0, 1]` and refusing on the boundary would lose passes that work.
+    NonFiniteDepthClear { value: u64 },
     /// The render-target extent does not fit the 32-bit fields a pass carries.
     ExtentTooLarge { axis: &'static str, value: u64 },
     /// The render target has no extent at all.
     ZeroExtent { width: u64, height: u64 },
+    /// One attachment named both an array slice and a depth plane.
+    ///
+    /// They are the same axis — [`Attachment::subresource`] says so and adds
+    /// them for exactly that reason — and which of the two a texture has is
+    /// the texture's property, so only one of them is ever non-zero. Both
+    /// non-zero is a contradiction for every texture there is: a volume has no
+    /// array slices and an array has no depth planes. Summing them anyway
+    /// attaches a third slice, and the pass runs and renders into it.
+    SliceAndDepthPlane {
+        slot: AttachmentSlot,
+        /// The attachment itself, or the target it resolves to.
+        which: &'static str,
+        slice: u16,
+        depth_plane: u16,
+    },
 }
 
 impl Refusal {
@@ -177,8 +216,11 @@ impl Refusal {
             Self::NoAttachments => "vk_pass_no_attachments",
             Self::SplitDepthStencil { .. } => "vk_pass_split_depth_stencil",
             Self::ResolveWithoutTarget { .. } => "vk_pass_resolve_without_target",
+            Self::DepthStencilDisagree { .. } => "vk_pass_depth_stencil_disagree",
+            Self::NonFiniteDepthClear { .. } => "vk_pass_non_finite_depth_clear",
             Self::ExtentTooLarge { .. } => "vk_pass_extent_too_large",
             Self::ZeroExtent { .. } => "vk_pass_zero_extent",
+            Self::SliceAndDepthPlane { .. } => "vk_pass_slice_and_depth_plane",
         }
     }
 }
@@ -205,12 +247,29 @@ impl std::fmt::Display for Refusal {
             Self::ResolveWithoutTarget { slot } => {
                 write!(f, "{} slot={}", self.slug(), slot_name(*slot))
             }
+            Self::DepthStencilDisagree { field } => {
+                write!(f, "{} field={field}", self.slug())
+            }
+            Self::NonFiniteDepthClear { value } => {
+                write!(f, "{} value={value:#x}", self.slug())
+            }
             Self::ExtentTooLarge { axis, value } => {
                 write!(f, "{} axis={axis} value={value}", self.slug())
             }
             Self::ZeroExtent { width, height } => {
                 write!(f, "{} width={width} height={height}", self.slug())
             }
+            Self::SliceAndDepthPlane {
+                slot,
+                which,
+                slice,
+                depth_plane,
+            } => write!(
+                f,
+                "{} slot={} which={which} slice={slice} depth_plane={depth_plane}",
+                self.slug(),
+                slot_name(*slot)
+            ),
         }
     }
 }
@@ -339,6 +398,33 @@ pub const fn store_op(action: StoreAction) -> vk::AttachmentStoreOp {
     }
 }
 
+/// The one subresource an attachment names, and the one its resolve target
+/// receives.
+///
+/// [`Attachment::subresource`] and [`Attachment::resolve_subresource`] already
+/// derive these, and the model owns the rule they rest on: the array slice and
+/// the depth plane are the same axis, and "only one of the fields is non-zero
+/// for a given" texture. Read from there rather than added again here — a
+/// second derivation of one decision is how two layers come to disagree about
+/// which slice a pass renders into.
+///
+/// The rule is checked and not assumed, and it needs no texture to check: a
+/// volume has no array slices and an array has no depth planes, so both
+/// non-zero contradicts every texture there is. Summing them regardless names
+/// a third slice, and a pass that renders into it runs.
+fn subresource_of(attachment: &Attachment) -> Result<(u32, u32), Refusal> {
+    if attachment.slice != 0 && attachment.depth_plane != 0 {
+        return Err(Refusal::SliceAndDepthPlane {
+            slot: attachment.slot,
+            which: "attachment",
+            slice: attachment.slice,
+            depth_plane: attachment.depth_plane,
+        });
+    }
+    let range = attachment.subresource();
+    Ok((range.base_level, range.base_slice))
+}
+
 fn resolve_of(attachment: &Attachment) -> Result<Option<Resolve>, Refusal> {
     if !attachment.store.resolves() {
         return Ok(None);
@@ -348,10 +434,19 @@ fn resolve_of(attachment: &Attachment) -> Result<Option<Resolve>, Refusal> {
         .ok_or(Refusal::ResolveWithoutTarget {
             slot: attachment.slot,
         })?;
+    if attachment.resolve_slice != 0 && attachment.resolve_depth_plane != 0 {
+        return Err(Refusal::SliceAndDepthPlane {
+            slot: attachment.slot,
+            which: "resolve",
+            slice: attachment.resolve_slice,
+            depth_plane: attachment.resolve_depth_plane,
+        });
+    }
+    let range = attachment.resolve_subresource();
     Ok(Some(Resolve {
         texture,
-        level: u32::from(attachment.resolve_level),
-        slice: u32::from(attachment.resolve_slice) + u32::from(attachment.resolve_depth_plane),
+        level: range.base_level,
+        slice: range.base_slice,
     }))
 }
 
@@ -403,11 +498,12 @@ pub fn plan(
                     .map(|components| ClearColor::of(format_of(texture), components))
             })
             .flatten();
+        let (level, slice) = subresource_of(attachment)?;
         color.push(AttachmentPlan {
             slot: attachment.slot,
             texture,
-            level: u32::from(attachment.level),
-            slice: u32::from(attachment.slice) + u32::from(attachment.depth_plane),
+            level,
+            slice,
             load: load_op(attachment.load),
             store: store_op(attachment.store),
             clear,
@@ -440,19 +536,66 @@ fn depth_stencil_of(descriptor: &PassDescriptor) -> Result<Option<DepthStencilPl
     };
 
     // The two aspects of one image, so one level and one slice. Taken from
-    // whichever slot the guest attached; when both are attached they name the
-    // same texture, and a descriptor whose two slots named different levels of
-    // it would be describing two attachments again.
+    // whichever slot the guest attached; when both are attached they must agree
+    // about which part of the image they mean and about where it resolves,
+    // because there is one place here to record either. A descriptor whose two
+    // slots disagree is describing two attachments again, and it is refused
+    // rather than resolved to the depth slot's answer --- the stencil half of
+    // which would then be silently dropped.
     let carrier = if depth.is_some() {
         &descriptor.depth
     } else {
         &descriptor.stencil
     };
+    if depth.is_some() && stencil.is_some() {
+        let (from_depth, from_stencil) = (&descriptor.depth, &descriptor.stencil);
+        for (field, agree) in [
+            ("level", from_depth.level == from_stencil.level),
+            ("slice", from_depth.slice == from_stencil.slice),
+            (
+                "depth_plane",
+                from_depth.depth_plane == from_stencil.depth_plane,
+            ),
+            // Both are resolved before either is compared, so a stencil slot
+            // that resolves to nowhere is that refusal rather than this one.
+            (
+                "resolve",
+                resolve_of(from_depth)? == resolve_of(from_stencil)?,
+            ),
+        ] {
+            if !agree {
+                return Err(Refusal::DepthStencilDisagree { field });
+            }
+        }
+    }
 
+    // Read only where the load action clears, which is the rule the colour side
+    // already states: the clear bits a `LOAD` attachment still carries are not
+    // a clear, and carrying them onward would put a value the pass never uses
+    // into a `VkClearValue` --- where, on the depth side, it can be a NaN.
+    let clear_depth = if descriptor.depth.load == LoadAction::Clear {
+        let value = descriptor.depth.clear_depth().unwrap_or(0.0);
+        let narrowed = value as f32;
+        if !narrowed.is_finite() {
+            return Err(Refusal::NonFiniteDepthClear {
+                value: value.to_bits(),
+            });
+        }
+        narrowed
+    } else {
+        0.0
+    };
+    let clear_stencil = if descriptor.stencil.load == LoadAction::Clear {
+        descriptor.stencil.clear_stencil().unwrap_or(0)
+    } else {
+        0
+    };
+
+    let (level, slice) = subresource_of(carrier)?;
     Ok(Some(DepthStencilPlan {
         texture,
-        level: u32::from(carrier.level),
-        slice: u32::from(carrier.slice) + u32::from(carrier.depth_plane),
+        level,
+        slice,
         depth: depth.map(|_| Ops {
             load: load_op(descriptor.depth.load),
             store: store_op(descriptor.depth.store),
@@ -463,8 +606,8 @@ fn depth_stencil_of(descriptor: &PassDescriptor) -> Result<Option<DepthStencilPl
         }),
         // Depth clears are `[0, 1]` in both models, so this is a narrowing and
         // not a mapping. The stencil clear is the guest's low word.
-        clear_depth: descriptor.depth.clear_depth().unwrap_or(0.0) as f32,
-        clear_stencil: descriptor.stencil.clear_stencil().unwrap_or(0),
+        clear_depth,
+        clear_stencil,
         resolve: resolve_of(carrier)?,
     }))
 }
@@ -568,6 +711,81 @@ mod tests {
             .dynamic_rendering,
             Some(Declined::Narrowed)
         );
+    }
+
+    /// The array slice and the depth plane are one axis, and the model says so
+    /// by adding them. Both non-zero contradicts every texture there is — a
+    /// volume has no array slices, an array has no depth planes — so the sum
+    /// would name a third slice and the pass would render into it. Refused on
+    /// the attachment and on its resolve target, which are two subresources
+    /// and two chances to say it.
+    #[test]
+    fn an_attachment_that_names_both_a_slice_and_a_depth_plane_is_refused() {
+        let mut descriptor = empty();
+        attach(&mut descriptor, 0, id(10));
+        descriptor.color[0].slice = 1;
+        descriptor.color[0].depth_plane = 2;
+        assert_eq!(
+            plan(&descriptor, colour()),
+            Err(Refusal::SliceAndDepthPlane {
+                slot: AttachmentSlot::Color(0),
+                which: "attachment",
+                slice: 1,
+                depth_plane: 2,
+            })
+        );
+
+        // Either one alone is the same slice on the one axis, and legal.
+        descriptor.color[0].depth_plane = 0;
+        assert_eq!(
+            plan(&descriptor, colour()).expect("plannable").color[0].slice,
+            1
+        );
+        descriptor.color[0].slice = 0;
+        descriptor.color[0].depth_plane = 2;
+        assert_eq!(
+            plan(&descriptor, colour()).expect("plannable").color[0].slice,
+            2
+        );
+
+        // And the resolve target is checked in its own right.
+        descriptor.color[0].depth_plane = 0;
+        descriptor.color[0].store = StoreAction::StoreAndMultisampleResolve;
+        descriptor.color[0].resolve_texture = Some(id(11));
+        descriptor.color[0].resolve_slice = 3;
+        descriptor.color[0].resolve_depth_plane = 4;
+        assert_eq!(
+            plan(&descriptor, colour()),
+            Err(Refusal::SliceAndDepthPlane {
+                slot: AttachmentSlot::Color(0),
+                which: "resolve",
+                slice: 3,
+                depth_plane: 4,
+            })
+        );
+    }
+
+    /// One derivation, not two: the subresources this plan carries are the
+    /// model's own answer for the same attachment.
+    #[test]
+    fn the_plans_subresources_are_the_models_own() {
+        let mut descriptor = empty();
+        attach(&mut descriptor, 0, id(10));
+        descriptor.color[0].level = 3;
+        descriptor.color[0].depth_plane = 5;
+        descriptor.color[0].store = StoreAction::StoreAndMultisampleResolve;
+        descriptor.color[0].resolve_texture = Some(id(11));
+        descriptor.color[0].resolve_level = 2;
+        descriptor.color[0].resolve_slice = 6;
+
+        let plan = plan(&descriptor, colour()).expect("plannable");
+        let model = descriptor.color[0].subresource();
+        assert_eq!(plan.color[0].level, model.base_level);
+        assert_eq!(plan.color[0].slice, model.base_slice);
+        let resolve = plan.color[0].resolve.expect("a resolve target");
+        let model = descriptor.color[0].resolve_subresource();
+        assert_eq!(resolve.level, model.base_level);
+        assert_eq!(resolve.slice, model.base_slice);
     }
 
     #[test]
@@ -720,7 +938,55 @@ mod tests {
             })
         );
         assert!((ds.clear_depth - 0.5).abs() < f32::EPSILON);
-        assert_eq!(ds.clear_stencil, 7);
+        // The stencil slot does not clear, so the bits it still carries are
+        // not a clear --- the same rule the colour side states, and the reason
+        // a `LOAD` attachment cannot carry a value the pass never uses into a
+        // `VkClearValue`.
+        assert_eq!(ds.clear_stencil, 0);
+    }
+
+    /// The stencil clear is the guest's low word, asserted where the slot
+    /// actually clears.
+    #[test]
+    fn a_clearing_stencil_slot_takes_the_low_word_of_its_bits() {
+        let mut descriptor = empty();
+        descriptor.stencil.texture = Some(id(9));
+        descriptor.stencil.load = LoadAction::Clear;
+        descriptor.stencil.store = StoreAction::Store;
+        descriptor.stencil.clear_bits = [0x1_0000_0007, 0, 0, 0];
+        let plan = plan(&descriptor, |_| MTL_FORMAT_DEPTH32_FLOAT).expect("plannable");
+        assert_eq!(
+            plan.depth_stencil.expect("attached").clear_stencil,
+            7,
+            "the low word, not the whole 64-bit value"
+        );
+    }
+
+    /// A depth clear that is not a number reaches `VkClearDepthStencilValue`
+    /// as one, and every fragment's depth test in the pass is against it.
+    #[test]
+    fn a_depth_clear_that_is_not_a_number_refuses() {
+        for bits in [
+            f64::NAN.to_bits(),
+            f64::INFINITY.to_bits(),
+            1.0e300f64.to_bits(),
+        ] {
+            let mut descriptor = empty();
+            descriptor.depth.texture = Some(id(9));
+            descriptor.depth.load = LoadAction::Clear;
+            descriptor.depth.clear_bits = [bits, 0, 0, 0];
+            assert_eq!(
+                plan(&descriptor, |_| MTL_FORMAT_DEPTH32_FLOAT).err(),
+                Some(Refusal::NonFiniteDepthClear { value: bits }),
+                "{bits:#x}"
+            );
+
+            // The same bits on a slot that does not clear are not a clear at
+            // all, so there is nothing to refuse.
+            descriptor.depth.load = LoadAction::Load;
+            let planned = plan(&descriptor, |_| MTL_FORMAT_DEPTH32_FLOAT).expect("plannable");
+            assert_eq!(planned.depth_stencil.expect("attached").clear_depth, 0.0);
+        }
     }
 
     #[test]
@@ -849,6 +1115,14 @@ mod tests {
                 width: 0,
                 height: 0,
             },
+            Refusal::DepthStencilDisagree { field: "level" },
+            Refusal::NonFiniteDepthClear { value: 1 },
+            Refusal::SliceAndDepthPlane {
+                slot: AttachmentSlot::Depth,
+                which: "attachment",
+                slice: 1,
+                depth_plane: 2,
+            },
         ];
         let slugs: BTreeSet<&str> = refusals.iter().map(|r| r.slug()).collect();
         assert_eq!(slugs.len(), refusals.len());
@@ -861,5 +1135,101 @@ mod tests {
         }
         .to_string()
         .contains("color3"));
+    }
+
+    /// The failure this exists to prevent: one Vulkan depth-stencil attachment
+    /// has one subresource and one resolve target, and taking the depth slot's
+    /// answers ran the pass with the stencil slot's silently dropped.
+    #[test]
+    fn depth_and_stencil_on_one_texture_must_agree_about_which_part_of_it() {
+        let both = || {
+            let mut descriptor = empty();
+            for slot in [&mut descriptor.depth, &mut descriptor.stencil] {
+                slot.texture = Some(id(9));
+                slot.load = LoadAction::Load;
+                slot.store = StoreAction::Store;
+                slot.level = 2;
+                slot.slice = 1;
+                slot.depth_plane = 0;
+            }
+            descriptor
+        };
+        // Agreeing is the ordinary case and still plans.
+        let agreed = plan(&both(), colour()).expect("plannable");
+        let attachment = agreed.depth_stencil.expect("one attachment");
+        assert_eq!((attachment.level, attachment.slice), (2, 1));
+        assert!(attachment.depth.is_some() && attachment.stencil.is_some());
+
+        for (field, break_it) in [
+            (
+                "level",
+                (|d: &mut PassDescriptor| d.stencil.level = 3) as fn(&mut PassDescriptor),
+            ),
+            ("slice", |d: &mut PassDescriptor| d.stencil.slice = 0),
+            ("depth_plane", |d: &mut PassDescriptor| {
+                d.stencil.depth_plane = 1
+            }),
+        ] {
+            let mut descriptor = both();
+            break_it(&mut descriptor);
+            assert_eq!(
+                plan(&descriptor, colour()).err(),
+                Some(Refusal::DepthStencilDisagree { field }),
+            );
+        }
+    }
+
+    /// A resolve named on only one of the two slots, or named differently on
+    /// each, has nowhere to go. This is `ResolveWithoutTarget`'s failure
+    /// reached from the other side: the pass runs and the guest's resolved
+    /// stencil image is never written.
+    #[test]
+    fn depth_and_stencil_on_one_texture_must_agree_about_where_it_resolves() {
+        let mut descriptor = empty();
+        for slot in [&mut descriptor.depth, &mut descriptor.stencil] {
+            slot.texture = Some(id(9));
+            slot.load = LoadAction::Load;
+            slot.store = StoreAction::Store;
+        }
+        // Only the stencil half resolves --- so the carrier, which is the depth
+        // slot, answers `None` and the resolve disappears.
+        descriptor.stencil.store = StoreAction::StoreAndMultisampleResolve;
+        descriptor.stencil.resolve_texture = Some(id(10));
+        assert_eq!(
+            plan(&descriptor, colour()).err(),
+            Some(Refusal::DepthStencilDisagree { field: "resolve" })
+        );
+
+        // Both resolve, to different places.
+        descriptor.depth.store = StoreAction::StoreAndMultisampleResolve;
+        descriptor.depth.resolve_texture = Some(id(11));
+        assert_eq!(
+            plan(&descriptor, colour()).err(),
+            Some(Refusal::DepthStencilDisagree { field: "resolve" })
+        );
+
+        // Both resolve to the same place, which is what one attachment can
+        // express.
+        descriptor.depth.resolve_texture = Some(id(10));
+        let planned = plan(&descriptor, colour()).expect("plannable");
+        assert_eq!(
+            planned.depth_stencil.expect("one attachment").resolve,
+            Some(Resolve {
+                texture: id(10),
+                level: 0,
+                slice: 0,
+            })
+        );
+
+        // A stencil slot that resolves to nowhere is still its own refusal and
+        // not a disagreement --- both sides are resolved before either is
+        // compared.
+        descriptor.stencil.resolve_texture = None;
+        assert_eq!(
+            plan(&descriptor, colour()).err(),
+            Some(Refusal::ResolveWithoutTarget {
+                slot: AttachmentSlot::Stencil,
+            })
+        );
     }
 }

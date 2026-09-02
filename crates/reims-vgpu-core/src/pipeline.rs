@@ -222,6 +222,37 @@ pub enum Lease {
     Absent,
 }
 
+/// Why a transaction can never use a pipeline it binds.
+///
+/// Both variants are terminal for the work, and they are kept apart because
+/// they are different defects: a refused pipeline is this device failing to
+/// build what the guest asked for, and an absent one is work naming an object
+/// this generation does not have — a use-after-delete, or a packet that
+/// outlived a reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseRefusal {
+    Refused {
+        pipeline: ResourceId,
+        reason: RefusalReason,
+    },
+    Absent {
+        pipeline: ResourceId,
+    },
+}
+
+impl LeaseRefusal {
+    /// The name this reaches a failure channel under. A refused pipeline
+    /// reports the build's own reason, because "the draw could not run" is not
+    /// the fact anyone reading the log needs.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Refused { reason, .. } => reason.slug(),
+            Self::Absent { .. } => "pipeline_absent",
+        }
+    }
+}
+
 /// The pipeline objects of one session.
 #[derive(Debug, Default)]
 pub struct PipelineTable {
@@ -241,6 +272,24 @@ pub struct Census {
     pub leases_pending: usize,
     /// Leases taken on a pipeline that was already ready. The steady state.
     pub leases_ready: usize,
+}
+
+/// What a closed semantic generation left behind.
+///
+/// Two lists over the same removal, because two callers ask different
+/// questions of it and answering only one of them strands the other — see
+/// [`PipelineTable::generation_closed`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[must_use = "a closed generation's pipelines are host objects to destroy and waits to discharge"]
+pub struct Closed {
+    /// Removed pipelines a host object exists for, in id order. Destroyed
+    /// rather than abandoned: a closed generation leaves the handles usable
+    /// and merely unnameable.
+    pub destroy: Vec<ResourceId>,
+    /// Every removed pipeline, in id order — including the ones no host object
+    /// was ever built for. These are the names nothing may reach again, which
+    /// is what a parked transaction was waiting on.
+    pub removed: Vec<ResourceId>,
 }
 
 impl PipelineTable {
@@ -287,7 +336,23 @@ impl PipelineTable {
     /// An illegal step is refused rather than applied, and a caller that has to
     /// care can ask. The common illegal step is real: a compile that finishes
     /// after the guest deleted the pipeline, which must not resurrect it.
+    ///
+    /// # `Refused` is not a step this door can take
+    ///
+    /// [`PipelineState::may_become`] says the transition is legal, and it is —
+    /// but the state is not the whole fact. A refused pipeline carries the
+    /// reason it was refused, because a refusal without one is how a guest
+    /// ends up rendering nothing with a clean log, and this door has no reason
+    /// to write. Taking the step here produced `state: Refused, refusal: None`
+    /// — a state the lease answer `expect`s cannot exist, so the next guest draw
+    /// binding that pipeline panicked in the semantic model, and the census
+    /// read zero refusals meanwhile.
+    ///
+    /// So the door that can supply a reason is the only door: [`Self::refuse`].
     pub fn advance(&mut self, id: ResourceId, next: PipelineState) -> bool {
+        if next == PipelineState::Refused {
+            return false;
+        }
         let Some(p) = self.pipelines.get_mut(&id) else {
             return false;
         };
@@ -324,6 +389,20 @@ impl PipelineTable {
     /// declared in a closed generation is absent to work from a later one even
     /// though the object is intact.
     pub fn lease(&mut self, id: ResourceId, generation: SessionGeneration) -> Lease {
+        let lease = self.peek(id, generation);
+        self.charge(lease);
+        lease
+    }
+
+    /// What a lease would answer, without charging the census for it.
+    ///
+    /// The census counts leases *taken*, and a lease is taken only if the
+    /// transaction that wanted it is admitted. [`Self::waits_for`] therefore
+    /// asks this for every pipeline first and charges only once it knows it is
+    /// returning `Ok` — otherwise a list whose third pipeline is refused
+    /// charges two leases for a transaction that never ran, and the number that
+    /// says whether compilation starts early enough grows with refusals.
+    fn peek(&self, id: ResourceId, generation: SessionGeneration) -> Lease {
         let Some(p) = self.pipelines.get(&id) else {
             return Lease::Absent;
         };
@@ -331,24 +410,188 @@ impl PipelineTable {
             return Lease::Absent;
         }
         match p.state {
-            PipelineState::Ready => {
-                self.census.leases_ready += 1;
-                Lease::Ready
-            }
+            PipelineState::Ready => Lease::Ready,
             PipelineState::Refused => {
                 Lease::Refused(p.refusal.expect("a refused pipeline carries its reason"))
             }
             PipelineState::Declared | PipelineState::Translating | PipelineState::Compiling => {
-                self.census.leases_pending += 1;
                 Lease::Pending
             }
             PipelineState::Retired => Lease::Absent,
         }
     }
 
+    /// Charge the census for a lease that was actually taken.
+    const fn charge(&mut self, lease: Lease) {
+        match lease {
+            Lease::Ready => self.census.leases_ready += 1,
+            Lease::Pending => self.census.leases_pending += 1,
+            Lease::Refused(_) | Lease::Absent => {}
+        }
+    }
+
+    /// Turn a transaction's pipeline leases into the waits it is admitted with.
+    ///
+    /// **The join between "a transaction leases pipelines" and "a transaction
+    /// is held until they are built".** [`crate::exec::ExecWork::pipeline_leases`]
+    /// says which pipelines the records bind and
+    /// [`crate::session::SessionModel::admit`] takes a list of waits, and
+    /// nothing turned one into the other — so the only ways to call `admit`
+    /// were with no waits, which runs a draw against a pipeline that is still
+    /// compiling, or with a list built somewhere else, which is a second
+    /// opinion about what the records bind.
+    ///
+    /// A lease is taken for every pipeline, in order, which is what the
+    /// census counts. Only the pending ones come back: a ready pipeline is
+    /// nothing to wait for, and returning it would park the transaction on a
+    /// completion that has already happened.
+    ///
+    /// # Errors
+    ///
+    /// [`LeaseRefusal`] at the first pipeline this work can never use. The
+    /// transaction is refused rather than admitted with a wait that will never
+    /// resolve — which is the same choice `admit` makes for every other
+    /// unsatisfiable packet, and for the same reason: a completion word the
+    /// guest waits on forever is worse than a refusal it is told about.
+    ///
+    /// Nothing is charged for a list that refuses. The walk decides in full
+    /// first and only then charges, so a refusal at the third pipeline leaves
+    /// the census exactly as it was — which is what
+    /// `an_unusable_pipeline_stops_the_walk_and_nothing_is_counted` asserts.
+    pub fn waits_for(
+        &mut self,
+        leases: &[ResourceId],
+        generation: SessionGeneration,
+    ) -> Result<Vec<ResourceId>, LeaseRefusal> {
+        let mut taken = Vec::new();
+        let mut waits = Vec::new();
+        for &pipeline in leases {
+            match self.peek(pipeline, generation) {
+                Lease::Ready => taken.push(Lease::Ready),
+                Lease::Pending => {
+                    taken.push(Lease::Pending);
+                    waits.push(pipeline);
+                }
+                Lease::Refused(reason) => return Err(LeaseRefusal::Refused { pipeline, reason }),
+                Lease::Absent => return Err(LeaseRefusal::Absent { pipeline }),
+            }
+        }
+        // Decided in full first: nothing is charged for a list that refuses.
+        for lease in taken {
+            self.charge(lease);
+        }
+        Ok(waits)
+    }
+
     /// Retire a pipeline the guest deleted.
     pub fn retire(&mut self, id: ResourceId) -> bool {
         self.advance(id, PipelineState::Retired)
+    }
+
+    /// A semantic generation closed: its pipelines can never be named again.
+    ///
+    /// Returns the ones a host object exists for, in id order.
+    ///
+    /// # Why this is a door and not a consequence of the generation check
+    ///
+    /// [`Self::lease`] already answers `Absent` for a pipeline of another
+    /// generation, so a closed generation's pipelines are unusable without
+    /// this. What they are not is *gone*: the entries stay, so a guest that
+    /// resets in a loop grows this table without bound, and — the reason it
+    /// matters more — nothing hands their host objects to whoever destroys
+    /// them. [`PipelineState::Retired`]'s own doc names two ways in, "the
+    /// guest deleted it, or its generation closed", and only the first had a
+    /// path.
+    ///
+    /// The objects are *destroyed*, not abandoned: a closed generation leaves
+    /// the handles perfectly usable and merely unnameable, which is exactly
+    /// [`crate::retire::Validity::SemanticallyClosed`]. That is the difference
+    /// from [`Self::device_lost`], where the handles are what went.
+    ///
+    /// Only the states a host object can exist in are offered for
+    /// destruction. `Declared` never reached the host, and `Refused` is a
+    /// build that did not happen; both leave the table with the rest and
+    /// neither is offered to a destroyer that has nothing to destroy.
+    ///
+    /// **Removal and destruction are different scopes, and both come back.**
+    /// Every pipeline of the closed generation leaves the table, whatever its
+    /// state, and a transaction parked on one is parked on a wait that nothing
+    /// can now discharge — [`Self::advance`] answers `false` for a pipeline
+    /// with no entry, so the compile that lands afterwards releases nobody.
+    /// Returning only the destroyable ones scoped this answer to whether a
+    /// host object existed, which is the right question for a destroyer and
+    /// the wrong one for the waiters: a `Declared` pipeline has no host object
+    /// and a draw can be parked on it just the same.
+    #[must_use = "a pipeline nobody destroys is a host object nothing frees, and one nobody names is a wait nothing discharges"]
+    pub fn generation_closed(&mut self, closed: SessionGeneration) -> Closed {
+        let mut out = Closed::default();
+        self.pipelines.retain(|id, p| {
+            if p.generation != closed {
+                return true;
+            }
+            if matches!(
+                p.state,
+                PipelineState::Translating | PipelineState::Compiling | PipelineState::Ready
+            ) {
+                self.census.retired += 1;
+                out.destroy.push(*id);
+            }
+            out.removed.push(*id);
+            false
+        });
+        out.destroy.sort_unstable();
+        out.removed.sort_unstable();
+        out
+    }
+
+    /// The host device incarnation ended: every build it performed is gone.
+    ///
+    /// Returns the pipelines whose build has to start again, in id order.
+    ///
+    /// # Why a build and not the object
+    ///
+    /// [`PipelineState::Ready`] is a statement that the *host* has built this
+    /// pipeline, and a host build belongs to one device incarnation. The
+    /// semantic object does not: a device loss is not a reset, so the guest
+    /// still names what it named — see [`crate::retire`], whose whole subject
+    /// is that these are two lifetimes and that answering with one produces
+    /// "dead handles reachable under a live name". This is that name.
+    ///
+    /// It is worse than the usual shape of that failure because the lease is
+    /// taken at *admission*. A transaction binding a pipeline still reading
+    /// `Ready` is admitted with no wait, given an ordering position and a
+    /// completion obligation, and only then does an executor find there is
+    /// nothing to record with — a refusal after admission, which
+    /// [`crate::session`] opens by saying costs the guest the channel.
+    ///
+    /// So the built ones go back to [`PipelineState::Declared`] and a
+    /// transaction binding one waits, exactly as it would have waited the
+    /// first time. `Refused` and `Retired` do not move: a pipeline this device
+    /// could not describe is not one the next incarnation describes either,
+    /// and an object the guest deleted is not resurrected by a new device.
+    #[must_use = "a build nobody restarts is a transaction that waits forever"]
+    pub fn device_lost(&mut self) -> Vec<ResourceId> {
+        let mut rebuilding = Vec::new();
+        for (id, p) in &mut self.pipelines {
+            if p.state.is_terminal() {
+                continue;
+            }
+            // Counted as a declaration, because that is what it now is: the
+            // number says how many builds this session has asked for, and a
+            // rebuild is one more of them.
+            self.census.declared += 1;
+            // Set rather than stepped through [`Self::advance`], and
+            // deliberately: [`PipelineState::may_become`] describes the
+            // lifetime's own forward order, and this is not a step in it. It
+            // is the incarnation underneath the lifetime changing, which is
+            // the fact `may_become` cannot express and should not be widened
+            // to — a `Ready -> Declared` step admitted there would let an
+            // ordinary caller un-build a live pipeline.
+            p.state = PipelineState::Declared;
+            rebuilding.push(*id);
+        }
+        rebuilding.sort_unstable();
+        rebuilding
     }
 
     /// Drop retired pipelines' bookkeeping.
@@ -397,6 +640,141 @@ mod tests {
         assert_eq!(t.lease(id(1), GEN), Lease::Ready);
         assert_eq!(t.census().leases_pending, 1);
         assert_eq!(t.census().leases_ready, 1);
+    }
+
+    /// The rule: a refusal that carries no reason is not a refusal this table
+    /// can hold, so the door that has no reason to write cannot take the step.
+    #[test]
+    fn a_refusal_only_arrives_through_the_door_that_carries_its_reason() {
+        let mut t = PipelineTable::new();
+        t.declare(id(1), GEN);
+        assert!(
+            !t.advance(id(1), PipelineState::Refused),
+            "the step `may_become` calls legal is not one this door can supply"
+        );
+        assert_eq!(
+            t.lease(id(1), GEN),
+            Lease::Pending,
+            "and nothing moved: a draw binding it still waits"
+        );
+        assert_eq!(t.census().refused, 0);
+
+        let reason = RefusalReason::CompilationFailed("no");
+        assert!(t.refuse(id(1), reason));
+        assert_eq!(t.lease(id(1), GEN), Lease::Refused(reason));
+        assert_eq!(t.census().refused, 1);
+    }
+
+    /// Only the pipelines that are still being built come back as waits.
+    ///
+    /// A ready pipeline is nothing to wait for, and returning it would park the
+    /// transaction on a completion that has already happened — a frame that
+    /// never arrives with nothing to explain it.
+    #[test]
+    fn a_ready_pipeline_is_not_something_to_wait_for() {
+        let mut t = PipelineTable::new();
+        for slot in [1, 2] {
+            t.declare(id(slot), GEN);
+        }
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            t.advance(id(1), step);
+        }
+        assert_eq!(t.waits_for(&[id(1), id(2)], GEN), Ok(vec![id(2)]));
+        // Every lease was taken, and the census says which kind each was.
+        assert_eq!(t.census().leases_ready, 1);
+        assert_eq!(t.census().leases_pending, 1);
+        assert_eq!(
+            t.waits_for(&[], GEN),
+            Ok(Vec::new()),
+            "nothing bound, nothing held"
+        );
+    }
+
+    /// A pipeline that will never build refuses the work that binds it, with
+    /// the build's own reason.
+    ///
+    /// Admitting it with a wait that cannot resolve is a completion word the
+    /// guest waits on forever, which is worse than a refusal it is told about.
+    /// The slug is the compilation's, because "the draw could not run" is not
+    /// the fact anyone reading the failure channel needs.
+    #[test]
+    fn a_pipeline_that_will_never_build_refuses_the_work_that_binds_it() {
+        let mut t = PipelineTable::new();
+        t.declare(id(1), GEN);
+        t.refuse(id(1), RefusalReason::TranslationFailed("no such stage"));
+        let refusal = t
+            .waits_for(&[id(1)], GEN)
+            .expect_err("a refused pipeline is terminal");
+        assert_eq!(
+            refusal,
+            LeaseRefusal::Refused {
+                pipeline: id(1),
+                reason: RefusalReason::TranslationFailed("no such stage"),
+            }
+        );
+        assert_eq!(refusal.slug(), "pipeline_translation_failed");
+    }
+
+    /// Work naming a pipeline this generation does not have is refused, and is
+    /// not the same failure as one that could not be built.
+    ///
+    /// A pipeline declared in a closed generation is intact and unusable, which
+    /// is why the generation is asked about rather than read off the object.
+    #[test]
+    fn a_pipeline_from_another_generation_is_absent_rather_than_refused() {
+        let mut t = PipelineTable::new();
+        t.declare(id(1), GEN);
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            t.advance(id(1), step);
+        }
+        assert_eq!(t.waits_for(&[id(1)], GEN), Ok(Vec::new()));
+        assert_eq!(
+            t.waits_for(&[id(1)], GEN.next()),
+            Err(LeaseRefusal::Absent { pipeline: id(1) })
+        );
+        assert_eq!(
+            t.waits_for(&[id(9)], GEN),
+            Err(LeaseRefusal::Absent { pipeline: id(9) }),
+            "and one that was never declared at all"
+        );
+    }
+
+    /// **The first unusable pipeline ends the answer, and nothing is counted.**
+    ///
+    /// This used to charge the pipelines ahead of the refused one, on the
+    /// reading that the walk had already leased them. It had not: a
+    /// `waits_for` that refuses refuses the whole list, its caller refuses the
+    /// packet, and no transaction ever holds any of them. `leases_pending` is
+    /// the number that says whether starting compilation at declaration is
+    /// early enough, and a lease charged for work that never ran cannot be part
+    /// of that answer.
+    #[test]
+    fn an_unusable_pipeline_stops_the_walk_and_nothing_is_counted() {
+        let mut t = PipelineTable::new();
+        for slot in [1, 2, 3] {
+            t.declare(id(slot), GEN);
+        }
+        t.refuse(id(2), RefusalReason::CompilationFailed("out of registers"));
+        assert!(matches!(
+            t.waits_for(&[id(1), id(2), id(3)], GEN),
+            Err(LeaseRefusal::Refused { pipeline, .. }) if pipeline == id(2)
+        ));
+        assert_eq!(
+            t.census().leases_pending,
+            0,
+            "no transaction held any of them"
+        );
+        // The same list without the refusal charges every one of them.
+        assert_eq!(t.waits_for(&[id(1), id(3)], GEN), Ok(vec![id(1), id(3)]));
+        assert_eq!(t.census().leases_pending, 2);
     }
 
     /// Skipping a step is not a shortcut. A pipeline that reached `Ready`
@@ -496,6 +874,100 @@ mod tests {
             generation: SlotGeneration::default().next(),
         };
         assert!(t.declare(reused, GEN));
+    }
+
+    /// A host build belongs to the incarnation that performed it.
+    #[test]
+    fn a_device_loss_takes_the_builds_and_leaves_the_objects() {
+        let gen = SessionGeneration::FIRST;
+        let mut t = PipelineTable::new();
+        // One at each state the loss can find a pipeline in.
+        let declared = id(1);
+        let translating = id(2);
+        let compiling = id(3);
+        let ready = id(4);
+        let refused = id(5);
+        let retired = id(6);
+        for p in [declared, translating, compiling, ready, refused, retired] {
+            assert!(t.declare(p, gen));
+        }
+        for (p, steps) in [(translating, 1), (compiling, 2), (ready, 3)] {
+            for step in [
+                PipelineState::Translating,
+                PipelineState::Compiling,
+                PipelineState::Ready,
+            ]
+            .into_iter()
+            .take(steps)
+            {
+                assert!(t.advance(p, step));
+            }
+        }
+        assert!(t.refuse(refused, RefusalReason::CompilationFailed("no")));
+        assert!(t.retire(retired));
+        let before = t.census();
+
+        assert_eq!(
+            t.device_lost(),
+            vec![declared, translating, compiling, ready],
+            "every build in flight or finished starts again, and the two \
+             terminal states do not"
+        );
+        for p in [declared, translating, compiling, ready] {
+            assert_eq!(
+                t.get(p).expect("still an object").state,
+                PipelineState::Declared
+            );
+            assert_eq!(t.lease(p, gen), Lease::Pending);
+        }
+        assert_eq!(
+            t.lease(refused, gen),
+            Lease::Refused(RefusalReason::CompilationFailed("no"))
+        );
+        assert_eq!(t.lease(retired, gen), Lease::Absent);
+        assert_eq!(
+            t.census().declared,
+            before.declared + 4,
+            "a rebuild is a build this session asked for"
+        );
+
+        // And the lifetime runs forward from there exactly as it did the first
+        // time --- a set state is not a state the machine cannot leave.
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(t.advance(ready, step));
+        }
+        assert_eq!(t.lease(ready, gen), Lease::Ready);
+        assert!(
+            t.device_lost().contains(&ready),
+            "and a second loss takes the second build"
+        );
+    }
+
+    /// The incarnation change is not a step in the lifetime, and the lifetime's
+    /// own order does not admit it.
+    #[test]
+    fn nothing_can_step_a_built_pipeline_back_to_declared() {
+        assert!(!PipelineState::Ready.may_become(PipelineState::Declared));
+        let gen = SessionGeneration::FIRST;
+        let mut t = PipelineTable::new();
+        let p = id(1);
+        t.declare(p, gen);
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(t.advance(p, step));
+        }
+        assert!(
+            !t.advance(p, PipelineState::Declared),
+            "un-building a live pipeline is not something a caller may ask for"
+        );
+        assert_eq!(t.lease(p, gen), Lease::Ready);
     }
 
     #[test]

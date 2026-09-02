@@ -82,12 +82,41 @@ pub struct Enabled {
     /// structure and the census admitted each on its own.
     pub vertex_attribute_divisor: bool,
     pub vertex_attribute_zero_divisor: bool,
+    /// The two `VK_EXT_extended_dynamic_state3` members this rail sets, which
+    /// let a pipeline take its fill mode and its depth clamp per draw instead
+    /// of baking one pipeline per value — see [`crate::raster`].
+    ///
+    /// Two fields and not one, unlike `dynamic_cull_and_winding` beside them:
+    /// they are two feature bits of one structure and a device may report
+    /// either without the other, so the census admits each on its own and the
+    /// request has to be able to say so.
+    ///
+    /// Never promoted, so there is no `core_promotions` route: the extension's
+    /// own structure is the only asker.
+    pub extended_dynamic_state3_polygon_mode: bool,
+    pub extended_dynamic_state3_depth_clamp_enable: bool,
     pub mesh_shader: bool,
     pub descriptor_buffer: bool,
     /// The 1.0 boolean block, requested through
     /// `VkDeviceCreateInfo::pEnabledFeatures`.
     pub depth_clamp: bool,
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::wideLines`, the 1.0 block again.
+    ///
+    /// `vkCmdSetLineWidth` with anything but 1.0 on a device without it is
+    /// invalid (VUID-vkCmdSetLineWidth-lineWidth-00788), and
+    /// [`crate::raster::line_width`] refuses one against the same census cell
+    /// --- so what is requested here and what a width is checked against are
+    /// the same fact.
+    pub wide_lines: bool,
+    /// `VkPhysicalDeviceFeatures::multiViewport`, the 1.0 block again.
+    ///
+    /// A pipeline whose `viewportCount` is above one without it is invalid
+    /// (VUID-VkPipelineViewportStateCreateInfo-viewportCount-01216), and
+    /// [`crate::raster::viewport_slots`] refuses one against the same census
+    /// cell --- so what is requested here and what a count is checked against
+    /// are the same fact.
+    pub multi_viewport: bool,
     /// Also the 1.0 block. A sampler whose plan sets `anisotropyEnable` on a
     /// device that never requested this feature is undefined behaviour, so the
     /// census cell [`crate::sampler::plan`] reads and the feature requested
@@ -126,10 +155,14 @@ impl Enabled {
             extended_dynamic_state: census.topology().dynamic,
             vertex_attribute_divisor: census.vertex().instance_rate_divisor,
             vertex_attribute_zero_divisor: census.vertex().zero_divisor,
+            extended_dynamic_state3_polygon_mode: census.raster().dynamic_polygon_mode,
+            extended_dynamic_state3_depth_clamp_enable: census.raster().dynamic_depth_clamp,
             mesh_shader: census.stages().mesh_shader,
             descriptor_buffer: census.descriptors().descriptor_buffer,
             depth_clamp: census.raster().depth_clamp,
             fill_mode_non_solid: census.raster().fill_mode_non_solid,
+            wide_lines: census.line_widths().wide_lines,
+            multi_viewport: census.viewports().multi_viewport,
             sampler_anisotropy: census.samplers().anisotropy,
             dual_src_blend: census.blend().dual_source,
             independent_blend: census.blend().independent,
@@ -207,98 +240,12 @@ impl DeviceEpoch {
         let enabled = Enabled::for_census(&census);
         let family = census.queues().universal().index;
 
-        let names: Vec<CString> = enabled
-            .extensions
-            .names()
-            .into_iter()
-            .map(|n| CString::new(n).expect("an extension name has no interior NUL"))
-            .collect();
-        let pointers: Vec<*const i8> = names.iter().map(|n| n.as_ptr()).collect();
-
-        let priorities = [1.0f32];
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(family)
-            .queue_priorities(&priorities)];
-
-        // Chained only where the capability was admitted, for the reason the
-        // census module gives: a feature struct for something the driver never
-        // reported is a question it has no answer to.
-        let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
-            .timeline_semaphore(true)
-            .sampler_mirror_clamp_to_edge(enabled.sampler_mirror_clamp_to_edge);
-        // The promoted pair, asked for through the version's own structure.
-        // Chained only at 1.3 and above, where that structure is legal at all.
-        let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default()
-            .synchronization2(enabled.synchronization2)
-            .dynamic_rendering(enabled.dynamic_rendering);
-        let mut synchronization2 =
-            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-        let mut dynamic_rendering =
-            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
-        let mut extended_dynamic_state =
-            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
-                .extended_dynamic_state(true);
-        // One structure whichever route the capability arrived by, and each
-        // half requested only where the census admitted it: a device that
-        // reports the divisor and not the zero divisor is asked for exactly
-        // what it reported.
-        let mut divisor = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default()
-            .vertex_attribute_instance_rate_divisor(enabled.vertex_attribute_divisor)
-            .vertex_attribute_instance_rate_zero_divisor(enabled.vertex_attribute_zero_divisor);
-        let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
-        let mut descriptor_buffer =
-            vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
-        // The 1.0 block. Two states a guest sets need these, and a device
-        // created without them clips where the guest asked to clamp and fills
-        // where it asked for lines — see [`crate::raster`].
-        let core_features = vk::PhysicalDeviceFeatures::default()
-            .depth_clamp(enabled.depth_clamp)
-            .fill_mode_non_solid(enabled.fill_mode_non_solid)
-            .sampler_anisotropy(enabled.sampler_anisotropy)
-            .dual_src_blend(enabled.dual_src_blend)
-            .independent_blend(enabled.independent_blend);
-
-        let mut create = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queue_info)
-            .enabled_extension_names(&pointers)
-            .enabled_features(&core_features)
-            .push_next(&mut vulkan12);
-        if enabled.core_promotions {
-            create = create.push_next(&mut vulkan13);
-        } else {
-            // Below 1.3 each capability is asked for through its own
-            // extension's structure, and only where the extension is in the
-            // list above — a feature structure for an extension that was not
-            // enabled is a question the driver has no answer to.
-            if enabled.extensions.synchronization2 {
-                create = create.push_next(&mut synchronization2);
-            }
-            if enabled.extensions.dynamic_rendering {
-                create = create.push_next(&mut dynamic_rendering);
-            }
-            if enabled.extensions.extended_dynamic_state {
-                create = create.push_next(&mut extended_dynamic_state);
-            }
-        }
-        // Outside the `core_promotions` split: 1.4 promoted this and the
-        // baseline is 1.2, so a device on any route asks through the same
-        // structure. Chained only where something was admitted, so a device
-        // that reported neither half is not handed a structure asking for
-        // both to be off.
-        if enabled.vertex_attribute_divisor || enabled.vertex_attribute_zero_divisor {
-            create = create.push_next(&mut divisor);
-        }
-        if enabled.mesh_shader {
-            create = create.push_next(&mut mesh);
-        }
-        if enabled.descriptor_buffer {
-            create = create.push_next(&mut descriptor_buffer);
-        }
-
         // SAFETY: `physical` belongs to `instance`, and every structure and
-        // array `create` points at outlives the call.
-        let device = unsafe { instance.create_device(physical, &create, None) }
-            .map_err(|result| DeviceFailure::CreateDevice { result })?;
+        // array the create info points at lives for the closure's whole body.
+        let device = with_create_info(&enabled, family, |create| unsafe {
+            instance.create_device(physical, create, None)
+        })
+        .map_err(|result| DeviceFailure::CreateDevice { result })?;
 
         // SAFETY: the family and index were requested above, so the queue
         // exists. A driver that returns a null handle here is the
@@ -318,7 +265,131 @@ impl DeviceEpoch {
             queues: QueuePlan::adopt(census.queues()),
         })
     }
+}
 
+/// Build the `VkDeviceCreateInfo` this rail asks for and hand it to `f`.
+///
+/// A closure for the reason [`crate::pipeline::Build::with_create_info`] takes
+/// one: every feature structure is a local that the chain points at, so the
+/// chain cannot outlive them and cannot be returned. What it *can* do is be
+/// walked --- which is the only way a test can say that an extension in the
+/// list has its feature structure on the chain, rather than a reader saying so.
+fn with_create_info<R>(
+    enabled: &Enabled,
+    family: u32,
+    f: impl FnOnce(&vk::DeviceCreateInfo) -> R,
+) -> R {
+    let names: Vec<CString> = enabled
+        .extensions
+        .names()
+        .into_iter()
+        .map(|n| CString::new(n).expect("an extension name has no interior NUL"))
+        .collect();
+    let pointers: Vec<*const i8> = names.iter().map(|n| n.as_ptr()).collect();
+
+    let priorities = [1.0f32];
+    let queue_info = [vk::DeviceQueueCreateInfo::default()
+        .queue_family_index(family)
+        .queue_priorities(&priorities)];
+
+    // Chained only where the capability was admitted, for the reason the
+    // census module gives: a feature struct for something the driver never
+    // reported is a question it has no answer to.
+    let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default()
+        .timeline_semaphore(true)
+        .sampler_mirror_clamp_to_edge(enabled.sampler_mirror_clamp_to_edge);
+    // The promoted pair, asked for through the version's own structure.
+    // Chained only at 1.3 and above, where that structure is legal at all.
+    let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default()
+        .synchronization2(enabled.synchronization2)
+        .dynamic_rendering(enabled.dynamic_rendering);
+    let mut synchronization2 =
+        vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+    let mut dynamic_rendering =
+        vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+    let mut extended_dynamic_state =
+        vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default().extended_dynamic_state(true);
+    // One structure whichever route the capability arrived by, and each
+    // half requested only where the census admitted it: a device that
+    // reports the divisor and not the zero divisor is asked for exactly
+    // what it reported.
+    let mut divisor = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default()
+        .vertex_attribute_instance_rate_divisor(enabled.vertex_attribute_divisor)
+        .vertex_attribute_instance_rate_zero_divisor(enabled.vertex_attribute_zero_divisor);
+    // Each member requested only where the census admitted it, like the
+    // divisor pair above: a device that offers the polygon mode and not
+    // the depth clamp is asked for exactly what it offers.
+    let mut extended_dynamic_state_3 =
+        vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default()
+            .extended_dynamic_state3_polygon_mode(enabled.extended_dynamic_state3_polygon_mode)
+            .extended_dynamic_state3_depth_clamp_enable(
+                enabled.extended_dynamic_state3_depth_clamp_enable,
+            );
+    let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
+    let mut descriptor_buffer =
+        vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
+    // The 1.0 block. Two states a guest sets need these, and a device
+    // created without them clips where the guest asked to clamp and fills
+    // where it asked for lines — see [`crate::raster`].
+    let core_features = vk::PhysicalDeviceFeatures::default()
+        .depth_clamp(enabled.depth_clamp)
+        .fill_mode_non_solid(enabled.fill_mode_non_solid)
+        .wide_lines(enabled.wide_lines)
+        .multi_viewport(enabled.multi_viewport)
+        .sampler_anisotropy(enabled.sampler_anisotropy)
+        .dual_src_blend(enabled.dual_src_blend)
+        .independent_blend(enabled.independent_blend);
+
+    let mut create = vk::DeviceCreateInfo::default()
+        .queue_create_infos(&queue_info)
+        .enabled_extension_names(&pointers)
+        .enabled_features(&core_features)
+        .push_next(&mut vulkan12);
+    if enabled.core_promotions {
+        create = create.push_next(&mut vulkan13);
+    } else {
+        // Below 1.3 each capability is asked for through its own
+        // extension's structure, and only where the extension is in the
+        // list above — a feature structure for an extension that was not
+        // enabled is a question the driver has no answer to.
+        if enabled.extensions.synchronization2 {
+            create = create.push_next(&mut synchronization2);
+        }
+        if enabled.extensions.dynamic_rendering {
+            create = create.push_next(&mut dynamic_rendering);
+        }
+        if enabled.extensions.extended_dynamic_state {
+            create = create.push_next(&mut extended_dynamic_state);
+        }
+    }
+    // Outside the `core_promotions` split: 1.4 promoted this and the
+    // baseline is 1.2, so a device on any route asks through the same
+    // structure. Chained only where something was admitted, so a device
+    // that reported neither half is not handed a structure asking for
+    // both to be off.
+    if enabled.vertex_attribute_divisor || enabled.vertex_attribute_zero_divisor {
+        create = create.push_next(&mut divisor);
+    }
+    // Outside the `core_promotions` split for the opposite reason to the
+    // divisor's: nothing ever promoted this extension, so there is no
+    // version at which its structure stops being the one to ask through.
+    // Chained on the extension being enabled, which
+    // `DeviceExtensions::extended_dynamic_state_3` already makes mean
+    // "and a member this rail sets came back with it".
+    if enabled.extensions.extended_dynamic_state_3 {
+        create = create.push_next(&mut extended_dynamic_state_3);
+    }
+    if enabled.mesh_shader {
+        create = create.push_next(&mut mesh);
+    }
+    if enabled.descriptor_buffer {
+        create = create.push_next(&mut descriptor_buffer);
+    }
+
+    f(&create)
+}
+
+impl DeviceEpoch {
     #[must_use]
     pub const fn id(&self) -> EpochId {
         self.id
@@ -380,6 +451,13 @@ impl Drop for DeviceEpoch {
         let _ = self.wait_idle();
         // SAFETY: this type owns the device, is not `Clone`, and the wait above
         // has completed every submission that could still name a child object.
+        //
+        // The second half is the owner's and not this type's: `vkDestroyDevice`
+        // also requires every child object to have been destroyed already
+        // (VUID-vkDestroyDevice-device-05137), and this epoch creates none ---
+        // pools, arenas, semaphores, swapchains and natives are all created by
+        // whoever holds this. Rust's drop order is what enforces it, so a value
+        // holding both must declare this field *after* them.
         unsafe { self.device.destroy_device(None) };
     }
 }
@@ -413,6 +491,48 @@ mod tests {
         }]
     }
 
+    /// A 1.2 device that reports the floor and nothing optional, for the
+    /// sweeps that vary one fact at a time through `..`.
+    fn bare<'a>(
+        memory: &'a vk::PhysicalDeviceMemoryProperties,
+        queue_families: &'a [vk::QueueFamilyProperties],
+    ) -> Reported<'a> {
+        Reported {
+            api_version: vk::make_api_version(0, 1, 2, 0),
+            extensions: &[extension::SWAPCHAIN],
+            timeline_semaphore: true,
+            synchronization2: false,
+            dynamic_rendering: false,
+            depth_clamp: false,
+            fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
+            multi_viewport: false,
+            max_viewports: 1,
+            sampler_anisotropy: false,
+            max_sampler_anisotropy: 1.0,
+            extended_dynamic_state: false,
+            dynamic_primitive_topology_unrestricted: None,
+            extended_dynamic_state3_polygon_mode: false,
+            extended_dynamic_state3_depth_clamp_enable: false,
+            vertex_attribute_instance_rate_divisor: false,
+            vertex_attribute_instance_rate_zero_divisor: false,
+            max_vertex_attrib_divisor: 0,
+            vertex_formats: crate::vertex::VertexFormatSupport::NONE,
+            dual_src_blend: false,
+            independent_blend: false,
+            sampler_mirror_clamp_to_edge: false,
+            mesh_shader: false,
+            descriptor_buffer: false,
+            max_push_descriptors: 0,
+            max_buffer_size: None,
+            host_pointer_importable: false,
+            min_imported_host_pointer_alignment: 0,
+            memory,
+            queue_families,
+        }
+    }
+
     fn census_of(api: (u32, u32), extensions: &[&str], features: (bool, bool, bool)) -> Census {
         let memory = mem::apple_m3_max();
         let families = families();
@@ -424,6 +544,10 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
+            multi_viewport: false,
+            max_viewports: 1,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
@@ -441,6 +565,8 @@ mod tests {
             descriptor_buffer: features.2,
             max_push_descriptors: 32,
             max_buffer_size: None,
+            host_pointer_importable: true,
+            min_imported_host_pointer_alignment: 4096,
             memory: &memory,
             queue_families: &families,
         })
@@ -555,52 +681,268 @@ mod tests {
         assert!(!enabled.core_promotions);
     }
 
+    /// Every extension this rail enables that publishes a feature structure
+    /// has that structure on the device's `pNext` chain, and no extension it
+    /// did not enable does.
+    ///
+    /// The law was previously true only by reading, and it was not true:
+    /// `VK_EXT_extended_dynamic_state3` was enumerated with no
+    /// `VkPhysicalDeviceExtendedDynamicState3FeaturesEXT` chained anywhere.
+    /// The chain is walkable now, so the law is a test --- and a new extension
+    /// whose structure nobody remembers to chain fails here rather than on a
+    /// host nobody ran.
+    #[test]
+    fn every_enabled_extension_that_has_features_has_them_on_the_chain() {
+        /// Every structure type this rail may chain, and the extension whose
+        /// features it carries. `None` is a structure that belongs to a core
+        /// version rather than to an extension in the list.
+        const CARRIERS: &[(vk::StructureType, Option<&str>)] = &[
+            (vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, None),
+            (vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, None),
+            (
+                vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+                Some(extension::SYNCHRONIZATION_2),
+            ),
+            (
+                vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+                Some(extension::DYNAMIC_RENDERING),
+            ),
+            (
+                vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+                Some(extension::EXTENDED_DYNAMIC_STATE),
+            ),
+            (
+                vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+                Some(extension::EXTENDED_DYNAMIC_STATE_3),
+            ),
+            (
+                vk::StructureType::PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
+                Some(extension::MESH_SHADER),
+            ),
+            (
+                vk::StructureType::PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
+                Some(extension::DESCRIPTOR_BUFFER),
+            ),
+            // The one structure with no single owning name: the capability
+            // arrives by either spelling of the extension or by 1.4 core, and
+            // one structure asks on every route. Checked by its own assertion
+            // below rather than against a name.
+            (
+                vk::StructureType::PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR,
+                None,
+            ),
+        ];
+        /// The extensions this rail enables that publish no feature structure
+        /// at all, so there is nothing for the chain to carry.
+        const FEATURELESS: &[&str] = &[
+            extension::SWAPCHAIN,
+            extension::PUSH_DESCRIPTOR,
+            extension::EXTERNAL_MEMORY_HOST,
+        ];
+
+        let memory = mem::apple_m3_max();
+        let families = families();
+        let every = &[
+            extension::SWAPCHAIN,
+            extension::PUSH_DESCRIPTOR,
+            extension::EXTERNAL_MEMORY_HOST,
+            extension::SYNCHRONIZATION_2,
+            extension::DYNAMIC_RENDERING,
+            extension::EXTENDED_DYNAMIC_STATE,
+            extension::EXTENDED_DYNAMIC_STATE_3,
+            extension::MESH_SHADER,
+            extension::DESCRIPTOR_BUFFER,
+            extension::VERTEX_ATTRIBUTE_DIVISOR,
+        ];
+
+        // Two hosts, at the two ends of what this rail admits: one that
+        // reports nothing optional, and one that reports everything. The chain
+        // has to match the list on both.
+        for (label, reported) in [
+            ("nothing optional", bare(&memory, &families)),
+            (
+                "everything",
+                Reported {
+                    extensions: every,
+                    synchronization2: true,
+                    dynamic_rendering: true,
+                    extended_dynamic_state: true,
+                    extended_dynamic_state3_polygon_mode: true,
+                    extended_dynamic_state3_depth_clamp_enable: true,
+                    vertex_attribute_instance_rate_divisor: true,
+                    vertex_attribute_instance_rate_zero_divisor: true,
+                    mesh_shader: true,
+                    descriptor_buffer: true,
+                    host_pointer_importable: true,
+                    min_imported_host_pointer_alignment: 4096,
+                    max_push_descriptors: 32,
+                    ..bare(&memory, &families)
+                },
+            ),
+        ] {
+            let census = Census::take(reported).expect("admitted");
+            let enabled = Enabled::for_census(&census);
+            let listed = enabled.extensions.names();
+
+            let chained = with_create_info(&enabled, 0, |create| {
+                let mut seen = Vec::new();
+                let mut next = create.p_next;
+                while !next.is_null() {
+                    // SAFETY: every structure on this chain begins with the
+                    // `VkBaseOutStructure` prefix, and the chain is alive for
+                    // the whole closure.
+                    let base = unsafe { &*next.cast::<vk::BaseOutStructure<'_>>() };
+                    seen.push(base.s_type);
+                    next = base.p_next.cast::<std::ffi::c_void>();
+                }
+                seen
+            });
+
+            // Nothing unknown rode along.
+            for s_type in &chained {
+                assert!(
+                    CARRIERS.iter().any(|(known, _)| known == s_type),
+                    "{label}: an unrecognized structure {s_type:?} is on the chain"
+                );
+            }
+            // And every extension's structure is present exactly where its
+            // extension is.
+            for (s_type, owner) in CARRIERS {
+                let Some(name) = owner else {
+                    continue;
+                };
+                assert_eq!(
+                    chained.contains(s_type),
+                    listed.contains(name),
+                    "{label}: {name} and {s_type:?} disagree"
+                );
+            }
+            // The divisor structure, on the capability rather than on a name.
+            assert_eq!(
+                chained.contains(
+                    &vk::StructureType::PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR
+                ),
+                enabled.vertex_attribute_divisor || enabled.vertex_attribute_zero_divisor,
+                "{label}: the divisor structure and the divisor capability disagree"
+            );
+            // The featureless ones have no structure to be missing, which is
+            // what keeps the loop above from being vacuously satisfiable by an
+            // empty carrier table.
+            for name in FEATURELESS {
+                assert!(
+                    !CARRIERS.iter().any(|(_, owner)| owner == &Some(*name)),
+                    "{name} was given a feature structure it does not have"
+                );
+            }
+        }
+    }
+
+    /// The two `VK_EXT_extended_dynamic_state3` members are requested exactly
+    /// where the census admitted them, and the extension is asked for exactly
+    /// where a member was.
+    ///
+    /// The regression: neither was requested at all. The extension went into
+    /// `ppEnabledExtensionNames` and no
+    /// `VkPhysicalDeviceExtendedDynamicState3FeaturesEXT` was ever chained, so
+    /// `raster::plan` placeheld the pipeline's `polygonMode` and
+    /// `depthClampEnable` and declared them dynamic on a device that had
+    /// enabled neither feature --- `vkCmdSetPolygonModeEXT` as invalid use,
+    /// and on a driver that ignores it a pipeline that silently rasterizes the
+    /// placeholder instead of the guest's wireframe fill.
+    #[test]
+    fn the_two_dynamic_state_3_members_are_requested_one_at_a_time() {
+        let memory = mem::apple_m3_max();
+        let families = families();
+        for polygon_mode in [false, true] {
+            for depth_clamp_enable in [false, true] {
+                let census = Census::take(Reported {
+                    extensions: &[extension::SWAPCHAIN, extension::EXTENDED_DYNAMIC_STATE_3],
+                    extended_dynamic_state3_polygon_mode: polygon_mode,
+                    extended_dynamic_state3_depth_clamp_enable: depth_clamp_enable,
+                    ..bare(&memory, &families)
+                })
+                .expect("admitted");
+                let enabled = Enabled::for_census(&census);
+
+                // Each member on its own, and each is what the raster planner
+                // will spend.
+                assert_eq!(enabled.extended_dynamic_state3_polygon_mode, polygon_mode);
+                assert_eq!(
+                    enabled.extended_dynamic_state3_depth_clamp_enable,
+                    depth_clamp_enable
+                );
+                assert_eq!(census.raster().dynamic_polygon_mode, polygon_mode);
+                assert_eq!(census.raster().dynamic_depth_clamp, depth_clamp_enable);
+
+                // And the extension travels with them: enabled where a member
+                // was admitted, absent where neither was, so no structure is
+                // ever chained for an extension that is not in the list and no
+                // member is ever spent without one.
+                let wanted = polygon_mode || depth_clamp_enable;
+                assert_eq!(enabled.extensions.extended_dynamic_state_3, wanted);
+                assert_eq!(
+                    enabled
+                        .extensions
+                        .names()
+                        .contains(&extension::EXTENDED_DYNAMIC_STATE_3),
+                    wanted
+                );
+            }
+        }
+
+        // A device that does not enumerate the extension admits neither member
+        // however it answers, because there is no structure to have answered
+        // through.
+        let census = Census::take(Reported {
+            extended_dynamic_state3_polygon_mode: true,
+            extended_dynamic_state3_depth_clamp_enable: true,
+            ..bare(&memory, &families)
+        })
+        .expect("admitted");
+        let enabled = Enabled::for_census(&census);
+        assert!(!enabled.extended_dynamic_state3_polygon_mode);
+        assert!(!enabled.extended_dynamic_state3_depth_clamp_enable);
+        assert!(!enabled.extensions.extended_dynamic_state_3);
+    }
+
     #[test]
     fn the_optional_raster_features_are_enabled_exactly_when_reported() {
         let memory = mem::apple_m3_max();
         let families = families();
         for depth_clamp in [false, true] {
             for fill_mode_non_solid in [false, true] {
-                let census = Census::take(Reported {
-                    depth_clamp,
-                    fill_mode_non_solid,
-                    ..Reported {
-                        api_version: vk::make_api_version(0, 1, 2, 0),
-                        extensions: &[extension::SWAPCHAIN],
-                        timeline_semaphore: true,
-                        synchronization2: false,
-                        dynamic_rendering: false,
-                        depth_clamp: false,
-                        fill_mode_non_solid: false,
-                        sampler_anisotropy: false,
-                        max_sampler_anisotropy: 1.0,
-                        extended_dynamic_state: false,
-                        dynamic_primitive_topology_unrestricted: None,
-                        extended_dynamic_state3_polygon_mode: false,
-                        extended_dynamic_state3_depth_clamp_enable: false,
-                        vertex_attribute_instance_rate_divisor: false,
-                        vertex_attribute_instance_rate_zero_divisor: false,
-                        max_vertex_attrib_divisor: 0,
-                        vertex_formats: crate::vertex::VertexFormatSupport::NONE,
-                        dual_src_blend: false,
-                        independent_blend: false,
-                        sampler_mirror_clamp_to_edge: false,
-                        mesh_shader: false,
-                        descriptor_buffer: false,
-                        max_push_descriptors: 0,
-                        max_buffer_size: None,
-                        memory: &memory,
-                        queue_families: &families,
-                    }
-                })
-                .expect("admitted");
-                let enabled = Enabled::for_census(&census);
-                assert_eq!(enabled.depth_clamp, depth_clamp);
-                assert_eq!(enabled.fill_mode_non_solid, fill_mode_non_solid);
-                // And the census agrees, so nothing can be enabled that the
-                // raster planner would not see.
-                assert_eq!(census.raster().depth_clamp, depth_clamp);
-                assert_eq!(census.raster().fill_mode_non_solid, fill_mode_non_solid);
+                for multi_viewport in [false, true] {
+                    let census = Census::take(Reported {
+                        depth_clamp,
+                        fill_mode_non_solid,
+                        multi_viewport,
+                        max_viewports: if multi_viewport { 16 } else { 1 },
+                        ..bare(&memory, &families)
+                    })
+                    .expect("admitted");
+                    let enabled = Enabled::for_census(&census);
+                    assert_eq!(enabled.depth_clamp, depth_clamp);
+                    assert_eq!(enabled.fill_mode_non_solid, fill_mode_non_solid);
+                    // And the census agrees, so nothing can be enabled that the
+                    // raster planner would not see.
+                    assert_eq!(census.raster().depth_clamp, depth_clamp);
+                    assert_eq!(census.raster().fill_mode_non_solid, fill_mode_non_solid);
+                    // `multiViewport` is the same shape and the same hazard: a
+                    // count is admitted against the census cell, so requesting the
+                    // feature and admitting the count have to be one fact.
+                    assert_eq!(enabled.multi_viewport, multi_viewport);
+                    // `wideLines` shares the shape and the hazard, and the bare
+                    // cell above it is what every device reports: the one width
+                    // that needs no feature.
+                    assert!(!enabled.wide_lines);
+                    assert_eq!(census.line_widths(), crate::raster::LineWidthCell::NARROW);
+                    assert_eq!(census.viewports().multi_viewport, multi_viewport);
+                    assert_eq!(
+                        crate::raster::viewport_slots(2, census.viewports()).is_ok(),
+                        multi_viewport,
+                        "a second viewport is admitted exactly where the feature is"
+                    );
+                }
             }
         }
     }
@@ -627,6 +969,10 @@ mod tests {
                         dynamic_rendering: false,
                         depth_clamp: false,
                         fill_mode_non_solid: false,
+                        wide_lines: false,
+                        line_width_range: [1.0, 1.0],
+                        multi_viewport: false,
+                        max_viewports: 1,
                         sampler_anisotropy: false,
                         max_sampler_anisotropy: 16.0,
                         extended_dynamic_state: false,
@@ -644,6 +990,8 @@ mod tests {
                         descriptor_buffer: false,
                         max_push_descriptors: 0,
                         max_buffer_size: None,
+                        host_pointer_importable: false,
+                        min_imported_host_pointer_alignment: 0,
                         memory: &memory,
                         queue_families: &families,
                     }
@@ -678,6 +1026,10 @@ mod tests {
                         dynamic_rendering: false,
                         depth_clamp: false,
                         fill_mode_non_solid: false,
+                        wide_lines: false,
+                        line_width_range: [1.0, 1.0],
+                        multi_viewport: false,
+                        max_viewports: 1,
                         sampler_anisotropy: false,
                         max_sampler_anisotropy: 16.0,
                         extended_dynamic_state: false,
@@ -695,6 +1047,8 @@ mod tests {
                         descriptor_buffer: false,
                         max_push_descriptors: 0,
                         max_buffer_size: None,
+                        host_pointer_importable: false,
+                        min_imported_host_pointer_alignment: 0,
                         memory: &memory,
                         queue_families: &families,
                     }
@@ -795,6 +1149,10 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
+            multi_viewport: false,
+            max_viewports: 1,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
@@ -812,6 +1170,8 @@ mod tests {
             descriptor_buffer: false,
             max_push_descriptors: 0,
             max_buffer_size: None,
+            host_pointer_importable: false,
+            min_imported_host_pointer_alignment: 0,
             memory: &memory,
             queue_families: &families,
         });

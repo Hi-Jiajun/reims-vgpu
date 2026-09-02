@@ -757,6 +757,26 @@ pub struct Command {
     /// bits: the selector declares it `Q` and the serializer narrows it, which
     /// only the capture shows.
     pub amplification_value: u32,
+    /// A `setVertexAmplificationCount:viewMappings:` record carried at least
+    /// one `MTLVertexAmplificationViewMapping` that is not the identity.
+    ///
+    /// Only ever true on [`Kind::SetVertexAmplification`], and only on the
+    /// count form — the mode record carries no mappings.
+    ///
+    /// It exists because the count alone does not say whether the record asks
+    /// for anything. A mapping offsets the viewport and render-target *array
+    /// indices* the view rasterises into, so a count of one with a non-zero
+    /// offset is a draw aimed at a different array slice than slice zero, while
+    /// a count of one with the identity is the API default and asks for nothing.
+    /// Reading only the count reports those two as the same record, and the
+    /// first of them then renders into the wrong slice with nothing said.
+    ///
+    /// A flag rather than the offsets themselves, for the reason
+    /// [`Command::has_attribute_stride`] is one: nothing downstream amplifies,
+    /// so what a reader needs is whether the record asked for something this
+    /// rail did not do, and carrying the pairs would suggest somebody applies
+    /// them.
+    pub amplification_offsets_views: bool,
     /// Threads per tile of a [`Kind::TileDispatch`], as width/height/depth.
     ///
     /// Unnarrowed `u64` — the serializer writes all three at full width, unlike
@@ -766,9 +786,6 @@ pub struct Command {
     pub tile_threads: [u64; 3],
     /// Value of a [`Kind::SetFloatState`] record.
     pub float_value: f32,
-    /// The sampler bind carried per-entry LOD clamps this decoder did not lift.
-    /// Only ever true on [`Kind::SetSampler`]; see [`wire::OPCODE_SET_VERTEX_SAMPLER_LOD`].
-    pub has_sampler_lod: bool,
     /// The vertex buffer bind carried a per-entry attribute stride this decoder
     /// did not lift. True on [`Kind::SetBuffer`] and [`Kind::SetBufferOffset`];
     /// see [`wire::OPCODE_SET_VERTEX_BUFFER_STRIDE`]. The buffer still binds — what is
@@ -1091,7 +1108,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             } else {
                 Stage::Fragment
             };
-            out.has_sampler_lod = true;
             out.first = head.first.get();
             out.count = head.count.get();
             if out.count == 0 {
@@ -1688,7 +1704,14 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count as usize != mappings.len() {
                 return Err(DecodeStatus::ErrShort);
             }
-            let _ = mappings; // unlifted by design
+            // The pairs stay unlifted — nothing downstream amplifies — but
+            // whether any of them is the identity is not the same question as
+            // the count, and it is the one that says whether the record asked
+            // for anything. See [`Command::amplification_offsets_views`].
+            out.amplification_offsets_views = mappings.iter().any(|m| {
+                m.viewport_array_index_offset.get() != 0
+                    || m.render_target_array_index_offset.get() != 0
+            });
             Ok(out)
         }
         wire::OPCODE_SET_VISIBILITY_RESULT_MODE => {

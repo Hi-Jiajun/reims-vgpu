@@ -34,7 +34,11 @@
 //! out again and the worker would silently lose depth every time it was busy.
 //! So a partial acquisition abandons what it took before returning, and a
 //! preparation abandoned later hands back its slots *and* its descriptor
-//! emissions through [`Unwound`].
+//! emissions through [`Unwound`]. An unwinding keeps the recording's identity
+//! for the same reason every other state does: the ring a lease goes back to
+//! is the one it was leased from, and a lease abandoned into some other ring
+//! is depth invented in one worker and lost in another --- an accounting error
+//! no later check can see, because both rings still look internally consistent.
 //!
 //! # A forged worker refuses before anything moves
 //!
@@ -294,9 +298,8 @@ impl<V> Preparation<V> {
     /// Give up before submitting. See [`Unwound`].
     pub fn unwind(self) -> Unwound<V> {
         Unwound {
+            held: self.held,
             leases: self.leases,
-            emissions: self.held.emissions,
-            variants: self.held.variants,
         }
     }
 }
@@ -379,9 +382,8 @@ impl<V> Recorded<V> {
             pool.ring_mut().abandon(lease);
         }
         Ok(Unwound {
+            held: self.held,
             leases: Vec::new(),
-            emissions: self.held.emissions,
-            variants: self.held.variants,
         })
     }
 }
@@ -396,18 +398,27 @@ impl<V> Recorded<V> {
 #[derive(Debug)]
 #[must_use = "an unwound recording that is not restored leaks command-buffer slots and descriptor sets"]
 pub struct Unwound<V> {
+    held: Held<V>,
     leases: Vec<Lease>,
-    emissions: Vec<SetEmission>,
-    variants: Vec<Variant<V>>,
 }
 
 impl<V> Unwound<V> {
+    #[must_use]
+    pub const fn worker(&self) -> WorkerId {
+        self.held.worker
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> DeviceEpoch {
+        self.held.epoch
+    }
+
     /// The descriptor emissions whose writes never completed. Each must be
     /// handed to [`crate::descriptor::SetRing::abandoned`] on the ring that
     /// planned it; this value does not know which ring that is, and inventing
     /// one here would be the guess that binds a stale set.
     pub fn emissions(&self) -> &[SetEmission] {
-        &self.emissions
+        &self.held.emissions
     }
 
     /// The native pipelines this recording had named. Held rather than
@@ -417,7 +428,7 @@ impl<V> Unwound<V> {
     /// when this value is dropped.
     #[must_use]
     pub fn variants(&self) -> &[Variant<V>] {
-        &self.variants
+        &self.held.variants
     }
 
     /// Return the command-buffer slots to their worker and drop the pipelines
@@ -428,22 +439,27 @@ impl<V> Unwound<V> {
     ///
     /// # Errors
     ///
-    /// [`Mismatch`] when the worker cannot be resolved, with the unwound
-    /// recording returned intact. There is no partial restore: nothing is given
-    /// back until the worker is proven.
+    /// [`Mismatch`] when this recording's own worker does not resolve to the
+    /// pool it was built from, with the unwound recording returned intact.
+    /// There is no partial restore: nothing is given back until the worker is
+    /// proven, and the worker proven is this recording's, not one a caller
+    /// supplies --- a slot abandoned into a ring it was never leased from is
+    /// depth invented in one worker and lost in another, which no later check
+    /// can detect.
     pub fn restore(
         mut self,
-        worker: WorkerId,
         pools: &mut WorkerPools,
     ) -> Result<Vec<SetEmission>, (Self, Mismatch)> {
-        let population = pools.population();
-        let Some(pool) = pools.for_worker(worker) else {
-            return Err((self, Mismatch::UnknownWorker { worker, population }));
-        };
+        if let Err(mismatch) = self.held.resolve(pools) {
+            return Err((self, mismatch));
+        }
+        let pool = pools
+            .for_worker(self.held.worker)
+            .expect("resolve admitted this worker");
         for lease in self.leases.drain(..).rev() {
             pool.ring_mut().abandon(lease);
         }
-        Ok(self.emissions)
+        Ok(self.held.emissions)
     }
 }
 
@@ -469,6 +485,23 @@ impl<V> InFlight<V> {
     #[must_use]
     pub const fn epoch(&self) -> DeviceEpoch {
         self.held.epoch
+    }
+
+    /// The device incarnation this recording belongs to is gone.
+    ///
+    /// The terminal state of a recording no timeline will ever pass. Named
+    /// rather than left to a drop: the `#[must_use]` on this type says a
+    /// dropped recording "destroys pipelines the GPU is still reading", which
+    /// is true while the device lives and is the reason a caller must not take
+    /// that route — so the case where it is *not* true needs a door of its
+    /// own, or the only way through is the one the type forbids.
+    ///
+    /// This is also where a [`Retirements::register`] refusal ends. That
+    /// refusal hands the recording back because its epoch is not the
+    /// registry's, and the reason that happens is that its own epoch is gone.
+    #[must_use = "an abandoned recording is still the caller's to take apart"]
+    pub fn abandon(self) -> Abandoned<V> {
+        Abandoned { held: self.held }
     }
 }
 
@@ -517,6 +550,46 @@ impl<V> Retired<V> {
     }
 }
 
+/// A recording whose device incarnation ended.
+///
+/// The other terminal state, and a different obligation from [`Retired`]:
+/// `Retired::release` proves the pools it names are the live ones before
+/// handing the pipelines back, and the pools of a lost epoch are not live —
+/// they were destroyed with the device that made them. So an abandoned
+/// recording's pipelines come back without that check and its command buffers
+/// are not touched at all, which is [`reims_vgpu_core::retire::Abandoned`]'s
+/// distinction expressed in this crate's own types.
+#[derive(Debug)]
+#[must_use = "an abandoned recording's pipelines are the caller's to release and its emissions the caller's to report"]
+pub struct Abandoned<V> {
+    held: Held<V>,
+}
+
+impl<V> Abandoned<V> {
+    #[must_use]
+    pub const fn worker(&self) -> WorkerId {
+        self.held.worker
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> DeviceEpoch {
+        self.held.epoch
+    }
+
+    /// The descriptor emissions this recording wrote, for a caller that
+    /// reports. The sets themselves went with the pool.
+    pub fn emissions(&self) -> &[SetEmission] {
+        &self.held.emissions
+    }
+
+    /// The pipelines it was keeping alive, released without the live-pool
+    /// check the epoch can no longer answer.
+    #[must_use = "the pipelines are released by dropping them, and a caller that keeps them keeps a dead epoch's leases alive"]
+    pub fn into_variants(self) -> Vec<Variant<V>> {
+        self.held.variants
+    }
+}
+
 /// The in-flight recordings of one device epoch, and the timeline readings
 /// that retire them.
 ///
@@ -554,7 +627,9 @@ impl<V> Retirements<V> {
     /// # Errors
     ///
     /// [`Mismatch::WrongEpoch`] with the recording returned intact and nothing
-    /// registered.
+    /// registered. A caller holding that recording has one lawful move —
+    /// [`InFlight::abandon`] — because the registry that would have taken it
+    /// belonged to the epoch that ended.
     pub fn register(&mut self, recording: InFlight<V>) -> Result<(), (InFlight<V>, Mismatch)> {
         if recording.held.epoch != self.epoch {
             let mismatch = Mismatch::WrongEpoch {
@@ -574,6 +649,12 @@ impl<V> Retirements<V> {
     /// [`crate::pools::BufferRing::recycle`] does: the only fact that makes a
     /// pipeline safe to destroy is that the GPU is past the submission naming
     /// it.
+    ///
+    /// `#[must_use]` on the method: the lint does not look inside a `Vec`, so
+    /// the one on [`Retired`] says nothing about a call whose result is
+    /// dropped, and that call drops every native object the recording held
+    /// without the device ever destroying them.
+    #[must_use = "a retired recording's held objects are the caller's to destroy"]
     pub fn retire(&mut self, reached: TimelinePoint) -> Vec<Retired<V>> {
         let mut retired = Vec::new();
         let mut still = Vec::with_capacity(self.in_flight.len());
@@ -589,6 +670,26 @@ impl<V> Retirements<V> {
         }
         self.in_flight = still;
         retired
+    }
+
+    /// The device is gone: take every registered recording at once, whatever
+    /// the timeline says.
+    ///
+    /// No timeline is consulted, because the thing that would advance it is
+    /// what was lost — the same argument [`crate::staging::Arena::device_lost`]
+    /// makes, and the same shape. A registry that insisted on
+    /// [`Self::retire`] here would hold every recording of the lost epoch for
+    /// the life of the process, waiting for a semaphore that will never be
+    /// signalled again.
+    ///
+    /// They come back as [`Abandoned`] and not as [`Retired`]: the pools a
+    /// retirement's release checks against were destroyed with the device, so
+    /// the check cannot be made and the pipelines are released without it.
+    ///
+    /// `#[must_use]` on the method for [`Self::retire`]'s reason.
+    #[must_use = "an abandoned epoch's recordings hold pipeline leases nothing else releases"]
+    pub fn device_lost(self) -> Vec<Abandoned<V>> {
+        self.in_flight.into_iter().map(InFlight::abandon).collect()
     }
 }
 
@@ -640,10 +741,7 @@ mod tests {
     }
 
     fn emission(set: usize) -> SetEmission {
-        SetEmission {
-            set,
-            partial: false,
-        }
+        SetEmission::forged(set, false)
     }
 
     fn prepared(pools: &mut WorkerPools, buffers: usize) -> Preparation<u64> {
@@ -751,9 +849,10 @@ mod tests {
         preparation.claimed(emission(0));
         preparation.claimed(emission(1));
 
-        let emissions = preparation
-            .unwind()
-            .restore(WorkerId(0), &mut pools)
+        let unwound = preparation.unwind();
+        assert_eq!(unwound.worker(), WorkerId(0));
+        let emissions = unwound
+            .restore(&mut pools)
             .unwrap_or_else(|(_, m)| panic!("{m}"));
 
         assert_eq!(emissions, [emission(0), emission(1)]);
@@ -761,28 +860,30 @@ mod tests {
     }
 
     #[test]
-    fn restoring_to_a_worker_that_does_not_exist_keeps_the_whole_unwinding() {
+    fn restoring_into_pools_the_unwinding_did_not_come_from_keeps_the_whole_unwinding() {
         let mut pools = one_worker(4);
         let mut preparation = prepared(&mut pools, 1);
         preparation.claimed(emission(0));
+        let unwound = preparation.unwind();
 
-        let (unwound, mismatch) = preparation
-            .unwind()
-            .restore(WorkerId(4), &mut pools)
-            .expect_err("no such worker");
+        // The epoch was torn down and rebuilt with no workers at all. The
+        // unwinding names its own worker, so this is the only way to reach
+        // the refusal --- a caller cannot name a different one.
+        let mut empty = WorkerPools::new();
+        let (unwound, mismatch) = unwound.restore(&mut empty).expect_err("no such worker");
 
         assert_eq!(
             mismatch,
             Mismatch::UnknownWorker {
-                worker: WorkerId(4),
-                population: 1,
+                worker: WorkerId(0),
+                population: 0,
             }
         );
         // Nothing was given back, so the retry has everything it needs.
         assert_eq!(unwound.emissions(), [emission(0)]);
         assert_eq!(pools.of_worker(WorkerId(0)).unwrap().ring().recording(), 1);
         let emissions = unwound
-            .restore(WorkerId(0), &mut pools)
+            .restore(&mut pools)
             .unwrap_or_else(|(_, m)| panic!("{m}"));
         assert_eq!(emissions, [emission(0)]);
         assert_eq!(pools.of_worker(WorkerId(0)).unwrap().ring().free(), 4);
@@ -854,6 +955,28 @@ mod tests {
         assert_eq!(recorded.worker(), WorkerId(0));
     }
 
+    #[test]
+    fn restoring_slots_into_a_rebuilt_pool_refuses_rather_than_inventing_depth() {
+        let mut pools = one_worker(4);
+        let mut preparation = prepared(&mut pools, 2);
+        preparation.claimed(emission(0));
+        let unwound = preparation.unwind();
+        // Same worker index, different pool: the epoch was rebuilt underneath
+        // the unwinding. Abandoning into this ring would hand it two slots it
+        // never leased while the ring that did lease them never gets them back.
+        let mut rebuilt = WorkerPools::new();
+        rebuilt.push(worker_pool(2, 3, 4));
+
+        let (unwound, mismatch) = unwound.restore(&mut rebuilt).expect_err("wrong pool");
+
+        assert_eq!(mismatch, Mismatch::WrongPool);
+        assert_eq!(rebuilt.of_worker(WorkerId(0)).unwrap().ring().free(), 4);
+        assert_eq!(unwound.emissions(), [emission(0)]);
+        assert_eq!(unwound.worker(), WorkerId(0));
+        // And the ring it really came from still holds them.
+        assert_eq!(pools.of_worker(WorkerId(0)).unwrap().ring().recording(), 2);
+    }
+
     fn registered(pools: &mut WorkerPools, point: u64) -> InFlight<u64> {
         let recorded = prepared(pools, 1).finish();
         let mut submitter = crate::submission::Submitter::new();
@@ -886,6 +1009,48 @@ mod tests {
         own.register(returned)
             .unwrap_or_else(|(_, m)| panic!("{m}"));
         assert_eq!(own.outstanding(), 1);
+    }
+
+    /// The lost-device door, and the reason it is not the retirement one: no
+    /// timeline will ever pass these points, so waiting for one holds every
+    /// recording of the dead epoch for the life of the process.
+    #[test]
+    fn a_lost_epoch_hands_back_every_recording_without_asking_a_timeline() {
+        let mut pools = one_worker(4);
+        let mut retirements = Retirements::new(epoch(1));
+        for point in [5u64, 9, 40] {
+            retirements
+                .register(registered(&mut pools, point))
+                .unwrap_or_else(|(_, m)| panic!("{m}"));
+        }
+        assert!(
+            retirements.retire(TimelinePoint(4)).is_empty(),
+            "the timeline has passed none of them"
+        );
+
+        let abandoned = retirements.device_lost();
+        assert_eq!(abandoned.len(), 3, "all of them, whatever their points");
+        for one in abandoned {
+            assert_eq!(one.epoch(), epoch(1));
+            // Released without the live-pool check a retirement makes: the
+            // pools that check names went with the device.
+            let _ = one.into_variants();
+        }
+    }
+
+    /// And the refusal path terminates: a recording whose epoch is not this
+    /// registry's has one lawful move, because the registry that would have
+    /// taken it belonged to the epoch that ended.
+    #[test]
+    fn a_recording_refused_by_a_foreign_registry_can_be_abandoned() {
+        let mut pools = one_worker(4);
+        let in_flight = registered(&mut pools, 5);
+        let mut retirements = Retirements::<u64>::new(epoch(2));
+        let (returned, _) = retirements.register(in_flight).expect_err("a stale epoch");
+        let abandoned = returned.abandon();
+        assert_eq!(abandoned.epoch(), epoch(1));
+        assert!(abandoned.emissions().is_empty());
+        let _ = abandoned.into_variants();
     }
 
     #[test]

@@ -371,7 +371,9 @@ Structures no serializer record carries, so no fixture can pin one. Their format
 device contract instead, and nothing here can be replayed in CI:
 
 - **The guest GPU page table** ([`crate::page_table`]) — the worked example.
-- **FIFO packet framing** (`decode/fifo.rs`) — rings, doorbells, completion stamps.
+- **FIFO packet framing** (`runtime/drain`) — rings, doorbells, completion stamps. The payload
+  *layouts* those packets carry live in `reims-vgpu-protocol`'s `fifo`; the framing that walks a
+  ring against live guest memory does not.
 - **Device-side descriptors reached by GVA** — the backing/5/11 IOSurface descriptors and the
   116-byte texture descriptor `decode_texture_descriptor` reads. That 116-byte record is a
   *different structure* from the 36-byte creation payload in [`crate::ops::texture`]; they are not

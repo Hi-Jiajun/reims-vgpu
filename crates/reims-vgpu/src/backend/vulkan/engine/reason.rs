@@ -26,7 +26,12 @@ use crate::backend::vulkan::translate::TranslateReason;
 use crate::observe::Decline;
 
 /// A request the engine understood and declined.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Clone` and not `Copy`: [`Self::SwapchainSurface`] carries the list of
+/// formats or colour spaces the surface actually offered, and that list is what
+/// makes the refusal actionable — a reason naming only "not offered" leaves the
+/// reader without the one thing they would go looking for next.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DrawReason {
     /// A validator rejected the SPIR-V module this device assembled, so it was
     /// never handed to the driver.
@@ -121,65 +126,60 @@ pub enum DrawReason {
         requested: usize,
         cap: usize,
     },
-    /// The device does not advertise `samplerAnisotropy` and the guest sampler
-    /// asked for it.
-    SamplerAnisotropyUnsupported,
-    /// The guest sampler uses `MTLSamplerAddressModeMirrorClampToEdge` and this
-    /// device offers neither the Vulkan 1.2 `samplerMirrorClampToEdge` feature
-    /// nor `VK_KHR_sampler_mirror_clamp_to_edge`.
+    /// The guest's sampler declaration is not one the guest API admits — an
+    /// ordinal outside an enum, an inverted level-of-detail clamp, or the one
+    /// unnormalized-coordinate restriction that cannot be conformed away.
     ///
-    /// Binding it anyway is what this crate used to do — the translation table
-    /// emitted `MIRROR_CLAMP_TO_EDGE` and nothing ever requested the feature,
-    /// so the sampler was created with a mode the device had not been asked
-    /// for. That is undefined behaviour a validation layer catches on someone
-    /// else's GPU; declining by name is the honest answer.
-    SamplerMirrorClampToEdgeUnsupported,
-    /// The guest sampler asks for pixel (unnormalized) coordinates **and** a
-    /// depth-compare function, and Vulkan forbids the pair outright
-    /// (`VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01077`: `compareEnable`
-    /// must be `VK_FALSE`).
+    /// Delegates its slug, like [`Self::ColorAttachmentFormat`] below: the
+    /// protocol layer already named the field that broke, and a second slug
+    /// here would make two log lines disagree about one event.
+    SamplerDeclaration(reims_vgpu_core::sampler::SamplerRefusal),
+    /// The declaration is admissible and *this device* cannot serve it — a
+    /// mode that is a Vulkan feature, or two border colours on one sampler.
     ///
-    /// Every other constraint an unnormalized sampler carries is conformed
-    /// silently by [`super::caches::ObjectCaches::get_or_create_sampler`],
-    /// because under Vulkan's own rules such a sampler may only be reached by an
-    /// explicit-LOD, non-minifying sample — so forcing `minFilter = magFilter`,
-    /// `mipmapMode = NEAREST`, `minLod = maxLod = 0` and anisotropy off changes
-    /// no result the guest can observe. A compare function is not in that class:
-    /// dropping it returns the sampled value instead of the comparison, which is
-    /// a different picture. So this one is a refusal by name rather than a
-    /// repair.
-    SamplerUnnormalizedCompare,
-    /// The guest pipeline names one of `MTLBlendFactor`'s four dual-source
-    /// factors (`Source1Color` .. `OneMinusSource1Alpha`, 15-18) and this device
-    /// does not advertise `VkPhysicalDeviceFeatures::dualSrcBlend`.
+    /// Delegates for the same reason as the variant above; the rail that owns
+    /// the capability is the one that names the refusal.
+    SamplerDevice(reims_vgpu_vulkan::sampler::Refusal),
+    /// A colour attachment's blend declaration is not one the guest API
+    /// admits — a factor, an operation or a mask ordinal outside its enum.
     ///
-    /// These reached no arm at all until the translation table was extended —
-    /// `translate::blend::factor` stopped at 14 and its test asserted 15 was
-    /// past the end of `MTLBlendFactor`, which runs to 18. So a guest asking
-    /// for dual-source blending was refused as an unknown factor on every host,
-    /// including the ones that support it. Now it translates, and only a host
-    /// that genuinely cannot run it declines — here, by name.
-    DualSourceBlendUnsupported,
-    /// The guest asked for `MTLTriangleFillModeLines` and this device does not
-    /// advertise `VkPhysicalDeviceFeatures::fillModeNonSolid`, so no pipeline
-    /// on it can name `VK_POLYGON_MODE_LINE`.
+    /// Delegates its slug for the same reason as [`Self::SamplerDeclaration`]:
+    /// the protocol layer already named the field that broke.
     ///
-    /// The alternative is rasterizing the wireframe filled, which is a whole
-    /// pass of wrong pixels the guest is never told about. Same reading as
-    /// [`Self::DualSourceBlendUnsupported`]: optional core feature, asked for
-    /// at device creation, declined by name where the host says no.
-    FillModeNonSolidUnsupported,
-    /// The guest asked for `MTLDepthClipModeClamp` and this device does not
-    /// advertise `VkPhysicalDeviceFeatures::depthClamp`, so no pipeline on it
-    /// can set `depthClampEnable`.
+    /// This used to be reported per attachment at translation time, where an
+    /// unrecognised ordinal made the *slot* unblended and left the pipeline to
+    /// build. It refuses the pipeline now, because the alternative is a
+    /// compositing draw silently becoming a raw store.
+    BlendDeclaration(reims_vgpu_core::blend::BlendRefusal),
+    /// The declaration is admissible and *this device* cannot serve it: one of
+    /// `MTLBlendFactor`'s four dual-source factors without
+    /// `VkPhysicalDeviceFeatures::dualSrcBlend`, or attachments that blend
+    /// differently without `independentBlend`.
     ///
-    /// Clipping instead discards every fragment the guest asked to keep at the
-    /// near and far planes, which is missing geometry rather than shifted
-    /// geometry — the sibling of the fill-mode refusal above.
-    DepthClampUnsupported,
+    /// Delegates for the same reason as [`Self::SamplerDevice`]; the rail that
+    /// owns the capability is the one that names the refusal.
+    BlendDevice(reims_vgpu_vulkan::blend::Refusal),
+    /// A fixed-function rasterizer state the guest set that this rail cannot
+    /// place: an ordinal outside a closed set, `MTLTriangleFillModeLines`
+    /// without `VkPhysicalDeviceFeatures::fillModeNonSolid`, or
+    /// `MTLDepthClipModeClamp` without `depthClamp`.
+    ///
+    /// The two capability arms have no substitute and so are not degraded:
+    /// rasterizing a wireframe filled is a whole pass of wrong pixels, and
+    /// clipping where the guest asked to clamp discards geometry it expected
+    /// to keep at the near and far planes. Delegates its slug, like the
+    /// sampler and blend pairs.
+    Raster(reims_vgpu_vulkan::raster::Refusal),
     /// The primary colour attachment has no faithful Vulkan format on this
     /// backend. Carries the translation reason so the refusal keeps one name.
     ColorAttachmentFormat(TranslateReason),
+    /// The guest's attribute names a step function that only means something
+    /// inside a tessellation pipeline, and this rail builds none.
+    ///
+    /// Recognised and declined for what it is, which is the distinction the
+    /// owning layer draws: reporting it as an unknown value would say the
+    /// stream was malformed when it was not.
+    VertexStep(reims_vgpu_vulkan::vertex::Refusal),
     /// The device declines this vertex attribute format and no portable
     /// substitute fits. Carries the translation-layer reason so the two log
     /// lines agree on why.
@@ -281,13 +281,16 @@ pub enum DrawReason {
     QueueCannotPresent {
         queue_family: u32,
     },
-    /// The surface's swapchain images cannot be a transfer destination, which
-    /// the present blit requires.
-    SwapchainLacksTransferDst,
-    /// The surface advertises no formats at all.
-    SwapchainNoSurfaceFormat,
-    /// The surface advertises no composite-alpha mode.
-    SwapchainNoCompositeAlpha,
+    /// The host window's surface cannot carry this composition: no formats at
+    /// all, not the scanout format, not under a colour space this device writes
+    /// through, no transfer destination for the present blit, or no
+    /// composite-alpha mode that leaves the frame alone.
+    ///
+    /// One arm carrying the rail's refusal rather than four flat variants, and
+    /// it delegates its slug for the same reason [`Self::SamplerDevice`] does:
+    /// the layer that asked the surface is the one that names what it answered,
+    /// and the answer is only actionable with the list it carries.
+    SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal),
     /// A binding one of this draw's two modules statically uses is absent from
     /// the descriptor set layout this draw would build.
     ///
@@ -353,12 +356,12 @@ impl crate::observe::Decline for DrawReason {
             Self::MultisampleResolveShapeUnsupported { .. } => {
                 "multisample_resolve_shape_unsupported"
             }
-            Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
-            Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
-            Self::SamplerUnnormalizedCompare => "sampler_unnormalized_compare",
-            Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
-            Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
-            Self::DepthClampUnsupported => "depth_clamp_unsupported",
+            Self::SamplerDeclaration(refusal) => Decline::slug(refusal),
+            Self::SamplerDevice(refusal) => refusal.slug(),
+            Self::VertexStep(refusal) => refusal.slug(),
+            Self::BlendDeclaration(refusal) => Decline::slug(refusal),
+            Self::BlendDevice(refusal) => refusal.slug(),
+            Self::Raster(refusal) => refusal.slug(),
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
@@ -390,9 +393,7 @@ impl crate::observe::Decline for DrawReason {
             }
             Self::SwapchainUnavailable => "swapchain_unavailable",
             Self::QueueCannotPresent { .. } => "queue_cannot_present",
-            Self::SwapchainLacksTransferDst => "swapchain_lacks_transfer_dst",
-            Self::SwapchainNoSurfaceFormat => "swapchain_no_surface_format",
-            Self::SwapchainNoCompositeAlpha => "swapchain_no_composite_alpha",
+            Self::SwapchainSurface(refusal) => refusal.slug(),
         }
     }
 }
@@ -503,6 +504,20 @@ impl std::fmt::Display for DrawReason {
                 " binding={binding} first_type={first_type} first_count={first_count} \
                  second_type={second_type} second_count={second_count}"
             ),
+            Self::BlendDeclaration(refusal) => {
+                for (name, value) in Decline::fields(refusal) {
+                    write!(f, " {name}={value}")?;
+                }
+                Ok(())
+            }
+            // The rail's own refusal already spells its slug and its fields;
+            // printing it whole keeps one event to one reading.
+            Self::BlendDevice(refusal) => write!(f, " {refusal}"),
+            Self::VertexStep(refusal) => write!(f, " {refusal}"),
+            Self::Raster(refusal) => write!(f, " {refusal}"),
+            // Same: the surface's answer is only actionable with what it
+            // offered, which the rail's refusal spells.
+            Self::SwapchainSurface(refusal) => write!(f, " {refusal}"),
             _ => Ok(()),
         }
     }
@@ -660,9 +675,11 @@ mod tests {
             color_input: false,
         },
         DrawReason::VisibilityResultMode(TranslateReason::UnknownVisibilityResultMode(0)),
-        DrawReason::SamplerAnisotropyUnsupported,
-        DrawReason::SamplerMirrorClampToEdgeUnsupported,
-        DrawReason::SamplerUnnormalizedCompare,
+        DrawReason::SamplerDeclaration(reims_vgpu_core::sampler::SamplerRefusal::BadLodClamp {
+            min_bits: 0,
+            max_bits: 0,
+        }),
+        DrawReason::SamplerDevice(reims_vgpu_vulkan::sampler::Refusal::NoMirrorClampToEdge),
         DrawReason::ConstantVertexAttribute,
         DrawReason::InstanceRateDivisorUnsupported { step_rate: 0 },
         DrawReason::InstanceRateDivisorOverLimit {
@@ -708,12 +725,52 @@ mod tests {
         },
         DrawReason::SwapchainUnavailable,
         DrawReason::QueueCannotPresent { queue_family: 0 },
-        DrawReason::SwapchainLacksTransferDst,
-        DrawReason::SwapchainNoSurfaceFormat,
-        DrawReason::SwapchainNoCompositeAlpha,
-        DrawReason::DualSourceBlendUnsupported,
-        DrawReason::FillModeNonSolidUnsupported,
-        DrawReason::DepthClampUnsupported,
+        DrawReason::SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal::NoFormats),
+        DrawReason::SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal::FormatNotOffered {
+            wanted: ash::vk::Format::B8G8R8A8_UNORM,
+            offered: Vec::new(),
+        }),
+        DrawReason::SwapchainSurface(
+            reims_vgpu_vulkan::swapchain::Refusal::ColorSpaceNotOffered {
+                format: ash::vk::Format::B8G8R8A8_UNORM,
+                offered: Vec::new(),
+            },
+        ),
+        DrawReason::SwapchainSurface(
+            reims_vgpu_vulkan::swapchain::Refusal::NoTransferDestination {
+                supported: ash::vk::ImageUsageFlags::empty(),
+            },
+        ),
+        DrawReason::SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal::NoOpaqueComposite {
+            supported: ash::vk::CompositeAlphaFlagsKHR::empty(),
+        }),
+        DrawReason::VertexStep(reims_vgpu_vulkan::vertex::Refusal::TessellationStep {
+            step: reims_vgpu_core::vertex_step::StepFunction::PerPatch,
+        }),
+        DrawReason::BlendDeclaration(reims_vgpu_core::blend::BlendRefusal::UnknownOrdinal {
+            field: "src_rgb",
+            ordinal: 0,
+        }),
+        DrawReason::BlendDevice(reims_vgpu_vulkan::blend::Refusal::NoDualSource {
+            factor: reims_vgpu_core::blend::BlendFactor::Source1Color,
+        }),
+        DrawReason::BlendDevice(reims_vgpu_vulkan::blend::Refusal::NoIndependentBlend { slots: 2 }),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::NoNonSolidFill),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::NoDepthClamp),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::UnknownOrdinal {
+            state: "cull_mode",
+            ordinal: 9,
+        }),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::OutOfRange {
+            field: "x",
+            value: 0,
+        }),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::NoWideLines { width_bits: 0 }),
+        DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::LineWidthOutOfRange {
+            width_bits: 0,
+            min_bits: 0,
+            max_bits: 0,
+        }),
     ];
 
     /// The rule this enum exists to enforce: two checks sharing a slug means a

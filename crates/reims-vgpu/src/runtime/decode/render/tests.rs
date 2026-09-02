@@ -1087,6 +1087,10 @@ fn vertex_amplification_decodes_at_the_widths_the_serializer_wrote() {
     let c = decode(&v).expect("amplification count");
     assert_eq!(c.kind, Kind::SetVertexAmplification);
     assert_eq!(c.count, 2, "the head was read as eight bytes");
+    assert!(
+        c.amplification_offsets_views,
+        "four non-zero offsets and the record claims to ask for nothing"
+    );
 
     // A count with no mappings behind it. The record is the guest's own
     // length claim, so this is the bound, and it must not wrap.
@@ -1096,6 +1100,59 @@ fn vertex_amplification_decodes_at_the_widths_the_serializer_wrote() {
     let mut huge = hdr(wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT, total);
     st32(&mut huge[OP_HEADER_LEN..], u32::MAX);
     assert_eq!(decode(&huge).unwrap_err(), DecodeStatus::ErrShort);
+}
+
+/// A count of one is the API default; a *mapping* of one is not.
+///
+/// `setVertexAmplificationCount:viewMappings:` carries one
+/// `MTLVertexAmplificationViewMapping` per view, and each offsets the viewport
+/// and render-target *array indices* that view rasterises into. So a record
+/// with count 1 and a zero mapping asks for exactly what this rail already
+/// does, while one with count 1 and a non-zero offset asks for a draw aimed at
+/// a different array slice — and until this landed the decoder discarded the
+/// mappings unread, so `count > 1` reported the two as the same record and the
+/// second rendered into slice zero with nothing said.
+///
+/// Both offsets are driven separately, because they are two different indices
+/// and an `any` over the wrong field would still pass with only one of them.
+#[test]
+fn a_single_view_mapping_that_offsets_a_view_is_not_the_default() {
+    use crate::protocol::endian::st32;
+    use reims_vgpu_wire::ops::render as wire;
+
+    let record = |viewport: u32, render_target: u32| {
+        let total = OP_HEADER_LEN + AMPLIFICATION_COUNT_LEN + AMPLIFICATION_MAPPING_SIZE;
+        let mut v = hdr(wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT, total);
+        st32(&mut v[OP_HEADER_LEN..], 1);
+        let e = OP_HEADER_LEN + AMPLIFICATION_COUNT_LEN;
+        st32(&mut v[e..], viewport);
+        st32(&mut v[e + 4..], render_target);
+        decode(&v).expect("amplification count")
+    };
+
+    let identity = record(0, 0);
+    assert_eq!(identity.count, 1);
+    assert!(
+        !identity.amplification_offsets_views,
+        "the identity mapping asks for what this rail already does"
+    );
+
+    for (viewport, render_target) in [(2u32, 0u32), (0, 3), (2, 3)] {
+        let c = record(viewport, render_target);
+        assert_eq!(c.count, 1, "still one view");
+        assert!(
+            c.amplification_offsets_views,
+            "viewport={viewport} render_target={render_target}"
+        );
+    }
+
+    // The mode record carries no mappings at all, so it never claims one.
+    let total = wire::SET_VERTEX_AMPLIFICATION_MODE_TOTAL_LEN as usize;
+    let mut v = hdr(wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE, total);
+    st32(&mut v[OP_HEADER_LEN..], 1);
+    st32(&mut v[OP_HEADER_LEN + 4..], 1);
+    let c = decode(&v).expect("amplification mode");
+    assert!(!c.amplification_offsets_views);
 }
 
 /// `0x0c` is two records, and only the length says which.
@@ -1931,35 +1988,45 @@ fn a_sampler_bind_with_lod_clamps_is_still_a_sampler_bind() {
         for i in 0..COUNT as usize {
             let e = OP_HEADER_LEN + BIND_ENTRIES + i * SAMPLER_LOD_BIND_ENTRY_SIZE;
             st32(&mut v[e..], 0x6363 + i as u32);
-            // Clamps this decoder does not lift. They are here so a decoder
-            // reading at the plain four-byte stride would pick one up as a
-            // ref and fail the assertion below.
-            st32(&mut v[e + 4..], 0x3e80_0000); // 0.25
-            st32(&mut v[e + 8..], 0x3f40_0000); // 0.75
+            // A distinct clamp pair per entry. Both halves are lifted, and
+            // `runtime::exec` zips them against the refs by position — so a
+            // decoder that read one entry's clamps for another's slot, or read
+            // at the plain four-byte stride and took a clamp for a ref, has to
+            // fail here rather than downstream where the pairing is invisible.
+            st32(&mut v[e + 4..], 0x3e80_0000 + i as u32); // ~0.25
+            st32(&mut v[e + 8..], 0x3f40_0000 + i as u32); // ~0.75
         }
 
         let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
         assert_eq!(c.kind, Kind::SetSampler, "op {op:#x}");
         assert_eq!(c.stage, stage, "op {op:#x}");
-        assert!(c.has_sampler_lod, "op {op:#x}");
         assert_eq!(c.first, 3, "op {op:#x}");
         assert_eq!(
             c.ref_binds,
             vec![0x6363, 0x6364],
             "op {op:#x} read the entries at the wrong stride"
         );
+        assert_eq!(
+            c.sampler_lod_binds,
+            vec![(0x3e80_0000, 0x3f40_0000), (0x3e80_0001, 0x3f40_0001)],
+            "op {op:#x} lost the clamps or paired them with the wrong slot"
+        );
         assert_eq!(c.sampler_ref, 0x6363, "op {op:#x}");
     }
 
-    // The plain forms keep the four-byte stride and say they carry no
-    // clamps, so the flag is the record's and not the family's.
+    // The plain forms keep the four-byte stride and carry no clamps at all,
+    // so the clamp list is empty rather than defaulted — and `exec`'s zip
+    // gives those slots `None` rather than a clamp the record never carried.
     let total = OP_HEADER_LEN + BIND_ENTRIES + REF_BIND_ENTRY_SIZE;
     let mut v = hdr(wire::OPCODE_SET_VERTEX_SAMPLER, total);
     st32(&mut v[OP_HEADER_LEN + BIND_COUNT..], 1);
     st32(&mut v[OP_HEADER_LEN + BIND_ENTRIES..], 0x6363);
     let c = decode(&v).expect("plain sampler bind");
-    assert!(!c.has_sampler_lod);
     assert_eq!(c.ref_binds, vec![0x6363]);
+    assert!(
+        c.sampler_lod_binds.is_empty(),
+        "a plain bind must not invent a clamp"
+    );
 }
 
 /// The accepted-opcode window ends exactly where Apple's render manifest

@@ -90,6 +90,8 @@ pub mod icb;
 // that makes each one greppable.
 #[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod draw;
+/// From a drained packet to the packet the semantic model admits.
+pub mod ingress;
 pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;

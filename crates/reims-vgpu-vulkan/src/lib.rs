@@ -103,6 +103,7 @@ pub mod memory;
 pub mod mipmap;
 pub mod pass;
 pub mod pipeline;
+pub mod pixel;
 pub mod placement;
 pub mod pools;
 pub mod queues;
@@ -121,3 +122,181 @@ pub mod transfer;
 pub mod variant;
 pub mod vertex;
 pub mod view;
+
+/// The dependency list, read back and checked against the claim above it.
+///
+/// # Why a test and not a comment
+///
+/// This crate's doc says "only place" is a claim a module boundary cannot hold,
+/// and that the dependency list is what holds it instead. A list held only by a
+/// comment is one a convenient import silently retires — and the import this
+/// rail is most likely to reach for is the protocol crate, because every wire
+/// vocabulary it wants is *in* there and also re-exported through the semantic
+/// model. Reaching it directly compiles, passes every test here, and quietly
+/// makes this rail a second decoder.
+///
+/// So the manifest is parsed and compared. The parser is a dozen lines here
+/// rather than a shared helper elsewhere: a boundary test that had to depend on
+/// something to run would be adding an edge to the graph it exists to bound.
+#[cfg(test)]
+mod boundary {
+    /// Every crate named in one section of a manifest, in the order it lists
+    /// them. Not just the in-workspace ones — `ash` is as much a part of this
+    /// crate's claim as `reims-vgpu-core` is.
+    fn deps(manifest: &str, section: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                inside = trimmed == section;
+                continue;
+            }
+            if !inside || trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = trimmed.split('=').next().map(str::trim) {
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    fn manifest() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("a crate can read its own manifest")
+    }
+
+    /// `ash`, the semantic model, the refusal vocabulary, the operator
+    /// switches. That is the whole list, and it is asserted as a list rather
+    /// than as a set of prohibitions because the edge that breaks this is the
+    /// one nobody thought to prohibit.
+    #[test]
+    fn the_rail_sees_ash_the_model_the_refusals_and_the_switches() {
+        assert_eq!(
+            deps(&manifest(), "[dependencies]"),
+            vec![
+                "ash",
+                "reims-vgpu-core",
+                "reims-vgpu-observe",
+                "reims-vgpu-config",
+            ],
+            "this crate's dependency list is what makes \"the only place host \
+             capabilities become policy\" true"
+        );
+    }
+
+    /// And in particular not the protocol crate, which is the one edge that
+    /// would be easy to justify and would make this rail a second decoder.
+    ///
+    /// Its own test because the list above would catch it, and because a reader
+    /// who changes that list needs to meet this sentence rather than a diff.
+    #[test]
+    fn the_rail_never_reaches_the_decode_vocabulary_directly() {
+        let m = manifest();
+        for section in [
+            "[dependencies]",
+            "[dev-dependencies]",
+            "[build-dependencies]",
+        ] {
+            for d in deps(&m, section) {
+                assert!(
+                    !matches!(
+                        d.as_str(),
+                        "reims-vgpu-protocol" | "reims-vgpu-wire" | "reims-vgpu-memory"
+                    ),
+                    "{section} names {d}: a wire tag's meaning reaches this rail \
+                     through the semantic model or not at all, and guest-RAM \
+                     ownership does not reach it"
+                );
+            }
+        }
+    }
+}
+
+/// How a guest enumerant's spelling becomes the Vulkan enumerant's.
+///
+/// For the tests, and only for them: two eight-arm mapping tables --- the
+/// comparison functions and the stencil operations --- are written out by hand,
+/// and what a hand-written table of same-named values gets wrong is a *swap*.
+/// Injectivity cannot see one, and a spot-checked arm catches only itself. The
+/// derivation here shares nothing with either table; it reads the guest name.
+#[cfg(test)]
+pub(crate) mod naming {
+    /// The guest name a Vulkan enumerant's own name, under two vocabulary
+    /// rules and nothing else.
+    ///
+    /// `LessEqual` is `LESS_OR_EQUAL` and `IncrementClamp` is
+    /// `INCREMENT_AND_CLAMP`; every other word survives the split unchanged.
+    /// Shared with [`crate::depth_stencil`], which maps the other
+    /// eight-arm table.
+    #[must_use]
+    pub(crate) fn vulkan_spelling(camel: &str) -> String {
+        let mut words: Vec<String> = Vec::new();
+        for ch in camel.chars() {
+            if ch.is_uppercase()
+                && !words.is_empty()
+                && !words.last().expect("non-empty").is_empty()
+            {
+                words.push(String::new());
+            }
+            if words.is_empty() {
+                words.push(String::new());
+            }
+            words
+                .last_mut()
+                .expect("non-empty")
+                .push(ch.to_ascii_uppercase());
+        }
+        // Word-for-word vocabulary, which is what makes this a derivation
+        // rather than a second table: each substitution is a fact about how
+        // the two APIs spell one concept, and every arm containing that word
+        // takes it. Nothing here knows which arm it is looking at.
+        for word in &mut words {
+            *word = match word.as_str() {
+                "SOURCE" => "SRC".to_string(),
+                "SOURCE1" => "SRC1".to_string(),
+                "DESTINATION" => "DST".to_string(),
+                // Metal names the blend constant after the blend; Vulkan names
+                // it after what it is.
+                "BLEND" => "CONSTANT".to_string(),
+                "SATURATED" => "SATURATE".to_string(),
+                other => other.to_string(),
+            };
+        }
+        // Metal writes the comparison as one word and Vulkan spells the
+        // conjunction; the same for the stencil operations' saturation.
+        // `NotEqual` is `NOT_EQUAL` in both, which is why the first rule asks
+        // what the `EQUAL` follows rather than only that it is last.
+        if words.len() > 1 {
+            let last = words[words.len() - 1].clone();
+            let before = words[words.len() - 2].clone();
+            if last == "EQUAL" && (before == "LESS" || before == "GREATER") {
+                words.insert(words.len() - 1, "OR".to_string());
+            } else if last == "CLAMP" || last == "WRAP" {
+                words.insert(words.len() - 1, "AND".to_string());
+            }
+        }
+        words.join("_")
+    }
+
+    /// The same, for the topology table, whose one difference is a suffix
+    /// rather than a word.
+    ///
+    /// Metal names the primitive and leaves the grouping implicit; Vulkan
+    /// names both. So a guest type that does not say `Strip` is a list, and
+    /// that is the whole rule --- which is exactly the distinction a pipeline
+    /// once lost by declaring a stand-in topology, so it is worth a check that
+    /// does not read the table.
+    #[must_use]
+    pub(crate) fn vulkan_topology_spelling(camel: &str) -> String {
+        let spelled = vulkan_spelling(camel);
+        if spelled.ends_with("_STRIP") {
+            spelled
+        } else {
+            format!("{spelled}_LIST")
+        }
+    }
+}

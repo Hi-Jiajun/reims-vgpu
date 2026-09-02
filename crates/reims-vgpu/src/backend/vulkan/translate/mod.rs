@@ -47,7 +47,6 @@
 //! * Never gate on a driver name, a vendor id, or an API version — that is
 //!   [`super::caps`]'s job and it has its own rules.
 
-pub mod blend;
 pub mod pixel;
 pub mod raster;
 pub mod reason;
@@ -56,4 +55,6 @@ pub mod support;
 pub mod vertex;
 
 pub(crate) use reason::TranslateReason;
-pub(crate) use support::VertexFormatSupport;
+// The measured capability itself belongs to the rail; `support` is the join
+// that probes it and names its refusals here.
+pub(crate) use reims_vgpu_vulkan::vertex::VertexFormatSupport;

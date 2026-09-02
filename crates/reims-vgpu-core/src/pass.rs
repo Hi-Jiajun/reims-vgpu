@@ -40,12 +40,29 @@
 use crate::access::{AccessMode, ByteRange, Participation, ParticipationExtent, SubresourceRange};
 use crate::identity::ResourceId;
 pub use reims_vgpu_protocol::pass_action::LoadAction;
+pub use reims_vgpu_protocol::pass_action::{
+    DepthResolveFilter, StencilResolveFilter, StoreActionOptions,
+};
 
 /// Colour attachment slots the record always carries, written or not.
 ///
 /// Eight, always: the record is a fixed shape and an unattached slot is one
 /// whose texture ref is zero, not one that is absent.
-pub const COLOR_ATTACHMENTS: usize = 8;
+///
+/// Taken from the layout rather than written again. [`pass_descriptor`] walks
+/// the wire body's colour array and indexes this descriptor's by the same
+/// number, so two constants that could disagree are a panic on guest data at
+/// the moment they do — and the wire's is the one that decides, because it is
+/// the array that exists.
+///
+/// [`pass_descriptor`]: crate::resolve::pass_descriptor
+pub const COLOR_ATTACHMENTS: usize = reims_vgpu_protocol::decode::RENDER_PASS_COLOR_ATTACHMENTS;
+
+// `AttachmentSlot::Color` names a slot in a `u8`, and `pass_descriptor` casts
+// the array index into one. Bounded here rather than checked there: the cast
+// is lossless for every count this constant can hold, and a wire that grew
+// past it should stop the build rather than renumber slot 256 as slot 0.
+const _: () = assert!(COLOR_ATTACHMENTS <= u8::MAX as usize + 1);
 
 /// Which of the pass's fixed slots an attachment is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -130,6 +147,18 @@ pub struct Attachment {
     pub resolve_depth_plane: u16,
     pub load: LoadAction,
     pub store: StoreAction,
+    /// What the store action is asked to do beyond storing.
+    ///
+    /// The wire prefix has carried this word since the layout was measured and
+    /// nothing here read it, which made a pass asking for a resolve at
+    /// programmable sample positions indistinguishable from one asking for the
+    /// ordinary resolve. It is on the attachment rather than on the pass
+    /// because the guest sets it per slot — the capture drives colour, depth
+    /// and stencil separately and gets three independent words.
+    ///
+    /// Carried, not decided. Whether a host can resolve at custom sample
+    /// positions is an executor's question, and this crate names none.
+    pub store_options: StoreActionOptions,
     /// The value this slot is cleared to, as the guest's bits.
     ///
     /// Four words, interpreted by [`Self::slot`] rather than by a tag: a colour
@@ -167,6 +196,7 @@ impl Attachment {
             resolve_depth_plane: 0,
             load: LoadAction::DontCare,
             store: StoreAction::DontCare,
+            store_options: StoreActionOptions::None,
             clear_bits: [0; 4],
         }
     }
@@ -203,25 +233,19 @@ impl Attachment {
     /// property, and only one of the fields is non-zero for a given one.
     #[must_use]
     pub const fn subresource(&self) -> SubresourceRange {
-        SubresourceRange {
-            base_level: self.level as u32,
-            level_count: 1,
-            base_slice: self.slice as u32 + self.depth_plane as u32,
-            slice_count: 1,
-            plane: 0,
-        }
+        SubresourceRange::one(
+            self.slice as u32 + self.depth_plane as u32,
+            self.level as u32,
+        )
     }
 
     /// The subresource the resolve target receives.
     #[must_use]
     pub const fn resolve_subresource(&self) -> SubresourceRange {
-        SubresourceRange {
-            base_level: self.resolve_level as u32,
-            level_count: 1,
-            base_slice: self.resolve_slice as u32 + self.resolve_depth_plane as u32,
-            slice_count: 1,
-            plane: 0,
-        }
+        SubresourceRange::one(
+            self.resolve_slice as u32 + self.resolve_depth_plane as u32,
+            self.resolve_level as u32,
+        )
     }
 
     /// How the pass accesses the attached texture, if it is attached.
@@ -272,6 +296,28 @@ pub struct PassDescriptor {
     /// names no buffer, so a model that took the buffer from the draw record
     /// would find none.
     pub visibility_result_buffer: Option<VisibilityResultBuffer>,
+    /// How the depth slot reduces its samples into its resolve target.
+    ///
+    /// On the descriptor and not on [`Attachment`] because the record carries
+    /// it on the depth and stencil bodies only — a colour slot has no such
+    /// word — and because the two slots' filters are two ordinal spaces. A
+    /// field on the shared attachment type would be a colour slot able to hold
+    /// a depth filter, and a single filter type would make `1` mean `Min` and
+    /// `DepthResolvedSample` at once.
+    ///
+    /// It was decoded by the wire layer and read by nothing until now, which
+    /// made a pass asking to resolve depth at the furthest sample
+    /// indistinguishable from one asking for sample zero. Those pick different
+    /// depths out of the same samples, and the guest reads the result back as
+    /// geometry — so the symptom is wrong occlusion later rather than a wrong
+    /// frame now.
+    pub depth_resolve_filter: DepthResolveFilter,
+    /// How the stencil slot reduces its samples into its resolve target.
+    ///
+    /// [`StencilResolveFilter::DepthResolvedSample`] takes the stencil of
+    /// whichever sample the *depth* filter chose, so this word is also where
+    /// the dependency between the two resolves is stated.
+    pub stencil_resolve_filter: StencilResolveFilter,
     pub extent: RenderTargetExtent,
 }
 
@@ -288,6 +334,8 @@ impl PassDescriptor {
             depth: Attachment::unattached(AttachmentSlot::Depth),
             stencil: Attachment::unattached(AttachmentSlot::Stencil),
             visibility_result_buffer: None,
+            depth_resolve_filter: DepthResolveFilter::Sample0,
+            stencil_resolve_filter: StencilResolveFilter::Sample0,
             extent: RenderTargetExtent::default(),
         }
     }
@@ -314,6 +362,17 @@ impl PassDescriptor {
     #[must_use]
     pub fn participations(&self) -> Vec<Participation> {
         let mut out = Vec::with_capacity(COLOR_ATTACHMENTS + 4);
+        self.extend_participations(&mut out);
+        out
+    }
+
+    /// [`Self::participations`], appended to a buffer the caller owns.
+    ///
+    /// The shape [`crate::exec::ResolvedOperation::participations`] needs: a
+    /// pass descriptor is reached once per `writeDescriptor` record, and a
+    /// fresh `Vec` for each would be an allocation per pass. The owning method
+    /// above stays for the readings that want a value.
+    pub fn extend_participations(&self, out: &mut Vec<Participation>) {
         for attachment in self.attached() {
             let (Some(texture), Some(mode)) = (attachment.texture, attachment.access_mode()) else {
                 continue;
@@ -346,7 +405,6 @@ impl PassDescriptor {
                 api_stages: NO_STAGES,
             });
         }
-        out
     }
 
     /// The byte range one occlusion query occupies, at `offset`.
@@ -372,6 +430,38 @@ const NO_STAGES: u32 = 0;
 
 #[cfg(test)]
 mod tests {
+    /// The claim `COLOR_ATTACHMENTS` is derived for: an empty descriptor has
+    /// exactly one slot per colour attachment the wire body carries, each
+    /// named by its own index.
+    ///
+    /// `crate::resolve::pass_descriptor` walks the wire array and writes
+    /// `descriptor.color[index]`, so a descriptor with fewer slots than the
+    /// body has is an index out of range on a guest render pass --- a panic on
+    /// guest data, which is the one failure this model may not have.
+    #[test]
+    fn a_descriptor_has_one_colour_slot_per_slot_the_wire_carries() {
+        let descriptor = PassDescriptor::empty();
+        assert_eq!(
+            descriptor.color.len(),
+            reims_vgpu_protocol::decode::RENDER_PASS_COLOR_ATTACHMENTS
+        );
+        // Not the same statement twice: the line above compares the descriptor
+        // to the wire's count, and this one proves that count really is the
+        // length of the array `pass_descriptor` walks.
+        assert_eq!(
+            core::mem::size_of_val(&descriptor.color) / core::mem::size_of::<Attachment>(),
+            core::mem::size_of::<
+                [reims_vgpu_protocol::decode::ColorAttachmentBody;
+                    reims_vgpu_protocol::decode::RENDER_PASS_COLOR_ATTACHMENTS],
+            >() / core::mem::size_of::<reims_vgpu_protocol::decode::ColorAttachmentBody>()
+        );
+        for (index, attachment) in descriptor.color.iter().enumerate() {
+            assert_eq!(
+                attachment.slot,
+                AttachmentSlot::Color(u8::try_from(index).expect("bounded by the const assertion"))
+            );
+        }
+    }
 
     /// A clear value is read through the slot that owns it, and every other
     /// reading is `None`. There is no tag to disagree with the slot, which is

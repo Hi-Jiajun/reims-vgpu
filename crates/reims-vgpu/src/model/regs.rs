@@ -312,9 +312,8 @@ pub const STAMP_SLOT_LEN: u32 = 4;
 /// second header parse and no sub-packet loop. Opcode 1's entry is the display
 /// pipe's shared-state page setup, whose payload is
 /// `{u32 pipe index, u32 page PFN}` — which is byte-for-byte what
-/// [`CHILD_SHARED_STATE_INDEX`], [`CHILD_SHARED_STATE_PFN`] and
-/// [`CHILD_SHARED_STATE_LEN`] already say, decoded independently from live
-/// traffic on the child channel.
+/// `reims_vgpu_protocol::fifo::decode_shared_state` reads, recovered
+/// independently from live traffic on the child channel.
 ///
 /// So the old arm read a **display pipe index** and dispatched the root table on
 /// it. Nothing has ever sent opcode 1 on the root channel here, which is why no
@@ -546,13 +545,11 @@ pub const CHILD_OP_DISCARD_RESOURCES: u16 = 0x3f;
 /// command.
 pub const CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN: u16 = 0x40;
 
-/// `CmdDisplayTransaction2_DEPRECATED` (op 6) trailer `[pipe][surface][task]`:
-/// surface id offset. `CmdDisplaySwapMapping` (op 8) is a different command with
-/// a different payload — see `DISPLAY_SWAP_MAPPING`, which is not this offset.
-pub const DISPLAY_TRANSACTION2_SURFACE_ID: usize = 0x04;
-/// `CmdDisplayTransaction3` (op 7) trailer is `[pipe][task][surface][gamma…]`,
-/// so its surface and task words are swapped relative to op 6's.
-pub const DISPLAY_TRANSACTION3_SURFACE_ID: usize = 0x08;
+// The three present commands' trailer offsets and widths live in
+// `reims_vgpu_protocol::present`, which is the layer allowed to say what a wire
+// tag means. They were here, in `drain`'s `display_txn_trailer_slots` and in
+// `drain`'s tests, and the tests read the same table the decoder did — so the
+// one thing a wrong offset would break was the one thing nothing checked.
 
 /// Every child-channel command this device names, with the name a log line and
 /// a ledger row spell it by.
@@ -675,8 +672,9 @@ pub const CHILD_REG_HEAD: u64 = 0x04;
 ///
 /// `drain::child` takes head, tail, stamp index and base PFN out of this block
 /// every doorbell; this word sits between head and stamp index and no product
-/// path touches it. It stays named for the reason [`DISPLAY_SWAP_DISPLAY`]
-/// does — a guest field with no name is the one nobody notices being ignored —
+/// path touches it. It stays named for the reason a present's display index is
+/// decoded rather than skipped — a guest field with no name is the one nobody
+/// notices being ignored —
 /// and because deleting it leaves the block map skipping `0x08` with nothing
 /// saying what lives there, which is how a later offset gets read from the
 /// wrong word.
@@ -691,71 +689,37 @@ pub const CHILD_REG_STAMP_INDEX: u64 = 0x0c;
 pub const CHILD_REG_BASE_PFN: u64 = 0x10;
 pub const CHILD_RING_PFN_ENTRY_LEN: u64 = 4;
 
-pub const DEVICE_INFO_REPLY_PAIR_LEN: usize = 8;
-
-/// How many arms the guest's key walker has, counting the terminator — so the
-/// reply may name every key **strictly below** this word.
+/// Bytes in one `(key, value)` pair of an info-query reply.
 ///
-/// **It is a table length, not a highest key**, and the difference is the whole
-/// reason it is spelled this way. The guest writes a literal, and the literal is
-/// `highest_key_it_parses + 1`: 18 against a walker whose jump table runs
-/// `case 0` (the terminator) through `case 17`. The sibling `CmdGetComputeInfo`
-/// carries the same field and writes 5 against a table of `case 0` through
-/// `case 4`. Read as a maximum, that 5 invents a key 5 that has no arm, no
-/// field and no meaning — the guest's walker sends it to the same skip arm as
-/// key 900.
-///
-/// Apple's own host writes the reply under `keyLimit > K`, which is this
-/// polarity exactly.
-///
-/// A separate word from [`DEVICE_INFO_TAHOE_COUNT`], bounding a different thing:
-/// this bounds *which* keys the reply may name, that one bounds *how many* pairs
-/// fit. A reply is correct only when it respects both.
-pub const DEVICE_INFO_TAHOE_KEY_TABLE_LEN: usize = 0x00;
+/// Derived rather than written: the layout is
+/// [`reims_vgpu_protocol::info_reply`]'s, and a second literal here is a number
+/// that can disagree with the encoder that produces the bytes.
+pub const DEVICE_INFO_REPLY_PAIR_LEN: usize = crate::protocol::info_reply::PAIR_LEN;
 
-/// How many 8-byte pairs the guest's reply buffer holds — its allocation size in
-/// bytes, shifted right by three. One page, so 512 on a 4 KiB guest.
-///
-/// The guest re-reads this word from its own staging copy to bound the walk, so
-/// it is never the host's to widen. The walk ends at whichever comes first, this
-/// many pairs or a key of 0.
-pub const DEVICE_INFO_TAHOE_COUNT: usize = 0x04;
-pub const DEVICE_INFO_TAHOE_REPLY_PFN: usize = 0x08;
+// The two device-info request forms — which words each carries and where —
+// live in `reims_vgpu_protocol::fifo`'s `DeviceInfoForm`, with the recovered
+// reading of the key-table length and the pair capacity. They were here as four
+// offsets that only `process_root_packet` read, and the two forms' offsets
+// collide: reading either request at the other's takes the count for a page
+// frame.
 
-/// The older request carries no parse ceiling — the record is the count and the
-/// PFN and nothing before them.
-///
-/// A `max_key` here would sit at these same two offsets, so reading one that is
-/// not there would take the count for a ceiling and the PFN for a count. Nothing
-/// this device has driven issues this opcode, and no disassembly of its builder
-/// has been read, so the reply is bounded by the count alone and by nothing else.
-pub const DEVICE_INFO_MONTEREY_COUNT: usize = 0x00;
-pub const DEVICE_INFO_MONTEREY_REPLY_PFN: usize = 0x04;
+// `CmdDefineTask2`'s four fields — including the doubled first word carrying the
+// task id and the kernel-task bit — and `CmdSetObjectList`'s three live in
+// `reims_vgpu_protocol::fifo`, with the floors derived from the last field
+// rather than written as literals beside the offsets they have to agree with.
 
-pub const DEFINE_TASK_RAW_ID: usize = 0x00;
-pub const DEFINE_TASK_LENGTH: usize = 0x04;
-pub const DEFINE_TASK_DIRECTORY_PFN: usize = 0x0c;
-pub const DEFINE_TASK_LEN: usize = 16;
-pub const DEFINE_TASK_ID_SHIFT: u32 = 1;
+// `CmdDisplaySwapMapping`'s trailer offsets moved to
+// `reims_vgpu_protocol::present` with the other two forms' — see the note above
+// `DISPLAY_SHARED_*`. Its display index is decoded there rather than named and
+// ignored here: whether ignoring it is correct is still not established, and it
+// needs the display count this device advertises, which no boot on this rig has
+// measured.
 
-pub const SET_OBJECT_LIST_TASK_ID: usize = 0x00;
-pub const SET_OBJECT_LIST_PFN: usize = 0x04;
-pub const SET_OBJECT_LIST_COUNT: usize = 0x08;
-pub const SET_OBJECT_LIST_LEN: usize = 12;
-
-// `CmdDisplaySwapMapping`'s trailer is `[display][_][mapping]`. Only the
-// mapping is read; the display index has no reader here, and it stays named
-// because a decoded guest field with no name is the one nobody notices being
-// ignored. Whether ignoring it is correct is not established — it needs the
-// display count this device advertises, which no boot on this rig has
-// measured. Its own length lives at `display_txn_trailer_len`.
-#[allow(dead_code)] // named on purpose and read by nothing — see above.
-pub const DISPLAY_SWAP_DISPLAY: usize = 0x00;
-pub const DISPLAY_SWAP_MAPPING: usize = 0x08;
-
-pub const CHILD_SHARED_STATE_INDEX: usize = 0x00;
-pub const CHILD_SHARED_STATE_PFN: usize = 0x04;
-pub const CHILD_SHARED_STATE_LEN: usize = 8;
+// `CmdDisplaySetSharedStatePage`'s two words moved to
+// `reims_vgpu_protocol::fifo` with the rest of the payload layouts, for the
+// reason the note above gives: this file's table is opcodes and registers, and
+// a record's field offsets belong to the crate that owns layouts. What the
+// device does with the page it names is still the display layer's.
 
 pub const DISPLAY_SHARED_PENDING: u64 = 0x100;
 pub const DISPLAY_SHARED_ENABLE_MASK: u64 = 0x104;
@@ -1114,7 +1078,6 @@ pub const CURSOR_GLYPH_BPP: u32 = 4;
 /// all — a silent loss in C, which is exactly what this constant existing in
 /// Rust is supposed to prevent.
 pub const CURSOR_MAX_DIM: u32 = 512;
-pub const CURSOR_GLYPH_PAYLOAD_LEN: usize = 0x2c;
 
 pub const MMIO_U32: u32 = 4;
 pub const MMIO_U64: u32 = 8;
@@ -1434,7 +1397,8 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// removing values whose meaning is not established would be trading one guess
 /// for another. They are not *sent* to a guest that has not asked for them:
 /// every request carries the guest's own exclusive parse ceiling
-/// ([`DEVICE_INFO_TAHOE_KEY_TABLE_LEN`]), and `reply_device_info` names only the keys
+/// (`reims_vgpu_protocol::fifo::DeviceInfoRequest::key_table_len`), and
+/// `reply_device_info` names only the keys
 /// below it. So this table is the set this device *can* answer, and the guest
 /// picks the prefix of it that it understands.
 ///

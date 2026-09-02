@@ -696,6 +696,29 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         None
     };
 
+    // The fifth encoder raster state, and the one this rail cannot send.
+    // `setLineWidth:` is on the wire and `MTLRenderCommandEncoder` has no
+    // public setter for it, so a width other than the default is guest work
+    // this arm drops — and it says so by name rather than by a counter,
+    // because a number cannot say which pipeline drew a hairline where the
+    // guest asked for a thick line. Once per `(pipeline, slug)`: the guest
+    // sets a width per encoder and draws many times under it.
+    //
+    // Only for a width that differs from Metal's own default. `None` is a
+    // stream that set none and 1.0 is a stream that set the default, and
+    // neither loses anything — reporting them would flood a log with draws
+    // that rasterize exactly as asked.
+    if let Some(width) = req.line_width {
+        if width != 1.0 && degrade_log_first(req.pipeline_ref, "metal_line_width_unsupported") {
+            crate::observe::fail(format!(
+                "metal_line_width_unsupported pipe={} width={width} \
+                 (MTLRenderCommandEncoder has no public line-width setter; \
+                 lines rasterize at 1.0)",
+                req.pipeline_ref
+            ));
+        }
+    }
+
     let depth_bias_state = req.depth_bias.map(|d| ReimsVgpuDepthBiasState {
         depth_bias: d[0],
         slope_scale: d[1],

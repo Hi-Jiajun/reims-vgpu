@@ -511,6 +511,37 @@ pub(super) fn note_pass_raster_sample_count_unsupported(
     drop
 }
 
+/// An attachment's store-action options asking for something this device does
+/// not provide. See [`StreamDrawDrop::StoreActionOptionsUnsupported`].
+///
+/// The census route keeps the name it had while this was a bare count, on the
+/// reading [`note_pass_array_length_unsupported`] states — except that the
+/// population shrinks with the verdict here, because the count used to fire on
+/// every record and now fires only on the ones this device cannot honour. That
+/// is the same narrowing the raster sample count took when it stopped counting
+/// its API default.
+///
+/// Deduped by [`StreamDrawDrop::latch`] on the options value and the
+/// attachment, because which option a guest asks for and on which attachment
+/// are the two things that vary.
+pub(super) fn note_store_action_options_unsupported(
+    task_id: u32,
+    aspect: &'static str,
+    slot: u32,
+    options: u64,
+) -> StreamDrawDrop {
+    crate::runtime::drain::note_store_route("render_store_action_options_dropped");
+    let drop = StreamDrawDrop::StoreActionOptionsUnsupported {
+        aspect,
+        slot,
+        options,
+    };
+    crate::observe::Emit::decline("stream_pass", &drop)
+        .field("task", task_id)
+        .fail_once(drop.latch());
+    drop
+}
+
 /// A colour attachment naming a mip, a slice, a depth plane or a multisample
 /// resolve target this device renders past.
 /// See [`StreamDrawDrop::ColorSubresourceUnsupported`].

@@ -7,7 +7,7 @@
 //! `setBuffer:offset:atIndex:` does not read the buffer. It writes a slot in
 //! the encoder's binding table, and the memory is touched later, by whatever
 //! dispatch runs with that slot still bound. That is the whole reason
-//! [`ComputeOp::record_access`] answers `None` for every bind: a model that
+//! [`ComputeOp::participations`] is empty for every bind: a model that
 //! produced an access at the bind would order against memory the guest may
 //! rebind before anything reads it.
 //!
@@ -38,7 +38,7 @@
 //! not the same type: one is threads and the other is texels, and a function
 //! that accepted either would accept a grid where a copy region belongs.
 
-use crate::access::AccessMode;
+use crate::access::{Participation, Participations};
 pub use crate::bind::{BindSpan, BufferBinding, IndirectSource, LodClamp, ObjectBinding};
 use crate::identity::ResourceId;
 pub use reims_vgpu_protocol::compute::{ComputeKind, DispatchType};
@@ -162,22 +162,6 @@ pub enum ComputeOp {
     Dispatch(DispatchOp),
 }
 
-/// The memory an operation names in its own record.
-///
-/// One entry at most: the only compute records that name memory are the two
-/// indirect dispatches and the indirect stage-in region, and each names one
-/// buffer. Everything a dispatch reads *through the binding table* is the
-/// encoder's to supply, and is deliberately not here — this answers "what did
-/// this record say", and the encoder answers "what was bound when it ran".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecordAccess {
-    pub buffer: ResourceId,
-    pub offset: u64,
-    /// The byte length, when the argument layout is established.
-    pub length: Option<u64>,
-    pub mode: AccessMode,
-}
-
 impl ComputeOp {
     /// Which record this is, which is also which opcode carried it.
     #[must_use]
@@ -211,27 +195,31 @@ impl ComputeOp {
 
     /// The memory this record names by itself.
     ///
-    /// Empty for every bind, because a bind touches no memory. That is the
-    /// module's central claim and it is checked by a test over the whole
+    /// One entry at most: the only compute records that name memory are the
+    /// two indirect dispatches and the indirect stage-in region, and each names
+    /// one buffer. Everything a dispatch reads *through the binding table* is
+    /// the encoder's to supply, and is deliberately not here — this answers
+    /// "what did this record say", and the encoder answers "what was bound when
+    /// it ran". Empty for every bind, because a bind touches no memory: that is
+    /// the module's central claim and it is checked by a test over the whole
     /// vocabulary rather than trusted.
     #[must_use]
-    pub const fn record_access(&self) -> Option<RecordAccess> {
+    pub const fn participations(&self) -> Participations {
         let (source, length) = match self {
             Self::Dispatch(dispatch) => match dispatch.indirect_read() {
                 Some(pair) => pair,
-                None => return None,
+                None => return Participations::NONE,
             },
             // No public structure names this argument layout, so the extent is
             // not established and the read is against the whole buffer.
             Self::SetStageInRegionIndirect { source } => (*source, None),
-            _ => return None,
+            _ => return Participations::NONE,
         };
-        Some(RecordAccess {
-            buffer: source.buffer,
-            offset: source.offset,
+        Participations::one(Participation::buffer_read(
+            source.buffer,
+            source.offset,
             length,
-            mode: AccessMode::Read,
-        })
+        ))
     }
 
     /// Whether this record consumes the encoder's accumulated state.
@@ -244,6 +232,7 @@ impl ComputeOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::{AccessMode, ByteRange, ParticipationExtent};
     use crate::identity::{ObjectListRef, SlotGeneration};
     use crate::operation::{classify, OperationClass, OperationHome};
     use reims_vgpu_protocol::closure::{Rail, LEDGER};
@@ -367,7 +356,7 @@ mod tests {
     #[test]
     fn only_the_indirect_records_name_memory() {
         for op in every_op() {
-            let named = op.record_access().is_some();
+            let named = !op.participations().is_empty();
             let expected = matches!(
                 op,
                 ComputeOp::SetStageInRegionIndirect { .. }
@@ -377,10 +366,9 @@ mod tests {
                     )
             );
             assert_eq!(named, expected, "{:?}", op.kind());
-            if let Some(access) = op.record_access() {
+            for access in op.participations() {
                 assert_eq!(access.mode, AccessMode::Read);
-                assert_eq!(access.buffer, res(9));
-                assert_eq!(access.offset, 0x40);
+                assert_eq!(access.resource, res(9));
             }
         }
     }
@@ -394,8 +382,11 @@ mod tests {
             threads_per_group: ComputeExtent::default(),
         });
         assert_eq!(
-            threadgroups.record_access().expect("reads").length,
-            Some(DISPATCH_THREADGROUPS_INDIRECT_ARGS_BYTES)
+            threadgroups.participations()[0].extent,
+            ParticipationExtent::Range(ByteRange {
+                offset: 0x40,
+                length: DISPATCH_THREADGROUPS_INDIRECT_ARGS_BYTES,
+            })
         );
         assert_eq!(DISPATCH_THREADGROUPS_INDIRECT_ARGS_BYTES, 12);
 
@@ -403,7 +394,10 @@ mod tests {
             ComputeOp::Dispatch(DispatchOp::ThreadsIndirect { source: source() }),
             ComputeOp::SetStageInRegionIndirect { source: source() },
         ] {
-            assert_eq!(op.record_access().expect("reads").length, None);
+            // No established layout, so the claim widens to the whole buffer
+            // rather than narrowing on a guessed span. The offset is not lost
+            // by that — see `Participation::buffer_read`.
+            assert_eq!(op.participations()[0].extent, ParticipationExtent::Whole);
         }
     }
 
@@ -416,7 +410,7 @@ mod tests {
             offset: 0x10,
             stride: None,
         };
-        assert_eq!(op.record_access(), None);
+        assert!(op.participations().is_empty());
         assert!(!op.is_dispatch());
     }
 

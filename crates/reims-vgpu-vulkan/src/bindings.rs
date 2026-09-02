@@ -63,6 +63,12 @@ impl SlotMask {
         self.words[word] |= 1 << (slot % 64);
     }
 
+    /// Whether `slot` is in the mask.
+    ///
+    /// For a caller asking about one slot; [`Self::slots`] is what an emitter
+    /// walks, and is therefore what the driven sweep drives. Inverting this
+    /// is not observable through that sweep, so the tests that name single
+    /// slots are the ones that hold it.
     #[must_use]
     pub fn contains(&self, slot: usize) -> bool {
         self.words
@@ -84,33 +90,44 @@ impl SlotMask {
         self.words.iter_mut().for_each(|w| *w = 0);
     }
 
-    fn fill(&mut self, slots: usize) {
-        self.words.resize(slots.div_ceil(64), 0);
-        for (i, word) in self.words.iter_mut().enumerate() {
-            let remaining = slots.saturating_sub(i * 64);
-            *word = if remaining >= 64 {
-                u64::MAX
-            } else if remaining == 0 {
-                0
-            } else {
-                (1u64 << remaining) - 1
-            };
+    /// Make room for `slots` without disturbing the bits already held.
+    ///
+    /// Redundant against every mask this module makes — they are all built by
+    /// [`Self::with_capacity`] at the table's own width — so no mutation of it
+    /// is observable and the driven sweep cannot catch one. Kept because what
+    /// it prevents is an index out of range in [`mark_bound`], which is a panic
+    /// rather than a wrong answer, and because the alternative is a width
+    /// assumption two functions have to keep agreeing about.
+    fn reserve(&mut self, slots: usize) {
+        let words = slots.div_ceil(64);
+        if self.words.len() < words {
+            self.words.resize(words, 0);
         }
     }
 
     /// The slots in the mask, ascending.
-    #[must_use]
-    pub fn slots(&self) -> Vec<usize> {
-        let mut out = Vec::with_capacity(self.len());
-        for (i, word) in self.words.iter().enumerate() {
-            let mut bits = *word;
-            while bits != 0 {
+    ///
+    /// An iterator and not a `Vec`. This is the door an emitter walks on every
+    /// draw that rebinds anything, once per class, and the walk keeps no state
+    /// past a word index and the residue of that word --- so the `Vec` was
+    /// three allocations per rebinding draw buying nothing. A caller that
+    /// genuinely wants one still collects; what it cannot do is get one
+    /// without asking.
+    pub fn slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words.iter().enumerate().flat_map(|(word, bits)| {
+            let mut bits = *bits;
+            core::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
                 let bit = bits.trailing_zeros() as usize;
-                out.push(i * 64 + bit);
+                // Clear the lowest set bit, so the residue is what is left to
+                // report and the loop terminates on the population count
+                // rather than on the word width.
                 bits &= bits - 1;
-            }
-        }
-        out
+                Some(word * 64 + bit)
+            })
+        })
     }
 }
 
@@ -148,6 +165,17 @@ pub struct Census {
     /// Times everything was invalidated by a command-buffer boundary or an
     /// incompatible pipeline layout.
     pub disturbances: usize,
+    /// Binds that named a slot past the table and were dropped.
+    ///
+    /// Counted rather than left to be inferred from the others. A dropped
+    /// bind is neither a change nor a redundancy, so without this the three
+    /// counters silently stop adding up to the binds the guest issued, and the
+    /// only evidence of guest work this table refused is a shader reading a
+    /// descriptor nobody wrote. Non-zero means either the guest contradicted
+    /// its own argument-table sizes or this table was built with the wrong
+    /// ones — and those are worth telling apart, which needs the number to
+    /// exist.
+    pub ignored: usize,
 }
 
 /// One shader-visible table's contents and its dirty set.
@@ -194,6 +222,7 @@ impl BindingTable {
     /// on this pipeline can read.
     pub fn bind_buffer(&mut self, slot: usize, binding: Option<BufferBinding>) -> bool {
         let Some(current) = self.buffers.get_mut(slot) else {
+            self.census.ignored += 1;
             return false;
         };
         if *current == binding {
@@ -209,6 +238,7 @@ impl BindingTable {
     /// Bind a texture slot, or unbind it with `None`.
     pub fn bind_texture(&mut self, slot: usize, binding: Option<ObjectBinding>) -> bool {
         let Some(current) = self.textures.get_mut(slot) else {
+            self.census.ignored += 1;
             return false;
         };
         if *current == binding {
@@ -224,6 +254,7 @@ impl BindingTable {
     /// Bind a sampler slot, or unbind it with `None`.
     pub fn bind_sampler(&mut self, slot: usize, binding: Option<ObjectBinding>) -> bool {
         let Some(current) = self.samplers.get_mut(slot) else {
+            self.census.ignored += 1;
             return false;
         };
         if *current == binding {
@@ -300,16 +331,26 @@ impl BindingTable {
     }
 }
 
+/// Add every bound slot to `mask`, keeping what it already holds.
+///
+/// A union and not a replacement. A slot the guest unbound since the last
+/// emission is dirty and *not* bound, so a mask built from the bound set alone
+/// would clear it — and the emission that followed would write every bound
+/// slot into a live set and leave the unbound one naming the resource the
+/// guest just released. A disturbance is a claim about what the driver
+/// believes, never permission to forget what the guest did.
+///
+/// A word at a time so the cost is the same as writing the whole mask.
 fn mark_bound<T>(slots: &[Option<T>], mask: &mut SlotMask) {
-    mask.fill(slots.len());
-    for (slot, entry) in slots.iter().enumerate() {
-        if entry.is_none() {
-            // `fill` set every bit; clearing the unbound ones is cheaper than
-            // testing each one before setting it, and the result is the same
-            // set.
-            let word = slot / 64;
-            mask.words[word] &= !(1 << (slot % 64));
+    mask.reserve(slots.len());
+    for (index, chunk) in slots.chunks(64).enumerate() {
+        let mut bound = 0u64;
+        for (bit, entry) in chunk.iter().enumerate() {
+            if entry.is_some() {
+                bound |= 1 << bit;
+            }
         }
+        mask.words[index] |= bound;
     }
 }
 
@@ -396,7 +437,7 @@ mod tests {
         t.bind_buffer(3, buffer(3, 256));
         t.bind_buffer(5, buffer(99, 0));
         let dirty = t.take_dirty();
-        assert_eq!(dirty.buffers.slots(), vec![3, 5]);
+        assert_eq!(dirty.buffers.slots().collect::<Vec<_>>(), vec![3, 5]);
         assert!(dirty.textures.is_empty());
     }
 
@@ -408,7 +449,7 @@ mod tests {
         t.bind_buffer(0, buffer(1, 0));
         emit(&mut t);
         assert!(t.bind_buffer(0, buffer(1, 64)));
-        assert_eq!(t.take_dirty().buffers.slots(), vec![0]);
+        assert_eq!(t.take_dirty().buffers.slots().collect::<Vec<_>>(), vec![0]);
     }
 
     /// Two different resources may occupy one native handle across a retire and
@@ -433,7 +474,7 @@ mod tests {
         t.bind_texture(4, texture(1));
         emit(&mut t);
         assert!(t.bind_texture(4, None));
-        assert_eq!(t.take_dirty().textures.slots(), vec![4]);
+        assert_eq!(t.take_dirty().textures.slots().collect::<Vec<_>>(), vec![4]);
         assert!(t.texture(4).is_none());
         assert!(!t.bind_texture(4, None), "it was already unbound");
     }
@@ -452,9 +493,9 @@ mod tests {
 
         t.disturb_all();
         let dirty = t.take_dirty();
-        assert_eq!(dirty.buffers.slots(), vec![0, 7]);
+        assert_eq!(dirty.buffers.slots().collect::<Vec<_>>(), vec![0, 7]);
         assert_eq!(
-            dirty.textures.slots(),
+            dirty.textures.slots().collect::<Vec<_>>(),
             vec![31, 64],
             "and the mask spans more than one word"
         );
@@ -490,6 +531,284 @@ mod tests {
         assert!(t.is_clean(), "there is nothing left to write");
     }
 
+    /// A driven history of the table against a shadow that knows only what the
+    /// *calls* said.
+    ///
+    /// The shadow is two plain arrays per class and no state machine: `held` is
+    /// what the guest last bound, updated from the bind arguments, and
+    /// `written` is what the descriptor set contains, updated only when an
+    /// emission hands the slot over. Nothing in it consults the table, so the
+    /// two cannot be wrong together.
+    ///
+    /// The claim under test is the one the module exists for and the one a
+    /// stale descriptor breaks: **after an emission, the set contains exactly
+    /// what the guest bound.** Not "the bound slots are right" — a slot the
+    /// guest *unbound* must stop naming the resource it named, because that
+    /// resource can then be freed, and a weaker invariant would pass the very
+    /// history that goes wrong.
+    ///
+    /// `disturb_all` therefore leaves `written` alone. It is a claim about what
+    /// the driver *believes*, not about what the set holds: an incompatible
+    /// pipeline layout unbinds the set and changes none of its descriptors, and
+    /// the emission that follows may reuse that same live set. Modelling it as
+    /// "the set is empty now" would describe only the fresh-set path and would
+    /// pass the reuse path, which is where the fault is.
+    ///
+    /// `reset` is the one place the sweep assumes a pairing the table cannot
+    /// enforce: it means the objects are gone, and the caller resets the
+    /// descriptor pool with it — `SetRing::reset` is the other half. The shadow
+    /// clears both sides to match, and that assumption is stated here rather
+    /// than hidden in the arithmetic.
+    #[test]
+    fn a_driven_history_never_leaves_the_set_disagreeing_with_the_guest() {
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        struct Shadow {
+            buffers: Vec<Option<BufferBinding>>,
+            textures: Vec<Option<ObjectBinding>>,
+            samplers: Vec<Option<ObjectBinding>>,
+        }
+
+        impl Shadow {
+            fn new(b: usize, t: usize, s: usize) -> Self {
+                Self {
+                    buffers: vec![None; b],
+                    textures: vec![None; t],
+                    samplers: vec![None; s],
+                }
+            }
+        }
+
+        let mut rng: u64 = 0x243f_6a88_85a3_08d3;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        // Counted so a floor can say the interesting paths were driven rather
+        // than assumed. `stale_window` is the fault's exact shape: an unbind
+        // that a disturbance sat on top of before it was emitted.
+        let (mut changed, mut redundant, mut ignored) = (0u64, 0u64, 0u64);
+        let (mut unbinds, mut emissions, mut disturbances, mut resets) = (0u64, 0u64, 0u64, 0u64);
+        let mut stale_window = 0u64;
+
+        for (buffers, textures, samplers) in [(6usize, 5usize, 4usize), (3, 70, 2)] {
+            for _ in 0..300 {
+                let mut table = BindingTable::new(buffers, textures, samplers);
+                let mut held = Shadow::new(buffers, textures, samplers);
+                let mut written = Shadow::new(buffers, textures, samplers);
+                // Slots unbound since the last emission, so the counter below
+                // can say the fault's window was actually entered.
+                let mut pending_unbind = false;
+                let mut binds = 0u64;
+
+                for _ in 0..60 {
+                    // Steered: three quarters of the operations are binds, so
+                    // the table spends its history in the state it exists for
+                    // rather than in emissions over nothing.
+                    match next() % 16 {
+                        0..=8 => {
+                            binds += 1;
+                            let class = next() % 3;
+                            // Occasionally past the table, which is the third
+                            // census answer and must not be a change.
+                            let width = match class {
+                                0 => buffers,
+                                1 => textures,
+                                _ => samplers,
+                            };
+                            let slot = if next() % 8 == 0 {
+                                width + (next() as usize % 4)
+                            } else {
+                                next() as usize % width.max(1)
+                            };
+                            // A small value space, so a rebind of the same
+                            // value is frequent and the redundant path is real.
+                            let name = (next() % 3) as u32;
+                            let unbind = next() % 4 == 0;
+                            let before = table.census();
+                            let was_clean = table.is_clean();
+                            // Whether the bind names what is already there.
+                            // Read off the shadow, so the claim below is not
+                            // the table agreeing with itself.
+                            let names_the_same;
+                            match class {
+                                0 => {
+                                    let value = if unbind { None } else { buffer(name, 0) };
+                                    names_the_same = held.buffers.get(slot) == Some(&value);
+                                    table.bind_buffer(slot, value);
+                                    if let Some(entry) = held.buffers.get_mut(slot) {
+                                        if *entry != value && value.is_none() {
+                                            pending_unbind = true;
+                                        }
+                                        *entry = value;
+                                    }
+                                }
+                                1 => {
+                                    let value = if unbind { None } else { texture(name) };
+                                    names_the_same = held.textures.get(slot) == Some(&value);
+                                    table.bind_texture(slot, value);
+                                    if let Some(entry) = held.textures.get_mut(slot) {
+                                        if *entry != value && value.is_none() {
+                                            pending_unbind = true;
+                                        }
+                                        *entry = value;
+                                    }
+                                }
+                                _ => {
+                                    let value = if unbind { None } else { texture(name) };
+                                    names_the_same = held.samplers.get(slot) == Some(&value);
+                                    table.bind_sampler(slot, value);
+                                    if let Some(entry) = held.samplers.get_mut(slot) {
+                                        if *entry != value && value.is_none() {
+                                            pending_unbind = true;
+                                        }
+                                        *entry = value;
+                                    }
+                                }
+                            }
+                            if unbind && slot < width {
+                                unbinds += 1;
+                            }
+                            // The gate the whole module exists for: a guest
+                            // binding the forty textures it already had must
+                            // leave a clean table clean, or the steady-state
+                            // draw rebuilds its bindings every frame. Asserted
+                            // per bind rather than only through the census
+                            // floors, which aggregate the three classes and so
+                            // let one of them stop detecting redundancy while
+                            // the other two cover for it.
+                            if was_clean && names_the_same {
+                                assert!(
+                                    table.is_clean(),
+                                    "a bind that changed nothing dirtied the table"
+                                );
+                            }
+                            let after = table.census();
+                            changed += (after.changed - before.changed) as u64;
+                            redundant += (after.redundant - before.redundant) as u64;
+                            ignored += (after.ignored - before.ignored) as u64;
+                        }
+                        9..=10 => {
+                            // An emission. Hands over exactly the slots the
+                            // table reports, and nothing else.
+                            if table.is_clean() {
+                                // The claim a clean draw rests on: it writes
+                                // nothing, so the set must already agree.
+                                assert_eq!(written, held, "clean and disagreeing");
+                            }
+                            let dirty = table.take_dirty();
+                            emissions += 1;
+                            for slot in dirty.buffers.slots() {
+                                written.buffers[slot] = held.buffers[slot];
+                            }
+                            for slot in dirty.textures.slots() {
+                                written.textures[slot] = held.textures[slot];
+                            }
+                            for slot in dirty.samplers.slots() {
+                                written.samplers[slot] = held.samplers[slot];
+                            }
+                            pending_unbind = false;
+                            assert_eq!(
+                                written, held,
+                                "the set disagrees with the guest after an emission"
+                            );
+                            // And the emission took everything: a table still
+                            // owed a write after handing one over would emit
+                            // the same slots on the next draw forever.
+                            assert!(table.is_clean(), "an emission left the table dirty");
+                        }
+                        11..=13 => {
+                            if pending_unbind {
+                                stale_window += 1;
+                            }
+                            table.disturb_all();
+                            disturbances += 1;
+                            // Deliberately not touching `written`: see the doc.
+                        }
+                        // Gated inside the arm rather than given a narrower
+                        // range: a reset truncates a history, and too many of
+                        // them leave every history too short to reach the
+                        // states the sweep is for.
+                        14 if next() % 4 == 0 => {
+                            table.reset();
+                            resets += 1;
+                            held = Shadow::new(buffers, textures, samplers);
+                            written = Shadow::new(buffers, textures, samplers);
+                            assert!(table.is_clean());
+                        }
+                        _ => {
+                            if table.is_clean() {
+                                assert_eq!(written, held, "clean and disagreeing");
+                            }
+                        }
+                    }
+                }
+
+                let census = table.census();
+                assert_eq!(
+                    census.changed + census.redundant + census.ignored,
+                    binds as usize,
+                    "every bind lands in exactly one census answer"
+                );
+            }
+        }
+
+        // Floors on each path separately, never on an aggregate: one busy path
+        // cannot cover for another that never ran.
+        assert!(changed > 2_000, "changed={changed}");
+        assert!(redundant > 2_000, "redundant={redundant}");
+        assert!(ignored > 200, "ignored={ignored}");
+        assert!(unbinds > 1_000, "unbinds={unbinds}");
+        assert!(emissions > 3_000, "emissions={emissions}");
+        assert!(disturbances > 3_000, "disturbances={disturbances}");
+        assert!(resets > 400, "resets={resets}");
+        // The fault's own window, without which the sweep would prove only
+        // that the ordinary path works.
+        assert!(stale_window > 1_000, "stale_window={stale_window}");
+    }
+
+    /// A slot the guest unbound is a change, and a disturbance is a claim
+    /// about the driver's belief rather than permission to forget it. The
+    /// disturbance built its mask from the *bound* slots and overwrote the
+    /// dirty set with it, so the unbind's bit was cleared; the emission that
+    /// followed took a live holder, wrote every bound slot into it, and left
+    /// the unbound slot's descriptor naming the released resource.
+    #[test]
+    fn a_disturbance_does_not_swallow_an_unbind_that_has_not_been_emitted() {
+        let mut t = table();
+        t.bind_texture(5, texture(9));
+        t.bind_texture(6, texture(10));
+        emit(&mut t);
+        assert!(t.is_clean());
+
+        assert!(t.bind_texture(5, None), "an unbind is a change");
+        t.disturb_all();
+
+        let dirty = t.take_dirty();
+        assert!(dirty.textures.contains(5), "the unbind still owes a write");
+        assert!(
+            dirty.textures.contains(6),
+            "and so does the slot still bound"
+        );
+    }
+
+    /// The union must not invent slots either: a disturbance still owes
+    /// nothing for a slot that was never bound.
+    #[test]
+    fn a_disturbance_still_marks_only_what_is_bound_or_already_dirty() {
+        let mut t = BindingTable::new(4, 4, 4);
+        t.bind_texture(2, texture(1));
+        emit(&mut t);
+        t.disturb_all();
+
+        let dirty = t.take_dirty();
+        assert_eq!(dirty.textures.slots().collect::<Vec<_>>(), vec![2]);
+        assert!(dirty.buffers.is_empty());
+        assert!(dirty.samplers.is_empty());
+    }
+
     /// The argument-table sizes are the guest's own capacity hints. A record
     /// past them names a slot no shader on this pipeline can read.
     #[test]
@@ -500,6 +819,29 @@ mod tests {
         assert_eq!(t.buffer(4), None);
     }
 
+    /// Dropped and counted. A bind the table refuses is neither a change nor a
+    /// redundancy, so a census that did not name it would report three
+    /// counters that no longer add up to the binds the guest issued.
+    #[test]
+    fn a_dropped_bind_is_counted_apart_from_a_redundant_one() {
+        let mut t = BindingTable::new(4, 4, 4);
+        t.bind_buffer(0, buffer(1, 0));
+        t.bind_buffer(0, buffer(1, 0));
+        t.bind_buffer(9, buffer(1, 0));
+        t.bind_texture(9, texture(1));
+        t.bind_sampler(9, texture(1));
+
+        let census = t.census();
+        assert_eq!(census.changed, 1);
+        assert_eq!(census.redundant, 1);
+        assert_eq!(census.ignored, 3, "one per table, and none of them silent");
+        assert_eq!(
+            census.changed + census.redundant + census.ignored,
+            5,
+            "every bind is accounted to exactly one of the three"
+        );
+    }
+
     #[test]
     fn the_mask_reports_exactly_the_slots_it_holds() {
         let mut m = SlotMask::with_capacity(8);
@@ -508,12 +850,12 @@ mod tests {
         m.insert(63);
         m.insert(64);
         m.insert(200);
-        assert_eq!(m.slots(), vec![0, 63, 64, 200]);
+        assert_eq!(m.slots().collect::<Vec<_>>(), vec![0, 63, 64, 200]);
         assert_eq!(m.len(), 4);
         assert!(m.contains(64));
         assert!(!m.contains(65));
         m.clear();
         assert!(m.is_empty());
-        assert_eq!(m.slots(), Vec::<usize>::new());
+        assert_eq!(m.slots().collect::<Vec<_>>(), Vec::<usize>::new());
     }
 }

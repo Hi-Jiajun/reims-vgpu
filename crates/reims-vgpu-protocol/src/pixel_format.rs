@@ -5737,3 +5737,177 @@ mod compile_time_tables {
         );
     }
 }
+
+#[cfg(test)]
+mod every_door_agrees_with_every_other {
+    //! What one door says about an ordinal, checked against what the others
+    //! say, over the whole namespace.
+    //!
+    //! # Why exhaustively, and why together
+    //!
+    //! This file's tables are the first layer that assigns meaning to a
+    //! `MTLPixelFormat` ordinal, and there are two dozen of them. Each is
+    //! individually plausible and the failure mode is between them: a format
+    //! one table admits and another does not reaches a caller as a refusal
+    //! that names the wrong thing, or --- worse --- as a width taken from one
+    //! table and a footprint taken from another.
+    //!
+    //! Over 0..=0xffff and not over a list of named constants. A hand-kept
+    //! list is a second copy of the vocabulary, and the arm it omits is
+    //! exactly the arm nobody remembered to add to the table either.
+
+    use super::*;
+
+    /// Every ordinal, and the law each pair of doors owes the other.
+    ///
+    /// One test rather than fifteen: they walk the same 65536 ordinals, and a
+    /// failure names the law and the ordinal, so splitting them would buy a
+    /// test name and cost fifteen walks.
+    #[test]
+    fn no_two_doors_disagree_about_any_ordinal() {
+        let mut broken: Vec<String> = Vec::new();
+        let mut note = |law: &str, format: u16| {
+            // At most four ordinals per law. A table missing a family reports
+            // hundreds, and the first four say which family as well as the
+            // hundredth does.
+            if broken.iter().filter(|s| s.starts_with(law)).count() < 4 {
+                broken.push(format!("{law} @ {format:#x}"));
+            }
+        };
+        for format in 0u16..=0xffff {
+            let geometry = block_geometry(format).is_some();
+
+            // The block-compression predicate and the layout it stands for.
+            if is_block_compressed(format) != block_compressed_layout(format).is_some() {
+                note(
+                    "a block-compressed format has a block-compressed layout",
+                    format,
+                );
+            }
+
+            // `block_geometry` is what turns an extent into bytes, so every
+            // door that admits a format commits this file to having one. This
+            // is the shape of a defect the executor rail carried: a format its
+            // format table translated and its geometry table did not know,
+            // which refused a legal draw one layer up.
+            for (law, admitted) in [
+                (
+                    "a format with a texel width has a block geometry",
+                    bytes_per_pixel(format).is_some(),
+                ),
+                (
+                    "a sampled format has a block geometry",
+                    sampled_class(format).is_some(),
+                ),
+                (
+                    "a storage format has a block geometry",
+                    storage_selector(format).is_some(),
+                ),
+                (
+                    "a render target has a block geometry",
+                    render_target_bpp(format).is_some(),
+                ),
+                (
+                    "a stored texel order has a block geometry",
+                    store_texel_order(format).is_some(),
+                ),
+                ("an sRGB format has a block geometry", is_srgb(format)),
+            ] {
+                if admitted && !geometry {
+                    note(law, format);
+                }
+            }
+
+            // And the converse pairing for the row helpers, which are
+            // `block_geometry` spelled per axis and must admit exactly what it
+            // admits rather than one format more or fewer.
+            if tight_row_bytes(1, format).is_some() != geometry {
+                note(
+                    "a tight row is sized for exactly the formats with a geometry",
+                    format,
+                );
+            }
+            if tight_row_count(1, format).is_some() != geometry {
+                note(
+                    "a tight row count is answered for exactly those formats",
+                    format,
+                );
+            }
+
+            // A colour attachment's width is the texel's width. Two numbers
+            // for one thing, and a caller sizing a clear from one and a
+            // readback from the other would disagree by a factor.
+            if let (Some(target), Some(texel)) =
+                (render_target_bpp(format), bytes_per_pixel(format))
+            {
+                if target != texel {
+                    note("a render target is as wide as its own texel", format);
+                }
+            }
+
+            // The two halves of "this is a colour attachment": a width with no
+            // numeric type cannot be cleared, and a numeric type with no width
+            // cannot be allocated.
+            if render_target_bpp(format).is_some() != render_target_numeric_type(format).is_some() {
+                note(
+                    "a render target has both a width and a numeric type",
+                    format,
+                );
+            }
+
+            // Depth and stencil. A packing describes where two planes sit in
+            // one combined cell, and it says for itself whether the cell bears
+            // depth --- which the aspect predicate also says. Two statements of
+            // one fact, and the packing's own arithmetic checked against the
+            // width the texel table gives the same ordinal.
+            let depth = format_has_depth_aspect(format);
+            let stencil = format_has_stencil_aspect(format);
+            if (depth || stencil) && bytes_per_pixel(format).is_none() {
+                note("a depth or stencil format has a texel width", format);
+            }
+            if let Some(packing) = depth_stencil_packing(format) {
+                if !depth && !stencil {
+                    note("a packed cell belongs to a depth or stencil format", format);
+                }
+                if (packing.depth_layout != DepthFieldLayout::None) != depth {
+                    note("a packing bears depth exactly when its format does", format);
+                }
+                if Some(packing.full_bpp) != bytes_per_pixel(format) {
+                    note("a packed cell is as wide as its own texel", format);
+                }
+                for (offset, width) in [
+                    (packing.depth_offset, packing.depth_plane_bpp),
+                    (packing.stencil_offset, packing.stencil_plane_bpp),
+                ] {
+                    if offset + width > packing.full_bpp {
+                        note("a packed plane fits inside its own cell", format);
+                    }
+                }
+            }
+
+            // A plane is as wide as something exactly when the format has that
+            // plane: a copy asking for a stencil the format does not carry has
+            // no width, and one asking for a stencil it does carry must have
+            // one or the copy has no length.
+            for (aspect, present) in [
+                (BlitAspect::Depth, depth),
+                (BlitAspect::Stencil, stencil),
+                (BlitAspect::Full, geometry),
+            ] {
+                if blit_aspect_bytes_per_pixel(format, aspect).is_some() != present {
+                    note(
+                        "a blit aspect is sized exactly when the format has it",
+                        format,
+                    );
+                }
+            }
+
+            // The CPU sampling rail cannot read a texel whose width this file
+            // does not know.
+            if texel_to_rgba8(format, &[0u8; 32]).is_some() && bytes_per_pixel(format).is_none() {
+                note("a CPU-sampled format has a texel width", format);
+            }
+        }
+        assert!(broken.is_empty(), "{broken:#?}");
+    }
+}

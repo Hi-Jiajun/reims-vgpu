@@ -110,8 +110,17 @@ impl Use {
     pub const fn stages(self) -> vk::PipelineStageFlags2 {
         match self {
             Self::ColorAttachment => vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            // Both, because a depth or stencil access happens in either. Which
+            // one is the pipeline's business --- a fragment shader that
+            // discards or writes `gl_FragDepth` forces the test late --- and a
+            // source mask naming only the early stage does not wait for the
+            // write the late stage performed. Sampling the depth buffer that
+            // was just rendered would then race it.
             Self::DepthStencilAttachment | Self::DepthStencilRead => {
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                vk::PipelineStageFlags2::from_raw(
+                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw(),
+                )
             }
             // Any shader stage may sample or store, and which ones is the
             // pipeline's business rather than the layout's. `ALL_COMMANDS` here
@@ -195,6 +204,24 @@ pub struct OwnershipTransfer {
     /// The layout on both sides. An ownership transfer may change layout too,
     /// but the two halves must agree, so it is one value rather than two.
     pub layout: vk::ImageLayout,
+    /// What the releasing queue has to make available: the stages and accesses
+    /// of the last use recorded on the family giving the image up.
+    ///
+    /// **A transfer is a memory dependency and not only a change of owner.**
+    /// Vulkan ignores a release's destination masks and an acquire's source
+    /// masks, which leaves exactly these two halves carrying the availability
+    /// and visibility operations. Carried on the plan rather than left to the
+    /// recorder because only the tracker knows what the previous owner did:
+    /// with both halves empty the source queue's writes are never made
+    /// available and nothing becomes visible to the destination, so the image
+    /// holds whatever that queue happens to see — a race with no failing call
+    /// in it.
+    pub src_stages: vk::PipelineStageFlags2,
+    pub src_access: vk::AccessFlags2,
+    /// What the acquiring queue needs visible: the use it is taking the image
+    /// for.
+    pub dst_stages: vk::PipelineStageFlags2,
+    pub dst_access: vk::AccessFlags2,
 }
 
 /// Why a plan could not be made.
@@ -450,6 +477,12 @@ impl LayoutTracker {
     /// `Ok(None)` when the family already owns it. The two halves come back
     /// together because recording one of them makes the contents undefined.
     ///
+    /// `use_` is what the acquiring family is taking the image for. It is
+    /// required, not optional: it is the visibility half of the transfer's
+    /// memory dependency, and a transfer planned without it hands the new
+    /// owner an image whose contents were never made visible to it. See
+    /// [`OwnershipTransfer::src_stages`].
+    ///
     /// # Errors
     ///
     /// If the image or subresource was never declared, or the image has no
@@ -459,6 +492,7 @@ impl LayoutTracker {
         image: ImageId,
         subresource: Subresource,
         to_family: u32,
+        use_: Use,
     ) -> Result<Option<OwnershipTransfer>, Decline> {
         let current = *self.state(image, subresource)?;
         let Some(from_family) = current.family else {
@@ -480,9 +514,19 @@ impl LayoutTracker {
             from_family,
             to_family,
             layout: current.layout,
+            // The releasing family's last recorded use is what has to be made
+            // available; the tracker is the only thing that knows it.
+            src_stages: current.last_stages,
+            src_access: current.last_access,
+            dst_stages: use_.stages(),
+            dst_access: use_.access(),
         }))
     }
 
+    /// The extent check below is redundant with the lookup that follows it:
+    /// `declare` inserts exactly the in-range keys, so a missing key and an
+    /// out-of-range coordinate are one fact. It is kept because it is the half
+    /// a reader can see, and because a sparse `declare` would make them differ.
     fn state(&self, image: ImageId, subresource: Subresource) -> Result<&State, Decline> {
         let img = self
             .images
@@ -580,6 +624,40 @@ mod tests {
         assert!(transition
             .dst_access
             .contains(vk::AccessFlags2::SHADER_SAMPLED_READ));
+    }
+
+    /// A depth or stencil access happens in the early *and* the late fragment
+    /// test stages, and which one a given draw used is a property of its
+    /// pipeline rather than of the layout. So a transition sourced at a depth
+    /// use has to wait for both: a fragment shader that discards or writes
+    /// `gl_FragDepth` forces the test late, and a source mask naming only the
+    /// early stage lets the sample below read the depth buffer while the late
+    /// stage is still writing it.
+    ///
+    /// This is the same claim `barrier::ACCESS_STAGES` makes for the two
+    /// depth-stencil accesses, and the reason `barrier::stages` turns one Metal
+    /// fragment stage into four Vulkan ones.
+    #[test]
+    fn a_depth_use_names_both_fragment_test_stages() {
+        const BOTH: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw(),
+        );
+        assert_eq!(Use::DepthStencilAttachment.stages(), BOTH);
+        assert_eq!(Use::DepthStencilRead.stages(), BOTH);
+
+        let mut t = tracker();
+        let sub = Subresource::new(1, 0);
+        t.plan(IMG, sub, Use::DepthStencilAttachment, Contents::Keep)
+            .expect("declared");
+        let transition = t
+            .plan(IMG, sub, Use::SampledRead, Contents::Keep)
+            .expect("declared")
+            .expect("depth attachment to shader read is a transition");
+        assert_eq!(transition.src_stages, BOTH);
+        assert!(transition
+            .src_access
+            .contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE));
     }
 
     /// Discarding is the caller's decision. The saving is real and so is the
@@ -727,11 +805,22 @@ mod tests {
             .expect("declared");
         assert_eq!(t.family(IMG, sub), Ok(Some(0)));
         let transfer = t
-            .plan_family(IMG, sub, 1)
+            .plan_family(IMG, sub, 1, Use::SampledRead)
             .expect("declared")
             .expect("family 0 to family 1");
         assert_eq!(transfer.from_family, 0);
         assert_eq!(transfer.to_family, 1);
+        // The dependency the transfer carries: what the releasing family last
+        // did, and what the acquiring family is taking it for. Empty on either
+        // side is a move of ownership that orders no memory.
+        assert_eq!(transfer.src_stages, Use::TransferDst.stages());
+        assert_eq!(transfer.src_access, Use::TransferDst.access());
+        assert_eq!(transfer.dst_stages, Use::SampledRead.stages());
+        assert_eq!(transfer.dst_access, Use::SampledRead.access());
+        assert!(
+            !transfer.src_stages.is_empty() && !transfer.dst_stages.is_empty(),
+            "a transfer with an empty half orders nothing across the queues"
+        );
         assert_eq!(
             transfer.layout,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -739,7 +828,7 @@ mod tests {
         );
         assert_eq!(t.family(IMG, sub), Ok(Some(1)));
         assert_eq!(
-            t.plan_family(IMG, sub, 1),
+            t.plan_family(IMG, sub, 1, Use::SampledRead),
             Ok(None),
             "the family already owns it"
         );
@@ -755,7 +844,7 @@ mod tests {
         let sub = Subresource::new(0, 0);
         assert_eq!(t.family(ImageId(2), sub), Ok(None));
         assert_eq!(
-            t.plan_family(ImageId(2), sub, 1),
+            t.plan_family(ImageId(2), sub, 1, Use::SampledRead),
             Err(Decline::NoRecordedFamily { image: ImageId(2) })
         );
     }
@@ -819,5 +908,432 @@ mod tests {
         let count = slugs.len();
         slugs.dedup();
         assert_eq!(slugs.len(), count);
+    }
+
+    // ---- A driven sweep of the transition chain --------------------------
+    //
+    // The unit tests above each state one rule. What none of them states is the
+    // property the whole module exists for: that across an arbitrary history of
+    // declares, uses, discards, ownership moves and forgets, every transition
+    // handed out starts where the previous one for that subresource ended.
+    // A gap in that chain is a `oldLayout` the image is not in, which is
+    // undefined behavior the validation layers may or may not be watching for.
+    //
+    // The shadow below is deliberately dumber than the tracker: it never sees a
+    // `Transition`, and it derives the layout it expects from the *arguments*
+    // of the calls that were accepted --- a use's layout is `Use::layout()` and
+    // nothing else. So it cannot agree with the tracker by making the same
+    // mistake; it can only agree by the tracker having chained correctly.
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    const EVERY_USE: [Use; 8] = [
+        Use::ColorAttachment,
+        Use::DepthStencilAttachment,
+        Use::DepthStencilRead,
+        Use::SampledRead,
+        Use::Storage,
+        Use::TransferSrc,
+        Use::TransferDst,
+        Use::Present,
+    ];
+
+    /// One subresource, as the shadow holds it: the last use it was put to and
+    /// the family that owns it. The layout is not stored --- it is *derived*
+    /// from the last use, which is the point.
+    #[derive(Clone, Copy)]
+    struct ShadowSub {
+        last: Option<Use>,
+        family: Option<u32>,
+    }
+
+    impl ShadowSub {
+        /// A subresource nothing has used is `UNDEFINED`, and every other one
+        /// is in the layout its last use needs.
+        fn layout(self) -> vk::ImageLayout {
+            self.last.map_or(vk::ImageLayout::UNDEFINED, Use::layout)
+        }
+
+        fn src_stages(self) -> vk::PipelineStageFlags2 {
+            self.last.map_or(vk::PipelineStageFlags2::NONE, Use::stages)
+        }
+
+        fn src_access(self) -> vk::AccessFlags2 {
+            self.last.map_or(vk::AccessFlags2::NONE, Use::access)
+        }
+    }
+
+    struct ShadowImage {
+        levels: u32,
+        layers: u32,
+        planes: u32,
+        subs: HashMap<Subresource, ShadowSub>,
+    }
+
+    #[derive(Default)]
+    struct Shadow {
+        images: HashMap<ImageId, ShadowImage>,
+    }
+
+    impl Shadow {
+        fn declare(
+            &mut self,
+            image: ImageId,
+            levels: u32,
+            layers: u32,
+            planes: u32,
+            family: Option<u32>,
+        ) {
+            let mut subs = HashMap::new();
+            for level in 0..levels {
+                for layer in 0..layers {
+                    for plane in 0..planes {
+                        subs.insert(
+                            Subresource {
+                                level,
+                                layer,
+                                plane,
+                            },
+                            ShadowSub { last: None, family },
+                        );
+                    }
+                }
+            }
+            self.images.insert(
+                image,
+                ShadowImage {
+                    levels,
+                    layers,
+                    planes,
+                    subs,
+                },
+            );
+        }
+
+        fn get(&self, image: ImageId, sub: Subresource) -> Result<ShadowSub, Decline> {
+            let img = self
+                .images
+                .get(&image)
+                .ok_or(Decline::UnknownImage { image })?;
+            if sub.level >= img.levels || sub.layer >= img.layers || sub.plane >= img.planes {
+                return Err(Decline::UnknownSubresource {
+                    image,
+                    subresource: sub,
+                });
+            }
+            Ok(img.subs[&sub])
+        }
+
+        /// Every (image, subresource) the shadow believes is declared, with the
+        /// layout and family it believes each is in. Compared against the
+        /// tracker after every single call, so a write that lands on the wrong
+        /// key is caught at the call that made it and not ten calls later.
+        fn projection(&self) -> Vec<(ImageId, Subresource, vk::ImageLayout, Option<u32>)> {
+            let mut out = Vec::new();
+            for (&id, img) in &self.images {
+                for (&sub, state) in &img.subs {
+                    out.push((id, sub, state.layout(), state.family));
+                }
+            }
+            out.sort_unstable_by_key(|&(id, sub, _, _)| (id, sub));
+            out
+        }
+    }
+
+    /// What the driver did, so a floor can say the sweep reached each path
+    /// rather than that it merely ran.
+    #[derive(Default)]
+    struct Tally {
+        transitions: usize,
+        steady: usize,
+        discards: usize,
+        moves: usize,
+        already_owned: usize,
+        unknown_image: usize,
+        unknown_subresource: usize,
+        no_recorded_family: usize,
+        forgets: usize,
+    }
+
+    #[test]
+    fn a_driven_history_never_breaks_the_transition_chain() {
+        let ids = [ImageId(1), ImageId(2), ImageId(3), ImageId(4)];
+        let mut tally = Tally::default();
+
+        for seed in 0..400_u64 {
+            let mut rng = Rng::new(seed);
+            let mut tracker = LayoutTracker::new();
+            let mut shadow = Shadow::default();
+            let (mut ok_plans, mut ok_discards, mut ok_moves) = (0_usize, 0_usize, 0_usize);
+
+            for _ in 0..120 {
+                // Steer at the declared images most of the time, so the sweep
+                // spends its budget on the chain rather than on refusals ---
+                // but not always, or an undeclared image is never asked about.
+                let declared: Vec<ImageId> = ids
+                    .iter()
+                    .copied()
+                    .filter(|i| shadow.images.contains_key(i))
+                    .collect();
+                let image = if !declared.is_empty() && rng.below(4) != 0 {
+                    declared[rng.below(declared.len() as u64) as usize]
+                } else {
+                    ids[rng.below(ids.len() as u64) as usize]
+                };
+                // Mostly inside the declared extent, so the budget goes on
+                // the chain; sometimes one past it, so the out-of-range refusal
+                // is driven on a live image rather than only on an absent one.
+                let sub = match shadow.images.get(&image) {
+                    Some(img) if rng.below(4) != 0 => Subresource {
+                        level: rng.below(u64::from(img.levels)) as u32,
+                        layer: rng.below(u64::from(img.layers)) as u32,
+                        plane: rng.below(u64::from(img.planes)) as u32,
+                    },
+                    _ => Subresource {
+                        level: rng.below(4) as u32,
+                        layer: rng.below(3) as u32,
+                        plane: rng.below(2) as u32,
+                    },
+                };
+
+                match rng.below(40) {
+                    0..=2 => {
+                        let levels = 1 + rng.below(3) as u32;
+                        let layers = 1 + rng.below(2) as u32;
+                        let planes = 1 + rng.below(2) as u32;
+                        let family = if rng.below(4) == 0 {
+                            None
+                        } else {
+                            Some(rng.below(3) as u32)
+                        };
+                        tracker.declare(image, levels, layers, planes, family);
+                        shadow.declare(image, levels, layers, planes, family);
+                    }
+                    3 => {
+                        tracker.forget(image);
+                        shadow.images.remove(&image);
+                        tally.forgets += 1;
+                    }
+                    4..=6 => {
+                        let to = rng.below(3) as u32;
+                        let before = shadow.get(image, sub);
+                        match tracker.plan_family(image, sub, to, Use::SampledRead) {
+                            Ok(moved) => {
+                                let before = before.expect("the tracker accepted it");
+                                let from = before.family.expect("an accepted move had an owner");
+                                assert_eq!(
+                                    moved.is_some(),
+                                    from != to,
+                                    "a move to the family that already owns it is not a move"
+                                );
+                                if let Some(transfer) = moved {
+                                    assert_eq!(transfer.image, image);
+                                    assert_eq!(transfer.subresource, sub);
+                                    assert_eq!(transfer.from_family, from);
+                                    assert_eq!(transfer.to_family, to);
+                                    assert_eq!(
+                                        transfer.layout,
+                                        before.layout(),
+                                        "an ownership move names the layout both halves are in"
+                                    );
+                                    ok_moves += 1;
+                                    tally.moves += 1;
+                                } else {
+                                    tally.already_owned += 1;
+                                }
+                                shadow
+                                    .images
+                                    .get_mut(&image)
+                                    .and_then(|i| i.subs.get_mut(&sub))
+                                    .expect("declared")
+                                    .family = Some(to);
+                            }
+                            Err(declined) => {
+                                match before {
+                                    // An owner the shadow has is one the
+                                    // tracker must have too, so the only
+                                    // refusal left on a live subresource is the
+                                    // concurrent image.
+                                    Ok(state) => {
+                                        assert_eq!(
+                                            state.family, None,
+                                            "{declined} on an owned subresource"
+                                        );
+                                        assert_eq!(declined, Decline::NoRecordedFamily { image });
+                                        tally.no_recorded_family += 1;
+                                    }
+                                    Err(expected) => {
+                                        assert_eq!(declined, expected);
+                                        count_decline(&mut tally, declined);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    7 => {
+                        assert_eq!(
+                            tracker.layout(image, sub),
+                            shadow.get(image, sub).map(ShadowSub::layout)
+                        );
+                        assert_eq!(
+                            tracker.family(image, sub),
+                            shadow.get(image, sub).map(|s| s.family)
+                        );
+                    }
+                    _ => {
+                        let before = shadow.get(image, sub);
+                        // Repeat the subresource's own last use often. A frame
+                        // in its steady state is mostly that, and a driver that
+                        // never repeats never reaches the no-transition path
+                        // this module exists for.
+                        let use_ = match before {
+                            Ok(ShadowSub {
+                                last: Some(last), ..
+                            }) if rng.below(5) < 2 => last,
+                            _ => EVERY_USE[rng.below(EVERY_USE.len() as u64) as usize],
+                        };
+                        // Discards are the interesting minority: they are the
+                        // only way `from` may leave the chain, and the sweep is
+                        // largely about proving that is the only way.
+                        let contents = if rng.below(4) == 0 {
+                            Contents::Discard
+                        } else {
+                            Contents::Keep
+                        };
+                        let discarding = contents == Contents::Discard;
+                        match tracker.plan(image, sub, use_, contents) {
+                            Ok(planned) => {
+                                let before = before.expect("the tracker accepted it");
+                                let owed = before.layout() != use_.layout() || discarding;
+                                assert_eq!(
+                                    planned.is_some(),
+                                    owed,
+                                    "a use in the layout it is in owes no transition, \
+                                     and a discard always does"
+                                );
+                                if let Some(t) = planned {
+                                    assert_eq!(t.image, image);
+                                    assert_eq!(t.subresource, sub);
+                                    assert_eq!(t.to, use_.layout());
+                                    assert_eq!(t.dst_stages, use_.stages());
+                                    assert_eq!(t.dst_access, use_.access());
+                                    assert_eq!(t.discarded_contents, discarding);
+                                    if discarding {
+                                        assert_eq!(t.from, vk::ImageLayout::UNDEFINED);
+                                        assert_eq!(t.src_stages, vk::PipelineStageFlags2::NONE);
+                                        assert_eq!(t.src_access, vk::AccessFlags2::NONE);
+                                        ok_discards += 1;
+                                        tally.discards += 1;
+                                    } else {
+                                        // The chain: this transition starts
+                                        // where the last accepted use for this
+                                        // exact subresource left it.
+                                        assert_eq!(
+                                            t.from,
+                                            before.layout(),
+                                            "the chain broke at {image:?} {sub:?}"
+                                        );
+                                        assert_eq!(t.src_stages, before.src_stages());
+                                        assert_eq!(t.src_access, before.src_access());
+                                        tally.transitions += 1;
+                                    }
+                                } else {
+                                    tally.steady += 1;
+                                }
+                                ok_plans += 1;
+                                shadow
+                                    .images
+                                    .get_mut(&image)
+                                    .and_then(|i| i.subs.get_mut(&sub))
+                                    .expect("declared")
+                                    .last = Some(use_);
+                            }
+                            Err(declined) => {
+                                assert_eq!(Err(declined), before.map(|_| unreachable!()));
+                                count_decline(&mut tally, declined);
+                            }
+                        }
+                    }
+                }
+
+                // After every call, including every refused one: the tracker's
+                // own answers for every live subresource, against the shadow's.
+                // A refusal that mutated something, or a write that landed on a
+                // neighbouring key, fails here at the call that did it.
+                let mut seen = Vec::new();
+                for (&id, img) in &shadow.images {
+                    for &sub in img.subs.keys() {
+                        seen.push((
+                            id,
+                            sub,
+                            tracker
+                                .layout(id, sub)
+                                .expect("the shadow says it is declared"),
+                            tracker
+                                .family(id, sub)
+                                .expect("the shadow says it is declared"),
+                        ));
+                    }
+                }
+                seen.sort_unstable_by_key(|&(id, sub, _, _)| (id, sub));
+                assert_eq!(seen, shadow.projection());
+            }
+
+            // The census counts what the tracker was *asked*, over the whole
+            // history --- so it survives every forget in it.
+            let census = tracker.census();
+            assert_eq!(census.already_in_layout + census.transitions, ok_plans);
+            assert_eq!(census.discards, ok_discards);
+            assert!(census.discards <= census.transitions);
+            assert_eq!(census.ownership_transfers, ok_moves);
+        }
+
+        // Floors on each path separately. One aggregate "some refusals
+        // happened" would let a path go undriven and still read as covered.
+        assert!(tally.transitions > 5_000, "{}", tally.transitions);
+        assert!(tally.steady > 2_000, "{}", tally.steady);
+        assert!(tally.discards > 2_000, "{}", tally.discards);
+        assert!(tally.moves > 500, "{}", tally.moves);
+        assert!(tally.already_owned > 200, "{}", tally.already_owned);
+        assert!(tally.unknown_image > 5_000, "{}", tally.unknown_image);
+        assert!(
+            tally.unknown_subresource > 2_000,
+            "{}",
+            tally.unknown_subresource
+        );
+        assert!(
+            tally.no_recorded_family > 200,
+            "{}",
+            tally.no_recorded_family
+        );
+        assert!(tally.forgets > 500, "{}", tally.forgets);
+    }
+
+    fn count_decline(tally: &mut Tally, declined: Decline) {
+        match declined {
+            Decline::UnknownImage { .. } => tally.unknown_image += 1,
+            Decline::UnknownSubresource { .. } => tally.unknown_subresource += 1,
+            Decline::NoRecordedFamily { .. } => tally.no_recorded_family += 1,
+        }
     }
 }

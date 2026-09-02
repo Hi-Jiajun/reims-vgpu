@@ -532,4 +532,51 @@ mod tests {
         .native();
         assert_eq!(off.blend_enable, vk::FALSE);
     }
+
+    /// Every blend factor and operation lands on the Vulkan value of the same
+    /// name.
+    ///
+    /// Nineteen factors written out by hand, most of them one word apart from a
+    /// neighbour: `SourceAlpha` beside `OneMinusSourceAlpha`, `SourceColor`
+    /// beside `SourceAlpha`, `BlendAlpha` beside `DestinationAlpha`. A swap or
+    /// a slip between any pair compiles, plans, and produces a frame blended
+    /// with the wrong term --- which looks like a shading bug and not like a
+    /// table.
+    ///
+    /// [`crate::naming`] derives the Vulkan spelling from the guest one through
+    /// word-for-word vocabulary --- `SOURCE` is `SRC`, `DESTINATION` is `DST`,
+    /// Metal's `BLEND` constant is Vulkan's `CONSTANT` --- so a rule serves
+    /// every arm that contains its word and none of them is written down twice.
+    #[test]
+    fn every_factor_and_operation_lands_on_the_value_of_the_same_name() {
+        for guest in BlendFactor::ALL {
+            assert_eq!(
+                format!("{:?}", factor(guest)),
+                crate::naming::vulkan_spelling(&format!("{guest:?}")),
+                "{guest:?}"
+            );
+        }
+        for guest in BlendOperation::ALL {
+            assert_eq!(
+                format!("{:?}", operation(guest)),
+                crate::naming::vulkan_spelling(&format!("{guest:?}")),
+                "{guest:?}"
+            );
+        }
+    }
+
+    /// And neither table collapses two guest values onto one Vulkan value.
+    #[test]
+    fn the_factors_and_operations_stay_distinct() {
+        let factors: std::collections::BTreeSet<i32> = BlendFactor::ALL
+            .iter()
+            .map(|f| factor(*f).as_raw())
+            .collect();
+        assert_eq!(factors.len(), BlendFactor::ALL.len());
+        let ops: std::collections::BTreeSet<i32> = BlendOperation::ALL
+            .iter()
+            .map(|o| operation(*o).as_raw())
+            .collect();
+        assert_eq!(ops.len(), BlendOperation::ALL.len());
+    }
 }

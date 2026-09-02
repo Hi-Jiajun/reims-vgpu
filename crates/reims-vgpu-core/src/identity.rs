@@ -142,11 +142,38 @@ impl TimelinePoint {
     }
 }
 
+/// What a present names as the thing to show.
+///
+/// **A third namespace, numerically overlapping the other two and unrelated to
+/// them.** The device's own state keeps this apart from object-list refs in as
+/// many words — "surface_id namespace only, never texture_ref (object list ids
+/// collide)" — because a host render cache keyed by one and fed by the other
+/// serves a frame from whatever texture happened to share a number. That is the
+/// hazard this module exists to make a type error, so a present's target is its
+/// own type rather than the `u32` it arrives as.
+///
+/// Not `NonZero`. Zero is a value the guest sends and it means "nothing to
+/// show": a present carrying it is a well-formed packet whose completion is
+/// owed in full, not a malformed one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MappingId(pub u32);
+
 /// A guest task ordinal, as it arrives on the wire.
 ///
 /// Task 0 is the kernel task and is a legal value, so this is not `NonZero`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskId(pub u32);
+
+/// The guest page frame a task's page-table root sits at.
+///
+/// A task's address space *is* this number: two definitions of one task id with
+/// the same root are the same space re-declared, and two with different roots
+/// are different spaces under one name — which is why the model keeps it rather
+/// than only the id. It is a page frame and not an address; what the frame
+/// contains, and how a walk of it translates anything, belongs to the layer
+/// that can read guest pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DirectoryFrame(pub u32);
 
 /// A name in the kernel **object-list** ref space: what a task's object list is
 /// keyed by, and what a decoded command resolves its objects out of.
@@ -230,6 +257,34 @@ impl IngressOrdinal {
     pub const fn next(self) -> IngressOrdinal {
         IngressOrdinal(self.0 + 1)
     }
+}
+
+/// Where one accepted packet sits, in every order the device keeps.
+///
+/// # Assigned once, by the one service that observes arrival
+///
+/// The four numbers are not independent: a packet's channel decides which
+/// sequence counter advances, and both are consumed under the same arrival that
+/// produced the ingress ordinal. Anything that could state them separately
+/// could state them inconsistently — a payload claiming ingress 7 inside an
+/// envelope that arrived at 8 is representable the moment two structures each
+/// carry their own copy, and no reader could say which one the dependency graph
+/// meant.
+///
+/// So identity is one value, and the service that observes FIFO arrival is the
+/// only thing that makes one. A builder resolving a packet's contents does not
+/// know where the packet sits and must not be able to say; it produces work,
+/// and admission stamps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TransactionIdentity {
+    /// The semantic lifetime this was accepted in.
+    pub session: SessionGeneration,
+    /// The submission ordering domain.
+    pub domain: ChannelId,
+    /// Position within that domain.
+    pub domain_sequence: ChannelSequence,
+    /// Position in the device's single arrival order.
+    pub ingress: IngressOrdinal,
 }
 
 /// Which of the guest's completion-stamp words a stamp names.

@@ -439,7 +439,8 @@ fn a_decoded_texture_becomes_an_image_the_driver_admitted() {
     // expansion is pure arithmetic and unit-tested as such; what a driver has
     // to agree with is that eighty-four single-slice views over a
     // cube-compatible image are legal, which no arithmetic can establish.
-    let whole = view::whole(texture, vk::Format::R8G8B8A8_UNORM).create_info(image);
+    let whole =
+        view::whole(texture, MTL_FORMAT_RGBA8_UNORM, vk::Format::R8G8B8A8_UNORM).create_info(image);
     let sampled = unsafe { device.create_image_view(&whole, None) }
         .expect("a cube-array view over a cube-compatible image");
     let expansion = view::attachments(texture, vk::Format::R8G8B8A8_UNORM);
@@ -631,7 +632,8 @@ fn a_ragged_fill_writes_exactly_the_range_the_guest_named() {
         &residency,
         &mut arena,
     )
-    .unwrap_or_else(|refusal| panic!("{refusal}"));
+    .unwrap_or_else(|refusal| panic!("{refusal}"))
+    .expect("bytes to fill");
     let head = plan
         .head
         .expect("a head, because 1 is not a multiple of four");
@@ -647,11 +649,13 @@ fn a_ragged_fill_writes_exactly_the_range_the_guest_named() {
     );
 
     // The CPU half: the edge bytes into the arena, flushed over the range the
-    // arena says covers them.
+    // arena says covers them. An edge carries the bytes rather than one
+    // repeated byte, because a four-byte pattern ending raggedly has a tail of
+    // its own leading bytes.
     for edge in [head, tail] {
         // SAFETY: the window came from this arena and nothing has been
-        // submitted against it.
-        unsafe { arena.set(edge.window, edge.byte) };
+        // submitted against it, and the slice is the window's own length.
+        unsafe { arena.write(edge.window, &edge.bytes[..edge.length as usize]) };
     }
     let scratch_kind = MappedMemoryKind::of(&properties, {
         let requirements = unsafe { device.get_buffer_memory_requirements(scratch) };
@@ -828,18 +832,22 @@ fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
     const TEXEL: [u8; 4] = [0x10, 0x20, 0x30, 0x40];
     let format = vk::Format::R8G8B8A8_UNORM;
 
-    // Measured, not assumed: a format that cannot be linearly filtered here
-    // must refuse rather than drop to nearest.
+    // Measured, not assumed: all three bits `vkCmdBlitImage` with a linear
+    // filter demands, read off this device for this format.
     let format_properties = unsafe {
         host.instance()
             .get_physical_device_format_properties(host.physical_device(), format)
     };
+    let features = format_properties.optimal_tiling_features;
     let support = mipmap::FilterSupport {
-        linear_blit_source: format_properties
-            .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR),
+        blit_source: features.contains(vk::FormatFeatureFlags::BLIT_SRC),
+        blit_dest: features.contains(vk::FormatFeatureFlags::BLIT_DST),
+        linear_blit_source: features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR),
     };
-    println!("linear blit source={}", support.linear_blit_source);
+    println!(
+        "blit src={} dst={} linear={}",
+        support.blit_source, support.blit_dest, support.linear_blit_source
+    );
 
     let declaration = TextureShape {
         kind: TextureKind::D2.ordinal(),
@@ -1028,7 +1036,7 @@ fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
         recorder.transfer(&transfer::Command::CopyBufferToImage {
             source: staging,
             dest: image,
-            regions: vec![region],
+            regions: transfer::Regions::One(region),
         });
     }
 
@@ -1062,7 +1070,7 @@ fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
         recorder.transfer(&transfer::Command::CopyImageToBuffer {
             source: image,
             dest: staging,
-            regions: vec![vk::BufferImageCopy {
+            regions: transfer::Regions::One(vk::BufferImageCopy {
                 buffer_offset: 0,
                 buffer_row_length: 0,
                 buffer_image_height: 0,
@@ -1078,7 +1086,7 @@ fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
                     height: 1,
                     depth: 1,
                 },
-            }],
+            }),
         });
     }
     unsafe { device.end_command_buffer(command) }.expect("end");
@@ -1170,7 +1178,7 @@ fn a_declined_vertex_format_has_a_substitute_or_no_sibling_at_all() {
     );
 
     for guest in declined {
-        let planned = vertex::attribute(0, 0, guest, 0, 64, cell, || {
+        let planned = vertex::attribute(0, 0, guest, 0, 64, cell.formats, || {
             vertex::ShaderInput::Channels(guest.components())
         });
         match guest.widened() {
@@ -1330,7 +1338,16 @@ fn a_planned_pass_becomes_a_render_pass_and_a_framebuffer_this_driver_accepts() 
             format: vk::Format::R8G8B8A8_UNORM,
             samples: vk::SampleCountFlags::TYPE_1,
             view: image_view,
-            resolve_view: None,
+            // The view is over the whole of a 64x32 image, which is the render
+            // area the descriptor above declared.
+            coverage: renderpass::Coverage {
+                extent: vk::Extent2D {
+                    width: 64,
+                    height: 32,
+                },
+                layers: 1,
+            },
+            resolve: None,
         }],
         None,
     )
@@ -1541,12 +1558,13 @@ fn an_assembled_key_becomes_a_pipeline_this_driver_accepts() {
             .expect("a default attachment needs no feature")],
         compatibility: renderpass::Compatibility {
             color: vec![vk::Format::B8G8R8A8_UNORM],
+            resolve: vec![false],
             depth_stencil: None,
             depth: false,
             stencil: false,
             samples: vk::SampleCountFlags::TYPE_1,
         },
-        viewports: 1,
+        viewports: reims_vgpu_vulkan::raster::ViewportSlots::ONE,
     };
     let built = pipeline::build(key).unwrap_or_else(|refusal| panic!("{refusal}"));
 

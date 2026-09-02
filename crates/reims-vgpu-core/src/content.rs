@@ -26,6 +26,7 @@
 //! would make the same guest stream mean different things on two hosts.
 
 use crate::access::{BackingId, ByteRange, ContentVersion};
+use crate::coverage::{Applied, Span, VersionCoverage};
 use crate::range_set::RangeSet;
 use std::collections::HashMap;
 
@@ -67,12 +68,29 @@ pub struct Transfer {
     pub to: Replica,
     /// Exactly the bytes the destination is behind on.
     pub bytes: RangeSet,
+    /// The version current in each part of `bytes` when the copy was planned —
+    /// which is to say, *what* is being copied and not only from where.
+    ///
+    /// A transfer is planned at admission and recorded at completion, and the
+    /// content can move in between. Without this the recording would mark the
+    /// destination fresh for bytes it holds an older copy of, and the next read
+    /// would find it fresh and serve them. See [`ContentLedger::record_transfer`].
+    pub at: Vec<Span>,
 }
 
 /// What has happened to one backing's content.
 #[derive(Clone, Debug, Default)]
 struct Entry {
-    version: ContentVersion,
+    /// Which version is current in each part of the backing. See
+    /// [`crate::coverage`] for why this is not one number.
+    canonical: VersionCoverage,
+    /// The extent the declaration named, which is the whole backing.
+    ///
+    /// `None` for a backing that reached this ledger through a write rather
+    /// than a declaration — a test, or a replay that starts mid-stream. It is
+    /// what turns "the whole backing" into bytes, and where it is absent that
+    /// translation is refused rather than guessed at some default size.
+    extent: Option<ByteRange>,
     fresh: HashMap<Replica, RangeSet>,
 }
 
@@ -80,6 +98,21 @@ struct Entry {
 #[derive(Debug, Default)]
 pub struct ContentLedger {
     backings: HashMap<BackingId, Entry>,
+    /// The next version any write may reserve. Monotone, and one counter for
+    /// the whole ledger.
+    ///
+    /// One per *backing* would be enough for the comparisons — every version
+    /// is only ever compared against another version of the same backing — but
+    /// it would live in the entry, and [`ContentLedger::forget`] drops the
+    /// entry. The counter would restart, and a version already carried by a
+    /// planned transfer or a reserved write would be handed out again for
+    /// different content. [`ContentLedger::reserve`] says why a number must not
+    /// be reused; this is where that has to be arranged.
+    ///
+    /// Per region would be wrong for the reason the coverage is not one number
+    /// the other way round: two writers of disjoint ranges must not be handed
+    /// one number, or their completions cannot be told apart.
+    next_version: ContentVersion,
     census: Census,
 }
 
@@ -92,9 +125,33 @@ pub struct Census {
     pub transfers_planned: usize,
     /// Bytes in those transfers.
     pub transfer_bytes: u64,
-    /// Reads that needed no transfer. The number that says how much the
-    /// per-byte freshness is buying over a per-resource flag.
+    /// Reads that needed no transfer because the replica was already fresh for
+    /// every byte. The number that says how much the per-byte freshness is
+    /// buying over a per-resource flag.
     pub reads_already_fresh: usize,
+    /// Reads that needed no transfer because no replica held the bytes they
+    /// were behind on — content nothing has ever written.
+    ///
+    /// A separate count and not part of [`Self::reads_already_fresh`], because
+    /// the two say opposite things about the ledger. A read that was already
+    /// fresh is the per-byte freshness paying for itself; a read over content
+    /// nobody has written is a resource being read before it is filled, and a
+    /// stream where that number is large is one where the guest is reading
+    /// undefined bytes rather than one where this ledger is working well.
+    /// Together they account for every read [`ContentLedger::transfer_for_read`]
+    /// answered with `None`, so a caller can tell that it has seen all of them.
+    pub reads_with_no_source: usize,
+    /// Copies that completed after the content they carried had already been
+    /// superseded, and so destroyed the destination's bytes instead of
+    /// delivering it the current ones.
+    ///
+    /// Not a ledger fault and not something the ledger can prevent: the copy
+    /// was correct when it was planned, and what orders it against a write is
+    /// the hazard graph, not this. It is here because the consequence — bytes
+    /// that were current in the destination and are now nowhere — is otherwise
+    /// visible only as a later read reporting no source, a long way from the
+    /// transfer that caused it.
+    pub transfers_overtaken: usize,
 }
 
 impl ContentLedger {
@@ -108,26 +165,173 @@ impl ContentLedger {
         self.census
     }
 
-    /// The backing's current content version.
+    /// The highest version current anywhere in the backing.
+    ///
+    /// `None` for a backing nothing has written. Distinct from version zero,
+    /// which is a version a write can produce — see
+    /// [`VersionCoverage::newest_over`].
+    ///
+    /// A summary, and only ever that. Two writers of disjoint ranges are both
+    /// current and this reports one of their versions, so a caller deciding
+    /// whether *its own* bytes are current must ask
+    /// [`Self::version_of`] about the range it names.
     #[must_use]
-    pub fn version(&self, backing: BackingId) -> ContentVersion {
+    pub fn newest_version(&self, backing: BackingId) -> Option<ContentVersion> {
+        self.backings.get(&backing).and_then(|e| {
+            e.canonical.newest_over(ByteRange {
+                offset: 0,
+                length: u64::MAX,
+            })
+        })
+    }
+
+    /// The highest version current over `range`.
+    #[must_use]
+    pub fn version_of(&self, backing: BackingId, range: ByteRange) -> Option<ContentVersion> {
         self.backings
             .get(&backing)
-            .map_or(ContentVersion::default(), |e| e.version)
+            .and_then(|e| e.canonical.newest_over(range))
+    }
+
+    /// The bytes a record naming "the whole backing" is naming.
+    ///
+    /// The extent its declaration gave it, and `None` for a backing no
+    /// declaration reached. A caller with a whole-backing write must ask this
+    /// rather than inventing a range: a write recorded against no bytes
+    /// publishes a version over nothing, so a later *older* write is not
+    /// beaten by it and a replica that produced the content does not become
+    /// fresh for it — which is a transfer that copies stale bytes over what
+    /// the device just wrote.
+    ///
+    /// Not answerable for a subresource, and that is a different fact: image
+    /// coordinates need a layout, which is an executor's and not this crate's.
+    #[must_use]
+    pub fn extent(&self, backing: BackingId) -> Option<ByteRange> {
+        self.backings.get(&backing).and_then(|e| e.extent)
+    }
+
+    /// Take the next version a write of this backing may produce.
+    ///
+    /// The planning half of the reservation rule: a version is reserved when
+    /// the write is planned and becomes current only when
+    /// [`Self::materialize`] records the completion, so a reader planned
+    /// against it waits for the work rather than for the plan.
+    ///
+    /// Advances the counter whatever happens next. A reservation that is never
+    /// materialized — a transaction the device refuses after planning it —
+    /// leaves a gap in the numbering and nothing else, which is the cheap
+    /// answer; reusing the number would let a later write pass for the
+    /// abandoned one.
+    pub fn reserve(&mut self, backing: BackingId) -> ContentVersion {
+        self.backings.entry(backing).or_default();
+        let reserved = self.next_version;
+        self.next_version = reserved.next();
+        reserved
+    }
+
+    /// Record that a write of `bytes` at `version` has completed in `replica`.
+    ///
+    /// Coverage is taken only where nothing at least as new already holds the
+    /// bytes, and **freshness follows the coverage**: a replica becomes fresh
+    /// for exactly the bytes whose version it won, and the other replica loses
+    /// exactly those. A completion that lost the race leaves both replicas as
+    /// they were, which is the point — the winner's bytes are the current
+    /// content and the loser's must not be readable from anywhere.
+    ///
+    /// Returns what landed and what was beaten. A caller that ignores the
+    /// second half has a transaction whose bytes never became visible and no
+    /// record saying so.
+    pub fn materialize(
+        &mut self,
+        backing: BackingId,
+        bytes: ByteRange,
+        version: ContentVersion,
+        replica: Replica,
+    ) -> Applied {
+        // Keep the counter ahead of anything committed, so content whose
+        // versions were assigned elsewhere — a replayed transaction, a test —
+        // cannot later reserve a number already in a coverage.
+        if version >= self.next_version {
+            self.next_version = version.next();
+        }
+        let e = self.backings.entry(backing).or_default();
+        let applied = e.canonical.apply(bytes, version);
+        for taken in applied.taken.ranges() {
+            for r in Replica::BOTH {
+                let set = e.fresh.entry(r).or_default();
+                if r == replica {
+                    set.insert(*taken);
+                } else {
+                    set.remove(*taken);
+                }
+            }
+        }
+        applied
     }
 
     /// Declare that a backing's content originates in one replica and is
-    /// entirely current there.
+    /// current there over `extent`.
     ///
     /// This is creation, not a write: a resource whose pages the guest supplied
     /// starts with the guest fresh for all of it and the device owning nothing.
-    /// Calling it on a live backing resets the authority, which is what a
-    /// replace-physical does and what nothing else may do.
+    ///
+    /// # A backing this ledger already knows is joined, not reset
+    ///
+    /// Two live names for one backing is a first-class state, not a corner —
+    /// [`crate::namespace::Teardown::HeldByAnotherName`] is a whole variant
+    /// about it, and an `IOSurface` reachable from two tasks is the ordinary
+    /// case. This used to clear the coverage and overwrite the extent whenever
+    /// it was called, so the second name's creation discarded the first name's
+    /// content: a range the device had rendered into became "content nothing
+    /// has ever written", so a later read planned no transfer and found no
+    /// source, and the backing's extent shrank to the newcomer's — which is
+    /// what turns a whole-resource participation into bytes, so every
+    /// whole-backing access of the older name was then planned over a window
+    /// of itself.
+    ///
+    /// So a known backing takes the declaration as a claim about *those*
+    /// bytes: the extent grows to cover both and the named range becomes the
+    /// declaring replica's at a new version, leaving every other byte's
+    /// authority where it was. That is the same answer a placed resource's
+    /// creation already gives for the same reason — "declaring the whole
+    /// backing would discard the neighbours' content" — and the same one
+    /// [`crate::lifecycle`]'s invalidate gives for "the guest's pages are the
+    /// current content".
+    ///
+    /// The clearing form is therefore reachable only for a backing nothing
+    /// knows, where there is nothing to clear. [`Self::forget`] is the one
+    /// door that drops what a backing holds.
     pub fn declare(&mut self, backing: BackingId, extent: ByteRange, authority: Replica) {
+        if let Some(known) = self.backings.get_mut(&backing) {
+            known.extent = Some(match known.extent {
+                Some(old) => {
+                    let end = old
+                        .offset
+                        .saturating_add(old.length)
+                        .max(extent.offset.saturating_add(extent.length));
+                    let offset = old.offset.min(extent.offset);
+                    ByteRange {
+                        offset,
+                        length: end - offset,
+                    }
+                }
+                None => extent,
+            });
+            self.write(backing, extent, authority);
+            return;
+        }
+        let version = self.reserve(backing);
         let e = self.backings.entry(backing).or_default();
-        e.version = e.version.next();
+        e.extent = Some(extent);
+        e.canonical.clear();
         e.fresh.clear();
         e.fresh.insert(authority, RangeSet::from_range(extent));
+        // The coverage is rebuilt rather than applied over the old one: a
+        // declaration is not a write that has to beat what was there, it is a
+        // statement that what was there is gone. `apply` on a cleared map takes
+        // everything, which is the same answer written the way the invariant
+        // wants it.
+        e.canonical.apply(extent, version);
     }
 
     /// Record a write of `bytes` performed in `replica`.
@@ -138,16 +342,11 @@ impl ContentLedger {
     /// what makes a read from *here* owe nothing.
     pub fn write(&mut self, backing: BackingId, bytes: ByteRange, replica: Replica) {
         self.census.writes += 1;
-        let e = self.backings.entry(backing).or_default();
-        e.version = e.version.next();
-        for r in Replica::BOTH {
-            let set = e.fresh.entry(r).or_default();
-            if r == replica {
-                set.insert(bytes);
-            } else {
-                set.remove(bytes);
-            }
-        }
+        let version = self.reserve(backing);
+        // A CPU write is planned and completed at once, so its reservation can
+        // never lose: nothing else could have taken a higher version in
+        // between. `materialize` still decides, rather than this asserting it.
+        self.materialize(backing, bytes, version, replica);
     }
 
     /// The transfer a read of `bytes` from `replica` needs, if any.
@@ -162,31 +361,46 @@ impl ContentLedger {
         bytes: ByteRange,
         replica: Replica,
     ) -> Option<Transfer> {
-        let e = self.backings.get(&backing)?;
-        let fresh = e.fresh.get(&replica).cloned().unwrap_or_default();
-        let owed = fresh.missing_from(bytes);
-        if owed.is_empty() {
+        // A backing this ledger has never heard of is the sourceless case in
+        // its purest form: no replica holds these bytes because nothing has
+        // ever written them. Returning `None` without counting it would leave
+        // the one number that says "the guest is reading undefined bytes"
+        // blind to the reads that say it loudest, and would break the census's
+        // own claim that the two counters account for every `None`.
+        let Some(e) = self.backings.get(&backing) else {
+            self.census.reads_with_no_source += 1;
+            return None;
+        };
+        let empty = RangeSet::new();
+        let fresh = e.fresh.get(&replica).unwrap_or(&empty);
+        // The steady-state answer, asked without building anything. A replica
+        // that already holds every byte is the common case on a warm frame,
+        // and computing the owed set only to find it empty put an allocation
+        // on the path every read takes.
+        if fresh.covers(bytes) {
             self.census.reads_already_fresh += 1;
             return None;
         }
+        let owed = fresh.missing_from(bytes);
         // Only the other replica can supply them, and only the parts it is
         // itself fresh for. Bytes neither replica holds have never been
         // written, so there is nothing to move and no version to preserve —
         // copying them would move whatever the source happens to contain and
         // then claim the destination is current.
         let source = replica.other();
-        let source_fresh = e.fresh.get(&source).cloned().unwrap_or_default();
-        let mut movable = RangeSet::new();
-        for r in owed.ranges() {
-            for s in source_fresh.ranges() {
-                if let Some(overlap) = intersect(*r, *s) {
-                    movable.insert(overlap);
-                }
-            }
-        }
+        let movable = owed.intersection(e.fresh.get(&source).unwrap_or(&empty));
         if movable.is_empty() {
+            self.census.reads_with_no_source += 1;
             return None;
         }
+        // What is being copied, taken while the answer is still the plan's.
+        // `fresh` is only ever set from bytes `canonical` covers, so every part
+        // of `movable` has a version here.
+        let at: Vec<Span> = movable
+            .ranges()
+            .iter()
+            .flat_map(|r| e.canonical.over(*r))
+            .collect();
         self.census.transfers_planned += 1;
         self.census.transfer_bytes += movable.len();
         Some(Transfer {
@@ -194,20 +408,70 @@ impl ContentLedger {
             from: source,
             to: replica,
             bytes: movable,
+            at,
         })
     }
 
     /// Record that a planned transfer has completed.
     ///
-    /// The destination becomes fresh for exactly the bytes that moved, and the
-    /// source keeps what it had: a copy does not change where content is
-    /// authoritative, only how many places hold it.
+    /// The destination becomes fresh for the bytes that moved *and are still
+    /// what the plan said they were*, and the source keeps what it had: a copy
+    /// does not change where content is authoritative, only how many places
+    /// hold it.
+    ///
+    /// # Why the version is checked here and not assumed
+    ///
+    /// A transfer is planned when a transaction is admitted and recorded when
+    /// it completes, and the guest may write the same bytes in between — that
+    /// is an ordinary sequence, not a race the device can forbid. The copy then
+    /// carried the older content, and marking the destination fresh for it
+    /// makes the next read of those bytes find a replica that is fresh by the
+    /// ledger and stale in fact, with no transfer owed and nothing to say so.
+    ///
+    /// [`Self::materialize`] already refuses a write beaten by newer content,
+    /// for the same reason and in the same words: the loser's bytes must not be
+    /// readable from anywhere. A completed copy is the other kind of completion
+    /// and was the one not asking.
+    ///
+    /// # And the bytes it did not deliver are bytes it destroyed
+    ///
+    /// A copy that arrives late does not arrive as nothing. It writes the
+    /// content it carried over whatever the destination had there, so where the
+    /// destination held the current bytes and the copy is stale, those bytes
+    /// are gone — from the destination's storage, and therefore from the ledger
+    /// too. Recording only the half that landed would leave the destination
+    /// fresh for content its own copy has just overwritten, which is the same
+    /// wrong answer one step further on.
+    ///
+    /// Where the source still holds them, the next read simply owes a transfer
+    /// again. Where it does not, the bytes are genuinely nowhere, and a read
+    /// reporting no source is the honest answer rather than a served copy of
+    /// something else. [`Census::transfers_overtaken`] counts these, because
+    /// the cause and the symptom are otherwise far apart.
+    ///
+    /// A backing this ledger has forgotten takes nothing: there are no content
+    /// facts left to update, and creating an entry for one would publish
+    /// freshness over coverage nobody declared.
     pub fn record_transfer(&mut self, transfer: &Transfer) {
-        let e = self.backings.entry(transfer.backing).or_default();
-        e.fresh
-            .entry(transfer.to)
-            .or_default()
-            .union_with(&transfer.bytes);
+        let Some(e) = self.backings.get_mut(&transfer.backing) else {
+            return;
+        };
+        let mut landed = RangeSet::new();
+        for planned in &transfer.at {
+            for now in e.canonical.over(planned.range) {
+                if now.version == planned.version {
+                    landed.insert(now.range);
+                }
+            }
+        }
+        let mut clobbered = transfer.bytes.clone();
+        clobbered.subtract(&landed);
+        let set = e.fresh.entry(transfer.to).or_default();
+        set.union_with(&landed);
+        set.subtract(&clobbered);
+        if !clobbered.is_empty() {
+            self.census.transfers_overtaken += 1;
+        }
     }
 
     /// Discard a replica's copy of some bytes without changing the content.
@@ -239,23 +503,29 @@ impl ContentLedger {
         range: ByteRange,
         replica: Replica,
     ) -> RangeSet {
-        let mut out = RangeSet::new();
         let Some(e) = self.backings.get(&backing) else {
-            return out;
+            return RangeSet::new();
         };
-        if let Some(here) = e.fresh.get(&replica) {
-            for r in here.ranges() {
-                if let Some(overlap) = intersect(*r, range) {
-                    out.insert(overlap);
-                }
-            }
-        }
+        let Some(here) = e.fresh.get(&replica) else {
+            return RangeSet::new();
+        };
+        let mut out = here.intersection(&RangeSet::from_range(range));
         if let Some(elsewhere) = e.fresh.get(&replica.other()) {
-            for r in elsewhere.ranges() {
-                out.remove(*r);
-            }
+            out.subtract(elsewhere);
         }
         out
+    }
+
+    /// Whether the ledger holds anything at all about a backing.
+    ///
+    /// The question [`Self::forget`] answers by making it false, and the one a
+    /// session-wide owner asks to check that it has neither dropped a live
+    /// backing's history nor kept a dead one's. Presence is not freshness: a
+    /// backing that was declared and never written is known here and fresh in
+    /// no replica.
+    #[must_use]
+    pub fn knows(&self, backing: BackingId) -> bool {
+        self.backings.contains_key(&backing)
     }
 
     /// Forget a backing entirely.
@@ -273,18 +543,6 @@ impl ContentLedger {
     }
 }
 
-fn intersect(a: ByteRange, b: ByteRange) -> Option<ByteRange> {
-    let start = a.offset.max(b.offset);
-    let end = a
-        .offset
-        .saturating_add(a.length)
-        .min(b.offset.saturating_add(b.length));
-    (start < end).then(|| ByteRange {
-        offset: start,
-        length: end - start,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,7 +558,9 @@ mod tests {
         c.declare(B, r(0, 256), Replica::GuestPages);
         assert!(c.is_fresh(B, r(0, 256), Replica::GuestPages));
         assert!(!c.is_fresh(B, r(0, 1), Replica::DeviceOwned));
-        assert_eq!(c.version(B), ContentVersion(1));
+        // A declaration reserves and commits one version over the extent.
+        assert_eq!(c.newest_version(B), Some(ContentVersion(0)));
+        assert_eq!(c.version_of(B, r(0, 256)), Some(ContentVersion(0)));
     }
 
     /// The first failure this module exists to prevent: a copy without a
@@ -323,6 +583,62 @@ mod tests {
         assert_eq!(c.census().reads_already_fresh, 1);
     }
 
+    /// **A copy that landed after the content moved on is not the content.**
+    ///
+    /// The plan and the recording are two moments — admission and completion —
+    /// and a guest write between them is ordinary. The copy then carried the
+    /// older bytes, so the destination must not come out of the recording fresh
+    /// for them: a replica fresh by the ledger and stale in fact owes no
+    /// transfer, and every later read of those bytes is served the old content
+    /// with nothing anywhere saying so.
+    #[test]
+    fn a_transfer_overtaken_by_a_write_does_not_make_the_destination_fresh() {
+        let mut c = ContentLedger::new();
+        c.declare(B, r(0, 256), Replica::GuestPages);
+        let t = c
+            .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
+            .expect("the device holds nothing yet");
+        assert_eq!(t.bytes.ranges(), &[r(0, 64)]);
+
+        // The guest rewrites the front half while the copy is in flight.
+        c.write(B, r(0, 32), Replica::GuestPages);
+        c.record_transfer(&t);
+
+        let again = c
+            .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
+            .expect("the front half is still owed");
+        assert_eq!(
+            again.bytes.ranges(),
+            &[r(0, 32)],
+            "exactly the bytes the copy was overtaken on, and not the ones it \
+             delivered"
+        );
+        assert!(
+            c.is_fresh(B, r(32, 32), Replica::DeviceOwned),
+            "the back half moved unchallenged and did land"
+        );
+
+        // And recording that one, unovertaken, finishes the job.
+        c.record_transfer(&again);
+        assert!(c
+            .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
+            .is_none());
+    }
+
+    /// A backing the ledger has forgotten has no content facts to update, and a
+    /// late recording must not invent one.
+    #[test]
+    fn a_transfer_recorded_after_the_backing_was_forgotten_publishes_nothing() {
+        let mut c = ContentLedger::new();
+        c.declare(B, r(0, 256), Replica::GuestPages);
+        let t = c
+            .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
+            .expect("owed");
+        c.forget(B);
+        c.record_transfer(&t);
+        assert!(!c.knows(B), "a recording is not a declaration");
+    }
+
     /// And a write is what makes it owed again.
     #[test]
     fn a_write_elsewhere_makes_the_transfer_owed_again() {
@@ -332,9 +648,15 @@ mod tests {
             .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
             .unwrap();
         c.record_transfer(&t);
-        let before = c.version(B);
+        let before = c.version_of(B, r(0, 16)).expect("declared");
         c.write(B, r(0, 16), Replica::GuestPages);
-        assert!(c.version(B) > before, "a write is a version transition");
+        assert!(
+            c.version_of(B, r(0, 16)).expect("written") > before,
+            "a write is a version transition"
+        );
+        // And only over the bytes it named: the rest of the backing is still
+        // at the version the declaration gave it.
+        assert_eq!(c.version_of(B, r(16, 240)), Some(before));
         let again = c
             .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
             .expect("the first sixteen bytes moved under it");
@@ -398,6 +720,55 @@ mod tests {
         );
     }
 
+    /// The two ways a read can owe nothing are two different facts, and a
+    /// census that folded them together would report a device whose resources
+    /// are read before they are written as a device whose freshness tracking is
+    /// working. Every `None` lands in exactly one of them.
+    #[test]
+    fn a_read_over_content_nobody_wrote_is_counted_apart_from_a_fresh_one() {
+        let mut c = ContentLedger::new();
+        c.declare(B, r(0, 64), Replica::GuestPages);
+        assert!(
+            c.transfer_for_read(B, r(64, 64), Replica::DeviceOwned)
+                .is_none(),
+            "nothing has written past the extent"
+        );
+        assert_eq!(c.census().reads_with_no_source, 1);
+        assert_eq!(c.census().reads_already_fresh, 0);
+
+        assert!(c
+            .transfer_for_read(B, r(0, 64), Replica::GuestPages)
+            .is_none());
+        assert_eq!(c.census().reads_already_fresh, 1);
+        assert_eq!(
+            c.census().reads_with_no_source,
+            1,
+            "a fresh read is not a sourceless one"
+        );
+
+        // And a read that owes a transfer is neither.
+        assert!(c
+            .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
+            .is_some());
+        assert_eq!(c.census().reads_already_fresh, 1);
+        assert_eq!(c.census().reads_with_no_source, 1);
+        assert_eq!(c.census().transfers_planned, 1);
+
+        // A backing the ledger has never heard of is the same fact as reading
+        // past a declared extent, and lands in the same counter: it is the
+        // read this number exists to make visible, not the one case exempt
+        // from it.
+        assert!(c
+            .transfer_for_read(BackingId(99), r(0, 64), Replica::DeviceOwned)
+            .is_none());
+        assert_eq!(c.census().reads_with_no_source, 2);
+        assert_eq!(c.census().reads_already_fresh, 1);
+        assert!(
+            !c.knows(BackingId(99)),
+            "and asking did not invent a history for it"
+        );
+    }
+
     /// A discard drops a copy and not the content, so the version does not
     /// move and the other replica is still authoritative.
     #[test]
@@ -408,9 +779,9 @@ mod tests {
             .transfer_for_read(B, r(0, 256), Replica::DeviceOwned)
             .unwrap();
         c.record_transfer(&t);
-        let version = c.version(B);
+        let version = c.version_of(B, r(0, 256));
         c.discard(B, r(0, 256), Replica::DeviceOwned);
-        assert_eq!(c.version(B), version, "nothing was written");
+        assert_eq!(c.version_of(B, r(0, 256)), version, "nothing was written");
         assert!(c.is_fresh(B, r(0, 256), Replica::GuestPages));
         assert!(c
             .transfer_for_read(B, r(0, 256), Replica::DeviceOwned)
@@ -430,10 +801,11 @@ mod tests {
         c.declare(B, r(0, 256), Replica::GuestPages);
         assert!(!c.is_fresh(B, r(0, 1), Replica::DeviceOwned));
         assert_eq!(
-            c.version(B),
-            ContentVersion(2),
-            "two declarations; the transfer between them was not a version \
-             transition, which is the whole reason it could not repeat"
+            c.version_of(B, r(0, 256)),
+            Some(ContentVersion(1)),
+            "two declarations, so the second reserved the version after the \
+             first; the transfer between them was not a version transition, \
+             which is the whole reason it could not repeat"
         );
     }
 
@@ -445,7 +817,7 @@ mod tests {
         assert!(c
             .transfer_for_read(B, r(0, 256), Replica::DeviceOwned)
             .is_none());
-        assert_eq!(c.version(B), ContentVersion::default());
+        assert_eq!(c.newest_version(B), None);
     }
     /// Two resources placed in one heap share a backing, so a discard has to
     /// be about bytes. A whole-backing discard would throw away a neighbour's
@@ -501,5 +873,259 @@ mod tests {
             &[],
             "and the question is bounded by the range asked about"
         );
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    const EXTENT: usize = 24;
+    const BACKINGS: u64 = 3;
+
+    /// What each replica physically holds, byte by byte, beside what the
+    /// content actually is.
+    ///
+    /// `truth[i]` is the version of the current content at byte `i`.
+    /// `held[r][i]` is the version of the copy replica `r` physically has
+    /// there, or `None` for no copy at all. They are the same number only while
+    /// that replica's bytes are the content.
+    #[derive(Clone)]
+    struct Physical {
+        truth: Vec<Option<u64>>,
+        held: [Vec<Option<u64>>; 2],
+    }
+
+    impl Physical {
+        fn new() -> Self {
+            Self {
+                truth: vec![None; EXTENT],
+                held: [vec![None; EXTENT], vec![None; EXTENT]],
+            }
+        }
+    }
+
+    const fn index(r: Replica) -> usize {
+        match r {
+            Replica::GuestPages => 0,
+            Replica::DeviceOwned => 1,
+        }
+    }
+
+    /// **A replica the ledger calls fresh holds the current content.**
+    ///
+    /// The one claim the whole module is for, and the one no hand-written case
+    /// can make: it is a property of every byte after every step of an
+    /// arbitrary history, and the histories that break it are the ones where a
+    /// plan and its completion are separated by something else.
+    ///
+    /// The shadow is deliberately *physical*. It tracks the version of the
+    /// bytes each replica actually has, which is not what the ledger tracks —
+    /// the ledger tracks which of them are current. A copy is modelled as
+    /// delivering the source's content **as it was when the transfer was
+    /// planned**, because that is the earliest the hardware could have read it
+    /// and therefore the worst case the ledger has to be right about.
+    ///
+    /// A shadow that instead recorded what the ledger said would agree with it
+    /// by construction and prove nothing.
+    #[test]
+    fn a_replica_the_ledger_calls_fresh_holds_the_current_bytes() {
+        let mut declares = 0usize;
+        let mut writes = 0usize;
+        let mut planned = 0usize;
+        let mut recorded = 0usize;
+        let mut overtaken = 0usize;
+        let mut discards = 0usize;
+        let mut forgets = 0usize;
+        let mut no_source = 0usize;
+
+        for seed in 0..512u64 {
+            let mut rng = Rng::new(seed);
+            let mut c = ContentLedger::new();
+            let mut phys: HashMap<BackingId, Physical> = HashMap::new();
+            // Transfers planned and not yet recorded, with the source content
+            // they will deliver.
+            let mut in_flight: Vec<(Transfer, Vec<Option<u64>>)> = Vec::new();
+            let mut clock = 0u64;
+
+            for _ in 0..48 {
+                let b = BackingId(rng.below(BACKINGS));
+                match rng.below(40) {
+                    // Declare, which is creation and resets every copy.
+                    0..=3 => {
+                        let authority = if rng.below(2) == 0 {
+                            Replica::GuestPages
+                        } else {
+                            Replica::DeviceOwned
+                        };
+                        clock += 1;
+                        c.declare(b, r(0, EXTENT as u64), authority);
+                        let p = phys.entry(b).or_insert_with(Physical::new);
+                        for i in 0..EXTENT {
+                            p.truth[i] = Some(clock);
+                            p.held[index(authority)][i] = Some(clock);
+                            p.held[index(authority.other())][i] = None;
+                        }
+                        // A declaration is a statement that what was there is
+                        // gone, so a copy still in flight over it delivers
+                        // nothing the ledger may believe.
+                        declares += 1;
+                    }
+                    // Write, which completes at once.
+                    4..=13 => {
+                        let Some(p) = phys.get_mut(&b) else { continue };
+                        let offset = rng.below(EXTENT as u64);
+                        let length = 1 + rng.below(EXTENT as u64 - offset);
+                        let replica = if rng.below(2) == 0 {
+                            Replica::GuestPages
+                        } else {
+                            Replica::DeviceOwned
+                        };
+                        clock += 1;
+                        c.write(b, r(offset, length), replica);
+                        for i in offset as usize..(offset + length) as usize {
+                            p.truth[i] = Some(clock);
+                            p.held[index(replica)][i] = Some(clock);
+                        }
+                        writes += 1;
+                    }
+                    // Plan a copy for a read.
+                    14..=25 => {
+                        let offset = rng.below(EXTENT as u64);
+                        let length = 1 + rng.below(EXTENT as u64 - offset);
+                        let replica = if rng.below(2) == 0 {
+                            Replica::GuestPages
+                        } else {
+                            Replica::DeviceOwned
+                        };
+                        match c.transfer_for_read(b, r(offset, length), replica) {
+                            Some(t) => {
+                                assert_eq!(t.to, replica, "seed {seed}");
+                                assert_eq!(t.from, replica.other(), "seed {seed}");
+                                assert!(!t.bytes.is_empty(), "seed {seed}");
+                                // What the source has right now is what the
+                                // copy will carry.
+                                let p = &phys[&b];
+                                let carried = p.held[index(t.from)].clone();
+                                for range in t.bytes.ranges() {
+                                    let span = range.offset as usize
+                                        ..(range.offset + range.length) as usize;
+                                    assert!(
+                                        carried[span].iter().all(Option::is_some),
+                                        "seed {seed}: planned a copy of bytes the source \
+                                         does not have"
+                                    );
+                                }
+                                in_flight.push((t, carried));
+                                planned += 1;
+                            }
+                            None => {
+                                no_source += 1;
+                            }
+                        }
+                    }
+                    // Record one, in any order and however late.
+                    26..=35 if !in_flight.is_empty() => {
+                        let which = rng.below(in_flight.len() as u64) as usize;
+                        let (t, carried) = in_flight.swap_remove(which);
+                        c.record_transfer(&t);
+                        if let Some(p) = phys.get_mut(&t.backing) {
+                            let mut late = false;
+                            for range in t.bytes.ranges() {
+                                let span =
+                                    range.offset as usize..(range.offset + range.length) as usize;
+                                for (i, delivered) in carried[span].iter().enumerate() {
+                                    let i = i + range.offset as usize;
+                                    // The destination now physically holds what
+                                    // the source had when this was planned.
+                                    p.held[index(t.to)][i] = *delivered;
+                                    if *delivered != p.truth[i] {
+                                        late = true;
+                                    }
+                                }
+                            }
+                            if late {
+                                overtaken += 1;
+                            }
+                        }
+                        recorded += 1;
+                    }
+                    // Drop a replica's copy without changing the content.
+                    36..=37 => {
+                        let offset = rng.below(EXTENT as u64);
+                        let length = 1 + rng.below(EXTENT as u64 - offset);
+                        let replica = if rng.below(2) == 0 {
+                            Replica::GuestPages
+                        } else {
+                            Replica::DeviceOwned
+                        };
+                        c.discard(b, r(offset, length), replica);
+                        if let Some(p) = phys.get_mut(&b) {
+                            for i in offset as usize..(offset + length) as usize {
+                                p.held[index(replica)][i] = None;
+                            }
+                        }
+                        discards += 1;
+                    }
+                    38 => {
+                        c.forget(b);
+                        phys.remove(&b);
+                        assert!(!c.knows(b), "seed {seed}");
+                        forgets += 1;
+                    }
+                    // A record whose queue was empty, and the arm that keeps
+                    // an empty queue from turning into a forget.
+                    _ => {}
+                }
+
+                // The claim, over every byte of every backing, after every step.
+                for (backing, p) in &phys {
+                    for replica in Replica::BOTH {
+                        for i in 0..EXTENT {
+                            if c.is_fresh(*backing, r(i as u64, 1), replica) {
+                                assert_eq!(
+                                    p.held[index(replica)][i],
+                                    p.truth[i],
+                                    "seed {seed}: {backing:?} byte {i} is fresh in \
+                                     {} and holds the wrong content",
+                                    replica.name()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Non-vacuity: every shape the assertion above depends on reaching.
+        assert!(declares > 2_000, "declarations: {declares}");
+        assert!(writes > 2_400, "writes: {writes}");
+        assert!(planned > 1_500, "copies planned: {planned}");
+        assert!(recorded > 1_200, "copies recorded: {recorded}");
+        assert!(
+            overtaken > 250,
+            "copies the content moved on under: {overtaken} --- the histories \
+             this sweep exists for"
+        );
+        assert!(discards > 1_000, "discards: {discards}");
+        assert!(forgets > 400, "forgets: {forgets}");
+        assert!(no_source > 4_000, "reads with nothing to copy: {no_source}");
     }
 }
