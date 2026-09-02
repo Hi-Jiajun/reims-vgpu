@@ -452,3 +452,142 @@ fn a_frame_through_an_overlapped_present_stream_allocates_nothing() {
         "sixteen overlapped frames over three images"
     );
 }
+
+/// The whole ingress walk, from EXEC bytes to a finished transaction.
+///
+/// `appending_records_to_a_transaction_does_not_allocate_per_record` measures
+/// the builder alone: it hands `ExecBuilder::record` an already-resolved
+/// operation, so it never touches the step before it. What that step does is
+/// turn a wire record into a `ResolvedOperation`, and the records that carry a
+/// counted list — a bind of eight vertex buffers is the ordinary one — have
+/// somewhere to put it. That somewhere is [`ExecArenas`], and the arenas exist
+/// for exactly this reason: a resolver that built a `Vec` per counted record
+/// would cost a trip into the allocator on every bind in every frame, and the
+/// builder-only measurement cannot see it.
+///
+/// So the walk is driven whole. The assertion is the growth law rather than a
+/// zero: a fresh builder per EXEC starts with empty vectors and its first
+/// records have to grow them, which is a per-*EXEC* cost the plan's per-draw
+/// zero does not forbid. Quadrupling the records may add a couple of doublings
+/// per vector and nothing more; anything per record shows up as a factor of
+/// four.
+#[test]
+fn walking_an_exec_does_not_allocate_per_record() {
+    use reims_vgpu_core::access::{AccessRefusal, Participation, ResourceKey};
+    use reims_vgpu_core::exec::ExecBuilder;
+    use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
+    use reims_vgpu_core::resolve::RefResolver;
+    use reims_vgpu_core::walk;
+    use reims_vgpu_protocol::segment::{SegmentKind, SegmentLifetime};
+    use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
+
+    /// Every ref names a live resource, so the walk reaches the builder rather
+    /// than refusing on the first name.
+    struct Everything;
+
+    impl RefResolver for Everything {
+        fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+            Some(ResourceId {
+                slot: ObjectListRef(object_ref),
+                generation: SlotGeneration(1),
+            })
+        }
+    }
+
+    fn everything(p: &Participation) -> Result<AccessIntent, AccessRefusal> {
+        Ok(p.resolve(
+            ChannelId(1),
+            ResourceKey {
+                backing: BackingId(u64::from(p.resource.slot.0)),
+                heap: None,
+            },
+            None,
+            None,
+        ))
+    }
+
+    fn framed(opcode: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let length = (reims_vgpu_protocol::decode::OP_HEADER_LEN + payload.len()) as u32;
+        out.extend_from_slice(&opcode.to_le_bytes());
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// `setVertexBuffers:offsets:withRange:` over eight slots — the counted
+    /// list the arenas exist for. The entry stride is twelve: a ref and a
+    /// `u64` offset.
+    fn bind_eight() -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&8u32.to_le_bytes());
+        for buffer in 1..=8u32 {
+            payload.extend_from_slice(&buffer.to_le_bytes());
+            payload.extend_from_slice(&0u64.to_le_bytes());
+        }
+        framed(
+            reims_vgpu_wire::ops::render::OPCODE_SET_VERTEX_BUFFER,
+            &payload,
+        )
+    }
+
+    /// `drawPrimitives:vertexStart:vertexCount:`, which names no memory of its
+    /// own, so what it declares came from the slots the bind above filled.
+    fn draw() -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        framed(reims_vgpu_wire::ops::render::OPCODE_DRAW, &payload)
+    }
+
+    fn stream(pairs: u32) -> Vec<u8> {
+        let mut records = Vec::new();
+        for _ in 0..pairs {
+            records.push(bind_eight());
+            records.push(draw());
+        }
+        let body: usize = records.iter().map(Vec::len).sum();
+        let mut out = Vec::new();
+        out.extend_from_slice(&((SEGMENT_HEADER_LEN + body) as u32).to_le_bytes());
+        out.push(SegmentKind::Render.wire_type());
+        let lifetime = SegmentLifetime::SELF_CONTAINED;
+        out.push(u8::from(lifetime.continues_previous));
+        out.push(u8::from(lifetime.continues_into_next));
+        // The byte the serializer never writes.
+        out.push(0xaa);
+        for r in records {
+            out.extend_from_slice(&r);
+        }
+        out
+    }
+
+    let cost = |pairs: u32| -> usize {
+        // The bytes are built outside the measurement: what is under test is
+        // the walk over them, not the fixture that wrote them.
+        let bytes = stream(pairs);
+        let (work, allocations) =
+            measure(|| walk::exec(&bytes, &Everything, &mut everything, ExecBuilder::new()));
+        let work = work.expect("every ref resolves and the encoder closes");
+        assert_eq!(
+            work.record_count(),
+            2 * pairs as usize,
+            "every record reached the transaction, so the walk really ran"
+        );
+        allocations
+    };
+
+    let small = cost(32);
+    let large = cost(128);
+    assert!(
+        small < 32,
+        "{small} trips for thirty-two binds and thirty-two draws is one per \
+         record"
+    );
+    assert!(
+        large <= small + 16,
+        "{large} trips for 128 pairs against {small} for 32: the cost is \
+         linear in the records rather than logarithmic"
+    );
+}
