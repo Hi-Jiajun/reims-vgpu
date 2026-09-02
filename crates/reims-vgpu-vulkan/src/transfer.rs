@@ -161,6 +161,21 @@ pub enum Refusal {
         dest_offset: u64,
         size: u64,
     },
+    /// A texture copy whose source and destination are the same image, over
+    /// regions of one subresource that overlap without being the same region.
+    ///
+    /// `vkCmdCopyImage`'s source and destination regions must not overlap in
+    /// memory (VUID-vkCmdCopyImage-pRegions-00124), which is the same rule
+    /// [`Self::OverlappingSelfCopy`] states for buffers. Different subresources
+    /// of one image are different memory, so this is about one level and one
+    /// slice; the axis is what says which one.
+    ///
+    /// The *exact* self-copy is not this. A region copied onto itself leaves
+    /// the destination holding what it already held, so it is answered as
+    /// nothing to record --- see [`plan`]. This is the shifted case, which
+    /// changes bytes it is also reading and needs a staging round-trip to
+    /// define.
+    OverlappingSelfImageCopy { level: u32, slice: u32 },
     /// A blit-encoder operation that is not a copy, and so has no native
     /// transfer form at all.
     ///
@@ -187,6 +202,7 @@ impl Refusal {
             Self::OutsideTexture { .. } => "vk_transfer_outside_texture",
             Self::OutsideBuffer { .. } => "vk_transfer_outside_buffer",
             Self::OverlappingSelfCopy { .. } => "vk_transfer_overlapping_self_copy",
+            Self::OverlappingSelfImageCopy { .. } => "vk_transfer_overlapping_self_image_copy",
             Self::NotACopy { .. } => "vk_transfer_not_a_copy",
         }
     }
@@ -269,6 +285,9 @@ impl std::fmt::Display for Refusal {
                 "{} source_offset={source_offset} dest_offset={dest_offset} size={size}",
                 self.slug()
             ),
+            Self::OverlappingSelfImageCopy { level, slice } => {
+                write!(f, "{} level={level} slice={slice}", self.slug())
+            }
             Self::NotACopy { op } => write!(f, "{} op={op}", self.slug()),
         }
     }
@@ -673,11 +692,26 @@ fn resolved<T>(result: Result<T, Miss>) -> Result<T, Refusal> {
 
 /// Plan the native commands one resolved transfer becomes.
 ///
+/// # `None` is a transfer that is already done, not one that was dropped
+///
+/// A copy whose destination is the same subresource, at the same origin, as
+/// its source leaves the destination holding exactly what it already held. It
+/// has no native form --- `vkCmdCopyImage`'s regions must not overlap in
+/// memory, and a region overlaps itself totally --- and it needs none, so the
+/// answer is that there is nothing to record. Not a refusal: an unmodified
+/// guest issues `copyFromTexture:X toTexture:X` with equal origins, and a
+/// refusal would drop a copy the guest treats as complete and report a failure
+/// for a frame that is correct.
+///
+/// The shape is [`crate::layout::LayoutTracker::plan`]'s, and for the same
+/// reason: "nothing to do" is the steady state of a real stream and is worth
+/// saying rather than dressing as a command that does nothing.
+///
 /// # Errors
 ///
 /// [`Refusal`] naming the one thing that could not be expressed.
-pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
-    match *op {
+pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refusal> {
+    Ok(Some(match *op {
         BlitOp::BufferToBuffer {
             source,
             source_offset,
@@ -705,7 +739,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                     size,
                 });
             }
-            Ok(Command::CopyBuffer {
+            Command::CopyBuffer {
                 source: from.buffer,
                 dest: to.buffer,
                 regions: Regions::One(vk::BufferCopy {
@@ -713,7 +747,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                     dst_offset: dest_offset,
                     size,
                 }),
-            })
+            }
         }
         BlitOp::BufferToTexture {
             source,
@@ -730,7 +764,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                 source_offset,
                 region_bytes(image.texture, source_pitch, size)?,
             )?;
-            Ok(Command::CopyBufferToImage {
+            Command::CopyBufferToImage {
                 source: from.buffer,
                 dest: image.image,
                 regions: Regions::One(buffer_image_region(
@@ -740,7 +774,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                     dest,
                     size,
                 )?),
-            })
+            }
         }
         BlitOp::TextureToBuffer {
             source,
@@ -757,7 +791,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                 dest_offset,
                 region_bytes(image.texture, dest_pitch, size)?,
             )?;
-            Ok(Command::CopyImageToBuffer {
+            Command::CopyImageToBuffer {
                 source: image.image,
                 dest: to.buffer,
                 regions: Regions::One(buffer_image_region(
@@ -767,7 +801,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                     source,
                     size,
                 )?),
-            })
+            }
         }
         BlitOp::TextureRegion {
             source,
@@ -779,7 +813,29 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
             let to = resolved(residency.image(dest.texture))?;
             let (src_subresource, src_offset, extent) = endpoint(from.texture, source, size)?;
             let (dst_subresource, dst_offset, _) = endpoint(to.texture, dest, size)?;
-            Ok(Command::CopyImage {
+            // One image, one subresource: the two regions are in the same
+            // memory and `vkCmdCopyImage` forbids them overlapping. Different
+            // levels or slices of one image are different memory, so this is
+            // the only shape that can. On the native handle rather than the
+            // two names, for the reason `OverlappingSelfCopy` gives.
+            if from.image == to.image && source.level == dest.level && source.slice == dest.slice {
+                if source.origin == dest.origin {
+                    // A region copied onto itself leaves the destination
+                    // holding what it already held. Answered as nothing to
+                    // record rather than refused: an unmodified guest issues
+                    // exactly this --- `copyFromTexture:X toTexture:X` with
+                    // equal origins --- and a refusal drops a copy it treats as
+                    // complete.
+                    return Ok(None);
+                }
+                if overlaps(src_offset, dst_offset, extent) {
+                    return Err(Refusal::OverlappingSelfImageCopy {
+                        level: u32::from(source.level),
+                        slice: u32::from(source.slice),
+                    });
+                }
+            }
+            Command::CopyImage {
                 source: from.image,
                 dest: to.image,
                 regions: Regions::One(vk::ImageCopy {
@@ -789,7 +845,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                     dst_offset,
                     extent,
                 }),
-            })
+            }
         }
         BlitOp::TextureSlices { source, dest } => {
             let from = resolved(residency.image(source.texture))?;
@@ -809,6 +865,31 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                     u64::from(span.base_slice) + u64::from(span.slice_count),
                     u64::from(texture.layers()),
                 )?;
+            }
+            // One image, and spans that share a (level, slice) pair. Each
+            // region covers its whole level, so a shared pair is a total
+            // overlap and never a partial one --- there is no offset to
+            // compare, only whether the two spans intersect on both axes.
+            if from.image == to.image {
+                let shares = |base_a: u16, base_b: u16, count: u16| {
+                    let (a, b) = (u32::from(base_a), u32::from(base_b));
+                    let count = u32::from(count);
+                    (a < b + count && b < a + count).then_some(a.max(b))
+                };
+                if let (Some(level), Some(slice)) = (
+                    shares(source.base_level, dest.base_level, source.level_count),
+                    shares(source.base_slice, dest.base_slice, source.slice_count),
+                ) {
+                    if source.base_level == dest.base_level && source.base_slice == dest.base_slice
+                    {
+                        // The whole span onto itself: every region would read
+                        // and write one subresource's own bytes. See the
+                        // region arm above for why this is nothing to record
+                        // rather than a refusal.
+                        return Ok(None);
+                    }
+                    return Err(Refusal::OverlappingSelfImageCopy { level, slice });
+                }
             }
             // One region per level and not per slice: `layerCount` covers the
             // slice span, and the extent is the level's own --- a mip chain
@@ -878,16 +959,16 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                         .collect::<Result<Vec<_>, _>>()?,
                 ),
             };
-            Ok(Command::CopyImage {
+            Command::CopyImage {
                 source: from.image,
                 dest: to.image,
                 regions,
-            })
+            }
         }
         // A fill is not a copy, and a ragged one is not even one command. See
         // [`plan_fill`], which is the only thing that can answer it, because
         // it needs the scratch memory this signature has no access to.
-        BlitOp::FillBuffer { .. } => Err(Refusal::NotACopy { op: "fill_buffer" }),
+        BlitOp::FillBuffer { .. } => return Err(Refusal::NotACopy { op: "fill_buffer" }),
         // A filtered reduction with a barrier between every pair of levels,
         // not a copy: see [`crate::mipmap`]. Refused here rather than absorbed
         // into one of the copies above, because a mipmap generation recorded
@@ -896,11 +977,31 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
         // nothing is that refusal and not this one.
         BlitOp::GenerateMipmaps { texture } => {
             resolved(residency.image(texture))?;
-            Err(Refusal::NotACopy {
+            return Err(Refusal::NotACopy {
                 op: "generate_mipmaps",
-            })
+            });
         }
-    }
+    }))
+}
+
+/// Whether two regions of one subresource, both `extent` in size, share a
+/// texel.
+///
+/// Two axis-aligned boxes intersect exactly when they intersect on every axis,
+/// which is three independent one-dimensional questions and not one
+/// three-dimensional one. Both offsets were narrowed to `i32` and the extent to
+/// `u32` by [`endpoint`], so the sums are inside `i64` and cannot wrap.
+fn overlaps(a: vk::Offset3D, b: vk::Offset3D, extent: vk::Extent3D) -> bool {
+    [
+        (a.x, b.x, extent.width),
+        (a.y, b.y, extent.height),
+        (a.z, b.z, extent.depth),
+    ]
+    .into_iter()
+    .all(|(a, b, span)| {
+        let (a, b, span) = (i64::from(a), i64::from(b), i64::from(span));
+        a < b + span && b < a + span
+    })
 }
 
 /// The interior of a fill, as `vkCmdFillBuffer` takes it.
@@ -1219,7 +1320,8 @@ mod tests {
             },
             &residency,
         )
-        .expect("plannable");
+        .expect("plannable")
+        .expect("native work to record");
         let Command::CopyBuffer {
             source,
             dest,
@@ -1470,8 +1572,8 @@ mod tests {
         .expect("plannable");
 
         let (
-            Command::CopyBufferToImage { regions: u, .. },
-            Command::CopyImageToBuffer { regions: d, .. },
+            Some(Command::CopyBufferToImage { regions: u, .. }),
+            Some(Command::CopyImageToBuffer { regions: d, .. }),
         ) = (up, down)
         else {
             panic!("one of each direction");
@@ -1532,7 +1634,8 @@ mod tests {
             },
             &residency,
         )
-        .expect("plannable");
+        .expect("plannable")
+        .expect("native work to record");
         let Command::CopyImageToBuffer { regions, .. } = planned else {
             panic!("a download");
         };
@@ -1564,7 +1667,8 @@ mod tests {
             },
             &residency,
         )
-        .expect("plannable");
+        .expect("plannable")
+        .expect("native work to record");
         let Command::CopyImage { regions, .. } = planned else {
             panic!("an image copy");
         };
@@ -1892,7 +1996,8 @@ mod tests {
             },
             &residency,
         )
-        .expect("plannable");
+        .expect("plannable")
+        .expect("native work to record");
         let Command::CopyImage {
             source,
             dest,
@@ -2449,6 +2554,130 @@ mod tests {
             &residency,
         )
         .is_ok());
+    }
+
+    /// The two halves of one image copying onto itself.
+    ///
+    /// `vkCmdCopyImage`'s regions must not overlap in memory, so a shifted
+    /// self-copy is a command with no defined result. The *exact* self-copy is
+    /// the same overlap and a different answer: the destination already holds
+    /// the source bytes, and an unmodified guest issues it —
+    /// `copyFromTexture:X toTexture:X` with equal origins — so refusing it
+    /// would report a failure for a frame that is correct.
+    #[test]
+    fn one_image_copying_onto_itself_is_nothing_to_do_or_a_refusal() {
+        let residency = populated();
+        let region = |source: TexturePoint, dest: TexturePoint, size: Size3| {
+            plan(
+                &BlitOp::TextureRegion {
+                    source,
+                    dest,
+                    size,
+                    options: Default::default(),
+                },
+                &residency,
+            )
+        };
+        let at = |level: u16, slice: u16, x: u64, y: u64| TexturePoint {
+            texture: id(IMAGE_A),
+            slice,
+            level,
+            origin: Origin3 { x, y, z: 0 },
+        };
+
+        // The exact self-copy: nothing to record, and not an error.
+        assert!(region(at(0, 0, 8, 8), at(0, 0, 8, 8), size(16, 16))
+            .expect("a copy onto itself is complete")
+            .is_none());
+
+        // Shifted, and the two rectangles share a texel.
+        assert_eq!(
+            region(at(0, 2, 0, 0), at(0, 2, 8, 8), size(16, 16))
+                .expect_err("shifted by less than its own extent"),
+            Refusal::OverlappingSelfImageCopy { level: 0, slice: 2 }
+        );
+
+        // Shifted clear of itself on one axis is a copy: two boxes intersect
+        // only when they intersect on *every* axis, so one is enough.
+        assert!(region(at(0, 0, 0, 0), at(0, 0, 16, 0), size(16, 16))
+            .expect("disjoint in x")
+            .is_some());
+        assert!(region(at(0, 0, 0, 0), at(0, 0, 0, 16), size(16, 16))
+            .expect("disjoint in y")
+            .is_some());
+
+        // A different level or a different slice of the same image is
+        // different memory, so the same origins do not overlap at all.
+        for (source, dest) in [
+            (at(0, 0, 0, 0), at(1, 0, 0, 0)),
+            (at(1, 0, 0, 0), at(1, 1, 0, 0)),
+        ] {
+            assert!(region(source, dest, size(8, 8))
+                .expect("different subresources")
+                .is_some());
+        }
+
+        // And two different images at the same origin are an ordinary copy,
+        // which is what makes this a rule about one allocation.
+        assert!(region(
+            at(0, 0, 0, 0),
+            TexturePoint {
+                texture: id(IMAGE_B),
+                ..at(0, 0, 0, 0)
+            },
+            size(16, 16)
+        )
+        .expect("two images")
+        .is_some());
+    }
+
+    /// The same two answers for a slice span, whose regions cover whole levels
+    /// — so a shared (level, slice) pair is a total overlap and there is no
+    /// origin to compare.
+    #[test]
+    fn one_image_spanning_onto_itself_is_nothing_to_do_or_a_refusal() {
+        let residency = populated();
+        let span = |base_level: u16, base_slice: u16, slice_count: u16| TextureSpan {
+            texture: id(IMAGE_A),
+            base_slice,
+            base_level,
+            slice_count,
+            level_count: 2,
+        };
+        let slices = |source: TextureSpan, dest: TextureSpan| {
+            plan(&BlitOp::TextureSlices { source, dest }, &residency)
+        };
+
+        assert!(slices(span(0, 0, 2), span(0, 0, 2))
+            .expect("a span onto itself is complete")
+            .is_none());
+        // Levels 0..2 against 1..3 and slices 0..2 against 1..3: one shared
+        // pair on each axis, which is one shared subresource.
+        assert_eq!(
+            slices(span(0, 0, 2), span(1, 1, 2)).expect_err("the spans overlap"),
+            Refusal::OverlappingSelfImageCopy { level: 1, slice: 1 }
+        );
+        // Disjoint on the level axis alone is enough. The deeper span is the
+        // source, so the destination levels are the larger ones --- a shallower
+        // source would be refused for a different reason entirely.
+        assert!(slices(span(2, 0, 2), span(0, 0, 2))
+            .expect("disjoint levels")
+            .is_some());
+        // And on the slice axis alone, with one slice each so two bases fit in
+        // the fixture's three layers.
+        assert!(slices(span(0, 0, 1), span(0, 1, 1))
+            .expect("disjoint slices")
+            .is_some());
+        // A different image at the same span is an ordinary copy.
+        assert!(slices(
+            span(0, 0, 2),
+            TextureSpan {
+                texture: id(IMAGE_B),
+                ..span(0, 0, 2)
+            }
+        )
+        .expect("two images")
+        .is_some());
     }
 
     /// A destination texture whose level zero is `width` by `height`, so a

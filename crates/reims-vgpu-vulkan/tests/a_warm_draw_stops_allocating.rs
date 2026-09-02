@@ -373,7 +373,9 @@ fn planning_a_transfer_allocates_nothing_per_single_region_record() {
     ] {
         let kind = op.kind();
         let (planned, allocations) = measure(|| transfer::plan(&op, &residency));
-        let planned = planned.unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+        let planned = planned
+            .unwrap_or_else(|e| panic!("{kind:?}: {e}"))
+            .expect("native work to record");
         assert_eq!(planned.region_count(), 1, "{kind:?} names one region");
         assert_eq!(allocations, 0, "{kind:?} planned through the allocator");
     }
@@ -392,6 +394,12 @@ fn planning_a_transfer_allocates_nothing_per_single_region_record() {
         },
     };
     let (planned, allocations) = measure(|| transfer::plan(&op, &residency));
-    assert_eq!(planned.expect("plannable").region_count(), 4);
+    assert_eq!(
+        planned
+            .expect("plannable")
+            .expect("native work to record")
+            .region_count(),
+        4
+    );
     assert_eq!(allocations, 1, "one allocation for the four regions");
 }
