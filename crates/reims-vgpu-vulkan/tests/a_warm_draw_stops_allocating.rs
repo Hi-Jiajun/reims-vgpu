@@ -151,3 +151,52 @@ fn taking_and_recycling_a_descriptor_set_allocates_nothing() {
         "sixteen frames of take-submit-recycle over a fixed ring"
     );
 }
+
+/// Walking the slots an emission owes costs nothing.
+///
+/// This is the door the descriptor emitter walks, once per binding kind, on
+/// every draw that rebound anything --- and the walk carries no state past a
+/// word index and the residue of that word, so there is nothing for it to
+/// build. It returned a `Vec` because it was only ever driven from tests, and
+/// the emitter would have inherited three allocations per rebinding draw the
+/// moment it was written. Measured before the emitter exists rather than after,
+/// which is the only time the number is free to fix.
+#[test]
+fn walking_the_slots_an_emission_owes_allocates_nothing() {
+    let mut table = BindingTable::new(512, 512, 16);
+    for slot in 0..512u32 {
+        table.bind_buffer(slot as usize, buffer(slot));
+        table.bind_texture(slot as usize, texture(10_000 + slot));
+    }
+    for slot in 0..16u32 {
+        table.bind_sampler(slot as usize, texture(20_000 + slot));
+    }
+    // Take the dirty set outside the measurement: its three replacement masks
+    // are a separate, already-measured cost, and what is under test is the
+    // walk over what it reported.
+    let dirty = table.take_dirty();
+    assert_eq!(dirty.len(), 512 + 512 + 16, "everything was just bound");
+
+    let (visited, allocations) = measure(|| {
+        let mut visited = 0usize;
+        for slot in dirty.buffers.slots() {
+            visited += slot;
+        }
+        for slot in dirty.textures.slots() {
+            visited += slot;
+        }
+        for slot in dirty.samplers.slots() {
+            visited += slot;
+        }
+        visited
+    });
+    // Two full 0..512 runs and one 0..16, so the walk really did visit every
+    // slot --- an empty iterator does not allocate either, and a measurement
+    // that did not check this would pass with the `Vec` restored and the mask
+    // drained.
+    assert_eq!(visited, 2 * (511 * 512 / 2) + 15 * 16 / 2);
+    assert_eq!(
+        allocations, 0,
+        "the walk over a dirty set builds nothing of its own"
+    );
+}

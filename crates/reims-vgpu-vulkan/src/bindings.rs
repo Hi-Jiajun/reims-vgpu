@@ -106,18 +106,28 @@ impl SlotMask {
     }
 
     /// The slots in the mask, ascending.
-    #[must_use]
-    pub fn slots(&self) -> Vec<usize> {
-        let mut out = Vec::with_capacity(self.len());
-        for (i, word) in self.words.iter().enumerate() {
-            let mut bits = *word;
-            while bits != 0 {
+    ///
+    /// An iterator and not a `Vec`. This is the door an emitter walks on every
+    /// draw that rebinds anything, once per class, and the walk keeps no state
+    /// past a word index and the residue of that word --- so the `Vec` was
+    /// three allocations per rebinding draw buying nothing. A caller that
+    /// genuinely wants one still collects; what it cannot do is get one
+    /// without asking.
+    pub fn slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words.iter().enumerate().flat_map(|(word, bits)| {
+            let mut bits = *bits;
+            core::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
                 let bit = bits.trailing_zeros() as usize;
-                out.push(i * 64 + bit);
+                // Clear the lowest set bit, so the residue is what is left to
+                // report and the loop terminates on the population count
+                // rather than on the word width.
                 bits &= bits - 1;
-            }
-        }
-        out
+                Some(word * 64 + bit)
+            })
+        })
     }
 }
 
@@ -427,7 +437,7 @@ mod tests {
         t.bind_buffer(3, buffer(3, 256));
         t.bind_buffer(5, buffer(99, 0));
         let dirty = t.take_dirty();
-        assert_eq!(dirty.buffers.slots(), vec![3, 5]);
+        assert_eq!(dirty.buffers.slots().collect::<Vec<_>>(), vec![3, 5]);
         assert!(dirty.textures.is_empty());
     }
 
@@ -439,7 +449,7 @@ mod tests {
         t.bind_buffer(0, buffer(1, 0));
         emit(&mut t);
         assert!(t.bind_buffer(0, buffer(1, 64)));
-        assert_eq!(t.take_dirty().buffers.slots(), vec![0]);
+        assert_eq!(t.take_dirty().buffers.slots().collect::<Vec<_>>(), vec![0]);
     }
 
     /// Two different resources may occupy one native handle across a retire and
@@ -464,7 +474,7 @@ mod tests {
         t.bind_texture(4, texture(1));
         emit(&mut t);
         assert!(t.bind_texture(4, None));
-        assert_eq!(t.take_dirty().textures.slots(), vec![4]);
+        assert_eq!(t.take_dirty().textures.slots().collect::<Vec<_>>(), vec![4]);
         assert!(t.texture(4).is_none());
         assert!(!t.bind_texture(4, None), "it was already unbound");
     }
@@ -483,9 +493,9 @@ mod tests {
 
         t.disturb_all();
         let dirty = t.take_dirty();
-        assert_eq!(dirty.buffers.slots(), vec![0, 7]);
+        assert_eq!(dirty.buffers.slots().collect::<Vec<_>>(), vec![0, 7]);
         assert_eq!(
-            dirty.textures.slots(),
+            dirty.textures.slots().collect::<Vec<_>>(),
             vec![31, 64],
             "and the mask spans more than one word"
         );
@@ -794,7 +804,7 @@ mod tests {
         t.disturb_all();
 
         let dirty = t.take_dirty();
-        assert_eq!(dirty.textures.slots(), vec![2]);
+        assert_eq!(dirty.textures.slots().collect::<Vec<_>>(), vec![2]);
         assert!(dirty.buffers.is_empty());
         assert!(dirty.samplers.is_empty());
     }
@@ -840,12 +850,12 @@ mod tests {
         m.insert(63);
         m.insert(64);
         m.insert(200);
-        assert_eq!(m.slots(), vec![0, 63, 64, 200]);
+        assert_eq!(m.slots().collect::<Vec<_>>(), vec![0, 63, 64, 200]);
         assert_eq!(m.len(), 4);
         assert!(m.contains(64));
         assert!(!m.contains(65));
         m.clear();
         assert!(m.is_empty());
-        assert_eq!(m.slots(), Vec::<usize>::new());
+        assert_eq!(m.slots().collect::<Vec<_>>(), Vec::<usize>::new());
     }
 }
