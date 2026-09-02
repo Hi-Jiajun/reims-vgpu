@@ -45,6 +45,33 @@
 //! bit down to its declared neighbours reports a guest request the device is
 //! sure it understood.
 //!
+//! # A stage mask and an access mask are one answer, not two
+//!
+//! Vulkan performs each access at particular stages, and a barrier whose
+//! access mask names an access its stage mask cannot perform is invalid use
+//! (VUID-VkMemoryBarrier2-srcAccessMask-03900 and its `dst` twin). The
+//! consequence that matters is not the validation message: a colour write
+//! happens at `COLOR_ATTACHMENT_OUTPUT`, so a barrier sourced at
+//! `FRAGMENT_SHADER` does not wait for it, and `textureBarrier` — which is
+//! *defined* as the colour write becoming readable — would order nothing it
+//! was asked to.
+//!
+//! The guest cannot name those stages, because Metal does not have them:
+//! `MTLRenderStageFragment` covers fragment shading together with the depth
+//! and stencil tests and the colour writes that follow it. So the fragment
+//! stage translates to four Vulkan stages, and the vertex stage to one.
+//!
+//! The access is then intersected with what those stages can perform. That is
+//! not the masking this module refuses elsewhere: an access a stage cannot
+//! perform did not happen in that stage, so the intersection removes nothing
+//! the guest asked for. A guest ordering render-target memory against the
+//! vertex stage gets an execution dependency and no memory one, which is the
+//! whole of what it asked for.
+//!
+//! [`ACCESS_STAGES`] is the table, and it has to cover every access this
+//! module emits for the same reason [`BarrierPlan::unmapped_bits`] exists: a
+//! row that is missing does not fail, it silently drops the access.
+//!
 //! # What this does not do
 //!
 //! A barrier over a listed set of resources becomes one image or buffer memory
@@ -182,6 +209,18 @@ const STAGE_MAP: &[(vk::PipelineStageFlags2, vk::PipelineStageFlags)] = &[
         vk::PipelineStageFlags::FRAGMENT_SHADER,
     ),
     (
+        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS,
+        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+    ),
+    (
+        vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+        vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+    ),
+    (
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+    ),
+    (
         vk::PipelineStageFlags2::TASK_SHADER_EXT,
         vk::PipelineStageFlags::TASK_SHADER_EXT,
     ),
@@ -238,6 +277,92 @@ const ACCESS_MAP: &[(vk::AccessFlags2, vk::AccessFlags)] = &[
         vk::AccessFlags::MEMORY_WRITE,
     ),
 ];
+
+/// Every shader stage this module can emit. The carrier of every access a
+/// shader performs, which is most of the table below.
+const SHADER_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+    vk::PipelineStageFlags2::VERTEX_SHADER.as_raw()
+        | vk::PipelineStageFlags2::FRAGMENT_SHADER.as_raw()
+        | vk::PipelineStageFlags2::COMPUTE_SHADER.as_raw()
+        | vk::PipelineStageFlags2::TASK_SHADER_EXT.as_raw()
+        | vk::PipelineStageFlags2::MESH_SHADER_EXT.as_raw(),
+);
+
+/// Every stage this module can emit, which is what carries `MEMORY_READ` and
+/// `MEMORY_WRITE` — the two accesses every stage performs.
+const ALL_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+    SHADER_STAGES.as_raw()
+        | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
+        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw()
+        | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT.as_raw(),
+);
+
+/// Which stages perform each access this module emits — Vulkan's "supported
+/// access types" relation, restricted to the accesses that can reach a plan.
+///
+/// This is the table that makes a stage mask and an access mask one answer.
+/// Every access below must also be produced by [`scope_access`] or by one of
+/// the two literal targets in [`translate`], and every access those produce
+/// must appear here: a row that is missing silently drops the access when the
+/// intersection is taken, which is the failure mode this table exists to make
+/// impossible. [`access_without_carrier`] is the check.
+const ACCESS_STAGES: &[(vk::AccessFlags2, vk::PipelineStageFlags2)] = &[
+    (vk::AccessFlags2::UNIFORM_READ, SHADER_STAGES),
+    (vk::AccessFlags2::SHADER_SAMPLED_READ, SHADER_STAGES),
+    (vk::AccessFlags2::SHADER_STORAGE_READ, SHADER_STAGES),
+    (vk::AccessFlags2::SHADER_STORAGE_WRITE, SHADER_STAGES),
+    (
+        vk::AccessFlags2::INPUT_ATTACHMENT_READ,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+    ),
+    (
+        vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+    ),
+    (
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+    ),
+    (
+        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+        vk::PipelineStageFlags2::from_raw(
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw(),
+        ),
+    ),
+    (
+        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::from_raw(
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw(),
+        ),
+    ),
+    (vk::AccessFlags2::MEMORY_READ, ALL_STAGES),
+    (vk::AccessFlags2::MEMORY_WRITE, ALL_STAGES),
+];
+
+/// The part of `access` that `stages` can actually perform.
+///
+/// Removes nothing the guest asked for: an access a stage cannot perform did
+/// not happen in that stage. See the module doc.
+fn access_within(access: vk::AccessFlags2, stages: vk::PipelineStageFlags2) -> vk::AccessFlags2 {
+    ACCESS_STAGES
+        .iter()
+        .filter(|(bit, carriers)| access.contains(*bit) && stages.intersects(*carriers))
+        .fold(vk::AccessFlags2::empty(), |acc, (bit, _)| acc | *bit)
+}
+
+/// The bits of `access` with no row in [`ACCESS_STAGES`], or zero.
+///
+/// Non-zero would mean an access reaches a plan that [`access_within`] then
+/// discards whatever the stages are — dropped ordering, silently.
+#[must_use]
+pub fn access_without_carrier(access: vk::AccessFlags2) -> u64 {
+    let covered = ACCESS_STAGES
+        .iter()
+        .fold(0, |acc, (bit, _)| acc | bit.as_raw());
+    access.as_raw() & !covered
+}
 
 fn mapped_stage_bits() -> u64 {
     STAGE_MAP.iter().fold(0, |acc, (new, _)| acc | new.as_raw())
@@ -305,11 +430,13 @@ pub fn translate(op: &BarrierOp, support: StageSupport) -> Result<BarrierPlan, D
     if !op.orders_anything() {
         return Ok(BarrierPlan::default());
     }
+    // One answer, not two: each half keeps only the access its own stages
+    // perform. See the module doc for why this loses nothing.
     Ok(BarrierPlan {
         src_stages,
         dst_stages,
-        src_access,
-        dst_access,
+        src_access: access_within(src_access, src_stages),
+        dst_access: access_within(dst_access, dst_stages),
     })
 }
 
@@ -364,7 +491,16 @@ fn stages(
         out |= vk::PipelineStageFlags2::VERTEX_SHADER;
     }
     if declared.0 & RenderStages::FRAGMENT != 0 {
-        out |= vk::PipelineStageFlags2::FRAGMENT_SHADER;
+        // Four, because Metal has one. `MTLRenderStageFragment` covers
+        // fragment shading and the per-fragment fixed function that follows
+        // it, and the guest has no other spelling for the stages that perform
+        // the depth, stencil and colour accesses. Emitting only the shader
+        // stage would leave every attachment access in the plan uncarried, and
+        // `textureBarrier` unable to name its own source.
+        out |= vk::PipelineStageFlags2::FRAGMENT_SHADER
+            | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
+            | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
     }
     if declared.0 & RenderStages::OBJECT != 0 {
         out |= vk::PipelineStageFlags2::TASK_SHADER_EXT;
@@ -412,6 +548,16 @@ mod tests {
             .contains(vk::AccessFlags2::SHADER_SAMPLED_READ));
     }
 
+    /// `MTLRenderStageFragment` is four Vulkan stages, and it has to be: the
+    /// colour write it names happens at `COLOR_ATTACHMENT_OUTPUT`, so a plan
+    /// sourced only at `FRAGMENT_SHADER` would not wait for it.
+    const FRAGMENT_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+        vk::PipelineStageFlags2::FRAGMENT_SHADER.as_raw()
+            | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
+            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw()
+            | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT.as_raw(),
+    );
+
     #[test]
     fn a_render_barrier_carries_the_stages_the_record_declared() {
         let plan = translate(
@@ -423,14 +569,111 @@ mod tests {
             RENDER,
         )
         .expect("declared bits only");
-        assert_eq!(plan.src_stages, vk::PipelineStageFlags2::FRAGMENT_SHADER);
+        assert_eq!(plan.src_stages, FRAGMENT_STAGES);
         assert_eq!(
             plan.dst_stages,
-            vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER
+            vk::PipelineStageFlags2::VERTEX_SHADER | FRAGMENT_STAGES
         );
         assert!(plan
             .src_access
             .contains(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE));
+    }
+
+    /// The rule the whole table serves: every access in a half is one the
+    /// stages of that same half perform. Asserted over every combination of
+    /// scope and declared stages, not over the handful of cases below.
+    #[test]
+    fn no_half_of_any_plan_names_an_access_its_own_stages_cannot_perform() {
+        let declared = [
+            RenderStages::VERTEX,
+            RenderStages::FRAGMENT,
+            RenderStages::OBJECT,
+            RenderStages::MESH,
+        ];
+        let mut seen_attachment = false;
+        let mut seen_shader = false;
+        for scope_bits in
+            0..=(BarrierScope::BUFFERS | BarrierScope::TEXTURES | BarrierScope::RENDER_TARGETS)
+        {
+            for after in 0..(1u32 << declared.len()) {
+                for before in 0..(1u32 << declared.len()) {
+                    let mask = |set: u32| {
+                        declared
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| set & (1 << i) != 0)
+                            .fold(0, |acc, (_, bit)| acc | bit)
+                    };
+                    let op = scope(scope_bits, Some(mask(after)), Some(mask(before)));
+                    let Ok(plan) = translate(&op, MESH) else {
+                        continue;
+                    };
+                    for (access, stages) in [
+                        (plan.src_access, plan.src_stages),
+                        (plan.dst_access, plan.dst_stages),
+                    ] {
+                        assert_eq!(
+                            access_within(access, stages),
+                            access,
+                            "{op:?} names {access:?} at {stages:?}"
+                        );
+                        seen_attachment |=
+                            access.contains(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE);
+                        seen_shader |= access.contains(vk::AccessFlags2::SHADER_SAMPLED_READ);
+                    }
+                }
+            }
+        }
+        // Not vacuous: the sweep reached both an attachment access and a
+        // shader one rather than only empty plans.
+        assert!(seen_attachment && seen_shader);
+    }
+
+    /// A guest may order render-target memory against the vertex stage. No
+    /// attachment access happens there, so what it asked for is an execution
+    /// dependency and no memory one — the plan says exactly that instead of
+    /// naming an access the stage cannot perform.
+    #[test]
+    fn a_scope_no_stage_in_the_mask_touches_becomes_an_execution_dependency() {
+        let plan = translate(
+            &scope(
+                BarrierScope::RENDER_TARGETS,
+                Some(RenderStages::VERTEX),
+                Some(RenderStages::VERTEX),
+            ),
+            RENDER,
+        )
+        .expect("declared bits only");
+        assert_eq!(plan.src_stages, vk::PipelineStageFlags2::VERTEX_SHADER);
+        assert_eq!(plan.src_access, vk::AccessFlags2::empty());
+        assert_eq!(plan.dst_access, vk::AccessFlags2::empty());
+        assert!(
+            plan.orders_anything(),
+            "an execution dependency is still an ordering"
+        );
+    }
+
+    /// A row missing from the table is not a compile error and not a refusal:
+    /// the intersection would drop the access whatever the stages were. So
+    /// every access this module can produce is checked against the table.
+    #[test]
+    fn every_access_this_module_emits_has_a_carrier() {
+        let mut every = vk::AccessFlags2::empty();
+        for bits in
+            0..=(BarrierScope::BUFFERS | BarrierScope::TEXTURES | BarrierScope::RENDER_TARGETS)
+        {
+            every |= scope_access(BarrierScope(bits));
+        }
+        // The two targets that carry a literal access rather than a scope.
+        every |= vk::AccessFlags2::MEMORY_READ
+            | vk::AccessFlags2::MEMORY_WRITE
+            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+            | vk::AccessFlags2::SHADER_SAMPLED_READ
+            | vk::AccessFlags2::INPUT_ATTACHMENT_READ;
+        assert_eq!(access_without_carrier(every), 0);
+        // And the check is not vacuous: an access nothing here emits has no
+        // carrier and would be reported.
+        assert_ne!(access_without_carrier(vk::AccessFlags2::HOST_WRITE), 0);
     }
 
     /// A barrier over nothing is legal to send and orders nothing. It must not
@@ -627,6 +870,12 @@ mod tests {
             plan.orders_anything(),
             "it names nothing and orders its pass"
         );
+        // And the write it waits for is carried by the stage that performs
+        // it. Sourced at `FRAGMENT_SHADER` alone, this barrier would let the
+        // read run before the write it exists to order.
+        assert!(plan
+            .src_stages
+            .contains(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT));
     }
 
     #[test]
