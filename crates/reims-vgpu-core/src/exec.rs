@@ -497,7 +497,10 @@ impl EncoderBindings {
     /// [`crate::pipeline::BindingUsage`], and the layer that can produce it is
     /// the executor that compiled the shader — so the narrowing arrives with
     /// the pipeline, not from here.
-    fn footprint_into(&mut self, op: &ResolvedOperation, out: &mut Vec<Participation>) {
+    ///
+    /// **Changes nothing.** Taking a footprint is not keeping it — see
+    /// [`Self::keep`].
+    fn footprint_into(&self, op: &ResolvedOperation, out: &mut Vec<Participation>) {
         match (self, op) {
             (Self::Render(state), ResolvedOperation::Render(RenderOp::Draw(_))) => {
                 state.footprint_into(None, None, out);
@@ -507,6 +510,33 @@ impl EncoderBindings {
             }
             _ => {}
         }
+    }
+
+    /// Take a record into the encoder's tables: what its footprint answered is
+    /// now declared, and what it binds is now bound.
+    ///
+    /// **The only door out of [`ExecBuilder::record`]'s success path, and the
+    /// reason it is one method.** [`Self::footprint_into`] runs before the
+    /// record is placed, because the accesses have to be built before anything
+    /// can refuse them — so a record that is then refused has had its footprint
+    /// taken and must not have had it *declared*. Marking inside the gather is
+    /// how the declaration used to be lost: the refused record took it, and the
+    /// next draw named nothing, which is a hazard edge that does not get built.
+    ///
+    /// Declaring before applying is the order, and not an arbitrary one: the
+    /// footprint that was answered is the one the tables held when it was
+    /// gathered, and a bind in the same record would move slots out from under
+    /// it. No record is both, so the two never actually meet — which is why the
+    /// order can be stated rather than defended.
+    fn keep(&mut self, op: &ResolvedOperation, arenas: &ExecArenas) {
+        match (&mut *self, op) {
+            (Self::Render(state), ResolvedOperation::Render(RenderOp::Draw(_))) => state.declare(),
+            (Self::Compute(state), ResolvedOperation::Compute(ComputeOp::Dispatch(_))) => {
+                state.declare();
+            }
+            _ => {}
+        }
+        self.apply(op, arenas);
     }
 
     /// Apply one accepted record to the open encoder's tables.
@@ -646,6 +676,10 @@ impl ExecBuilder {
         // here, beside the record's own participations, for the same reason
         // those are derived rather than declared: a footprint supplied
         // separately can disagree with the records that produced it.
+        //
+        // Gathering only. Whether the encoder has *declared* what it just
+        // answered is settled on the success path below, because everything
+        // between here and there can still refuse the record.
         self.bindings.footprint_into(&op, &mut parts);
         // Pushed straight onto the transaction's list and rolled back on any
         // refusal, rather than gathered into a second vector: a record's
@@ -672,7 +706,7 @@ impl ExecBuilder {
                 if let Some(pipeline) = lease {
                     self.lease_pipeline(pipeline);
                 }
-                self.bindings.apply(&op, &self.arenas);
+                self.bindings.keep(&op, &self.arenas);
                 Ok(at)
             }
             Err(refusal) => {
@@ -1504,6 +1538,57 @@ mod tests {
     /// transaction holding a lease for a pipeline no record of its own binds
     /// waits for a compilation it has no interest in, which the guest
     /// experiences as a frame that never arrives.
+    /// **A record the builder does not keep must not take the encoder's
+    /// declaration with it.**
+    ///
+    /// The footprint has to be gathered before anything can refuse it — the
+    /// accesses are built from it — so a refused record has had its footprint
+    /// *taken*. Marking the slots declared as part of that gather meant the
+    /// refused record consumed the declaration and the next draw named
+    /// nothing: no access, no hazard edge, and no log line saying so. A
+    /// resolver that refuses one record and keeps going is a wrong frame.
+    #[test]
+    fn a_refused_draw_does_not_consume_the_encoders_declaration() {
+        let mut b = builder();
+        b.begin_encoder(SegmentKind::Render, SegmentLifetime::SELF_CONTAINED)
+            .expect("open");
+        let entries = bind_arena(&mut b, &[res(7)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
+                first: 0,
+                entries,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+
+        // A source that refuses everything, so this draw is not kept.
+        let mut refusing = |p: &Participation| {
+            Err(crate::access::AccessRefusal {
+                resource: p.resource,
+                reason: "the test refused it",
+            })
+        };
+        assert!(matches!(
+            b.record(a_draw(), &mut refusing),
+            Err(StreamRefusal::Access(_))
+        ));
+        assert!(b.accesses.is_empty(), "and it left no accesses behind");
+
+        // The next draw is the first one the transaction keeps, so it is the
+        // one that owes the binding.
+        b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+            .expect("draw");
+        let mut named: Vec<_> = b.accesses.iter().filter_map(|a| backing(a.key)).collect();
+        named.sort_unstable();
+        assert_eq!(
+            named,
+            vec![BackingId(5), BackingId(7)],
+            "the kept draw names its index buffer and the slot the bind filled"
+        );
+    }
+
     #[test]
     fn a_refused_bind_leases_nothing() {
         let mut b = builder();
@@ -1750,5 +1835,532 @@ mod tests {
                 "{directive:?}"
             );
         }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// A source that answers like [`StubRegistry`] and refuses on a schedule.
+    ///
+    /// The refusal is what drives the rollback. It counts every call, so the
+    /// sweep can compare what the builder kept against what the source was
+    /// actually asked for — which is the only way to tell "the record declared
+    /// nothing" from "the record's accesses were dropped".
+    struct Flaky {
+        domain: ChannelId,
+        /// Calls before the next refusal, or `None` to answer everything.
+        refuse_at: Option<u32>,
+        calls: u32,
+        answered: u32,
+    }
+
+    impl AccessSource for Flaky {
+        fn access(
+            &mut self,
+            participation: &Participation,
+        ) -> Result<AccessIntent, crate::access::AccessRefusal> {
+            self.calls += 1;
+            if self.refuse_at == Some(self.calls) {
+                return Err(crate::access::AccessRefusal {
+                    resource: participation.resource,
+                    reason: "sweep_refused_this_access",
+                });
+            }
+            self.answered += 1;
+            Ok(participation.resolve(
+                self.domain,
+                ResourceKey {
+                    backing: BackingId(u64::from(participation.resource.slot.0)),
+                    heap: None,
+                },
+                None,
+                None,
+            ))
+        }
+    }
+
+    /// The classes an encoder of each kind carries, so the driver spends most
+    /// of its steps inside the rules rather than bouncing off them.
+    ///
+    /// Read off [`class_admissible_on`] and the single-rail mapping — driving,
+    /// not checking: what the builder does with a record it should not have
+    /// taken is asserted below whatever this picks.
+    fn admissible_shapes(kind: SegmentKind) -> &'static [u64] {
+        match kind {
+            SegmentKind::Render => &[0, 0, 1, 5, 6, 8, 10, 12, 12],
+            SegmentKind::Compute => &[2, 3, 5, 9],
+            SegmentKind::Blit => &[4, 6, 8, 9, 11],
+            SegmentKind::Event => &[7],
+            SegmentKind::Info => &[],
+        }
+    }
+
+    /// Every operation shape the sweep drives, each in its own class.
+    fn some_op(rng: &mut Rng, open: Option<SegmentKind>, entries: BindSpan) -> ResolvedOperation {
+        // Mostly a shape the open encoder carries, so the sweep reaches the
+        // paths past admission; the rest is whatever, so it keeps reaching the
+        // refusals too.
+        let which = match open.map(admissible_shapes) {
+            Some(shapes) if !shapes.is_empty() && rng.below(4) != 0 => {
+                shapes[rng.below(shapes.len() as u64) as usize]
+            }
+            _ => rng.below(13),
+        };
+        let r = res(rng_slot(rng));
+        let r2 = res(rng_slot(rng));
+        match which {
+            0 => a_draw(),
+            1 => ResolvedOperation::Render(RenderOp::SetPipeline { pipeline: r }),
+            2 => ResolvedOperation::Compute(ComputeOp::SetPipeline { pipeline: r }),
+            3 => ResolvedOperation::Compute(ComputeOp::Dispatch(
+                crate::compute::DispatchOp::Threadgroups {
+                    groups: crate::compute::ComputeExtent {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    threads_per_group: crate::compute::ComputeExtent {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                },
+            )),
+            4 => a_blit(),
+            5 => a_barrier(),
+            6 => ResolvedOperation::Fence(crate::sync::FenceOp {
+                kind: reims_vgpu_protocol::sync::FenceKind::Update,
+                fence: r,
+                stages: None,
+            }),
+            7 => ResolvedOperation::Event(crate::sync::EventOp {
+                kind: reims_vgpu_protocol::sync::EventKind::Signal,
+                event: r,
+                value: 1,
+            }),
+            8 => ResolvedOperation::IndirectCommand(crate::icb::IcbOp::ExecuteRange {
+                icb: r,
+                commands: crate::icb::CommandRange {
+                    location: 0,
+                    length: 4,
+                },
+            }),
+            9 => ResolvedOperation::ResourceState(ResourceStateOp {
+                directive: crate::resource_state::ContentDirective::Synchronize,
+                target: crate::resource_state::ResourceStateTarget::Resource {
+                    resource: r,
+                    subresource: None,
+                },
+            }),
+            // A record naming two resources, so a refusal can land between
+            // them and leave the first already answered.
+            10 => {
+                ResolvedOperation::Render(RenderOp::Draw(crate::render::DrawOp::IndexedIndirect {
+                    primitive: crate::render::PrimitiveType(0),
+                    index: crate::render::IndexSource {
+                        buffer: r,
+                        offset: 0,
+                        index_type: crate::render::IndexType::Uint16,
+                    },
+                    arguments: crate::bind::IndirectSource {
+                        buffer: r2,
+                        offset: 0,
+                    },
+                }))
+            }
+            11 => ResolvedOperation::Blit(BlitOp::BufferToBuffer {
+                source: r,
+                source_offset: 0,
+                dest: r2,
+                dest_offset: 0,
+                size: 16,
+            }),
+            // The record that fills the encoder's tables. Its own footprint is
+            // empty — a bind writes a slot and touches no memory — and what it
+            // buys is the *next* draw's.
+            _ => ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
+                first: 0,
+                entries,
+            }),
+        }
+    }
+
+    fn rng_slot(rng: &mut Rng) -> u32 {
+        rng.below(4) as u32 + 1
+    }
+
+    /// What the builder held, as far as a caller can see it.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Held {
+        accesses: usize,
+        leases: Vec<ResourceId>,
+        streams: usize,
+        open_records: Option<usize>,
+    }
+
+    fn held(b: &ExecBuilder) -> Held {
+        Held {
+            accesses: b.accesses.len(),
+            leases: b.pipeline_leases.clone(),
+            streams: b.streams.len(),
+            open_records: b.open.as_ref().map(|s| s.records.len()),
+        }
+    }
+
+    #[derive(Default)]
+    struct Census {
+        finished: u32,
+        refused_finish: u32,
+        records_kept: u32,
+        records_refused: u32,
+        /// Records refused by the source rather than by the cursor, which are
+        /// the ones that had already declared accesses.
+        refused_by_the_source: u32,
+        /// Refusals that arrived after the source had already answered part of
+        /// the record's list, which is the only shape a partial roll-back can
+        /// be seen in.
+        refused_mid_record: u32,
+        leases: u32,
+        rebound_pipelines: u32,
+        binds: u32,
+        /// Bind entries that changed the slot, and entries that did not.
+        rearming_binds: u32,
+        unchanged_binds: u32,
+        /// Draws that read slots a bind before them had filled, which is the
+        /// case the encoder tables exist for.
+        draws_over_bindings: u32,
+    }
+
+    /// **A record either takes effect entirely or leaves nothing behind, and a
+    /// finished transaction's derived lists are functions of the records it
+    /// kept.**
+    ///
+    /// Three shadows, none of which knows how the builder works.
+    ///
+    /// The first is [`Held`]: everything a refusal must not change, snapshotted
+    /// before the call and compared after. A record the cursor declines after
+    /// the source has already answered two of its participations is the shape
+    /// that costs a transaction its meaning — two accesses claiming work that
+    /// is not in any stream — and it is driven here rather than reasoned about.
+    ///
+    /// The second is the lease list, recomputed at the end by scanning the
+    /// finished transaction's records for the ones that bind a pipeline. The
+    /// builder accumulates it incrementally and deduplicates as it goes; the
+    /// shadow scans the whole thing once and deduplicates at the end, so a
+    /// lease taken for a record that was refused, or dropped because an equal
+    /// one came earlier under a different generation, disagrees.
+    ///
+    /// The third is the source's own call count: the builder must keep exactly
+    /// the accesses the source answered for records it kept, and no others.
+    #[test]
+    fn a_record_is_kept_whole_or_not_at_all() {
+        let mut census = Census::default();
+        for seed in 0..500u64 {
+            let mut rng = Rng::new(seed + 1);
+            let mut b = builder();
+            let mut source = Flaky {
+                domain: ChannelId(1),
+                refuse_at: None,
+                calls: 0,
+                answered: 0,
+            };
+            // Accesses the builder is entitled to hold: what the source
+            // answered for records that were kept.
+            let mut owed = 0usize;
+            // Which encoder the driver believes is open. Followed from the
+            // builder's answers rather than predicted — it steers the driver
+            // and asserts nothing.
+            let mut open: Option<SegmentKind> = None;
+            // The shadow's model of the open render encoder's vertex buffer
+            // table: which slots hold what, which of those a draw has already
+            // declared, and which pipeline is bound. A map and a set rather
+            // than two parallel vectors, so the shadow cannot make the real
+            // table's mistakes about growth, gaps or the slot past the end.
+            let mut slots: std::collections::HashMap<u32, ResourceId> =
+                std::collections::HashMap::new();
+            let mut declared: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut pipeline: Option<ResourceId> = None;
+
+            for _ in 0..24 {
+                let before = held(&b);
+                // A tenth of the steps are deliberately out of order — a
+                // record with nothing open, a second begin, an end with
+                // nothing to end — so the refusal paths stay driven.
+                let step = if rng.below(10) == 0 {
+                    rng.below(3)
+                } else if open.is_none() {
+                    0
+                } else if rng.below(6) == 0 {
+                    1
+                } else {
+                    2
+                };
+                match step {
+                    0 => {
+                        let kind = match rng.below(5) {
+                            0 => SegmentKind::Render,
+                            1 => SegmentKind::Compute,
+                            2 => SegmentKind::Blit,
+                            3 => SegmentKind::Event,
+                            _ => SegmentKind::Info,
+                        };
+                        let lifetime = SegmentLifetime {
+                            continues_previous: false,
+                            continues_into_next: false,
+                        };
+                        if b.begin_encoder(kind, lifetime).is_err() {
+                            assert_eq!(held(&b), before, "seed {seed}: a refused begin");
+                        } else {
+                            open = Some(kind);
+                            // A new encoder starts with everything unbound and
+                            // no pipeline, which is Metal's rule rather than a
+                            // simplification.
+                            slots.clear();
+                            declared.clear();
+                            pipeline = None;
+                        }
+                    }
+                    1 => {
+                        if b.end_segment().is_err() {
+                            assert_eq!(held(&b), before, "seed {seed}: a refused end");
+                        } else {
+                            open = None;
+                        }
+                    }
+                    _ => {
+                        // Refuse somewhere inside this record's own list, so
+                        // both "refused on its first participation" and
+                        // "refused with some already answered" occur.
+                        let calls_before = source.calls;
+                        let answered_before = source.answered;
+                        source.refuse_at =
+                            (rng.below(4) == 0).then(|| calls_before + rng.below(3) as u32 + 1);
+                        // Two slots' worth of bindings filed the way a
+                        // resolver would file them, whether or not the shape
+                        // drawn below is the one that names them.
+                        let width = rng.below(3) as usize + 1;
+                        // Varied, so a rebind is sometimes the same resource
+                        // and sometimes a different one. A guest re-binds its
+                        // whole table between draws, and only the entries that
+                        // actually changed may make a draw declare again.
+                        let filed: Vec<ResourceId> =
+                            (0..width).map(|_| res(rng.below(2) as u32 + 10)).collect();
+                        let entries = bind_arena(&mut b, &filed);
+                        let op = some_op(&mut rng, open, entries);
+                        match b.record(op, &mut source) {
+                            Ok(_) => {
+                                census.records_kept += 1;
+                                let declared_here = (source.answered - answered_before) as usize;
+                                owed += declared_here;
+                                // The claim this module exists for: a draw
+                                // declares what its own fields name *and* what
+                                // the encoder had bound before it. The shadow
+                                // is a count, cleared when an encoder opens.
+                                match op {
+                                    ResolvedOperation::Render(RenderOp::BindBuffers {
+                                        first: 0,
+                                        ..
+                                    }) => {
+                                        assert_eq!(
+                                            declared_here, 0,
+                                            "seed {seed}: a bind touches no memory"
+                                        );
+                                        // A bind of what the slot already holds
+                                        // changes nothing, including whether a
+                                        // draw has to declare it again. A guest
+                                        // that re-binds its whole table between
+                                        // draws must not make every draw
+                                        // declare everything.
+                                        for (i, r) in filed.iter().enumerate() {
+                                            let slot = i as u32;
+                                            if slots.get(&slot) != Some(r) {
+                                                slots.insert(slot, *r);
+                                                declared.remove(&slot);
+                                                census.rearming_binds += 1;
+                                            } else {
+                                                census.unchanged_binds += 1;
+                                            }
+                                        }
+                                        census.binds += 1;
+                                    }
+                                    // What a bound slot contributes is the
+                                    // pipeline's answer, so a *different*
+                                    // pipeline makes every slot a fresh
+                                    // question and the same one changes
+                                    // nothing.
+                                    ResolvedOperation::Render(RenderOp::SetPipeline {
+                                        pipeline: bound_now,
+                                    }) => {
+                                        if pipeline != Some(bound_now) {
+                                            pipeline = Some(bound_now);
+                                            declared.clear();
+                                        }
+                                    }
+                                    ResolvedOperation::Render(RenderOp::Draw(draw)) => {
+                                        let own = match draw {
+                                            crate::render::DrawOp::Indexed { .. } => 1,
+                                            crate::render::DrawOp::IndexedIndirect { .. } => 2,
+                                            _ => unreachable!("the sweep drives two draw shapes"),
+                                        };
+                                        let owed_here =
+                                            slots.keys().filter(|s| !declared.contains(s)).count();
+                                        assert_eq!(
+                                            declared_here,
+                                            own + owed_here,
+                                            "seed {seed}: a draw names its own buffers and \
+                                             every bound slot no draw has declared yet"
+                                        );
+                                        if owed_here > 0 {
+                                            census.draws_over_bindings += 1;
+                                        }
+                                        // Declared once per encoder per
+                                        // pipeline: a draw loop pays for its
+                                        // bindings on its first iteration.
+                                        declared.extend(slots.keys().copied());
+                                    }
+                                    _ => {}
+                                }
+                                if let Some(pipeline) = op.pipeline_lease() {
+                                    if before.leases.contains(&pipeline) {
+                                        census.rebound_pipelines += 1;
+                                    } else {
+                                        census.leases += 1;
+                                    }
+                                }
+                            }
+                            Err(refusal) => {
+                                census.records_refused += 1;
+                                if matches!(refusal, StreamRefusal::Access(_)) {
+                                    census.refused_by_the_source += 1;
+                                    if source.answered > answered_before {
+                                        census.refused_mid_record += 1;
+                                    }
+                                }
+                                assert_eq!(
+                                    held(&b),
+                                    before,
+                                    "seed {seed}: a refused record left something behind"
+                                );
+                            }
+                        }
+                        source.refuse_at = None;
+                    }
+                }
+                assert_eq!(
+                    b.accesses.len(),
+                    owed,
+                    "seed {seed}: the builder holds accesses no kept record answered for"
+                );
+            }
+
+            // Mostly close what is open, so a transaction that had a legal
+            // shape gets to finish; sometimes not, because an encoder that
+            // never ended is a refusal the cursor owes and the sweep wants it.
+            if open.is_some() && rng.below(4) != 0 {
+                let _ = b.end_segment();
+            }
+
+            match b.finish() {
+                Err(_) => census.refused_finish += 1,
+                Ok(work) => {
+                    census.finished += 1;
+                    assert_eq!(work.accesses.len(), owed, "seed {seed}: accesses at finish");
+
+                    // Every access carries the source's domain, so a
+                    // transaction cannot have been assembled from two.
+                    for access in &work.accesses {
+                        assert_eq!(access.domain, ChannelId(1), "seed {seed}");
+                    }
+
+                    // The lease list, recomputed by scanning the records the
+                    // transaction actually kept.
+                    let mut want: Vec<ResourceId> = Vec::new();
+                    for record in work.records() {
+                        if let Some(pipeline) = record.op.pipeline_lease() {
+                            if !want.contains(&pipeline) {
+                                want.push(pipeline);
+                            }
+                        }
+                    }
+                    assert_eq!(work.pipeline_leases, want, "seed {seed}: leases");
+
+                    // Positions never go backwards, and the record count is the
+                    // records.
+                    let mut last: Option<StreamPosition> = None;
+                    let mut counted = 0usize;
+                    for record in work.records() {
+                        if let Some(previous) = last {
+                            assert!(
+                                record.at > previous,
+                                "seed {seed}: {:?} does not follow {previous:?}",
+                                record.at
+                            );
+                        }
+                        last = Some(record.at);
+                        counted += 1;
+                    }
+                    assert_eq!(counted, work.record_count(), "seed {seed}: record_count");
+
+                    assert_eq!(
+                        work.writes_anything(),
+                        work.accesses.iter().any(|a| a.mode.writes()),
+                        "seed {seed}: writes_anything"
+                    );
+                }
+            }
+        }
+
+        assert!(census.finished > 250, "{}", census.finished);
+        assert!(census.refused_finish > 50, "{}", census.refused_finish);
+        assert!(census.records_kept > 3000, "{}", census.records_kept);
+        assert!(census.records_refused > 1500, "{}", census.records_refused);
+        assert!(
+            census.refused_by_the_source > 200,
+            "the source never refused: {}",
+            census.refused_by_the_source
+        );
+        assert!(
+            census.refused_mid_record > 50,
+            "no record was refused with part of its list already answered: {}",
+            census.refused_mid_record
+        );
+        assert!(census.leases > 250, "{}", census.leases);
+        assert!(
+            census.rebound_pipelines > 50,
+            "no pipeline was ever rebound: {}",
+            census.rebound_pipelines
+        );
+        assert!(census.binds > 200, "{}", census.binds);
+        assert!(census.rearming_binds > 300, "{}", census.rearming_binds);
+        assert!(
+            census.unchanged_binds > 50,
+            "no slot was ever re-bound to what it already held: {}",
+            census.unchanged_binds
+        );
+        assert!(
+            census.draws_over_bindings > 50,
+            "no draw ever read a bound slot: {}",
+            census.draws_over_bindings
+        );
     }
 }

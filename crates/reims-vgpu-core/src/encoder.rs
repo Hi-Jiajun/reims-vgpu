@@ -73,8 +73,15 @@ mod table_hint {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotTable<T> {
     slots: Vec<Option<T>>,
-    /// Parallel to `slots`: whether the current binding is already in the
-    /// footprint. Never longer than `slots`, and read only for bound slots.
+    /// Whether the current binding is already in the footprint.
+    ///
+    /// **Shorter than `slots` is legal and means the tail is undeclared.**
+    /// That is the encoding [`SlotTable::undeclare`] rests on: a pipeline
+    /// change takes back every declaration in constant time by truncating this
+    /// rather than by walking the table, which matters because the guest binds
+    /// a pipeline per draw. Nothing indexes it — [`SlotTable::is_declared`] and
+    /// [`SlotTable::undeclare_slot`] are the two doors, and both answer for a
+    /// slot past the end.
     declared: Vec<bool>,
 }
 
@@ -97,15 +104,34 @@ impl<T: Copy + PartialEq> SlotTable<T> {
         let index = slot as usize;
         if index >= self.slots.len() {
             // Nothing between the old end and the new slot was bound, so the
-            // gap is empty rather than a copy of anything.
+            // gap is empty rather than a copy of anything. `declared` is not
+            // grown with it: the slots past its end are undeclared, which is
+            // what a slot that has just been bound is.
             self.slots.resize(index + 1, None);
-            self.declared.resize(index + 1, false);
         }
         if self.slots[index] == value {
             return;
         }
         self.slots[index] = value;
-        self.declared[index] = false;
+        self.undeclare_slot(index);
+    }
+
+    /// Whether the footprint already has the binding at `index`.
+    fn is_declared(&self, index: usize) -> bool {
+        self.declared.get(index).copied().unwrap_or(false)
+    }
+
+    /// Take back one slot's declaration.
+    ///
+    /// A slot past the end of `declared` is already undeclared, so there is
+    /// nothing to write. Indexing instead would panic on exactly the ordinary
+    /// sequence [`Self::undeclare`] produces — bind, draw, bind a different
+    /// pipeline, re-bind the slot — because the pipeline change left `declared`
+    /// empty and the slot is still inside `slots`.
+    fn undeclare_slot(&mut self, index: usize) {
+        if let Some(flag) = self.declared.get_mut(index) {
+            *flag = false;
+        }
     }
 
     /// Every bound slot the open encoder has not declared yet.
@@ -114,10 +140,10 @@ impl<T: Copy + PartialEq> SlotTable<T> {
     /// zipped for exactly that reason: [`Self::undeclare`] empties one of them,
     /// and a zip would then yield nothing at all rather than everything.
     pub fn undeclared(&self) -> impl Iterator<Item = (u32, T)> + '_ {
-        self.slots.iter().enumerate().filter_map(|(i, v)| {
-            v.filter(|_| !self.declared.get(i).copied().unwrap_or(false))
-                .map(|v| (i as u32, v))
-        })
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.filter(|_| !self.is_declared(i)).map(|v| (i as u32, v)))
     }
 
     /// Record that the footprint now has every bound slot.
@@ -212,7 +238,15 @@ impl StageTables {
     /// Written into a caller's buffer rather than returned, because this runs
     /// once per draw and a fresh `Vec` per draw is an allocation the frame does
     /// not need.
-    pub fn footprint_into(&mut self, usage: Option<&BindingUsage>, out: &mut Vec<Participation>) {
+    ///
+    /// **Reads and does not mark.** What the footprint *has* is
+    /// [`Self::declare`], and the two are separate because a caller may gather
+    /// a record's footprint and then not keep the record — a resolution that
+    /// refuses, a cursor that declines the record's rail. Marked here, that
+    /// discarded footprint would take the declaration with it and the next
+    /// draw would name nothing, which is a missing hazard edge and not a
+    /// missing log line.
+    pub fn footprint_into(&self, usage: Option<&BindingUsage>, out: &mut Vec<Participation>) {
         for (slot, binding) in self.buffers.undeclared() {
             let Some(buffer) = binding.buffer else {
                 continue;
@@ -245,11 +279,15 @@ impl StageTables {
                 api_stages: NO_STAGES,
             });
         }
-        // Both tables, after both loops: a slot that contributed nothing under
-        // this pipeline is as answered as one that contributed a
-        // participation, and only a new pipeline makes either a fresh
-        // question. Samplers bind no memory and are never in the footprint, so
-        // their slots are left alone.
+    }
+
+    /// Record that a footprint this stage answered is now in a transaction.
+    ///
+    /// Both tables: a slot that contributed nothing under this pipeline is as
+    /// answered as one that contributed a participation, and only a new
+    /// pipeline makes either a fresh question. Samplers bind no memory and are
+    /// never in the footprint, so their slots are left alone.
+    pub fn declare(&mut self) {
         self.buffers.mark_declared();
         self.textures.mark_declared();
     }
@@ -336,8 +374,15 @@ impl ComputeEncoderState {
     }
 
     /// What a dispatch reads through the bound slots.
-    pub fn footprint_into(&mut self, usage: Option<&BindingUsage>, out: &mut Vec<Participation>) {
+    pub fn footprint_into(&self, usage: Option<&BindingUsage>, out: &mut Vec<Participation>) {
         self.tables.footprint_into(usage, out);
+    }
+
+    /// Record that the footprint this encoder answered is now in a
+    /// transaction. See [`StageTables::footprint_into`] for why it is a second
+    /// call.
+    pub fn declare(&mut self) {
+        self.tables.declare();
     }
 
     /// Apply one record to the encoder's state.
@@ -455,13 +500,20 @@ impl RenderEncoderState {
     /// vertex shader reads and the fragment shader writes is two participations
     /// on one resource, and collapsing them would lose the write.
     pub fn footprint_into(
-        &mut self,
+        &self,
         vertex_usage: Option<&BindingUsage>,
         fragment_usage: Option<&BindingUsage>,
         out: &mut Vec<Participation>,
     ) {
         self.vertex.footprint_into(vertex_usage, out);
         self.fragment.footprint_into(fragment_usage, out);
+    }
+
+    /// Record that the footprint this encoder answered is now in a
+    /// transaction. Both stages, because the footprint was both stages'.
+    pub fn declare(&mut self) {
+        self.vertex.declare();
+        self.fragment.declare();
     }
 
     /// Apply one record to the encoder's state.
@@ -621,6 +673,7 @@ mod tests {
 
         let mut out = Vec::new();
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 2, "samplers bind no memory");
         for part in &out {
             assert_eq!(part.mode, AccessMode::Unknown);
@@ -644,6 +697,7 @@ mod tests {
         );
         let mut out = Vec::new();
         state.footprint_into(Some(&usage), &mut out);
+        state.declare();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].resource, res(1));
         assert_eq!(out[0].mode, AccessMode::Read);
@@ -661,6 +715,7 @@ mod tests {
         let usage = BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new());
         let mut out = Vec::new();
         state.footprint_into(Some(&usage), &mut out);
+        state.declare();
         assert!(out.is_empty());
     }
 
@@ -686,6 +741,7 @@ mod tests {
         let write = BindingUsage::new(vec![None, None, None, Some(AccessMode::Write)], Vec::new());
         let mut out = Vec::new();
         state.footprint_into(Some(&read), Some(&write), &mut out);
+        state.declare();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].mode, AccessMode::Read);
         assert_eq!(out[1].mode, AccessMode::Write);
@@ -854,6 +910,7 @@ mod tests {
         assert_eq!(state.stage(ShaderStage::Fragment).textures.get(0), None);
         let mut out = Vec::new();
         state.footprint_into(None, None, &mut out);
+        state.declare();
         assert!(out.is_empty(), "samplers bind no memory");
     }
 
@@ -871,19 +928,23 @@ mod tests {
         state.tables.buffers.set(0, Some(buffer(1)));
         let mut out = vec![];
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 1);
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 1, "the second draw's bindings are already in it");
 
         // A bind that changes nothing changes nothing here either: guests
         // re-bind whole tables between draws.
         state.tables.buffers.set(0, Some(buffer(1)));
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 1);
 
         // A bind of something else is a new participation, and only that slot's.
         state.tables.buffers.set(3, Some(buffer(2)));
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].resource, res(2));
     }
@@ -904,18 +965,22 @@ mod tests {
         );
         let mut out = vec![];
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 1);
 
         // The same pipeline is not a change.
         state.apply(&ComputeOp::SetPipeline { pipeline: res(9) }, &[], &[]);
         state.apply(&ComputeOp::SetPipeline { pipeline: res(9) }, &[], &[]);
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 2, "the first bind of it is a change");
 
         state.apply(&ComputeOp::SetPipeline { pipeline: res(8) }, &[], &[]);
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 3);
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 3);
     }
 
@@ -934,13 +999,91 @@ mod tests {
             .set(0, Some(buffer(2)));
         let mut out = vec![];
         state.footprint_into(None, None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 2);
         state.footprint_into(None, None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 2);
 
         state.apply(&RenderOp::SetPipeline { pipeline: res(9) }, &[], &[]);
         state.footprint_into(None, None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 4);
+    }
+
+    /// **A slot re-bound after a pipeline change is an ordinary frame, and it
+    /// used to be a panic.**
+    ///
+    /// `declared` is allowed to be shorter than `slots` — that is how a
+    /// pipeline change takes back every declaration without walking the table
+    /// — and `set` indexed it anyway, guarded only by `slots`'s length. So
+    /// bind, draw, bind a different pipeline, re-bind the slot: the pipeline
+    /// change emptied `declared`, the slot was still inside `slots`, and the
+    /// write went past the end of a zero-length vector.
+    ///
+    /// The guest does exactly this. It binds a pipeline per draw and re-binds
+    /// its buffer table between them, so the sequence is not a corner — it is
+    /// what a second material in one encoder looks like.
+    #[test]
+    fn a_slot_rebound_after_a_pipeline_change_is_not_a_panic() {
+        let mut state = RenderEncoderState::default();
+        state
+            .stage_mut(ShaderStage::Vertex)
+            .buffers
+            .set(0, Some(buffer(1)));
+        let mut out = vec![];
+        state.footprint_into(None, None, &mut out);
+        state.declare();
+        assert_eq!(out.len(), 1, "the draw declares the bound slot");
+
+        // A different pipeline: every slot's contribution is a fresh question.
+        state.apply(&RenderOp::SetPipeline { pipeline: res(9) }, &[], &[]);
+        // And the guest re-binds the table under it.
+        state
+            .stage_mut(ShaderStage::Vertex)
+            .buffers
+            .set(0, Some(buffer(2)));
+        state.footprint_into(None, None, &mut out);
+        state.declare();
+        assert_eq!(
+            out.len(),
+            2,
+            "the new binding is declared under the new pipeline"
+        );
+        state.footprint_into(None, None, &mut out);
+        state.declare();
+        assert_eq!(out.len(), 2, "and only once");
+    }
+
+    /// Re-binding what the slot already holds, after a pipeline change, still
+    /// takes the declaration the pipeline change already took.
+    ///
+    /// The other half of the same encoding: `set` returns early when the value
+    /// is unchanged, so the slot's declared flag is whatever the pipeline
+    /// change left it — which is undeclared, and must stay so.
+    #[test]
+    fn an_unchanged_rebind_after_a_pipeline_change_still_declares() {
+        let mut state = RenderEncoderState::default();
+        state
+            .stage_mut(ShaderStage::Vertex)
+            .buffers
+            .set(0, Some(buffer(1)));
+        let mut out = vec![];
+        state.footprint_into(None, None, &mut out);
+        state.declare();
+        assert_eq!(out.len(), 1);
+        state.apply(&RenderOp::SetPipeline { pipeline: res(9) }, &[], &[]);
+        state
+            .stage_mut(ShaderStage::Vertex)
+            .buffers
+            .set(0, Some(buffer(1)));
+        state.footprint_into(None, None, &mut out);
+        state.declare();
+        assert_eq!(
+            out.len(),
+            2,
+            "the pipeline changed, so the slot is a fresh question"
+        );
     }
 
     /// Unbinding a declared slot and binding it again declares it again: the
@@ -951,11 +1094,14 @@ mod tests {
         state.tables.buffers.set(0, Some(buffer(1)));
         let mut out = vec![];
         state.footprint_into(None, &mut out);
+        state.declare();
         state.tables.buffers.set(0, None);
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 1, "an unbound slot contributes nothing");
         state.tables.buffers.set(0, Some(buffer(1)));
         state.footprint_into(None, &mut out);
+        state.declare();
         assert_eq!(out.len(), 2);
     }
 }
