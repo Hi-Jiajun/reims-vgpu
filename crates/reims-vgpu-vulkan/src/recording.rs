@@ -640,10 +640,7 @@ mod tests {
     }
 
     fn emission(set: usize) -> SetEmission {
-        SetEmission {
-            set,
-            partial: false,
-        }
+        SetEmission::forged(set, false)
     }
 
     fn prepared(pools: &mut WorkerPools, buffers: usize) -> Preparation<u64> {

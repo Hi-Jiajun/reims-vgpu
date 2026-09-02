@@ -299,18 +299,41 @@ pub enum SetState {
 }
 
 /// Where an emission writes, and how much of the binding table it has to write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// A *receipt*, not a description: [`SetRing::emit`] is the only thing that
+/// makes one, and handing one to [`SetRing::abandoned`] frees the set it names.
+/// So it is neither `Copy` nor `Clone`, and its fields are private. A caller
+/// that could copy one could abandon the same set twice — freeing a set a later
+/// emission had since taken and a submission is reading — and a caller that
+/// could build one from an integer could free a set it never took. Both are
+/// exactly the illegal update this module claims cannot be expressed, so the
+/// type stops expressing them. [`crate::frames::Reservation`] is the same
+/// shape for the same reason.
+#[derive(Debug, PartialEq, Eq)]
 #[must_use = "an emission that is planned and not written leaves the set stale"]
 pub struct SetEmission {
     /// Index into the caller's own `VkDescriptorSet` array.
-    pub set: usize,
+    set: usize,
     /// `true` when the set already holds the previous contents, so only the
     /// dirty slots need writing. `false` when the set is fresh and empty, so
     /// every bound slot must be written — see [`Self::whole`].
-    pub partial: bool,
+    partial: bool,
 }
 
 impl SetEmission {
+    /// Index into the caller's own `VkDescriptorSet` array.
+    #[must_use]
+    pub const fn set(&self) -> usize {
+        self.set
+    }
+
+    /// Whether the set already held the previous contents, so only the dirty
+    /// slots need writing.
+    #[must_use]
+    pub const fn partial(&self) -> bool {
+        self.partial
+    }
+
     /// Whether the caller must write every bound slot rather than only the
     /// dirty ones.
     ///
@@ -319,8 +342,16 @@ impl SetEmission {
     /// gone, so the caller disturbs the table and takes the resulting full
     /// dirty set.
     #[must_use]
-    pub const fn whole(self) -> bool {
+    pub const fn whole(&self) -> bool {
         !self.partial
+    }
+
+    /// A receipt for a set the ring never handed out, so that tests can drive
+    /// the paths that only a wrong caller could reach. Not reachable from
+    /// outside the crate, which is the whole point of the type.
+    #[cfg(test)]
+    pub(crate) const fn forged(set: usize, partial: bool) -> Self {
+        Self { set, partial }
     }
 }
 
@@ -607,7 +638,10 @@ impl SetRing {
 /// a clean table needs no emission, and a fresh set needs the whole table. A
 /// caller that goes through it cannot get one of those three right and another
 /// wrong.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Clone`: two of the three variants carry a [`SetEmission`], and cloning
+/// one would reproduce the receipt it exists to keep unique.
+#[derive(Debug, PartialEq, Eq)]
 #[must_use = "a planned emission that is not written leaves descriptors stale"]
 pub enum Emission {
     /// Push the slots into command-buffer state. No allocation, and always
@@ -644,7 +678,7 @@ impl Emission {
     pub const fn set(&self) -> Option<usize> {
         match self {
             Self::Push { .. } => None,
-            Self::Set { emission, .. } | Self::Buffer { emission, .. } => Some(emission.set),
+            Self::Set { emission, .. } | Self::Buffer { emission, .. } => Some(emission.set()),
         }
     }
 }
@@ -1264,14 +1298,15 @@ mod tests {
     fn an_abandoned_fresh_emission_frees_its_set_and_gives_up_the_holder() {
         let mut ring = SetRing::new(2);
         let first = ring.emit().expect("a free set");
-        assert_eq!(ring.holder(), Some(first.set));
+        let set = first.set();
+        assert_eq!(ring.holder(), Some(set));
 
         ring.abandoned(first);
 
         // Freed rather than leaked: nothing else can free a set that was never
         // submitted, so an abandoned one would take a slot out of the ring for
         // the life of the epoch.
-        assert_eq!(ring.state(first.set), Some(SetState::Free));
+        assert_eq!(ring.state(set), Some(SetState::Free));
         assert_eq!(ring.free(), 2);
         assert_eq!(ring.holder(), None);
         assert_eq!(ring.census().abandoned, 1);
@@ -1293,30 +1328,28 @@ mod tests {
     fn abandoning_a_submitted_holder_gives_up_the_holder_and_frees_nothing() {
         let mut ring = SetRing::new(2);
         let first = ring.emit().expect("a free set");
+        let set = first.set();
         // A second recording reuses the live holder, then the first one is
         // submitted while the second is still preparing.
         let partial = ring.emit().expect("the live holder");
-        assert_eq!(partial.set, first.set);
+        assert_eq!(partial.set(), set);
         ring.submitted(at(7));
 
         ring.abandoned(partial);
 
         // The GPU may still be reading it, so the timeline stays the only
         // thing that frees it.
-        assert_eq!(ring.state(first.set), Some(SetState::Submitted(at(7))));
+        assert_eq!(ring.state(set), Some(SetState::Submitted(at(7))));
         assert_eq!(ring.holder(), None);
         assert_eq!(ring.recycle(at(7)), 1);
-        assert_eq!(ring.state(first.set), Some(SetState::Free));
+        assert_eq!(ring.state(set), Some(SetState::Free));
     }
 
     #[test]
     fn abandoning_an_emission_for_a_set_outside_the_ring_changes_nothing() {
         let mut ring = SetRing::new(1);
         let before = ring.clone();
-        ring.abandoned(SetEmission {
-            set: 9,
-            partial: false,
-        });
+        ring.abandoned(SetEmission::forged(9, false));
         assert_eq!(ring, before);
     }
 }
