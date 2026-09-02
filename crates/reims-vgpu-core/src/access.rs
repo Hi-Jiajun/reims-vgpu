@@ -60,7 +60,8 @@ use crate::identity::{ChannelId, ResourceId};
 /// logs, and the frame is wrong intermittently.
 ///
 /// One of the three joins is settled, and the two that are not are named here
-/// with what would settle them.
+/// with what would settle them — each as a value somebody has to supply, not as
+/// a question somebody has to think about.
 ///
 /// ## Settled: every name this device can see is a window of one address space
 ///
@@ -100,17 +101,34 @@ use crate::identity::{ChannelId, ResourceId};
 /// than a wiring one, and nothing above it can be right until it is closed —
 /// two placements in one heap must not come out distinct.
 ///
-/// ## Open: when the id is minted against when it can be known
+/// ## Open: a window is not enough on its own — it needs an incarnation
 ///
-/// [`crate::namespace::Namespace::declare`] wants one at declaration, and on
+/// [`crate::namespace::Namespace::declare`] wants an id at declaration, and on
 /// this interface a declaration is the guest writing a record into its own
-/// object-list page — which happens before it has finished mapping the backing.
-/// A descriptor-derived window is available then; a page-derived one is not,
-/// and is also not stable, because a physical replacement re-points the same
-/// object at different pages. The settled join above says a window is
-/// sufficient, so the descriptor is the side to derive from — but a window and
-/// a *resolved* window are different values, and which one two overlapping
-/// names have to agree on is the part still to state.
+/// object-list page — before it has necessarily finished mapping the backing.
+/// A descriptor-derived window is available then and a page-derived one is not,
+/// so the settled join above says the descriptor is the side to derive from.
+///
+/// A window alone is still wrong, and this is the part to state. A physical
+/// replacement re-points the *same* guest-virtual window at different host
+/// frames. Work already accepted was planned against the old frames and must
+/// keep reading them — which is [`crate::namespace::Namespace::replace_physical`]'s
+/// whole contract — so the two incarnations must not share an id. Derived from
+/// the window alone they would, and then a [`Claim`] on the old frames would be
+/// satisfied by the new ones and the old storage would be handed back while
+/// something is still reading it. That is false *equality*, the direction this
+/// type's other risk is not, and it is the one a window invites.
+///
+/// So the id is a window and an incarnation. The device already counts
+/// incarnations for one half: a mapping bumps a generation whenever its page
+/// list changes — a map, an unmap, a replacement, a reattach, or a page-table
+/// refresh that moves frames. It counts none for the other: the same
+/// replacement command on an object named by a plain handle drops the host
+/// copies and returns, with nothing recording that the pages behind that window
+/// are now different pages. Supplying that counter, for storage that is named
+/// by an address rather than by a mapping, is what is left.
+///
+/// [`Claim`]: crate::namespace::Claim
 ///
 /// ## Not this
 ///
