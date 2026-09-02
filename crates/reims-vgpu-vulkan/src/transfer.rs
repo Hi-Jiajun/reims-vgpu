@@ -702,6 +702,27 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                         axis: "level",
                         value: u64::from(source.base_level) + u64::from(level),
                     })?;
+                // And the destination level has to hold it. The span check
+                // above bounds how many levels and slices each side has, not
+                // how big they are, and the two textures are separately
+                // declared: nothing in the record makes the level this writes
+                // to the same size as the level it reads. A destination level
+                // smaller than the source's is the whole-extent write past the
+                // end of an image that `endpoint` refuses for its own arm.
+                let dest_extent = to
+                    .texture
+                    .level_extent(u32::from(dest.base_level) + level)
+                    .ok_or(Refusal::ExtentTooLarge {
+                        axis: "level",
+                        value: u64::from(dest.base_level) + u64::from(level),
+                    })?;
+                for (axis, named, available) in [
+                    ("x", source_extent.x, dest_extent.x),
+                    ("y", source_extent.y, dest_extent.y),
+                    ("z", source_extent.z, dest_extent.z),
+                ] {
+                    within(axis, u64::from(named), u64::from(available))?;
+                }
                 regions.push(vk::ImageCopy {
                     src_subresource: vk::ImageSubresourceLayers {
                         aspect_mask: aspect(from.texture.pixel_format()),
@@ -2125,6 +2146,153 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// A destination texture whose level zero is `width` by `height`, so a
+    /// slice span can be aimed at a level too small to hold what it copies.
+    fn with_small_dest(width: u32, height: u32) -> Residency {
+        let mut residency = Residency::new();
+        let mut retire = NativeRetirement::new();
+        let lifetime = Lifetime::new(SessionGeneration::FIRST, DeviceEpoch::FIRST);
+        for (slot, native) in [
+            (
+                IMAGE_A,
+                native_image(0x1A, texture(MTL_FORMAT_RGBA8_UNORM, 64, 32, 4, 3)),
+            ),
+            (
+                IMAGE_B,
+                native_image(0x1B, texture(MTL_FORMAT_RGBA8_UNORM, width, height, 4, 3)),
+            ),
+        ] {
+            residency
+                .publish(id(slot), lifetime, native, &mut retire)
+                .unwrap_or_else(|(_, e)| panic!("{e}"));
+        }
+        residency
+    }
+
+    /// The failure this exists to prevent: a slice span copies at the *source*
+    /// level's extent, and the span check bounds only how many levels and
+    /// slices each side has. Two separately declared textures can differ in
+    /// size at the same level, so the destination has to be measured too ---
+    /// otherwise the copy writes a 64-wide row into a 32-wide image, which is
+    /// the same write past the end of an image that a region copy refuses.
+    #[test]
+    fn a_slice_span_into_a_smaller_destination_level_refuses() {
+        let whole = TextureSpan {
+            texture: id(IMAGE_A),
+            base_level: 0,
+            level_count: 4,
+            base_slice: 0,
+            slice_count: 3,
+        };
+        let span = |residency: &Residency| {
+            plan(
+                &BlitOp::TextureSlices {
+                    source: whole,
+                    dest: TextureSpan {
+                        texture: id(IMAGE_B),
+                        ..whole
+                    },
+                },
+                residency,
+            )
+        };
+        assert!(
+            span(&with_small_dest(64, 32)).is_ok(),
+            "the same shape on both sides is what this copy is for"
+        );
+        assert!(
+            span(&with_small_dest(128, 64)).is_ok(),
+            "a destination larger than the source is a copy into part of it"
+        );
+        assert_eq!(
+            span(&with_small_dest(32, 32)).expect_err("half as wide"),
+            Refusal::OutsideTexture {
+                axis: "x",
+                named: 64,
+                available: 32,
+            }
+        );
+        assert_eq!(
+            span(&with_small_dest(64, 16)).expect_err("half as tall"),
+            Refusal::OutsideTexture {
+                axis: "y",
+                named: 32,
+                available: 16,
+            }
+        );
+    }
+
+    /// The check is per level and not only on the first one: a destination
+    /// whose chain is shorter than its extent suggests --- here the mismatch
+    /// only appears below level zero --- is still a write past the end.
+    #[test]
+    fn a_slice_span_measures_every_level_it_copies() {
+        let mut residency = Residency::new();
+        let mut retire = NativeRetirement::new();
+        let lifetime = Lifetime::new(SessionGeneration::FIRST, DeviceEpoch::FIRST);
+        for (slot, native) in [
+            (
+                IMAGE_A,
+                native_image(0x1A, texture(MTL_FORMAT_RGBA8_UNORM, 64, 8, 4, 1)),
+            ),
+            (
+                IMAGE_B,
+                native_image(0x1B, texture(MTL_FORMAT_RGBA8_UNORM, 64, 32, 4, 1)),
+            ),
+        ] {
+            residency
+                .publish(id(slot), lifetime, native, &mut retire)
+                .unwrap_or_else(|(_, e)| panic!("{e}"));
+        }
+        // Level zero fits --- 64x8 into 64x32 --- and so do levels one and
+        // two. Level three is 8x1 in the source and 8x4 in the destination, so
+        // a check that stopped at the first level would pass this and a check
+        // that runs on all four still passes it.
+        let ok = TextureSpan {
+            texture: id(IMAGE_A),
+            base_level: 0,
+            level_count: 4,
+            base_slice: 0,
+            slice_count: 1,
+        };
+        assert!(plan(
+            &BlitOp::TextureSlices {
+                source: ok,
+                dest: TextureSpan {
+                    texture: id(IMAGE_B),
+                    ..ok
+                },
+            },
+            &residency,
+        )
+        .is_ok());
+        // Aim the source's level zero at the destination's level two: 64x8
+        // into 16x8, which level zero's own comparison never sees.
+        assert_eq!(
+            plan(
+                &BlitOp::TextureSlices {
+                    source: TextureSpan {
+                        level_count: 2,
+                        ..ok
+                    },
+                    dest: TextureSpan {
+                        texture: id(IMAGE_B),
+                        base_level: 2,
+                        level_count: 2,
+                        ..ok
+                    },
+                },
+                &residency,
+            )
+            .expect_err("level zero into level two"),
+            Refusal::OutsideTexture {
+                axis: "x",
+                named: 64,
+                available: 16,
+            }
+        );
     }
 
     /// A buffer whose length is exactly the fixture's, so a bound can be
