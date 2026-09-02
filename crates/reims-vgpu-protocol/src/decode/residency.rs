@@ -41,7 +41,7 @@
 //! resources themselves. Collapsing the two would either declare far too much
 //! or declare a heap's ref as though it were a texture's.
 
-use super::{no_record, short, DecodeRefusal};
+use super::{no_record, DecodeRefusal};
 use crate::closure::Rail;
 use crate::residency::{RenderStages, ResourceUsage};
 use reims_vgpu_wire::op::Op;
@@ -126,8 +126,9 @@ pub fn lift<'a>(rail: Rail, op: &Op<'a>) -> Result<ResidencyRecord<'a>, DecodeRe
     }
     Ok(match opcode {
         wire::OPCODE_USE_RESOURCE => {
-            let (head, refs) = wire::use_resource(op)
-                .map_err(|_| counted(rail, op, core::mem::size_of::<wire::UseResource>()))?;
+            let (head, refs) = wire::use_resource(op).map_err(|_| {
+                super::counted_head(rail, op, core::mem::size_of::<wire::UseResource>())
+            })?;
             ResidencyRecord {
                 subject: ResidencySubject::Resources,
                 refs,
@@ -136,8 +137,9 @@ pub fn lift<'a>(rail: Rail, op: &Op<'a>) -> Result<ResidencyRecord<'a>, DecodeRe
             }
         }
         wire::OPCODE_USE_HEAP => {
-            let (head, refs) = wire::use_heap(op)
-                .map_err(|_| counted(rail, op, core::mem::size_of::<wire::UseHeap>()))?;
+            let (head, refs) = wire::use_heap(op).map_err(|_| {
+                super::counted_head(rail, op, core::mem::size_of::<wire::UseHeap>())
+            })?;
             ResidencyRecord {
                 subject: ResidencySubject::Heaps,
                 refs,
@@ -146,8 +148,9 @@ pub fn lift<'a>(rail: Rail, op: &Op<'a>) -> Result<ResidencyRecord<'a>, DecodeRe
             }
         }
         wire::OPCODE_USE_HEAPS_NO_STAGES => {
-            let (_, refs) = wire::use_heaps_no_stages(op)
-                .map_err(|_| counted(rail, op, core::mem::size_of::<wire::UseHeapsNoStages>()))?;
+            let (_, refs) = wire::use_heaps_no_stages(op).map_err(|_| {
+                super::counted_head(rail, op, core::mem::size_of::<wire::UseHeapsNoStages>())
+            })?;
             ResidencyRecord {
                 subject: ResidencySubject::Heaps,
                 refs,
@@ -157,7 +160,7 @@ pub fn lift<'a>(rail: Rail, op: &Op<'a>) -> Result<ResidencyRecord<'a>, DecodeRe
         }
         _ => {
             let (head, refs) = wire::use_resources_no_stages(op).map_err(|_| {
-                counted(rail, op, core::mem::size_of::<wire::UseResourcesNoStages>())
+                super::counted_head(rail, op, core::mem::size_of::<wire::UseResourcesNoStages>())
             })?;
             ResidencyRecord {
                 subject: ResidencySubject::Resources,
@@ -167,23 +170,6 @@ pub fn lift<'a>(rail: Rail, op: &Op<'a>) -> Result<ResidencyRecord<'a>, DecodeRe
             }
         }
     })
-}
-
-/// A counted record that did not fit. The count leads every head here, which is
-/// the one thing the four shapes do agree on.
-fn counted(rail: Rail, op: &Op<'_>, head_len: usize) -> DecodeRefusal {
-    let have = op.payload.len();
-    if have < head_len {
-        return short(rail, op.opcode(), have, head_len);
-    }
-    let mut count = [0u8; 4];
-    count.copy_from_slice(&op.payload[..4]);
-    DecodeRefusal::CountOverruns {
-        rail,
-        opcode: op.opcode(),
-        count: u32::from_le_bytes(count),
-        have,
-    }
 }
 
 #[cfg(test)]

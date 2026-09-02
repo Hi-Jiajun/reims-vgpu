@@ -198,6 +198,36 @@ pub(crate) fn short(rail: Rail, opcode: u32, have: usize, need: usize) -> Decode
     }
 }
 
+/// Why a counted record whose count leads its head did not fit.
+///
+/// Two failures wear one `Err` in the wire crate, and they are not the same
+/// news. A payload shorter than the head never carried a count at all, so the
+/// honest report is how many bytes arrived against how many the head needs.
+/// A payload long enough for the head that still did not fit is an array that
+/// overran, and there the count is the fact worth having: "the guest asked for
+/// two hundred" beside "the record held twelve" is the pair that says which of
+/// the two is wrong.
+///
+/// Written once because the residency and barrier decoders both had it, under
+/// two different names — so a reader could not tell they were one rule, and a
+/// third counted record would have been a third copy. The count leads the head
+/// in every record this serves; [`render::counted_at`] is the form for the
+/// records that put a `first` in front of theirs.
+pub(crate) fn counted_head(rail: Rail, op: &Op<'_>, head_len: usize) -> DecodeRefusal {
+    let have = op.payload.len();
+    if have < head_len {
+        return short(rail, op.opcode(), have, head_len);
+    }
+    let mut count = [0u8; 4];
+    count.copy_from_slice(&op.payload[..4]);
+    DecodeRefusal::CountOverruns {
+        rail,
+        opcode: op.opcode(),
+        count: u32::from_le_bytes(count),
+        have,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
