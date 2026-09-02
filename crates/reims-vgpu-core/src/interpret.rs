@@ -1978,6 +1978,17 @@ mod tests {
                 Planned::Present => present(1, 9),
                 Planned::Control => control(1),
             };
+            // Every class carries a word, because the second obligation these
+            // arms state is the one about hangs: a transaction that ran pays
+            // its completion word whatever its payload did or did not do. A
+            // declined operation and a stalled query each say so in their own
+            // doc, and neither said it about the others.
+            let stamp = CompletionStamp {
+                slot: StampSlot(5),
+                value: StampValue(7),
+            };
+            let mut tx = tx;
+            tx.completion = Some(stamp);
 
             assert_eq!(
                 interp.run(&tx),
@@ -1995,6 +2006,31 @@ mod tests {
                 usize::from(plan.publishes()),
                 "{plan:?} published {published} versions; trace {:?}",
                 interp.trace()
+            );
+            // The other half, and the one whose failure is a hang rather than
+            // a wrong value: whatever the payload did, the word the guest is
+            // blocked on is paid, once, and last.
+            assert_eq!(
+                interp.stamp(stamp.slot),
+                Some(stamp.value),
+                "{plan:?} left the guest waiting on its completion word"
+            );
+            assert_eq!(
+                interp.trace().last(),
+                Some(&Observation::StampPublished {
+                    slot: stamp.slot,
+                    value: stamp.value,
+                }),
+                "{plan:?} published its word before everything it makes visible"
+            );
+            assert_eq!(
+                interp
+                    .trace()
+                    .iter()
+                    .filter(|o| matches!(o, Observation::StampPublished { .. }))
+                    .count(),
+                1,
+                "{plan:?} paid its word more than once"
             );
             // And the ledger agrees with the trace, so a publication that
             // reached one and not the other is caught too. `version_of` is the
