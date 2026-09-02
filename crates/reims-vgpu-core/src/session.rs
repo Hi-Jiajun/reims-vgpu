@@ -115,7 +115,7 @@ impl Refusal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlRefusal {
     Open(Refusal),
-    Free(RetireRefusal),
+    Free(FreeRefusal),
 }
 
 impl ControlRefusal {
@@ -126,6 +126,37 @@ impl ControlRefusal {
         match self {
             Self::Open(refusal) => refusal.slug(),
             Self::Free(refusal) => refusal.slug(),
+        }
+    }
+}
+
+/// Why a channel could not be freed.
+///
+/// Two owners answer this and they answer different things, which is why it is
+/// not one of them: the session knows whether a domain was ever opened, and
+/// the publisher knows whether an open one still owes publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreeRefusal {
+    /// The command named a submission domain no channel definition opened.
+    ///
+    /// The mirror of [`Refusal::ChannelAlreadyOpen`], which the opening door
+    /// has always refused, and the same fact [`SessionModel::admit`] refuses a
+    /// packet for. Answering `Ok` told a guest that a free succeeded for a
+    /// channel that never existed — and told it twice for a double free —
+    /// while the FIFO it meant to free stayed open with nothing on any failure
+    /// channel to say so.
+    NotOpen(Refusal),
+    /// The channel still owes publication the guest is waiting on.
+    Owed(RetireRefusal),
+}
+
+impl FreeRefusal {
+    /// The forwarded owner's name, unchanged.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::NotOpen(refusal) => refusal.slug(),
+            Self::Owed(refusal) => refusal.slug(),
         }
     }
 }
@@ -703,13 +734,28 @@ impl SessionModel {
     ///
     /// # Errors
     ///
+    /// If no channel definition opened the domain — a driver bug, or a second
+    /// free of one already freed. Checked first because it is the precondition
+    /// the other answer assumes: a domain that was never opened holds no
+    /// positions, so a publisher that found none would have called it drained.
+    ///
     /// If the channel still holds unreleased positions. A free that dropped
     /// them would drop the completion words the guest is waiting on, so the
     /// caller drains first.
-    pub fn retire_channel(&mut self, domain: ChannelId) -> Result<(), RetireRefusal> {
-        self.publisher.retire(domain)?;
+    pub fn retire_channel(&mut self, domain: ChannelId) -> Result<(), FreeRefusal> {
+        if !self.open_channels.remove(&domain) {
+            self.refusals += 1;
+            return Err(FreeRefusal::NotOpen(Refusal::ChannelNotOpen {
+                channel: domain,
+            }));
+        }
+        if let Err(owed) = self.publisher.retire(domain) {
+            // Nothing was freed, so the domain is still open.
+            self.open_channels.insert(domain);
+            self.refusals += 1;
+            return Err(FreeRefusal::Owed(owed));
+        }
         self.channel_sequence.remove(&domain);
-        self.open_channels.remove(&domain);
         Ok(())
     }
 
@@ -1800,13 +1846,43 @@ mod tests {
         );
     }
 
+    /// Freeing a domain no definition opened is a refusal, not a success.
+    ///
+    /// The mirror of `open_channel`'s `ChannelAlreadyOpen`, and the same fact
+    /// `admit` already refuses a packet for. Answered `Ok`, a driver bug and a
+    /// double free both looked like clean runs while the FIFO the guest meant
+    /// to free stayed open.
+    #[test]
+    fn freeing_a_domain_nothing_opened_is_refused_by_name() {
+        let mut s = session();
+        let before = s.refusals();
+        assert_eq!(
+            s.retire_channel(ChannelId(7)),
+            Err(FreeRefusal::NotOpen(Refusal::ChannelNotOpen {
+                channel: ChannelId(7)
+            }))
+        );
+        assert_eq!(s.refusals(), before + 1, "and it is counted as one");
+
+        // The double free of a domain that did exist reaches the same answer.
+        assert_eq!(s.retire_channel(ChannelId(2)), Ok(()));
+        assert_eq!(
+            s.retire_channel(ChannelId(2)),
+            Err(FreeRefusal::NotOpen(Refusal::ChannelNotOpen {
+                channel: ChannelId(2)
+            }))
+        );
+    }
+
     #[test]
     fn a_channel_with_unpublished_work_cannot_end_its_lifetime() {
         let mut s = session();
         let a = s.admit(&packet(0x37)).expect("accepted");
         assert_eq!(
             s.retire_channel(ChannelId(2)),
-            Err(RetireRefusal::LivePositions { outstanding: 1 })
+            Err(FreeRefusal::Owed(RetireRefusal::LivePositions {
+                outstanding: 1
+            }))
         );
         let _ = s.complete(a.transaction.identity.ingress);
         assert_eq!(s.retire_channel(ChannelId(2)), Ok(()));
@@ -1868,9 +1944,9 @@ mod tests {
         // domain stays open — a refused transition changes nothing.
         assert_eq!(
             s.apply_control(free),
-            Err(ControlRefusal::Free(RetireRefusal::LivePositions {
-                outstanding: 1
-            }))
+            Err(ControlRefusal::Free(FreeRefusal::Owed(
+                RetireRefusal::LivePositions { outstanding: 1 }
+            )))
         );
         assert!(s.channel_open(ChannelId(2)));
 
@@ -2432,6 +2508,7 @@ mod tests {
         let mut losses = 0usize;
         let mut stranded_total = 0usize;
         let mut channel_retires_refused = 0usize;
+        let mut channel_frees_unopened = 0usize;
 
         for seed in 0..384u64 {
             let mut rng = Rng::new(seed);
@@ -2474,8 +2551,10 @@ mod tests {
                     2 => {
                         let d = DOMAINS[rng.below(3) as usize];
                         let live = s.publisher().outstanding(d);
+                        let was_open = open.contains(&d);
                         match s.retire_channel(d) {
                             Ok(()) => {
+                                assert!(was_open, "seed {seed}: freed a domain nothing opened");
                                 assert_eq!(live, 0, "seed {seed}: retired a live channel");
                                 open.remove(&d);
                                 // The next lifetime starts at position one.
@@ -2483,10 +2562,22 @@ mod tests {
                                 taken.remove(&d);
                                 released.remove(&d);
                             }
-                            Err(RetireRefusal::LivePositions { outstanding: n }) => {
+                            Err(FreeRefusal::Owed(RetireRefusal::LivePositions {
+                                outstanding: n,
+                            })) => {
+                                assert!(was_open);
                                 assert_eq!(n, live);
                                 assert!(n > 0);
                                 channel_retires_refused += 1;
+                            }
+                            // A free of a domain no definition opened, which
+                            // the sweep produces because it names domains
+                            // rather than only open ones.
+                            Err(FreeRefusal::NotOpen(refusal)) => {
+                                assert!(!was_open, "seed {seed}: refused an open domain");
+                                assert_eq!(refusal, Refusal::ChannelNotOpen { channel: d });
+                                assert_eq!(live, 0);
+                                channel_frees_unopened += 1;
                             }
                         }
                     }
@@ -2694,6 +2785,10 @@ mod tests {
         assert!(
             channel_retires_refused > 60,
             "channel frees refused for live positions: {channel_retires_refused}"
+        );
+        assert!(
+            channel_frees_unopened > 60,
+            "channel frees refused for a domain nothing opened: {channel_frees_unopened}"
         );
         assert!(refused_unknown > 700, "unknown opcode: {refused_unknown}");
         assert!(
