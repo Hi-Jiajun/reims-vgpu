@@ -368,3 +368,87 @@ fn a_read_that_owes_a_transfer_pays_for_the_answer_and_not_for_the_search() {
          search is allocating per member"
     );
 }
+
+/// Appending records to one transaction's builder does not allocate per
+/// record.
+///
+/// # What this can and cannot claim
+///
+/// A transaction owns its records: [`ExecWork`] hands `Vec`s to whoever takes
+/// the transaction, so a builder starting empty must grow them, and that
+/// growth is `O(log n)` trips for `n` records. What must never happen is a
+/// trip *per record* — a scratch buffer rebuilt per operation, a participation
+/// list allocated and dropped, a per-record `Vec` inside a resolved operation.
+/// `ExecBuilder::record` already takes its participation scratch out and puts
+/// it back for exactly that reason, and this is what checks that it still
+/// does.
+///
+/// So the assertion is the growth law: quadrupling the record count may add a
+/// couple of doublings per vector and nothing more.
+#[test]
+fn appending_records_to_a_transaction_does_not_allocate_per_record() {
+    use reims_vgpu_core::access::{AccessRefusal, Participation, ResourceKey};
+    use reims_vgpu_core::blit::BlitOp;
+    use reims_vgpu_core::exec::{ExecBuilder, ResolvedOperation};
+    use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
+    use reims_vgpu_core::stream::{SegmentKind, SegmentLifetime};
+
+    fn id(slot: u32) -> ResourceId {
+        ResourceId {
+            slot: ObjectListRef(slot),
+            generation: SlotGeneration(1),
+        }
+    }
+
+    fn everything(p: &Participation) -> Result<AccessIntent, AccessRefusal> {
+        Ok(p.resolve(
+            ChannelId(1),
+            ResourceKey {
+                backing: BackingId(u64::from(p.resource.slot.0)),
+                heap: None,
+            },
+            None,
+            None,
+        ))
+    }
+
+    fn run(records: u32) -> usize {
+        let mut builder = ExecBuilder::new();
+        builder
+            .begin_encoder(
+                SegmentKind::Blit,
+                SegmentLifetime {
+                    continues_previous: false,
+                    continues_into_next: false,
+                },
+            )
+            .expect("an encoder may open");
+        let ((), allocations) = measure(|| {
+            for n in 0..records {
+                let op = ResolvedOperation::Blit(BlitOp::BufferToBuffer {
+                    source: id(n % 8),
+                    source_offset: 0,
+                    dest: id(8 + n % 8),
+                    dest_offset: 0,
+                    size: 256,
+                });
+                builder
+                    .record(op, &mut everything)
+                    .expect("a blit in a blit encoder");
+            }
+        });
+        allocations
+    }
+
+    let small = run(64);
+    let large = run(256);
+    assert!(
+        small < 64,
+        "{small} trips for sixty-four records is one per record"
+    );
+    assert!(
+        large <= small + 16,
+        "{large} trips for 256 records against {small} for 64: the cost is \
+         linear in the records rather than logarithmic"
+    );
+}
