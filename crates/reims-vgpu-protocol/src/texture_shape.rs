@@ -299,6 +299,23 @@ pub enum ShapeRefusal {
         dimension: &'static str,
         found: u32,
     },
+    /// A cube type whose faces are not square.
+    ///
+    /// The guest API builds a cube from one `size`, so its six faces are
+    /// square by construction and a declaration with two different extents is
+    /// not describing a cube. Refused rather than squared off: which of the
+    /// two the guest meant is not in the record, and every downstream answer —
+    /// the pyramid's depth, the face's footprint, the view a sampler binds —
+    /// is a different number under each reading.
+    ///
+    /// It is also invalid usage one layer down. A `VkImage` created
+    /// `CUBE_COMPATIBLE` must have equal width and height, and the flag is set
+    /// from the type alone, so a non-square cube reaching the executor is a
+    /// `vkCreateImage` no driver is obliged to reject.
+    CubeNotSquare {
+        width: u32,
+        height: u32,
+    },
     /// `array_length` is zero, or is not one on a type that is not arrayed.
     ArrayLength {
         kind: TextureKind,
@@ -351,6 +368,7 @@ impl reims_vgpu_observe::Decline for ShapeRefusal {
             Self::NoPixelFormat => "texture_shape_no_pixel_format",
             Self::ZeroExtent { .. } => "texture_shape_zero_extent",
             Self::UnusedDimension { .. } => "texture_shape_unused_dimension",
+            Self::CubeNotSquare { .. } => "texture_shape_cube_not_square",
             Self::ArrayLength { .. } => "texture_shape_array_length",
             Self::MipLevels { .. } => "texture_shape_mip_levels",
             Self::MipLevelsBeyondExtent { .. } => "texture_shape_mip_levels_beyond_extent",
@@ -381,6 +399,9 @@ impl reims_vgpu_observe::Decline for ShapeRefusal {
                 ("dimension", (*dimension).to_string()),
                 ("found", found.to_string()),
             ],
+            Self::CubeNotSquare { width, height } => {
+                vec![("width", width.to_string()), ("height", height.to_string())]
+            }
             Self::ArrayLength { kind, found } | Self::MipLevels { kind, found } => vec![
                 ("kind", kind.name().to_string()),
                 ("found", found.to_string()),
@@ -485,6 +506,17 @@ impl TextureShape {
                 width: extent.x,
                 height: extent.y,
                 depth: extent.z,
+            });
+        }
+
+        // A cube is built from one size, so its faces are square. Checked
+        // before the pyramid below it, which takes the longest dimension: on a
+        // declaration that is not a cube at all, "the longest" is a reading of
+        // a field that does not mean what it is being read as.
+        if kind.is_cube() && extent.x != extent.y {
+            return Err(ShapeRefusal::CubeNotSquare {
+                width: extent.x,
+                height: extent.y,
             });
         }
 
@@ -689,6 +721,11 @@ mod tests {
             kind: kind.ordinal(),
             height: if kind.dimensions() == Dimensions::One {
                 1
+            } else if kind.is_cube() {
+                // A cube's faces are square, so the base's oblong extent is
+                // not a valid declaration of one --- and a test mutating some
+                // other field would see this refusal instead of that field's.
+                base().width
             } else {
                 base().height
             },
@@ -1185,6 +1222,8 @@ mod tests {
                                 width,
                                 height: if kind.dimensions() == Dimensions::One {
                                     1
+                                } else if kind.is_cube() {
+                                    width
                                 } else {
                                     height
                                 },
@@ -1252,5 +1291,54 @@ mod tests {
         // would satisfy any bound written on the sweep as a whole.
         assert!(accepted > 500, "{accepted}");
         assert!(refused > 500, "{refused}");
+    }
+
+    /// The failure this exists to prevent: the guest API builds a cube from
+    /// one `size`, so a declaration naming two different extents is not
+    /// describing a cube — and it reached the executor, which sets
+    /// `CUBE_COMPATIBLE` from the type alone. A `VkImage` created with that
+    /// flag must have equal width and height, so the result was a
+    /// `vkCreateImage` no driver is obliged to reject and a cube view reading
+    /// past the end of its own face.
+    #[test]
+    fn a_cube_whose_faces_are_not_square_is_not_a_cube() {
+        for kind in TextureKind::ALL {
+            let oblong = TextureShape {
+                width: 64,
+                height: 32,
+                ..shaped(kind)
+            };
+            // A 1D type has no height to disagree with, so it is not part of
+            // this question at all.
+            if kind.dimensions() == Dimensions::One {
+                continue;
+            }
+            let answer = oblong.checked();
+            if kind.is_cube() {
+                assert_eq!(
+                    answer.expect_err("a cube with two extents"),
+                    ShapeRefusal::CubeNotSquare {
+                        width: 64,
+                        height: 32,
+                    },
+                    "{}",
+                    kind.name()
+                );
+            } else {
+                assert!(
+                    answer.is_ok(),
+                    "{} is not a cube and owes nothing about its aspect",
+                    kind.name()
+                );
+            }
+            // And the square form of the same declaration is admitted, so the
+            // refusal is the aspect and not the extent.
+            assert!(TextureShape {
+                height: 64,
+                ..oblong
+            }
+            .checked()
+            .is_ok());
+        }
     }
 }
