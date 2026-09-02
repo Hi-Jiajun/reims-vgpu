@@ -1068,4 +1068,165 @@ mod tests {
             assert!(!refusal.fields().is_empty());
         }
     }
+
+    /// Every declaration the checkpoint admits, checked against the two rules
+    /// the checkpoint is for.
+    ///
+    /// `every_unnormalized_restriction_but_the_comparison_is_conformed_away`
+    /// drives five declarations, each breaking one rule, and the conformance
+    /// touches six fields on three axes. What that list cannot say is what
+    /// happens when two rules break at once, or when the rule breaks on the
+    /// `s` or `r` axis rather than the `t` one — and a conformance is exactly
+    /// the kind of pass that fixes one field while reading another it forgot
+    /// to fix first.
+    ///
+    /// So it is driven over the product instead. Both directions matter and
+    /// both are asserted: an unnormalized state satisfies the restriction, and
+    /// a normalized one is untouched. A conformance that ran on every
+    /// declaration would satisfy the first alone.
+    #[test]
+    fn no_admitted_sampler_leaves_the_region_its_mode_allows() {
+        let mut unnormalized_seen = 0u32;
+        let mut conformed_seen = 0u32;
+        let mut normalized_seen = 0u32;
+        let mut refused = 0u32;
+        // One past each closed set, so an unknown ordinal is driven on every
+        // field rather than assumed unreachable.
+        for min_filter in 0..=2 {
+            for mag_filter in 0..=2 {
+                for mip_filter in 0..=3 {
+                    for s_address in 0..=6 {
+                        for t_address in 0..=6 {
+                            for r_address in [0, 2, 5, 6] {
+                                for max_anisotropy in [0, 1, 4] {
+                                    for (lod_min_clamp, lod_max_clamp) in
+                                        [(0.0, 0.0), (1.0, 4.0), (0.0, f32::MAX)]
+                                    {
+                                        for compare_enabled in [false, true] {
+                                            for normalized_coordinates in [false, true] {
+                                                let shape = SamplerShape {
+                                                    min_filter,
+                                                    mag_filter,
+                                                    mip_filter,
+                                                    s_address,
+                                                    t_address,
+                                                    r_address,
+                                                    max_anisotropy,
+                                                    lod_min_clamp,
+                                                    lod_max_clamp,
+                                                    compare_function: MTL_COMPARE_FUNCTION_LESS,
+                                                    compare_enabled,
+                                                    border_color:
+                                                        MTL_SAMPLER_BORDER_COLOR_OPAQUE_WHITE,
+                                                    normalized_coordinates,
+                                                };
+                                                let Ok(state) = shape.checked() else {
+                                                    refused += 1;
+                                                    continue;
+                                                };
+
+                                                // Whatever came out, the flag
+                                                // is only ever set on the mode
+                                                // that has a conformance.
+                                                assert_eq!(
+                                                    state.normalized_coordinates(),
+                                                    normalized_coordinates
+                                                );
+                                                assert!(
+                                                    !state.unnormalized_conformed()
+                                                        || !normalized_coordinates
+                                                );
+
+                                                if normalized_coordinates {
+                                                    normalized_seen += 1;
+                                                    // Untouched: every field
+                                                    // is the parse of the
+                                                    // ordinal the guest wrote.
+                                                    assert_eq!(
+                                                        Some(state.min_filter()),
+                                                        Filter::parse(min_filter)
+                                                    );
+                                                    assert_eq!(
+                                                        Some(state.mip_filter()),
+                                                        MipFilter::parse(mip_filter)
+                                                    );
+                                                    assert_eq!(
+                                                        state.address(),
+                                                        [s_address, t_address, r_address]
+                                                            .map(|a| AddressMode::parse(a)
+                                                                .expect("admitted"))
+                                                    );
+                                                    assert_eq!(
+                                                        state.max_anisotropy(),
+                                                        max_anisotropy.max(1)
+                                                    );
+                                                    assert_eq!(
+                                                        state.lod_clamp(),
+                                                        (lod_min_clamp, lod_max_clamp)
+                                                    );
+                                                    assert_eq!(
+                                                        state.compare().is_some(),
+                                                        compare_enabled
+                                                    );
+                                                    assert!(!state.unnormalized_conformed());
+                                                    continue;
+                                                }
+
+                                                unnormalized_seen += 1;
+                                                if state.unnormalized_conformed() {
+                                                    conformed_seen += 1;
+                                                }
+                                                // The region both APIs admit
+                                                // for a pixel-coordinate
+                                                // sampler, in full.
+                                                assert_eq!(state.min_filter(), state.mag_filter());
+                                                assert_eq!(
+                                                    state.mip_filter(),
+                                                    MipFilter::NotMipmapped
+                                                );
+                                                assert_eq!(state.max_anisotropy(), 1);
+                                                assert_eq!(state.lod_clamp(), (0.0, 0.0));
+                                                assert!(state.compare().is_none());
+                                                for mode in state.address() {
+                                                    assert!(mode.allows_unnormalized());
+                                                }
+                                                // And the flag says whether it
+                                                // took any of that to get
+                                                // there, which is the one
+                                                // thing a backend reports.
+                                                let untouched = min_filter == mag_filter
+                                                    && mip_filter
+                                                        == MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED
+                                                    && max_anisotropy <= 1
+                                                    && lod_min_clamp == 0.0
+                                                    && lod_max_clamp == 0.0
+                                                    && [s_address, t_address, r_address]
+                                                        .iter()
+                                                        .all(|&a| {
+                                                            AddressMode::parse(a).is_some_and(
+                                                                AddressMode::allows_unnormalized,
+                                                            )
+                                                        });
+                                                assert_eq!(
+                                                    state.unnormalized_conformed(),
+                                                    !untouched,
+                                                    "{shape:?}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Floors per outcome. One aggregate would be satisfied by a product
+        // that refused everything, or that never reached the conforming arm.
+        assert!(normalized_seen > 500, "{normalized_seen}");
+        assert!(unnormalized_seen > 500, "{unnormalized_seen}");
+        assert!(conformed_seen > 500, "{conformed_seen}");
+        assert!(refused > 500, "{refused}");
+    }
 }
