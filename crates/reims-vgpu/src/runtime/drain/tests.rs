@@ -1071,6 +1071,69 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     assert_eq!(state.translation_order_hold_mask, 0);
 }
 
+/// A cursor pitch that does not fit a word must be refused, not wrapped.
+///
+/// `CmdSetCursorGlyph` carries `stride` in eight bytes and the drain wanted
+/// four. Taking the low four of `0x1_0000_0100` gives `0x100`, which clears the
+/// geometry bound for a 64-pixel-wide sprite and makes `need` small enough that
+/// a modest `mapped_length` covers it — so the glyph was accepted and then read
+/// at a pitch of 256 bytes when the guest laid it out at four gigabytes and a
+/// bit. A garbled pointer, and nothing on the failure channel to say why.
+///
+/// Compared in its own width the same record does not survive: `need` is the
+/// height times the real pitch, `mapped_length` does not cover it, and
+/// `cursor_glyph_mapped_len` says so.
+#[test]
+fn a_cursor_pitch_wider_than_a_word_is_refused_rather_than_truncated() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut payload = vec![0u8; crate::protocol::fifo::CURSOR_GLYPH_LEN];
+    let put32 =
+        |p: &mut Vec<u8>, at: usize, v: u32| p[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 =
+        |p: &mut Vec<u8>, at: usize, v: u64| p[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    put32(&mut payload, crate::protocol::fifo::CURSOR_GLYPH_TASK_ID, 1);
+    put64(
+        &mut payload,
+        crate::protocol::fifo::CURSOR_GLYPH_MAPPED_LENGTH,
+        0x4000,
+    );
+    // Low word `0x100`, which is exactly the pitch a 64-wide sprite needs.
+    put64(
+        &mut payload,
+        crate::protocol::fifo::CURSOR_GLYPH_STRIDE,
+        0x1_0000_0100,
+    );
+    payload[crate::protocol::fifo::CURSOR_GLYPH_WIDTH..][..2].copy_from_slice(&64u16.to_le_bytes());
+    payload[crate::protocol::fifo::CURSOR_GLYPH_HEIGHT..][..2]
+        .copy_from_slice(&32u16.to_le_bytes());
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &Packet {
+            opcode: CHILD_OP_CURSOR_GLYPH,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert!(
+        !state.cursor.glyph_ready,
+        "a sprite read at a pitch the guest did not use is not a glyph"
+    );
+    assert!(state.cursor.pixels.is_empty());
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("reason=cursor_glyph_mapped_len"),
+        "the refusal names the bound the real pitch failed, not silence: {log}"
+    );
+}
+
 /// The open end of the same lifetime owes the same forgetting, and its
 /// sibling below is the only thing that was ever asserted about it.
 ///

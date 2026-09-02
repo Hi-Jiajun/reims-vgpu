@@ -2867,7 +2867,14 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
     let task_id = record.task_id;
     let virtual_offset = record.virtual_offset;
     let mapped_length = record.mapped_length;
-    let stride = record.stride as u32;
+    // Whole, not narrowed. The wire's stride is eight bytes, and taking the
+    // low four of it turns a pitch that does not fit into a small one that
+    // passes every bound below — the glyph is then read at the wrong pitch and
+    // the guest gets a garbled pointer with nothing on the failure channel. It
+    // is compared and multiplied in its own width, and the bounds it has to
+    // pass — `cursor_glyph_geom`, `cursor_glyph_mapped_len`,
+    // `cursor_glyph_alloc` — are what refuse an unusable one.
+    let stride = record.stride;
     let width = u32::from(record.width);
     let height = u32::from(record.height);
     let hot_x = u32::from(record.hot_x);
@@ -2877,7 +2884,7 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
         || height == 0
         || width > CURSOR_MAX_DIM
         || height > CURSOR_MAX_DIM
-        || stride < width.saturating_mul(CURSOR_GLYPH_BPP)
+        || stride < u64::from(width.saturating_mul(CURSOR_GLYPH_BPP))
         || hot_x >= width
         || hot_y >= height
     {
@@ -2886,9 +2893,9 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
             format!("cursor_glyph_fail reason=cursor_glyph_geom {width}x{height} stride={stride} hot=({hot_x},{hot_y}) max={CURSOR_MAX_DIM}"),
         );
     }
-    let need = (height as u64 - 1)
-        .saturating_mul(stride as u64)
-        .saturating_add(width as u64 * CURSOR_GLYPH_BPP as u64);
+    let need = u64::from(height - 1)
+        .saturating_mul(stride)
+        .saturating_add(u64::from(width) * u64::from(CURSOR_GLYPH_BPP));
     if mapped_length < need {
         return cursor_glyph_fail(
             "cursor_glyph_mapped_len",
@@ -2921,10 +2928,13 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
 
     let mut pixels = Vec::with_capacity((width * height) as usize);
     for y in 0..height {
-        let row = (y as usize).saturating_mul(stride as usize);
+        // `need` bounded the last row's start and `host_alloc_len` accepted it,
+        // so the product fits; `try_from` rather than `as` because a cast here
+        // would be the narrowing this function just stopped doing.
+        let row = usize::try_from(u64::from(y).saturating_mul(stride)).unwrap_or(usize::MAX);
         for x in 0..width {
-            let px = row + (x as usize) * CURSOR_GLYPH_BPP as usize;
-            if px + 4 > src.len() {
+            let px = row.saturating_add((x as usize) * CURSOR_GLYPH_BPP as usize);
+            if px.saturating_add(4) > src.len() {
                 return cursor_glyph_fail(
                     "cursor_glyph_bounds",
                     format!("cursor_glyph_fail reason=cursor_glyph_bounds px={px} src_len={} {width}x{height} stride={stride}", src.len()),
