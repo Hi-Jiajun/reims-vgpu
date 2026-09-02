@@ -1294,6 +1294,201 @@ mod tests {
         }
     }
 
+    /// A driven history of the ring against a shadow built only from what the
+    /// calls said.
+    ///
+    /// The shadow is one array: for each set, the timeline point a submission
+    /// last named it at, or `None`. It is written from three places and no
+    /// others — the set an `emit` handed back becomes the holder, a
+    /// `submitted(at)` stamps that holder, and a `recycle(p)` clears every
+    /// stamp `p` has passed. It never reads a [`SetState`], so it cannot be
+    /// wrong in the same way the ring is.
+    ///
+    /// The law it holds is the one this module exists for: **a set handed to an
+    /// emission is never one a submission may still be reading.** Writing into
+    /// such a set is undefined behaviour, and it is the failure no test of a
+    /// single sequence finds, because it needs a submission, a recycle that
+    /// does not pass it, and a later emission under pressure.
+    ///
+    /// Four more claims fall out of the same shadow: the `partial` flag is true
+    /// exactly when the holder survived unsubmitted, `recycle` frees exactly
+    /// the stamps the point passed, `Exhausted` reports the real depth and
+    /// in-flight count rather than a plausible pair, and the ring's own
+    /// `Submitted` set is stamp for stamp the shadow's.
+    ///
+    /// The points are deliberately not monotone. A monotone clock cannot drive
+    /// `submitted`'s keep-the-later-of-two rule at all — the later point is
+    /// always the new one — and it cannot produce the recycle that passes one
+    /// submission and not another, which is the shape the safety law is about.
+    #[test]
+    fn a_driven_history_never_hands_out_a_set_a_submission_may_be_reading() {
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let (mut whole, mut partial_emits, mut exhausted) = (0u64, 0u64, 0u64);
+        let (mut submissions, mut recycled, mut abandons, mut resets) = (0u64, 0u64, 0u64, 0u64);
+        // The safety law's own window: an emission taken while some other set
+        // was still in flight. Without it the sweep would prove only that an
+        // idle ring hands out free sets.
+        let mut emit_under_flight = 0u64;
+
+        for depth in [1usize, 2, 3, 5] {
+            for _ in 0..200 {
+                let mut ring = SetRing::new(depth);
+                let mut stamped: Vec<Option<TimelinePoint>> = vec![None; depth];
+                let mut holder: Option<usize> = None;
+                let mut clock = 1u64;
+
+                for _ in 0..50 {
+                    match next() % 16 {
+                        // Emissions dominate: the ring exists for the draw
+                        // path, and a history spent recycling drives none of it.
+                        0..=6 => {
+                            let outstanding = stamped.iter().filter(|s| s.is_some()).count();
+                            // Expected before the call, from the shadow alone.
+                            let expect_partial = holder.is_some_and(|h| stamped[h].is_none());
+                            match ring.emit() {
+                                Ok(emission) => {
+                                    let set = emission.set();
+                                    assert!(
+                                        stamped[set].is_none(),
+                                        "emitted set {set} is named by a submission at {:?}",
+                                        stamped[set]
+                                    );
+                                    assert_eq!(
+                                        emission.partial(),
+                                        expect_partial,
+                                        "the partial flag disagrees with the holder's history"
+                                    );
+                                    if expect_partial {
+                                        assert_eq!(Some(set), holder);
+                                        partial_emits += 1;
+                                    } else {
+                                        whole += 1;
+                                    }
+                                    if outstanding > 0 {
+                                        emit_under_flight += 1;
+                                    }
+                                    holder = Some(set);
+                                }
+                                Err(refusal) => {
+                                    exhausted += 1;
+                                    assert_eq!(refusal.depth, depth);
+                                    assert_eq!(refusal.in_flight, outstanding);
+                                }
+                            }
+                        }
+                        7..=9 => {
+                            // Usually a new point and sometimes an older one,
+                            // so the keep-the-later rule is driven both ways.
+                            let at = if next() % 3 == 0 {
+                                TimelinePoint(clock.saturating_sub(next() % 4))
+                            } else {
+                                clock += 1;
+                                TimelinePoint(clock)
+                            };
+                            ring.submitted(at);
+                            if let Some(h) = holder {
+                                submissions += 1;
+                                stamped[h] = Some(match stamped[h] {
+                                    Some(previous) if previous.0 > at.0 => previous,
+                                    _ => at,
+                                });
+                            }
+                        }
+                        10..=12 => {
+                            let reached = TimelinePoint(clock.saturating_sub(next() % 5));
+                            let freed = ring.recycle(reached);
+                            let mut expected = 0;
+                            for slot in &mut stamped {
+                                if slot.is_some_and(|at| reached.reached(at)) {
+                                    *slot = None;
+                                    expected += 1;
+                                }
+                            }
+                            assert_eq!(freed, expected, "recycle freed the wrong count");
+                            recycled += freed as u64;
+                        }
+                        13..=14 => {
+                            if let Some(h) = holder {
+                                // The receipt a recording that gave up would
+                                // hand back. Forged because the sweep does not
+                                // keep them; what it drives is the ring's
+                                // answer, not the receipt's own discipline,
+                                // which the type enforces at compile time.
+                                ring.abandoned(SetEmission::forged(h, true));
+                                holder = None;
+                                abandons += 1;
+                            }
+                        }
+                        _ => {
+                            // Legal exactly when the shadow says nothing is in
+                            // flight, which is also what `resettable` claims.
+                            let idle = stamped.iter().all(Option::is_none);
+                            assert_eq!(ring.resettable(), idle);
+                            if idle {
+                                ring.reset();
+                                resets += 1;
+                                holder = None;
+                            }
+                        }
+                    }
+
+                    // The ring's bookkeeping, stamp for stamp against the
+                    // shadow's, after every operation rather than at the end.
+                    for (set, expected) in stamped.iter().enumerate() {
+                        let state = ring.state(set).expect("a set inside the ring");
+                        match (state, expected) {
+                            (SetState::Submitted(at), Some(want)) => assert_eq!(&at, want),
+                            (SetState::Submitted(at), None) => {
+                                panic!("set {set} is Submitted({at:?}) with no stamp behind it")
+                            }
+                            (_, Some(want)) => {
+                                panic!("set {set} is {state:?} and the shadow stamped it {want:?}")
+                            }
+                            (_, None) => {}
+                        }
+                    }
+                    assert_eq!(
+                        ring.in_flight(),
+                        stamped.iter().filter(|s| s.is_some()).count()
+                    );
+
+                    // Conservation, and the structural claim underneath it:
+                    // every set is in exactly one state, at most one is `Live`,
+                    // and that one is the holder. A `Live` set that nobody
+                    // holds is a slot lost for the epoch — it is neither
+                    // reusable nor recyclable — and no count alone would say so.
+                    let live: Vec<usize> = (0..depth)
+                        .filter(|s| ring.state(*s) == Some(SetState::Live))
+                        .collect();
+                    assert_eq!(ring.free() + live.len() + ring.in_flight(), depth);
+                    assert!(live.len() <= 1, "two sets describe the bindings: {live:?}");
+                    if let Some(only) = live.first() {
+                        assert_eq!(ring.holder(), Some(*only), "a live set nobody holds");
+                    }
+                }
+            }
+        }
+
+        assert!(whole > 2_000, "whole={whole}");
+        assert!(partial_emits > 1_000, "partial={partial_emits}");
+        assert!(exhausted > 300, "exhausted={exhausted}");
+        assert!(submissions > 1_500, "submissions={submissions}");
+        assert!(recycled > 800, "recycled={recycled}");
+        assert!(abandons > 800, "abandons={abandons}");
+        assert!(resets > 300, "resets={resets}");
+        assert!(
+            emit_under_flight > 800,
+            "emit_under_flight={emit_under_flight}"
+        );
+    }
+
     #[test]
     fn an_abandoned_fresh_emission_frees_its_set_and_gives_up_the_holder() {
         let mut ring = SetRing::new(2);
