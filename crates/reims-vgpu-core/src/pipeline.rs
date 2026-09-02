@@ -454,7 +454,10 @@ impl PipelineTable {
     /// unsatisfiable packet, and for the same reason: a completion word the
     /// guest waits on forever is worse than a refusal it is told about.
     ///
-    /// Leases already taken stay counted. They happened.
+    /// Nothing is charged for a list that refuses. The walk decides in full
+    /// first and only then charges, so a refusal at the third pipeline leaves
+    /// the census exactly as it was — which is what
+    /// `an_unusable_pipeline_stops_the_walk_and_nothing_is_counted` asserts.
     pub fn waits_for(
         &mut self,
         leases: &[ResourceId],
