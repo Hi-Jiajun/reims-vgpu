@@ -45,6 +45,48 @@ use crate::identity::{ChannelId, ResourceId};
 /// is that decision's result: two resources that share backing share a
 /// `BackingId`. Resource names alone never prove or disprove aliasing, so
 /// nothing here is derived from a name.
+///
+/// # What a producer of these has to establish first
+///
+/// This crate consumes `BackingId`s and cannot mint one: minting requires
+/// reading a guest descriptor and a page table, which is the device's. A survey
+/// of what this interface's objects actually name found that the device cannot
+/// mint one correctly yet either, and the reason is a contract question rather
+/// than missing code. Recorded here, at the type that demands the value,
+/// because the failure mode is silent: an id that is *too distinct* — two names
+/// for one piece of storage getting different ids — makes
+/// [`crate::depend`] find no conflict between them and drop the hazard edge
+/// that was ordering a real read against a real write. Nothing refuses, nothing
+/// logs, and the frame is wrong intermittently.
+///
+/// Three joins are unresolved. Each one is a pair of names this device can see
+/// and cannot prove equal or distinct:
+///
+/// 1. **A mapping against a guest-virtual window.** Some objects name a
+///    mapping the device tracks; the rest name pages by an address in the
+///    owning task. Both bottom out in the same address space, so an imported
+///    surface also bound as a linear texture is one piece of storage under two
+///    schemes — and no rule says when a mapping's pages and an object's address
+///    are the same bytes. Two id schemes without that rule are false
+///    distinctness on exactly the aliasing case a hazard model exists for.
+/// 2. **Heap identity.** [`crate::heap`] requires a placement to take its
+///    heap's id and a byte range, because two windows the guest chose to
+///    overlap are the same bytes. The device decodes a heap reference and an
+///    offset for a heap-placed texture and keeps neither: there is no heap
+///    object, no heap extent, and no value that could be a heap's canonical
+///    identity.
+/// 3. **When the id is minted against when it can be known.**
+///    [`crate::namespace::Namespace::declare`] wants one at declaration, and on
+///    this interface a declaration is the guest writing a record into its own
+///    object-list page — which happens before it has finished mapping the
+///    backing. So an id derived from the descriptor is available and cannot
+///    span join 1, and one derived from resolved pages spans it and is neither
+///    available at declaration nor stable across a physical replacement.
+///
+/// Until those are answered, an id derived from a resource's own name — a
+/// per-resource counter, a slot number — is the tempting shape and the
+/// forbidden one: it is what the first paragraph rules out, it gets every
+/// sharing relationship wrong in the dangerous direction, and it would compile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BackingId(pub u64);
 
