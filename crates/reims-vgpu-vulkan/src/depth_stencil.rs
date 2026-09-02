@@ -797,4 +797,39 @@ mod tests {
         assert_eq!(FacePlan::PASS_THROUGH, FacePlan::of(StencilFace::DEFAULT));
         assert_eq!(FacePlan::PASS_THROUGH, FacePlan::pass_through());
     }
+
+    /// Every stencil operation lands on the Vulkan operation of the same name.
+    ///
+    /// The eight arms are written out because a numeric coincidence between
+    /// two vendors' enums is not a contract, and writing them out is where a
+    /// swapped pair gets in: `IncrementClamp` bound to `DECREMENT_AND_CLAMP`
+    /// and `DecrementClamp` to `INCREMENT_AND_CLAMP` is still eight distinct
+    /// operations and still compiles. What it produces is a stencil buffer
+    /// that counts the wrong way, which no test of the plan's *shape* can see.
+    ///
+    /// So the answer is checked against its own name, through the same
+    /// derivation [`crate::sampler`] uses for the comparison table --- the
+    /// guest spelling, plus the one conjunction Vulkan writes and Metal does
+    /// not.
+    #[test]
+    fn every_stencil_operation_lands_on_the_operation_of_the_same_name() {
+        for guest in GuestOp::ALL {
+            assert_eq!(
+                format!("{:?}", stencil_op(guest)),
+                crate::naming::vulkan_spelling(&format!("{guest:?}")),
+                "{guest:?}"
+            );
+        }
+    }
+
+    /// And no two of them collapse onto one, which a name check alone would
+    /// miss if two guest spellings ever normalised alike.
+    #[test]
+    fn the_eight_stencil_operations_stay_eight() {
+        let mapped: std::collections::BTreeSet<i32> = GuestOp::ALL
+            .iter()
+            .map(|op| stencil_op(*op).as_raw())
+            .collect();
+        assert_eq!(mapped.len(), GuestOp::ALL.len());
+    }
 }

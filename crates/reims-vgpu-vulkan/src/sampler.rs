@@ -351,6 +351,29 @@ mod tests {
         );
     }
 
+    /// Every comparison lands on the Vulkan operation of the same name.
+    ///
+    /// Injectivity above says no two guest comparisons collapse onto one
+    /// Vulkan operation. It says nothing about a *swap*: `Less` bound to
+    /// `GREATER` and `Greater` to `LESS` is still eight distinct operations,
+    /// and one pinned arm cannot catch it. A swapped depth comparison is a
+    /// frame that draws inside out, on every guest, silently.
+    ///
+    /// So the answer is checked against its own name. The derivation shares
+    /// nothing with the table: it reads the guest variant's spelling, applies
+    /// the one vocabulary rule Metal and Vulkan disagree about, and compares
+    /// with what the `VkCompareOp` calls itself.
+    #[test]
+    fn every_comparison_lands_on_the_operation_of_the_same_name() {
+        for guest in CompareFunction::ALL {
+            assert_eq!(
+                format!("{:?}", compare_op(guest)),
+                crate::naming::vulkan_spelling(&format!("{guest:?}")),
+                "{guest:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_border_colour_maps_to_a_float_variant() {
         for guest in BorderColor::ALL {

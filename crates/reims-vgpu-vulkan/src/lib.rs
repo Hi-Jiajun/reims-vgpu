@@ -215,3 +215,54 @@ mod boundary {
         }
     }
 }
+
+/// How a guest enumerant's spelling becomes the Vulkan enumerant's.
+///
+/// For the tests, and only for them: two eight-arm mapping tables --- the
+/// comparison functions and the stencil operations --- are written out by hand,
+/// and what a hand-written table of same-named values gets wrong is a *swap*.
+/// Injectivity cannot see one, and a spot-checked arm catches only itself. The
+/// derivation here shares nothing with either table; it reads the guest name.
+#[cfg(test)]
+pub(crate) mod naming {
+    /// The guest name a Vulkan enumerant's own name, under two vocabulary
+    /// rules and nothing else.
+    ///
+    /// `LessEqual` is `LESS_OR_EQUAL` and `IncrementClamp` is
+    /// `INCREMENT_AND_CLAMP`; every other word survives the split unchanged.
+    /// Shared with [`crate::depth_stencil`], which maps the other
+    /// eight-arm table.
+    #[must_use]
+    pub(crate) fn vulkan_spelling(camel: &str) -> String {
+        let mut words: Vec<String> = Vec::new();
+        for ch in camel.chars() {
+            if ch.is_uppercase()
+                && !words.is_empty()
+                && !words.last().expect("non-empty").is_empty()
+            {
+                words.push(String::new());
+            }
+            if words.is_empty() {
+                words.push(String::new());
+            }
+            words
+                .last_mut()
+                .expect("non-empty")
+                .push(ch.to_ascii_uppercase());
+        }
+        // Metal writes the comparison as one word and Vulkan spells the
+        // conjunction; the same for the stencil operations' saturation.
+        // `NotEqual` is `NOT_EQUAL` in both, which is why the first rule asks
+        // what the `EQUAL` follows rather than only that it is last.
+        if words.len() > 1 {
+            let last = words[words.len() - 1].clone();
+            let before = words[words.len() - 2].clone();
+            if last == "EQUAL" && (before == "LESS" || before == "GREATER") {
+                words.insert(words.len() - 1, "OR".to_string());
+            } else if last == "CLAMP" || last == "WRAP" {
+                words.insert(words.len() - 1, "AND".to_string());
+            }
+        }
+        words.join("_")
+    }
+}
