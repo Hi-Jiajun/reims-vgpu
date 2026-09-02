@@ -500,6 +500,14 @@ pub(crate) struct WindowPresenter {
     /// Whether the run in progress is a window with no area, so the reason is
     /// stated when the run starts and not on every frame of it.
     surface_had_no_area: bool,
+    /// `vkGetPhysicalDeviceSurfaceSupportKHR` for this surface and the graphics
+    /// queue, asked once at attach.
+    ///
+    /// Carried rather than re-queried per recreate: it is a property of the
+    /// pairing, which does not change while the presenter owns the surface, and
+    /// a second query is a second answer that could disagree with the one
+    /// attach already refused on.
+    present_family_supported: bool,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -759,6 +767,9 @@ impl WindowPresenter {
             cadence_busy_acquire: 0,
             cadence_busy_no_area: 0,
             surface_had_no_area: false,
+            // Attach refused above unless this was true, so the presenter that
+            // exists is one whose queue can address its surface.
+            present_family_supported: present_capable,
         };
         // A window created while minimized has no swapchain yet, which is not a
         // failure to attach: `begin_present` retries every frame until the
@@ -874,6 +885,7 @@ impl WindowPresenter {
         // MAILBOX asks for a third image.
         let plan = match reims_vgpu_vulkan::swapchain::plan(
             &reims_vgpu_vulkan::swapchain::Surface {
+                supported_by_present_family: self.present_family_supported,
                 capabilities: caps,
                 formats: &formats,
                 present_modes: &modes,
@@ -2130,6 +2142,7 @@ mod tests {
             };
             let Ok(Outcome::Ready(plan)) = plan(
                 &Surface {
+                    supported_by_present_family: true,
                     capabilities,
                     formats: &[format],
                     present_modes: &[fifo, mailbox],
