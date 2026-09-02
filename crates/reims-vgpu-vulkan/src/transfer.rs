@@ -993,7 +993,10 @@ mod tests {
                 usage: vk::ImageUsageFlags::SAMPLED,
                 flags: vk::ImageCreateFlags::empty(),
             },
-            sampled: vk::ImageView::from_raw(handle),
+            sampled: std::collections::BTreeMap::from([(
+                texture.pixel_format(),
+                vk::ImageView::from_raw(handle),
+            )]),
             attachments: Vec::new(),
         })
     }

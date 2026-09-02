@@ -77,10 +77,61 @@ pub struct NativeImage {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
     pub plan: ImagePlan,
-    /// The whole-texture view a sampled binding uses.
-    pub sampled: vk::ImageView,
+    /// The whole-texture views a sampled binding uses, by the guest format the
+    /// bind named.
+    ///
+    /// A map and not one view, because one image genuinely has several, and
+    /// two independent decisions of this rail each produce a second one:
+    ///
+    /// - [`crate::pixel::sample_view_format`] answers a sampled bind with the
+    ///   bind's own spelling of the stored texel, so one surface serves both
+    ///   `BGRA8Unorm` and `BGRA8Unorm_sRGB` through one image and two views.
+    ///   That is why [`crate::image::plan`] sets `MUTABLE_FORMAT` for a format
+    ///   with a second spelling whatever the guest declared.
+    /// - [`crate::view::sampled_aspect`] reads which plane a bind means off
+    ///   the guest view format, because `X32_Stencil8` and
+    ///   `Depth32Float_Stencil8` translate to one `VkFormat` and are two views
+    ///   of one combined texture.
+    ///
+    /// The guest view format is the key because it is the input both of those
+    /// take and the only thing that separates the cases — a `VkFormat` cannot,
+    /// which is the second point's whole content. One view here would make the
+    /// state this rail already decided on unrepresentable, and a caller
+    /// reaching for "the" sampled view would bind the depth plane to a shader
+    /// reading stencil, or the linear spelling to a shader that decodes sRGB.
+    ///
+    /// Their lifetime is exactly the image's, which is why they live here; see
+    /// [`Self::views`] for the destruction order that follows from it.
+    pub sampled: BTreeMap<u16, vk::ImageView>,
     /// One per attachable slice, in [`crate::view::attachments`] order.
     pub attachments: Vec<vk::ImageView>,
+}
+
+impl NativeImage {
+    /// The sampled view a bind naming `guest_view_format` reads through, if
+    /// one has been made for it.
+    ///
+    /// `None` is "not made yet" and not "not possible": the set grows as the
+    /// guest names spellings, and every one of them is legal because the image
+    /// carries `MUTABLE_FORMAT` whenever a second spelling exists.
+    #[must_use]
+    pub fn sampled_view(&self, guest_view_format: u16) -> Option<vk::ImageView> {
+        self.sampled.get(&guest_view_format).copied()
+    }
+
+    /// Every `VkImageView` this image owns, sampled and attachment alike.
+    ///
+    /// One list because they are destroyed together with the image, and a
+    /// caller walking only one of the two fields would leak the other — which
+    /// is the failure the fields being here rather than in a second table
+    /// exists to prevent, and which two fields reintroduce unless something
+    /// names them together.
+    pub fn views(&self) -> impl Iterator<Item = vk::ImageView> + '_ {
+        self.sampled
+            .values()
+            .copied()
+            .chain(self.attachments.iter().copied())
+    }
 }
 
 /// What a guest resource name resolves to.
@@ -485,7 +536,10 @@ mod tests {
                 usage: vk::ImageUsageFlags::SAMPLED,
                 flags: vk::ImageCreateFlags::empty(),
             },
-            sampled: vk::ImageView::from_raw(handle),
+            sampled: BTreeMap::from([(
+                reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                vk::ImageView::from_raw(handle),
+            )]),
             attachments: Vec::new(),
         })
     }
@@ -495,6 +549,52 @@ mod tests {
             Native::Buffer(b) => b.buffer.as_raw(),
             Native::Image(i) => i.image.as_raw(),
         }
+    }
+
+    /// One image, several sampled views. Two of this rail's own decisions each
+    /// produce a second one — a bind's sRGB spelling of a stored texel, and
+    /// the plane a combined depth-stencil bind names — and a record holding
+    /// one view could express neither.
+    #[test]
+    fn an_image_holds_one_sampled_view_per_spelling_the_guest_names() {
+        use reims_vgpu_core::pixel_format::{
+            MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM,
+        };
+        let Native::Image(mut image) = native_image(7) else {
+            panic!("an image");
+        };
+        image.sampled = BTreeMap::from([
+            (MTL_FORMAT_BGRA8_UNORM, vk::ImageView::from_raw(1)),
+            (MTL_FORMAT_BGRA8_UNORM_SRGB, vk::ImageView::from_raw(2)),
+        ]);
+        image.attachments = vec![vk::ImageView::from_raw(3)];
+
+        // The two spellings are one image and two views, and the bind's own
+        // spelling is what selects between them.
+        assert_eq!(
+            image.sampled_view(MTL_FORMAT_BGRA8_UNORM),
+            Some(vk::ImageView::from_raw(1))
+        );
+        assert_eq!(
+            image.sampled_view(MTL_FORMAT_BGRA8_UNORM_SRGB),
+            Some(vk::ImageView::from_raw(2))
+        );
+        // Not made yet is not impossible: the set grows as the guest names
+        // spellings.
+        assert_eq!(image.sampled_view(MTL_FORMAT_RGBA8_UNORM), None);
+
+        // And everything destroyed with the image is reachable from one walk,
+        // so a caller cannot free the attachment views and leak the sampled
+        // ones.
+        let views: Vec<vk::ImageView> = image.views().collect();
+        assert_eq!(
+            views,
+            vec![
+                vk::ImageView::from_raw(1),
+                vk::ImageView::from_raw(2),
+                vk::ImageView::from_raw(3),
+            ]
+        );
     }
 
     #[test]
