@@ -809,7 +809,8 @@ impl SessionModel {
     /// plane owns is the consequence, which is why the two steps that *have* a
     /// consequence — a pipeline becoming usable and a pipeline becoming
     /// impossible — are [`Self::pipeline_ready`] and [`Self::pipeline_refused`]
-    /// rather than calls on the table.
+    /// rather than calls on the table. A pipeline the *guest* ends is the
+    /// third: [`Self::pipeline_retired`].
     pub const fn pipelines(&mut self) -> &mut crate::pipeline::PipelineTable {
         &mut self.pipelines
     }
@@ -855,6 +856,35 @@ impl SessionModel {
         reason: crate::pipeline::RefusalReason,
     ) -> Vec<IngressOrdinal> {
         if !self.pipelines.refuse(pipeline, reason) {
+            return Vec::new();
+        }
+        self.scheduler.pipeline_refused(pipeline)
+    }
+
+    /// The guest deleted a pipeline: retire it, and name the transactions that
+    /// were waiting for it.
+    ///
+    /// A guest deleting a pipeline mid-compile is ordinary —
+    /// [`crate::pipeline::PipelineState::may_become`] says so — and nothing
+    /// orders that delete behind the work that leased it. The compile then
+    /// lands into a table with no usable entry, [`Self::pipeline_ready`]
+    /// answers `false`, and a transaction parked on the pipeline is parked on
+    /// a wait nothing can discharge: the same hang [`Self::reset`] used to
+    /// leave behind, arriving through the other door that ends a pipeline's
+    /// name.
+    ///
+    /// `pipeline_ready`'s "must not release work either, since that work
+    /// cannot be admitted against a retired pipeline in the first place" is
+    /// about work admitted *after* the retirement. The window opens at
+    /// admission, while the pipeline was still pending, and this is that
+    /// window's other end.
+    ///
+    /// They come back rather than being dropped, for
+    /// [`Self::pipeline_refused`]'s reason, and the caller withdraws each.
+    /// Empty when the retirement was not a legal step.
+    #[must_use = "work stranded by a delete holds its channel's publication head until it is withdrawn"]
+    pub fn pipeline_retired(&mut self, pipeline: ResourceId) -> Vec<IngressOrdinal> {
+        if !self.pipelines.retire(pipeline) {
             return Vec::new();
         }
         self.scheduler.pipeline_refused(pipeline)
@@ -1264,6 +1294,45 @@ mod tests {
         // nothing, which is what stops a late compile callback resurrecting a
         // pipeline the guest deleted.
         assert!(!s.pipeline_ready(pipeline));
+    }
+
+    /// The guest deleting a pipeline is the other door that ends its name, and
+    /// it strands the same way.
+    ///
+    /// A delete mid-compile is ordinary and nothing orders it behind the work
+    /// that leased the pipeline, so the draw already parked on it is parked on
+    /// a wait the landing compile cannot discharge.
+    #[test]
+    fn a_deleted_pipeline_names_the_work_it_left_waiting() {
+        let mut s = session();
+        let pipeline = ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration(1),
+        };
+        let gen = s.generation();
+        s.pipelines().declare(pipeline, gen);
+        s.pipelines()
+            .advance(pipeline, crate::pipeline::PipelineState::Translating);
+        let mut leased = packet(0x37);
+        let Payload::Exec(work) = &mut leased.payload else {
+            panic!("an EXEC");
+        };
+        work.pipeline_leases.push(pipeline);
+        let admitted = s.admit(&leased).expect("accepted");
+        assert!(!admitted.ready);
+
+        assert_eq!(
+            s.pipeline_retired(pipeline),
+            vec![admitted.transaction.identity.ingress]
+        );
+        assert!(
+            !s.pipeline_ready(pipeline),
+            "the compile landing afterwards resurrects nothing"
+        );
+        assert!(s.take_ready().is_empty(), "and releases nobody");
+
+        // A second delete is not a legal step and names nobody twice.
+        assert!(s.pipeline_retired(pipeline).is_empty());
     }
 
     /// A reset ends the pipeline's *name*, and a transaction waiting for one
