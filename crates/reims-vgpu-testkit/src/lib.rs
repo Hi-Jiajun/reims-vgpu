@@ -40,6 +40,7 @@
 //! that put the loaders here rather than in three crates.
 
 pub mod allocations;
+pub mod dispatch;
 pub mod obligations;
 pub mod slugs;
 
