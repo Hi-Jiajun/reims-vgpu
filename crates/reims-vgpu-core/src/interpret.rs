@@ -418,10 +418,31 @@ impl Interpreter {
                         });
                     }
                 }
-                Err(reason) => self.trace.push(Observation::OperationDeclined {
-                    ingress: tx.identity.ingress,
-                    reason,
-                }),
+                Err(reason) => {
+                    self.trace.push(Observation::OperationDeclined {
+                        ingress: tx.identity.ingress,
+                        reason,
+                    });
+                    self.ran += 1;
+                    // The word, and nothing else --- the same shape the
+                    // stalled query below has, and for the same reason.
+                    //
+                    // A lifecycle payload's accesses are exactly its
+                    // operation's own resource list, which
+                    // [`crate::transaction::LifecyclePayload::new`] enforces in
+                    // both directions, and `Lifecycle::apply` is all-or-nothing.
+                    // So a declined operation moved *no* bytes for *any* of
+                    // them. Falling through to the publication below would
+                    // certify, in the trace an implementation is checked
+                    // against, that content nothing wrote had become current
+                    // --- and a later read planned against that version is one
+                    // that skips the transfer which would have made it true.
+                    //
+                    // The stamp is still owed in full, for the reason
+                    // [`Observation::OperationDeclined`] gives: the guest is
+                    // blocked on the word whether or not the device acted.
+                    return Ok(tx.completion);
+                }
             }
         }
 
@@ -1822,6 +1843,87 @@ mod tests {
             "declined, and the word the guest is blocked on is still paid"
         );
         assert_eq!(interp.stamp(stamp.slot), Some(stamp.value));
+        assert_eq!(interp.census(), (1, 0), "ran, and was not refused");
+    }
+
+    /// The other half of the same rule, and the one that would have made the
+    /// reference certify a lie: a lifecycle operation the model declined moved
+    /// no bytes, so it publishes no version.
+    ///
+    /// Identical to the test below except that nothing declares the task, so
+    /// `Lifecycle::apply` refuses. Publishing version four here would tell the
+    /// content authority that this backing's first 128 bytes are current at a
+    /// version nothing produced, and a later read planned against it would skip
+    /// the transfer that would have made it true. The completion word is still
+    /// paid, because the guest is blocked on it either way.
+    #[test]
+    fn a_declined_lifecycle_operation_publishes_no_version_for_bytes_it_did_not_move() {
+        let mut interp = Interpreter::new();
+        interp.content_mut().declare(
+            BackingId(9),
+            ByteRange {
+                offset: 0,
+                length: 256,
+            },
+            Replica::GuestPages,
+        );
+        let region = AccessKey::Range(
+            ResourceKey {
+                backing: BackingId(9),
+                heap: None,
+            },
+            ByteRange {
+                offset: 0,
+                length: 128,
+            },
+        );
+        let mut tx = synchronize(
+            1,
+            vec![AccessIntent {
+                domain: ChannelId(1),
+                key: region,
+                mode: AccessMode::Write,
+                api_stages: 0,
+                input_content_version: None,
+                output_content_version: Some(ContentVersion(4)),
+            }],
+        );
+        let stamp = CompletionStamp {
+            slot: StampSlot(3),
+            value: StampValue(1),
+        };
+        tx.completion = Some(stamp);
+
+        assert_eq!(interp.run(&tx), Outcome::Ran, "declined is not refused");
+        assert_eq!(
+            interp.trace(),
+            &[
+                Observation::OperationDeclined {
+                    ingress: tx.identity.ingress,
+                    reason: crate::lifecycle::Refusal::NoSuchTask {
+                        task: crate::identity::TaskId(1),
+                    },
+                },
+                Observation::StampPublished {
+                    slot: stamp.slot,
+                    value: stamp.value,
+                },
+            ],
+            "the word is owed and the version is not"
+        );
+        // And the ledger agrees. Still the version the declaration above left
+        // --- the guest's own pages as declared --- and not the four this
+        // transaction reserved and never wrote.
+        assert_eq!(
+            interp.content_mut().version_of(
+                BackingId(9),
+                ByteRange {
+                    offset: 0,
+                    length: 128,
+                },
+            ),
+            Some(ContentVersion(0))
+        );
         assert_eq!(interp.census(), (1, 0), "ran, and was not refused");
     }
 
