@@ -765,21 +765,31 @@ mod tests {
         }
     }
 
-    /// A heap-texture query writing its reply into `backing`, versioned so the
+    /// A compute-info query writing its reply into `backing`, versioned so the
     /// answer is something the trace can show landing.
+    ///
+    /// Key-value rather than the heap-texture question, because these tests are
+    /// about the *length* of an answer against the window it goes into, and a
+    /// fixed record has exactly one lawful length — see
+    /// [`crate::query::Stall::FixedReplyWrongSize`]. The bounds are generous so
+    /// the request's own limit is never the one being tested.
     fn query(ingress: u64, backing: BackingId, window: u64) -> DeviceTransaction {
-        let request = crate::query::resolve(
-            crate::query::QueryKind::HeapTextureSizeAndAlign,
-            crate::query::RequestWords::HeapTexture,
-            crate::query::ReplyDestination {
+        let request = crate::query::QueryRequest {
+            kind: crate::query::QueryKind::ComputeInfo,
+            destination: crate::query::ReplyDestination {
                 backing,
                 bytes: ByteRange {
                     offset: 0,
                     length: window,
                 },
             },
-        )
-        .expect("its own layout");
+            reply: crate::query::ReplyShape::KeyValue(
+                reims_vgpu_protocol::info_reply::ReplyBounds {
+                    key_table_len: 64,
+                    count: 4096,
+                },
+            ),
+        };
         DeviceTransaction {
             identity: crate::testing::identity(1, ingress),
             stamp_waits: Vec::new(),
@@ -826,7 +836,7 @@ mod tests {
             vec![
                 Observation::QueryUnanswered {
                     ingress: IngressOrdinal(1),
-                    kind: crate::query::QueryKind::HeapTextureSizeAndAlign,
+                    kind: crate::query::QueryKind::ComputeInfo,
                     reason: crate::query::Stall::NoAnswer,
                 },
                 Observation::StampPublished {
@@ -932,7 +942,7 @@ mod tests {
             stalled[0],
             Observation::QueryUnanswered {
                 ingress: IngressOrdinal(1),
-                kind: crate::query::QueryKind::HeapTextureSizeAndAlign,
+                kind: crate::query::QueryKind::ComputeInfo,
                 reason: crate::query::Stall::ReplyTooLarge {
                     needed: 64,
                     available: 16,

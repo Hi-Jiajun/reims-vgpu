@@ -346,6 +346,27 @@ pub enum Stall {
     /// published, so the guest proceeds on its own zeroed destination rather
     /// than waiting forever.
     NoAnswer,
+    /// A key-value reply is not a run of pairs the request asked for.
+    ///
+    /// The request says how many pairs the guest's walker will consume, so a
+    /// reply longer than that runs past where the guest stops reading, and one
+    /// that is not a whole number of pairs is not a reply at all. Either way
+    /// the guest's parser reads bytes nothing wrote.
+    ///
+    /// **This is a defect in the answer and not in the request.** The bound is
+    /// what [`reims_vgpu_protocol::info_reply::encode`] already honours, so a
+    /// reply that violates it came from somewhere that did not go through the
+    /// encoder — which is the case this exists to name.
+    KeyValueReplyMalformed { bytes: u64, allowed: u64 },
+    /// A fixed reply was answered at a length that is not the record's.
+    ///
+    /// A fixed record has no count and no terminator: the guest reads exactly
+    /// the contract's bytes at the destination's offset. Answering fewer leaves
+    /// the tail as whatever the destination already held, which the guest
+    /// cannot tell from an answer — and it is *its own* variant rather than a
+    /// [`Self::ReplyTooLarge`] because the destination is not the bound that
+    /// was missed.
+    FixedReplyWrongSize { bytes: u64, expected: u64 },
 }
 
 impl Stall {
@@ -354,6 +375,8 @@ impl Stall {
         match self {
             Self::ReplyTooLarge { .. } => "query_reply_too_large",
             Self::NoAnswer => "query_no_answer",
+            Self::KeyValueReplyMalformed { .. } => "query_key_value_reply_malformed",
+            Self::FixedReplyWrongSize { .. } => "query_fixed_reply_wrong_size",
         }
     }
 }
@@ -368,6 +391,13 @@ impl Stall {
 pub struct PendingQuery {
     kind: QueryKind,
     destination: ReplyDestination,
+    /// What shape of answer the request asked for.
+    ///
+    /// Carried, and not only the destination, because "does the answer fit" is
+    /// two questions and this is the one the destination cannot answer. See
+    /// [`ReplyShape`]: a destination says how many bytes are available, the
+    /// shape says how many the guest will actually read.
+    reply: ReplyShape,
     stamp: Option<CompletionStamp>,
 }
 
@@ -394,6 +424,7 @@ impl PendingQuery {
         Self {
             kind: request.kind,
             destination: request.destination,
+            reply: request.reply,
             stamp,
         }
     }
@@ -419,12 +450,32 @@ impl PendingQuery {
     /// Consumes the pending state: after this the completion word may be
     /// published and the reply cannot be written again.
     ///
+    /// # Two bounds, and the request's is checked first
+    ///
+    /// [`ReplyShape`] says a reply is correct only under the request's bounds
+    /// *and* the destination's, and the destination alone was checked — so a
+    /// fixed record answered at half its length, or a run of pairs longer than
+    /// the guest's walker consumes, was accepted whenever the guest's window
+    /// was roomy, which it is: the guest hands over a page for a sixteen-byte
+    /// answer. The guest then reads the contract's bytes and finds whatever the
+    /// destination already held past the answer, which is exactly the wrong
+    /// value this class exists to prevent.
+    ///
+    /// The request's bound is checked first because missing it is a defect in
+    /// this device's answer, while missing the destination's is a mismatch with
+    /// the guest's buffer — and a reply that is the wrong shape is the wrong
+    /// shape wherever it would have fitted.
+    ///
     /// # Errors
     ///
-    /// If the answer does not fit. The query is returned with the pending
-    /// state intact so the caller can complete it as unanswerable — a stall
-    /// that was refused still has to publish its stamp.
+    /// If the answer is not the shape the request asked for, or does not fit.
+    /// The query is returned with the pending state intact so the caller can
+    /// complete it as unanswerable — a stall that was refused still has to
+    /// publish its stamp.
     pub fn answer(self, len: u64) -> Result<CompletedQuery, (Self, Stall)> {
+        if let Some(stall) = self.misshapen(len) {
+            return Err((self, stall));
+        }
         if len > self.destination.bytes.length {
             let stall = Stall::ReplyTooLarge {
                 needed: len,
@@ -443,6 +494,34 @@ impl PendingQuery {
             }),
             stamp: self.stamp,
         })
+    }
+
+    /// Why an answer of `len` bytes is not the reply the request asked for.
+    ///
+    /// The key-value bound is `count` pairs and nothing more:
+    /// [`reims_vgpu_protocol::info_reply::encode`] writes at most `count`
+    /// pairs, and the terminator it may add takes one of them — a reply is
+    /// terminated only when it wrote *fewer* than `count`. So `count * PAIR_LEN`
+    /// bounds every reply the encoder can produce, terminated or not.
+    const fn misshapen(&self, len: u64) -> Option<Stall> {
+        match self.reply {
+            ReplyShape::KeyValue(bounds) => {
+                let pair = reims_vgpu_protocol::info_reply::PAIR_LEN as u64;
+                let allowed = bounds.count as u64 * pair;
+                if len > allowed || !len.is_multiple_of(pair) {
+                    return Some(Stall::KeyValueReplyMalformed {
+                        bytes: len,
+                        allowed,
+                    });
+                }
+                None
+            }
+            ReplyShape::Fixed { bytes } if len != bytes => Some(Stall::FixedReplyWrongSize {
+                bytes: len,
+                expected: bytes,
+            }),
+            ReplyShape::Fixed { .. } => None,
+        }
     }
 
     /// Complete the query with no answer, for a named reason.
@@ -832,9 +911,117 @@ mod tests {
             },
             None,
         )
-        .answer(8)
-        .expect("fits");
+        .answer(16)
+        .expect("the record's own length");
         assert_eq!(done.publication(), None);
+    }
+
+    /// **A fixed record answered at any other length is a stall, not a
+    /// reply.**
+    ///
+    /// The destination is a page and the answer is sixteen bytes, so the
+    /// destination bound says nothing at all here: an eight-byte answer fits it
+    /// comfortably. What the guest does is read the contract's sixteen bytes
+    /// and take the second eight from whatever the destination already held,
+    /// with no way to tell that half its answer was never written.
+    #[test]
+    fn a_fixed_reply_answered_at_the_wrong_length_is_a_stall() {
+        let query = || {
+            PendingQuery::new(
+                QueryRequest {
+                    kind: QueryKind::HeapTextureSizeAndAlign,
+                    // Roomy on purpose: this is not about fitting.
+                    destination: destination(4096),
+                    reply: ReplyShape::Fixed { bytes: 16 },
+                },
+                Some(stamp()),
+            )
+        };
+        for len in [0, 8, 15, 17, 32] {
+            let (still_pending, stall) = query()
+                .answer(len)
+                .expect_err("not the record's own length");
+            assert_eq!(
+                stall,
+                Stall::FixedReplyWrongSize {
+                    bytes: len,
+                    expected: 16
+                }
+            );
+            // And it still completes, or the guest blocks forever.
+            assert_eq!(
+                still_pending.unanswerable(stall).publication(),
+                Some(stamp())
+            );
+        }
+        assert!(query().answer(16).is_ok());
+    }
+
+    /// **A run of pairs longer than the guest asked for, or not a whole number
+    /// of pairs, is a stall.**
+    ///
+    /// The request says how many pairs the guest's walker consumes. A reply
+    /// past that runs beyond where the guest stops reading; one that is not a
+    /// multiple of the pair length is not a reply at all. Neither is bounded by
+    /// the destination, which is a page.
+    #[test]
+    fn a_key_value_reply_outside_the_requests_bounds_is_a_stall() {
+        let pairs = reims_vgpu_protocol::info_reply::PAIR_LEN as u64;
+        let query = |count: u32| {
+            PendingQuery::new(
+                QueryRequest {
+                    kind: QueryKind::ComputeInfo,
+                    destination: destination(4096),
+                    reply: ReplyShape::KeyValue(ReplyBounds {
+                        key_table_len: 5,
+                        count,
+                    }),
+                },
+                Some(stamp()),
+            )
+        };
+        // Exactly the count is the largest reply the encoder can produce, and
+        // it is allowed.
+        assert!(query(3).answer(3 * pairs).is_ok());
+        for (count, len) in [(3u32, 4 * pairs), (3, 3 * pairs + 1), (0, pairs)] {
+            let (still_pending, stall) = query(count)
+                .answer(len)
+                .expect_err("outside the request's bounds");
+            assert_eq!(
+                stall,
+                Stall::KeyValueReplyMalformed {
+                    bytes: len,
+                    allowed: u64::from(count) * pairs
+                }
+            );
+            assert_eq!(
+                still_pending.unanswerable(stall).publication(),
+                Some(stamp())
+            );
+        }
+    }
+
+    /// The request's bound is checked before the destination's: a reply that
+    /// misses both is this device's defect first.
+    #[test]
+    fn a_reply_that_misses_both_bounds_names_the_devices_own() {
+        let query = PendingQuery::new(
+            QueryRequest {
+                kind: QueryKind::HeapTextureSizeAndAlign,
+                destination: destination(8),
+                reply: ReplyShape::Fixed { bytes: 16 },
+            },
+            Some(stamp()),
+        );
+        let (_, stall) = query.answer(24).expect_err("neither bound");
+        assert_eq!(
+            stall,
+            Stall::FixedReplyWrongSize {
+                bytes: 24,
+                expected: 16
+            },
+            "the answer is the wrong shape wherever it would have fitted"
+        );
     }
 
     /// The reply layout and the destination bound are two owners answering one
@@ -862,13 +1049,36 @@ mod tests {
 
     #[test]
     fn every_stall_has_its_own_slug() {
-        assert_ne!(
-            Stall::NoAnswer.slug(),
+        let all = [
+            Stall::NoAnswer,
             Stall::ReplyTooLarge {
                 needed: 0,
-                available: 0
+                available: 0,
+            },
+            Stall::KeyValueReplyMalformed {
+                bytes: 0,
+                allowed: 0,
+            },
+            Stall::FixedReplyWrongSize {
+                bytes: 0,
+                expected: 0,
+            },
+        ];
+        // Named without a wildcard, so a variant added without a slug of its
+        // own stops the build here rather than reaching the failure channel
+        // under somebody else's name.
+        for stall in all {
+            match stall {
+                Stall::NoAnswer
+                | Stall::ReplyTooLarge { .. }
+                | Stall::KeyValueReplyMalformed { .. }
+                | Stall::FixedReplyWrongSize { .. } => {}
             }
-            .slug()
-        );
+        }
+        let mut slugs: Vec<&str> = all.iter().map(|s| s.slug()).collect();
+        slugs.sort_unstable();
+        let before = slugs.len();
+        slugs.dedup();
+        assert_eq!(slugs.len(), before);
     }
 }
