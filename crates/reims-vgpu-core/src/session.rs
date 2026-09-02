@@ -653,7 +653,7 @@ impl SessionModel {
     /// A completion is an asynchronous fact: it was produced by a submission
     /// made under some host device incarnation and arrives some time later,
     /// by which point that incarnation may be dead. That is the same shape as
-    /// a timeline point, and [`crate::retire::Retirements::reached`] takes the
+    /// a timeline point, and [`crate::retire::NativeRetirement::reached`] takes the
     /// epoch for the same reason — the incarnation is what makes the number
     /// mean anything.
     ///
@@ -2233,7 +2233,7 @@ mod tests {
     /// nothing public tells it whether an ordinal is still outstanding.
     ///
     /// The incarnation is what answers it, which is why `complete` takes one,
-    /// for the reason [`crate::retire::Retirements::reached`] takes one. Both
+    /// for the reason [`crate::retire::NativeRetirement::reached`] takes one. Both
     /// windows are covered: the epoch does not advance until a replacement is
     /// opened, so between the loss and `recreate_device` the dead incarnation's
     /// number is still the current one and only `DeviceState` separates them.
