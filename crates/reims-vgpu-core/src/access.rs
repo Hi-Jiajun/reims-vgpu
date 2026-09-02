@@ -62,13 +62,18 @@ use crate::identity::{ChannelId, ResourceId};
 /// Three joins are unresolved. Each one is a pair of names this device can see
 /// and cannot prove equal or distinct:
 ///
-/// 1. **A mapping against a guest-virtual window.** Some objects name a
-///    mapping the device tracks; the rest name pages by an address in the
-///    owning task. Both bottom out in the same address space, so an imported
-///    surface also bound as a linear texture is one piece of storage under two
-///    schemes — and no rule says when a mapping's pages and an object's address
-///    are the same bytes. Two id schemes without that rule are false
-///    distinctness on exactly the aliasing case a hazard model exists for.
+/// 1. **One address space, and one task.** Some objects name a mapping the
+///    device tracks; the rest name pages by a handle in the owning task. Those
+///    are *not* two namespaces: both are guest-virtual page numbers at the
+///    device's own page shift, resolved through the same task's page directory,
+///    which the device states at both ends. So within a task the join is
+///    settled and overlap is the test — a mapping and a linear texture over the
+///    same pages are one window and can be seen to be one. What is **not**
+///    settled is the same storage reached from two tasks: one imported surface
+///    is a different guest-virtual address in each address space, and nothing
+///    above the page walk equates them. An id keyed on task and address is
+///    false distinctness for exactly that case, which is the one an imported
+///    surface exists to create.
 /// 2. **Heap identity.** [`crate::heap`] requires a placement to take its
 ///    heap's id and a byte range, because two windows the guest chose to
 ///    overlap are the same bytes. The device decodes a heap reference and an
@@ -79,9 +84,10 @@ use crate::identity::{ChannelId, ResourceId};
 ///    [`crate::namespace::Namespace::declare`] wants one at declaration, and on
 ///    this interface a declaration is the guest writing a record into its own
 ///    object-list page — which happens before it has finished mapping the
-///    backing. So an id derived from the descriptor is available and cannot
-///    span join 1, and one derived from resolved pages spans it and is neither
-///    available at declaration nor stable across a physical replacement.
+///    backing. So an id derived from the descriptor is available at
+///    declaration and cannot span the cross-task half of join 1, and one
+///    derived from resolved pages spans it and is neither available at
+///    declaration nor stable across a physical replacement.
 ///
 /// Until those are answered, an id derived from a resource's own name — a
 /// per-resource counter, a slot number — is the tempting shape and the
