@@ -1727,6 +1727,10 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                         )));
                     }
                 };
+                // What the reference names, measured. See
+                // `objects::note_heap_reference` for why the placement is
+                // executed and the reference still reported.
+                let _ = objects::note_heap_reference(state, host, task_id, heap_ref);
                 heap_texture = Some((heap_ref, use_offset, offset, descriptor));
             }
             if heap_texture.is_some() {

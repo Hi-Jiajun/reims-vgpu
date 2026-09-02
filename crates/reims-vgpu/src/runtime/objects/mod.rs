@@ -2721,6 +2721,81 @@ fn note_backing_claimants<M: HostMemory>(
     }
 }
 
+/// What the object-list slot a heap reference names actually holds.
+///
+/// Returned as well as reported so the reading can be asserted where a boot is
+/// not available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeapReference {
+    /// The task lists nothing at that slot.
+    Unlisted,
+    /// It lists an object, of this type and descriptor length.
+    Listed {
+        object_type: u8,
+        descriptor_length: u32,
+    },
+}
+
+/// Report what a heap-placed texture's heap reference names.
+///
+/// # The one field of a heap placement this device throws away
+///
+/// A heap-placed texture's record carries a heap reference and an offset. This
+/// device checks the reference against zero, puts it in a log line and resolves
+/// it no further: the placed texture becomes host-only storage keyed by the
+/// texture's own name, so two textures placed at overlapping offsets in one
+/// heap become two independent host images. Content written through one is not
+/// visible through the other, which is the thing a heap is for.
+///
+/// That is a modelling gap and not a decode failure — the placement executes,
+/// and correctly, as long as nothing aliases. Reported on the always-on channel
+/// because a guest that does alias gets a wrong surface with no refusal
+/// anywhere, and because the reading here is the one thing that would close it:
+/// a canonical identity for a heap needs some value to be canonical *about*,
+/// and whether this reference names a decodable object is what says whether
+/// such a value is already on the wire.
+///
+/// One 12-byte guest read per distinct shape. `first_sight` is keyed on the
+/// answer rather than on the reference, so a boot placing ten thousand textures
+/// in one heap costs one line, and a second *kind* of answer still gets its own.
+pub fn note_heap_reference<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    heap_ref: u32,
+) -> HeapReference {
+    let found = match probe_list_entry(state, host, task_id, heap_ref) {
+        Some(entry) => HeapReference::Listed {
+            object_type: entry.object_type,
+            descriptor_length: entry.descriptor_length,
+        },
+        None => HeapReference::Unlisted,
+    };
+    let shape = match found {
+        HeapReference::Unlisted => 0,
+        HeapReference::Listed {
+            object_type,
+            descriptor_length,
+        } => (u64::from(object_type) << 32) | u64::from(descriptor_length) | (1 << 63),
+    };
+    if !crate::observe::first_sight("heap_reference", shape) {
+        return found;
+    }
+    let names = match found {
+        HeapReference::Unlisted => "nothing".to_string(),
+        HeapReference::Listed {
+            object_type,
+            descriptor_length,
+        } => format!("type={object_type} desc_len={descriptor_length}"),
+    };
+    crate::observe::fail(format!(
+        "heap_reference_unresolved task={task_id} heap={heap_ref} names={names} \
+         (the placement becomes host-only storage keyed by the texture's own name, \
+         so two placements sharing bytes in this heap are two independent images)"
+    ));
+    found
+}
+
 /// The mapping format a backing latches: single-plane MTL only.
 ///
 /// Multi-plane and unknown-FourCC surfaces get `0`, and that zero is a decoded
