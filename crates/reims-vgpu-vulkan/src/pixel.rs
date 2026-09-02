@@ -178,6 +178,38 @@ fn srgb(vk: vk::Format, linear_vk: vk::Format, bytes_per_texel: u32) -> PixelFor
     }
 }
 
+/// How a multisample resolve of this colour attachment is performed.
+///
+/// Vulkan permits only `SAMPLE_ZERO` when the attachment has an integer colour
+/// format — an average of integers is not a defined operation, and asking for
+/// one is invalid use. The render-pass rung has no mode field at all and
+/// resolves an integer attachment by sample zero, so this is what keeps the two
+/// rungs' answers the same rather than leaving one of them illegal.
+///
+/// A closed set of the integer *colour* formats [`translate`] can produce.
+/// Depth-stencil formats are not here: this rail refuses a depth-stencil
+/// resolve by name rather than emitting one, so no such attachment reaches a
+/// mode. Everything else averages, which is right for every unorm, snorm, srgb
+/// and float texel.
+///
+/// `every_integer_colour_format_this_rail_produces_resolves_by_sample_zero` is
+/// what says the set is closed rather than remembered.
+#[must_use]
+pub fn color_resolve_mode(format: vk::Format) -> vk::ResolveModeFlags {
+    match format {
+        vk::Format::R8_UINT
+        | vk::Format::R8G8_UINT
+        | vk::Format::R16G16_UINT
+        | vk::Format::R32_UINT
+        | vk::Format::R8G8B8A8_UINT
+        | vk::Format::R16G16B16A16_UINT
+        | vk::Format::R32G32B32A32_UINT
+        | vk::Format::R32_SINT
+        | vk::Format::R8G8B8A8_SINT => vk::ResolveModeFlags::SAMPLE_ZERO,
+        _ => vk::ResolveModeFlags::AVERAGE,
+    }
+}
+
 /// Translate one decoded `MTLPixelFormat`.
 ///
 /// Total over the values `reims_vgpu_core::pixel_format` defines; every other
@@ -2022,6 +2054,55 @@ mod tests {
     /// got would depend on the order of two `if let`s rather than on the format
     /// it declared.
     ///
+    /// [`color_resolve_mode`]'s set is closed, not remembered.
+    ///
+    /// It is a second table over the same formats [`translate`] produces, and a
+    /// second table cannot be kept honest by the compiler. So it is checked
+    /// against the one thing that names a format's numeric class independently:
+    /// `vk::Format`'s own debug name. Every colour format this rail can produce
+    /// whose name ends in `UINT` or `SINT` must resolve by sample zero, and
+    /// every other one must average.
+    ///
+    /// Depth-stencil formats are excluded by name rather than by list: they
+    /// carry a stencil aspect spelled `S8_UINT` and are not colour attachments,
+    /// and this rail refuses a depth-stencil resolve rather than emitting a
+    /// mode for one.
+    #[test]
+    fn every_integer_colour_format_this_rail_produces_resolves_by_sample_zero() {
+        let mut integer = 0usize;
+        let mut averaging = 0usize;
+        for mtl in 0..=u16::MAX {
+            let Ok(format) = translate(mtl) else { continue };
+            for vk_format in [format.vk, format.linear_vk] {
+                let name = format!("{vk_format:?}");
+                if name.starts_with('D') || name.starts_with('S') && name.contains("8_UINT") {
+                    continue;
+                }
+                let is_integer = name.ends_with("UINT") || name.ends_with("SINT");
+                let mode = color_resolve_mode(vk_format);
+                if is_integer {
+                    integer += 1;
+                    assert_eq!(
+                        mode,
+                        vk::ResolveModeFlags::SAMPLE_ZERO,
+                        "{name} is an integer colour format and averaging one is invalid use"
+                    );
+                } else {
+                    averaging += 1;
+                    assert_eq!(
+                        mode,
+                        vk::ResolveModeFlags::AVERAGE,
+                        "{name} is not an integer format and must not lose samples"
+                    );
+                }
+            }
+        }
+        // Neither side of the comparison is empty, so a sweep that stopped
+        // matching cannot pass by finding nothing.
+        assert!(integer > 8, "integer colour formats swept: {integer}");
+        assert!(averaging > 20, "other formats swept: {averaging}");
+    }
+
     /// The sweep is the whole `u16` space because neither table publishes its
     /// membership as a list, and both are cheap total functions.
     #[test]

@@ -510,8 +510,16 @@ fn attachment_description(
     }
 }
 
+/// One attachment for the dynamic-rendering rung.
+///
+/// `format` is the attachment's, and it is here for one reason: a resolve mode
+/// is not a constant. An integer colour attachment must resolve by sample zero
+/// — see [`crate::pixel::color_resolve_mode`] — and the render-pass rung, which
+/// has no mode field, already does. A hardcoded `AVERAGE` made the two rungs
+/// disagree with one of them invalid.
 fn rendering_attachment(
     view: vk::ImageView,
+    format: vk::Format,
     layout: vk::ImageLayout,
     load: vk::AttachmentLoadOp,
     store: vk::AttachmentStoreOp,
@@ -526,7 +534,7 @@ fn rendering_attachment(
         .clear_value(clear);
     if let Some(target) = resolve {
         info = info
-            .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+            .resolve_mode(crate::pixel::color_resolve_mode(format))
             .resolve_image_view(target)
             .resolve_image_layout(layout);
     }
@@ -699,6 +707,7 @@ pub fn build(
         resolve_flags.push(planned.resolve.is_some());
         color_rendering.push(rendering_attachment(
             bound.view,
+            bound.format,
             color_layout(),
             planned.load,
             planned.store,
@@ -778,6 +787,7 @@ pub fn build(
         if has_depth {
             depth_rendering = Some(rendering_attachment(
                 bound.view,
+                bound.format,
                 depth_stencil_layout(),
                 depth.load,
                 depth.store,
@@ -788,6 +798,7 @@ pub fn build(
         if has_stencil {
             stencil_rendering = Some(rendering_attachment(
                 bound.view,
+                bound.format,
                 depth_stencil_layout(),
                 stencil.load,
                 stencil.store,
