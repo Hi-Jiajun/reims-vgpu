@@ -321,9 +321,21 @@ impl Namespace {
                 return claim;
             }
         }
-        if let Some(claims) = self.retiring.get_mut(&lease.backing) {
-            *claims += 1;
-        }
+        // The name moved between the resolve and the acquire — deleted,
+        // repointed, or redeclared. The claim is still a claim, so it is
+        // counted against the *storage*, which is what it was taken on and what
+        // must not be freed under it.
+        //
+        // **Entered rather than only incremented.** When a detachment left uses
+        // outstanding there is an entry to add to; when it left none there is
+        // not, because [`Self::detach`] removes an empty one — and the arm that
+        // only incremented dropped the claim on the floor in exactly that case.
+        // The backing then read as held by nothing, [`Self::holds`] said so, and
+        // [`Self::release`] returned `None` for a claim that was the last thing
+        // reading the storage. That is a claim taken and never paid off, which
+        // the rest of this module spends [`Claim`]'s whole type design making
+        // unspellable.
+        *self.retiring.entry(lease.backing).or_insert(0) += 1;
         claim
     }
 
@@ -584,6 +596,63 @@ mod tests {
                 backing: backing(10)
             })
         );
+    }
+
+    /// **A claim is counted whatever the name did in the meantime.**
+    ///
+    /// `acquire` takes a lease resolved a moment earlier, and between the two
+    /// the name may have been deleted, repointed or redeclared. When the
+    /// detachment left uses outstanding there was a per-backing counter to add
+    /// to and the claim landed in it. When it left none there was not — a
+    /// detachment with nothing outstanding removes its entry — and the claim
+    /// went nowhere: the storage read as held by nothing, and the release of
+    /// the only thing still using it returned nothing to free.
+    #[test]
+    fn a_claim_taken_after_its_name_went_still_holds_the_storage() {
+        // Deleted with nothing outstanding, so the namespace kept no counter.
+        let mut ns = Namespace::new();
+        let id = ns.declare(slot(1), backing(10)).expect("free slot");
+        let lease = ns.resolve(id).expect("live");
+        assert_eq!(
+            ns.delete(id),
+            Ok(Teardown::Now {
+                backing: backing(10)
+            })
+        );
+        assert!(!ns.holds(backing(10)), "nothing had taken a claim yet");
+        let claim = ns.acquire(lease);
+        assert!(
+            ns.holds(backing(10)),
+            "a claim on the storage is the namespace answering for it"
+        );
+        assert_eq!(ns.awaiting_teardown(), 1);
+        assert_eq!(
+            ns.release(claim),
+            Some(backing(10)),
+            "and the last claim is what hands it back"
+        );
+        assert!(!ns.holds(backing(10)));
+        assert_eq!(ns.awaiting_teardown(), 0);
+
+        // Redeclared into the same storage: the claim is still owed, and the
+        // handback is not, because a live name answers for those bytes.
+        let mut ns = Namespace::new();
+        let first = ns.declare(slot(1), backing(10)).expect("free slot");
+        let lease = ns.resolve(first).expect("live");
+        assert_eq!(
+            ns.delete(first),
+            Ok(Teardown::Now {
+                backing: backing(10)
+            })
+        );
+        let claim = ns.acquire(lease);
+        let _second = ns.declare(slot(1), backing(10)).expect("deleted slot");
+        assert_eq!(
+            ns.release(claim),
+            None,
+            "the new occupant answers for the storage"
+        );
+        assert!(ns.holds(backing(10)));
     }
 
     /// Slot reuse produces a new generation, and the old name does not follow
@@ -971,6 +1040,7 @@ mod tests {
         let mut refused_undeclared = 0usize;
         let mut replacements = 0usize;
         let mut late_releases = 0usize;
+        let mut late_acquires = 0usize;
 
         for seed in 0..384u64 {
             let mut rng = Rng::new(seed);
@@ -981,6 +1051,12 @@ mod tests {
             let mut detached: HashMap<BackingId, usize> = HashMap::new();
             let mut names: Vec<ResourceId> = Vec::new();
             let mut leases: Vec<Claim> = Vec::new();
+            // Leases resolved and not yet acquired. A lease is uncounted by
+            // construction — see `RefResolver` — so holding one across a
+            // delete, a replacement or a redeclaration is the shape where the
+            // slot the claim would have landed in is gone by the time it is
+            // taken.
+            let mut pending: Vec<Lease> = Vec::new();
             let mut resolved = 0usize;
             let mut refused = 0usize;
 
@@ -999,7 +1075,7 @@ mod tests {
             };
 
             for _ in 0..64 {
-                match rng.below(12) {
+                match rng.below(13) {
                     // Declare.
                     0..=2 => {
                         let sl = slot(rng.below(SLOTS) as u32);
@@ -1043,8 +1119,14 @@ mod tests {
                                 assert!(!sh.deleted, "seed {seed}: a deleted slot resolved");
                                 assert_eq!(lease.backing(), sh.backing, "seed {seed}");
                                 assert_eq!(lease.id().generation, sh.generation, "seed {seed}");
-                                sh.claims += 1;
-                                leases.push(ns.acquire(lease));
+                                // Acquired now, or held for a later step so the
+                                // name can move underneath it first.
+                                if rng.below(3) == 0 {
+                                    pending.push(lease);
+                                } else {
+                                    sh.claims += 1;
+                                    leases.push(ns.acquire(lease));
+                                }
                             }
                             Err(Refusal::NotDeclared { .. }) => {
                                 refused += 1;
@@ -1094,6 +1176,27 @@ mod tests {
                             );
                             handbacks_on_release += 1;
                         }
+                    }
+                    // Take a claim on a lease the name may have moved out
+                    // from under. Wherever it lands, it is a claim and the
+                    // storage is not free until it is released.
+                    11 if !pending.is_empty() => {
+                        let lease = pending.swap_remove(rng.below(pending.len() as u64) as usize);
+                        let (id, held) = (lease.id(), lease.backing());
+                        let still_here = shadow.get_mut(&id.slot).filter(|s| {
+                            s.generation == id.generation && !s.deleted && s.backing == held
+                        });
+                        if let Some(sh) = still_here {
+                            sh.claims += 1;
+                        } else {
+                            *detached.entry(held).or_insert(0) += 1;
+                            late_acquires += 1;
+                        }
+                        leases.push(ns.acquire(lease));
+                        assert!(
+                            ns.holds(held),
+                            "seed {seed}: {held:?} is claimed and the namespace does not say so"
+                        );
                     }
                     // Delete a name, possibly a stale one.
                     9..=10 if !names.is_empty() => {
@@ -1248,6 +1351,10 @@ mod tests {
         assert!(
             late_releases > 400,
             "releases after a detach: {late_releases}"
+        );
+        assert!(
+            late_acquires > 200,
+            "claims taken after the name moved: {late_acquires}"
         );
         assert!(replacements > 300, "replacements: {replacements}");
         assert!(refused_occupied > 200, "slot occupied: {refused_occupied}");
