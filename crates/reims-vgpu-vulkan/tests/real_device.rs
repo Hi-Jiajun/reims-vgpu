@@ -649,11 +649,13 @@ fn a_ragged_fill_writes_exactly_the_range_the_guest_named() {
     );
 
     // The CPU half: the edge bytes into the arena, flushed over the range the
-    // arena says covers them.
+    // arena says covers them. An edge carries the bytes rather than one
+    // repeated byte, because a four-byte pattern ending raggedly has a tail of
+    // its own leading bytes.
     for edge in [head, tail] {
         // SAFETY: the window came from this arena and nothing has been
-        // submitted against it.
-        unsafe { arena.set(edge.window, edge.byte) };
+        // submitted against it, and the slice is the window's own length.
+        unsafe { arena.write(edge.window, &edge.bytes[..edge.length as usize]) };
     }
     let scratch_kind = MappedMemoryKind::of(&properties, {
         let requirements = unsafe { device.get_buffer_memory_requirements(scratch) };

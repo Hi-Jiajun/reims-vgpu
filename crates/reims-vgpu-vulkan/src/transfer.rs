@@ -66,16 +66,21 @@ pub enum Refusal {
     /// The guest's format has no block geometry this build knows, so no pitch
     /// conversion exists for it.
     UnknownFormatGeometry { format: u16 },
-    /// A fill whose offset or length is not four-byte aligned, and whose
-    /// pattern is four bytes wide.
+    /// A fill whose offset is not four-byte aligned, and whose pattern is four
+    /// bytes wide.
     ///
     /// The byte-wide pattern has a ragged form — see [`plan_fill`] — because
     /// every byte of the range takes the same value and the phase of the
     /// pattern therefore does not exist. A four-byte pattern has a phase, and
-    /// which byte of it lands on a range that does not start at a multiple of
+    /// which byte of it lands on a range that does not *start* at a multiple of
     /// four is not a term this wire has established. Refused rather than
     /// guessed: a wrong phase writes the right number of bytes in the wrong
     /// order, everywhere, and nothing downstream can see it.
+    ///
+    /// A range that starts at a multiple of four and merely ends raggedly is
+    /// not this refusal and never was: every byte's phase follows from the
+    /// start, so the tail's bytes are the pattern's leading ones and nothing is
+    /// being guessed at.
     RaggedPatternFill { offset: u64, length: u64 },
     /// The scratch memory a ragged fill needs was not available.
     NoStaging { refusal: crate::staging::Refusal },
@@ -1065,13 +1070,19 @@ pub struct FillRange {
 
 /// The bytes a ragged fill's edge needs, and where they go.
 ///
-/// The caller writes `byte` into every one of `length` bytes at the window,
-/// flushes if the mapping is not coherent, and copies the window into the
-/// destination buffer at `dest_offset`.
+/// The caller writes `bytes[..length]` into the window, flushes if the mapping
+/// is not coherent, and copies the window into the destination buffer at
+/// `dest_offset`.
+///
+/// The bytes are carried rather than one repeated byte because an edge is not
+/// always one value: a four-byte pattern whose range ends raggedly has a tail
+/// of its own leading bytes, and its phase there is known exactly — the tail
+/// begins at a four-byte boundary. `length` is at most three, so the array is
+/// the pattern's width and never a buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StagedEdge {
     pub window: crate::staging::Window,
-    pub byte: u8,
+    pub bytes: [u8; 4],
     pub dest_offset: u64,
     pub length: u64,
 }
@@ -1151,13 +1162,24 @@ pub fn plan_fill(
     }
 
     // A byte pattern has no phase: every byte of the range takes the value, so
-    // splitting the range changes nothing. A four-byte pattern does have one,
-    // and which of its bytes lands on an unaligned start is not established.
-    let FillPattern::Byte(byte) = pattern else {
+    // splitting the range changes nothing.
+    //
+    // A four-byte pattern does have one, and the unestablished term is where
+    // it *starts* — which of its bytes lands on a range that does not begin at
+    // a multiple of four. A range that begins at one and merely ends raggedly
+    // asks nothing: every byte's phase follows from the start, the tail begins
+    // at a four-byte boundary, and its bytes are the pattern's leading ones.
+    // Refusing that too refused a fill the guest is entitled to and the device
+    // has always performed.
+    if !span.offset.is_multiple_of(4) && matches!(pattern, FillPattern::Pattern4(_)) {
         return Err(Refusal::RaggedPatternFill {
             offset: span.offset,
             length: span.length,
         });
+    }
+    let bytes = match pattern {
+        FillPattern::Byte(byte) => [byte; 4],
+        FillPattern::Pattern4(word) => word.to_le_bytes(),
     };
 
     // One allocation for both edges, so there is one failure point and no
@@ -1172,7 +1194,7 @@ pub fn plan_fill(
             offset: scratch.offset,
             size: head_length,
         },
-        byte,
+        bytes,
         dest_offset: span.offset,
         length: head_length,
     });
@@ -1182,7 +1204,7 @@ pub fn plan_fill(
             offset: scratch.offset + head_length,
             size: tail_length,
         },
-        byte,
+        bytes,
         dest_offset: span.offset + head_length + middle_length,
         length: tail_length,
     });
@@ -1949,8 +1971,8 @@ mod tests {
         assert_eq!(middle.offset + middle.size, tail.dest_offset);
         assert_eq!(tail.dest_offset + tail.length, 65 + 198);
 
-        assert_eq!(head.byte, 0xAB);
-        assert_eq!(tail.byte, 0xAB);
+        assert_eq!(head.bytes, [0xAB; 4]);
+        assert_eq!(tail.bytes, [0xAB; 4]);
         assert_eq!(middle.data, 0xABAB_ABAB);
 
         // Six bytes of scratch whatever the size of the fill, in one
@@ -2003,6 +2025,43 @@ mod tests {
             &mut arena,
         )
         .is_ok());
+    }
+
+    /// The other half of the same phase question, which the refusal used to
+    /// swallow: a range that *starts* aligned and ends raggedly asks nothing.
+    ///
+    /// Its tail begins at a four-byte boundary, so the bytes there are the
+    /// pattern's leading ones and no term is being guessed at. The device this
+    /// replaces fills exactly this range — it refuses on the start alone — so
+    /// refusing it here would have dropped a legal fill and left the guest's
+    /// buffer holding stale bytes with only a slug to show for it.
+    #[test]
+    fn a_four_byte_pattern_ending_raggedly_fills_its_tail_from_the_patterns_front() {
+        let residency = populated();
+        let mut arena = arena();
+        let plan = plan_fill(
+            span(4, 6),
+            FillPattern::Pattern4(0x1234_5678),
+            &residency,
+            &mut arena,
+        )
+        .expect("an aligned start asks nothing")
+        .expect("six bytes are filled");
+
+        assert!(plan.head.is_none(), "the range starts aligned");
+        let middle = plan.middle.expect("four bytes a native fill can do");
+        assert_eq!(middle.offset, 4);
+        assert_eq!(middle.size, 4);
+        assert_eq!(middle.data, 0x1234_5678);
+
+        let tail = plan.tail.expect("two bytes it cannot");
+        assert_eq!(tail.dest_offset, 8, "at the boundary the middle ended on");
+        assert_eq!(tail.length, 2);
+        assert_eq!(
+            &tail.bytes[..2],
+            &0x1234_5678u32.to_le_bytes()[..2],
+            "the phase at a four-byte boundary is the pattern's own front"
+        );
     }
 
     #[test]
