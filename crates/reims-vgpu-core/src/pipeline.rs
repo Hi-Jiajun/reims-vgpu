@@ -451,6 +451,56 @@ impl PipelineTable {
         self.advance(id, PipelineState::Retired)
     }
 
+    /// The host device incarnation ended: every build it performed is gone.
+    ///
+    /// Returns the pipelines whose build has to start again, in id order.
+    ///
+    /// # Why a build and not the object
+    ///
+    /// [`PipelineState::Ready`] is a statement that the *host* has built this
+    /// pipeline, and a host build belongs to one device incarnation. The
+    /// semantic object does not: a device loss is not a reset, so the guest
+    /// still names what it named — see [`crate::retire`], whose whole subject
+    /// is that these are two lifetimes and that answering with one produces
+    /// "dead handles reachable under a live name". This is that name.
+    ///
+    /// It is worse than the usual shape of that failure because the lease is
+    /// taken at *admission*. A transaction binding a pipeline still reading
+    /// `Ready` is admitted with no wait, given an ordering position and a
+    /// completion obligation, and only then does an executor find there is
+    /// nothing to record with — a refusal after admission, which
+    /// [`crate::session`] opens by saying costs the guest the channel.
+    ///
+    /// So the built ones go back to [`PipelineState::Declared`] and a
+    /// transaction binding one waits, exactly as it would have waited the
+    /// first time. `Refused` and `Retired` do not move: a pipeline this device
+    /// could not describe is not one the next incarnation describes either,
+    /// and an object the guest deleted is not resurrected by a new device.
+    #[must_use = "a build nobody restarts is a transaction that waits forever"]
+    pub fn device_lost(&mut self) -> Vec<ResourceId> {
+        let mut rebuilding = Vec::new();
+        for (id, p) in &mut self.pipelines {
+            if p.state.is_terminal() {
+                continue;
+            }
+            // Counted as a declaration, because that is what it now is: the
+            // number says how many builds this session has asked for, and a
+            // rebuild is one more of them.
+            self.census.declared += 1;
+            // Set rather than stepped through [`Self::advance`], and
+            // deliberately: [`PipelineState::may_become`] describes the
+            // lifetime's own forward order, and this is not a step in it. It
+            // is the incarnation underneath the lifetime changing, which is
+            // the fact `may_become` cannot express and should not be widened
+            // to — a `Ready -> Declared` step admitted there would let an
+            // ordinary caller un-build a live pipeline.
+            p.state = PipelineState::Declared;
+            rebuilding.push(*id);
+        }
+        rebuilding.sort_unstable();
+        rebuilding
+    }
+
     /// Drop retired pipelines' bookkeeping.
     ///
     /// Separate from [`Self::retire`] for the reason retirement and compaction
@@ -708,6 +758,100 @@ mod tests {
             generation: SlotGeneration::default().next(),
         };
         assert!(t.declare(reused, GEN));
+    }
+
+    /// A host build belongs to the incarnation that performed it.
+    #[test]
+    fn a_device_loss_takes_the_builds_and_leaves_the_objects() {
+        let gen = SessionGeneration::FIRST;
+        let mut t = PipelineTable::new();
+        // One at each state the loss can find a pipeline in.
+        let declared = id(1);
+        let translating = id(2);
+        let compiling = id(3);
+        let ready = id(4);
+        let refused = id(5);
+        let retired = id(6);
+        for p in [declared, translating, compiling, ready, refused, retired] {
+            assert!(t.declare(p, gen));
+        }
+        for (p, steps) in [(translating, 1), (compiling, 2), (ready, 3)] {
+            for step in [
+                PipelineState::Translating,
+                PipelineState::Compiling,
+                PipelineState::Ready,
+            ]
+            .into_iter()
+            .take(steps)
+            {
+                assert!(t.advance(p, step));
+            }
+        }
+        assert!(t.refuse(refused, RefusalReason::CompilationFailed("no")));
+        assert!(t.retire(retired));
+        let before = t.census();
+
+        assert_eq!(
+            t.device_lost(),
+            vec![declared, translating, compiling, ready],
+            "every build in flight or finished starts again, and the two \
+             terminal states do not"
+        );
+        for p in [declared, translating, compiling, ready] {
+            assert_eq!(
+                t.get(p).expect("still an object").state,
+                PipelineState::Declared
+            );
+            assert_eq!(t.lease(p, gen), Lease::Pending);
+        }
+        assert_eq!(
+            t.lease(refused, gen),
+            Lease::Refused(RefusalReason::CompilationFailed("no"))
+        );
+        assert_eq!(t.lease(retired, gen), Lease::Absent);
+        assert_eq!(
+            t.census().declared,
+            before.declared + 4,
+            "a rebuild is a build this session asked for"
+        );
+
+        // And the lifetime runs forward from there exactly as it did the first
+        // time --- a set state is not a state the machine cannot leave.
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(t.advance(ready, step));
+        }
+        assert_eq!(t.lease(ready, gen), Lease::Ready);
+        assert!(
+            t.device_lost().contains(&ready),
+            "and a second loss takes the second build"
+        );
+    }
+
+    /// The incarnation change is not a step in the lifetime, and the lifetime's
+    /// own order does not admit it.
+    #[test]
+    fn nothing_can_step_a_built_pipeline_back_to_declared() {
+        assert!(!PipelineState::Ready.may_become(PipelineState::Declared));
+        let gen = SessionGeneration::FIRST;
+        let mut t = PipelineTable::new();
+        let p = id(1);
+        t.declare(p, gen);
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(t.advance(p, step));
+        }
+        assert!(
+            !t.advance(p, PipelineState::Declared),
+            "un-building a live pipeline is not something a caller may ask for"
+        );
+        assert_eq!(t.lease(p, gen), Lease::Ready);
     }
 
     #[test]

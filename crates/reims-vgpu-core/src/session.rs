@@ -223,6 +223,14 @@ pub struct SessionModel {
     open_channels: BTreeSet<ChannelId>,
     channel_sequence: BTreeMap<ChannelId, ChannelSequence>,
     graph: DependencyGraph,
+    /// The pipelines whose host build a device loss took, waiting for the
+    /// replacement incarnation that can start them again.
+    ///
+    /// Held here because nothing else can enumerate them: the table knows
+    /// which builds it lost and the caller knows how to start one, and between
+    /// the loss and [`SessionModel::recreate_device`] there is no device to
+    /// start them against.
+    rebuilding: Vec<ResourceId>,
     /// The pipeline objects this session's work binds.
     ///
     /// Held here rather than beside this plane, because the waits a transaction
@@ -251,6 +259,7 @@ impl SessionModel {
             open_channels: BTreeSet::new(),
             channel_sequence: BTreeMap::new(),
             graph: DependencyGraph::new(),
+            rebuilding: Vec::new(),
             pipelines: crate::pipeline::PipelineTable::new(),
             scheduler: Scheduler::new(),
             publisher: Publisher::new(),
@@ -322,6 +331,11 @@ impl SessionModel {
     /// submitted in between is admitted into an incarnation that does not
     /// exist. Until [`SessionModel::recreate_device`] runs, admission refuses.
     ///
+    /// The pipelines whose builds it took are kept until a replacement device
+    /// exists and come back from [`SessionModel::recreate_device`]; see
+    /// [`crate::pipeline::PipelineTable::device_lost`] for why a build is an
+    /// incarnation's and the object is not.
+    ///
     /// Returns the epoch that died — the identity the retirement queue has to
     /// be told about — and the work that died with it.
     ///
@@ -345,6 +359,11 @@ impl SessionModel {
         for ingress in &stranded {
             released.extend(self.withdraw(*ingress));
         }
+        // The host builds died with the incarnation that made them. Held until
+        // a replacement exists rather than reported now: there is nothing to
+        // build against until then, and a caller handed the list while the
+        // device is lost has nowhere to take it.
+        self.rebuilding = self.pipelines.device_lost();
         DeviceLoss {
             epoch: self.epoch,
             stranded,
@@ -366,6 +385,25 @@ impl SessionModel {
         self.epoch = self.epoch.next();
         self.device = DeviceState::Live;
         Ok(self.epoch)
+    }
+
+    /// The pipelines a device loss sent back to the start of their build.
+    ///
+    /// Read rather than taken, because starting a build is not this plane's
+    /// and a caller that fails to start one must still be able to see which it
+    /// owes. Each entry leaves when the table takes it past
+    /// [`crate::pipeline::PipelineState::Declared`] again — so a list that
+    /// stops shrinking is builds nobody started, which is a transaction
+    /// waiting forever and is exactly what the list exists to make visible.
+    #[must_use]
+    pub fn rebuilding(&mut self) -> Vec<ResourceId> {
+        let table = &self.pipelines;
+        self.rebuilding.retain(|id| {
+            table
+                .get(*id)
+                .is_some_and(|p| p.state == crate::pipeline::PipelineState::Declared)
+        });
+        self.rebuilding.clone()
     }
 
     /// Turn a packet into a transaction, or refuse it.
@@ -769,6 +807,13 @@ mod tests {
     /// so the payload is the emptiest lawful member of the right class — and it
     /// has to be the *right* class, because `admit` refuses a payload that
     /// disagrees with the opcode.
+    fn res(slot: u32) -> ResourceId {
+        ResourceId {
+            slot: ObjectListRef(slot),
+            generation: SlotGeneration(1),
+        }
+    }
+
     fn packet(opcode: u16) -> Packet {
         Packet {
             channel: Channel::Child,
@@ -1187,6 +1232,90 @@ mod tests {
         let ok = s.admit(&leased).expect("declared and built");
         assert_eq!(ok.transaction.identity.ingress, IngressOrdinal(1));
         assert!(ok.ready, "a pipeline already built is nothing to wait for");
+    }
+
+    /// **A device loss takes the pipeline builds with it.**
+    ///
+    /// A `VkPipeline` is an object of one device incarnation. `Ready` is a
+    /// statement that the *host* has built it, so after the incarnation that
+    /// built it is gone, `Ready` is a live name over a dead handle — which is
+    /// one of the two failures [`crate::retire`] separates the two lifetimes to
+    /// prevent, and it is worse than the other because the lease is taken at
+    /// admission: the transaction is admitted with no wait, given an ordering
+    /// position and a completion obligation, and only then does an executor
+    /// discover there is nothing to record with.
+    ///
+    /// The guest's object survives — it has not reset and still names what it
+    /// named — so the build starts again rather than the pipeline becoming
+    /// absent.
+    #[test]
+    fn a_replacement_device_rebuilds_the_pipelines_the_lost_one_had_built() {
+        use crate::pipeline::{Lease, PipelineState};
+        let mut s = session();
+        let gen = s.generation();
+        let built = res(80);
+        let refused = res(81);
+        let deleted = res(82);
+        for p in [built, refused, deleted] {
+            s.pipelines().declare(p, gen);
+        }
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            s.pipelines().advance(built, step);
+        }
+        s.pipelines().refuse(
+            refused,
+            crate::pipeline::RefusalReason::CompilationFailed("x"),
+        );
+        s.pipelines().retire(deleted);
+        assert_eq!(s.pipelines().lease(built, gen), Lease::Ready);
+
+        let died = s.device_lost();
+        let epoch = s.recreate_device().expect("lost, so replaceable");
+        assert_ne!(epoch, died.epoch);
+        assert_eq!(
+            s.generation(),
+            gen,
+            "a device loss is not a reset; the guest still names its objects"
+        );
+
+        assert_eq!(
+            s.pipelines().lease(built, gen),
+            Lease::Pending,
+            "the host build died with the incarnation that made it"
+        );
+        assert_eq!(
+            s.rebuilding(),
+            vec![built],
+            "and the caller is told which builds to start, because nothing \
+             else can enumerate them"
+        );
+        assert_eq!(
+            s.pipelines().lease(refused, gen),
+            Lease::Refused(crate::pipeline::RefusalReason::CompilationFailed("x")),
+            "a pipeline this device cannot describe is not describable by the \
+             next one either; refused stays terminal"
+        );
+        assert_eq!(
+            s.pipelines().lease(deleted, gen),
+            Lease::Absent,
+            "and a deleted object is not resurrected by a new device"
+        );
+
+        // The rebuilt one goes through the whole lifetime again, and is then
+        // usable exactly as before.
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            s.pipelines().advance(built, step);
+        }
+        assert_eq!(s.pipelines().lease(built, gen), Lease::Ready);
+        assert!(s.rebuilding().is_empty());
     }
 
     /// The envelope has no access list of its own, so the accesses the
