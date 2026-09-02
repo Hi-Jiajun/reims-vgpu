@@ -652,6 +652,62 @@ pub struct StoreCensus {
     /// Published a flight into the wrong family. Always a caller bug, and
     /// never a mutation.
     pub foreign_flights: u64,
+    /// Published under a semantic pipeline this store holds no family for.
+    /// A caller bug like [`Self::foreign_flights`], and a different one: that
+    /// is a flight given to the wrong live family, this is an id no flight was
+    /// ever taken under.
+    pub unknown_families: u64,
+}
+
+/// Why a publication did not land.
+///
+/// Both arms hand the flight and the compiled pipeline back whole, because the
+/// caller holds the only name for that `VkPipeline`: a publication that
+/// swallowed it would leak a handle *and* leave its key compiling for the life
+/// of the family.
+///
+/// Two arms and not one, because a store that answered "misdirected" for an id
+/// it simply does not know would have to invent a family to name in the report.
+#[derive(Debug)]
+pub enum Unpublished {
+    /// The id names a family and the flight belongs to a different one.
+    Misdirected(variant::Misdirected<GraphicsKey, Native, VariantRefusal>),
+    /// The id names no family at all.
+    ///
+    /// **Not a race.** A flight exists only because [`Store::begin_flight`]
+    /// created a family to hold its `Compiling` entry, and [`Store::collect`]
+    /// never drops a family with a flight outstanding. So this is an id no
+    /// flight was ever taken under, and creating a family to receive the
+    /// publication would put a live one under a name the guest may have
+    /// deleted — which nothing would then retire.
+    NoFamily {
+        id: ResourceId,
+        flight: variant::Flight<GraphicsKey>,
+        outcome: Result<Native, VariantRefusal>,
+    },
+}
+
+impl Unpublished {
+    /// The name this reaches the failure channel under.
+    #[must_use]
+    pub const fn slug(&self) -> &'static str {
+        match self {
+            Self::Misdirected(inner) => inner.wrong.slug(),
+            Self::NoFamily { .. } => "vk_pipeline_store_no_family",
+        }
+    }
+
+    /// The flight and the compiled pipeline, whichever arm this is. The caller
+    /// publishes them where they belong or destroys the pipeline.
+    #[must_use]
+    pub fn into_parts(self) -> (variant::Flight<GraphicsKey>, Result<Native, VariantRefusal>) {
+        match self {
+            Self::Misdirected(inner) => (inner.flight, inner.outcome),
+            Self::NoFamily {
+                flight, outcome, ..
+            } => (flight, outcome),
+        }
+    }
 }
 
 /// Every semantic pipeline's family of native variants.
@@ -764,12 +820,16 @@ impl Store {
 
     /// Publish a compilation's outcome under `id`.
     ///
+    /// A retired family still accepts its own flight: it was taken before the
+    /// retirement and its key belongs nowhere else, and [`Self::collect`]
+    /// keeps the family until it lands.
+    ///
     /// # Errors
     ///
-    /// [`variant::Misdirected`] when the flight belongs to another semantic
-    /// pipeline. Nothing is modified, and the flight and the compiled pipeline
-    /// come back — the caller still has the only name for that `VkPipeline`
-    /// and must either publish it where it belongs or destroy it.
+    /// [`Unpublished`], in either arm. **Nothing is modified either way** —
+    /// which is what the lookup below is for: `or_default` would have created
+    /// a family for an id that has none, so the report that said "never a
+    /// mutation" was made by the one path that mutated.
     ///
     /// Boxed because it carries a whole key and a compiled pipeline, and this
     /// is a caller bug rather than a path a draw takes: an allocation here
@@ -780,13 +840,20 @@ impl Store {
         id: ResourceId,
         flight: variant::Flight<GraphicsKey>,
         outcome: Result<Native, VariantRefusal>,
-    ) -> Result<(), Box<variant::Misdirected<GraphicsKey, Native, VariantRefusal>>> {
-        let family = self.families.entry(id).or_default();
+    ) -> Result<(), Box<Unpublished>> {
+        let Some(family) = self.families.get_mut(&id) else {
+            self.census.unknown_families += 1;
+            return Err(Box::new(Unpublished::NoFamily {
+                id,
+                flight,
+                outcome,
+            }));
+        };
         match family.publish(flight, outcome) {
             Ok(_) => Ok(()),
             Err(misdirected) => {
                 self.census.foreign_flights += 1;
-                Err(Box::new(misdirected))
+                Err(Box::new(Unpublished::Misdirected(misdirected)))
             }
         }
     }
@@ -2120,16 +2187,64 @@ mod store_tests {
 
         // And the publication is recoverable rather than a leak plus a key
         // stuck compiling for the life of the family.
+        assert!(matches!(*misdirected, Unpublished::Misdirected(_)));
+        let (flight, outcome) = misdirected.into_parts();
         assert!(matches!(
-            misdirected.outcome,
+            outcome,
             Ok(Native {
                 pipeline: p,
                 ..
             }) if p == vk::Pipeline::from_raw(0xAA)
         ));
         store
-            .publish(theirs, misdirected.flight, misdirected.outcome)
+            .publish(theirs, flight, outcome)
             .expect("its own family this time");
         assert!(store.request(theirs, &key(1)).is_ready());
+    }
+
+    /// **A publication under an id with no family creates nothing.** The store
+    /// reached its family through `or_default`, so the one path documented as
+    /// "never a mutation" was the one that mutated: it left a live family under
+    /// a name no flight was ever taken under, which nothing retires and
+    /// therefore nothing ever collects.
+    #[test]
+    fn publishing_under_an_unknown_pipeline_leaves_no_family_behind() {
+        let mut store = Store::new();
+        let (mine, nowhere) = (id(7, 1), id(8, 1));
+        let flight = store.begin_flight(mine, key(1)).expect("first");
+
+        let refused = store
+            .publish(nowhere, flight, Ok(native(0xAA)))
+            .expect_err("no family under that id");
+        assert!(matches!(*refused, Unpublished::NoFamily { id, .. } if id == nowhere));
+        assert_eq!(store.census().unknown_families, 1);
+        assert_eq!(store.census().foreign_flights, 0, "not a misdirect");
+        assert_eq!(
+            store.census().families,
+            1,
+            "the publication invented a family for an id nothing named"
+        );
+
+        // The flight and the pipeline came back whole and still land at home.
+        let (flight, outcome) = refused.into_parts();
+        store.publish(mine, flight, outcome).expect("its own");
+        assert!(store.request(mine, &key(1)).is_ready());
+    }
+
+    /// A retired family still takes its own flight. It was granted before the
+    /// retirement, its key belongs nowhere else, and `collect` keeps the family
+    /// until it lands — so this is the one publication into a retired family
+    /// that is not a caller bug.
+    #[test]
+    fn a_flight_taken_before_a_retirement_still_lands() {
+        let mut store = Store::new();
+        let pipeline = id(7, 1);
+        let flight = store.begin_flight(pipeline, key(1)).expect("first");
+        assert!(store.retire(pipeline));
+        store
+            .publish(pipeline, flight, Ok(native(0xAA)))
+            .expect("its own family, retired or not");
+        assert_eq!(store.census().unknown_families, 0);
+        assert_eq!(store.collect().len(), 1, "and is collected straight away");
     }
 }
