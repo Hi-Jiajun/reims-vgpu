@@ -444,7 +444,10 @@ fn drive_withdrawing(
         } else {
             let indices: Vec<usize> = (0..completable.len()).collect();
             let chosen = completable[policy.pick(&indices, &mut rng)];
-            let _ = model.complete(chosen);
+            let epoch = model.epoch();
+            let _ = model
+                .complete(epoch, chosen)
+                .expect("no device loss in this harness");
             gate.retire(chosen);
             completed.insert(chosen);
             ready.remove(&chosen);
@@ -620,7 +623,10 @@ fn order(seed: u64, policy: Policy) -> Vec<u64> {
         if !completable.is_empty() && (submittable.is_empty() || rng.below(2) == 0) {
             let indices: Vec<usize> = (0..completable.len()).collect();
             let chosen = completable[policy.pick(&indices, &mut rng)];
-            let _ = model.complete(chosen);
+            let epoch = model.epoch();
+            let _ = model
+                .complete(epoch, chosen)
+                .expect("no device loss in this harness");
             gate.retire(chosen);
             done.insert(chosen);
             ready.remove(&chosen);

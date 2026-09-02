@@ -54,6 +54,19 @@ pub enum Refusal {
     DeviceLost { epoch: DeviceEpoch },
     /// A replacement device was asked for while the current one is live.
     DeviceNotLost { epoch: DeviceEpoch },
+    /// A host completion arrived for an incarnation that is no longer the one
+    /// executing. Its transaction was stranded by
+    /// [`SessionModel::device_lost`], which is the only thing that takes an
+    /// *accepted and submitted* transaction out, so there is no position left
+    /// to publish and nothing was lost by saying so.
+    ///
+    /// Not a caller error. Submission is not completion: work handed to a host
+    /// before the loss can still report back after it, and a caller that could
+    /// not have known is exactly who this is for.
+    CompletionAfterLoss {
+        submitted_under: DeviceEpoch,
+        current: DeviceEpoch,
+    },
     /// The packet named a submission domain no channel definition opened.
     /// Admitting it would give it an ordering position in a publication order
     /// nothing will ever drain, which is a completion word the guest waits on
@@ -96,6 +109,7 @@ impl Refusal {
             Self::UnestablishedContract { .. } => "ingress_unestablished_contract",
             Self::DeviceLost { .. } => "ingress_device_lost",
             Self::DeviceNotLost { .. } => "ingress_device_not_lost",
+            Self::CompletionAfterLoss { .. } => "ingress_completion_after_loss",
             Self::ChannelNotOpen { .. } => "ingress_channel_not_open",
             Self::ChannelAlreadyOpen { .. } => "ingress_channel_already_open",
             Self::PayloadMismatch { .. } => "ingress_payload_mismatch",
@@ -633,8 +647,48 @@ impl SessionModel {
     /// possibly a queue of them, possibly nothing. Whatever it published is
     /// also published to the readiness service, because a packet waiting on a
     /// completion word waits for the word the guest would read.
+    ///
+    /// # The incarnation is an argument for the reason it is one on `reached`
+    ///
+    /// A completion is an asynchronous fact: it was produced by a submission
+    /// made under some host device incarnation and arrives some time later,
+    /// by which point that incarnation may be dead. That is the same shape as
+    /// a timeline point, and [`crate::retire::Retirements::reached`] takes the
+    /// epoch for the same reason — the incarnation is what makes the number
+    /// mean anything.
+    ///
+    /// It matters here because [`Self::device_lost`] withdraws every
+    /// transaction admitted into the lost epoch, including ones a host was
+    /// already executing. Submission is not completion, so those can still
+    /// report back. Without the epoch this call had no way to tell that
+    /// completion from a caller inventing an ordinal, and answered both by
+    /// panicking on a race the contract creates.
+    ///
+    /// # Errors
+    ///
+    /// If the completion was produced under an incarnation that has ended.
+    ///
+    /// # Panics
+    ///
+    /// If the ordinal holds no channel position under the *current*
+    /// incarnation. That is not a race — nothing but a loss takes an accepted
+    /// transaction out — so it is a caller completing something it never
+    /// admitted, or completing it twice.
     #[must_use = "what the channel published is what the guest may now read"]
-    pub fn complete(&mut self, ingress: IngressOrdinal) -> Vec<Release> {
+    pub fn complete(
+        &mut self,
+        epoch: DeviceEpoch,
+        ingress: IngressOrdinal,
+    ) -> Result<Vec<Release>, Refusal> {
+        // `Lost` and not only a mismatch: the epoch does not advance until a
+        // replacement is opened, so between the loss and `recreate_device` the
+        // dead incarnation's number is still the current one.
+        if epoch != self.epoch || self.device == DeviceState::Lost {
+            return Err(Refusal::CompletionAfterLoss {
+                submitted_under: epoch,
+                current: self.epoch,
+            });
+        }
         let owed = self.scheduler.complete(ingress);
         self.graph.retire(ingress);
         let (domain, sequence) = self
@@ -647,7 +701,7 @@ impl SessionModel {
                 self.scheduler.publish(stamp);
             }
         }
-        released
+        Ok(released)
     }
 
     /// Remove a transaction that will never publish, releasing everything it
@@ -925,6 +979,15 @@ mod tests {
     use crate::access::{AccessIntent, AccessKey, AccessMode, BackingId, ResourceKey};
     use crate::identity::{ObjectListRef, SlotGeneration, StampSlot, StampValue};
     use crate::retire::Validity;
+
+    /// Complete under the incarnation that is current, which is what a caller
+    /// that has not lost its device does. The loss cases name the epoch
+    /// themselves.
+    fn done(s: &mut SessionModel, ingress: IngressOrdinal) -> Vec<Release> {
+        let epoch = s.epoch();
+        s.complete(epoch, ingress)
+            .expect("the incarnation is the live one")
+    }
 
     /// A session with the two submission domains the tests use already open,
     /// because opening them is a channel definition's job and not a thing under
@@ -1752,7 +1815,7 @@ mod tests {
         assert_eq!(r.hazard_waits, vec![w.transaction.identity.ingress]);
         assert_eq!(s.take_ready(), vec![w.transaction.identity.ingress]);
 
-        let released = s.complete(w.transaction.identity.ingress);
+        let released = done(&mut s, w.transaction.identity.ingress);
         assert_eq!(s.take_ready(), vec![r.transaction.identity.ingress]);
         assert_eq!(
             released,
@@ -1832,7 +1895,7 @@ mod tests {
         });
         let d = s.admit(&doomed).expect("accepted");
         let b = s.admit(&behind).expect("accepted");
-        assert!(s.complete(b.transaction.identity.ingress).is_empty());
+        assert!(done(&mut s, b.transaction.identity.ingress).is_empty());
 
         assert_eq!(
             s.withdraw(d.transaction.identity.ingress)
@@ -1866,7 +1929,7 @@ mod tests {
         let b = s.admit(&second).expect("accepted");
 
         assert!(
-            s.complete(b.transaction.identity.ingress).is_empty(),
+            done(&mut s, b.transaction.identity.ingress).is_empty(),
             "the second position finished first and published nothing"
         );
         assert_eq!(
@@ -1880,7 +1943,7 @@ mod tests {
             "and the cost of holding it is counted"
         );
         assert_eq!(
-            s.complete(a.transaction.identity.ingress)
+            done(&mut s, a.transaction.identity.ingress)
                 .into_iter()
                 .map(|r| r.stamp)
                 .collect::<Vec<_>>(),
@@ -1901,7 +1964,7 @@ mod tests {
         });
         let a = s.admit(&packet(0x37)).expect("accepted");
         let b = s.admit(&second).expect("accepted");
-        assert!(s.complete(b.transaction.identity.ingress).is_empty());
+        assert!(done(&mut s, b.transaction.identity.ingress).is_empty());
         assert_eq!(
             s.withdraw(a.transaction.identity.ingress)
                 .into_iter()
@@ -1953,7 +2016,7 @@ mod tests {
                 outstanding: 1
             }))
         );
-        let _ = s.complete(a.transaction.identity.ingress);
+        let _ = done(&mut s, a.transaction.identity.ingress);
         assert_eq!(s.retire_channel(ChannelId(2)), Ok(()));
         assert!(
             !s.channel_open(ChannelId(2)),
@@ -2019,7 +2082,7 @@ mod tests {
         );
         assert!(s.channel_open(ChannelId(2)));
 
-        let _ = s.complete(admitted.transaction.identity.ingress);
+        let _ = done(&mut s, admitted.transaction.identity.ingress);
         assert_eq!(s.apply_control(free), Ok(()));
         assert_eq!(
             s.admit(&packet(0x37)),
@@ -2163,6 +2226,63 @@ mod tests {
         assert_eq!(s.generation(), after_reset.session);
     }
 
+    /// Submission is not completion, so a host handed work before a loss can
+    /// report it back after one. `device_lost` withdrew that transaction — it
+    /// is the only thing that takes an *accepted and submitted* transaction out
+    /// — so there is no position left, and the caller could not have known:
+    /// nothing public tells it whether an ordinal is still outstanding.
+    ///
+    /// The incarnation is what answers it, which is why `complete` takes one,
+    /// for the reason [`crate::retire::Retirements::reached`] takes one. Both
+    /// windows are covered: the epoch does not advance until a replacement is
+    /// opened, so between the loss and `recreate_device` the dead incarnation's
+    /// number is still the current one and only `DeviceState` separates them.
+    #[test]
+    fn a_completion_from_the_lost_incarnation_is_refused_and_not_a_panic() {
+        let mut s = session();
+        let admitted = s
+            .admit(&touching(packet(0x37), vec![whole(1, AccessMode::Write)]))
+            .expect("accepted");
+        let ingress = admitted.transaction.identity.ingress;
+        let submitted_under = s.epoch();
+        // The executor takes it and submits it. Then the device dies.
+        let loss = s.device_lost();
+        assert_eq!(loss.stranded, vec![ingress]);
+
+        // The host reports the submission it had already accepted. The epoch
+        // still reads as the dead one, so the state is what separates them.
+        assert_eq!(
+            s.complete(submitted_under, ingress),
+            Err(Refusal::CompletionAfterLoss {
+                submitted_under,
+                current: submitted_under,
+            })
+        );
+
+        // And after a replacement, where the number separates them too.
+        let replacement = s.recreate_device().expect("lost, so replaceable");
+        assert_eq!(
+            s.complete(submitted_under, ingress),
+            Err(Refusal::CompletionAfterLoss {
+                submitted_under,
+                current: replacement,
+            })
+        );
+
+        // The replacement device completes its own work normally.
+        let after = s
+            .admit(&touching(packet(0x37), vec![whole(1, AccessMode::Write)]))
+            .expect("accepted");
+        assert_eq!(
+            s.complete(replacement, after.transaction.identity.ingress),
+            Ok(vec![Release {
+                sequence: ChannelSequence(2),
+                stamp: None,
+            }]),
+            "the position published; it owed no stamp"
+        );
+    }
+
     /// A device loss takes every transaction admitted into it out of all three
     /// planes, and names them.
     ///
@@ -2242,7 +2362,7 @@ mod tests {
         let h = s.admit(&head).expect("accepted");
         let b = s.admit(&behind).expect("accepted");
         // The second finished; the first is still running when the device dies.
-        assert!(s.complete(b.transaction.identity.ingress).is_empty());
+        assert!(done(&mut s, b.transaction.identity.ingress).is_empty());
 
         let loss = s.device_lost();
         assert_eq!(loss.stranded, vec![h.transaction.identity.ingress]);
@@ -2332,7 +2452,7 @@ mod tests {
         assert_eq!(b.device_state(), DeviceState::Live);
         assert_eq!(untouched.against(b.generation(), b.epoch()), Validity::Live);
         assert!(b.admit(&packet(0x37)).is_ok());
-        assert!(!b.complete(admitted.transaction.identity.ingress).is_empty());
+        assert!(!done(&mut b, admitted.transaction.identity.ingress).is_empty());
     }
 
     /// A reset opens a new lifetime and does not throw away work that has not
@@ -2714,7 +2834,7 @@ mod tests {
                         }
                         let i = rng.below(outstanding.len() as u64) as usize;
                         let (ordinal, domain) = outstanding.swap_remove(i);
-                        let n = s.complete(ordinal).len();
+                        let n = done(&mut s, ordinal).len();
                         *released.entry(domain).or_default() += n;
                         completions += 1;
                     }
