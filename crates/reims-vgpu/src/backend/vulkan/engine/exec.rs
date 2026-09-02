@@ -4215,9 +4215,24 @@ pub(crate) unsafe fn execute_draw_inner(
     // over a four-byte slot is a device-side write past the slot, not a short
     // read. The seed path above answers the same question on the way in, and
     // states the same reason.
-    let rb_texel = u64::from(super::readback_bytes_per_texel(color0_format));
-    let rb_size = (req.width as u64) * (req.height as u64) * rb_texel;
     let do_readback = !req.skip_readback;
+    let rb_size = match super::readback_slot_bytes(req.width, req.height, color0_format) {
+        Some(bytes) => bytes,
+        // A draw that reads nothing back allocates no slot, so a geometry
+        // whose length cannot be represented is only this draw's problem when
+        // this draw would have taken one.
+        None if !do_readback => 0,
+        None => {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::UnrepresentableImageBytes {
+                    width: req.width,
+                    height: req.height,
+                    layers: 1,
+                    bytes_per_texel: super::readback_bytes_per_texel(color0_format),
+                },
+            ))
+        }
+    };
     phase.note_target(req.width, req.height, if do_readback { rb_size } else { 0 });
     let readback = if do_readback {
         Some(pools.acquire_readback(ctx, rb_size, counters)?)
