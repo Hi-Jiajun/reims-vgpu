@@ -439,7 +439,8 @@ fn a_decoded_texture_becomes_an_image_the_driver_admitted() {
     // expansion is pure arithmetic and unit-tested as such; what a driver has
     // to agree with is that eighty-four single-slice views over a
     // cube-compatible image are legal, which no arithmetic can establish.
-    let whole = view::whole(texture, vk::Format::R8G8B8A8_UNORM).create_info(image);
+    let whole =
+        view::whole(texture, MTL_FORMAT_RGBA8_UNORM, vk::Format::R8G8B8A8_UNORM).create_info(image);
     let sampled = unsafe { device.create_image_view(&whole, None) }
         .expect("a cube-array view over a cube-compatible image");
     let expansion = view::attachments(texture, vk::Format::R8G8B8A8_UNORM);
