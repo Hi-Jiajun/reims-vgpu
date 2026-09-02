@@ -574,6 +574,12 @@ impl<V> Retirements<V> {
     /// [`crate::pools::BufferRing::recycle`] does: the only fact that makes a
     /// pipeline safe to destroy is that the GPU is past the submission naming
     /// it.
+    ///
+    /// `#[must_use]` on the method: the lint does not look inside a `Vec`, so
+    /// the one on [`Retired`] says nothing about a call whose result is
+    /// dropped, and that call drops every native object the recording held
+    /// without the device ever destroying them.
+    #[must_use = "a retired recording's held objects are the caller's to destroy"]
     pub fn retire(&mut self, reached: TimelinePoint) -> Vec<Retired<V>> {
         let mut retired = Vec::new();
         let mut still = Vec::with_capacity(self.in_flight.len());

@@ -33,12 +33,14 @@
 //!
 //! # And the instruments a suite measures with
 //!
-//! The capture is one shared fixture; [`allocations`] is another. Both are
+//! The capture is one shared fixture; [`allocations`] and [`obligations`] are
+//! two more. All three are
 //! things several suites need and none of them owns, and a second copy of a
 //! `GlobalAlloc` is a second thing to get subtly wrong — the same argument
 //! that put the loaders here rather than in three crates.
 
 pub mod allocations;
+pub mod obligations;
 
 use serde_json::Value;
 

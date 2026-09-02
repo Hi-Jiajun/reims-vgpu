@@ -126,6 +126,7 @@ impl Lifetime {
 /// An object whose last use has completed. Its handles are live and it must be
 /// destroyed through the device that made them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a retired object nothing destroys is a handle the device never gets back"]
 pub struct Retired<T> {
     pub lifetime: Lifetime,
     pub last_use: TimelinePoint,
@@ -135,6 +136,7 @@ pub struct Retired<T> {
 /// An object whose device incarnation ended. Its handles went with it and it
 /// must be dropped without being touched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "an abandoned object is still the caller's to drop, and to drop without touching"]
 pub struct Abandoned<T> {
     pub lifetime: Lifetime,
     pub object: T,
@@ -196,6 +198,12 @@ impl<T> NativeRetirement<T> {
     /// are unrelated numbers, and comparing one against the other would retire
     /// live objects whenever a new device's timeline started behind an old
     /// one's.
+    ///
+    /// `#[must_use]` on the method and not only on [`Retired`]: the lint does
+    /// not look inside a `Vec`, so the annotation on the element type says
+    /// nothing at all about a call whose result is dropped — which is the exact
+    /// call that leaks every handle it just took out of the queue.
+    #[must_use = "objects taken out of the queue and not destroyed are handles nothing will ever destroy"]
     pub fn reached(&mut self, epoch: DeviceEpoch, at: TimelinePoint) -> Vec<Retired<T>> {
         let mut out = Vec::new();
         let mut i = 0;
@@ -220,6 +228,9 @@ impl<T> NativeRetirement<T> {
     /// No timeline is consulted, because the thing that would advance it is
     /// what was lost. Waiting for a point a dead device will never reach is how
     /// a device loss becomes a leak and a hang instead of a transition.
+    ///
+    /// `#[must_use]` for the reason [`Self::reached`] gives.
+    #[must_use = "objects taken out of the queue are the caller's to drop"]
     pub fn epoch_lost(&mut self, epoch: DeviceEpoch) -> Vec<Abandoned<T>> {
         let mut out = Vec::new();
         let mut i = 0;

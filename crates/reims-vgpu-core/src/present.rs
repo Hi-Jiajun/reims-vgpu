@@ -415,6 +415,11 @@ impl PresentStream {
     }
 
     /// The timeline reached `at`: take the swapchains nothing reads any more.
+    ///
+    /// `#[must_use]` on the method, because the lint does not look inside a
+    /// `Vec` and the one on [`Retired`] therefore says nothing about a call
+    /// whose result is dropped — which is the swapchain leak it names.
+    #[must_use = "a retired swapchain nothing retires is a leak"]
     pub fn reached(&mut self, at: TimelinePoint) -> Vec<Retired> {
         let mut out = Vec::new();
         let mut i = 0;
