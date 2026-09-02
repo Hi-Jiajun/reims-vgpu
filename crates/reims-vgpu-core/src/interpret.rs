@@ -1846,6 +1846,202 @@ mod tests {
         assert_eq!(interp.census(), (1, 0), "ran, and was not refused");
     }
 
+    /// **A shadow over the reference's own publication rule, across every
+    /// payload class that has one.**
+    ///
+    /// The trace is what implementations are checked against, so a version in
+    /// it for bytes nothing wrote is worse here than the same defect in a
+    /// device: the *correct* device is the one that gets reported as divergent.
+    /// Two arms have had exactly this hole --- a query published its
+    /// destination's version whether or not an answer was written, and a
+    /// declined lifetime operation published its accesses' versions --- and
+    /// each was found on its own, one payload class at a time.
+    ///
+    /// So the law is written once, over all of them: **a transaction publishes
+    /// a content version only if its payload's work happened.** The shadow
+    /// decides "happened" from what this sweep set up, before the run, and
+    /// never from the interpreter --- a shadow that asked the model whether the
+    /// task existed would agree with the code by construction and prove
+    /// nothing.
+    ///
+    /// The three classes with no version to publish are driven too, because
+    /// "publishes none" is the claim for them and a sweep that only drove the
+    /// writers could not tell a present that published nothing from one that
+    /// published something the comparison happened not to look at.
+    #[test]
+    fn a_content_version_reaches_the_trace_only_when_the_work_behind_it_happened() {
+        // What this sweep decided the transaction would be, before running it.
+        #[derive(Clone, Copy, Debug)]
+        enum Planned {
+            /// A lifetime synchronise. Its work happens iff the task exists.
+            Lifecycle {
+                declared: bool,
+            },
+            /// A query. Its work happens iff an answer of a fitting length is
+            /// available.
+            Query {
+                answered: bool,
+            },
+            /// An EXEC. Its records always run, so its accesses always publish.
+            Exec,
+            Present,
+            Control,
+        }
+
+        impl Planned {
+            /// Whether this payload writes content at all, and whether the
+            /// write happened. Both from the plan and neither from the run.
+            const fn publishes(self) -> bool {
+                match self {
+                    Self::Lifecycle { declared } => declared,
+                    Self::Query { answered } => answered,
+                    Self::Exec => true,
+                    Self::Present | Self::Control => false,
+                }
+            }
+        }
+
+        let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let mut tally = [0usize; 7];
+        for _ in 0..2_000 {
+            let plan = match next() % 6 {
+                0 => Planned::Lifecycle { declared: true },
+                1 => Planned::Lifecycle { declared: false },
+                2 => Planned::Query { answered: true },
+                3 => Planned::Query { answered: false },
+                4 => Planned::Exec,
+                _ => {
+                    if next() % 2 == 0 {
+                        Planned::Present
+                    } else {
+                        Planned::Control
+                    }
+                }
+            };
+            tally[match plan {
+                Planned::Lifecycle { declared: true } => 0,
+                Planned::Lifecycle { declared: false } => 1,
+                Planned::Query { answered: true } => 2,
+                Planned::Query { answered: false } => 3,
+                Planned::Exec => 4,
+                Planned::Present => 5,
+                Planned::Control => 6,
+            }] += 1;
+
+            let mut interp = Interpreter::new();
+            interp.content_mut().declare(
+                BackingId(9),
+                ByteRange {
+                    offset: 0,
+                    length: 4096,
+                },
+                Replica::GuestPages,
+            );
+
+            let tx = match plan {
+                Planned::Lifecycle { declared } => {
+                    if declared {
+                        declare_resource(&mut interp, BackingId(9), 4096);
+                    }
+                    synchronize(
+                        1,
+                        vec![AccessIntent {
+                            output_content_version: Some(ContentVersion(4)),
+                            ..write_access(9, 0, 128)
+                        }],
+                    )
+                }
+                Planned::Query { answered } => {
+                    if answered {
+                        // A whole number of pairs, inside both bounds.
+                        interp.answers_from(Box::new(AnswersWith(
+                            reims_vgpu_protocol::info_reply::PAIR_LEN as u64 * 2,
+                        )));
+                    }
+                    query(1, BackingId(9), 4096)
+                }
+                Planned::Exec => {
+                    let mut b = builder(1);
+                    b.declare_access(AccessIntent {
+                        output_content_version: Some(ContentVersion(4)),
+                        ..write_access(9, 0, 128)
+                    });
+                    b.finish().expect("frozen")
+                }
+                Planned::Present => present(1, 9),
+                Planned::Control => control(1),
+            };
+
+            assert_eq!(
+                interp.run(&tx),
+                Outcome::Ran,
+                "{plan:?} is not a refusal; declining and stalling are things a \
+                 transaction that ran does"
+            );
+            let published = interp
+                .trace()
+                .iter()
+                .filter(|o| matches!(o, Observation::VersionPublished { .. }))
+                .count();
+            assert_eq!(
+                published,
+                usize::from(plan.publishes()),
+                "{plan:?} published {published} versions; trace {:?}",
+                interp.trace()
+            );
+            // And the ledger agrees with the trace, so a publication that
+            // reached one and not the other is caught too. `version_of` is the
+            // *highest* version current over a range, so the ranges below are
+            // chosen to separate what a payload wrote from what it left.
+            let ledger = interp.content_mut();
+            let held = |from: u64, to: u64| {
+                ledger.version_of(
+                    BackingId(9),
+                    ByteRange {
+                        offset: from,
+                        length: to - from,
+                    },
+                )
+            };
+            match plan {
+                // Both writers cover the whole 128 they named.
+                Planned::Lifecycle { declared: true } | Planned::Exec => {
+                    assert_eq!(held(0, 128), Some(ContentVersion(4)), "{plan:?}");
+                }
+                // The answer's own window and not the destination's, which is
+                // the rule `Answer::Written` exists to carry: two pairs is 16
+                // bytes and the guest handed over a 4096-byte page.
+                Planned::Query { answered: true } => {
+                    let pairs = reims_vgpu_protocol::info_reply::PAIR_LEN as u64 * 2;
+                    assert_eq!(held(0, pairs), Some(ContentVersion(1)), "{plan:?}");
+                    assert_eq!(
+                        held(pairs, 4096),
+                        Some(ContentVersion(0)),
+                        "{plan:?} made the bytes past its reply current"
+                    );
+                }
+                _ => assert_eq!(
+                    held(0, 128),
+                    Some(ContentVersion(0)),
+                    "{plan:?} wrote nothing"
+                ),
+            }
+        }
+
+        // Per arm, because one aggregate would let an arm go undriven and still
+        // read as covered.
+        for (arm, count) in tally.iter().enumerate() {
+            assert!(*count > 100, "arm {arm} ran {count} times");
+        }
+    }
+
     /// The other half of the same rule, and the one that would have made the
     /// reference certify a lie: a lifecycle operation the model declined moved
     /// no bytes, so it publishes no version.
