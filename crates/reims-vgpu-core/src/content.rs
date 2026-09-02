@@ -289,7 +289,16 @@ impl ContentLedger {
         bytes: ByteRange,
         replica: Replica,
     ) -> Option<Transfer> {
-        let e = self.backings.get(&backing)?;
+        // A backing this ledger has never heard of is the sourceless case in
+        // its purest form: no replica holds these bytes because nothing has
+        // ever written them. Returning `None` without counting it would leave
+        // the one number that says "the guest is reading undefined bytes"
+        // blind to the reads that say it loudest, and would break the census's
+        // own claim that the two counters account for every `None`.
+        let Some(e) = self.backings.get(&backing) else {
+            self.census.reads_with_no_source += 1;
+            return None;
+        };
         let fresh = e.fresh.get(&replica).cloned().unwrap_or_default();
         let owed = fresh.missing_from(bytes);
         if owed.is_empty() {
@@ -579,6 +588,20 @@ mod tests {
         assert_eq!(c.census().reads_already_fresh, 1);
         assert_eq!(c.census().reads_with_no_source, 1);
         assert_eq!(c.census().transfers_planned, 1);
+
+        // A backing the ledger has never heard of is the same fact as reading
+        // past a declared extent, and lands in the same counter: it is the
+        // read this number exists to make visible, not the one case exempt
+        // from it.
+        assert!(c
+            .transfer_for_read(BackingId(99), r(0, 64), Replica::DeviceOwned)
+            .is_none());
+        assert_eq!(c.census().reads_with_no_source, 2);
+        assert_eq!(c.census().reads_already_fresh, 1);
+        assert!(
+            !c.knows(BackingId(99)),
+            "and asking did not invent a history for it"
+        );
     }
 
     /// A discard drops a copy and not the content, so the version does not
