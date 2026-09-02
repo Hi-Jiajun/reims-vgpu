@@ -40,11 +40,28 @@
 //! filtering of a depth image is invalid usage regardless of what the format
 //! reports, because there is no meaningful average of two depth values.
 //!
-//! # One level is a no-op, not a refusal
+//! # One level is a refusal, not a no-op
 //!
-//! A texture with a single level has nothing to generate, and the guest's own
-//! call on one does nothing. An empty plan says exactly that, and a refusal
-//! there would turn a legal guest command into a lost frame.
+//! `generateMipmapsForTexture:` on a texture whose `mipmapLevelCount` is one
+//! is rejected by the reference implementation — it is not a call that quietly
+//! does nothing. So an empty plan is the wrong answer twice over: it hides a
+//! command the guest's own hardware would have failed, and it drops decoded
+//! guest work off the failure channel entirely, leaving a guest whose upper
+//! levels are undefined with nothing to attribute that to.
+//!
+//! This is also the only way `Multisampled` was ever reached: a multisample
+//! declaration is forced to exactly one level by
+//! `texture_shape::TextureShape::checked`, so before this the same texture
+//! could refuse or silently do nothing depending only on which check ran
+//! first. Both now refuse, and the multisample check stays ahead of the level
+//! check so the guest gets the more specific of the two reasons.
+//!
+//! # Guest-attributable reasons before host-attributable ones
+//!
+//! A single-level or depth texture is refused on every host; a format without
+//! the blit bits is refused on this one. The texture's own facts are therefore
+//! decided first, so that a guest reading the failure channel is told what it
+//! did before it is told what this machine cannot do.
 //!
 //! # Planned, not recorded
 //!
@@ -97,6 +114,9 @@ pub enum Refusal {
     /// A multisample texture has no mip chain to generate and no blit that
     /// could produce one.
     Multisampled { samples: u32 },
+    /// The texture declares one level, so there is no chain to generate. A
+    /// refusal rather than an empty plan — see the module doc.
+    SingleLevel,
     /// The layout tracker does not know this image or subresource.
     Untracked { decline: Decline },
 }
@@ -110,6 +130,7 @@ impl Refusal {
             Self::NoBlitDest { .. } => "vk_mipmap_no_blit_dest",
             Self::DepthStencil { .. } => "vk_mipmap_depth_stencil",
             Self::Multisampled { .. } => "vk_mipmap_multisampled",
+            Self::SingleLevel => "vk_mipmap_single_level",
             Self::Untracked { .. } => "vk_mipmap_untracked",
         }
     }
@@ -125,6 +146,7 @@ impl std::fmt::Display for Refusal {
                 write!(f, "{} format={format}", self.slug())
             }
             Self::Multisampled { samples } => write!(f, "{} samples={samples}", self.slug()),
+            Self::SingleLevel => write!(f, "{}", self.slug()),
             Self::Untracked { decline } => write!(f, "{} {decline}", self.slug()),
         }
     }
@@ -188,7 +210,7 @@ pub enum Step {
 
 /// The steps that build `texture`'s mip chain from its top level.
 ///
-/// Empty when there is nothing to generate.
+/// Never empty on success: a texture with no chain to build refuses.
 ///
 /// # Errors
 ///
@@ -206,6 +228,9 @@ pub fn plan(
             samples: texture.sample_count(),
         });
     }
+    if texture.mip_levels() < 2 {
+        return Err(Refusal::SingleLevel);
+    }
     if format_has_depth_aspect(format) || format_has_stencil_aspect(format) {
         return Err(Refusal::DepthStencil { format });
     }
@@ -217,9 +242,6 @@ pub fn plan(
     }
     if !support.linear_blit_source {
         return Err(Refusal::NoLinearFilter { format });
-    }
-    if texture.mip_levels() < 2 {
-        return Ok(Vec::new());
     }
 
     let layers = texture.layers();
@@ -468,14 +490,29 @@ mod tests {
     }
 
     #[test]
-    fn a_single_level_texture_generates_nothing_rather_than_refusing() {
+    fn a_single_level_texture_refuses_rather_than_generating_nothing() {
+        // Not a quiet no-op: the reference implementation rejects the call,
+        // and an empty plan would drop decoded guest work with no reason.
         let texture = texture(TextureKind::D2, 16, 1, 1, MTL_FORMAT_RGBA8_UNORM);
         let mut tracker = tracked(texture);
         assert_eq!(
             plan(IMAGE, texture, filterable(), &mut tracker),
-            Ok(Vec::new())
+            Err(Refusal::SingleLevel)
         );
         assert_eq!(tracker.census().transitions, 0);
+    }
+
+    #[test]
+    fn a_texture_this_host_cannot_blit_is_told_what_it_declared_first() {
+        // Guest-attributable before host-attributable: a single-level texture
+        // is refused on every host, so it hears that rather than a capability
+        // this machine happens to lack.
+        let texture = texture(TextureKind::D2, 16, 1, 1, MTL_FORMAT_RGBA8_UNORM);
+        let mut tracker = tracked(texture);
+        assert_eq!(
+            plan(IMAGE, texture, FilterSupport::default(), &mut tracker),
+            Err(Refusal::SingleLevel)
+        );
     }
 
     #[test]
@@ -629,6 +666,7 @@ mod tests {
             Refusal::NoBlitDest { format: 1 },
             Refusal::DepthStencil { format: 1 },
             Refusal::Multisampled { samples: 4 },
+            Refusal::SingleLevel,
             Refusal::Untracked {
                 decline: Decline::UnknownImage { image: IMAGE },
             },
