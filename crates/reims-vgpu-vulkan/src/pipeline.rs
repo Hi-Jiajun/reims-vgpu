@@ -467,7 +467,7 @@ impl Build {
         let mut vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&self.bindings)
             .vertex_attribute_descriptions(&self.attributes);
-        if !self.divisors.is_empty() {
+        if self.has_divisors() {
             vertex_input = vertex_input.push_next(&mut divisor_state);
         }
 

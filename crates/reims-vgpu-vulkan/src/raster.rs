@@ -207,7 +207,9 @@ impl Default for ViewportCell {
 /// --- `VkPipelineViewportStateCreateInfo::viewportCount`, which the with-count
 /// dynamic states are needed to move --- so the check has to happen before the
 /// pipeline key exists, and a key holding a bare number could be assembled by
-/// a caller that never asked. There is no constructor but [`viewport_slots`].
+/// a caller that never asked. The only ways to reach one are
+/// [`viewport_slots`], which asks the host, and [`ViewportSlots::ONE`],
+/// which is the count no host can refuse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ViewportSlots(u32);
 
