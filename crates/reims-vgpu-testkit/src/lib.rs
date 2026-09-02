@@ -41,6 +41,7 @@
 
 pub mod allocations;
 pub mod obligations;
+pub mod slugs;
 
 use serde_json::Value;
 
