@@ -416,7 +416,20 @@ pub struct Redefinition {
     pub task: TaskId,
     pub previous: DirectoryFrame,
     pub directory: DirectoryFrame,
-    pub root_moved: bool,
+}
+
+impl Redefinition {
+    /// Whether the object list itself is now a different page.
+    ///
+    /// Derived rather than carried: it is exactly `previous != directory`, and
+    /// a field holding the same answer is a second copy that a construction
+    /// site can set the other way. There is one source, and it is the pair of
+    /// frames this already reports.
+    #[must_use]
+    pub const fn root_moved(&self) -> bool {
+        // `PartialEq` is not `const`, and a `DirectoryFrame` is one `u32`.
+        self.previous.0 != self.directory.0
+    }
 }
 
 /// An interval of a task's address space whose translations have changed.
@@ -1393,7 +1406,6 @@ impl Lifecycle {
                     task,
                     previous,
                     directory,
-                    root_moved: previous != directory,
                 });
                 effects
             }
@@ -2139,9 +2151,9 @@ mod tests {
                 task: TASK,
                 previous: DirectoryFrame(0x1000),
                 directory: DirectoryFrame(0x2000),
-                root_moved: true,
             }]
         );
+        assert!(effects.redefined[0].root_moved());
         assert!(
             !effects.teardowns.is_empty(),
             "the resource the old definition owned retired by name"
@@ -2175,8 +2187,11 @@ mod tests {
                 task: TASK,
                 previous: DirectoryFrame(0x1000),
                 directory: DirectoryFrame(0x1000),
-                root_moved: false,
             }]
+        );
+        assert!(
+            !effects.redefined[0].root_moved(),
+            "what the guest published into that page is still in it"
         );
     }
 
