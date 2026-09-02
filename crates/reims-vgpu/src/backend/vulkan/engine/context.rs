@@ -1049,8 +1049,7 @@ impl DeviceContext {
             zero_divisor: divisor_features.vertex_attribute_instance_rate_zero_divisor == vk::TRUE,
             max_divisor: divisor_properties.max_vertex_attrib_divisor,
         };
-        let vertex_formats =
-            crate::backend::vulkan::translate::VertexFormatSupport::probe(&instance, pd);
+        let vertex_formats = crate::backend::vulkan::translate::support::probe(&instance, pd);
         let mut enabled_device_extensions = Vec::new();
         if portability_subset {
             enabled_device_extensions.push(vk::KHR_PORTABILITY_SUBSET_NAME.as_ptr());

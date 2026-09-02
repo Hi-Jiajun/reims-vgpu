@@ -468,7 +468,14 @@ pub fn binding(
 ///
 /// `shader` is what is declared at `location`, which the caller reads from the
 /// module it is about to bind. It is consulted only when the substitution is
-/// actually needed — on a host that declines nothing, no module is walked.
+/// actually needed — on a host that declines nothing, no module is walked —
+/// and only after the two structural questions below have been answered, so a
+/// substitution that could never be made does not cost a module walk.
+///
+/// Takes the format support rather than the whole [`VertexCell`] because that
+/// is all it reads. The divisor capabilities belong to [`binding`], and a
+/// signature naming them here would oblige a caller that has measured formats
+/// and nothing else to invent them.
 ///
 /// # Errors
 ///
@@ -479,10 +486,10 @@ pub fn attribute(
     guest: VertexFormat,
     offset: u32,
     stride: u32,
-    cell: VertexCell,
+    formats: VertexFormatSupport,
     shader: impl FnOnce() -> ShaderInput,
 ) -> Result<AttributePlan, Refusal> {
-    if cell.formats.has(guest) {
+    if formats.has(guest) {
         return Ok(AttributePlan {
             location,
             binding,
@@ -494,19 +501,17 @@ pub fn attribute(
     let Some(wider) = guest.widened() else {
         return Err(Refusal::NoFormat { guest });
     };
-    if !cell.formats.has(wider) {
+    if !formats.has(wider) {
         // The substitute is mandatory in Vulkan for every case this reaches,
         // so a device declining it has declined the whole family; there is no
         // second rung to climb to.
         return Err(Refusal::NoFormat { guest });
     }
-    match shader() {
-        ShaderInput::Channels(read) if read > guest.components() => {
-            return Err(Refusal::WidenReadAsFour { guest })
-        }
-        ShaderInput::Unreadable => return Err(Refusal::WidenShaderUnreadable { guest }),
-        ShaderInput::Channels(_) | ShaderInput::Absent => {}
-    }
+    // Asked before the shader, because it is a comparison of three integers
+    // the caller already holds and the shader is a walk of a whole module. An
+    // attribute whose substitute cannot fit inside the vertex is refused
+    // whatever the shader reads, so the walk would buy nothing but a different
+    // name for the same refusal.
     let widened_bytes = wider.bytes();
     let fits = offset
         .checked_add(widened_bytes)
@@ -518,6 +523,13 @@ pub fn attribute(
             widened_bytes,
             stride,
         });
+    }
+    match shader() {
+        ShaderInput::Channels(read) if read > guest.components() => {
+            return Err(Refusal::WidenReadAsFour { guest })
+        }
+        ShaderInput::Unreadable => return Err(Refusal::WidenShaderUnreadable { guest }),
+        ShaderInput::Channels(_) | ShaderInput::Absent => {}
     }
     Ok(AttributePlan {
         location,
@@ -619,7 +631,7 @@ mod tests {
 
     #[test]
     fn a_supported_format_is_bound_as_itself_and_no_module_is_walked() {
-        let plan = attribute(3, 1, VertexFormat::Short3, 8, 32, cell(), unreached)
+        let plan = attribute(3, 1, VertexFormat::Short3, 8, 32, cell().formats, unreached)
             .expect("this host supports everything");
         assert_eq!(plan.format, vk::Format::R16G16B16_UINT);
         assert_eq!(plan.widened_from, None);
@@ -637,7 +649,7 @@ mod tests {
             formats: VertexFormatSupport::all().without(VertexFormat::Short3),
             ..cell()
         };
-        let plan = attribute(0, 0, VertexFormat::Short3, 0, 8, narrow, || {
+        let plan = attribute(0, 0, VertexFormat::Short3, 0, 8, narrow.formats, || {
             ShaderInput::Channels(3)
         })
         .expect("the wider sibling is mandatory");
@@ -651,10 +663,12 @@ mod tests {
 
         // An input nothing declares widens too — there is no fourth channel
         // for anybody to read.
-        assert!(attribute(0, 0, VertexFormat::Short3, 0, 8, narrow, || {
-            ShaderInput::Absent
-        })
-        .is_ok());
+        assert!(
+            attribute(0, 0, VertexFormat::Short3, 0, 8, narrow.formats, || {
+                ShaderInput::Absent
+            })
+            .is_ok()
+        );
     }
 
     /// The whole difficulty: Vulkan stops defaulting the fourth channel.
@@ -664,7 +678,7 @@ mod tests {
             formats: VertexFormatSupport::all().without(VertexFormat::Short3),
             ..cell()
         };
-        let refused = attribute(0, 0, VertexFormat::Short3, 0, 8, narrow, || {
+        let refused = attribute(0, 0, VertexFormat::Short3, 0, 8, narrow.formats, || {
             ShaderInput::Channels(4)
         })
         .expect_err("the fourth channel would stop being 1.0");
@@ -678,7 +692,7 @@ mod tests {
 
         // Unmeasurable is refused separately, because "reads four" and "we
         // could not tell" are different reports.
-        let unreadable = attribute(0, 0, VertexFormat::Short3, 0, 8, narrow, || {
+        let unreadable = attribute(0, 0, VertexFormat::Short3, 0, 8, narrow.formats, || {
             ShaderInput::Unreadable
         })
         .expect_err("no way to know the fourth channel is unread");
@@ -699,7 +713,7 @@ mod tests {
             ..cell()
         };
         // Six bytes at offset 2 fits a stride of 8; eight bytes does not.
-        let refused = attribute(0, 0, VertexFormat::Short3, 2, 8, narrow, || {
+        let refused = attribute(0, 0, VertexFormat::Short3, 2, 8, narrow.formats, || {
             ShaderInput::Channels(3)
         })
         .expect_err("2 + 8 > 8");
@@ -716,10 +730,139 @@ mod tests {
         // the refusal is about the substitution rather than the declaration.
         assert!(2 + VertexFormat::Short3.bytes() <= 8);
         // One more byte of stride and it fits.
-        assert!(attribute(0, 0, VertexFormat::Short3, 2, 10, narrow, || {
-            ShaderInput::Channels(3)
-        })
-        .is_ok());
+        assert!(
+            attribute(0, 0, VertexFormat::Short3, 2, 10, narrow.formats, || {
+                ShaderInput::Channels(3)
+            })
+            .is_ok()
+        );
+    }
+
+    /// **A substitution that cannot fit is refused without walking a module.**
+    ///
+    /// The stride comparison is three integers the caller already holds; the
+    /// shader is a walk of a whole SPIR-V module. An attribute whose substitute
+    /// runs past the end of a vertex is refused whatever the shader declares,
+    /// so consulting it first would buy a different name for the same refusal
+    /// at the cost of the walk.
+    #[test]
+    fn a_substitution_that_cannot_fit_never_consults_the_shader() {
+        let narrow = VertexFormatSupport::all().without(VertexFormat::Short3);
+        let refused =
+            attribute(0, 0, VertexFormat::Short3, 2, 8, narrow, unreached).expect_err("2 + 8 > 8");
+        assert_eq!(
+            refused,
+            Refusal::WidenPastStride {
+                guest: VertexFormat::Short3,
+                offset: 2,
+                widened_bytes: 8,
+                stride: 8,
+            },
+            "and it refuses for the reason that is actually true"
+        );
+    }
+
+    /// **Every optional three-channel format has a substitute this rail will
+    /// actually make**, and the mandatory ones never reach the substitution.
+    ///
+    /// The nine are the whole of what Vulkan leaves optional at three channels:
+    /// the 8- and 16-bit ones. Asserted through [`attribute`] rather than
+    /// through [`VertexFormat::widened`], because the sibling relation is
+    /// geometry and hands *every* format below four channels a sibling — what
+    /// this claims is that the plan comes back widened, which is a different
+    /// statement.
+    #[test]
+    fn every_optional_three_channel_format_widens_and_the_mandatory_ones_do_not() {
+        use VertexFormat as F;
+        let optional = [
+            F::UChar3,
+            F::Char3,
+            F::UChar3Normalized,
+            F::Char3Normalized,
+            F::UShort3,
+            F::Short3,
+            F::UShort3Normalized,
+            F::Short3Normalized,
+            F::Half3,
+        ];
+        assert_eq!(optional.len(), 9);
+        for guest in optional {
+            let narrow = VertexFormatSupport::all().without(guest);
+            let plan = attribute(0, 0, guest, 0, 64, narrow, || ShaderInput::Channels(3))
+                .unwrap_or_else(|r| panic!("{guest:?} must widen, got {r}"));
+            assert_eq!(plan.widened_from, Some(guest), "{guest:?}");
+            assert_eq!(
+                plan.format,
+                format(guest.widened().expect("a wider sibling")),
+                "{guest:?}"
+            );
+        }
+        // The 32-bit three-channel formats are mandatory, so a device that
+        // reports them never reaches the substitution at all.
+        for guest in [F::Float3, F::Int3, F::UInt3] {
+            assert!(guest.widened().is_some(), "{guest:?}");
+            let plan = attribute(0, 0, guest, 0, 64, VertexFormatSupport::all(), unreached)
+                .expect("mandatory");
+            assert_eq!(plan.widened_from, None, "{guest:?}");
+        }
+    }
+
+    /// **A shader may not read past the channels the guest's own format
+    /// supplies, whatever that count is.**
+    ///
+    /// The comparison is against the declared format's channel count and not
+    /// the literal four. Written as four it would be right only while the
+    /// sibling lookup was itself restricted to three-channel formats: a
+    /// one-channel format widened under that rule lets a shader reading two
+    /// channels see a real second component where Vulkan had been defaulting a
+    /// zero — no refusal, no log line, a wrong vertex stream.
+    #[test]
+    fn the_channel_comparison_is_against_the_declared_format_and_not_the_literal_four() {
+        use VertexFormat as F;
+        for (guest, channels) in [(F::Half, 1u32), (F::Half2, 2), (F::Half3, 3)] {
+            assert_eq!(guest.components(), channels, "{guest:?}");
+            let narrow = VertexFormatSupport::all().without(guest);
+            let planned = attribute(0, 0, guest, 0, 64, narrow, || ShaderInput::Channels(2));
+            if channels >= 2 {
+                assert!(
+                    planned.is_ok_and(|p| p.widened_from.is_some()),
+                    "{guest:?} supplies {channels} and the shader reads two"
+                );
+            } else {
+                assert_eq!(
+                    planned.expect_err("one channel, two read"),
+                    Refusal::WidenReadAsFour { guest },
+                    "{guest:?} supplies one channel and the shader reads two"
+                );
+            }
+        }
+    }
+
+    /// A measured support set covers every format an attribute can resolve to,
+    /// substitutes included.
+    ///
+    /// [`VertexFormatSupport::measured`] asks about the enumeration, and a
+    /// substitute is a member of it, so nothing an attribute can be bound as
+    /// goes unqueried. Stated as a test because the alternative — a probe
+    /// driven by a hand-written list — is what this replaced.
+    #[test]
+    fn the_measured_set_covers_every_format_an_attribute_can_resolve_to() {
+        let mut asked: BTreeSet<i32> = BTreeSet::new();
+        let _ = VertexFormatSupport::measured(|f| {
+            asked.insert(f.as_raw());
+            true
+        });
+        for guest in VertexFormat::ALL {
+            assert!(asked.contains(&format(guest).as_raw()), "{guest:?}");
+            if let Some(wider) = guest.widened() {
+                assert!(
+                    asked.contains(&format(wider).as_raw()),
+                    "{guest:?} substitute went unqueried"
+                );
+            }
+        }
+        assert_eq!(VertexFormat::ALL.len(), 53);
+        assert!(asked.len() >= 30, "queried {}", asked.len());
     }
 
     #[test]
@@ -729,8 +872,10 @@ mod tests {
                 formats: VertexFormatSupport::all().without(guest),
                 ..cell()
             };
-            let refused = attribute(0, 0, guest, 0, 64, narrow, || ShaderInput::Channels(1))
-                .expect_err("nothing wider exists");
+            let refused = attribute(0, 0, guest, 0, 64, narrow.formats, || {
+                ShaderInput::Channels(1)
+            })
+            .expect_err("nothing wider exists");
             assert_eq!(refused, Refusal::NoFormat { guest });
         }
     }

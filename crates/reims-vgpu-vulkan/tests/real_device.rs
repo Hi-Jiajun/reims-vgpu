@@ -1170,7 +1170,7 @@ fn a_declined_vertex_format_has_a_substitute_or_no_sibling_at_all() {
     );
 
     for guest in declined {
-        let planned = vertex::attribute(0, 0, guest, 0, 64, cell, || {
+        let planned = vertex::attribute(0, 0, guest, 0, 64, cell.formats, || {
             vertex::ShaderInput::Channels(guest.components())
         });
         match guest.widened() {

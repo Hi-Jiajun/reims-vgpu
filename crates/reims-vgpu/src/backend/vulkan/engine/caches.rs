@@ -2276,28 +2276,30 @@ impl ObjectCaches {
         let mut binding_divisors: Vec<Option<vk::VertexInputBindingDivisorDescriptionKHR>> =
             Vec::with_capacity(key.attrs.len());
         for attr in &key.attrs {
-            let binding =
-                match ctx
-                    .vertex_formats
-                    .resolve(attr.format, attr.offset, attr.stride, || {
-                        shader_inputs
-                            .get_or_insert_with(|| VertexInputWidths::from_spirv(vert_spirv))
-                            .at(attr.location)
-                    }) {
-                    Ok(binding) => binding,
-                    Err(translate_reason) => {
-                        let err = DrawError::Unsupported(super::reason::DrawReason::VertexFormat(
-                            translate_reason,
-                        ));
-                        crate::observe::Emit::decline("vk_engine_vertex_format", &translate_reason)
-                            .fail_once(
-                                (u64::from(attr.location) << 32)
-                                    | u64::from(translate_reason.value()),
-                            );
-                        self.pipelines.insert_negative(key.clone(), err.clone());
-                        return Err(err);
-                    }
-                };
+            let binding = match translate::support::resolve(
+                ctx.vertex_formats,
+                attr.format,
+                attr.offset,
+                attr.stride,
+                || {
+                    shader_inputs
+                        .get_or_insert_with(|| VertexInputWidths::from_spirv(vert_spirv))
+                        .at(attr.location)
+                },
+            ) {
+                Ok(binding) => binding,
+                Err(translate_reason) => {
+                    let err = DrawError::Unsupported(super::reason::DrawReason::VertexFormat(
+                        translate_reason,
+                    ));
+                    crate::observe::Emit::decline("vk_engine_vertex_format", &translate_reason)
+                        .fail_once(
+                            (u64::from(attr.location) << 32) | u64::from(translate_reason.value()),
+                        );
+                    self.pipelines.insert_negative(key.clone(), err.clone());
+                    return Err(err);
+                }
+            };
             if let Some(narrow) = binding.widened_from {
                 // Fail-visible because a widened attribute is a device-specific
                 // difference from what the guest asked for, even though
@@ -3272,12 +3274,15 @@ mod object_cache_tests {
     #[test]
     fn vertex_format_widening_names_both_formats_and_attribute() {
         use crate::observe::Decline as _;
-        let narrow = reims_vgpu_vulkan::vertex::format(VertexAttributeFormat::UChar3Normalized);
-        let binding = translate::VertexFormatSupport::with_unsupported(&[narrow])
-            .resolve(VertexAttributeFormat::UChar3Normalized, 12, 32, || {
-                crate::runtime::spirv_vertex_input::InputWidth::Components(3)
-            })
-            .unwrap();
+        let guest = VertexAttributeFormat::UChar3Normalized;
+        let binding = translate::support::resolve(
+            translate::VertexFormatSupport::all().without(guest),
+            guest,
+            12,
+            32,
+            || crate::runtime::spirv_vertex_input::InputWidth::Components(3),
+        )
+        .unwrap();
         let decline = VertexFormatWidenDecline {
             from: binding.widened_from.unwrap(),
             to: binding.format,

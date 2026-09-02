@@ -1446,9 +1446,15 @@ mod tests {
         assert!(census.vertex().formats.has(VertexFormat::Short4));
 
         // The declined format widens where the shader reads three.
-        let widened = attribute(0, 0, VertexFormat::Short3, 0, 8, census.vertex(), || {
-            ShaderInput::Channels(3)
-        })
+        let widened = attribute(
+            0,
+            0,
+            VertexFormat::Short3,
+            0,
+            8,
+            census.vertex().formats,
+            || ShaderInput::Channels(3),
+        )
         .expect("the wider sibling is mandatory");
         assert_eq!(widened.widened_from, Some(VertexFormat::Short3));
 
@@ -1458,9 +1464,15 @@ mod tests {
         let empty = Census::take(r).expect("admitted");
         assert_eq!(empty.vertex().formats.count(), 0);
         assert_eq!(
-            attribute(0, 0, VertexFormat::Short3, 0, 8, empty.vertex(), || {
-                ShaderInput::Channels(3)
-            }),
+            attribute(
+                0,
+                0,
+                VertexFormat::Short3,
+                0,
+                8,
+                empty.vertex().formats,
+                || { ShaderInput::Channels(3) }
+            ),
             Err(Refusal::NoFormat {
                 guest: VertexFormat::Short3
             })

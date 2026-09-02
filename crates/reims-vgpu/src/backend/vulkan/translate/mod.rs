@@ -55,4 +55,6 @@ pub mod support;
 pub mod vertex;
 
 pub(crate) use reason::TranslateReason;
-pub(crate) use support::VertexFormatSupport;
+// The measured capability itself belongs to the rail; `support` is the join
+// that probes it and names its refusals here.
+pub(crate) use reims_vgpu_vulkan::vertex::VertexFormatSupport;
