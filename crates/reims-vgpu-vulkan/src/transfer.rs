@@ -276,7 +276,26 @@ fn narrow(axis: &'static str, value: u64) -> Result<u32, Refusal> {
     u32::try_from(value).map_err(|_| Refusal::ExtentTooLarge { axis, value })
 }
 
+/// A copy size, as the 32-bit triple a native copy carries.
+///
+/// # Zero on any axis is a refusal, not a copy of nothing
+///
+/// `VkImageCopy` and `VkBufferImageCopy` both require every component of
+/// `imageExtent` to be non-zero, so a record with a zero axis has no native
+/// form at all and recording one is invalid usage rather than a no-op. It is
+/// refused here — the one place a guest [`Size3`] becomes a native extent, so
+/// every arm that copies texels is bounded by the same sentence, the way
+/// [`within_buffer`] bounds every arm that copies bytes.
+///
+/// A zero depth is *not* read as "one", even though [`ImagePitch::span_bytes`]
+/// reads it that way. There it stands for an absent slice stride on a copy
+/// whose slice count the pitch does not carry; here it is the copy's own
+/// declared depth, and inventing a slice the guest did not ask for would copy
+/// a plane it never named.
 fn extent(size: Size3) -> Result<vk::Extent3D, Refusal> {
+    if size.width == 0 || size.height == 0 || size.depth == 0 {
+        return Err(Refusal::EmptyRange);
+    }
     Ok(vk::Extent3D {
         width: narrow("width", size.width)?,
         height: narrow("height", size.height)?,
@@ -2148,6 +2167,76 @@ mod tests {
         }
     }
 
+    /// The failure this exists to prevent: `imageExtent` must be non-zero on
+    /// every component of a `VkImageCopy` and a `VkBufferImageCopy`, so a copy
+    /// with a zero axis is not a copy of nothing — it is a command with no
+    /// native form. Two arms already refused it by way of their own byte
+    /// count; the three that carry a texel extent went through a narrowing
+    /// that accepted zero and recorded the invalid command.
+    #[test]
+    fn a_copy_with_a_zero_axis_is_refused_on_every_arm_that_carries_an_extent() {
+        let residency = populated();
+        let flat = ImagePitch {
+            bytes_per_row: 0,
+            bytes_per_image: 0,
+        };
+        for axis in ["width", "height", "depth"] {
+            let size = Size3 {
+                width: if axis == "width" { 0 } else { 4 },
+                height: if axis == "height" { 0 } else { 4 },
+                depth: if axis == "depth" { 0 } else { 1 },
+            };
+            for op in [
+                BlitOp::BufferToTexture {
+                    source: id(BUFFER_A),
+                    source_offset: 0,
+                    source_pitch: flat,
+                    size,
+                    dest: point(IMAGE_A, 0, 0),
+                    options: Default::default(),
+                },
+                BlitOp::TextureToBuffer {
+                    source: point(IMAGE_A, 0, 0),
+                    size,
+                    dest: id(BUFFER_A),
+                    dest_offset: 0,
+                    dest_pitch: flat,
+                    options: Default::default(),
+                },
+                BlitOp::TextureRegion {
+                    source: point(IMAGE_A, 0, 0),
+                    dest: point(IMAGE_B, 0, 0),
+                    size,
+                    options: Default::default(),
+                },
+            ] {
+                let kind = op.kind();
+                assert_eq!(
+                    plan(&op, &residency).expect_err("a zero axis"),
+                    Refusal::EmptyRange,
+                    "{kind:?} with a zero {axis}"
+                );
+            }
+        }
+        // And the same three plan when no axis is zero, so the refusal is the
+        // zero and not the fixture.
+        let size = Size3 {
+            width: 4,
+            height: 4,
+            depth: 1,
+        };
+        assert!(plan(
+            &BlitOp::TextureRegion {
+                source: point(IMAGE_A, 0, 0),
+                dest: point(IMAGE_B, 0, 0),
+                size,
+                options: Default::default(),
+            },
+            &residency
+        )
+        .is_ok());
+    }
+
     /// A destination texture whose level zero is `width` by `height`, so a
     /// slice span can be aimed at a level too small to hold what it copies.
     fn with_small_dest(width: u32, height: u32) -> Residency {
@@ -2601,7 +2690,7 @@ mod tests {
     /// wrong with, and refuses the rest by the reason the shadow names.
     #[test]
     fn a_transfer_is_planned_exactly_when_both_of_its_ends_hold_it() {
-        let mut tally = (0_u32, 0_u32, 0_u32, 0_u32);
+        let mut tally = (0_u32, 0_u32, 0_u32, 0_u32, 0_u32);
         for seed in 0..1_500_u64 {
             let mut rng = Rng::new(seed);
             let shape = texture(MTL_FORMAT_RGBA8_UNORM, 32, 16, 3, 2);
@@ -2697,9 +2786,13 @@ mod tests {
             let footprint = brute_footprint(1, 1, 4, row_texels, size.height, size);
             let fits_buffer = buffer_offset + footprint <= buffer_bytes;
             let pitch_reaches = pitch.bytes_per_row == 0 || row_texels >= size.width;
+            // A copy with a zero axis has no native extent, so it is neither
+            // inside the texture nor outside it --- it is not a copy.
+            let nonempty = size.width != 0 && size.height != 0 && size.depth != 0;
 
             match planned {
                 Ok(_) => {
+                    assert!(nonempty, "planned a copy of no texels");
                     assert!(fits_texture, "planned a copy outside the texture");
                     assert!(fits_buffer, "planned a copy outside the buffer");
                     assert!(
@@ -2723,10 +2816,14 @@ mod tests {
                     assert!(!pitch_reaches);
                     tally.3 += 1;
                 }
+                Err(Refusal::EmptyRange) => {
+                    assert!(!nonempty, "refused a copy that has texels");
+                    tally.4 += 1;
+                }
                 Err(other) => panic!("{other}"),
             }
         }
-        let (ok, outside_texture, outside_buffer, short_pitch) = tally;
+        let (ok, outside_texture, outside_buffer, short_pitch, empty) = tally;
         // Floors per path, not one aggregate: the first driver here reached
         // the accepted path fifteen times in fifteen hundred, which reads as
         // covered and is not.
@@ -2734,5 +2831,6 @@ mod tests {
         assert!(outside_texture > 400, "{outside_texture}");
         assert!(outside_buffer > 100, "{outside_buffer}");
         assert!(short_pitch > 100, "{short_pitch}");
+        assert!(empty > 20, "{empty}");
     }
 }
