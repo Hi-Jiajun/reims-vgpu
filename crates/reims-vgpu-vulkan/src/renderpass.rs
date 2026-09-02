@@ -166,6 +166,28 @@ pub struct FramebufferKey {
     pub layers: u32,
 }
 
+/// The single-sampled image a multisample attachment resolves into.
+///
+/// Carries its own format and sample count, because they are not the
+/// attachment's to assume. Vulkan requires a resolve attachment to have the
+/// *same* format as the colour attachment it resolves
+/// (VUID-VkSubpassDescription-pResolveAttachments-00866) and a sample count of
+/// exactly one (VUID-VkSubpassDescription-pResolveAttachments-00869), and both
+/// are properties of a different guest texture that the guest chose
+/// independently.
+///
+/// Describing it from the attachment's own [`Bound`] would state those two
+/// requirements as facts instead of checking them. The attachment description
+/// would then claim a format the view does not have, and `vkCreateFramebuffer`
+/// would refuse it with a message naming neither texture — a driver error
+/// standing in for a refusal this rail can give by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolveTarget {
+    pub view: vk::ImageView,
+    pub format: vk::Format,
+    pub samples: vk::SampleCountFlags,
+}
+
 /// One attachment's image, resolved by the caller from the plan's resource
 /// names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,9 +195,9 @@ pub struct Bound {
     pub format: vk::Format,
     pub samples: vk::SampleCountFlags,
     pub view: vk::ImageView,
-    /// The resolve target's view. Required exactly when the plan's attachment
-    /// asks to resolve.
-    pub resolve_view: Option<vk::ImageView>,
+    /// The image this attachment resolves into. Required exactly when the
+    /// plan's attachment asks to resolve.
+    pub resolve: Option<ResolveTarget>,
 }
 
 /// Why a pass cannot be built here.
@@ -214,6 +236,22 @@ pub enum Refusal {
     /// the guest's resolved depth image, which is exactly what
     /// [`Self::ResolveMismatch`] exists to prevent on the colour side.
     DepthStencilResolveUnsupported,
+    /// A resolve target's format differs from the attachment it resolves.
+    ///
+    /// Vulkan admits only the same format, and the two are different guest
+    /// textures — so this is the guest naming a pair no host can resolve
+    /// between, and the refusal names both.
+    ResolveFormatMismatch {
+        index: usize,
+        attachment: vk::Format,
+        resolve: vk::Format,
+    },
+    /// A resolve target is itself multisampled. It is where a resolve *lands*,
+    /// so it is single-sampled or it is not a resolve target.
+    ResolveIsMultisampled {
+        index: usize,
+        samples: vk::SampleCountFlags,
+    },
 }
 
 impl Refusal {
@@ -225,6 +263,8 @@ impl Refusal {
             Self::SampleCountMismatch { .. } => "vk_renderpass_sample_count",
             Self::ResolveMismatch { .. } => "vk_renderpass_resolve",
             Self::DepthStencilResolveUnsupported => "vk_renderpass_depth_stencil_resolve",
+            Self::ResolveFormatMismatch { .. } => "vk_renderpass_resolve_format",
+            Self::ResolveIsMultisampled { .. } => "vk_renderpass_resolve_multisampled",
         }
     }
 }
@@ -248,6 +288,23 @@ impl std::fmt::Display for Refusal {
             Self::ResolveMismatch { index, planned } => {
                 write!(f, "{} index={index} planned={planned}", self.slug())
             }
+            Self::ResolveFormatMismatch {
+                index,
+                attachment,
+                resolve,
+            } => write!(
+                f,
+                "{} index={index} attachment={:?} resolve={:?}",
+                self.slug(),
+                attachment.as_raw(),
+                resolve.as_raw()
+            ),
+            Self::ResolveIsMultisampled { index, samples } => write!(
+                f,
+                "{} index={index} samples={:?}",
+                self.slug(),
+                samples.as_raw()
+            ),
             Self::DepthStencilResolveUnsupported => f.write_str(self.slug()),
         }
     }
@@ -423,11 +480,29 @@ pub fn build(
     let samples = samples.unwrap_or(vk::SampleCountFlags::TYPE_1);
 
     for (index, (planned, bound)) in plan.color.iter().zip(color).enumerate() {
-        if planned.resolve.is_some() != bound.resolve_view.is_some() {
+        if planned.resolve.is_some() != bound.resolve.is_some() {
             return Err(Refusal::ResolveMismatch {
                 index,
                 planned: planned.resolve.is_some(),
             });
+        }
+        // The two requirements a resolve target carries in its own right,
+        // checked before its description is written rather than asserted by
+        // writing one. See [`ResolveTarget`].
+        if let Some(target) = bound.resolve {
+            if target.format != bound.format {
+                return Err(Refusal::ResolveFormatMismatch {
+                    index,
+                    attachment: bound.format,
+                    resolve: target.format,
+                });
+            }
+            if target.samples != vk::SampleCountFlags::TYPE_1 {
+                return Err(Refusal::ResolveIsMultisampled {
+                    index,
+                    samples: target.samples,
+                });
+            }
         }
     }
     // The depth-stencil pair, which the loop above does not reach. A resolve
@@ -441,7 +516,7 @@ pub fn build(
     {
         return Err(Refusal::DepthStencilResolveUnsupported);
     }
-    if depth_stencil.is_some_and(|bound| bound.resolve_view.is_some()) {
+    if depth_stencil.is_some_and(|bound| bound.resolve.is_some()) {
         return Err(Refusal::ResolveMismatch {
             index: plan.color.len(),
             planned: false,
@@ -475,26 +550,27 @@ pub fn build(
             planned.load,
             planned.store,
             clear,
-            bound.resolve_view,
+            bound.resolve.map(|target| target.view),
         ));
 
-        if let Some(target) = bound.resolve_view {
+        if let Some(target) = bound.resolve {
             resolve_refs.push(vk::AttachmentReference {
                 attachment: u32::try_from(attachments.len()).unwrap_or(u32::MAX),
                 layout: color_layout(),
             });
-            // A resolve target is written and not read, and it is always
-            // single-sampled whatever the pass is.
+            // The target's own format and sample count, both already checked
+            // against what Vulkan admits. Taking the attachment's instead
+            // would describe an image nobody looked at.
             attachments.push(attachment_description(
-                bound.format,
-                vk::SampleCountFlags::TYPE_1,
+                target.format,
+                target.samples,
                 ops_of(
                     vk::AttachmentLoadOp::DONT_CARE,
                     vk::AttachmentStoreOp::STORE,
                     color_layout(),
                 ),
             ));
-            views.push(target);
+            views.push(target.view);
             clears.push(vk::ClearValue {
                 color: vk::ClearColorValue { float32: [0.0; 4] },
             });
@@ -977,7 +1053,16 @@ mod tests {
             format: vk::Format::R8G8B8A8_UNORM,
             samples: vk::SampleCountFlags::TYPE_1,
             view: view(view_id),
-            resolve_view: None,
+            resolve: None,
+        }
+    }
+
+    /// A legal resolve target for [`bound`]: its format, and one sample.
+    fn resolve_target(view_id: u64) -> ResolveTarget {
+        ResolveTarget {
+            view: view(view_id),
+            format: vk::Format::R8G8B8A8_UNORM,
+            samples: vk::SampleCountFlags::TYPE_1,
         }
     }
 
@@ -985,6 +1070,58 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         value.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// A resolve target is a different guest texture, so the two facts Vulkan
+    /// demands of it — the attachment's format, and exactly one sample — are
+    /// its own and not the attachment's. Checked here, where the refusal can
+    /// name both, rather than asserted by writing a description and letting
+    /// `vkCreateFramebuffer` refuse a view whose format it does not match.
+    #[test]
+    fn a_resolve_target_answers_for_its_own_format_and_sample_count() {
+        let mut plan = one_colour(LoadAction::Load, StoreAction::Store);
+        plan.color[0].resolve = Some(crate::pass::Resolve {
+            texture: plan.color[0].texture,
+            level: 0,
+            slice: 0,
+        });
+
+        let legal = Bound {
+            resolve: Some(resolve_target(2)),
+            ..bound(1)
+        };
+        assert!(build(&plan, &[legal], None).is_ok());
+
+        let wrong_format = Bound {
+            resolve: Some(ResolveTarget {
+                format: vk::Format::B8G8R8A8_UNORM,
+                ..resolve_target(2)
+            }),
+            ..bound(1)
+        };
+        assert_eq!(
+            build(&plan, &[wrong_format], None).expect_err("two formats"),
+            Refusal::ResolveFormatMismatch {
+                index: 0,
+                attachment: vk::Format::R8G8B8A8_UNORM,
+                resolve: vk::Format::B8G8R8A8_UNORM,
+            }
+        );
+
+        let multisampled = Bound {
+            resolve: Some(ResolveTarget {
+                samples: vk::SampleCountFlags::TYPE_4,
+                ..resolve_target(2)
+            }),
+            ..bound(1)
+        };
+        assert_eq!(
+            build(&plan, &[multisampled], None).expect_err("a multisample target"),
+            Refusal::ResolveIsMultisampled {
+                index: 0,
+                samples: vk::SampleCountFlags::TYPE_4,
+            }
+        );
     }
 
     /// A resolve is not an operation. Vulkan's compatibility rule names
@@ -1010,7 +1147,7 @@ mod tests {
         let with = build(
             &resolving,
             &[Bound {
-                resolve_view: Some(view(2)),
+                resolve: Some(resolve_target(2)),
                 ..bound(1)
             }],
             None,
@@ -1193,7 +1330,7 @@ mod tests {
             format: vk::Format::D32_SFLOAT,
             samples: vk::SampleCountFlags::TYPE_1,
             view: view(30),
-            resolve_view: None,
+            resolve: None,
         };
         let built = build(&plan, &[bound(10), bound(20)], Some(depth)).expect("legal");
 
@@ -1244,7 +1381,7 @@ mod tests {
         let plan = plan(&d, |_| MTL_FORMAT_RGBA8_UNORM).expect("a legal descriptor");
 
         let resolving = Bound {
-            resolve_view: Some(view(99)),
+            resolve: Some(resolve_target(99)),
             samples: vk::SampleCountFlags::TYPE_4,
             ..bound(2)
         };
@@ -1294,7 +1431,7 @@ mod tests {
             format: vk::Format::D32_SFLOAT,
             samples: vk::SampleCountFlags::TYPE_1,
             view: view(2),
-            resolve_view: None,
+            resolve: None,
         };
         let built = build(&plan, &[bound(1)], Some(depth)).expect("legal");
 
@@ -1405,7 +1542,7 @@ mod tests {
             build(
                 &plan,
                 &[Bound {
-                    resolve_view: Some(view(9)),
+                    resolve: Some(resolve_target(9)),
                     ..bound(1)
                 }],
                 None
@@ -1506,7 +1643,7 @@ mod tests {
         let quiet = depth_stencil_that_resolves(false);
         let depth = Bound {
             format: vk::Format::D32_SFLOAT,
-            resolve_view: Some(view(7)),
+            resolve: Some(resolve_target(7)),
             ..bound(2)
         };
         assert_eq!(
@@ -1538,6 +1675,15 @@ mod tests {
                 planned: true,
             },
             Refusal::DepthStencilResolveUnsupported,
+            Refusal::ResolveFormatMismatch {
+                index: 0,
+                attachment: vk::Format::R8G8B8A8_UNORM,
+                resolve: vk::Format::B8G8R8A8_UNORM,
+            },
+            Refusal::ResolveIsMultisampled {
+                index: 0,
+                samples: vk::SampleCountFlags::TYPE_4,
+            },
         ];
         let mut slugs: Vec<&str> = refusals.iter().map(|r| r.slug()).collect();
         let count = slugs.len();
@@ -1894,7 +2040,7 @@ mod cache_tests {
                 format: vk::Format::B8G8R8A8_UNORM,
                 samples: vk::SampleCountFlags::TYPE_1,
                 view: vk::ImageView::from_raw(10),
-                resolve_view: None,
+                resolve: None,
             }],
             None,
         )

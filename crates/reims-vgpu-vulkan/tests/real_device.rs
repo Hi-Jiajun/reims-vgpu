@@ -1335,7 +1335,7 @@ fn a_planned_pass_becomes_a_render_pass_and_a_framebuffer_this_driver_accepts() 
             format: vk::Format::R8G8B8A8_UNORM,
             samples: vk::SampleCountFlags::TYPE_1,
             view: image_view,
-            resolve_view: None,
+            resolve: None,
         }],
         None,
     )
