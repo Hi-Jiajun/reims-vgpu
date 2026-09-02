@@ -28,11 +28,21 @@
 //! # The terminator
 //!
 //! A guest that asked for more pairs than were answered gets one zero pair
-//! after the last real one, which is how its walker stops. It is written only
-//! when there is room for it: a terminator that ran off the end would be the
-//! same overrun the size bound exists to prevent, and a guest reading a
-//! not-written terminator sees whatever the destination already held — which
-//! is why the caller is told the exact byte count rather than assuming one.
+//! after the last real one, which is how its walker stops. A terminator that
+//! ran off the end would be the same overrun the size bound exists to prevent,
+//! so it is never written past the destination — and the caller is told the
+//! exact byte count rather than assuming one.
+//!
+//! Where the guest's `count` is more than the destination holds, the last slot
+//! is **kept** for the terminator rather than filled with an answer. Without
+//! that reservation a full destination carried no stop word at all, and the
+//! guest's walker — which stops at a zero pair or at `count`, whichever comes
+//! first — read past the last real pair into whatever the destination already
+//! held. The trade is one capability against a parser walking into bytes
+//! nothing wrote, and the capability is the cheaper of the two: it is counted
+//! in [`Written::dropped`], so it reaches the failure channel by the same
+//! route every other truncation does, while the bytes the walker would have
+//! read have no name at all.
 
 use crate::endian::st32;
 
@@ -87,6 +97,17 @@ pub struct Written {
 /// are not "dropped" — the guest asked not to be told.
 pub fn encode(bounds: ReplyBounds, answers: &[(u32, u32)], out: &mut [u8]) -> Written {
     let capacity = out.len() / PAIR_LEN;
+    // The stop word needs a slot of its own, and a destination filled to the
+    // last pair has none left to give it. So where the guest may read further
+    // than this destination reaches, the last slot is reserved. Conditioned on
+    // `count` and not on how many answers there are: a reply that fills the
+    // destination exactly and answers the whole count needs no terminator, and
+    // reserving there would drop an answer for nothing.
+    let usable = if bounds.count as usize > capacity {
+        capacity.saturating_sub(1)
+    } else {
+        capacity
+    };
     let mut written = Written::default();
     let mut parsed = 0u32;
     for &(key, value) in answers {
@@ -96,7 +117,7 @@ pub fn encode(bounds: ReplyBounds, answers: &[(u32, u32)], out: &mut [u8]) -> Wr
             continue;
         }
         parsed = parsed.saturating_add(1);
-        if written.pairs >= bounds.count || written.pairs as usize >= capacity {
+        if written.pairs >= bounds.count || written.pairs as usize >= usable {
             continue;
         }
         let at = written.pairs as usize * PAIR_LEN;
@@ -188,10 +209,38 @@ mod tests {
     }
 
     /// A guest may ask for more pairs than its own destination holds. The
-    /// destination wins, and what did not fit is named.
+    /// destination wins, what did not fit is named, and the reply is still
+    /// terminated.
+    ///
+    /// The regression: the destination was filled to its last pair and the
+    /// stop word had nowhere to go, so a walker that stops at a zero pair or
+    /// at `count` read the one real pair and then three pairs of whatever the
+    /// destination already held. Reserving the last slot costs one more
+    /// capability, and a dropped capability is counted and reported while
+    /// bytes nobody wrote are not.
     #[test]
     fn the_destination_bounds_the_reply_and_the_loss_is_reported() {
-        let mut out = [0u8; PAIR_LEN];
+        let mut out = [0xaau8; PAIR_LEN];
+        let w = encode(
+            ReplyBounds {
+                key_table_len: 8,
+                count: 4,
+            },
+            &[(1, 10), (2, 20), (3, 30)],
+            &mut out,
+        );
+        assert_eq!(w.pairs, 0, "the one slot there is belongs to the stop word");
+        assert!(w.terminated);
+        assert_eq!(w.bytes, PAIR_LEN);
+        assert_eq!(out, [0u8; PAIR_LEN], "and the stop word was written");
+        assert_eq!(w.dropped, 3, "three capabilities the guest never learns");
+    }
+
+    /// Two pairs of room and a guest that will read four: one answer and the
+    /// stop word, never two answers and a walk into the third slot.
+    #[test]
+    fn a_truncated_reply_keeps_its_last_slot_for_the_stop_word() {
+        let mut out = [0xaau8; 2 * PAIR_LEN];
         let w = encode(
             ReplyBounds {
                 key_table_len: 8,
@@ -201,9 +250,33 @@ mod tests {
             &mut out,
         );
         assert_eq!(w.pairs, 1);
-        assert_eq!(w.bytes, PAIR_LEN, "the terminator did not fit either");
-        assert!(!w.terminated);
-        assert_eq!(w.dropped, 2, "two capabilities the guest never learns");
+        assert!(w.terminated);
+        assert_eq!(w.bytes, 2 * PAIR_LEN);
+        assert_eq!(pair(&out, 0), (1, 10));
+        assert_eq!(pair(&out, 1), (0, 0));
+        assert_eq!(w.dropped, 2);
+    }
+
+    /// And no slot is reserved where none is needed: a destination that holds
+    /// exactly what the guest will read needs no stop word, and giving one a
+    /// slot would drop an answer for nothing.
+    #[test]
+    fn a_reply_that_answers_the_whole_count_reserves_nothing() {
+        let mut out = [0xaau8; 2 * PAIR_LEN];
+        let w = encode(
+            ReplyBounds {
+                key_table_len: 8,
+                count: 2,
+            },
+            &[(1, 10), (2, 20), (3, 30)],
+            &mut out,
+        );
+        assert_eq!(w.pairs, 2, "both slots carry an answer");
+        assert!(!w.terminated, "the guest reads exactly `count` and stops");
+        assert_eq!(w.bytes, 2 * PAIR_LEN);
+        assert_eq!(pair(&out, 0), (1, 10));
+        assert_eq!(pair(&out, 1), (2, 20));
+        assert_eq!(w.dropped, 1);
     }
 
     #[test]
