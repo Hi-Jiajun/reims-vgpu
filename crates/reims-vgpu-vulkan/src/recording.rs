@@ -34,7 +34,11 @@
 //! out again and the worker would silently lose depth every time it was busy.
 //! So a partial acquisition abandons what it took before returning, and a
 //! preparation abandoned later hands back its slots *and* its descriptor
-//! emissions through [`Unwound`].
+//! emissions through [`Unwound`]. An unwinding keeps the recording's identity
+//! for the same reason every other state does: the ring a lease goes back to
+//! is the one it was leased from, and a lease abandoned into some other ring
+//! is depth invented in one worker and lost in another --- an accounting error
+//! no later check can see, because both rings still look internally consistent.
 //!
 //! # A forged worker refuses before anything moves
 //!
@@ -294,9 +298,8 @@ impl<V> Preparation<V> {
     /// Give up before submitting. See [`Unwound`].
     pub fn unwind(self) -> Unwound<V> {
         Unwound {
+            held: self.held,
             leases: self.leases,
-            emissions: self.held.emissions,
-            variants: self.held.variants,
         }
     }
 }
@@ -379,9 +382,8 @@ impl<V> Recorded<V> {
             pool.ring_mut().abandon(lease);
         }
         Ok(Unwound {
+            held: self.held,
             leases: Vec::new(),
-            emissions: self.held.emissions,
-            variants: self.held.variants,
         })
     }
 }
@@ -396,18 +398,27 @@ impl<V> Recorded<V> {
 #[derive(Debug)]
 #[must_use = "an unwound recording that is not restored leaks command-buffer slots and descriptor sets"]
 pub struct Unwound<V> {
+    held: Held<V>,
     leases: Vec<Lease>,
-    emissions: Vec<SetEmission>,
-    variants: Vec<Variant<V>>,
 }
 
 impl<V> Unwound<V> {
+    #[must_use]
+    pub const fn worker(&self) -> WorkerId {
+        self.held.worker
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> DeviceEpoch {
+        self.held.epoch
+    }
+
     /// The descriptor emissions whose writes never completed. Each must be
     /// handed to [`crate::descriptor::SetRing::abandoned`] on the ring that
     /// planned it; this value does not know which ring that is, and inventing
     /// one here would be the guess that binds a stale set.
     pub fn emissions(&self) -> &[SetEmission] {
-        &self.emissions
+        &self.held.emissions
     }
 
     /// The native pipelines this recording had named. Held rather than
@@ -417,7 +428,7 @@ impl<V> Unwound<V> {
     /// when this value is dropped.
     #[must_use]
     pub fn variants(&self) -> &[Variant<V>] {
-        &self.variants
+        &self.held.variants
     }
 
     /// Return the command-buffer slots to their worker and drop the pipelines
@@ -428,22 +439,27 @@ impl<V> Unwound<V> {
     ///
     /// # Errors
     ///
-    /// [`Mismatch`] when the worker cannot be resolved, with the unwound
-    /// recording returned intact. There is no partial restore: nothing is given
-    /// back until the worker is proven.
+    /// [`Mismatch`] when this recording's own worker does not resolve to the
+    /// pool it was built from, with the unwound recording returned intact.
+    /// There is no partial restore: nothing is given back until the worker is
+    /// proven, and the worker proven is this recording's, not one a caller
+    /// supplies --- a slot abandoned into a ring it was never leased from is
+    /// depth invented in one worker and lost in another, which no later check
+    /// can detect.
     pub fn restore(
         mut self,
-        worker: WorkerId,
         pools: &mut WorkerPools,
     ) -> Result<Vec<SetEmission>, (Self, Mismatch)> {
-        let population = pools.population();
-        let Some(pool) = pools.for_worker(worker) else {
-            return Err((self, Mismatch::UnknownWorker { worker, population }));
-        };
+        if let Err(mismatch) = self.held.resolve(pools) {
+            return Err((self, mismatch));
+        }
+        let pool = pools
+            .for_worker(self.held.worker)
+            .expect("resolve admitted this worker");
         for lease in self.leases.drain(..).rev() {
             pool.ring_mut().abandon(lease);
         }
-        Ok(self.emissions)
+        Ok(self.held.emissions)
     }
 }
 
@@ -754,9 +770,10 @@ mod tests {
         preparation.claimed(emission(0));
         preparation.claimed(emission(1));
 
-        let emissions = preparation
-            .unwind()
-            .restore(WorkerId(0), &mut pools)
+        let unwound = preparation.unwind();
+        assert_eq!(unwound.worker(), WorkerId(0));
+        let emissions = unwound
+            .restore(&mut pools)
             .unwrap_or_else(|(_, m)| panic!("{m}"));
 
         assert_eq!(emissions, [emission(0), emission(1)]);
@@ -764,28 +781,30 @@ mod tests {
     }
 
     #[test]
-    fn restoring_to_a_worker_that_does_not_exist_keeps_the_whole_unwinding() {
+    fn restoring_into_pools_the_unwinding_did_not_come_from_keeps_the_whole_unwinding() {
         let mut pools = one_worker(4);
         let mut preparation = prepared(&mut pools, 1);
         preparation.claimed(emission(0));
+        let unwound = preparation.unwind();
 
-        let (unwound, mismatch) = preparation
-            .unwind()
-            .restore(WorkerId(4), &mut pools)
-            .expect_err("no such worker");
+        // The epoch was torn down and rebuilt with no workers at all. The
+        // unwinding names its own worker, so this is the only way to reach
+        // the refusal --- a caller cannot name a different one.
+        let mut empty = WorkerPools::new();
+        let (unwound, mismatch) = unwound.restore(&mut empty).expect_err("no such worker");
 
         assert_eq!(
             mismatch,
             Mismatch::UnknownWorker {
-                worker: WorkerId(4),
-                population: 1,
+                worker: WorkerId(0),
+                population: 0,
             }
         );
         // Nothing was given back, so the retry has everything it needs.
         assert_eq!(unwound.emissions(), [emission(0)]);
         assert_eq!(pools.of_worker(WorkerId(0)).unwrap().ring().recording(), 1);
         let emissions = unwound
-            .restore(WorkerId(0), &mut pools)
+            .restore(&mut pools)
             .unwrap_or_else(|(_, m)| panic!("{m}"));
         assert_eq!(emissions, [emission(0)]);
         assert_eq!(pools.of_worker(WorkerId(0)).unwrap().ring().free(), 4);
@@ -855,6 +874,28 @@ mod tests {
         assert_eq!(mismatch, Mismatch::WrongPool);
         assert_eq!(rebuilt.of_worker(WorkerId(0)).unwrap().ring().free(), 4);
         assert_eq!(recorded.worker(), WorkerId(0));
+    }
+
+    #[test]
+    fn restoring_slots_into_a_rebuilt_pool_refuses_rather_than_inventing_depth() {
+        let mut pools = one_worker(4);
+        let mut preparation = prepared(&mut pools, 2);
+        preparation.claimed(emission(0));
+        let unwound = preparation.unwind();
+        // Same worker index, different pool: the epoch was rebuilt underneath
+        // the unwinding. Abandoning into this ring would hand it two slots it
+        // never leased while the ring that did lease them never gets them back.
+        let mut rebuilt = WorkerPools::new();
+        rebuilt.push(worker_pool(2, 3, 4));
+
+        let (unwound, mismatch) = unwound.restore(&mut rebuilt).expect_err("wrong pool");
+
+        assert_eq!(mismatch, Mismatch::WrongPool);
+        assert_eq!(rebuilt.of_worker(WorkerId(0)).unwrap().ring().free(), 4);
+        assert_eq!(unwound.emissions(), [emission(0)]);
+        assert_eq!(unwound.worker(), WorkerId(0));
+        // And the ring it really came from still holds them.
+        assert_eq!(pools.of_worker(WorkerId(0)).unwrap().ring().recording(), 2);
     }
 
     fn registered(pools: &mut WorkerPools, point: u64) -> InFlight<u64> {
