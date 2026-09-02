@@ -451,6 +451,13 @@ impl Drop for DeviceEpoch {
         let _ = self.wait_idle();
         // SAFETY: this type owns the device, is not `Clone`, and the wait above
         // has completed every submission that could still name a child object.
+        //
+        // The second half is the owner's and not this type's: `vkDestroyDevice`
+        // also requires every child object to have been destroyed already
+        // (VUID-vkDestroyDevice-device-05137), and this epoch creates none ---
+        // pools, arenas, semaphores, swapchains and natives are all created by
+        // whoever holds this. Rust's drop order is what enforces it, so a value
+        // holding both must declare this field *after* them.
         unsafe { self.device.destroy_device(None) };
     }
 }

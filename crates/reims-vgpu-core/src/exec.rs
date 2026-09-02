@@ -821,9 +821,12 @@ impl ExecBuilder {
 /// Which rail a resolved operation's records are read on, when its class
 /// belongs to exactly one.
 ///
-/// `None` for the five classes that exist on more than one encoder. Those are
-/// admitted by whichever encoder is open, and [`admissible_on`] is what keeps
-/// that from meaning "any encoder at all".
+/// `None` for the four classes that exist on more than one encoder --- fence,
+/// barrier, resource state and indirect command. Those are admitted by
+/// whichever encoder is open, and [`admissible_on`] is what keeps that from
+/// meaning "any encoder at all". The `None` arm also carries the three classes
+/// with no [`ResolvedOperation`] variant at all, which reach neither this
+/// function nor that one.
 fn rail_of(op: &ResolvedOperation) -> Option<reims_vgpu_protocol::closure::Rail> {
     use reims_vgpu_protocol::closure::Rail;
     Some(match op.class() {
@@ -831,9 +834,16 @@ fn rail_of(op: &ResolvedOperation) -> Option<reims_vgpu_protocol::closure::Rail>
         OperationClass::Compute => Rail::Compute,
         OperationClass::Blit => Rail::Blit,
         OperationClass::Event => Rail::Event,
+        // No payload today, so unreachable; answered rather than left to the
+        // `None` arm because the wire has an [`SegmentKind::Info`] segment and
+        // a record of this class would be inside it, not on whichever encoder
+        // happened to be open. Falling through would have made a future info
+        // payload multi-encoder by default.
         OperationClass::InfoQuery => Rail::Info,
-        // A boundary is the segment rather than a record inside one, so no
-        // payload of this class exists to reach here.
+        // The four multi-encoder classes, and the three with no payload: a
+        // boundary is the segment rather than a record inside one, an info
+        // query answers into a reply buffer, and the completion class has no
+        // record at all. Only the first four can be reached.
         OperationClass::EncoderBoundary
         | OperationClass::Fence
         | OperationClass::Barrier

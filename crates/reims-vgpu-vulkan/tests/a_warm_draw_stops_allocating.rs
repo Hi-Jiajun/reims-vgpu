@@ -162,6 +162,26 @@ fn taking_and_recycling_a_descriptor_set_allocates_nothing() {
         allocations, 0,
         "sixteen frames of take-submit-recycle over a fixed ring"
     );
+
+    // The clean draw's half of the same steady state. A draw with nothing
+    // dirty writes no descriptors and binds the holder, and it goes through
+    // the ring rather than around it --- see `SetRing::bind` --- so it is on
+    // the hottest path there is and has to cost nothing.
+    let (bound, allocations) = measure(|| {
+        let mut last = None;
+        for _ in 0..64 {
+            last = ring.bind();
+        }
+        last
+    });
+    assert!(
+        bound.is_some(),
+        "something has been emitted, so one is held"
+    );
+    assert_eq!(
+        allocations, 0,
+        "sixty-four clean draws binding the holder they already have"
+    );
 }
 
 /// Walking the slots an emission owes costs nothing.
