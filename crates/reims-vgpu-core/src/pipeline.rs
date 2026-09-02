@@ -451,6 +451,50 @@ impl PipelineTable {
         self.advance(id, PipelineState::Retired)
     }
 
+    /// A semantic generation closed: its pipelines can never be named again.
+    ///
+    /// Returns the ones a host object exists for, in id order.
+    ///
+    /// # Why this is a door and not a consequence of the generation check
+    ///
+    /// [`Self::lease`] already answers `Absent` for a pipeline of another
+    /// generation, so a closed generation's pipelines are unusable without
+    /// this. What they are not is *gone*: the entries stay, so a guest that
+    /// resets in a loop grows this table without bound, and — the reason it
+    /// matters more — nothing hands their host objects to whoever destroys
+    /// them. [`PipelineState::Retired`]'s own doc names two ways in, "the
+    /// guest deleted it, or its generation closed", and only the first had a
+    /// path.
+    ///
+    /// The objects are *destroyed*, not abandoned: a closed generation leaves
+    /// the handles perfectly usable and merely unnameable, which is exactly
+    /// [`crate::retire::Validity::SemanticallyClosed`]. That is the difference
+    /// from [`Self::device_lost`], where the handles are what went.
+    ///
+    /// Only the states a host object can exist in come back. `Declared` never
+    /// reached the host, and `Refused` is a build that did not happen; both
+    /// leave the table with the rest and neither is offered to a destroyer
+    /// that has nothing to destroy.
+    #[must_use = "a pipeline nobody destroys is a host object nothing frees"]
+    pub fn generation_closed(&mut self, closed: SessionGeneration) -> Vec<ResourceId> {
+        let mut destroy = Vec::new();
+        self.pipelines.retain(|id, p| {
+            if p.generation != closed {
+                return true;
+            }
+            if matches!(
+                p.state,
+                PipelineState::Translating | PipelineState::Compiling | PipelineState::Ready
+            ) {
+                self.census.retired += 1;
+                destroy.push(*id);
+            }
+            false
+        });
+        destroy.sort_unstable();
+        destroy
+    }
+
     /// The host device incarnation ended: every build it performed is gone.
     ///
     /// Returns the pipelines whose build has to start again, in id order.

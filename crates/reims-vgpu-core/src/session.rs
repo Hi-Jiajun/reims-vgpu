@@ -198,6 +198,25 @@ pub struct DeviceLoss {
     pub released: Vec<Release>,
 }
 
+/// What a guest reset closed.
+///
+/// The generation and the pipelines are one value because they are one event.
+/// A generation that closed without its pipelines being taken out leaves a
+/// table that grows with every reset and host objects nothing frees; a list of
+/// pipelines without the new generation says nothing about what may now be
+/// named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "the closed generation's pipelines are host objects nothing else will destroy"]
+pub struct Reset {
+    /// The lifetime the guest may now name things in.
+    pub generation: SessionGeneration,
+    /// Pipelines of the closed generation that a host object exists for, in id
+    /// order. Destroyed rather than abandoned: the handles are live and merely
+    /// unnameable — see
+    /// [`crate::pipeline::PipelineTable::generation_closed`].
+    pub destroy: Vec<ResourceId>,
+}
+
 /// What admitting a packet produced.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Admitted {
@@ -307,9 +326,18 @@ impl SessionModel {
     /// host device, which may be perfectly healthy — recreating it here would
     /// throw away work the host is still executing in order to answer a
     /// question the guest did not ask.
-    pub fn reset(&mut self) -> SessionGeneration {
+    pub fn reset(&mut self) -> Reset {
+        let closed = self.generation;
         self.generation = self.generation.next();
-        self.generation
+        Reset {
+            generation: self.generation,
+            // Accepted work is untouched — that is the whole of what a reset
+            // is not — but the *names* are gone, so nothing may reach these
+            // pipelines again and their host objects are the caller's to
+            // destroy. A transaction already admitted against one holds it
+            // through the executor's own lease, not through this table.
+            destroy: self.pipelines.generation_closed(closed),
+        }
     }
 
     /// Whether this session has a host device at all.
@@ -1834,7 +1862,7 @@ mod tests {
         let mut s = session();
         let start = s.lifetime();
 
-        s.reset();
+        let _ = s.reset();
         assert_eq!(
             s.epoch(),
             start.epoch,
@@ -1994,7 +2022,7 @@ mod tests {
         let lease = s.lifetime();
         assert_eq!(lease.against(s.generation(), s.epoch()), Validity::Live);
 
-        s.reset();
+        let _ = s.reset();
         let after = lease.against(s.generation(), s.epoch());
         assert!(!after.admits_new_work(), "the guest may not name it");
         assert!(
@@ -2021,7 +2049,7 @@ mod tests {
         let untouched = b.lifetime();
         let admitted = b.admit(&packet(0x37)).expect("accepted");
 
-        a.reset();
+        let _ = a.reset();
         assert!(
             a.device_lost().stranded.is_empty(),
             "the other session's work is not this one's to strand"
@@ -2044,7 +2072,7 @@ mod tests {
         let writer = touching(packet(0x37), vec![whole(1, AccessMode::Write)]);
         let w = s.admit(&writer).expect("accepted");
         let before = s.generation();
-        let after = s.reset();
+        let after = s.reset().generation;
         assert!(after > before);
         assert_eq!(s.scheduler().pending(), 1);
         // Work accepted after the reset carries the new generation and still
@@ -2054,6 +2082,112 @@ mod tests {
         let r = s.admit(&reader).expect("accepted");
         assert_eq!(r.transaction.identity.session, after);
         assert_eq!(r.hazard_waits, vec![w.transaction.identity.ingress]);
+    }
+
+    /// **A closed generation's pipelines leave with it.**
+    ///
+    /// The generation check in `lease` already makes them unusable, so nothing
+    /// misbehaved — but the entries stayed, so a guest resetting in a loop
+    /// grew the table without bound, and the host objects behind them were
+    /// handed to nobody. `PipelineState::Retired` names "its generation
+    /// closed" as one of its two ways in and only the other had a path.
+    ///
+    /// Destroyed, not abandoned: a reset says nothing about the host device,
+    /// so the handles are live and merely unnameable — which is exactly
+    /// [`crate::retire::Validity::SemanticallyClosed`].
+    #[test]
+    fn a_reset_hands_back_the_pipelines_its_generation_could_name() {
+        use crate::pipeline::{Lease, PipelineState};
+        let mut s = session();
+        let gen = s.generation();
+        let (declared, translating, ready, refused) = (res(90), res(91), res(92), res(93));
+        for p in [declared, translating, ready, refused] {
+            s.pipelines().declare(p, gen);
+        }
+        s.pipelines()
+            .advance(translating, PipelineState::Translating);
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            s.pipelines().advance(ready, step);
+        }
+        s.pipelines()
+            .refuse(refused, crate::pipeline::RefusalReason::Undescribable("x"));
+        assert_eq!(s.pipelines().len(), 4);
+
+        let reset = s.reset();
+        assert!(reset.generation > gen);
+        assert_eq!(
+            reset.destroy,
+            vec![translating, ready],
+            "only the ones the host has something for; a declaration never \
+             reached it and a refusal is a build that did not happen"
+        );
+        assert_eq!(
+            s.pipelines().len(),
+            0,
+            "and none of the four can ever be named again, so none of them stays"
+        );
+        for p in [declared, translating, ready, refused] {
+            assert_eq!(s.pipelines().lease(p, gen), Lease::Absent);
+            assert_eq!(s.pipelines().lease(p, reset.generation), Lease::Absent);
+        }
+
+        // The next generation declares its own, and a second reset takes only
+        // those.
+        let next = reset.generation;
+        s.pipelines().declare(declared, next);
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            s.pipelines().advance(declared, step);
+        }
+        assert_eq!(s.reset().destroy, vec![declared]);
+    }
+
+    /// A reset closes names; a device loss takes handles. The two doors hand
+    /// back different things for that reason.
+    #[test]
+    fn a_reset_destroys_pipelines_and_a_device_loss_rebuilds_them() {
+        use crate::pipeline::PipelineState;
+        let build = |s: &mut SessionModel, id, gen| {
+            s.pipelines().declare(id, gen);
+            for step in [
+                PipelineState::Translating,
+                PipelineState::Compiling,
+                PipelineState::Ready,
+            ] {
+                s.pipelines().advance(id, step);
+            }
+        };
+
+        let mut s = session();
+        let p = res(94);
+        let gen = s.generation();
+        build(&mut s, p, gen);
+        let _ = s.device_lost();
+        s.recreate_device().expect("lost");
+        assert_eq!(
+            s.rebuilding(),
+            vec![p],
+            "the object survives a loss and its build starts again"
+        );
+        assert_eq!(s.pipelines().len(), 1);
+
+        let mut s = session();
+        let gen = s.generation();
+        build(&mut s, p, gen);
+        assert_eq!(
+            s.reset().destroy,
+            vec![p],
+            "the object does not survive a reset, and its handle is live"
+        );
+        assert_eq!(s.pipelines().len(), 0);
+        assert!(s.rebuilding().is_empty());
     }
 
     /// A packet read under a lifetime that has since closed is refused, and the
@@ -2072,7 +2206,7 @@ mod tests {
         let mut s = session();
         let stale = packet(0x37);
         let closed = s.generation();
-        let current = s.reset();
+        let current = s.reset().generation;
         let err = s.admit(&stale).expect_err("its lifetime is over");
         assert_eq!(
             err,
@@ -2314,7 +2448,7 @@ mod tests {
                     // The guest reset. The ordering plane is untouched.
                     14 => {
                         let before = s.scheduler().pending();
-                        generation = s.reset();
+                        generation = s.reset().generation;
                         assert_eq!(s.generation(), generation, "seed {seed}: reset generation");
                         assert_eq!(
                             s.scheduler().pending(),
