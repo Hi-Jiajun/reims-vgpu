@@ -316,6 +316,25 @@ pub enum SetState {
     /// Named by a submission and readable by the GPU until this point. Writing
     /// into it before then is undefined behaviour.
     Submitted(TimelinePoint),
+    /// Both at once: a submission may read it until this point, *and* a
+    /// recorded draw that has not been submitted binds it.
+    ///
+    /// # Why one state cannot say both
+    ///
+    /// [`SetRing::bind`] used to leave a submitted set alone, on the reading
+    /// that binding changes no contents — true, and not the whole rule.
+    /// [`SetRing::recycle`] returns a submitted *holder* to [`Self::Live`],
+    /// which is writable, and a draw that bound it in the meantime is then a
+    /// draw whose descriptors a later dirty draw in the same recording updates
+    /// underneath it. That is the exact failure
+    /// `a_second_draw_in_one_recording_never_writes_the_set_the_first_one_bound`
+    /// names, reached the long way round, and it is on the documented
+    /// exhaustion path: a dirty draw that finds no set polls the timeline and
+    /// calls `recycle` before retrying.
+    ///
+    /// So the timeline passing the point returns this to [`Self::Bound`] and
+    /// not to `Live`: the GPU is finished with it and the recording is not.
+    SubmittedAndBound(TimelinePoint),
 }
 
 /// Where an emission writes, and how much of the binding table it has to write.
@@ -553,15 +572,21 @@ impl SetRing {
     /// what would happen if the ring only heard about draws that wrote.
     ///
     /// Returns `None` before anything has ever been emitted, in which case the
-    /// draw binds no set. Idempotent, and safe on a set that is already bound
-    /// or submitted: binding does not change contents, so only the first bind
-    /// after a write means anything.
+    /// draw binds no set.
+    ///
+    /// Idempotent, and it does not leave a submitted set alone. Binding changes
+    /// no contents, which is why that looked safe; what it changes is who is
+    /// entitled to the contents next. See [`SetState::SubmittedAndBound`] for
+    /// the sequence that made a submitted set writable again with a recorded
+    /// draw already holding it.
     #[must_use]
     pub fn bind(&mut self) -> Option<usize> {
         let set = self.holder?;
-        if self.sets[set] == SetState::Live {
-            self.sets[set] = SetState::Bound;
-        }
+        self.sets[set] = match self.sets[set] {
+            SetState::Live => SetState::Bound,
+            SetState::Submitted(at) => SetState::SubmittedAndBound(at),
+            unchanged => unchanged,
+        };
         Some(set)
     }
 
@@ -620,6 +645,14 @@ impl SetRing {
                 SetState::Submitted(previous) if holder == Some(index) && at > previous => {
                     SetState::Submitted(at)
                 }
+                // The recording reached the queue, so the bound half is
+                // discharged. The read window is the later of the two
+                // submissions whatever the set's role: a draw in *this*
+                // command buffer bound it, which is what put it here, and the
+                // earlier submission's point may still be the later one.
+                SetState::SubmittedAndBound(previous) => {
+                    SetState::Submitted(if at > previous { at } else { previous })
+                }
                 unchanged => unchanged,
             };
         }
@@ -635,8 +668,8 @@ impl SetRing {
         let holder = self.holder;
         let mut freed = 0;
         for (index, set) in self.sets.iter_mut().enumerate() {
-            if let SetState::Submitted(at) = *set {
-                if reached.reached(at) {
+            match *set {
+                SetState::Submitted(at) if reached.reached(at) => {
                     *set = if holder == Some(index) {
                         SetState::Live
                     } else {
@@ -644,6 +677,15 @@ impl SetRing {
                     };
                     freed += 1;
                 }
+                // The GPU is finished with it and the recording that bound it
+                // is not, so it becomes bound and nothing more. Counted as
+                // freed all the same: what this returns is how many sets the
+                // timeline released, and this one is no longer in flight.
+                SetState::SubmittedAndBound(at) if reached.reached(at) => {
+                    *set = SetState::Bound;
+                    freed += 1;
+                }
+                _ => {}
             }
         }
         self.census.recycled += freed;
@@ -654,7 +696,7 @@ impl SetRing {
     pub fn in_flight(&self) -> usize {
         self.sets
             .iter()
-            .filter(|s| matches!(s, SetState::Submitted(_)))
+            .filter(|s| matches!(s, SetState::Submitted(_) | SetState::SubmittedAndBound(_)))
             .count()
     }
 
@@ -664,6 +706,12 @@ impl SetRing {
     }
 
     /// How many sets a recorded draw binds and no submission carries yet.
+    ///
+    /// [`SetState::SubmittedAndBound`] is *not* one of them, and deliberately:
+    /// a submission does carry it, so it is counted by [`Self::in_flight`].
+    /// These four counts partition the ring — `free + live + bound + in_flight`
+    /// is the depth — and a set that answered to two of them would break the
+    /// one identity that says no set was lost.
     #[must_use]
     pub fn bound(&self) -> usize {
         self.sets.iter().filter(|s| **s == SetState::Bound).count()
@@ -711,9 +759,12 @@ impl SetRing {
         let Some(state) = self.sets.get_mut(emission.set) else {
             return;
         };
-        if !matches!(*state, SetState::Submitted(_)) {
-            *state = SetState::Free;
-        }
+        *state = match *state {
+            // Still readable by the submission that named it; only the
+            // recording's hold is given up.
+            SetState::Submitted(at) | SetState::SubmittedAndBound(at) => SetState::Submitted(at),
+            _ => SetState::Free,
+        };
         if self.holder == Some(emission.set) {
             self.holder = None;
         }
@@ -1042,6 +1093,51 @@ mod tests {
         assert_ne!(second.set, first.set, "the bound set was rewritten");
         assert!(second.whole(), "a fresh set holds nothing");
         assert_eq!(ring.census().partial, 0);
+    }
+
+    /// The same rule, reached the long way round: through a submission, a clean
+    /// draw, and the exhaustion path the caller is documented to take.
+    ///
+    /// A depth-1 ring is the whole point — it forces the retry to land on the
+    /// one set the recorded draw is holding, which is what a deeper ring would
+    /// let the free list hide.
+    #[test]
+    fn recycling_under_a_clean_draw_never_reopens_the_set_that_draw_bound() {
+        let mut ring = SetRing::new(1);
+        let dirty = ring.emit().expect("the only set");
+        ring.submitted(TimelinePoint(7));
+        assert_eq!(
+            ring.state(dirty.set),
+            Some(SetState::Submitted(TimelinePoint(7)))
+        );
+
+        // A clean draw in a *later* recording binds the holder without writing
+        // it. Nothing about the contents changed, which is why leaving the
+        // state alone looked correct.
+        assert_eq!(ring.bind(), Some(dirty.set));
+
+        // A dirty draw in that same recording finds nothing writable and takes
+        // the documented exhaustion path: poll the timeline, recycle, retry.
+        ring.emit().expect_err("the only set is in flight");
+        assert_eq!(ring.recycle(TimelinePoint(7)), 1, "the GPU is done with it");
+
+        // The GPU is done with it and the recording is not. A retry that got
+        // this set would write descriptors under the clean draw already
+        // recorded against them.
+        ring.emit()
+            .expect_err("the only set is bound by a recorded draw");
+        assert_eq!(ring.state(dirty.set), Some(SetState::Bound));
+        assert_eq!(ring.bound(), 1);
+        assert_eq!(ring.in_flight(), 0);
+        assert!(!ring.resettable(), "a recorded draw will read it");
+
+        // And the recording's own two exits both return it: the queue, or
+        // giving up.
+        ring.submitted(TimelinePoint(9));
+        assert_eq!(
+            ring.state(dirty.set),
+            Some(SetState::Submitted(TimelinePoint(9)))
+        );
     }
 
     #[test]
@@ -1498,6 +1594,37 @@ mod tests {
         Live,
         Bound,
         Submitted(u64),
+        /// The mirror of [`SetState::SubmittedAndBound`]. A shadow without it
+        /// could only disagree with the ring, never with the rule: it is the
+        /// independent [`Reads`] record, not this arm, that catches a `bind`
+        /// which leaves a submitted set alone.
+        SubmittedAndBound(u64),
+    }
+
+    /// What the *history* says about one set, arrived at without restating the
+    /// ring's state machine.
+    ///
+    /// [`Shadow`] is a deliberate mirror, and a mirror cannot fail where the
+    /// thing it mirrors fails. One arm of `submitted` is not covered by the
+    /// sweep's other, independent claims: a holder already submitted has its
+    /// point moved *forward*, and a version that kept the earlier point would
+    /// leave the mirror agreeing with it exactly — both would recycle the set
+    /// while the later submission is still reading it, and nothing would
+    /// disagree. That is the failure this record exists for, and it is the
+    /// worst one a descriptor ring has.
+    ///
+    /// So this is not a state machine at all. It is two physical facts —
+    /// whether a recorded draw is holding the set, and the latest point a
+    /// submission may still read it at — and the second is a running maximum
+    /// rather than a transition, which is what makes it a different statement
+    /// from the code it checks.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct Reads {
+        /// A recorded draw bound it and that command buffer has not been
+        /// submitted or given up.
+        bound: bool,
+        /// The latest submission point that may still be reading it.
+        until: Option<u64>,
     }
 
     /// A driven history of the ring against a shadow built only from what the
@@ -1556,6 +1683,7 @@ mod tests {
             for _ in 0..750 {
                 let mut ring = SetRing::new(depth);
                 let mut shadow: Vec<Shadow> = vec![Shadow::Free; depth];
+                let mut reads: Vec<Reads> = vec![Reads::default(); depth];
                 let mut holder: Option<usize> = None;
                 let mut clock = 1u64;
 
@@ -1566,22 +1694,34 @@ mod tests {
                         0..=4 => {
                             let outstanding = shadow
                                 .iter()
-                                .filter(|s| matches!(s, Shadow::Submitted(_)))
+                                .filter(|s| {
+                                    matches!(s, Shadow::Submitted(_) | Shadow::SubmittedAndBound(_))
+                                })
                                 .count();
-                            let bound = shadow.iter().filter(|s| **s == Shadow::Bound).count();
+                            let bound = shadow
+                                .iter()
+                                .filter(|s| {
+                                    matches!(s, Shadow::Bound | Shadow::SubmittedAndBound(_))
+                                })
+                                .count();
                             // Expected before the call, from the shadow alone.
                             let expect_partial = holder.is_some_and(|h| shadow[h] == Shadow::Live);
                             match ring.emit() {
                                 Ok(emission) => {
                                     let set = emission.set();
                                     assert!(
-                                        !matches!(shadow[set], Shadow::Submitted(_)),
+                                        !matches!(
+                                            shadow[set],
+                                            Shadow::Submitted(_) | Shadow::SubmittedAndBound(_)
+                                        ),
                                         "emitted set {set} is named by a submission: {:?}",
                                         shadow[set]
                                     );
-                                    assert_ne!(
-                                        shadow[set],
-                                        Shadow::Bound,
+                                    assert!(
+                                        !matches!(
+                                            shadow[set],
+                                            Shadow::Bound | Shadow::SubmittedAndBound(_)
+                                        ),
                                         "emitted set {set} is bound by a recorded draw"
                                     );
                                     assert_eq!(
@@ -1602,7 +1742,18 @@ mod tests {
                                     if bound > 0 {
                                         emit_under_bound += 1;
                                     }
+                                    // The same two claims, made from the
+                                    // history instead of from the mirror.
+                                    assert!(
+                                        !reads[set].bound,
+                                        "set {set} was emitted while a recorded draw holds it"
+                                    );
+                                    assert_eq!(
+                                        reads[set].until, None,
+                                        "set {set} was emitted while a submission may read it"
+                                    );
                                     shadow[set] = Shadow::Bound;
+                                    reads[set].bound = true;
                                     holder = Some(set);
                                 }
                                 Err(refusal) => {
@@ -1617,9 +1768,20 @@ mod tests {
                             assert_eq!(ring.bind(), holder);
                             if let Some(h) = holder {
                                 binds += 1;
-                                if shadow[h] == Shadow::Live {
-                                    binds_that_closed += 1;
-                                    shadow[h] = Shadow::Bound;
+                                // A draw bound it whether or not the mirror
+                                // moved: binding is what puts a set in a
+                                // command buffer.
+                                reads[h].bound = true;
+                                match shadow[h] {
+                                    Shadow::Live => {
+                                        binds_that_closed += 1;
+                                        shadow[h] = Shadow::Bound;
+                                    }
+                                    Shadow::Submitted(at) => {
+                                        binds_that_closed += 1;
+                                        shadow[h] = Shadow::SubmittedAndBound(at);
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -1649,8 +1811,22 @@ mod tests {
                                     {
                                         Shadow::Submitted(at.0)
                                     }
+                                    Shadow::SubmittedAndBound(previous) => {
+                                        Shadow::Submitted(previous.max(at.0))
+                                    }
                                     unchanged => unchanged,
                                 };
+                            }
+                            // The history's own account: this command buffer
+                            // reads every set a draw of its bound, and the
+                            // holder whether or not one did. `max`, because two
+                            // command buffers may name one unchanged set and
+                            // the GPU reads it until the later of them.
+                            for (set, r) in reads.iter_mut().enumerate() {
+                                if r.bound || holder == Some(set) {
+                                    r.until = Some(r.until.map_or(at.0, |p| p.max(at.0)));
+                                    r.bound = false;
+                                }
                             }
                             // The claim in one line: after a submission there
                             // is nothing left that only a returned receipt
@@ -1666,8 +1842,8 @@ mod tests {
                             let freed = ring.recycle(reached);
                             let mut expected = 0;
                             for (set, slot) in shadow.iter_mut().enumerate() {
-                                if let Shadow::Submitted(at) = *slot {
-                                    if reached.reached(TimelinePoint(at)) {
+                                match *slot {
+                                    Shadow::Submitted(at) if reached.reached(TimelinePoint(at)) => {
                                         *slot = if holder == Some(set) {
                                             Shadow::Live
                                         } else {
@@ -1675,9 +1851,34 @@ mod tests {
                                         };
                                         expected += 1;
                                     }
+                                    // The recording that bound it is still
+                                    // open, so the timeline releases it only as
+                                    // far as bound — never to a writable state.
+                                    Shadow::SubmittedAndBound(at)
+                                        if reached.reached(TimelinePoint(at)) =>
+                                    {
+                                        *slot = Shadow::Bound;
+                                        expected += 1;
+                                    }
+                                    _ => {}
                                 }
                             }
                             assert_eq!(freed, expected, "recycle freed the wrong count");
+                            // The same count from the history: a set stops
+                            // being readable exactly when the point it was
+                            // last submitted at has been passed.
+                            let mut released = 0;
+                            for r in &mut reads {
+                                if r.until.is_some_and(|p| reached.reached(TimelinePoint(p))) {
+                                    r.until = None;
+                                    released += 1;
+                                }
+                            }
+                            assert_eq!(
+                                freed, released,
+                                "the ring recycled a different set of sets than the history says \
+                                 the timeline has passed"
+                            );
                             recycled += freed as u64;
                         }
                         14 => {
@@ -1688,9 +1889,17 @@ mod tests {
                                 // answer, not the receipt's own discipline,
                                 // which the type enforces at compile time.
                                 ring.abandoned(SetEmission::forged(h, true));
-                                if !matches!(shadow[h], Shadow::Submitted(_)) {
-                                    shadow[h] = Shadow::Free;
-                                }
+                                shadow[h] = match shadow[h] {
+                                    Shadow::Submitted(at) | Shadow::SubmittedAndBound(at) => {
+                                        Shadow::Submitted(at)
+                                    }
+                                    _ => Shadow::Free,
+                                };
+                                // The recording never reached the queue, so no
+                                // draw of its is holding the set. What an
+                                // *earlier* submission may still be reading is
+                                // untouched — that is the timeline's to release.
+                                reads[h].bound = false;
                                 holder = None;
                                 abandons += 1;
                             }
@@ -1707,6 +1916,7 @@ mod tests {
                                 ring.reset();
                                 resets += 1;
                                 shadow.iter_mut().for_each(|s| *s = Shadow::Free);
+                                reads.iter_mut().for_each(|r| *r = Reads::default());
                                 holder = None;
                             }
                         }
@@ -1721,6 +1931,9 @@ mod tests {
                             (SetState::Live, Shadow::Live) => true,
                             (SetState::Bound, Shadow::Bound) => true,
                             (SetState::Submitted(at), Shadow::Submitted(want)) => at.0 == *want,
+                            (SetState::SubmittedAndBound(at), Shadow::SubmittedAndBound(want)) => {
+                                at.0 == *want
+                            }
                             _ => false,
                         };
                         assert!(
@@ -1732,7 +1945,9 @@ mod tests {
                         ring.in_flight(),
                         shadow
                             .iter()
-                            .filter(|s| matches!(s, Shadow::Submitted(_)))
+                            .filter(|s| {
+                                matches!(s, Shadow::Submitted(_) | Shadow::SubmittedAndBound(_))
+                            })
                             .count()
                     );
                     assert_eq!(
