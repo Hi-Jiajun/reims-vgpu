@@ -2290,4 +2290,278 @@ mod tests {
             }
         );
     }
+
+    // ---- The bounds, driven against an independently shaped shadow -------
+    //
+    // Every check `plan` makes about whether a transfer fits is arithmetic, and
+    // arithmetic that agrees with itself is the failure mode a hand-written
+    // case cannot see. So the footprint is checked against a *brute force* ---
+    // every block the region addresses, enumerated, and the furthest one taken
+    // --- and acceptance is checked against a shadow that re-derives the bound
+    // from the texture's declared shape rather than from anything `endpoint`
+    // returned.
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// The last byte a buffer-image region addresses, found by visiting every
+    /// block it names rather than by a closed form.
+    ///
+    /// This is the spec's addressing read literally: block `(x, y, z)` of the
+    /// copy sits at `((z * rows_per_image + y) * blocks_per_row + x)` blocks
+    /// from the buffer offset. Slow, obviously right, and shaped nothing like
+    /// [`region_bytes`].
+    fn brute_footprint(
+        block_width: u32,
+        block_height: u32,
+        block_bytes: u32,
+        row_texels: u64,
+        image_rows: u64,
+        size: Size3,
+    ) -> u64 {
+        if size.width == 0 || size.height == 0 || size.depth == 0 {
+            return 0;
+        }
+        let ceil = |value: u64, by: u32| value.div_ceil(u64::from(by));
+        let blocks_per_row = ceil(row_texels, block_width);
+        let rows_per_image = ceil(image_rows, block_height);
+        let mut furthest = 0;
+        for z in 0..size.depth {
+            for y in 0..ceil(size.height, block_height) {
+                for x in 0..ceil(size.width, block_width) {
+                    let block = (z * rows_per_image + y) * blocks_per_row + x;
+                    furthest = furthest.max((block + 1) * u64::from(block_bytes));
+                }
+            }
+        }
+        furthest
+    }
+
+    #[test]
+    fn the_footprint_closed_form_is_the_furthest_block_the_region_addresses() {
+        let mut rng = Rng::new(7);
+        let mut nonzero_pitches = 0_u32;
+        for _ in 0..4_000 {
+            let (format, block_width, block_height, block_bytes) = if rng.below(2) == 0 {
+                (MTL_FORMAT_RGBA8_UNORM, 1, 1, 4)
+            } else {
+                (MTL_FORMAT_BC3_RGBA, 4, 4, 16)
+            };
+            // Wide enough that a level exists for every copy below.
+            let texture = texture(format, 64, 64, 1, 1);
+            let size = Size3 {
+                width: rng.below(17),
+                height: rng.below(17),
+                depth: 1 + rng.below(3),
+            };
+            // A byte pitch is only convertible in whole blocks, so it is built
+            // out of them rather than filtered for afterwards.
+            let row_blocks = rng.below(9);
+            let bytes_per_row = row_blocks * u64::from(block_bytes);
+            let image_block_rows = rng.below(9);
+            let bytes_per_image = image_block_rows * bytes_per_row;
+            let pitch = ImagePitch {
+                bytes_per_row,
+                bytes_per_image,
+            };
+            let Ok(bytes) = region_bytes(texture, pitch, size) else {
+                continue;
+            };
+            let (row_length, image_height) =
+                texel_pitch(texture, pitch, size).expect("region_bytes just converted it");
+            if row_length != 0 {
+                nonzero_pitches += 1;
+            }
+            let row_texels = if row_length == 0 {
+                size.width
+            } else {
+                u64::from(row_length)
+            };
+            let image_rows = if image_height == 0 {
+                size.height
+            } else {
+                u64::from(image_height)
+            };
+            assert_eq!(
+                bytes,
+                brute_footprint(
+                    block_width,
+                    block_height,
+                    block_bytes,
+                    row_texels,
+                    image_rows,
+                    size
+                ),
+                "format={format:x} {size:?} {pitch:?}"
+            );
+        }
+        assert!(nonzero_pitches > 500, "{nonzero_pitches}");
+    }
+
+    /// What the shadow believes about one texture, derived from the declared
+    /// shape alone.
+    fn level_of(texture: Texture, level: u16) -> Option<(u64, u64, u64)> {
+        texture
+            .level_extent(u32::from(level))
+            .map(|e| (u64::from(e.x), u64::from(e.y), u64::from(e.z)))
+    }
+
+    /// A driven sweep of every copy shape against a shadow that re-derives both
+    /// bounds. `plan` accepts exactly the transfers the shadow finds nothing
+    /// wrong with, and refuses the rest by the reason the shadow names.
+    #[test]
+    fn a_transfer_is_planned_exactly_when_both_of_its_ends_hold_it() {
+        let mut tally = (0_u32, 0_u32, 0_u32, 0_u32);
+        for seed in 0..1_500_u64 {
+            let mut rng = Rng::new(seed);
+            let shape = texture(MTL_FORMAT_RGBA8_UNORM, 32, 16, 3, 2);
+            // Varied per seed: a buffer large enough for every copy never
+            // drives the buffer bound, and one too small for any never drives
+            // the accepted path.
+            let buffer_bytes = 128 + rng.below(2_048);
+            let mut residency = Residency::new();
+            let mut retire = NativeRetirement::new();
+            let lifetime = Lifetime::new(SessionGeneration::FIRST, DeviceEpoch::FIRST);
+            for (slot, native) in [
+                (BUFFER_A, sized_buffer(0xB1, buffer_bytes)),
+                (IMAGE_A, native_image(0x1A, shape)),
+            ] {
+                residency
+                    .publish(id(slot), lifetime, native, &mut retire)
+                    .unwrap_or_else(|(_, e)| panic!("{e}"));
+            }
+
+            let level = rng.below(4) as u16;
+            let slice = rng.below(3) as u16;
+            // Draw the window inside the level three times in four. Unsteered,
+            // the sweep is nine refusals to one accepted copy and the accepted
+            // path --- the one the bounds must not break --- goes undriven.
+            let (lx, ly) = level_of(shape, level).map_or((32, 16), |(x, y, _)| (x, y));
+            let mut window = |available: u64, wide: u64| {
+                if rng.below(4) == 0 {
+                    (rng.below(wide), rng.below(wide))
+                } else {
+                    let origin = rng.below(available + 1);
+                    (origin, rng.below(available - origin + 1))
+                }
+            };
+            let (origin_x, width) = window(lx, 34);
+            let (origin_y, height) = window(ly, 18);
+            let point = TexturePoint {
+                texture: id(IMAGE_A),
+                slice,
+                level,
+                origin: Origin3 {
+                    x: origin_x,
+                    y: origin_y,
+                    z: 0,
+                },
+            };
+            let size = Size3 {
+                width,
+                height,
+                depth: 1,
+            };
+            // A row pitch that reaches the copy most of the time, so the
+            // footprint is exercised rather than the pitch refusal.
+            let pitch = ImagePitch {
+                bytes_per_row: match rng.below(4) {
+                    0 => 0,
+                    1 => rng.below(9) * 4,
+                    _ => (width + rng.below(4)) * 4,
+                },
+                bytes_per_image: 0,
+            };
+            let buffer_offset = if rng.below(4) == 0 {
+                rng.below(buffer_bytes + 64)
+            } else {
+                rng.below(512)
+            };
+
+            let planned = plan(
+                &BlitOp::BufferToTexture {
+                    source: id(BUFFER_A),
+                    source_offset: buffer_offset,
+                    source_pitch: pitch,
+                    size,
+                    dest: point,
+                    options: Default::default(),
+                },
+                &residency,
+            );
+
+            // The shadow: the texture's own declared shape, and the buffer's
+            // own declared length. Nothing here calls `endpoint`, `texel_pitch`
+            // or `within_buffer`.
+            let fits_texture = level_of(shape, level).is_some_and(|(x, y, z)| {
+                u64::from(slice) < u64::from(shape.layers())
+                    && point.origin.x + size.width <= x
+                    && point.origin.y + size.height <= y
+                    && point.origin.z + size.depth <= z
+            });
+            let row_texels = if pitch.bytes_per_row == 0 {
+                size.width
+            } else {
+                pitch.bytes_per_row / 4
+            };
+            let footprint = brute_footprint(1, 1, 4, row_texels, size.height, size);
+            let fits_buffer = buffer_offset + footprint <= buffer_bytes;
+            let pitch_reaches = pitch.bytes_per_row == 0 || row_texels >= size.width;
+
+            match planned {
+                Ok(_) => {
+                    assert!(fits_texture, "planned a copy outside the texture");
+                    assert!(fits_buffer, "planned a copy outside the buffer");
+                    assert!(
+                        pitch_reaches,
+                        "planned a copy its row pitch cannot describe"
+                    );
+                    tally.0 += 1;
+                }
+                Err(Refusal::OutsideTexture { .. }) => {
+                    assert!(!fits_texture, "refused a copy the texture holds");
+                    tally.1 += 1;
+                }
+                Err(Refusal::OutsideBuffer { .. }) => {
+                    assert!(!fits_buffer, "refused a copy the buffer holds");
+                    // The texture is checked after the buffer only because the
+                    // buffer needs the footprint the pitch gives; either
+                    // refusal is a correct answer when both hold.
+                    tally.2 += 1;
+                }
+                Err(Refusal::RowPitchShorterThanCopy { .. }) => {
+                    assert!(!pitch_reaches);
+                    tally.3 += 1;
+                }
+                Err(other) => panic!("{other}"),
+            }
+        }
+        let (ok, outside_texture, outside_buffer, short_pitch) = tally;
+        // Floors per path, not one aggregate: the first driver here reached
+        // the accepted path fifteen times in fifteen hundred, which reads as
+        // covered and is not.
+        assert!(ok > 200, "{ok}");
+        assert!(outside_texture > 400, "{outside_texture}");
+        assert!(outside_buffer > 100, "{outside_buffer}");
+        assert!(short_pitch > 100, "{short_pitch}");
+    }
 }
