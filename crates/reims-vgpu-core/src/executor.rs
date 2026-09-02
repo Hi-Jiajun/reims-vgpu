@@ -54,10 +54,36 @@ pub struct Assignment<T> {
 
 /// Proof that a worker accepted work. Not a result and not a handle to one:
 /// the work is running, and what it produces arrives on its own path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Not `Clone`, no public constructor, and consumed by
+/// [`FixedExecutor::finished`], because occupancy is the number placement is
+/// decided from and a receipt completed twice makes it quietly wrong. The
+/// `occupancy > 0` assertion catches that only for a worker holding one piece
+/// of work; a worker holding two absorbs the second completion silently and
+/// the panic then lands on whichever *other* receipt arrives next, naming a
+/// caller that did nothing. So the second completion is unrepresentable
+/// instead, and the assertion is left as the backstop for the case a type
+/// cannot reach: a receipt handed to a different population.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a receipt never completed leaves its worker occupied forever"]
 pub struct Receipt {
-    pub worker: WorkerId,
-    pub ingress: IngressOrdinal,
+    worker: WorkerId,
+    ingress: IngressOrdinal,
+}
+
+impl Receipt {
+    /// The worker that took the work.
+    #[must_use]
+    pub const fn worker(&self) -> WorkerId {
+        self.worker
+    }
+
+    /// The transaction the work belongs to, so a completion can be matched to
+    /// it without the payload being inspected.
+    #[must_use]
+    pub const fn ingress(&self) -> IngressOrdinal {
+        self.ingress
+    }
 }
 
 /// Why a worker did not take the work.
@@ -250,7 +276,7 @@ mod tests {
         let mut e = FixedExecutor::with_population(3);
         for n in 1..=64 {
             let worker = e.assign().expect("a live worker");
-            e.dispatch(work(worker, n, "record")).expect("accepted");
+            let _receipt = e.dispatch(work(worker, n, "record")).expect("accepted");
         }
         assert_eq!(e.population(), 3, "sixty-four packets, three workers");
         assert_eq!(
@@ -270,7 +296,7 @@ mod tests {
             let receipt = e
                 .dispatch(work(pinned, n, "continuation"))
                 .expect("accepted");
-            assert_eq!(receipt.worker, pinned);
+            assert_eq!(receipt.worker(), pinned);
         }
         assert_eq!(e.occupancy(pinned), 5);
         assert_eq!(
@@ -344,14 +370,19 @@ mod tests {
     }
 
     /// Placement is decided from occupancy, so a receipt completed twice would
-    /// corrupt every later placement rather than fail where it happened.
+    /// corrupt every later placement rather than fail where it happened. It
+    /// cannot be spelled: `Receipt` is not `Clone` and `finished` consumes it,
+    /// so this test is the *other* forgery --- a receipt taken from one
+    /// population and completed against another, which no type can prevent.
     #[test]
     #[should_panic(expected = "finished work it was not given")]
-    fn finishing_a_receipt_twice_is_loud() {
-        let mut e = FixedExecutor::with_population(1);
-        let receipt = e.dispatch(work(WorkerId(0), 1, "once")).expect("accepted");
-        e.finished(receipt);
-        e.finished(receipt);
+    fn completing_another_populations_receipt_is_loud() {
+        let mut mine = FixedExecutor::with_population(1);
+        let mut theirs = FixedExecutor::with_population(1);
+        let receipt = theirs
+            .dispatch(work(WorkerId(0), 1, "elsewhere"))
+            .expect("accepted");
+        mine.finished(receipt);
     }
 
     #[test]
