@@ -901,4 +901,263 @@ mod tests {
         );
         assert_eq!(AccessKey::DomainOnly.rung(), 3);
     }
+
+    // ---- The alias relation's algebra, enumerated ------------------------
+    //
+    // `crate::depend`'s all-pairs oracle decides conflict by calling
+    // `requires_edge`, which calls `may_alias` — the shadow and the thing it
+    // shadows share this function, so a wrong answer here agrees with itself
+    // and the sweep there cannot see it. The key space is small, so the
+    // properties the dependency graph relies on are enumerated rather than
+    // sampled.
+
+    fn heap_of(id: u64, membership_generation: u64) -> HeapId {
+        HeapId {
+            id,
+            membership_generation,
+        }
+    }
+
+    /// Two backings, and every heap membership a resource on one can record:
+    /// none, a heap at two different membership generations, and a second heap.
+    fn every_resource_key() -> Vec<ResourceKey> {
+        let mut out = Vec::new();
+        for backing in [1_u64, 2] {
+            for heap in [
+                None,
+                Some(heap_of(1, 0)),
+                Some(heap_of(1, 1)),
+                Some(heap_of(2, 0)),
+            ] {
+                out.push(ResourceKey {
+                    backing: BackingId(backing),
+                    heap,
+                });
+            }
+        }
+        out
+    }
+
+    /// Every variant over that pool, including the degenerate ranges that name
+    /// no memory — they are the ones the relation is least obviously total on.
+    fn every_key() -> Vec<AccessKey> {
+        let ranges = [
+            ByteRange {
+                offset: 0,
+                length: 0,
+            },
+            ByteRange {
+                offset: 0,
+                length: 64,
+            },
+            ByteRange {
+                offset: 64,
+                length: 64,
+            },
+        ];
+        let subresources = [
+            SubresourceRange {
+                base_level: 0,
+                level_count: 0,
+                base_slice: 0,
+                slice_count: 1,
+                plane: 0,
+            },
+            SubresourceRange {
+                base_level: 0,
+                level_count: 1,
+                base_slice: 0,
+                slice_count: 1,
+                plane: 0,
+            },
+            SubresourceRange {
+                base_level: 1,
+                level_count: 1,
+                base_slice: 0,
+                slice_count: 1,
+                plane: 0,
+            },
+            SubresourceRange {
+                base_level: 0,
+                level_count: 2,
+                base_slice: 0,
+                slice_count: 1,
+                plane: 1,
+            },
+        ];
+        let mut out = vec![AccessKey::DomainOnly];
+        for heap in [heap_of(1, 0), heap_of(1, 1), heap_of(2, 0)] {
+            out.push(AccessKey::Heap(heap));
+        }
+        for resource in every_resource_key() {
+            out.push(AccessKey::Whole(resource));
+            for range in ranges {
+                out.push(AccessKey::Range(resource, range));
+            }
+            for subresource in subresources {
+                out.push(AccessKey::Subresource(resource, subresource));
+            }
+        }
+        out
+    }
+
+    /// Whether a key names at least one byte. A zero-length range and a
+    /// zero-count subresource window deliberately name nothing, so they are
+    /// the exceptions to reflexivity rather than counterexamples to it.
+    fn names_memory(key: AccessKey) -> bool {
+        match key {
+            AccessKey::Range(_, range) => range.length > 0,
+            AccessKey::Subresource(_, window) => window.level_count > 0 && window.slice_count > 0,
+            AccessKey::Whole(_) | AccessKey::Heap(_) | AccessKey::DomainOnly => true,
+        }
+    }
+
+    /// An asymmetric alias relation makes the dependency graph's answer depend
+    /// on which access arrived first, which is exactly the property a hazard
+    /// compiler may not have.
+    #[test]
+    fn the_alias_relation_is_symmetric_and_reflexive_on_keys_that_name_memory() {
+        let keys = every_key();
+        let (mut alias, mut disjoint) = (0_u32, 0_u32);
+        for &a in &keys {
+            for &b in &keys {
+                assert_eq!(
+                    a.may_alias(b),
+                    b.may_alias(a),
+                    "alias is asymmetric: {a:?} vs {b:?}"
+                );
+                if a.may_alias(b) {
+                    alias += 1;
+                } else {
+                    disjoint += 1;
+                }
+            }
+            assert_eq!(
+                a.may_alias(a),
+                names_memory(a),
+                "a key aliases itself exactly when it names memory: {a:?}"
+            );
+        }
+        assert!(alias > 0 && disjoint > 0, "vacuous: {alias} vs {disjoint}");
+    }
+
+    /// The safety property of the precision ladder: replacing a key with a
+    /// coarser one may only *add* edges. Losing one is a race, and every rung
+    /// above the exact one exists precisely because the exact answer was not
+    /// available.
+    #[test]
+    fn coarsening_a_key_never_loses_an_alias() {
+        let keys = every_key();
+        let mut strict_gains = 0_u32;
+        for &fine in &keys {
+            let coarser = match fine {
+                AccessKey::Range(resource, _) | AccessKey::Subresource(resource, _) => {
+                    vec![AccessKey::Whole(resource), AccessKey::DomainOnly]
+                }
+                AccessKey::Whole(_) | AccessKey::Heap(_) => vec![AccessKey::DomainOnly],
+                AccessKey::DomainOnly => vec![],
+            };
+            for coarse in coarser {
+                for &other in &keys {
+                    if fine.may_alias(other) {
+                        assert!(
+                            coarse.may_alias(other),
+                            "coarsening {fine:?} to {coarse:?} lost its alias with {other:?}"
+                        );
+                    } else if coarse.may_alias(other) {
+                        strict_gains += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            strict_gains > 0,
+            "vacuous: coarsening never widened anything"
+        );
+    }
+
+    /// Distinct backings are distinct memory, and sharing a heap does not
+    /// change that — heap membership is what lets a *heap* declaration meet a
+    /// resource, not what lets two resources meet each other.
+    #[test]
+    fn resource_keys_over_different_backings_never_alias_however_they_are_placed() {
+        let keys = every_key();
+        let mut checked = 0_u32;
+        for &a in &keys {
+            for &b in &keys {
+                let (Some(ra), Some(rb)) = (a.resource(), b.resource()) else {
+                    continue;
+                };
+                if ra.backing == rb.backing {
+                    continue;
+                }
+                assert!(!a.may_alias(b), "{a:?} and {b:?} are separate backings");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "vacuous: no cross-backing pair in the pool");
+    }
+
+    /// A heap declaration meets a key exactly when that key records membership
+    /// in the same heap, whatever generation either side was recorded against.
+    /// It is deliberately *not* enough to sit on the heap's storage backing:
+    /// that fact is not in the key.
+    #[test]
+    fn a_heap_declaration_meets_exactly_the_keys_that_record_its_membership() {
+        let keys = every_key();
+        let (mut met, mut missed) = (0_u32, 0_u32);
+        for heap in [heap_of(1, 0), heap_of(1, 1), heap_of(2, 0)] {
+            let declaration = AccessKey::Heap(heap);
+            for &other in &keys {
+                let expected = match other {
+                    AccessKey::DomainOnly => true,
+                    AccessKey::Heap(theirs) => theirs.same_heap(heap),
+                    _ => other
+                        .resource()
+                        .and_then(|r| r.heap)
+                        .is_some_and(|theirs| theirs.same_heap(heap)),
+                };
+                assert_eq!(
+                    declaration.may_alias(other),
+                    expected,
+                    "heap {heap:?} against {other:?}"
+                );
+                if expected {
+                    met += 1;
+                } else {
+                    missed += 1;
+                }
+            }
+        }
+        assert!(met > 0 && missed > 0, "vacuous: {met} vs {missed}");
+    }
+
+    /// Bytes and image subresources are two coordinate systems over one
+    /// backing and this crate cannot relate them, so every such pair over one
+    /// backing must answer conservatively — including the degenerate windows,
+    /// where "names nothing" is a claim about one coordinate system that says
+    /// nothing about the other.
+    #[test]
+    fn a_byte_range_and_a_subresource_window_over_one_backing_always_meet() {
+        let keys = every_key();
+        let mut bridged = 0_u32;
+        for &a in &keys {
+            for &b in &keys {
+                let bridge = matches!(
+                    (a, b),
+                    (AccessKey::Range(..), AccessKey::Subresource(..))
+                        | (AccessKey::Subresource(..), AccessKey::Range(..))
+                );
+                let (Some(ra), Some(rb)) = (a.resource(), b.resource()) else {
+                    continue;
+                };
+                if !bridge || ra.backing != rb.backing {
+                    continue;
+                }
+                assert!(a.may_alias(b), "{a:?} and {b:?} cannot be proven disjoint");
+                bridged += 1;
+            }
+        }
+        assert!(bridged > 0, "vacuous: no bridge pair in the pool");
+    }
 }
