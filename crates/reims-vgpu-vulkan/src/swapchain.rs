@@ -90,6 +90,18 @@ use ash::vk;
 /// whole choice is testable against surfaces that do not exist.
 #[derive(Clone, Debug)]
 pub struct Surface<'a> {
+    /// `vkGetPhysicalDeviceSurfaceSupportKHR` for the queue family this rail
+    /// presents on.
+    ///
+    /// Separate from every other answer here because it is the only one that
+    /// is about the *pairing* rather than about the surface: the other three
+    /// describe what the surface offers, and this says whether this device's
+    /// present queue can address it at all. `VK_KHR_swapchain` being
+    /// enumerated does not imply it --- a host whose display is driven by a
+    /// different adapter enumerates the extension and supports no family for
+    /// the window's surface --- and it cannot be answered by
+    /// [`crate::census::Census`], which is taken before any surface exists.
+    pub supported_by_present_family: bool,
     pub capabilities: vk::SurfaceCapabilitiesKHR,
     pub formats: &'a [vk::SurfaceFormatKHR],
     pub present_modes: &'a [vk::PresentModeKHR],
@@ -184,6 +196,14 @@ pub enum Refusal {
     },
     /// The surface reported no formats at all.
     NoFormats,
+    /// No queue family this rail presents on supports this surface.
+    ///
+    /// `VkSwapchainCreateInfoKHR`'s surface must be one the device supports as
+    /// determined by `vkGetPhysicalDeviceSurfaceSupportKHR`
+    /// (VUID-VkSwapchainCreateInfoKHR-surface-01270). A refusal rather than
+    /// [`NotReady`]: nothing about this pairing changes when the window comes
+    /// back.
+    NotSupportedByPresentFamily,
 }
 
 impl Refusal {
@@ -195,6 +215,7 @@ impl Refusal {
             Self::NoTransferDestination { .. } => "vk_swapchain_no_transfer_destination",
             Self::NoOpaqueComposite { .. } => "vk_swapchain_no_opaque_composite",
             Self::NoFormats => "vk_swapchain_no_formats",
+            Self::NotSupportedByPresentFamily => "vk_swapchain_family_cannot_present",
         }
     }
 }
@@ -220,7 +241,7 @@ impl std::fmt::Display for Refusal {
             Self::NoOpaqueComposite { supported } => {
                 write!(f, "{} supported={supported:?}", self.slug())
             }
-            Self::NoFormats => f.write_str(self.slug()),
+            Self::NoFormats | Self::NotSupportedByPresentFamily => f.write_str(self.slug()),
         }
     }
 }
@@ -355,6 +376,14 @@ pub fn plan(
     wanted: Wanted,
     narrowing: Narrowing,
 ) -> Result<Outcome, Refusal> {
+    // Before anything the surface offers is read, because none of it is a
+    // property of a pairing this device cannot make: a surface the present
+    // family does not support may still answer formats and present modes, and
+    // choosing among them would be planning a swapchain that
+    // `vkCreateSwapchainKHR` is not permitted to build.
+    if !surface.supported_by_present_family {
+        return Err(Refusal::NotSupportedByPresentFamily);
+    }
     if surface.formats.is_empty() {
         return Err(Refusal::NoFormats);
     }
@@ -502,6 +531,7 @@ mod tests {
         narrowing: Narrowing,
     ) -> Plan {
         let surface = Surface {
+            supported_by_present_family: true,
             capabilities,
             formats,
             present_modes: modes,
@@ -518,11 +548,60 @@ mod tests {
         wanted: Wanted,
     ) -> Refusal {
         let surface = Surface {
+            supported_by_present_family: true,
             capabilities,
             formats,
             present_modes: &[vk::PresentModeKHR::FIFO],
         };
         plan(&surface, wanted, Narrowing::default()).expect_err("refused")
+    }
+
+    /// A surface no present family supports is refused before anything it
+    /// offers is read.
+    ///
+    /// The regression: the pairing was never asked about. `VK_KHR_swapchain`
+    /// being enumerated says the entry points resolve, not that this device
+    /// can address this window --- on a host whose display is driven by a
+    /// different adapter it is enumerated and no family supports the surface
+    /// --- and the census cannot answer it, being taken before any surface
+    /// exists. So a perfectly ordinary-looking surface produced a plan and
+    /// `vkCreateSwapchainKHR` was handed a surface
+    /// VUID-VkSwapchainCreateInfoKHR-surface-01270 forbids.
+    #[test]
+    fn a_surface_the_present_family_cannot_address_is_refused_before_it_is_read() {
+        // Everything else about this surface is as ordinary as it gets: the
+        // format, the colour space and the composite alpha all match, so the
+        // only thing left to refuse on is the pairing.
+        let surface = Surface {
+            supported_by_present_family: false,
+            capabilities: capabilities(),
+            formats: &[vk::SurfaceFormatKHR {
+                format: BGRA,
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            }],
+            present_modes: &[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX],
+        };
+        let refused = plan(&surface, wanted(), Narrowing::default()).expect_err("refused");
+        assert_eq!(refused, Refusal::NotSupportedByPresentFamily);
+        assert_eq!(refused.slug(), "vk_swapchain_family_cannot_present");
+
+        // And it is not a not-ready: a minimized window comes back, an
+        // unsupported pairing does not. Checked with a zero extent, which is
+        // the one input that would otherwise produce `NotReady`.
+        let minimized = Surface {
+            capabilities: vk::SurfaceCapabilitiesKHR {
+                current_extent: vk::Extent2D {
+                    width: 0,
+                    height: 0,
+                },
+                ..capabilities()
+            },
+            ..surface
+        };
+        assert_eq!(
+            plan(&minimized, wanted(), Narrowing::default()).expect_err("refused"),
+            Refusal::NotSupportedByPresentFamily
+        );
     }
 
     #[test]
@@ -697,6 +776,7 @@ mod tests {
             ..capabilities()
         };
         let surface = Surface {
+            supported_by_present_family: true,
             capabilities,
             formats: &[srgb_space(BGRA)],
             present_modes: &[vk::PresentModeKHR::FIFO],
@@ -719,6 +799,7 @@ mod tests {
         assert!(matches!(
             plan(
                 &Surface {
+                    supported_by_present_family: true,
                     capabilities: one_zero,
                     ..surface.clone()
                 },
@@ -949,6 +1030,7 @@ mod tests {
         assert!(matches!(
             plan(
                 &Surface {
+                    supported_by_present_family: true,
                     capabilities: no_transfer,
                     formats: &[srgb_space(BGRA)],
                     present_modes: &[vk::PresentModeKHR::FIFO],
@@ -970,6 +1052,7 @@ mod tests {
                 ..capabilities()
             };
             let surface = Surface {
+                supported_by_present_family: true,
                 capabilities,
                 formats: &[srgb_space(BGRA)],
                 present_modes: &[vk::PresentModeKHR::FIFO],
