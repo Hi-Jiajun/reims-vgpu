@@ -1759,6 +1759,213 @@ mod cache_tests {
         }
     }
 
+    /// A driven history of the cache against a shadow that owns no index.
+    ///
+    /// The shadow is one map from key to handle, written only when a `create`
+    /// closure actually returned a handle and read only to say what a
+    /// `forget_view` should have handed back. It has no reverse index at all,
+    /// which is the point: the reverse index is the thing under test, and a
+    /// shadow that kept one would go wrong in the same way.
+    ///
+    /// Three laws, and every one of them is a native object's lifetime:
+    ///
+    /// - **No handle comes back twice.** A framebuffer handed to the caller
+    ///   twice is destroyed twice, and the second destroy is on a handle the
+    ///   driver has already reused. Held over the whole history, across
+    ///   `forget_view` and `retire` together, not per call.
+    /// - **No handle is lost.** Everything created and not forgotten comes back
+    ///   from `retire`. A framebuffer the cache forgot about is one the epoch
+    ///   ends without destroying.
+    /// - **The index says exactly what is live.** `indexed_views` counts the
+    ///   distinct views of the live framebuffers and nothing else — an index
+    ///   that keeps a dead key hands the same handle back on a later forget,
+    ///   which is the first law again by a longer route.
+    ///
+    /// `forget_view` is driven mostly on views something actually names, and
+    /// the counter below says how often, because a sweep that forgets views
+    /// nobody used proves only that the empty case returns nothing.
+    ///
+    /// A `create` that fails is driven too. Its key must stay a miss: a cached
+    /// failure turns one driver refusal into a permanent one, and an *indexed*
+    /// failure would hand back a handle that was never made.
+    #[test]
+    fn a_driven_history_hands_every_framebuffer_back_exactly_once() {
+        use std::collections::{HashMap as Map, HashSet as Set};
+
+        let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let (mut created, mut hits, mut refused_creates) = (0u64, 0u64, 0u64);
+        let (mut forgets_that_dropped, mut empty_forgets, mut retires) = (0u64, 0u64, 0u64);
+        let (mut pass_hits, mut pass_misses) = (0u64, 0u64);
+
+        for _ in 0..400 {
+            let mut cache = Cache::new();
+            // What the sweep believes is live, and every handle ever returned
+            // to the caller. Both are written from the calls alone.
+            let mut live: Map<FramebufferKey, vk::Framebuffer> = Map::new();
+            let mut returned: Set<u64> = Set::new();
+            let mut handles = 1u64;
+
+            for _ in 0..40 {
+                match next() % 10 {
+                    // A framebuffer, from a small pool of views so that one
+                    // view names several framebuffers and several views name
+                    // one.
+                    0..=4 => {
+                        let count = 1 + (next() % 2) as usize;
+                        let views: Vec<vk::ImageView> = (0..count)
+                            .map(|_| vk::ImageView::from_raw(1 + next() % 3))
+                            .collect();
+                        let key = FramebufferKey {
+                            render_pass: vk::RenderPass::from_raw(1),
+                            views,
+                            width: 64,
+                            height: 32,
+                            layers: 1,
+                        };
+                        let fail = next() % 8 == 0;
+                        let expected = live.get(&key).copied();
+                        let mut ran = false;
+                        let answer = cache.framebuffer(&key, || {
+                            ran = true;
+                            if fail {
+                                Err(())
+                            } else {
+                                handles += 1;
+                                Ok(vk::Framebuffer::from_raw(handles))
+                            }
+                        });
+                        match (expected, answer) {
+                            (Some(known), Ok(got)) => {
+                                assert_eq!(got, known, "a hit answered with another handle");
+                                assert!(!ran, "a hit called the driver");
+                                hits += 1;
+                            }
+                            (None, Ok(got)) => {
+                                assert!(ran);
+                                created += 1;
+                                live.insert(key, got);
+                            }
+                            (None, Err(())) => {
+                                assert!(ran);
+                                refused_creates += 1;
+                            }
+                            (Some(_), Err(())) => panic!("a live key reached the driver"),
+                        }
+                    }
+                    5..=7 => {
+                        // Mostly a view something names, so the interesting
+                        // half of `forget_view` is actually driven.
+                        let view = vk::ImageView::from_raw(if next() % 8 == 0 {
+                            90 + next() % 4
+                        } else {
+                            1 + next() % 3
+                        });
+                        let mut expected: Vec<vk::Framebuffer> = Vec::new();
+                        live.retain(|key, framebuffer| {
+                            if key.views.contains(&view) {
+                                expected.push(*framebuffer);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        let mut dropped = cache.forget_view(view);
+                        dropped.sort_by_key(|f| f.as_raw());
+                        expected.sort_by_key(|f| f.as_raw());
+                        assert_eq!(dropped, expected, "forget_view answered the wrong set");
+                        if dropped.is_empty() {
+                            empty_forgets += 1;
+                        } else {
+                            forgets_that_dropped += 1;
+                        }
+                        for framebuffer in dropped {
+                            assert!(
+                                returned.insert(framebuffer.as_raw()),
+                                "a framebuffer came back twice"
+                            );
+                        }
+                    }
+                    8 => {
+                        let signature = signature(if next() % 2 == 0 {
+                            vk::AttachmentLoadOp::CLEAR
+                        } else {
+                            vk::AttachmentLoadOp::LOAD
+                        });
+                        let before = cache.census();
+                        let _ = cache.render_pass(&signature, || {
+                            handles += 1;
+                            Ok::<_, ()>(vk::RenderPass::from_raw(handles))
+                        });
+                        let after = cache.census();
+                        pass_hits += (after.render_pass_hits - before.render_pass_hits) as u64;
+                        pass_misses +=
+                            (after.render_pass_misses - before.render_pass_misses) as u64;
+                    }
+                    // Gated inside the arm rather than given a narrower
+                    // range: a retirement empties the cache, and too many of
+                    // them leave every history too short for one view to name
+                    // several framebuffers.
+                    _ if next() % 3 == 0 => {
+                        let retired = cache.retire();
+                        retires += 1;
+                        let mut got: Vec<u64> =
+                            retired.framebuffers.iter().map(|f| f.as_raw()).collect();
+                        let mut want: Vec<u64> = live.values().map(|f| f.as_raw()).collect();
+                        got.sort_unstable();
+                        want.sort_unstable();
+                        assert_eq!(got, want, "retire lost or invented a framebuffer");
+                        for raw in got {
+                            assert!(returned.insert(raw), "a framebuffer came back twice");
+                        }
+                        live.clear();
+                        assert_eq!(cache.indexed_views(), 0, "an index survived retirement");
+                    }
+                    _ => {}
+                }
+
+                // The index holds exactly the live framebuffers' views, after
+                // every operation. An index entry for a framebuffer that is
+                // gone is how the same handle comes back a second time.
+                let distinct: Set<vk::ImageView> =
+                    live.keys().flat_map(|k| k.views.iter().copied()).collect();
+                assert_eq!(
+                    cache.indexed_views(),
+                    distinct.len(),
+                    "the reverse index and the live set disagree"
+                );
+                assert_eq!(cache.census().framebuffers, live.len());
+            }
+
+            // Nothing is lost at the end of the history either.
+            let retired = cache.retire();
+            for framebuffer in retired.framebuffers {
+                assert!(
+                    returned.insert(framebuffer.as_raw()),
+                    "a framebuffer came back twice"
+                );
+            }
+        }
+
+        assert!(created > 5_000, "created={created}");
+        assert!(hits > 1_500, "hits={hits}");
+        assert!(refused_creates > 500, "refused={refused_creates}");
+        assert!(
+            forgets_that_dropped > 2_000,
+            "forgets_that_dropped={forgets_that_dropped}"
+        );
+        assert!(empty_forgets > 2_000, "empty_forgets={empty_forgets}");
+        assert!(retires > 400, "retires={retires}");
+        assert!(pass_hits > 500, "pass_hits={pass_hits}");
+        assert!(pass_misses > 800, "pass_misses={pass_misses}");
+    }
+
     /// A repeated signature is one object, and the driver is asked once.
     #[test]
     fn a_repeated_signature_is_one_render_pass() {
