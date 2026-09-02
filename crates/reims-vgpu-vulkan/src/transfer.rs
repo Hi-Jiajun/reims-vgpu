@@ -43,6 +43,7 @@ use reims_vgpu_core::blit::{BlitOp, ImagePitch, Origin3, Size3, TexturePoint};
 use reims_vgpu_core::pixel_format::block_geometry;
 use reims_vgpu_core::texture_shape::Texture;
 
+use crate::buffer::BufferPlan;
 use crate::resident::{Miss, Residency};
 use crate::view::aspect;
 
@@ -126,6 +127,17 @@ pub enum Refusal {
         named: u64,
         available: u64,
     },
+    /// The buffer side of a transfer runs past the end of the buffer it names.
+    ///
+    /// The last byte a copy or a fill addresses, against the length the buffer
+    /// was created with. Past it the driver writes into --- or reads from ---
+    /// whatever the allocator put next, which for a suballocated buffer is
+    /// another guest resource. Nothing downstream can see that happen.
+    ///
+    /// `length` for a buffer-image copy is the region's *addressed footprint*
+    /// and not its texel count: a pitch wider than the copy makes the two
+    /// differ, and it is the footprint that reaches memory.
+    OutsideBuffer { offset: u64, length: u64, size: u64 },
     /// A blit-encoder operation that is not a copy, and so has no native
     /// transfer form at all.
     ///
@@ -150,6 +162,7 @@ impl Refusal {
             Self::ImagePitchShorterThanCopy { .. } => "vk_transfer_image_pitch_shorter_than_copy",
             Self::ImagePitchWithoutRowPitch { .. } => "vk_transfer_image_pitch_without_row_pitch",
             Self::OutsideTexture { .. } => "vk_transfer_outside_texture",
+            Self::OutsideBuffer { .. } => "vk_transfer_outside_buffer",
             Self::NotACopy { .. } => "vk_transfer_not_a_copy",
         }
     }
@@ -212,6 +225,15 @@ impl std::fmt::Display for Refusal {
             } => write!(
                 f,
                 "{} axis={axis} named={named} available={available}",
+                self.slug()
+            ),
+            Self::OutsideBuffer {
+                offset,
+                length,
+                size,
+            } => write!(
+                f,
+                "{} offset={offset} length={length} size={size}",
                 self.slug()
             ),
             Self::NotACopy { op } => write!(f, "{} op={op}", self.slug()),
@@ -277,6 +299,87 @@ fn offset(origin: Origin3) -> Result<vk::Offset3D, Refusal> {
             value: origin.z,
         })?,
     })
+}
+
+/// A window of a buffer must end inside it.
+///
+/// The one place a buffer's own length is compared against what a transfer
+/// asks of it, so every copy and every fill is bounded by the same sentence.
+fn within_buffer(plan: &BufferPlan, offset: u64, length: u64) -> Result<(), Refusal> {
+    let end = offset.checked_add(length).ok_or(Refusal::OutsideBuffer {
+        offset,
+        length,
+        size: plan.size,
+    })?;
+    if end > plan.size {
+        return Err(Refusal::OutsideBuffer {
+            offset,
+            length,
+            size: plan.size,
+        });
+    }
+    Ok(())
+}
+
+/// The bytes one buffer-image region addresses, from its buffer offset.
+///
+/// **Not the texel count and not the packed size of the copy.** Vulkan
+/// addresses a region through the row and image pitches, so a copy of 8x8
+/// texels described with a 1024-texel row reaches nearly seven rows further
+/// into the buffer than its own texels occupy. Bounding the buffer by the
+/// packed size would admit exactly that copy, and it is the shape a guest
+/// producing a window into a larger image naturally sends.
+///
+/// The last addressed block is
+/// `(depth-1)*rows_per_image*blocks_per_row + (rows-1)*blocks_per_row +
+/// blocks_across`, in blocks, which is the spec's own addressing spelled in
+/// this module's units. An empty extent addresses nothing.
+///
+/// # Errors
+///
+/// [`Refusal`] from the pitch conversion, or when the footprint does not fit
+/// 64 bits.
+pub fn region_bytes(texture: Texture, pitch: ImagePitch, size: Size3) -> Result<u64, Refusal> {
+    let format = texture.pixel_format();
+    let block = block_geometry(format).ok_or(Refusal::UnknownFormatGeometry { format })?;
+    let (row_length, image_height) = texel_pitch(texture, pitch, size)?;
+    if size.width == 0 || size.height == 0 || size.depth == 0 {
+        return Ok(0);
+    }
+    // Zero is "as wide as the copy" and "as tall as the copy", which is what
+    // Vulkan reads a zero pitch as.
+    let row_texels = if row_length == 0 {
+        size.width
+    } else {
+        u64::from(row_length)
+    };
+    let image_rows = if image_height == 0 {
+        size.height
+    } else {
+        u64::from(image_height)
+    };
+    let ceil = |value: u64, by: u32| value.div_ceil(u64::from(by));
+    let blocks_per_row = ceil(row_texels, block.width);
+    let rows_per_image = ceil(image_rows, block.height);
+    let blocks_across = ceil(size.width, block.width);
+    let rows = ceil(size.height, block.height);
+
+    let overflow = || Refusal::ExtentTooLarge {
+        axis: "footprint",
+        value: u64::MAX,
+    };
+    let slices = rows_per_image
+        .checked_mul(blocks_per_row)
+        .and_then(|per_slice| per_slice.checked_mul(size.depth - 1))
+        .ok_or_else(overflow)?;
+    let within_slice = blocks_per_row
+        .checked_mul(rows - 1)
+        .and_then(|b| b.checked_add(blocks_across))
+        .ok_or_else(overflow)?;
+    slices
+        .checked_add(within_slice)
+        .and_then(|blocks| blocks.checked_mul(u64::from(block.bytes)))
+        .ok_or_else(overflow)
 }
 
 /// `named` must not exceed `available`, on one axis of one texture.
@@ -477,9 +580,13 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
             if size == 0 {
                 return Err(Refusal::EmptyRange);
             }
+            let from = resolved(residency.buffer(source))?;
+            let to = resolved(residency.buffer(dest))?;
+            within_buffer(&from.plan, source_offset, size)?;
+            within_buffer(&to.plan, dest_offset, size)?;
             Ok(Command::CopyBuffer {
-                source: resolved(residency.buffer(source))?.buffer,
-                dest: resolved(residency.buffer(dest))?.buffer,
+                source: from.buffer,
+                dest: to.buffer,
                 regions: vec![vk::BufferCopy {
                     src_offset: source_offset,
                     dst_offset: dest_offset,
@@ -495,10 +602,15 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
             dest,
             options: _,
         } => {
-            let buffer = resolved(residency.buffer(source))?.buffer;
+            let from = resolved(residency.buffer(source))?;
             let image = resolved(residency.image(dest.texture))?;
+            within_buffer(
+                &from.plan,
+                source_offset,
+                region_bytes(image.texture, source_pitch, size)?,
+            )?;
             Ok(Command::CopyBufferToImage {
-                source: buffer,
+                source: from.buffer,
                 dest: image.image,
                 regions: vec![buffer_image_region(
                     image.texture,
@@ -518,10 +630,15 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
             options: _,
         } => {
             let image = resolved(residency.image(source.texture))?;
-            let buffer = resolved(residency.buffer(dest))?.buffer;
+            let to = resolved(residency.buffer(dest))?;
+            within_buffer(
+                &to.plan,
+                dest_offset,
+                region_bytes(image.texture, dest_pitch, size)?,
+            )?;
             Ok(Command::CopyImageToBuffer {
                 source: image.image,
-                dest: buffer,
+                dest: to.buffer,
                 regions: vec![buffer_image_region(
                     image.texture,
                     dest_offset,
@@ -705,7 +822,9 @@ pub fn plan_fill(
     if span.length == 0 {
         return Err(Refusal::EmptyRange);
     }
-    let dest = resolved(residency.buffer(span.buffer))?.buffer;
+    let target = resolved(residency.buffer(span.buffer))?;
+    within_buffer(&target.plan, span.offset, span.length)?;
+    let dest = target.buffer;
 
     // The bytes before the first four-byte boundary inside the range, and
     // after the last one. Both are zero for an aligned range, which is the
@@ -1714,6 +1833,11 @@ mod tests {
                 named: 2,
                 available: 1,
             },
+            Refusal::OutsideBuffer {
+                offset: 1,
+                length: 2,
+                size: 2,
+            },
             Refusal::NotACopy { op: "x" },
         ];
         let slugs: BTreeSet<&str> = refusals.iter().map(|r| r.slug()).collect();
@@ -1998,5 +2122,172 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// A buffer whose length is exactly the fixture's, so a bound can be
+    /// written against a number instead of against `1 << 20`.
+    fn sized_buffer(handle: u64, size: u64) -> Native {
+        Native::Buffer(NativeBuffer {
+            buffer: vk::Buffer::from_raw(handle),
+            memory: vk::DeviceMemory::from_raw(handle),
+            plan: BufferPlan {
+                size,
+                usage: EVERY_CLASS,
+                aliased: false,
+            },
+        })
+    }
+
+    fn with_small_buffer(size: u64) -> Residency {
+        let mut residency = Residency::new();
+        let mut retire = NativeRetirement::new();
+        let lifetime = Lifetime::new(SessionGeneration::FIRST, DeviceEpoch::FIRST);
+        for (slot, native) in [
+            (BUFFER_A, sized_buffer(0xB1, size)),
+            (BUFFER_B, native_buffer(0xB2)),
+            (
+                IMAGE_A,
+                native_image(0x1A, texture(MTL_FORMAT_RGBA8_UNORM, 64, 32, 4, 3)),
+            ),
+        ] {
+            residency
+                .publish(id(slot), lifetime, native, &mut retire)
+                .unwrap_or_else(|(_, e)| panic!("{e}"));
+        }
+        residency
+    }
+
+    /// The failure this exists to prevent: a copy whose buffer window ends past
+    /// the buffer. Past it the driver reaches whatever the allocator put next,
+    /// which for a suballocated buffer is another guest resource.
+    #[test]
+    fn a_buffer_copy_past_the_end_of_its_buffer_refuses() {
+        let residency = with_small_buffer(256);
+        let copy = |source_offset, size| {
+            plan(
+                &BlitOp::BufferToBuffer {
+                    source: id(BUFFER_A),
+                    source_offset,
+                    dest: id(BUFFER_B),
+                    dest_offset: 0,
+                    size,
+                },
+                &residency,
+            )
+        };
+        assert!(copy(192, 64).is_ok(), "ending exactly on the end is inside");
+        assert_eq!(
+            copy(192, 65).expect_err("one byte past"),
+            Refusal::OutsideBuffer {
+                offset: 192,
+                length: 65,
+                size: 256,
+            }
+        );
+        // The wrap a plain addition would have turned into a copy that fits.
+        assert_eq!(
+            copy(u64::MAX, 8).expect_err("wrapped"),
+            Refusal::OutsideBuffer {
+                offset: u64::MAX,
+                length: 8,
+                size: 256,
+            }
+        );
+    }
+
+    /// A fill is not a copy and had no bound at all --- a `fillBuffer:range:`
+    /// past the end writes the pattern into whatever follows.
+    #[test]
+    fn a_fill_past_the_end_of_its_buffer_refuses() {
+        let residency = with_small_buffer(256);
+        let mut arena = arena();
+        assert_eq!(
+            plan_fill(
+                BufferSpan {
+                    buffer: id(BUFFER_A),
+                    offset: 128,
+                    length: 256,
+                },
+                FillPattern::Byte(0xAB),
+                &residency,
+                &mut arena,
+            )
+            .expect_err("past the end"),
+            Refusal::OutsideBuffer {
+                offset: 128,
+                length: 256,
+                size: 256,
+            }
+        );
+        assert!(plan_fill(
+            BufferSpan {
+                buffer: id(BUFFER_A),
+                offset: 128,
+                length: 128,
+            },
+            FillPattern::Byte(0xAB),
+            &residency,
+            &mut arena,
+        )
+        .is_ok());
+    }
+
+    /// A buffer-image copy reaches as far as its *pitch* says, not as far as
+    /// its texels occupy. Bounding by the packed size would admit a copy whose
+    /// row pitch walks it off the end --- which is the shape a guest sending a
+    /// window into a larger image naturally produces.
+    #[test]
+    fn a_buffer_image_copy_is_bounded_by_the_footprint_the_pitch_addresses() {
+        let flat = texture(MTL_FORMAT_RGBA8_UNORM, 64, 32, 1, 1);
+        // Eight rows of 8 texels each, described with a 64-texel row: the last
+        // row starts 7*256 bytes in and is 32 bytes long.
+        let windowed = ImagePitch {
+            bytes_per_row: 256,
+            bytes_per_image: 0,
+        };
+        assert_eq!(region_bytes(flat, windowed, size(8, 8)), Ok(7 * 256 + 32));
+        // The same copy packed is eight rows of 32 bytes.
+        assert_eq!(
+            region_bytes(
+                flat,
+                ImagePitch {
+                    bytes_per_row: 0,
+                    bytes_per_image: 0,
+                },
+                size(8, 8),
+            ),
+            Ok(8 * 32)
+        );
+        // BC3 is a 4x4 block of sixteen bytes: an 8x8 copy is two rows of two
+        // blocks, and a 64-texel row is sixteen blocks.
+        let compressed = texture(MTL_FORMAT_BC3_RGBA, 64, 32, 1, 1);
+        assert_eq!(
+            region_bytes(compressed, windowed, size(8, 8)),
+            Ok(16 * 16 + 2 * 16)
+        );
+
+        let residency = with_small_buffer(7 * 256 + 32);
+        let copy = |offset| {
+            plan(
+                &BlitOp::BufferToTexture {
+                    source: id(BUFFER_A),
+                    source_offset: offset,
+                    source_pitch: windowed,
+                    size: size(8, 8),
+                    dest: point(IMAGE_A, 0, 0),
+                    options: Default::default(),
+                },
+                &residency,
+            )
+        };
+        assert!(copy(0).is_ok(), "the footprint is exactly the buffer");
+        assert_eq!(
+            copy(1).expect_err("one byte past"),
+            Refusal::OutsideBuffer {
+                offset: 1,
+                length: 7 * 256 + 32,
+                size: 7 * 256 + 32,
+            }
+        );
     }
 }
