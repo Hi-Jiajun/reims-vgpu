@@ -802,4 +802,312 @@ mod tests {
         assert!(occupied.to_string().starts_with(occupied.slug()));
         assert!(occupied.slug().starts_with("vk_resident_"));
     }
+
+    // ---- A driven history of the table's lifetime bookkeeping ------------
+    //
+    // Every rule this module states is about *conservation*: a native that
+    // leaves the table reaches retirement exactly once, against the last point
+    // a submission named it, and nothing else. A native queued twice is a
+    // double destroy; a native queued against too early a point is a
+    // use-after-free; a native that leaves the table and is never queued is a
+    // leak. None of the three is visible in a single call.
+    //
+    // The shadow below never asks the table anything. It follows the calls'
+    // *arguments* --- which slot, which generation, which point --- and every
+    // claim is checked against that.
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// One slot, as the shadow holds it.
+    #[derive(Clone, Copy)]
+    struct Held {
+        generation: u64,
+        last_use: u64,
+        /// The `vkBuffer`/`vkImage` raw handle, which is unique per publish and
+        /// is therefore the identity a conservation claim is written against.
+        handle: u64,
+        is_image: bool,
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        published: usize,
+        occupied: usize,
+        replaced: usize,
+        deleted: usize,
+        used: usize,
+        used_stale: usize,
+        drained: usize,
+        unknown: usize,
+        stale: usize,
+        wrong_kind: usize,
+    }
+
+    #[test]
+    fn every_native_that_leaves_the_table_is_retired_once_against_its_last_use() {
+        let mut tally = Tally::default();
+        for seed in 0..600_u64 {
+            let mut rng = Rng::new(seed);
+            let mut table = Residency::new();
+            let mut retire = NativeRetirement::new();
+            let mut shadow: BTreeMap<u32, Held> = BTreeMap::new();
+            // Every handle ever minted, and where the shadow says it went.
+            let mut minted: Vec<u64> = Vec::new();
+            // handle -> the last-use point the shadow says it left with. The
+            // number a destroy must wait for, and the one a use-after-free
+            // gets wrong.
+            let mut departed: BTreeMap<u64, u64> = BTreeMap::new();
+            let mut handle = 0_u64;
+            let (mut publishes, mut replacements) = (0_usize, 0_usize);
+
+            for _ in 0..80 {
+                let slot = rng.below(5) as u32;
+                // Mostly the generation the shadow holds, so the resolving
+                // paths are driven; sometimes a neighbour, so both directions
+                // of `Stale` are.
+                let generation = match shadow.get(&slot) {
+                    Some(held) if rng.below(4) != 0 => held.generation,
+                    Some(held) => held.generation + 1 + rng.below(2),
+                    None => 1 + rng.below(3),
+                };
+                let id = id(slot, generation);
+
+                match rng.below(16) {
+                    0..=4 => {
+                        handle += 1;
+                        let is_image = rng.below(2) == 0;
+                        let native = if is_image {
+                            native_image(handle)
+                        } else {
+                            native_buffer(handle)
+                        };
+                        let displaced = shadow.get(&slot).copied();
+                        match table.publish(id, lifetime(), native, &mut retire) {
+                            Ok(()) => {
+                                assert!(
+                                    displaced.is_none_or(|d| d.generation != generation),
+                                    "the same generation was published twice"
+                                );
+                                minted.push(handle);
+                                publishes += 1;
+                                tally.published += 1;
+                                if let Some(gone) = displaced {
+                                    replacements += 1;
+                                    tally.replaced += 1;
+                                    departed.insert(gone.handle, gone.last_use);
+                                }
+                                shadow.insert(
+                                    slot,
+                                    Held {
+                                        generation,
+                                        last_use: 0,
+                                        handle,
+                                        is_image,
+                                    },
+                                );
+                            }
+                            Err((back, occupied)) => {
+                                let held = displaced.expect("something refused it");
+                                assert_eq!(held.generation, generation);
+                                assert_eq!(occupied.slot, id.slot);
+                                assert_eq!(occupied.generation, id.generation);
+                                // Handed back rather than leaked, and it is the
+                                // one the caller passed in.
+                                assert_eq!(raw_of(&back), handle);
+                                handle -= 1;
+                                tally.occupied += 1;
+                            }
+                        }
+                    }
+                    5..=7 => {
+                        let at = TimelinePoint(1 + rng.below(20));
+                        let before = shadow.get(&slot).copied();
+                        match table.used(id, at) {
+                            Ok(()) => {
+                                let held = before.expect("it resolved");
+                                assert_eq!(held.generation, generation);
+                                // Forward only: an earlier submission naming a
+                                // resource does not shorten a later one's hold.
+                                shadow.get_mut(&slot).expect("held").last_use =
+                                    held.last_use.max(at.0);
+                                tally.used += 1;
+                            }
+                            Err(miss) => {
+                                assert_eq!(miss, expected_miss(before, slot, generation, None));
+                                tally.used_stale += 1;
+                                count_miss(&mut tally, miss);
+                            }
+                        }
+                    }
+                    8 | 9 => {
+                        let before = shadow.get(&slot).copied();
+                        match table.delete(id, &mut retire) {
+                            Ok(()) => {
+                                let held = before.expect("it resolved");
+                                assert_eq!(held.generation, generation);
+                                departed.insert(held.handle, held.last_use);
+                                shadow.remove(&slot);
+                                tally.deleted += 1;
+                            }
+                            Err(miss) => {
+                                assert_eq!(miss, expected_miss(before, slot, generation, None));
+                                count_miss(&mut tally, miss);
+                            }
+                        }
+                    }
+                    10 => {
+                        let expected = shadow.len();
+                        assert_eq!(table.drain(&mut retire), expected);
+                        for gone in shadow.values() {
+                            departed.insert(gone.handle, gone.last_use);
+                        }
+                        shadow.clear();
+                        tally.drained += 1;
+                    }
+                    _ => {
+                        // The three resolving doors, against the shadow.
+                        let before = shadow.get(&slot).copied();
+                        let want_image = rng.below(2) == 0;
+                        let resolved = if want_image {
+                            table.image(id).map(|i| i.image.as_raw())
+                        } else {
+                            table.buffer(id).map(|b| b.buffer.as_raw())
+                        };
+                        match resolved {
+                            Ok(raw) => {
+                                let held = before.expect("it resolved");
+                                assert_eq!(held.generation, generation);
+                                assert_eq!(held.is_image, want_image);
+                                assert_eq!(raw, held.handle);
+                            }
+                            Err(miss) => {
+                                assert_eq!(
+                                    miss,
+                                    expected_miss(before, slot, generation, Some(want_image))
+                                );
+                                count_miss(&mut tally, miss);
+                            }
+                        }
+                    }
+                }
+
+                assert_eq!(table.population(), shadow.len());
+                assert_eq!(table.census(), (publishes, replacements));
+            }
+
+            // Conservation, over the whole history. Everything ever published
+            // is either still nameable or waiting to be destroyed --- never
+            // both, never neither, never twice.
+            let still_held: BTreeMap<u64, u64> =
+                shadow.values().map(|h| (h.handle, h.last_use)).collect();
+            let mut queued: BTreeMap<u64, u64> = BTreeMap::new();
+            for retired in retire.reached(DeviceEpoch::FIRST, TimelinePoint(u64::MAX)) {
+                let raw = raw_of(&retired.object);
+                assert!(
+                    queued.insert(raw, retired.last_use.0).is_none(),
+                    "handle {raw} was queued for destruction twice"
+                );
+                assert!(
+                    !still_held.contains_key(&raw),
+                    "handle {raw} is queued for destruction and still nameable"
+                );
+                // The point a destroy waits for. Too early is a use-after-free
+                // and too late is a leak, and only the history knows which one
+                // this is.
+                assert_eq!(
+                    Some(&retired.last_use.0),
+                    departed.get(&raw),
+                    "handle {raw} was retired against the wrong last use"
+                );
+            }
+            assert_eq!(retire.outstanding(), 0);
+            for handle in &minted {
+                let where_it_went = still_held.contains_key(handle) || queued.contains_key(handle);
+                assert!(where_it_went, "handle {handle} was published and then lost");
+            }
+            assert_eq!(minted.len(), still_held.len() + queued.len());
+        }
+
+        // Floors per path. One aggregate would let a path go undriven and
+        // still read as covered.
+        assert!(tally.published > 5_000, "{}", tally.published);
+        assert!(tally.occupied > 2_000, "{}", tally.occupied);
+        assert!(tally.replaced > 700, "{}", tally.replaced);
+        assert!(tally.deleted > 800, "{}", tally.deleted);
+        assert!(tally.used > 1_000, "{}", tally.used);
+        assert!(tally.used_stale > 3_000, "{}", tally.used_stale);
+        assert!(tally.drained > 1_500, "{}", tally.drained);
+        assert!(tally.unknown > 8_000, "{}", tally.unknown);
+        assert!(tally.stale > 1_000, "{}", tally.stale);
+        assert!(tally.wrong_kind > 1_000, "{}", tally.wrong_kind);
+    }
+
+    /// The raw handle, which is the same number for either kind because the
+    /// fixtures mint them from one counter.
+    fn raw_of(native: &Native) -> u64 {
+        match native {
+            Native::Buffer(buffer) => buffer.buffer.as_raw(),
+            Native::Image(image) => image.image.as_raw(),
+        }
+    }
+
+    /// What the shadow says a name should miss with, derived from the calls'
+    /// arguments and never from the table.
+    fn expected_miss(
+        held: Option<Held>,
+        slot: u32,
+        generation: u64,
+        want_image: Option<bool>,
+    ) -> Miss {
+        let Some(held) = held else {
+            return Miss::Unknown {
+                slot: ObjectListRef(slot),
+            };
+        };
+        if held.generation != generation {
+            return Miss::Stale {
+                slot: ObjectListRef(slot),
+                held: SlotGeneration(held.generation),
+                named: SlotGeneration(generation),
+            };
+        }
+        let wanted = want_image.expect("a kind question is the only miss left");
+        Miss::WrongKind {
+            slot: ObjectListRef(slot),
+            held: if held.is_image {
+                Kind::Image
+            } else {
+                Kind::Buffer
+            },
+            wanted: if wanted { Kind::Image } else { Kind::Buffer },
+        }
+    }
+
+    fn count_miss(tally: &mut Tally, miss: Miss) {
+        match miss {
+            Miss::Unknown { .. } => tally.unknown += 1,
+            Miss::Stale { .. } => tally.stale += 1,
+            Miss::WrongKind { .. } => tally.wrong_kind += 1,
+        }
+    }
 }
