@@ -1694,6 +1694,7 @@ mod tests {
     use super::*;
     use crate::identity::SlotGeneration;
     use reims_vgpu_protocol::packets::LEDGER;
+    use std::collections::HashSet;
 
     const TASK: TaskId = TaskId(1);
 
@@ -3407,5 +3408,577 @@ mod tests {
             }]
         );
         assert_eq!(l.content().extent(BackingId(10)), None);
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// Deliberately tiny pools, so tasks share backings constantly and a
+    /// cross-task holder is the common case rather than a corner.
+    const TASKS: u64 = 3;
+    const SLOTS: u64 = 4;
+    const BACKINGS: u64 = 4;
+    const HEAPS: u64 = 2;
+    const HEAP_LENGTH: u64 = 256;
+    const RESOURCE_LENGTH: u64 = 64;
+
+    /// One task, projected to what a caller can observe of it.
+    #[derive(Debug, PartialEq, Eq)]
+    struct TaskShot {
+        task: TaskId,
+        directory: DirectoryFrame,
+        names: Vec<ResourceId>,
+        resident: Vec<(ResourceId, BackingId, ByteRange)>,
+        heaps: Vec<u64>,
+    }
+
+    /// The whole model, projected. Compared before and after a refusal, because
+    /// "nothing is half-applied" is a claim about everything and not about the
+    /// registry the refusal came from.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Shot {
+        tasks: Vec<TaskShot>,
+        content: Vec<(BackingId, bool, Option<ByteRange>)>,
+    }
+
+    fn shot(l: &Lifecycle) -> Shot {
+        let mut tasks: Vec<TaskShot> = l
+            .tasks
+            .iter()
+            .map(|(task, t)| {
+                let mut resident: Vec<(ResourceId, BackingId, ByteRange)> = t
+                    .resident
+                    .iter()
+                    .map(|(id, r)| (*id, r.backing(), r.extent()))
+                    .collect();
+                resident.sort_unstable_by_key(|(id, _, _)| (id.slot.0, id.generation));
+                TaskShot {
+                    task: *task,
+                    directory: t.directory,
+                    names: t.namespace.live_names(),
+                    resident,
+                    heaps: t.heaps.live_heaps(),
+                }
+            })
+            .collect();
+        tasks.sort_unstable_by_key(|s| s.task.0);
+        let content = (0..BACKINGS)
+            .map(|n| {
+                let b = BackingId(n);
+                (b, l.content().knows(b), l.content().extent(b))
+            })
+            .collect();
+        Shot { tasks, content }
+    }
+
+    /// A name the sweep hands out, remembered whether or not it is still live,
+    /// so stale names keep reaching the operations that must refuse them.
+    #[derive(Clone, Copy)]
+    struct Handed {
+        task: TaskId,
+        id: ResourceId,
+    }
+
+    #[derive(Default)]
+    struct Census {
+        applied: u32,
+        refused: u32,
+        /// Deletes, replacements and backing retirements that resolved, which
+        /// are the routes that forget content.
+        deletes: u32,
+        replacements: u32,
+        retired_backings: u32,
+        deleted_tasks: u32,
+        redefinitions: u32,
+        placed: u32,
+        /// Placements refused after their name was published, which spend a
+        /// generation without leaving a resource behind.
+        spent_generations: u32,
+        /// Steps where a backing was named by live residents of two tasks at
+        /// once, which is the shape the per-task teardown answer cannot see.
+        shared_backings: u32,
+        declines: u32,
+    }
+
+    /// **The content authority holds exactly the backings the model still
+    /// answers for, and a refused operation changes nothing.**
+    ///
+    /// Two claims, and the first needs a shadow the model does not have. Where
+    /// a backing's bytes are is session-wide; who still names it is per task,
+    /// split across two registries — a task's namespace and a task's heaps —
+    /// and no single owner in the model is asked the whole question in the
+    /// course of ordinary work. The shadow asks it the dumbest possible way,
+    /// by scanning every task after every step, and holds the ledger to it in
+    /// both directions: nothing a live name reaches may be forgotten, and
+    /// nothing the model has let go of may be kept.
+    ///
+    /// The second claim needs no shadow at all, only a projection: a refusal
+    /// compares the whole model against the whole model, so a half-applied
+    /// list, a name published before a placement was checked, or a content
+    /// write recorded before a refusal disagrees wherever it happened.
+    ///
+    /// The resident map is checked against a shadow built independently too,
+    /// because two operations delete resources the caller never named — a
+    /// backing retirement deletes everything that named it, and a task
+    /// definition over a live task deletes everything the task had. A cascade
+    /// computed wrong would otherwise only show up as a leak much later.
+    #[test]
+    fn the_content_authority_holds_exactly_what_the_model_still_answers_for() {
+        let mut census = Census::default();
+        for seed in 0..400u64 {
+            let mut rng = Rng::new(seed + 1);
+            let mut l = Lifecycle::new();
+            // The shadow: live residents per task, and heap storage per task.
+            // Flat maps, updated from the operation the sweep issued and never
+            // from the model's own bookkeeping.
+            let mut live: HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>> =
+                HashMap::new();
+            let mut storage: HashMap<TaskId, HashMap<u64, BackingId>> = HashMap::new();
+            let mut generations: HashMap<(TaskId, ObjectListRef), SlotGeneration> = HashMap::new();
+            let mut handed: Vec<Handed> = Vec::new();
+            // Backings the ledger knew at the previous step. A backing
+            // something still holds may not stop being known.
+            let mut knew: HashSet<BackingId> = HashSet::new();
+
+            for _ in 0..64 {
+                let task = TaskId(rng.below(TASKS) as u32 + 1);
+                let slot = ObjectListRef(rng.below(SLOTS) as u32);
+                let backing = BackingId(rng.below(BACKINGS));
+                let before = shot(&l);
+
+                // A heap declaration and a recorded write are owner calls
+                // rather than packets, so they are driven apart from the
+                // operation vocabulary. The write is what puts bytes in the
+                // device's replica, which is the only state in which a discard
+                // can be the declined kind.
+                if rng.below(10) == 0 {
+                    let heap = rng.below(HEAPS);
+                    if l.declare_heap(task, heap, backing, HEAP_LENGTH).is_ok() {
+                        storage.entry(task).or_default().insert(heap, backing);
+                    } else {
+                        assert_eq!(shot(&l), before, "seed {seed}: refused heap declaration");
+                    }
+                    check(seed, &l, &live, &storage, &mut knew, &mut census);
+                    continue;
+                }
+                if rng.below(5) == 0 {
+                    if let Some(h) = a_live_name(&live, &mut rng) {
+                        let replica = if rng.below(3) == 0 {
+                            Replica::GuestPages
+                        } else {
+                            Replica::DeviceOwned
+                        };
+                        if l.record_write(h.task, h.id, 0, RESOURCE_LENGTH, replica)
+                            .is_err()
+                        {
+                            assert_eq!(shot(&l), before, "seed {seed}: refused write");
+                        }
+                    }
+                    check(seed, &l, &live, &storage, &mut knew, &mut census);
+                    continue;
+                }
+
+                let op = match rng.below(22) {
+                    0 => LifecycleOp::DefineTask {
+                        task,
+                        kernel: false,
+                        directory: DirectoryFrame(0x1000 * (rng.below(2) as u32 + 1)),
+                    },
+                    1 => LifecycleOp::DeleteTask { task },
+                    2..=10 => LifecycleOp::CreateResource {
+                        task,
+                        // Mostly a slot the shadow says is free: a redeclared
+                        // live slot refuses, and a driver that spent most of
+                        // its creates on one would leave the model nearly
+                        // empty.
+                        slot: a_free_slot(&live, task, &mut rng).unwrap_or(slot),
+                        storage: if rng.below(2) == 0 {
+                            Storage::Placed {
+                                heap: storage
+                                    .get(&task)
+                                    .and_then(|h| {
+                                        let mut keys: Vec<u64> = h.keys().copied().collect();
+                                        keys.sort_unstable();
+                                        keys.get(rng.below(keys.len().max(1) as u64) as usize)
+                                            .copied()
+                                    })
+                                    .unwrap_or_else(|| rng.below(HEAPS)),
+                                // Reaches past the heap, so a placement that
+                                // must be refused after its name was already
+                                // published is a case the sweep drives.
+                                offset: rng.below(6) * RESOURCE_LENGTH,
+                                length: RESOURCE_LENGTH,
+                            }
+                        } else {
+                            Storage::Dedicated {
+                                backing,
+                                extent: range(0, RESOURCE_LENGTH),
+                            }
+                        },
+                    },
+                    11..=13 => {
+                        let Some(h) = a_name(&live, &handed, &mut rng) else {
+                            continue;
+                        };
+                        LifecycleOp::DeleteResource {
+                            task: h.task,
+                            resource: h.id,
+                        }
+                    }
+                    14..=16 => {
+                        let Some(h) = a_name(&live, &handed, &mut rng) else {
+                            continue;
+                        };
+                        LifecycleOp::ReplacePhysical {
+                            task: h.task,
+                            resource: h.id,
+                            backing,
+                            extent: range(0, RESOURCE_LENGTH),
+                        }
+                    }
+                    17 => LifecycleOp::DeleteBacking { task, backing },
+                    18 => LifecycleOp::MapMemory {
+                        task,
+                        span: GuestSpan {
+                            base: 0x1_0000,
+                            length: 0x1000,
+                        },
+                    },
+                    19 | 20 => {
+                        let resources: Vec<ResourceId> = (0..rng.below(3))
+                            .map(|_| {
+                                a_name(&live, &handed, &mut rng).map_or_else(|| name(0), |h| h.id)
+                            })
+                            .collect();
+                        // Weighted towards the discard, because it is the
+                        // only one of the four whose answer depends on the
+                        // state its transfers left — the declined kind needs
+                        // bytes the device holds alone, which the driven
+                        // writes above are what produce.
+                        match rng.below(6) {
+                            0 => LifecycleOp::Invalidate { task, resources },
+                            1 => LifecycleOp::Synchronize { task, resources },
+                            2 => LifecycleOp::SynchronizeAndDiscard { task, resources },
+                            _ => LifecycleOp::Discard { task, resources },
+                        }
+                    }
+                    _ => LifecycleOp::UnmapMemory {
+                        task,
+                        span: GuestSpan {
+                            base: 0x1_0000,
+                            length: 0x1000,
+                        },
+                    },
+                };
+
+                match l.apply(&op) {
+                    Err(_) => {
+                        census.refused += 1;
+                        assert_eq!(
+                            shot(&l),
+                            before,
+                            "seed {seed}: a refused {op:?} changed the model"
+                        );
+                        // One refusal is not a no-op, and the module says so:
+                        // a placement checked after its name was published
+                        // withdraws the name and leaves the generation spent,
+                        // which is exactly what stops a stale resolution from
+                        // succeeding against the slot's next occupant. The
+                        // shadow states the condition for itself rather than
+                        // reading the model's counter.
+                        if let LifecycleOp::CreateResource {
+                            task,
+                            slot,
+                            storage: Storage::Placed { heap, .. },
+                        } = &op
+                        {
+                            let task_exists = live.contains_key(task);
+                            let slot_free = live.get(task).is_none_or(|r| !r.contains_key(slot));
+                            let heap_exists =
+                                storage.get(task).is_some_and(|h| h.contains_key(heap));
+                            if task_exists && slot_free && heap_exists {
+                                census.spent_generations += 1;
+                                let spent = generations
+                                    .get(&(*task, *slot))
+                                    .map_or_else(|| SlotGeneration::default().next(), |g| g.next());
+                                generations.insert((*task, *slot), spent);
+                            }
+                        }
+                    }
+                    Ok(effects) => {
+                        census.applied += 1;
+                        census.declines += l.complete(&effects).len() as u32;
+                        follow(
+                            &op,
+                            &mut live,
+                            &mut storage,
+                            &mut generations,
+                            &mut handed,
+                            &mut census,
+                        );
+                    }
+                }
+                check(seed, &l, &live, &storage, &mut knew, &mut census);
+            }
+        }
+
+        assert!(census.applied > 3000, "{}", census.applied);
+        assert!(census.refused > 8000, "{}", census.refused);
+        assert!(census.deletes > 300, "{}", census.deletes);
+        assert!(census.replacements > 250, "{}", census.replacements);
+        assert!(census.retired_backings > 120, "{}", census.retired_backings);
+        assert!(census.deleted_tasks > 120, "{}", census.deleted_tasks);
+        assert!(census.redefinitions > 120, "{}", census.redefinitions);
+        assert!(census.placed > 200, "{}", census.placed);
+        assert!(
+            census.spent_generations > 100,
+            "no placement was refused after publishing its name: {}",
+            census.spent_generations
+        );
+        // Thin on purpose rather than by accident: a declined discard needs a
+        // device write over the resource with no invalidate, synchronise or
+        // guest write between, and every one of those restores the guest's
+        // authority. The named test is where the case is pinned; this floor
+        // only says the sweep reaches it.
+        assert!(census.declines > 5, "{}", census.declines);
+        assert!(
+            census.shared_backings > 300,
+            "no backing was ever named by two tasks at once: {}",
+            census.shared_backings
+        );
+    }
+
+    /// A name the shadow believes is live, so the driver spends most of its
+    /// steps on work that can apply rather than on refusals.
+    fn a_live_name(
+        live: &HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>>,
+        rng: &mut Rng,
+    ) -> Option<Handed> {
+        let mut all: Vec<Handed> = live
+            .iter()
+            .flat_map(|(task, r)| {
+                r.values().map(move |(id, _)| Handed {
+                    task: *task,
+                    id: *id,
+                })
+            })
+            .collect();
+        if all.is_empty() {
+            return None;
+        }
+        // Sorted, so which name a seed picks is a property of the seed and not
+        // of a hash order.
+        all.sort_unstable_by_key(|h| (h.task.0, h.id.slot.0, h.id.generation));
+        Some(all[rng.below(all.len() as u64) as usize])
+    }
+
+    /// A slot this task has nothing live in, so a declaration can land.
+    fn a_free_slot(
+        live: &HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>>,
+        task: TaskId,
+        rng: &mut Rng,
+    ) -> Option<ObjectListRef> {
+        if rng.below(4) == 0 {
+            return None;
+        }
+        let taken = live.get(&task);
+        let free: Vec<ObjectListRef> = (0..SLOTS)
+            .map(|n| ObjectListRef(n as u32))
+            .filter(|slot| taken.is_none_or(|t| !t.contains_key(slot)))
+            .collect();
+        (!free.is_empty()).then(|| free[rng.below(free.len() as u64) as usize])
+    }
+
+    /// Mostly a live name, sometimes one the sweep handed out long ago — which
+    /// is how a stale generation, a deleted name and a name from a task that
+    /// has since been redefined all keep reaching the operations that have to
+    /// refuse them.
+    fn a_name(
+        live: &HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>>,
+        handed: &[Handed],
+        rng: &mut Rng,
+    ) -> Option<Handed> {
+        if rng.below(4) != 0 {
+            if let Some(h) = a_live_name(live, rng) {
+                return Some(h);
+            }
+        }
+        if handed.is_empty() {
+            return None;
+        }
+        Some(handed[rng.below(handed.len() as u64) as usize])
+    }
+
+    /// Update the shadow from the operation the sweep issued, computing the
+    /// two cascades — a backing retirement and a redefinition — for itself.
+    fn follow(
+        op: &LifecycleOp,
+        live: &mut HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>>,
+        storage: &mut HashMap<TaskId, HashMap<u64, BackingId>>,
+        generations: &mut HashMap<(TaskId, ObjectListRef), SlotGeneration>,
+        handed: &mut Vec<Handed>,
+        census: &mut Census,
+    ) {
+        match op {
+            LifecycleOp::DefineTask { task, .. } => {
+                if live.insert(*task, HashMap::new()).is_some() {
+                    census.redefinitions += 1;
+                }
+                // A new namespace and new heaps: the generations restart with
+                // them, which is what makes a name from the previous
+                // definition refuse rather than resolve to its successor.
+                storage.insert(*task, HashMap::new());
+                generations.retain(|(t, _), _| t != task);
+            }
+            LifecycleOp::DeleteTask { task } => {
+                census.deleted_tasks += 1;
+                live.remove(task);
+                storage.remove(task);
+                generations.retain(|(t, _), _| t != task);
+            }
+            LifecycleOp::CreateResource {
+                task,
+                slot,
+                storage: what,
+            } => {
+                let generation = generations
+                    .get(&(*task, *slot))
+                    .map_or_else(|| SlotGeneration::default().next(), |g| g.next());
+                generations.insert((*task, *slot), generation);
+                let id = ResourceId {
+                    slot: *slot,
+                    generation,
+                };
+                let backing = match what {
+                    Storage::Dedicated { backing, .. } => *backing,
+                    Storage::Placed { heap, .. } => {
+                        census.placed += 1;
+                        storage[task][heap]
+                    }
+                };
+                live.entry(*task).or_default().insert(*slot, (id, backing));
+                handed.push(Handed { task: *task, id });
+            }
+            LifecycleOp::DeleteResource { task, resource } => {
+                census.deletes += 1;
+                live.entry(*task).or_default().remove(&resource.slot);
+            }
+            LifecycleOp::ReplacePhysical {
+                task,
+                resource,
+                backing,
+                ..
+            } => {
+                census.replacements += 1;
+                if let Some(entry) = live.entry(*task).or_default().get_mut(&resource.slot) {
+                    entry.1 = *backing;
+                }
+            }
+            LifecycleOp::DeleteBacking { task, backing } => {
+                census.retired_backings += 1;
+                live.entry(*task)
+                    .or_default()
+                    .retain(|_, (_, b)| b != backing);
+            }
+            LifecycleOp::MapMemory { .. }
+            | LifecycleOp::UnmapMemory { .. }
+            | LifecycleOp::Invalidate { .. }
+            | LifecycleOp::Synchronize { .. }
+            | LifecycleOp::SynchronizeAndDiscard { .. }
+            | LifecycleOp::Discard { .. } => {}
+        }
+    }
+
+    /// Hold the model to the shadow, and the content ledger to both.
+    fn check(
+        seed: u64,
+        l: &Lifecycle,
+        live: &HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>>,
+        storage: &HashMap<TaskId, HashMap<u64, BackingId>>,
+        knew: &mut HashSet<BackingId>,
+        census: &mut Census,
+    ) {
+        // The resident map, against a shadow that computed both cascades for
+        // itself.
+        for (task, t) in &l.tasks {
+            let mut mine: Vec<(ObjectListRef, ResourceId, BackingId)> = t
+                .resident
+                .iter()
+                .map(|(id, r)| (id.slot, *id, r.backing()))
+                .collect();
+            mine.sort_unstable_by_key(|(slot, _, _)| slot.0);
+            let mut theirs: Vec<(ObjectListRef, ResourceId, BackingId)> = live
+                .get(task)
+                .into_iter()
+                .flatten()
+                .map(|(slot, (id, b))| (*slot, *id, *b))
+                .collect();
+            theirs.sort_unstable_by_key(|(slot, _, _)| slot.0);
+            assert_eq!(mine, theirs, "seed {seed}: residents of {task:?}");
+        }
+        assert_eq!(
+            l.tasks.len(),
+            live.len(),
+            "seed {seed}: the model and the shadow hold different tasks"
+        );
+
+        for n in 0..BACKINGS {
+            let b = BackingId(n);
+            let namers: Vec<TaskId> = live
+                .iter()
+                .filter(|(_, r)| r.values().any(|(_, x)| *x == b))
+                .map(|(t, _)| *t)
+                .collect();
+            let stored = storage.values().any(|h| h.values().any(|x| *x == b));
+            if namers.len() > 1 {
+                census.shared_backings += 1;
+            }
+            if !namers.is_empty() {
+                assert!(
+                    l.content().knows(b),
+                    "seed {seed}: {b:?} is named by {namers:?} and the ledger forgot it"
+                );
+            }
+            // A heap's storage may be known without a live name — a placement
+            // wrote it and the heap still holds the storage. So the two
+            // remaining claims ask both registries: nothing held may stop
+            // being known, and nothing unheld may stay known.
+            if (!namers.is_empty() || stored) && knew.contains(&b) {
+                assert!(
+                    l.content().knows(b),
+                    "seed {seed}: {b:?} is still held and the ledger forgot it"
+                );
+            }
+            if namers.is_empty() && !stored {
+                assert!(
+                    !l.content().knows(b),
+                    "seed {seed}: nothing answers for {b:?} and the ledger kept it"
+                );
+            }
+            if l.content().knows(b) {
+                knew.insert(b);
+            } else {
+                knew.remove(&b);
+            }
+        }
     }
 }

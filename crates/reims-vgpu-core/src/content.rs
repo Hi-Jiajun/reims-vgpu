@@ -386,6 +386,18 @@ impl ContentLedger {
         out
     }
 
+    /// Whether the ledger holds anything at all about a backing.
+    ///
+    /// The question [`Self::forget`] answers by making it false, and the one a
+    /// session-wide owner asks to check that it has neither dropped a live
+    /// backing's history nor kept a dead one's. Presence is not freshness: a
+    /// backing that was declared and never written is known here and fresh in
+    /// no replica.
+    #[must_use]
+    pub fn knows(&self, backing: BackingId) -> bool {
+        self.backings.contains_key(&backing)
+    }
+
     /// Forget a backing entirely.
     pub fn forget(&mut self, backing: BackingId) {
         self.backings.remove(&backing);
