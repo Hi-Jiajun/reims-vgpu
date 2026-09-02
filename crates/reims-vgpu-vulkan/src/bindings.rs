@@ -142,6 +142,17 @@ pub struct Census {
     /// Times everything was invalidated by a command-buffer boundary or an
     /// incompatible pipeline layout.
     pub disturbances: usize,
+    /// Binds that named a slot past the table and were dropped.
+    ///
+    /// Counted rather than left to be inferred from the others. A dropped
+    /// bind is neither a change nor a redundancy, so without this the three
+    /// counters silently stop adding up to the binds the guest issued, and the
+    /// only evidence of guest work this table refused is a shader reading a
+    /// descriptor nobody wrote. Non-zero means either the guest contradicted
+    /// its own argument-table sizes or this table was built with the wrong
+    /// ones — and those are worth telling apart, which needs the number to
+    /// exist.
+    pub ignored: usize,
 }
 
 /// One shader-visible table's contents and its dirty set.
@@ -188,6 +199,7 @@ impl BindingTable {
     /// on this pipeline can read.
     pub fn bind_buffer(&mut self, slot: usize, binding: Option<BufferBinding>) -> bool {
         let Some(current) = self.buffers.get_mut(slot) else {
+            self.census.ignored += 1;
             return false;
         };
         if *current == binding {
@@ -203,6 +215,7 @@ impl BindingTable {
     /// Bind a texture slot, or unbind it with `None`.
     pub fn bind_texture(&mut self, slot: usize, binding: Option<ObjectBinding>) -> bool {
         let Some(current) = self.textures.get_mut(slot) else {
+            self.census.ignored += 1;
             return false;
         };
         if *current == binding {
@@ -218,6 +231,7 @@ impl BindingTable {
     /// Bind a sampler slot, or unbind it with `None`.
     pub fn bind_sampler(&mut self, slot: usize, binding: Option<ObjectBinding>) -> bool {
         let Some(current) = self.samplers.get_mut(slot) else {
+            self.census.ignored += 1;
             return false;
         };
         if *current == binding {
@@ -542,6 +556,29 @@ mod tests {
         assert!(!t.bind_buffer(4, buffer(1, 0)));
         assert!(t.is_clean());
         assert_eq!(t.buffer(4), None);
+    }
+
+    /// Dropped and counted. A bind the table refuses is neither a change nor a
+    /// redundancy, so a census that did not name it would report three
+    /// counters that no longer add up to the binds the guest issued.
+    #[test]
+    fn a_dropped_bind_is_counted_apart_from_a_redundant_one() {
+        let mut t = BindingTable::new(4, 4, 4);
+        t.bind_buffer(0, buffer(1, 0));
+        t.bind_buffer(0, buffer(1, 0));
+        t.bind_buffer(9, buffer(1, 0));
+        t.bind_texture(9, texture(1));
+        t.bind_sampler(9, texture(1));
+
+        let census = t.census();
+        assert_eq!(census.changed, 1);
+        assert_eq!(census.redundant, 1);
+        assert_eq!(census.ignored, 3, "one per table, and none of them silent");
+        assert_eq!(
+            census.changed + census.redundant + census.ignored,
+            5,
+            "every bind is accounted to exactly one of the three"
+        );
     }
 
     #[test]
