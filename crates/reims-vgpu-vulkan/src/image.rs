@@ -203,7 +203,14 @@ pub fn plan(texture: Texture, format: vk::Format, route: Route) -> Result<ImageP
     // Zero means "any" and is the widest declaration, not the narrowest.
     let any = declared.is_unknown();
     let wants = |bit: TextureUsage| any || declared.contains(bit);
-    if !any && declared.contains(TextureUsage::SHADER_WRITE) && depth_stencil {
+    // Both spellings of a shader store. `SHADER_ATOMIC` is the other one --- an
+    // atomic *is* a store, which is why the usage below asks for one storage
+    // image for either bit --- so a depth declaration carrying it is the same
+    // declaration this refuses, and answering only the first spelling dropped
+    // the second quietly, which is the thing the refusal exists to not do.
+    let stores = declared.contains(TextureUsage::SHADER_WRITE)
+        || declared.contains(TextureUsage::SHADER_ATOMIC);
+    if !any && stores && depth_stencil {
         return Err(Refusal::DepthShaderWrite {
             format: guest_format,
         });
@@ -660,25 +667,33 @@ mod tests {
 
     #[test]
     fn shader_writes_to_a_depth_format_refuse_rather_than_being_dropped() {
-        let depth = TextureShape {
-            pixel_format: MTL_FORMAT_DEPTH32_FLOAT,
-            kind: TextureKind::D2.ordinal(),
-            width: 64,
-            height: 64,
-            depth: 1,
-            mipmap_level_count: 1,
-            sample_count: 1,
-            array_length: 1,
-            usage: TextureUsage::SHADER_WRITE,
+        // Both spellings, because the usage below asks for one storage image
+        // for either bit --- an atomic is a store --- so a depth declaration
+        // carrying `SHADER_ATOMIC` is the same declaration, and answering it
+        // with a plan that has no storage image is the quiet drop this refusal
+        // was written against.
+        for usage in [TextureUsage::SHADER_WRITE, TextureUsage::SHADER_ATOMIC] {
+            let depth = TextureShape {
+                pixel_format: MTL_FORMAT_DEPTH32_FLOAT,
+                kind: TextureKind::D2.ordinal(),
+                width: 64,
+                height: 64,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                usage,
+            }
+            .checked()
+            .expect("a declaration");
+            assert_eq!(
+                plan(depth, DEPTH, optimal()),
+                Err(Refusal::DepthShaderWrite {
+                    format: MTL_FORMAT_DEPTH32_FLOAT
+                }),
+                "{usage:?}"
+            );
         }
-        .checked()
-        .expect("a declaration");
-        assert_eq!(
-            plan(depth, DEPTH, optimal()),
-            Err(Refusal::DepthShaderWrite {
-                format: MTL_FORMAT_DEPTH32_FLOAT
-            })
-        );
     }
 
     #[test]
