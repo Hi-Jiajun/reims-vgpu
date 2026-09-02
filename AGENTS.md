@@ -118,6 +118,19 @@ inputs returning a value — wires first: the caller keeps its ownership and los
 arithmetic, so a regression points at one table. Modules owning handles, caches, or submission
 lifetimes wire once the model that owns those lifetimes is in place, because they cannot be split.
 
+The same rule decides how the final ingress switch is cut. **A packet class moves to the new model
+alone exactly when nothing it owns is ordered against, or shares mutable state with, anything still
+on the legacy path. Classes that do share such state move together, and that group — not
+"everything" — is the atomic unit.** Two models are dangerous because they can disagree about one
+piece of state; where there is no shared state there is nothing to disagree about, and holding a
+disjoint class back buys no safety while costing the bisect it could have provided.
+
+State the disjointness before moving a group and make it hold structurally — named owners, not an
+argument that the current call sites happen not to overlap. If it cannot be made to hold, the group
+is larger than it looked: enlarge it rather than move anyway. Within a group the switch is atomic
+and the legacy counterpart is deleted in the same commit. Order the groups by how little state they
+move; the ordering and publication core is last, and carries the scheduler's deletion.
+
 ## Working and verification
 
 Use a workflow proportionate to the change:
