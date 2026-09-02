@@ -58,7 +58,7 @@
 //! their own raw index, masked to a slot by
 //! [`stamp_slot_index`], which is the one place that mask is applied.
 
-use crate::model::{is_child_channel, stamp_slot_index, MAX_CHANNELS};
+use crate::model::{is_child_channel, stamp_slot_index};
 use crate::runtime::drain;
 use reims_vgpu_core::control;
 use reims_vgpu_core::identity::{
@@ -248,6 +248,9 @@ pub fn packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The channel bound, read only by the test that sweeps it: `Fifo::child`
+    // asks `is_child_channel` and never the constant behind it.
+    use crate::model::MAX_CHANNELS;
     use reims_vgpu_protocol::packets::LEDGER;
 
     /// A payload long enough for every control command's own layout. Only the
