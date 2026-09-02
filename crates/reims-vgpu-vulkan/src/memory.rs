@@ -205,13 +205,38 @@ impl TopologySignal {
     }
 }
 
+/// How many entries of a reported memory array this process may read.
+///
+/// `memoryTypeCount` and `memoryHeapCount` are a *claim* about arrays whose
+/// length is fixed by the header — `VK_MAX_MEMORY_TYPES` and
+/// `VK_MAX_MEMORY_HEAPS`. Two spellings of one fact, and only one of them is
+/// something this process can check, so the bound is taken from the array and
+/// the count narrows it rather than the other way round.
+///
+/// A driver claiming more than its array can hold is not hypothetical
+/// arithmetic: a layer that rewrites the structure, an ICD built against a
+/// different header, or a translation layer sitting under this rail produces
+/// exactly that, and every read of it here is a direct index. The failure is a
+/// panic inside the executor, which is the one place this crate must not
+/// produce one. Taking the smaller of the two costs nothing on a driver that
+/// is right, and it also keeps `1 << index` below the width it shifts.
+fn readable_types(props: &vk::PhysicalDeviceMemoryProperties) -> u32 {
+    let capacity = u32::try_from(props.memory_types.len()).unwrap_or(u32::MAX);
+    props.memory_type_count.min(capacity)
+}
+
+fn readable_heaps(props: &vk::PhysicalDeviceMemoryProperties) -> u32 {
+    let capacity = u32::try_from(props.memory_heaps.len()).unwrap_or(u32::MAX);
+    props.memory_heap_count.min(capacity)
+}
+
 /// Classify a device's memory layout. Pure over
 /// `VkPhysicalDeviceMemoryProperties`, so every row of the support matrix is
 /// testable without that GPU present.
 pub fn classify_memory(props: &vk::PhysicalDeviceMemoryProperties) -> MemoryProfile {
     use vk::MemoryPropertyFlags as F;
-    let heaps = &props.memory_heaps[..props.memory_heap_count as usize];
-    let types = &props.memory_types[..props.memory_type_count as usize];
+    let heaps = &props.memory_heaps[..readable_heaps(props) as usize];
+    let types = &props.memory_types[..readable_types(props) as usize];
 
     // Signal A — no heap lacks DEVICE_LOCAL. An empty heap list cannot be
     // unified by omission, so require at least one heap.
@@ -414,7 +439,8 @@ pub fn select_memory_type(
     bytes: u64,
     max_allocation: u64,
 ) -> Result<MemoryTypePick, MemoryTypeRefusal> {
-    let heap_index = |index: u32| props.memory_types[index as usize].heap_index;
+    let types = &props.memory_types[..readable_types(props) as usize];
+    let heap_index = |index: u32| types.get(index as usize).map_or(u32::MAX, |t| t.heap_index);
     let heap_bytes = |index: u32| {
         props
             .memory_heaps
@@ -422,19 +448,18 @@ pub fn select_memory_type(
             .map_or(0, |h| h.size)
     };
     let carries = |index: u32, flags: vk::MemoryPropertyFlags| {
-        (type_bits & (1u32 << index)) != 0
-            && props.memory_types[index as usize]
-                .property_flags
-                .contains(flags)
+        types
+            .get(index as usize)
+            .is_some_and(|t| (type_bits & (1u32 << index)) != 0 && t.property_flags.contains(flags))
     };
     let find_fitting = |flags: vk::MemoryPropertyFlags| {
-        (0..props.memory_type_count)
+        (0..readable_types(props))
             .find(|&index| carries(index, flags) && heap_bytes(index) >= bytes)
     };
     // The roomiest heap any candidate type draws from. Zero candidates and a
     // candidate on a zero-sized heap are told apart by the `Option`, because the
     // two are different refusals.
-    let roomiest_required = (0..props.memory_type_count)
+    let roomiest_required = (0..readable_types(props))
         .filter(|&index| carries(index, req.required))
         .map(heap_bytes)
         .max();
@@ -471,16 +496,13 @@ pub fn select_memory_type(
 /// from the same `required` flags the selector filters on, so the two cannot
 /// name different populations of memory types.
 pub fn roomiest_heap_for(props: &vk::PhysicalDeviceMemoryProperties, req: &MemoryRequest) -> u64 {
-    (0..props.memory_type_count)
-        .filter(|&index| {
-            props.memory_types[index as usize]
-                .property_flags
-                .contains(req.required)
-        })
+    let types = &props.memory_types[..readable_types(props) as usize];
+    (0..readable_types(props))
+        .filter(|&index| types[index as usize].property_flags.contains(req.required))
         .map(|index| {
             props
                 .memory_heaps
-                .get(props.memory_types[index as usize].heap_index as usize)
+                .get(types[index as usize].heap_index as usize)
                 .map_or(0, |h| h.size)
         })
         .max()
@@ -503,9 +525,15 @@ pub struct MappedMemoryKind {
 }
 
 impl MappedMemoryKind {
+    /// A type index the device did not report is neither cached nor coherent
+    /// — the answer that makes a caller flush and invalidate, which is correct
+    /// for memory whose properties are unknown and is the safe direction to be
+    /// wrong in.
     pub fn of(props: &vk::PhysicalDeviceMemoryProperties, index: u32) -> Self {
         use vk::MemoryPropertyFlags as F;
-        let flags = props.memory_types[index as usize].property_flags;
+        let flags = props.memory_types[..readable_types(props) as usize]
+            .get(index as usize)
+            .map_or(F::empty(), |t| t.property_flags);
         Self {
             cached: flags.contains(F::HOST_CACHED),
             coherent: flags.contains(F::HOST_COHERENT),
@@ -1114,5 +1142,43 @@ mod tests {
             pick.heap_bytes,
             props.memory_heaps[t.heap_index as usize].size
         );
+    }
+
+    /// The failure this exists to prevent: a driver whose reported count is
+    /// larger than the array the header gives it. Every read here is a direct
+    /// index, so the old shape panicked inside the executor --- and
+    /// `1 << index` for an index past 31 panicked before the index did.
+    #[test]
+    fn a_count_larger_than_the_array_narrows_instead_of_indexing_past_it() {
+        let mut props = fixtures::nvidia_discrete();
+        let real_types = props.memory_type_count;
+        let real_heaps = props.memory_heap_count;
+        props.memory_type_count = u32::MAX;
+        props.memory_heap_count = u32::MAX;
+
+        let capacity = u32::try_from(props.memory_types.len()).expect("a header-sized array");
+        assert_eq!(readable_types(&props), capacity);
+        assert_eq!(
+            readable_heaps(&props),
+            u32::try_from(props.memory_heaps.len()).expect("a header-sized array")
+        );
+
+        // Each of the four readers, on the lying properties. None panics, and
+        // each answers about the types the array can actually hold.
+        let profile = classify_memory(&props);
+        assert!(profile.device_local_bytes > 0);
+        let request = profile.topology.request(MemoryClass::Upload);
+        assert!(roomiest_heap_for(&props, &request) > 0);
+        assert!(select_memory_type(&props, u32::MAX, &request, 0, u64::MAX).is_ok());
+        // A type index the device never reported is neither cached nor
+        // coherent, which is the answer that makes a caller flush.
+        let unreported = MappedMemoryKind::of(&props, capacity);
+        assert!(!unreported.cached && !unreported.coherent);
+
+        // An honest count answers the same as before, so the narrowing is
+        // invisible to every driver that is right.
+        props.memory_type_count = real_types;
+        props.memory_heap_count = real_heaps;
+        assert_eq!(classify_memory(&props).topology, profile.topology);
     }
 }
