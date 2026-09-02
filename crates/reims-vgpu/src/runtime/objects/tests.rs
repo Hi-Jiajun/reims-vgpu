@@ -1,7 +1,7 @@
 use reims_vgpu_wire::device_desc::BackingBuilder;
 
 use super::*;
-use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::model::{DeviceId, StorageIncarnation, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::protocol::endian::{ld32, st16, st32, st64};
 use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::protocol::iosurface_pages::DEVICE_DESC_PLANE_COUNT;
@@ -2268,6 +2268,107 @@ fn a_repoint_retires_a_backing_mapping_owned_by_the_packet_task() {
         state.mappings[&7].map_generation,
         "the generation bump makes the retired walk unusable as currency"
     );
+}
+
+/// Storage named by an address rather than by a mapping gets an incarnation,
+/// and it advances on exactly the events that make the pages behind that name
+/// different pages.
+///
+/// The counter exists so a canonical backing identity can be a window *and* a
+/// number. A window alone repeats across a physical replacement — same
+/// guest-virtual address, different host frames — and equal ids would let a
+/// claim on the old frames be satisfied by the new ones, handing storage back
+/// under a live reader. Each assertion below is one way that could happen.
+#[test]
+fn address_named_storage_counts_its_incarnations() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let (task, object, neighbour) = (3u32, 9u32, 10u32);
+    state.define_task(task, 0x1000, 0x40);
+    assert!(state.insert_object(task, object));
+    assert!(state.insert_object(task, neighbour));
+
+    // The first incarnation is a value, not an absence: nothing has re-pointed
+    // this name, which is a fact about it and not missing information.
+    let first = state.storage_incarnation(task, object);
+    assert_eq!(
+        first,
+        StorageIncarnation::default(),
+        "nothing has happened yet"
+    );
+    // Every incarnation this one reference has ever carried. Distinctness is
+    // the whole property, and a pairwise assertion would only catch neighbours.
+    let mut seen = vec![first];
+
+    // A re-point that reaches no mapping and no host copy still advances it.
+    // The packet is an announcement about the guest's memory; what this device
+    // happened to be caching does not decide whether the pages moved.
+    super::replace_physical(&mut state, &mut host, task, object);
+    let after_repoint = state.storage_incarnation(task, object);
+    assert_ne!(after_repoint, first, "the announcement was not recorded");
+    seen.push(after_repoint);
+    assert_eq!(
+        state.storage_incarnation(task, neighbour),
+        first,
+        "a re-point of one reference moved another reference's storage"
+    );
+
+    // Releasing the name advances it too. A compositor recycles object-list
+    // slots, so the next object at this reference is unrelated storage that a
+    // window-only identity would call the same.
+    assert!(state.delete_object(task, object));
+    let after_delete = state.storage_incarnation(task, object);
+    assert!(
+        !seen.contains(&after_delete),
+        "a recycled reference repeats"
+    );
+    seen.push(after_delete);
+    assert!(state.insert_object(task, object));
+    assert_eq!(
+        state.storage_incarnation(task, object),
+        after_delete,
+        "taking the name again is not itself a re-point"
+    );
+
+    // A task teardown ends every name the task held at once, and a task id
+    // comes back.
+    assert!(state.delete_task(task));
+    let after_teardown = state.storage_incarnation(task, object);
+    assert!(
+        !seen.contains(&after_teardown),
+        "the task teardown left this reference on an incarnation it already had"
+    );
+    seen.push(after_teardown);
+    assert_ne!(
+        state.storage_incarnation(task, neighbour),
+        first,
+        "a reference the guest published and never re-pointed has no per-name \
+         entry, so only the task epoch can carry it across a teardown"
+    );
+
+    // Taking the id again moves nothing further, and does not have to: the
+    // teardown is the event that separated the two tasks' storage.
+    state.define_task(task, 0x1000, 0x40);
+    assert!(state.insert_object(task, object));
+    assert_eq!(
+        state.storage_incarnation(task, object),
+        after_teardown,
+        "the new task's reference left the incarnation its teardown established"
+    );
+
+    // And a redefinition of a live task is the same event: it drops the task's
+    // objects and may root a different physical page under the same addresses.
+    let before_redefine = state.storage_incarnation(task, object);
+    state.define_task(task, 0x1000, 0x41);
+    assert_ne!(state.storage_incarnation(task, object), before_redefine);
+    assert!(
+        !seen.contains(&state.storage_incarnation(task, object)),
+        "an incarnation this reference already had came back"
+    );
+
+    // A different task's identically-numbered reference is its own count, which
+    // is what makes the key task-local rather than a global object number.
+    assert_eq!(state.storage_incarnation(task + 1, object), first);
 }
 
 /// A re-point that reaches nothing changes nothing, and does not invent a

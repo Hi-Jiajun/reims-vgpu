@@ -2505,6 +2505,11 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     // indexes over the same resource lifetime; reaching one does not excuse
     // leaving the other stale.
     let (texture_cache, linear_cache) = state.invalidate_object_host_copies(task_id, object_id);
+    // The packet's own contract is that the PFNs under this window have already
+    // changed, so it says so whether or not this device was holding anything to
+    // invalidate — the announcement is about the guest's memory, not about our
+    // caches. Ahead of the unreached arm's early return for that reason.
+    state.bump_storage_incarnation(task_id, object_id);
 
     let Some(target) = target else {
         note_replace_physical_unmapped_after_invalidation(
