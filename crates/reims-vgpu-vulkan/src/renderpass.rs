@@ -469,6 +469,29 @@ fn ops_of(
     }
 }
 
+/// What a render pass does with an aspect of its depth-stencil attachment that
+/// the guest did not attach: preserve it.
+///
+/// `DepthStencilPlan::depth` is `None` when the guest attached *only stencil*,
+/// and `stencil` is `None` when it attached only depth — one image with two
+/// aspects, of which this pass uses one. That is not permission to throw the
+/// other away, and `DONT_CARE` as a store op is exactly that permission: on a
+/// combined format the driver may discard the aspect, and a later pass that
+/// attaches it reads whatever is left.
+///
+/// It is also what made the two rungs of one [`Build`] disagree about guest
+/// pixels. Dynamic rendering attaches nothing for an unplanned aspect, so it
+/// leaves it untouched; the render-pass object has one attachment carrying both
+/// pairs of operations and cannot say "not attached" — the nearest thing it can
+/// say is load it and store it back, which is what leaving it alone means here.
+///
+/// Ignored by the driver for a format that has no such aspect, so a pure-depth
+/// attachment pays nothing for the stencil pair.
+const UNATTACHED_ASPECT: Ops = Ops {
+    load: vk::AttachmentLoadOp::LOAD,
+    store: vk::AttachmentStoreOp::STORE,
+};
+
 fn attachment_description(
     format: vk::Format,
     samples: vk::SampleCountFlags,
@@ -725,14 +748,8 @@ pub fn build(
     let (mut has_depth, mut has_stencil) = (false, false);
 
     if let (Some(planned), Some(bound)) = (plan.depth_stencil.as_ref(), depth_stencil) {
-        let depth = planned.depth.unwrap_or(Ops {
-            load: vk::AttachmentLoadOp::DONT_CARE,
-            store: vk::AttachmentStoreOp::DONT_CARE,
-        });
-        let stencil = planned.stencil.unwrap_or(Ops {
-            load: vk::AttachmentLoadOp::DONT_CARE,
-            store: vk::AttachmentStoreOp::DONT_CARE,
-        });
+        let depth = planned.depth.unwrap_or(UNATTACHED_ASPECT);
+        let stencil = planned.stencil.unwrap_or(UNATTACHED_ASPECT);
         let ops = AttachmentOps {
             load: depth.load,
             store: depth.store,
@@ -1145,7 +1162,9 @@ mod tests {
     use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
     use reims_vgpu_core::pass::{LoadAction, StoreAction};
     use reims_vgpu_core::pass::{PassDescriptor, RenderTargetExtent};
-    use reims_vgpu_core::pixel_format::{MTL_FORMAT_DEPTH32_FLOAT, MTL_FORMAT_RGBA8_UNORM};
+    use reims_vgpu_core::pixel_format::{
+        MTL_FORMAT_DEPTH32_FLOAT, MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, MTL_FORMAT_RGBA8_UNORM,
+    };
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -1746,6 +1765,73 @@ mod tests {
             d.depth.resolve_texture = Some(id(3));
         }
         plan(&d, |_| MTL_FORMAT_DEPTH32_FLOAT).expect("a legal descriptor")
+    }
+
+    /// One image, two aspects, and this pass uses one of them. The other is not
+    /// this pass's to throw away.
+    ///
+    /// `DepthStencilPlan::depth` is `None` when the guest attached only
+    /// stencil, and `stencil` is `None` when it attached only depth. Both used
+    /// to become `DONT_CARE`, which on a combined format licenses the driver to
+    /// discard an aspect of a texture the guest still owns — so a depth prepass
+    /// on a `Depth32Float_Stencil8` target destroyed the stencil mask a later
+    /// pass tested against.
+    ///
+    /// The two rungs disagreed about it, which is the sharper form of the same
+    /// claim: dynamic rendering attaches nothing for an unplanned aspect and so
+    /// leaves it alone, while the render-pass object discarded it. One `Build`
+    /// producing two different guest-visible results is what the fourth
+    /// supported pathway exists to measure, and it would have been read as a
+    /// metal2vulkan difference.
+    #[test]
+    fn an_aspect_this_pass_does_not_attach_is_preserved_on_both_rungs() {
+        let mut d = descriptor();
+        d.color[0].texture = Some(id(1));
+        d.color[0].load = LoadAction::Load;
+        d.color[0].store = StoreAction::Store;
+        // Depth attached, stencil not — the depth-prepass shape.
+        d.depth.texture = Some(id(2));
+        d.depth.load = LoadAction::Clear;
+        d.depth.store = StoreAction::Store;
+        let planned = plan(&d, |_| MTL_FORMAT_DEPTH32_FLOAT_STENCIL8).expect("a legal descriptor");
+        let ds = planned.depth_stencil.as_ref().expect("attached");
+        assert!(ds.depth.is_some());
+        assert!(
+            ds.stencil.is_none(),
+            "the guest attached no stencil, which is what this is about"
+        );
+
+        let combined = Bound {
+            format: vk::Format::D32_SFLOAT_S8_UINT,
+            ..bound(2)
+        };
+        let built = build(&planned, &[bound(1)], Some(combined)).expect("builds");
+
+        let ds_attachment = built
+            .attachments()
+            .iter()
+            .find(|a| a.format == vk::Format::D32_SFLOAT_S8_UINT)
+            .expect("the depth-stencil attachment is described");
+        assert_ne!(
+            ds_attachment.stencil_store_op,
+            vk::AttachmentStoreOp::DONT_CARE,
+            "the render pass may not discard an aspect this pass never touched"
+        );
+        assert_eq!(ds_attachment.stencil_store_op, vk::AttachmentStoreOp::STORE);
+        assert_eq!(ds_attachment.stencil_load_op, vk::AttachmentLoadOp::LOAD);
+        // And the aspect this pass *does* use keeps what the guest asked for.
+        assert_eq!(ds_attachment.load_op, vk::AttachmentLoadOp::CLEAR);
+        assert_eq!(ds_attachment.store_op, vk::AttachmentStoreOp::STORE);
+
+        // The other rung's answer to the same question, which is what the two
+        // have to agree about: no stencil attachment at all.
+        built.with_rendering_info(|info| {
+            assert!(
+                info.p_stencil_attachment.is_null(),
+                "dynamic rendering attaches no aspect the guest did not"
+            );
+            assert!(!info.p_depth_attachment.is_null());
+        });
     }
 
     #[test]
