@@ -229,6 +229,19 @@ pub enum Refusal {
         min_bits: u32,
         max_bits: u32,
     },
+    /// A viewport with no area.
+    ///
+    /// `VkViewport::width` must be greater than zero
+    /// (VUID-VkViewport-width-01770), and a zero or negative height is the
+    /// same degenerate rectangle on the other axis --- negative is what the Y
+    /// flip *produces*, so it cannot also be what the guest is allowed to
+    /// declare. Refused rather than recorded: `vkCmdSetViewport` on it is
+    /// invalid usage, and clamping it to one pixel would rasterize geometry
+    /// the guest asked to see none of.
+    ///
+    /// The bits are the guest's own doubles, before the narrowing, because
+    /// that is where the number came from and it is what a report should name.
+    NonPositiveViewport { width_bits: u64, height_bits: u64 },
 }
 
 impl Refusal {
@@ -241,6 +254,7 @@ impl Refusal {
             Self::OutOfRange { .. } => "vk_raster_out_of_range",
             Self::NoWideLines { .. } => "vk_raster_no_wide_lines",
             Self::LineWidthOutOfRange { .. } => "vk_raster_line_width_out_of_range",
+            Self::NonPositiveViewport { .. } => "vk_raster_non_positive_viewport",
         }
     }
 }
@@ -269,6 +283,16 @@ impl std::fmt::Display for Refusal {
                 f32::from_bits(*width_bits),
                 f32::from_bits(*min_bits),
                 f32::from_bits(*max_bits)
+            ),
+            Self::NonPositiveViewport {
+                width_bits,
+                height_bits,
+            } => write!(
+                f,
+                "{} width={} height={}",
+                self.slug(),
+                f64::from_bits(*width_bits),
+                f64::from_bits(*height_bits)
             ),
         }
     }
@@ -730,6 +754,15 @@ pub fn plan(guest: GuestRasterState, cell: RasterCell) -> Result<Plan, Refusal> 
 /// on; they were the two of six nothing looked at. Their *range* is
 /// deliberately not narrowed here: Metal and Vulkan agree on `[0, 1]` and a
 /// guest that reverses its own range is doing something both models allow.
+///
+/// # And a viewport has to have an area
+///
+/// Vulkan requires `width` greater than zero, and a zero or negative height
+/// is the same degenerate rectangle on the other axis. Read before the flip
+/// negates the height, so a legal rectangle is not mistaken for a degenerate
+/// one --- and read *after* the narrowing, because a positive double small
+/// enough narrows to zero and the field the driver reads is the one that has
+/// to be legal. See [`Refusal::NonPositiveViewport`].
 pub fn viewport(guest: Viewport) -> Result<vk::Viewport, Refusal> {
     let x = f64::from_bits(guest.origin_x_bits);
     let y = f64::from_bits(guest.origin_y_bits);
@@ -748,15 +781,32 @@ pub fn viewport(guest: Viewport) -> Result<vk::Viewport, Refusal> {
             })
         }
     };
-    Ok(vk::Viewport {
+    let native = vk::Viewport {
         x: narrowed("origin_x", x)?,
         // The bottom edge, because the height below is negative and a viewport
         // is measured from its `y`.
         y: narrowed("origin_y", y + height)?,
         width: narrowed("width", width)?,
-        height: -narrowed("height", height)?,
+        // Negated last, so the positivity check below reads the guest's
+        // rectangle and not this function's own flip.
+        height: narrowed("height", height)?,
         min_depth: narrowed("z_near", near)?,
         max_depth: narrowed("z_far", far)?,
+    };
+    // On the narrowed values and not on the guest's doubles. A positive double
+    // small enough --- `1e-300` --- narrows to zero, so a rectangle that has an
+    // area in the guest's arithmetic has none in the field the driver reads,
+    // and the field the driver reads is the one that has to be legal. Both are
+    // finite by now, so this decides rather than falling through.
+    if native.width <= 0.0 || native.height <= 0.0 {
+        return Err(Refusal::NonPositiveViewport {
+            width_bits: guest.width_bits,
+            height_bits: guest.height_bits,
+        });
+    }
+    Ok(vk::Viewport {
+        height: -native.height,
+        ..native
     })
 }
 
@@ -974,6 +1024,84 @@ mod tests {
                 viewport(guest),
                 Err(Refusal::OutOfRange { field: "width", .. })
             ));
+        }
+    }
+
+    /// The failure this exists to prevent: `VkViewport::width` must be greater
+    /// than zero, and a zero or negative height is the same degenerate
+    /// rectangle on the other axis. Production's own draw validation refuses
+    /// it as `NonPositiveViewport`; this rail narrowed the numbers, checked
+    /// them for finiteness, and recorded the rectangle.
+    #[test]
+    fn a_viewport_with_no_area_refuses_rather_than_rasterizing_nothing() {
+        assert!(
+            viewport(guest_viewport(0.0, 0.0, 1.0, 1.0)).is_ok(),
+            "one pixel is an area"
+        );
+        for (width, height) in [
+            (0.0, 600.0),
+            (800.0, 0.0),
+            (0.0, 0.0),
+            (-800.0, 600.0),
+            (800.0, -600.0),
+        ] {
+            let guest = guest_viewport(0.0, 0.0, width, height);
+            assert_eq!(
+                viewport(guest).expect_err("no area"),
+                Refusal::NonPositiveViewport {
+                    width_bits: width.to_bits(),
+                    height_bits: height.to_bits(),
+                },
+                "{width}x{height}"
+            );
+        }
+        // A width or height smaller than a pixel is still an area, and a
+        // rectangle a guest may legitimately draw into.
+        assert!(viewport(guest_viewport(0.0, 0.0, 0.5, 0.25)).is_ok());
+
+        // And a dimension positive in the guest's arithmetic and zero in the
+        // field the driver reads is the degenerate case, not the legal one.
+        // This is why the check is after the narrowing and not before it.
+        assert!(1e-300_f64 > 0.0 && 1e-300_f64 as f32 == 0.0, "the premise");
+        assert_eq!(
+            viewport(guest_viewport(0.0, 0.0, 1e-300, 600.0))
+                .expect_err("positive as a double, zero as a float"),
+            Refusal::NonPositiveViewport {
+                width_bits: 1e-300_f64.to_bits(),
+                height_bits: 600.0_f64.to_bits(),
+            }
+        );
+    }
+
+    /// And a dimension that is not a number stays the range failure it is.
+    ///
+    /// The two checks are on the same two fields and one of them runs first.
+    /// Reading the sign before the narrowing would report a NaN width as a
+    /// rectangle with no area, which names the wrong thing about it --- a NaN
+    /// compares false against every bound, including this one.
+    ///
+    /// The height's NaN surfaces on `origin_y` rather than on `height`,
+    /// because the bottom edge is `y + height` and is narrowed first. That is
+    /// the sum genuinely not being a number, and the field it names is the one
+    /// whose value could not be produced.
+    #[test]
+    fn a_dimension_that_is_not_a_number_outranks_the_area_check() {
+        for (field, set) in [
+            (
+                "width",
+                (|v: &mut Viewport, b| v.width_bits = b) as fn(&mut Viewport, u64),
+            ),
+            ("origin_y", |v: &mut Viewport, b| v.height_bits = b),
+        ] {
+            let mut guest = guest_viewport(0.0, 0.0, 1.0, 1.0);
+            set(&mut guest, f64::NAN.to_bits());
+            assert!(
+                matches!(
+                    viewport(guest).expect_err("not a number"),
+                    Refusal::OutOfRange { field: named, .. } if named == field
+                ),
+                "{field}"
+            );
         }
     }
 
