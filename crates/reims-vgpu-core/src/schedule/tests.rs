@@ -546,6 +546,33 @@ fn a_batch_of_mixed_classes_schedules_equivalently() {
          everywhere else: same versions, same stamps, same releases"
     );
 
+    // The reference is checked for the two structural properties too, and not
+    // only the schedules compared against it. A stamp that went backwards is
+    // wrong however the work ran, and `Summary` records where a monotone point
+    // came to rest --- so a regressing reference leaves no trace in the outcome
+    // comparison and would have been declared equivalent to a correct
+    // schedule. Republishing a value the slot already reached is the smallest
+    // regression there is.
+    let (slot, value) = reference
+        .trace
+        .iter()
+        .find_map(|o| match *o {
+            crate::interpret::Observation::StampPublished { slot, value } => Some((slot, value)),
+            _ => None,
+        })
+        .expect("the reference publishes a stamp");
+    let mut regressed = reference.clone();
+    regressed
+        .trace
+        .push(crate::interpret::Observation::StampPublished { slot, value });
+    assert!(
+        matches!(
+            equivalent(&regressed, &reference).expect_err("a regressing reference is a divergence"),
+            Divergence::NonMonotonePublication { .. }
+        ),
+        "a reference that republished a value it had reached was accepted"
+    );
+
     let mut orders = std::collections::BTreeSet::new();
     for seed in 0..64u64 {
         let run = parallel(&batch, seed);

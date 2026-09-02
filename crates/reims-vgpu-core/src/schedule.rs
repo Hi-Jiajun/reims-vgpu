@@ -807,6 +807,17 @@ pub fn equivalent(serial: &Run, parallel: &Run) -> Result<(), Divergence> {
         }
     }
 
+    // Both runs, and the serial one first. These two are properties of the
+    // *model*, not of an interleaving: a completion window that another
+    // transaction published inside, or a stamp that went backwards, is wrong
+    // however the work was scheduled. Checking only the parallel run made the
+    // reference an oracle nothing tested --- and a serial run that regressed a
+    // stamp would have gone unseen twice over, because `Summary` records where
+    // a monotone point *came to rest* and a regression leaves no trace in it.
+    // So the outcome comparison above cannot see it either, and a broken
+    // reference would have been declared equivalent to a correct schedule.
+    monotone(serial)?;
+    atomic_publication(serial)?;
     monotone(parallel)?;
     atomic_publication(parallel)
 }
