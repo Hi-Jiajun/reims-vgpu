@@ -25,3 +25,6 @@ reims-vgpu-config = { path = "../reims-vgpu-config" }
 
 [dev-dependencies]
 reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["testing"] }
+# The shared allocation-counting instrument the structural-zero suites measure
+# with. Nothing in the library depends on it.
+reims-vgpu-testkit = { path = "../reims-vgpu-testkit" }

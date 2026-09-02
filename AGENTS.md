@@ -47,8 +47,9 @@ Persist only the resulting field, layout, lifetime, ordering, or calling-convent
   capabilities into placement and transfer policy. It sees `ash`, the semantic
   model, the refusal vocabulary and the operator switches, and nothing of QEMU,
   the device model, guest-RAM ownership or decode.
-- `crates/reims-vgpu-testkit`: shared behavioral fixtures — where the oracle's
-  capture is, whether it is there, and how the suites that read it read it.
+- `crates/reims-vgpu-testkit`: shared behavioral fixtures and test instruments —
+  where the oracle's capture is, whether it is there, how the suites that read it
+  read it, and the allocation counter the structural-zero suites measure with.
 - `conformance`: native-oracle and guest-visible compatibility cases.
 - `vm`: rail-selected, snapshot-reverting boot harnesses.
 

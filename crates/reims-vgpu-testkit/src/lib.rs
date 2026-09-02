@@ -30,6 +30,15 @@
 //! Anything that goes wrong in a *loader* is therefore the capture being
 //! removed between building a test and running it, not the ordinary
 //! fixture-less checkout, and the panics say so.
+//!
+//! # And the instruments a suite measures with
+//!
+//! The capture is one shared fixture; [`allocations`] is another. Both are
+//! things several suites need and none of them owns, and a second copy of a
+//! `GlobalAlloc` is a second thing to get subtly wrong — the same argument
+//! that put the loaders here rather than in three crates.
+
+pub mod allocations;
 
 use serde_json::Value;
 

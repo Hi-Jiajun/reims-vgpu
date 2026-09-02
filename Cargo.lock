@@ -1224,6 +1224,7 @@ dependencies = [
  "reims-vgpu-config",
  "reims-vgpu-core",
  "reims-vgpu-observe",
+ "reims-vgpu-testkit",
 ]
 
 [[package]]

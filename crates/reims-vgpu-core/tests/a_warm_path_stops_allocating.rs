@@ -23,79 +23,19 @@
 //! model keeps its forbid, and the measurement is taken through the public API
 //! a caller would use anyway.
 //!
-//! # The counter is per thread and off by default
-//!
-//! `#[global_allocator]` is program-wide and libtest runs tests in parallel, so
-//! a process-wide counter would count whatever else happened to be running.
-//! The count lives in thread-local storage, initialised at compile time so that
-//! reading it cannot itself allocate and recurse. Only [`measure`] turns it on,
-//! and only for its own thread.
-
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+//! The instrument itself is [`reims_vgpu_testkit::allocations`], shared with
+//! the rail's own suite: its counter is per thread and off unless a
+//! measurement asks, so tests still run in parallel.
 
 use reims_vgpu_core::access::{
     AccessIntent, AccessKey, AccessMode, BackingId, ByteRange, ResourceKey,
 };
 use reims_vgpu_core::depend::DependencyGraph;
 use reims_vgpu_core::identity::{ChannelId, IngressOrdinal};
-
-thread_local! {
-    /// Trips into the allocator on this thread since counting began. `const`
-    /// initialisation matters: a lazily initialised thread-local allocates on
-    /// first use, from inside the allocator.
-    static COUNT: Cell<usize> = const { Cell::new(0) };
-    static ON: Cell<bool> = const { Cell::new(false) };
-}
-
-struct Counting;
-
-// SAFETY: every method forwards to `System`, which is a correct allocator. The
-// bookkeeping around it allocates nothing — `Cell<usize>` and `Cell<bool>` are
-// const-initialised and have no destructor, so no thread-local registration
-// happens on first use. `try_with` rather than `with`, because a thread tearing
-// down may already have destroyed its storage and a panic inside the allocator
-// aborts the process.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        bump();
-        System.alloc(layout)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // A `Vec` growing is an allocation by the measure that matters here:
-        // it is a trip into the allocator and the bytes may move.
-        bump();
-        System.realloc(ptr, layout, new_size)
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        bump();
-        System.alloc_zeroed(layout)
-    }
-}
-
-fn bump() {
-    if ON.try_with(Cell::get).unwrap_or(false) {
-        let _ = COUNT.try_with(|c| c.set(c.get() + 1));
-    }
-}
+use reims_vgpu_testkit::allocations::{measure, Counting};
 
 #[global_allocator]
-static ALLOCATOR: Counting = Counting;
-
-/// Run `body` and return how many times it entered the allocator.
-fn measure<T>(body: impl FnOnce() -> T) -> (T, usize) {
-    COUNT.with(|c| c.set(0));
-    ON.with(|c| c.set(true));
-    let out = body();
-    ON.with(|c| c.set(false));
-    (out, COUNT.with(Cell::get))
-}
+static ALLOCATOR: Counting = Counting::new();
 
 /// The instrument first. A measurement that cannot see a known allocation is
 /// worth nothing, and one that counts allocations the body did not make would
