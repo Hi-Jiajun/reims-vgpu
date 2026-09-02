@@ -82,6 +82,19 @@ pub struct Enabled {
     /// structure and the census admitted each on its own.
     pub vertex_attribute_divisor: bool,
     pub vertex_attribute_zero_divisor: bool,
+    /// The two `VK_EXT_extended_dynamic_state3` members this rail sets, which
+    /// let a pipeline take its fill mode and its depth clamp per draw instead
+    /// of baking one pipeline per value — see [`crate::raster`].
+    ///
+    /// Two fields and not one, unlike `dynamic_cull_and_winding` beside them:
+    /// they are two feature bits of one structure and a device may report
+    /// either without the other, so the census admits each on its own and the
+    /// request has to be able to say so.
+    ///
+    /// Never promoted, so there is no `core_promotions` route: the extension's
+    /// own structure is the only asker.
+    pub extended_dynamic_state3_polygon_mode: bool,
+    pub extended_dynamic_state3_depth_clamp_enable: bool,
     pub mesh_shader: bool,
     pub descriptor_buffer: bool,
     /// The 1.0 boolean block, requested through
@@ -142,6 +155,8 @@ impl Enabled {
             extended_dynamic_state: census.topology().dynamic,
             vertex_attribute_divisor: census.vertex().instance_rate_divisor,
             vertex_attribute_zero_divisor: census.vertex().zero_divisor,
+            extended_dynamic_state3_polygon_mode: census.raster().dynamic_polygon_mode,
+            extended_dynamic_state3_depth_clamp_enable: census.raster().dynamic_depth_clamp,
             mesh_shader: census.stages().mesh_shader,
             descriptor_buffer: census.descriptors().descriptor_buffer,
             depth_clamp: census.raster().depth_clamp,
@@ -263,6 +278,15 @@ impl DeviceEpoch {
         let mut divisor = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default()
             .vertex_attribute_instance_rate_divisor(enabled.vertex_attribute_divisor)
             .vertex_attribute_instance_rate_zero_divisor(enabled.vertex_attribute_zero_divisor);
+        // Each member requested only where the census admitted it, like the
+        // divisor pair above: a device that offers the polygon mode and not
+        // the depth clamp is asked for exactly what it offers.
+        let mut extended_dynamic_state_3 =
+            vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default()
+                .extended_dynamic_state3_polygon_mode(enabled.extended_dynamic_state3_polygon_mode)
+                .extended_dynamic_state3_depth_clamp_enable(
+                    enabled.extended_dynamic_state3_depth_clamp_enable,
+                );
         let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
         let mut descriptor_buffer =
             vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
@@ -307,6 +331,15 @@ impl DeviceEpoch {
         // both to be off.
         if enabled.vertex_attribute_divisor || enabled.vertex_attribute_zero_divisor {
             create = create.push_next(&mut divisor);
+        }
+        // Outside the `core_promotions` split for the opposite reason to the
+        // divisor's: nothing ever promoted this extension, so there is no
+        // version at which its structure stops being the one to ask through.
+        // Chained on the extension being enabled, which
+        // `DeviceExtensions::extended_dynamic_state_3` already makes mean
+        // "and a member this rail sets came back with it".
+        if enabled.extensions.extended_dynamic_state_3 {
+            create = create.push_next(&mut extended_dynamic_state_3);
         }
         if enabled.mesh_shader {
             create = create.push_next(&mut mesh);
@@ -431,6 +464,48 @@ mod tests {
                 depth: 1,
             },
         }]
+    }
+
+    /// A 1.2 device that reports the floor and nothing optional, for the
+    /// sweeps that vary one fact at a time through `..`.
+    fn bare<'a>(
+        memory: &'a vk::PhysicalDeviceMemoryProperties,
+        queue_families: &'a [vk::QueueFamilyProperties],
+    ) -> Reported<'a> {
+        Reported {
+            api_version: vk::make_api_version(0, 1, 2, 0),
+            extensions: &[extension::SWAPCHAIN],
+            timeline_semaphore: true,
+            synchronization2: false,
+            dynamic_rendering: false,
+            depth_clamp: false,
+            fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
+            multi_viewport: false,
+            max_viewports: 1,
+            sampler_anisotropy: false,
+            max_sampler_anisotropy: 1.0,
+            extended_dynamic_state: false,
+            dynamic_primitive_topology_unrestricted: None,
+            extended_dynamic_state3_polygon_mode: false,
+            extended_dynamic_state3_depth_clamp_enable: false,
+            vertex_attribute_instance_rate_divisor: false,
+            vertex_attribute_instance_rate_zero_divisor: false,
+            max_vertex_attrib_divisor: 0,
+            vertex_formats: crate::vertex::VertexFormatSupport::NONE,
+            dual_src_blend: false,
+            independent_blend: false,
+            sampler_mirror_clamp_to_edge: false,
+            mesh_shader: false,
+            descriptor_buffer: false,
+            max_push_descriptors: 0,
+            max_buffer_size: None,
+            host_pointer_importable: false,
+            min_imported_host_pointer_alignment: 0,
+            memory,
+            queue_families,
+        }
     }
 
     fn census_of(api: (u32, u32), extensions: &[&str], features: (bool, bool, bool)) -> Census {
@@ -581,6 +656,74 @@ mod tests {
         assert!(!enabled.core_promotions);
     }
 
+    /// The two `VK_EXT_extended_dynamic_state3` members are requested exactly
+    /// where the census admitted them, and the extension is asked for exactly
+    /// where a member was.
+    ///
+    /// The regression: neither was requested at all. The extension went into
+    /// `ppEnabledExtensionNames` and no
+    /// `VkPhysicalDeviceExtendedDynamicState3FeaturesEXT` was ever chained, so
+    /// `raster::plan` placeheld the pipeline's `polygonMode` and
+    /// `depthClampEnable` and declared them dynamic on a device that had
+    /// enabled neither feature --- `vkCmdSetPolygonModeEXT` as invalid use,
+    /// and on a driver that ignores it a pipeline that silently rasterizes the
+    /// placeholder instead of the guest's wireframe fill.
+    #[test]
+    fn the_two_dynamic_state_3_members_are_requested_one_at_a_time() {
+        let memory = mem::apple_m3_max();
+        let families = families();
+        for polygon_mode in [false, true] {
+            for depth_clamp_enable in [false, true] {
+                let census = Census::take(Reported {
+                    extensions: &[extension::SWAPCHAIN, extension::EXTENDED_DYNAMIC_STATE_3],
+                    extended_dynamic_state3_polygon_mode: polygon_mode,
+                    extended_dynamic_state3_depth_clamp_enable: depth_clamp_enable,
+                    ..bare(&memory, &families)
+                })
+                .expect("admitted");
+                let enabled = Enabled::for_census(&census);
+
+                // Each member on its own, and each is what the raster planner
+                // will spend.
+                assert_eq!(enabled.extended_dynamic_state3_polygon_mode, polygon_mode);
+                assert_eq!(
+                    enabled.extended_dynamic_state3_depth_clamp_enable,
+                    depth_clamp_enable
+                );
+                assert_eq!(census.raster().dynamic_polygon_mode, polygon_mode);
+                assert_eq!(census.raster().dynamic_depth_clamp, depth_clamp_enable);
+
+                // And the extension travels with them: enabled where a member
+                // was admitted, absent where neither was, so no structure is
+                // ever chained for an extension that is not in the list and no
+                // member is ever spent without one.
+                let wanted = polygon_mode || depth_clamp_enable;
+                assert_eq!(enabled.extensions.extended_dynamic_state_3, wanted);
+                assert_eq!(
+                    enabled
+                        .extensions
+                        .names()
+                        .contains(&extension::EXTENDED_DYNAMIC_STATE_3),
+                    wanted
+                );
+            }
+        }
+
+        // A device that does not enumerate the extension admits neither member
+        // however it answers, because there is no structure to have answered
+        // through.
+        let census = Census::take(Reported {
+            extended_dynamic_state3_polygon_mode: true,
+            extended_dynamic_state3_depth_clamp_enable: true,
+            ..bare(&memory, &families)
+        })
+        .expect("admitted");
+        let enabled = Enabled::for_census(&census);
+        assert!(!enabled.extended_dynamic_state3_polygon_mode);
+        assert!(!enabled.extended_dynamic_state3_depth_clamp_enable);
+        assert!(!enabled.extensions.extended_dynamic_state_3);
+    }
+
     #[test]
     fn the_optional_raster_features_are_enabled_exactly_when_reported() {
         let memory = mem::apple_m3_max();
@@ -593,40 +736,7 @@ mod tests {
                         fill_mode_non_solid,
                         multi_viewport,
                         max_viewports: if multi_viewport { 16 } else { 1 },
-                        ..Reported {
-                            api_version: vk::make_api_version(0, 1, 2, 0),
-                            extensions: &[extension::SWAPCHAIN],
-                            timeline_semaphore: true,
-                            synchronization2: false,
-                            dynamic_rendering: false,
-                            depth_clamp: false,
-                            fill_mode_non_solid: false,
-                            wide_lines: false,
-                            line_width_range: [1.0, 1.0],
-                            multi_viewport: false,
-                            max_viewports: 1,
-                            sampler_anisotropy: false,
-                            max_sampler_anisotropy: 1.0,
-                            extended_dynamic_state: false,
-                            dynamic_primitive_topology_unrestricted: None,
-                            extended_dynamic_state3_polygon_mode: false,
-                            extended_dynamic_state3_depth_clamp_enable: false,
-                            vertex_attribute_instance_rate_divisor: false,
-                            vertex_attribute_instance_rate_zero_divisor: false,
-                            max_vertex_attrib_divisor: 0,
-                            vertex_formats: crate::vertex::VertexFormatSupport::NONE,
-                            dual_src_blend: false,
-                            independent_blend: false,
-                            sampler_mirror_clamp_to_edge: false,
-                            mesh_shader: false,
-                            descriptor_buffer: false,
-                            max_push_descriptors: 0,
-                            max_buffer_size: None,
-                            host_pointer_importable: false,
-                            min_imported_host_pointer_alignment: 0,
-                            memory: &memory,
-                            queue_families: &families,
-                        }
+                        ..bare(&memory, &families)
                     })
                     .expect("admitted");
                     let enabled = Enabled::for_census(&census);
