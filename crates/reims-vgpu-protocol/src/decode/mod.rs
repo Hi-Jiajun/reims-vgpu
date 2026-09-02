@@ -49,7 +49,7 @@ pub use reims_vgpu_wire::{F32le, F64le, U16le, U32le, U64le};
 
 pub use reims_vgpu_wire::ops::render_pass::{
     AttachmentPrefix, ColorAttachmentBody, DepthAttachmentBody, RenderPassBody,
-    StencilAttachmentBody,
+    StencilAttachmentBody, RENDER_PASS_COLOR_ATTACHMENTS,
 };
 
 /// Why a record could not be lifted.

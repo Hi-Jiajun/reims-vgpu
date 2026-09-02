@@ -48,7 +48,21 @@ pub use reims_vgpu_protocol::pass_action::{
 ///
 /// Eight, always: the record is a fixed shape and an unattached slot is one
 /// whose texture ref is zero, not one that is absent.
-pub const COLOR_ATTACHMENTS: usize = 8;
+///
+/// Taken from the layout rather than written again. [`pass_descriptor`] walks
+/// the wire body's colour array and indexes this descriptor's by the same
+/// number, so two constants that could disagree are a panic on guest data at
+/// the moment they do — and the wire's is the one that decides, because it is
+/// the array that exists.
+///
+/// [`pass_descriptor`]: crate::resolve::pass_descriptor
+pub const COLOR_ATTACHMENTS: usize = reims_vgpu_protocol::decode::RENDER_PASS_COLOR_ATTACHMENTS;
+
+// `AttachmentSlot::Color` names a slot in a `u8`, and `pass_descriptor` casts
+// the array index into one. Bounded here rather than checked there: the cast
+// is lossless for every count this constant can hold, and a wire that grew
+// past it should stop the build rather than renumber slot 256 as slot 0.
+const _: () = assert!(COLOR_ATTACHMENTS <= u8::MAX as usize + 1);
 
 /// Which of the pass's fixed slots an attachment is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -416,6 +430,38 @@ const NO_STAGES: u32 = 0;
 
 #[cfg(test)]
 mod tests {
+    /// The claim `COLOR_ATTACHMENTS` is derived for: an empty descriptor has
+    /// exactly one slot per colour attachment the wire body carries, each
+    /// named by its own index.
+    ///
+    /// `crate::resolve::pass_descriptor` walks the wire array and writes
+    /// `descriptor.color[index]`, so a descriptor with fewer slots than the
+    /// body has is an index out of range on a guest render pass --- a panic on
+    /// guest data, which is the one failure this model may not have.
+    #[test]
+    fn a_descriptor_has_one_colour_slot_per_slot_the_wire_carries() {
+        let descriptor = PassDescriptor::empty();
+        assert_eq!(
+            descriptor.color.len(),
+            reims_vgpu_protocol::decode::RENDER_PASS_COLOR_ATTACHMENTS
+        );
+        // Not the same statement twice: the line above compares the descriptor
+        // to the wire's count, and this one proves that count really is the
+        // length of the array `pass_descriptor` walks.
+        assert_eq!(
+            core::mem::size_of_val(&descriptor.color) / core::mem::size_of::<Attachment>(),
+            core::mem::size_of::<
+                [reims_vgpu_protocol::decode::ColorAttachmentBody;
+                    reims_vgpu_protocol::decode::RENDER_PASS_COLOR_ATTACHMENTS],
+            >() / core::mem::size_of::<reims_vgpu_protocol::decode::ColorAttachmentBody>()
+        );
+        for (index, attachment) in descriptor.color.iter().enumerate() {
+            assert_eq!(
+                attachment.slot,
+                AttachmentSlot::Color(u8::try_from(index).expect("bounded by the const assertion"))
+            );
+        }
+    }
 
     /// A clear value is read through the slot that owns it, and every other
     /// reading is `None`. There is no tag to disagree with the slot, which is
