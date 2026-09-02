@@ -99,6 +99,11 @@ pub enum Refusal {
     /// An alignment that is not a power of two. Every Vulkan alignment is, and
     /// a caller passing zero or three has computed one rather than read it.
     BadAlignment { alignment: u64 },
+    /// A request for no bytes. There is no window that names them: a zero
+    /// window's flush range has size zero, which `vkFlushMappedMemoryRanges`
+    /// refuses, and the copy it would feed is a region `vkCmdCopyBuffer`
+    /// refuses too. A caller with nothing to stage skips staging.
+    Empty,
 }
 
 impl Refusal {
@@ -108,6 +113,7 @@ impl Refusal {
             Self::TooLarge { .. } => "vk_staging_larger_than_chunk",
             Self::Exhausted { .. } => "vk_staging_exhausted",
             Self::BadAlignment { .. } => "vk_staging_bad_alignment",
+            Self::Empty => "vk_staging_empty",
         }
     }
 }
@@ -124,6 +130,7 @@ impl std::fmt::Display for Refusal {
             Self::BadAlignment { alignment } => {
                 write!(f, "{} alignment={alignment}", self.slug())
             }
+            Self::Empty => f.write_str(self.slug()),
         }
     }
 }
@@ -314,6 +321,13 @@ impl Arena {
         if !alignment.is_power_of_two() {
             self.census.refused += 1;
             return Err(Refusal::BadAlignment { alignment });
+        }
+        // Before the room question, because no arrangement of chunks answers
+        // it: a window of no bytes is one whose flush range is empty. See
+        // [`Refusal::Empty`].
+        if size == 0 {
+            self.census.refused += 1;
+            return Err(Refusal::Empty);
         }
         let chunk_size = self.chunks[0].size;
         if size > chunk_size {
@@ -692,6 +706,7 @@ mod tests {
                 in_flight: 1,
             },
             Refusal::BadAlignment { alignment: 3 },
+            Refusal::Empty,
         ];
         let slugs: BTreeSet<&str> = refusals.iter().map(|r| r.slug()).collect();
         assert_eq!(slugs.len(), refusals.len());
@@ -699,6 +714,23 @@ mod tests {
             assert!(refusal.to_string().starts_with(refusal.slug()));
             assert!(refusal.slug().starts_with("vk_staging_"));
         }
+    }
+
+    #[test]
+    fn a_request_for_no_bytes_is_refused_rather_than_handed_an_unflushable_window() {
+        let mut arena = arena(2, 64);
+        assert_eq!(arena.allocate(0, 4), Err(Refusal::Empty));
+        // Refused before the room question, so an alignment that is not a
+        // power of two is still the answer a caller gets first, and the arena
+        // is untouched apart from the count.
+        assert_eq!(
+            arena.allocate(0, 3),
+            Err(Refusal::BadAlignment { alignment: 3 })
+        );
+        assert_eq!(arena.census().allocated, 0);
+        assert_eq!(arena.census().refused, 2);
+        // And the whole chunk is still there to hand out.
+        assert_eq!(arena.allocate(CHUNK, 4).expect("room").offset, 0);
     }
 
     #[test]
@@ -781,6 +813,7 @@ mod tests {
         bad_alignment: usize,
         too_large: usize,
         exhausted: usize,
+        empty: usize,
         submitted: usize,
         recycled: usize,
         flushes: usize,
@@ -803,8 +836,9 @@ mod tests {
                     0..=9 => {
                         // Sizes that mostly fit and sometimes do not, and one
                         // alignment in eight that is not a power of two.
-                        let size = match rng.below(8) {
-                            0 => CHUNK + 1 + rng.below(64),
+                        let size = match rng.below(16) {
+                            0 | 1 => CHUNK + 1 + rng.below(64),
+                            2 => 0,
                             _ => 1 + rng.below(CHUNK / 3),
                         };
                         let alignment = match rng.below(8) {
@@ -815,6 +849,7 @@ mod tests {
                         // says it is --- and the padding an alignment costs is
                         // part of the room question, not a detail beside it.
                         let open_with_room = alignment.is_power_of_two()
+                            && size > 0
                             && size <= CHUNK
                             && shadow.iter().any(|c| {
                                 let used = c.live.last().map_or(0, |&(_, end)| end);
@@ -858,7 +893,7 @@ mod tests {
                                 assert!(start + length >= window.end(), "the flush misses bytes");
                                 assert!(start + length <= CHUNK);
                                 assert!(
-                                    length % atom == 0 || start + length == CHUNK,
+                                    length.is_multiple_of(atom),
                                     "a flush size Vulkan refuses: {length} against atom {atom}"
                                 );
                                 tally.flushes += 1;
@@ -872,6 +907,10 @@ mod tests {
                                 assert_eq!((requested, chunk), (size, CHUNK));
                                 assert!(size > CHUNK);
                                 tally.too_large += 1;
+                            }
+                            Err(Refusal::Empty) => {
+                                assert_eq!(size, 0);
+                                tally.empty += 1;
                             }
                             Err(Refusal::Exhausted { chunks, .. }) => {
                                 assert_eq!(chunks, CHUNKS);
@@ -958,6 +997,7 @@ mod tests {
         assert!(tally.bad_alignment > 500, "{}", tally.bad_alignment);
         assert!(tally.too_large > 500, "{}", tally.too_large);
         assert!(tally.exhausted > 500, "{}", tally.exhausted);
+        assert!(tally.empty > 500, "{}", tally.empty);
         assert!(tally.submitted > 2_000, "{}", tally.submitted);
         assert!(tally.out_of_order > 500, "{}", tally.out_of_order);
         assert!(tally.recycled > 2_000, "{}", tally.recycled);
