@@ -110,8 +110,17 @@ impl Use {
     pub const fn stages(self) -> vk::PipelineStageFlags2 {
         match self {
             Self::ColorAttachment => vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            // Both, because a depth or stencil access happens in either. Which
+            // one is the pipeline's business --- a fragment shader that
+            // discards or writes `gl_FragDepth` forces the test late --- and a
+            // source mask naming only the early stage does not wait for the
+            // write the late stage performed. Sampling the depth buffer that
+            // was just rendered would then race it.
             Self::DepthStencilAttachment | Self::DepthStencilRead => {
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                vk::PipelineStageFlags2::from_raw(
+                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw(),
+                )
             }
             // Any shader stage may sample or store, and which ones is the
             // pipeline's business rather than the layout's. `ALL_COMMANDS` here
@@ -584,6 +593,40 @@ mod tests {
         assert!(transition
             .dst_access
             .contains(vk::AccessFlags2::SHADER_SAMPLED_READ));
+    }
+
+    /// A depth or stencil access happens in the early *and* the late fragment
+    /// test stages, and which one a given draw used is a property of its
+    /// pipeline rather than of the layout. So a transition sourced at a depth
+    /// use has to wait for both: a fragment shader that discards or writes
+    /// `gl_FragDepth` forces the test late, and a source mask naming only the
+    /// early stage lets the sample below read the depth buffer while the late
+    /// stage is still writing it.
+    ///
+    /// This is the same claim `barrier::ACCESS_STAGES` makes for the two
+    /// depth-stencil accesses, and the reason `barrier::stages` turns one Metal
+    /// fragment stage into four Vulkan ones.
+    #[test]
+    fn a_depth_use_names_both_fragment_test_stages() {
+        const BOTH: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw(),
+        );
+        assert_eq!(Use::DepthStencilAttachment.stages(), BOTH);
+        assert_eq!(Use::DepthStencilRead.stages(), BOTH);
+
+        let mut t = tracker();
+        let sub = Subresource::new(1, 0);
+        t.plan(IMG, sub, Use::DepthStencilAttachment, Contents::Keep)
+            .expect("declared");
+        let transition = t
+            .plan(IMG, sub, Use::SampledRead, Contents::Keep)
+            .expect("declared")
+            .expect("depth attachment to shader read is a transition");
+        assert_eq!(transition.src_stages, BOTH);
+        assert!(transition
+            .src_access
+            .contains(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE));
     }
 
     /// Discarding is the caller's decision. The saving is real and so is the
