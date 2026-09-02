@@ -1033,7 +1033,7 @@ fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
         recorder.transfer(&transfer::Command::CopyBufferToImage {
             source: staging,
             dest: image,
-            regions: vec![region],
+            regions: transfer::Regions::One(region),
         });
     }
 
@@ -1067,7 +1067,7 @@ fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
         recorder.transfer(&transfer::Command::CopyImageToBuffer {
             source: image,
             dest: staging,
-            regions: vec![vk::BufferImageCopy {
+            regions: transfer::Regions::One(vk::BufferImageCopy {
                 buffer_offset: 0,
                 buffer_row_length: 0,
                 buffer_image_height: 0,
@@ -1083,7 +1083,7 @@ fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
                     height: 1,
                     depth: 1,
                 },
-            }],
+            }),
         });
     }
     unsafe { device.end_command_buffer(command) }.expect("end");

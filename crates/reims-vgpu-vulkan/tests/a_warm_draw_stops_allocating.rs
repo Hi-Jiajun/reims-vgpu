@@ -14,11 +14,23 @@
 //! model's own suite. Its counter is per thread and off unless a measurement
 //! asks for it, so these run alongside everything else.
 
+use ash::vk;
+use ash::vk::Handle;
 use reims_vgpu_core::bind::{BufferBinding, ObjectBinding};
-use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration, TimelinePoint};
+use reims_vgpu_core::blit::{BlitOp, ImagePitch, Origin3, Size3, TexturePoint, TextureSpan};
+use reims_vgpu_core::identity::{
+    DeviceEpoch, ObjectListRef, ResourceId, SessionGeneration, SlotGeneration, TimelinePoint,
+};
+use reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+use reims_vgpu_core::retire::{Lifetime, NativeRetirement};
+use reims_vgpu_core::texture_shape::{TextureKind, TextureShape, TextureUsage};
 use reims_vgpu_testkit::allocations::{measure, Counting};
 use reims_vgpu_vulkan::bindings::BindingTable;
+use reims_vgpu_vulkan::buffer::{BufferPlan, EVERY_CLASS};
 use reims_vgpu_vulkan::descriptor::SetRing;
+use reims_vgpu_vulkan::image::ImagePlan;
+use reims_vgpu_vulkan::resident::{Native, NativeBuffer, NativeImage, Residency};
+use reims_vgpu_vulkan::transfer;
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting::new();
@@ -199,4 +211,187 @@ fn walking_the_slots_an_emission_owes_allocates_nothing() {
         allocations, 0,
         "the walk over a dirty set builds nothing of its own"
     );
+}
+
+/// Planning a transfer costs the allocator nothing.
+///
+/// Four of the five transfer shapes produce exactly one region, and a frame
+/// that streams — a texture upload, a readback, a buffer copy — issues them by
+/// the dozen. A `Vec` to carry a value the plan already had is one trip into
+/// the allocator per record on that path, which is the per-record heap cost
+/// the plan's structural zeros rule out.
+///
+/// A slice span of more than one level is the one shape that genuinely has
+/// several regions, and it is measured too so the number is the level count
+/// and not the level count plus a surprise.
+#[test]
+fn planning_a_transfer_allocates_nothing_per_single_region_record() {
+    let mut residency = Residency::new();
+    let mut retire = NativeRetirement::new();
+    let lifetime = Lifetime::new(SessionGeneration::FIRST, DeviceEpoch::FIRST);
+    let shape = TextureShape {
+        kind: TextureKind::D2Array.ordinal(),
+        width: 64,
+        height: 32,
+        depth: 1,
+        mipmap_level_count: 4,
+        sample_count: 1,
+        array_length: 3,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        usage: TextureUsage::SHADER_READ,
+    }
+    .checked()
+    .expect("a valid declaration");
+    for (slot, native) in [
+        (
+            1u32,
+            Native::Buffer(NativeBuffer {
+                buffer: vk::Buffer::from_raw(0xB1),
+                memory: vk::DeviceMemory::from_raw(0xB1),
+                plan: BufferPlan {
+                    size: 1 << 20,
+                    usage: EVERY_CLASS,
+                    aliased: false,
+                },
+            }),
+        ),
+        (
+            2,
+            Native::Image(NativeImage {
+                texture: shape,
+                image: vk::Image::from_raw(0x1A),
+                memory: vk::DeviceMemory::from_raw(0x1A),
+                plan: ImagePlan {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::R8G8B8A8_UNORM,
+                    extent: vk::Extent3D {
+                        width: 64,
+                        height: 32,
+                        depth: 1,
+                    },
+                    mip_levels: 4,
+                    array_layers: 3,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    tiling: vk::ImageTiling::OPTIMAL,
+                    usage: vk::ImageUsageFlags::SAMPLED,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                sampled: Default::default(),
+                attachments: Vec::new(),
+            }),
+        ),
+        (
+            3,
+            Native::Image(NativeImage {
+                texture: shape,
+                image: vk::Image::from_raw(0x1B),
+                memory: vk::DeviceMemory::from_raw(0x1B),
+                plan: ImagePlan {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::R8G8B8A8_UNORM,
+                    extent: vk::Extent3D {
+                        width: 64,
+                        height: 32,
+                        depth: 1,
+                    },
+                    mip_levels: 4,
+                    array_layers: 3,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    tiling: vk::ImageTiling::OPTIMAL,
+                    usage: vk::ImageUsageFlags::SAMPLED,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                sampled: Default::default(),
+                attachments: Vec::new(),
+            }),
+        ),
+    ] {
+        residency
+            .publish(id(slot), lifetime, native, &mut retire)
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+    }
+
+    let point = |slot: u32| TexturePoint {
+        texture: id(slot),
+        slice: 0,
+        level: 0,
+        origin: Origin3 { x: 0, y: 0, z: 0 },
+    };
+    let flat = ImagePitch {
+        bytes_per_row: 0,
+        bytes_per_image: 0,
+    };
+    let size = Size3 {
+        width: 8,
+        height: 8,
+        depth: 1,
+    };
+    let one_level = TextureSpan {
+        texture: id(2),
+        base_slice: 0,
+        base_level: 0,
+        slice_count: 3,
+        level_count: 1,
+    };
+    for op in [
+        BlitOp::BufferToBuffer {
+            source: id(1),
+            source_offset: 0,
+            dest: id(1),
+            dest_offset: 4096,
+            size: 256,
+        },
+        BlitOp::BufferToTexture {
+            source: id(1),
+            source_offset: 0,
+            source_pitch: flat,
+            size,
+            dest: point(2),
+            options: Default::default(),
+        },
+        BlitOp::TextureToBuffer {
+            source: point(2),
+            size,
+            dest: id(1),
+            dest_offset: 0,
+            dest_pitch: flat,
+            options: Default::default(),
+        },
+        BlitOp::TextureRegion {
+            source: point(2),
+            dest: point(3),
+            size,
+            options: Default::default(),
+        },
+        BlitOp::TextureSlices {
+            source: one_level,
+            dest: TextureSpan {
+                texture: id(3),
+                ..one_level
+            },
+        },
+    ] {
+        let kind = op.kind();
+        let (planned, allocations) = measure(|| transfer::plan(&op, &residency));
+        let planned = planned.unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+        assert_eq!(planned.region_count(), 1, "{kind:?} names one region");
+        assert_eq!(allocations, 0, "{kind:?} planned through the allocator");
+    }
+
+    // The one shape that really does have several. Its cost is the one `Vec`
+    // holding them, and nothing beside it.
+    let four_levels = TextureSpan {
+        level_count: 4,
+        ..one_level
+    };
+    let op = BlitOp::TextureSlices {
+        source: four_levels,
+        dest: TextureSpan {
+            texture: id(3),
+            ..four_levels
+        },
+    };
+    let (planned, allocations) = measure(|| transfer::plan(&op, &residency));
+    assert_eq!(planned.expect("plannable").region_count(), 4);
+    assert_eq!(allocations, 1, "one allocation for the four regions");
 }

@@ -241,6 +241,44 @@ impl std::fmt::Display for Refusal {
     }
 }
 
+/// The regions of one native transfer, held inline when there is one of them.
+///
+/// Four of the five transfer shapes produce exactly one region — a whole
+/// buffer copy, both directions of a buffer-image copy, and a single-region
+/// texture copy. Only a slice span produces more, one per level. A `Vec` for
+/// all five costs a trip into the allocator on every transfer a frame issues
+/// in order to hold a value the plan already had, which is a per-record heap
+/// cost the plan's structural zeros do not allow.
+///
+/// A borrowed slice would remove the allocation too, and it would also make
+/// [`Command`] borrow the arena the plan wrote into — so a caller could hold
+/// one command while planning the next only by keeping two arenas. This owns
+/// what it carries and stays the value it always was.
+#[derive(Clone, Debug)]
+pub enum Regions<T> {
+    /// The single-region case, which is every transfer but a slice span.
+    One(T),
+    /// A slice span's one region per level.
+    Many(Vec<T>),
+}
+
+impl<T> core::ops::Deref for Regions<T> {
+    type Target = [T];
+
+    /// The regions, as the slice a native call takes.
+    ///
+    /// `Deref` and not a named door: every reader of this wants the slice ---
+    /// the recorder hands it to `ash`, the tests index and iterate it --- and
+    /// a container that spells `len`, `is_empty`, `iter` and `Index` itself is
+    /// a second slice vocabulary that can disagree with the one it is holding.
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::One(region) => core::slice::from_ref(region),
+            Self::Many(regions) => regions,
+        }
+    }
+}
+
 /// One native transfer command, with the handles it names already resolved.
 ///
 /// Not `PartialEq`: ash's copy structures are not, and wrapping nine `u32`
@@ -252,23 +290,41 @@ pub enum Command {
     CopyBuffer {
         source: vk::Buffer,
         dest: vk::Buffer,
-        regions: Vec<vk::BufferCopy>,
+        regions: Regions<vk::BufferCopy>,
     },
     CopyBufferToImage {
         source: vk::Buffer,
         dest: vk::Image,
-        regions: Vec<vk::BufferImageCopy>,
+        regions: Regions<vk::BufferImageCopy>,
     },
     CopyImageToBuffer {
         source: vk::Image,
         dest: vk::Buffer,
-        regions: Vec<vk::BufferImageCopy>,
+        regions: Regions<vk::BufferImageCopy>,
     },
     CopyImage {
         source: vk::Image,
         dest: vk::Image,
-        regions: Vec<vk::ImageCopy>,
+        regions: Regions<vk::ImageCopy>,
     },
+}
+
+impl Command {
+    /// How many regions this command records.
+    ///
+    /// The count and not the regions: the four variants carry three different
+    /// region types, and a caller that wants the regions themselves has
+    /// already matched the variant that says which type they are.
+    #[must_use]
+    pub fn region_count(&self) -> usize {
+        match self {
+            Self::CopyBuffer { regions, .. } => regions.len(),
+            Self::CopyBufferToImage { regions, .. } | Self::CopyImageToBuffer { regions, .. } => {
+                regions.len()
+            }
+            Self::CopyImage { regions, .. } => regions.len(),
+        }
+    }
 }
 
 /// A dimension the guest gave in 64 bits, as the 32 a native copy carries.
@@ -606,11 +662,11 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
             Ok(Command::CopyBuffer {
                 source: from.buffer,
                 dest: to.buffer,
-                regions: vec![vk::BufferCopy {
+                regions: Regions::One(vk::BufferCopy {
                     src_offset: source_offset,
                     dst_offset: dest_offset,
                     size,
-                }],
+                }),
             })
         }
         BlitOp::BufferToTexture {
@@ -631,13 +687,13 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
             Ok(Command::CopyBufferToImage {
                 source: from.buffer,
                 dest: image.image,
-                regions: vec![buffer_image_region(
+                regions: Regions::One(buffer_image_region(
                     image.texture,
                     source_offset,
                     source_pitch,
                     dest,
                     size,
-                )?],
+                )?),
             })
         }
         BlitOp::TextureToBuffer {
@@ -658,13 +714,13 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
             Ok(Command::CopyImageToBuffer {
                 source: image.image,
                 dest: to.buffer,
-                regions: vec![buffer_image_region(
+                regions: Regions::One(buffer_image_region(
                     image.texture,
                     dest_offset,
                     dest_pitch,
                     source,
                     size,
-                )?],
+                )?),
             })
         }
         BlitOp::TextureRegion {
@@ -680,13 +736,13 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
             Ok(Command::CopyImage {
                 source: from.image,
                 dest: to.image,
-                regions: vec![vk::ImageCopy {
+                regions: Regions::One(vk::ImageCopy {
                     src_subresource,
                     src_offset,
                     dst_subresource,
                     dst_offset,
                     extent,
-                }],
+                }),
             })
         }
         BlitOp::TextureSlices { source, dest } => {
@@ -708,12 +764,10 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                     u64::from(texture.layers()),
                 )?;
             }
-            let mut regions = Vec::with_capacity(usize::from(source.level_count));
-            for level in 0..u32::from(source.level_count) {
-                // One region per level and not per slice: `layerCount` covers
-                // the slice span, and the extent is the level's own — a mip
-                // chain copied with level zero's extent reads past every level
-                // below it.
+            // One region per level and not per slice: `layerCount` covers the
+            // slice span, and the extent is the level's own --- a mip chain
+            // copied with level zero's extent reads past every level below it.
+            let region = |level: u32| -> Result<vk::ImageCopy, Refusal> {
                 let source_extent = from
                     .texture
                     .level_extent(u32::from(source.base_level) + level)
@@ -742,7 +796,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                 ] {
                     within(axis, u64::from(named), u64::from(available))?;
                 }
-                regions.push(vk::ImageCopy {
+                Ok(vk::ImageCopy {
                     src_subresource: vk::ImageSubresourceLayers {
                         aspect_mask: aspect(from.texture.pixel_format()),
                         mip_level: u32::from(source.base_level) + level,
@@ -762,11 +816,22 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
                         height: source_extent.y,
                         depth: source_extent.z,
                     },
-                });
-            }
-            if regions.is_empty() {
-                return Err(Refusal::EmptyRange);
-            }
+                })
+            };
+            // A one-level span is the single-region shape the other four arms
+            // are, so it is held the way they are held. The count is decided
+            // before the first region is built rather than after the last one,
+            // because a `Vec` collected and then found to hold one has already
+            // paid for itself.
+            let regions = match source.level_count {
+                0 => return Err(Refusal::EmptyRange),
+                1 => Regions::One(region(0)?),
+                count => Regions::Many(
+                    (0..u32::from(count))
+                        .map(region)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            };
             Ok(Command::CopyImage {
                 source: from.image,
                 dest: to.image,
