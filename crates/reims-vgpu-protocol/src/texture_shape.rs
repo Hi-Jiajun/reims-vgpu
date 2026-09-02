@@ -322,6 +322,26 @@ pub enum ShapeRefusal {
         kind: TextureKind,
         found: u32,
     },
+    /// The (mip level, layer) pairs this declaration names cannot be counted.
+    ///
+    /// [`Texture::layers`] and [`Texture::subresources`] are the answers this
+    /// type exists to give, and both are products of guest fields: a cube's
+    /// layer count is `array_length * 6`, and a subresource count is that
+    /// times the mip levels. `array_length` is otherwise bounded only by not
+    /// being zero, so a declaration can name more pairs than a `u32` holds —
+    /// and then the answer is a panic in a checked build and a small wrong
+    /// number in an unchecked one, from a method whose signature promises
+    /// neither.
+    ///
+    /// Refused at the checkpoint rather than made fallible at the doors. The
+    /// point of [`Texture`] is that a holder does not re-derive the rules, and
+    /// a `layers()` returning `Option` would push exactly that back out to
+    /// every caller.
+    SubresourceCount {
+        kind: TextureKind,
+        array_length: u32,
+        mip_levels: u32,
+    },
 }
 
 impl reims_vgpu_observe::Decline for ShapeRefusal {
@@ -335,6 +355,7 @@ impl reims_vgpu_observe::Decline for ShapeRefusal {
             Self::MipLevels { .. } => "texture_shape_mip_levels",
             Self::MipLevelsBeyondExtent { .. } => "texture_shape_mip_levels_beyond_extent",
             Self::SampleCount { .. } => "texture_shape_sample_count",
+            Self::SubresourceCount { .. } => "texture_shape_subresource_count",
         }
     }
 
@@ -374,6 +395,15 @@ impl reims_vgpu_observe::Decline for ShapeRefusal {
             } => vec![
                 ("declared", declared.to_string()),
                 ("available", available.to_string()),
+            ],
+            Self::SubresourceCount {
+                kind,
+                array_length,
+                mip_levels,
+            } => vec![
+                ("kind", kind.name().to_string()),
+                ("array_length", array_length.to_string()),
+                ("mip_levels", mip_levels.to_string()),
             ],
         }
     }
@@ -498,6 +528,26 @@ impl TextureShape {
             return Err(ShapeRefusal::SampleCount {
                 kind,
                 found: self.sample_count,
+            });
+        }
+
+        // Last, because it is a rule about the answers the checked type gives
+        // rather than about any one field: `layers` and `subresources` are
+        // products, `array_length` is bounded only by not being zero, and a
+        // declaration naming more pairs than a `u32` holds has no countable
+        // subresources. Both products are checked here so neither door has to
+        // be fallible.
+        let layers = if kind.is_cube() {
+            self.array_length.checked_mul(CUBE_FACES)
+        } else {
+            Some(self.array_length)
+        };
+        let countable = layers.and_then(|layers| layers.checked_mul(self.mipmap_level_count));
+        if countable.is_none() {
+            return Err(ShapeRefusal::SubresourceCount {
+                kind,
+                array_length: self.array_length,
+                mip_levels: self.mipmap_level_count,
             });
         }
 
@@ -1026,5 +1076,181 @@ mod tests {
                 refusal == ShapeRefusal::NoPixelFormat
             );
         }
+    }
+
+    /// The failure this exists to prevent: `layers` and `subresources` are the
+    /// two answers this type is for, and both are products of guest fields.
+    /// `array_length` was bounded only by not being zero, so a cube array
+    /// naming more than `u32::MAX / 6` elements — or any type naming more
+    /// (level, layer) pairs than a `u32` holds — reached a `layers()` that
+    /// panicked in a checked build and wrapped to a small number in an
+    /// unchecked one. A wrapped layer count is a view over slices that do not
+    /// exist.
+    #[test]
+    fn a_declaration_with_more_subresources_than_can_be_counted_refuses() {
+        let base = TextureShape {
+            kind: TextureKind::CubeArray.ordinal(),
+            width: 16,
+            height: 16,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            pixel_format: 70,
+            usage: TextureUsage::SHADER_READ,
+        };
+        // The cube multiply is the first of the two products.
+        let limit = u32::MAX / CUBE_FACES;
+        assert!(
+            TextureShape {
+                array_length: limit,
+                ..base
+            }
+            .checked()
+            .is_ok(),
+            "exactly as many faces as fit is a countable declaration"
+        );
+        assert_eq!(
+            TextureShape {
+                array_length: limit + 1,
+                ..base
+            }
+            .checked()
+            .expect_err("one element past what six faces of it can be counted as"),
+            ShapeRefusal::SubresourceCount {
+                kind: TextureKind::CubeArray,
+                array_length: limit + 1,
+                mip_levels: 1,
+            }
+        );
+
+        // And the mip multiply is the second, on a type with no cube factor at
+        // all --- so a check that only guarded the cube product would pass this.
+        let flat = TextureShape {
+            kind: TextureKind::D2Array.ordinal(),
+            width: 1 << 15,
+            height: 1,
+            mipmap_level_count: 16,
+            array_length: 1 << 28,
+            ..base
+        };
+        assert_eq!(
+            flat.checked()
+                .expect_err("sixteen levels of two hundred and sixty-eight million layers"),
+            ShapeRefusal::SubresourceCount {
+                kind: TextureKind::D2Array,
+                array_length: 1 << 28,
+                mip_levels: 16,
+            }
+        );
+        assert!(
+            TextureShape {
+                mipmap_level_count: 15,
+                ..flat
+            }
+            .checked()
+            .is_ok(),
+            "one level fewer is exactly countable"
+        );
+    }
+
+    /// Every declaration that passes the checkpoint, asked every question the
+    /// checked type answers.
+    ///
+    /// Driven over a product of the fields rather than over named cases: what
+    /// the type promises is that its answers agree *with each other*, and a
+    /// hand-picked declaration checks one point of a space whose corners are
+    /// where the products overflow and the pyramids bottom out.
+    #[test]
+    fn no_answer_a_checked_texture_gives_disagrees_with_another() {
+        let interesting: [u32; 8] = [
+            1,
+            2,
+            3,
+            16,
+            1 << 15,
+            1 << 16,
+            u32::MAX / CUBE_FACES,
+            u32::MAX,
+        ];
+        let mut accepted = 0u32;
+        let mut refused = 0u32;
+        for kind in TextureKind::ALL {
+            for &width in &interesting {
+                for &height in &[1u32, 2, 33, 1 << 15] {
+                    for &array_length in &interesting {
+                        for &mipmap_level_count in &[1u32, 2, 5, 17, 32, u32::MAX] {
+                            let shape = TextureShape {
+                                kind: kind.ordinal(),
+                                width,
+                                height: if kind.dimensions() == Dimensions::One {
+                                    1
+                                } else {
+                                    height
+                                },
+                                depth: 1,
+                                mipmap_level_count,
+                                sample_count: if kind.is_multisample() { 4 } else { 1 },
+                                array_length: if kind.is_arrayed() { array_length } else { 1 },
+                                pixel_format: 70,
+                                usage: TextureUsage::SHADER_READ,
+                            };
+                            let Ok(texture) = shape.checked() else {
+                                refused += 1;
+                                continue;
+                            };
+                            accepted += 1;
+
+                            // The two products are countable, which is the
+                            // whole of the new rule and is asserted by asking
+                            // rather than by re-deriving --- these panic in
+                            // this build if they are not.
+                            let layers = texture.layers();
+                            assert_eq!(texture.subresources(), layers * texture.mip_levels());
+
+                            // A cube is six faces per element and nothing else
+                            // is.
+                            assert_eq!(
+                                layers,
+                                if kind.is_cube() {
+                                    texture.array_length() * CUBE_FACES
+                                } else {
+                                    texture.array_length()
+                                }
+                            );
+
+                            // A level exists exactly when it is below the
+                            // declared count, and level zero is the extent the
+                            // declaration named.
+                            assert!(texture.level_extent(texture.mip_levels()).is_none());
+                            assert_eq!(texture.level_extent(0), Some(texture.extent()));
+
+                            // The pyramid never grows, never reaches zero, and
+                            // leaves the axes the type does not use at one.
+                            let mut previous = texture.extent();
+                            for level in 1..texture.mip_levels() {
+                                let e = texture.level_extent(level).expect("below the count");
+                                for (now, before) in
+                                    [(e.x, previous.x), (e.y, previous.y), (e.z, previous.z)]
+                                {
+                                    assert!(now <= before && now >= 1, "{kind:?} level {level}");
+                                }
+                                if texture.kind().dimensions() != Dimensions::Three {
+                                    assert_eq!(e.z, 1);
+                                }
+                                if texture.kind().dimensions() == Dimensions::One {
+                                    assert_eq!(e.y, 1);
+                                }
+                                previous = e;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Floors per outcome, not one total: a product that refused everything
+        // would satisfy any bound written on the sweep as a whole.
+        assert!(accepted > 500, "{accepted}");
+        assert!(refused > 500, "{refused}");
     }
 }
