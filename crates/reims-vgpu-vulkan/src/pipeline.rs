@@ -313,6 +313,14 @@ pub fn build(key: GraphicsKey) -> Result<Build, Refusal> {
 
     let mut dynamic = ALWAYS_DYNAMIC.to_vec();
     dynamic.extend(key.raster.dynamic.states());
+    // The topology key already spent this host's capability: `Exact` is the
+    // baseline rung and declares nothing, `Class` and `Any` exist only where
+    // `vkCmdSetPrimitiveTopology` is available. Taken from the same plan that
+    // supplies the declared topology, because the stand-in and the state that
+    // explains it are one decision — a pipeline declaring `TRIANGLE_LIST` for
+    // a key that also serves strips, without declaring the state, draws
+    // triangle lists for every strip the guest sends.
+    dynamic.extend(key.topology.input_assembly().states());
 
     Ok(Build {
         key,
@@ -448,25 +456,14 @@ impl Build {
 
     /// The input assembly this key's topology means.
     ///
-    /// A pipeline built for [`topology::TopologyKey::Class`] or
-    /// [`topology::TopologyKey::Any`] declares *a* topology and moves within
-    /// what the key allows, so the declared one is the class's list form and
-    /// `Any`'s is the triangle list — the type every guest draws most of, and
-    /// the one a device that ignores the declaration would be given anyway.
+    /// [`topology::TopologyKey::input_assembly`]'s answer and not a second
+    /// derivation of it. That plan carries the declared topology *and* the
+    /// dynamic state that explains it, and its own doc says why they cannot be
+    /// derived apart: a pipeline that declares a stand-in topology without
+    /// declaring the state draws the stand-in, silently, on a host with no
+    /// validation layers. `build` reads the states off the same call.
     fn input_assembly(&self) -> vk::PipelineInputAssemblyStateCreateInfo<'static> {
-        use reims_vgpu_core::topology::{PrimitiveType, TopologyClass};
-        let declared = match self.key.topology {
-            topology::TopologyKey::Exact(primitive) => primitive,
-            topology::TopologyKey::Class(TopologyClass::Point) => PrimitiveType::Point,
-            topology::TopologyKey::Class(TopologyClass::Line) => PrimitiveType::Line,
-            topology::TopologyKey::Class(TopologyClass::Triangle) | topology::TopologyKey::Any => {
-                PrimitiveType::Triangle
-            }
-        };
-        vk::PipelineInputAssemblyStateCreateInfo {
-            topology: topology::topology(declared),
-            ..vk::PipelineInputAssemblyStateCreateInfo::default()
-        }
+        self.key.topology.input_assembly().native()
     }
 }
 
@@ -1348,6 +1345,45 @@ mod tests {
             assert_eq!(
                 build.input_assembly().primitive_restart_enable,
                 vk::FALSE,
+                "{key_topology:?}"
+            );
+            // And the declaration is only half the answer. A key that serves
+            // more than one primitive type declares a stand-in, so the
+            // pipeline has to declare the state that lets a draw move off it;
+            // one that serves exactly one type must not, because the state
+            // needs a capability the baseline rung does not have.
+            assert_eq!(
+                build
+                    .dynamic_states()
+                    .contains(&vk::DynamicState::PRIMITIVE_TOPOLOGY),
+                !matches!(key_topology, topology::TopologyKey::Exact(_)),
+                "{key_topology:?}"
+            );
+        }
+    }
+
+    /// The two halves come from one call, so a key cannot declare a stand-in
+    /// topology and leave the state that explains it undeclared.
+    #[test]
+    fn the_declared_topology_and_its_dynamic_state_are_one_decision() {
+        use reims_vgpu_core::topology::TopologyClass;
+        for key_topology in [
+            topology::TopologyKey::Exact(PrimitiveType::TriangleStrip),
+            topology::TopologyKey::Class(TopologyClass::Triangle),
+            topology::TopologyKey::Any,
+        ] {
+            let build = build(GraphicsKey {
+                topology: key_topology,
+                ..key()
+            })
+            .expect("built");
+            let plan = key_topology.input_assembly();
+            assert_eq!(build.input_assembly().topology, plan.topology);
+            assert_eq!(
+                build
+                    .dynamic_states()
+                    .contains(&vk::DynamicState::PRIMITIVE_TOPOLOGY),
+                plan.dynamic,
                 "{key_topology:?}"
             );
         }
