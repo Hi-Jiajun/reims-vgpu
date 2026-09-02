@@ -299,8 +299,8 @@ impl ContentLedger {
             self.census.reads_with_no_source += 1;
             return None;
         };
-        let fresh = e.fresh.get(&replica).cloned().unwrap_or_default();
-        let owed = fresh.missing_from(bytes);
+        let empty = RangeSet::new();
+        let owed = e.fresh.get(&replica).unwrap_or(&empty).missing_from(bytes);
         if owed.is_empty() {
             self.census.reads_already_fresh += 1;
             return None;
@@ -311,15 +311,7 @@ impl ContentLedger {
         // copying them would move whatever the source happens to contain and
         // then claim the destination is current.
         let source = replica.other();
-        let source_fresh = e.fresh.get(&source).cloned().unwrap_or_default();
-        let mut movable = RangeSet::new();
-        for r in owed.ranges() {
-            for s in source_fresh.ranges() {
-                if let Some(overlap) = intersect(*r, *s) {
-                    movable.insert(overlap);
-                }
-            }
-        }
+        let movable = owed.intersection(e.fresh.get(&source).unwrap_or(&empty));
         if movable.is_empty() {
             self.census.reads_with_no_source += 1;
             return None;
@@ -376,21 +368,15 @@ impl ContentLedger {
         range: ByteRange,
         replica: Replica,
     ) -> RangeSet {
-        let mut out = RangeSet::new();
         let Some(e) = self.backings.get(&backing) else {
-            return out;
+            return RangeSet::new();
         };
-        if let Some(here) = e.fresh.get(&replica) {
-            for r in here.ranges() {
-                if let Some(overlap) = intersect(*r, range) {
-                    out.insert(overlap);
-                }
-            }
-        }
+        let Some(here) = e.fresh.get(&replica) else {
+            return RangeSet::new();
+        };
+        let mut out = here.intersection(&RangeSet::from_range(range));
         if let Some(elsewhere) = e.fresh.get(&replica.other()) {
-            for r in elsewhere.ranges() {
-                out.remove(*r);
-            }
+            out.subtract(elsewhere);
         }
         out
     }
@@ -420,18 +406,6 @@ impl ContentLedger {
             .and_then(|e| e.fresh.get(&replica))
             .is_some_and(|set| set.covers(bytes))
     }
-}
-
-fn intersect(a: ByteRange, b: ByteRange) -> Option<ByteRange> {
-    let start = a.offset.max(b.offset);
-    let end = a
-        .offset
-        .saturating_add(a.length)
-        .min(b.offset.saturating_add(b.length));
-    (start < end).then(|| ByteRange {
-        offset: start,
-        length: end - start,
-    })
 }
 
 #[cfg(test)]

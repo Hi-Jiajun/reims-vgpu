@@ -144,17 +144,134 @@ impl RangeSet {
     #[must_use]
     pub fn missing_from(&self, range: ByteRange) -> RangeSet {
         let mut want = RangeSet::from_range(range);
-        for r in &self.ranges {
-            want.remove(*r);
-        }
+        want.subtract(self);
         want
     }
 
-    /// Everything in `other` as well as everything here.
-    pub fn union_with(&mut self, other: &RangeSet) {
-        for r in &other.ranges {
-            self.insert(*r);
+    /// The bytes both sets hold.
+    ///
+    /// # Why this is here and not written at the call site
+    ///
+    /// Two places in [`crate::content`] used to intersect a freshness set with
+    /// another by nesting one member loop inside the other and inserting each
+    /// overlap. That is quadratic in the member lists *and* pays an `insert`
+    /// per overlap, and it is on the path a read takes — a backing written in
+    /// many small pieces makes both lists long, which is exactly the case the
+    /// per-byte representation exists to serve well.
+    ///
+    /// Both lists are sorted and disjoint, so one merge walk finds every
+    /// overlap in linear time. The overlaps come out sorted, and already
+    /// non-adjacent: two adjacent pieces would need two adjacent members on
+    /// one side, which coalescing forbids. So the result is built directly
+    /// rather than inserted into.
+    #[must_use]
+    pub fn intersection(&self, other: &RangeSet) -> RangeSet {
+        let mut out = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        while i < self.ranges.len() && j < other.ranges.len() {
+            let (a, b) = (self.ranges[i], other.ranges[j]);
+            let (a_end, b_end) = (end_of(a), end_of(b));
+            let start = a.offset.max(b.offset);
+            let end = a_end.min(b_end);
+            if start < end {
+                out.push(ByteRange {
+                    offset: start,
+                    length: end - start,
+                });
+            }
+            // Retire whichever member ends first; the other may still meet the
+            // next one on that side.
+            if a_end < b_end {
+                i += 1;
+            } else {
+                j += 1;
+            }
         }
+        RangeSet { ranges: out }
+    }
+
+    /// Drop everything `other` holds.
+    ///
+    /// Linear for the reason [`Self::intersection`] is, and the reason
+    /// [`Self::missing_from`] is written in terms of it: removing `other`'s
+    /// members one at a time rebuilds the whole member list per member.
+    pub fn subtract(&mut self, other: &RangeSet) {
+        if self.ranges.is_empty() || other.ranges.is_empty() {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.ranges.len());
+        let mut j = 0;
+        for a in self.ranges.drain(..) {
+            let a_end = end_of(a);
+            let mut cur = a.offset;
+            // Members of `other` that end at or before this one begins can
+            // never meet a later one either, both lists being sorted.
+            while j < other.ranges.len() && end_of(other.ranges[j]) <= cur {
+                j += 1;
+            }
+            let mut k = j;
+            while k < other.ranges.len() && other.ranges[k].offset < a_end {
+                let b = other.ranges[k];
+                if b.offset > cur {
+                    out.push(ByteRange {
+                        offset: cur,
+                        length: b.offset - cur,
+                    });
+                }
+                cur = cur.max(end_of(b));
+                if cur >= a_end {
+                    break;
+                }
+                k += 1;
+            }
+            if cur < a_end {
+                out.push(ByteRange {
+                    offset: cur,
+                    length: a_end - cur,
+                });
+            }
+        }
+        self.ranges = out;
+    }
+
+    /// Everything in `other` as well as everything here.
+    ///
+    /// One merge walk rather than an `insert` per member, each of which
+    /// rebuilds the whole list.
+    pub fn union_with(&mut self, other: &RangeSet) {
+        if other.ranges.is_empty() {
+            return;
+        }
+        if self.ranges.is_empty() {
+            self.ranges = other.ranges.clone();
+            return;
+        }
+        let mut out: Vec<ByteRange> = Vec::with_capacity(self.ranges.len() + other.ranges.len());
+        let (mut i, mut j) = (0, 0);
+        while i < self.ranges.len() || j < other.ranges.len() {
+            let take_self = match (self.ranges.get(i), other.ranges.get(j)) {
+                (Some(a), Some(b)) => a.offset <= b.offset,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            let next = if take_self {
+                i += 1;
+                self.ranges[i - 1]
+            } else {
+                j += 1;
+                other.ranges[j - 1]
+            };
+            match out.last_mut() {
+                // Touching counts as overlapping: the invariant is that two
+                // ranges which meet are one range.
+                Some(last) if next.offset <= end_of(*last) => {
+                    let end = end_of(*last).max(end_of(next));
+                    last.length = end - last.offset;
+                }
+                _ => out.push(next),
+            }
+        }
+        self.ranges = out;
     }
 
     /// Drop everything.
@@ -380,6 +497,8 @@ mod tests {
         let mut merges = 0usize;
         let mut covered_queries = 0usize;
         let mut uncovered_queries = 0usize;
+        let mut intersections = 0usize;
+        let mut subtractions = 0usize;
 
         for seed in 0..256u64 {
             let mut rng = Rng::new(seed);
@@ -478,6 +597,56 @@ mod tests {
                     .filter(|b| !shadow[*b as usize])
                     .collect();
                 assert_eq!(missing_bytes, owed, "missing_from({q:?})");
+
+                // The two set-against-set operations, against an independently
+                // built partner and a bitmap that does not know what a member
+                // is. Neither one changes `set`, so they ride along on every
+                // step rather than needing arms of their own.
+                let mut partner = RangeSet::new();
+                let mut partner_bits = vec![false; WINDOW as usize];
+                for _ in 0..rng.below(4) {
+                    let x = gen_range(&mut rng);
+                    partner.insert(x);
+                    for b in x.offset..end_of(x) {
+                        partner_bits[b as usize] = true;
+                    }
+                }
+
+                let both = set.intersection(&partner);
+                assert_sorted_disjoint_coalesced(&both);
+                assert_eq!(
+                    bitmap(&both),
+                    shadow
+                        .iter()
+                        .zip(&partner_bits)
+                        .map(|(a, b)| *a && *b)
+                        .collect::<Vec<bool>>(),
+                    "intersection"
+                );
+                assert_eq!(
+                    both,
+                    partner.intersection(&set),
+                    "and it does not depend on which side asks"
+                );
+                if !both.is_empty() {
+                    intersections += 1;
+                }
+
+                let mut without = set.clone();
+                without.subtract(&partner);
+                assert_sorted_disjoint_coalesced(&without);
+                assert_eq!(
+                    bitmap(&without),
+                    shadow
+                        .iter()
+                        .zip(&partner_bits)
+                        .map(|(a, b)| *a && !*b)
+                        .collect::<Vec<bool>>(),
+                    "subtract"
+                );
+                if without != set {
+                    subtractions += 1;
+                }
             }
         }
 
@@ -492,6 +661,14 @@ mod tests {
         assert!(unions > 1_000, "{unions}");
         assert!(covered_queries > 3_000, "{covered_queries}");
         assert!(uncovered_queries > 4_000, "{uncovered_queries}");
+        assert!(
+            intersections > 4_000,
+            "intersections that met: {intersections}"
+        );
+        assert!(
+            subtractions > 4_000,
+            "subtractions that took: {subtractions}"
+        );
     }
 
     /// The one range the model asks for that is not a range: `newest_over`
