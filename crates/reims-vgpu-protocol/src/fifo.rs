@@ -1955,8 +1955,13 @@ mod tests {
             state ^= state >> 27;
             state.wrapping_mul(0x2545_F491_4F6C_DD1D)
         };
-        let mut decoded = 0usize;
-        let mut refused = 0usize;
+        // Per decoder, not one aggregate. Three of the four decoders below
+        // shared no counter at all, so the floors at the end were met by
+        // `decode_invalidate_resources` alone and a sibling that refused every
+        // one of the 4096 payloads would still have read as covered.
+        let (mut decoded, mut refused) = (0usize, 0usize);
+        let (mut sync_decoded, mut sync_refused) = (0usize, 0usize);
+        let (mut table_decoded, mut table_refused) = (0usize, 0usize);
         for _ in 0..4096 {
             // Lengths clustered on the thresholds, where an off-by-one lives:
             // the two header lengths, the three record strides, and the exec
@@ -1990,21 +1995,26 @@ mod tests {
             }
             match decode_synchronize_resources(&payload) {
                 Ok(cmd) => {
+                    sync_decoded += 1;
                     assert_eq!(cmd.object_ids.len() as u64, u64::from(cmd.count));
                     assert!(
                         resource_list_need(cmd.count, CHILD_SYNCHRONIZE_RECORD_LEN) <= len as u64
                     );
                 }
-                Err(_) => {}
+                Err(_) => sync_refused += 1,
             }
-            if let Ok(descs) = decode_exec_resource_table(&payload) {
-                let count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
-                assert_eq!(descs.len() as u64, u64::from(count));
-                assert!(
-                    CHILD_EXEC_INDIRECT_HEADER_LEN as usize
-                        + descs.len() * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
-                        <= len
-                );
+            match decode_exec_resource_table(&payload) {
+                Ok(descs) => {
+                    table_decoded += 1;
+                    let count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
+                    assert_eq!(descs.len() as u64, u64::from(count));
+                    assert!(
+                        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                            + descs.len() * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+                            <= len
+                    );
+                }
+                Err(_) => table_refused += 1,
             }
             assert_eq!(decode_task_object(&payload).is_ok(), len >= TASK_OBJECT_LEN);
             // No length in this sweep can carry a well-formed record, so what
@@ -2023,11 +2033,16 @@ mod tests {
         }
         // A sweep where everything refuses proves only that refusing does not
         // panic, and one where nothing does proves only the happy path.
-        assert!(decoded > 100, "only {decoded} of 4096 payloads decoded");
-        assert!(
-            refused > 100,
-            "only {refused} of 4096 payloads were refused"
-        );
+        for (name, count) in [
+            ("invalidate decoded", decoded),
+            ("invalidate refused", refused),
+            ("synchronize decoded", sync_decoded),
+            ("synchronize refused", sync_refused),
+            ("resource table decoded", table_decoded),
+            ("resource table refused", table_refused),
+        ] {
+            assert!(count > 100, "only {count} of 4096 payloads: {name}");
+        }
     }
 
     /// The two forms do not share offsets, and reading one at the other's is
