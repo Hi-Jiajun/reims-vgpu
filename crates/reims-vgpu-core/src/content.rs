@@ -81,11 +81,6 @@ pub struct Transfer {
 /// What has happened to one backing's content.
 #[derive(Clone, Debug, Default)]
 struct Entry {
-    /// The next version a write of this backing may reserve. Monotone, and one
-    /// counter for the whole backing even though the coverage is per region:
-    /// two writers of disjoint ranges must not be handed the same number, or
-    /// their completions cannot be told apart.
-    next_version: ContentVersion,
     /// Which version is current in each part of the backing. See
     /// [`crate::coverage`] for why this is not one number.
     canonical: VersionCoverage,
@@ -103,6 +98,21 @@ struct Entry {
 #[derive(Debug, Default)]
 pub struct ContentLedger {
     backings: HashMap<BackingId, Entry>,
+    /// The next version any write may reserve. Monotone, and one counter for
+    /// the whole ledger.
+    ///
+    /// One per *backing* would be enough for the comparisons — every version
+    /// is only ever compared against another version of the same backing — but
+    /// it would live in the entry, and [`ContentLedger::forget`] drops the
+    /// entry. The counter would restart, and a version already carried by a
+    /// planned transfer or a reserved write would be handed out again for
+    /// different content. [`ContentLedger::reserve`] says why a number must not
+    /// be reused; this is where that has to be arranged.
+    ///
+    /// Per region would be wrong for the reason the coverage is not one number
+    /// the other way round: two writers of disjoint ranges must not be handed
+    /// one number, or their completions cannot be told apart.
+    next_version: ContentVersion,
     census: Census,
 }
 
@@ -131,6 +141,17 @@ pub struct Census {
     /// Together they account for every read [`ContentLedger::transfer_for_read`]
     /// answered with `None`, so a caller can tell that it has seen all of them.
     pub reads_with_no_source: usize,
+    /// Copies that completed after the content they carried had already been
+    /// superseded, and so destroyed the destination's bytes instead of
+    /// delivering it the current ones.
+    ///
+    /// Not a ledger fault and not something the ledger can prevent: the copy
+    /// was correct when it was planned, and what orders it against a write is
+    /// the hazard graph, not this. It is here because the consequence — bytes
+    /// that were current in the destination and are now nowhere — is otherwise
+    /// visible only as a later read reporting no source, a long way from the
+    /// transfer that caused it.
+    pub transfers_overtaken: usize,
 }
 
 impl ContentLedger {
@@ -202,9 +223,9 @@ impl ContentLedger {
     /// answer; reusing the number would let a later write pass for the
     /// abandoned one.
     pub fn reserve(&mut self, backing: BackingId) -> ContentVersion {
-        let e = self.backings.entry(backing).or_default();
-        let reserved = e.next_version;
-        e.next_version = reserved.next();
+        self.backings.entry(backing).or_default();
+        let reserved = self.next_version;
+        self.next_version = reserved.next();
         reserved
     }
 
@@ -227,13 +248,13 @@ impl ContentLedger {
         version: ContentVersion,
         replica: Replica,
     ) -> Applied {
-        let e = self.backings.entry(backing).or_default();
-        // Keep the counter ahead of anything committed, so a backing whose
+        // Keep the counter ahead of anything committed, so content whose
         // versions were assigned elsewhere — a replayed transaction, a test —
-        // cannot later reserve a number already in the coverage.
-        if version >= e.next_version {
-            e.next_version = version.next();
+        // cannot later reserve a number already in a coverage.
+        if version >= self.next_version {
+            self.next_version = version.next();
         }
+        let e = self.backings.entry(backing).or_default();
         let applied = e.canonical.apply(bytes, version);
         for taken in applied.taken.ranges() {
             for r in Replica::BOTH {
@@ -369,6 +390,22 @@ impl ContentLedger {
     /// readable from anywhere. A completed copy is the other kind of completion
     /// and was the one not asking.
     ///
+    /// # And the bytes it did not deliver are bytes it destroyed
+    ///
+    /// A copy that arrives late does not arrive as nothing. It writes the
+    /// content it carried over whatever the destination had there, so where the
+    /// destination held the current bytes and the copy is stale, those bytes
+    /// are gone — from the destination's storage, and therefore from the ledger
+    /// too. Recording only the half that landed would leave the destination
+    /// fresh for content its own copy has just overwritten, which is the same
+    /// wrong answer one step further on.
+    ///
+    /// Where the source still holds them, the next read simply owes a transfer
+    /// again. Where it does not, the bytes are genuinely nowhere, and a read
+    /// reporting no source is the honest answer rather than a served copy of
+    /// something else. [`Census::transfers_overtaken`] counts these, because
+    /// the cause and the symptom are otherwise far apart.
+    ///
     /// A backing this ledger has forgotten takes nothing: there are no content
     /// facts left to update, and creating an entry for one would publish
     /// freshness over coverage nobody declared.
@@ -384,7 +421,14 @@ impl ContentLedger {
                 }
             }
         }
-        e.fresh.entry(transfer.to).or_default().union_with(&landed);
+        let mut clobbered = transfer.bytes.clone();
+        clobbered.subtract(&landed);
+        let set = e.fresh.entry(transfer.to).or_default();
+        set.union_with(&landed);
+        set.subtract(&clobbered);
+        if !clobbered.is_empty() {
+            self.census.transfers_overtaken += 1;
+        }
     }
 
     /// Discard a replica's copy of some bytes without changing the content.
@@ -786,5 +830,259 @@ mod tests {
             &[],
             "and the question is bounded by the range asked about"
         );
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    const EXTENT: usize = 24;
+    const BACKINGS: u64 = 3;
+
+    /// What each replica physically holds, byte by byte, beside what the
+    /// content actually is.
+    ///
+    /// `truth[i]` is the version of the current content at byte `i`.
+    /// `held[r][i]` is the version of the copy replica `r` physically has
+    /// there, or `None` for no copy at all. They are the same number only while
+    /// that replica's bytes are the content.
+    #[derive(Clone)]
+    struct Physical {
+        truth: Vec<Option<u64>>,
+        held: [Vec<Option<u64>>; 2],
+    }
+
+    impl Physical {
+        fn new() -> Self {
+            Self {
+                truth: vec![None; EXTENT],
+                held: [vec![None; EXTENT], vec![None; EXTENT]],
+            }
+        }
+    }
+
+    const fn index(r: Replica) -> usize {
+        match r {
+            Replica::GuestPages => 0,
+            Replica::DeviceOwned => 1,
+        }
+    }
+
+    /// **A replica the ledger calls fresh holds the current content.**
+    ///
+    /// The one claim the whole module is for, and the one no hand-written case
+    /// can make: it is a property of every byte after every step of an
+    /// arbitrary history, and the histories that break it are the ones where a
+    /// plan and its completion are separated by something else.
+    ///
+    /// The shadow is deliberately *physical*. It tracks the version of the
+    /// bytes each replica actually has, which is not what the ledger tracks —
+    /// the ledger tracks which of them are current. A copy is modelled as
+    /// delivering the source's content **as it was when the transfer was
+    /// planned**, because that is the earliest the hardware could have read it
+    /// and therefore the worst case the ledger has to be right about.
+    ///
+    /// A shadow that instead recorded what the ledger said would agree with it
+    /// by construction and prove nothing.
+    #[test]
+    fn a_replica_the_ledger_calls_fresh_holds_the_current_bytes() {
+        let mut declares = 0usize;
+        let mut writes = 0usize;
+        let mut planned = 0usize;
+        let mut recorded = 0usize;
+        let mut overtaken = 0usize;
+        let mut discards = 0usize;
+        let mut forgets = 0usize;
+        let mut no_source = 0usize;
+
+        for seed in 0..512u64 {
+            let mut rng = Rng::new(seed);
+            let mut c = ContentLedger::new();
+            let mut phys: HashMap<BackingId, Physical> = HashMap::new();
+            // Transfers planned and not yet recorded, with the source content
+            // they will deliver.
+            let mut in_flight: Vec<(Transfer, Vec<Option<u64>>)> = Vec::new();
+            let mut clock = 0u64;
+
+            for _ in 0..48 {
+                let b = BackingId(rng.below(BACKINGS));
+                match rng.below(40) {
+                    // Declare, which is creation and resets every copy.
+                    0..=3 => {
+                        let authority = if rng.below(2) == 0 {
+                            Replica::GuestPages
+                        } else {
+                            Replica::DeviceOwned
+                        };
+                        clock += 1;
+                        c.declare(b, r(0, EXTENT as u64), authority);
+                        let p = phys.entry(b).or_insert_with(Physical::new);
+                        for i in 0..EXTENT {
+                            p.truth[i] = Some(clock);
+                            p.held[index(authority)][i] = Some(clock);
+                            p.held[index(authority.other())][i] = None;
+                        }
+                        // A declaration is a statement that what was there is
+                        // gone, so a copy still in flight over it delivers
+                        // nothing the ledger may believe.
+                        declares += 1;
+                    }
+                    // Write, which completes at once.
+                    4..=13 => {
+                        let Some(p) = phys.get_mut(&b) else { continue };
+                        let offset = rng.below(EXTENT as u64);
+                        let length = 1 + rng.below(EXTENT as u64 - offset);
+                        let replica = if rng.below(2) == 0 {
+                            Replica::GuestPages
+                        } else {
+                            Replica::DeviceOwned
+                        };
+                        clock += 1;
+                        c.write(b, r(offset, length), replica);
+                        for i in offset as usize..(offset + length) as usize {
+                            p.truth[i] = Some(clock);
+                            p.held[index(replica)][i] = Some(clock);
+                        }
+                        writes += 1;
+                    }
+                    // Plan a copy for a read.
+                    14..=25 => {
+                        let offset = rng.below(EXTENT as u64);
+                        let length = 1 + rng.below(EXTENT as u64 - offset);
+                        let replica = if rng.below(2) == 0 {
+                            Replica::GuestPages
+                        } else {
+                            Replica::DeviceOwned
+                        };
+                        match c.transfer_for_read(b, r(offset, length), replica) {
+                            Some(t) => {
+                                assert_eq!(t.to, replica, "seed {seed}");
+                                assert_eq!(t.from, replica.other(), "seed {seed}");
+                                assert!(!t.bytes.is_empty(), "seed {seed}");
+                                // What the source has right now is what the
+                                // copy will carry.
+                                let p = &phys[&b];
+                                let carried = p.held[index(t.from)].clone();
+                                for range in t.bytes.ranges() {
+                                    let span = range.offset as usize
+                                        ..(range.offset + range.length) as usize;
+                                    assert!(
+                                        carried[span].iter().all(Option::is_some),
+                                        "seed {seed}: planned a copy of bytes the source \
+                                         does not have"
+                                    );
+                                }
+                                in_flight.push((t, carried));
+                                planned += 1;
+                            }
+                            None => {
+                                no_source += 1;
+                            }
+                        }
+                    }
+                    // Record one, in any order and however late.
+                    26..=35 if !in_flight.is_empty() => {
+                        let which = rng.below(in_flight.len() as u64) as usize;
+                        let (t, carried) = in_flight.swap_remove(which);
+                        c.record_transfer(&t);
+                        if let Some(p) = phys.get_mut(&t.backing) {
+                            let mut late = false;
+                            for range in t.bytes.ranges() {
+                                let span =
+                                    range.offset as usize..(range.offset + range.length) as usize;
+                                for (i, delivered) in carried[span].iter().enumerate() {
+                                    let i = i + range.offset as usize;
+                                    // The destination now physically holds what
+                                    // the source had when this was planned.
+                                    p.held[index(t.to)][i] = *delivered;
+                                    if *delivered != p.truth[i] {
+                                        late = true;
+                                    }
+                                }
+                            }
+                            if late {
+                                overtaken += 1;
+                            }
+                        }
+                        recorded += 1;
+                    }
+                    // Drop a replica's copy without changing the content.
+                    36..=37 => {
+                        let offset = rng.below(EXTENT as u64);
+                        let length = 1 + rng.below(EXTENT as u64 - offset);
+                        let replica = if rng.below(2) == 0 {
+                            Replica::GuestPages
+                        } else {
+                            Replica::DeviceOwned
+                        };
+                        c.discard(b, r(offset, length), replica);
+                        if let Some(p) = phys.get_mut(&b) {
+                            for i in offset as usize..(offset + length) as usize {
+                                p.held[index(replica)][i] = None;
+                            }
+                        }
+                        discards += 1;
+                    }
+                    38 => {
+                        c.forget(b);
+                        phys.remove(&b);
+                        assert!(!c.knows(b), "seed {seed}");
+                        forgets += 1;
+                    }
+                    // A record whose queue was empty, and the arm that keeps
+                    // an empty queue from turning into a forget.
+                    _ => {}
+                }
+
+                // The claim, over every byte of every backing, after every step.
+                for (backing, p) in &phys {
+                    for replica in Replica::BOTH {
+                        for i in 0..EXTENT {
+                            if c.is_fresh(*backing, r(i as u64, 1), replica) {
+                                assert_eq!(
+                                    p.held[index(replica)][i],
+                                    p.truth[i],
+                                    "seed {seed}: {backing:?} byte {i} is fresh in \
+                                     {} and holds the wrong content",
+                                    replica.name()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Non-vacuity: every shape the assertion above depends on reaching.
+        assert!(declares > 2_000, "declarations: {declares}");
+        assert!(writes > 2_400, "writes: {writes}");
+        assert!(planned > 1_500, "copies planned: {planned}");
+        assert!(recorded > 1_200, "copies recorded: {recorded}");
+        assert!(
+            overtaken > 250,
+            "copies the content moved on under: {overtaken} --- the histories \
+             this sweep exists for"
+        );
+        assert!(discards > 1_000, "discards: {discards}");
+        assert!(forgets > 400, "forgets: {forgets}");
+        assert!(no_source > 4_000, "reads with nothing to copy: {no_source}");
     }
 }
