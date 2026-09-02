@@ -568,41 +568,52 @@ impl PresentStream {
                 expected: Phase::Ready,
             });
         }
-        let head = self
-            .in_flight
-            .front()
-            .map_or(ticket.sequence, |f| f.sequence);
+        // **A queued frame is the host's, not this stream's.** Both orders
+        // reason about the earlier frames this stream still owns — the ones in
+        // `AcquirePending` or `Ready`. A frame in `Phase::Queued` has been
+        // handed to the host's presentation queue and its image is being read
+        // there, so neither order may pass judgement on it: FIFO must not
+        // refuse behind it, because waiting for it to complete would cap the
+        // host at one outstanding present however many images it returned, and
+        // superseding must not drop it, because freeing its image to the next
+        // acquire while the presentation engine reads it is the same second
+        // claim on one image that [`Refusal::UndrawnFrameAhead`] names one
+        // phase earlier.
         let mut dropped = Vec::new();
-        if head != ticket.sequence {
-            match self.order {
-                Order::Fifo => {
+        let earlier_unqueued =
+            |f: &InFlight| f.sequence < ticket.sequence && f.phase != Phase::Queued;
+        match self.order {
+            Order::Fifo => {
+                if let Some(behind) = self.in_flight.iter().find(|f| earlier_unqueued(f)) {
                     return Err(Refusal::OutOfOrder {
-                        head,
+                        head: behind.sequence,
                         named: ticket.sequence,
-                    })
+                    });
                 }
-                Order::Superseding => {
-                    if let Some(undrawn) = self
-                        .in_flight
-                        .iter()
-                        .find(|f| f.sequence < ticket.sequence && f.phase == Phase::AcquirePending)
-                    {
-                        return Err(Refusal::UndrawnFrameAhead {
-                            sequence: undrawn.sequence,
-                        });
-                    }
-                    while let Some(front) = self.in_flight.front() {
-                        if front.sequence >= ticket.sequence {
-                            break;
-                        }
-                        dropped.push(front.sequence);
-                        self.in_flight.pop_front();
+            }
+            Order::Superseding => {
+                if let Some(undrawn) = self
+                    .in_flight
+                    .iter()
+                    .find(|f| f.sequence < ticket.sequence && f.phase == Phase::AcquirePending)
+                {
+                    return Err(Refusal::UndrawnFrameAhead {
+                        sequence: undrawn.sequence,
+                    });
+                }
+                // Nothing can refuse from here, so the drops are final.
+                let mut i = 0;
+                while i < self.in_flight.len() {
+                    if earlier_unqueued(&self.in_flight[i]) {
+                        dropped.push(self.in_flight[i].sequence);
+                        self.in_flight.remove(i);
                         self.superseded += 1;
+                    } else {
+                        i += 1;
                     }
                 }
             }
         }
-        // Nothing can refuse from here, so the drops above are final.
         self.in_flight
             .iter_mut()
             .find(|f| f.sequence == ticket.sequence)
@@ -1035,6 +1046,84 @@ mod tests {
         s.complete(&first).expect("queued");
     }
 
+    /// **FIFO orders presentation; it does not serialize it.**
+    ///
+    /// The returned image count is the bound on frames in flight, and a stream
+    /// that will hold only one frame at the host at a time cannot use it: with
+    /// three images it still shows a frame every present-completion latency.
+    /// So the law is that no *earlier* frame may still be unqueued, not that
+    /// this frame is at the head of everything still in flight.
+    #[test]
+    fn fifo_lets_every_returned_image_be_at_the_host_at_once() {
+        let mut s = PresentStream::new(Order::Fifo);
+        s.configure(3, 3);
+        let first = s.acquire().expect("an image");
+        let second = s.acquire().expect("an image");
+        let third = s.acquire().expect("an image");
+        for t in [&first, &second, &third] {
+            s.ready(t).expect("acquired");
+        }
+        assert_eq!(s.queue(&first).expect("nothing ahead"), Vec::<u64>::new());
+        assert_eq!(
+            s.queue(&third),
+            Err(Refusal::OutOfOrder {
+                head: second.sequence,
+                named: third.sequence
+            }),
+            "the earliest frame not yet handed over is what names the refusal"
+        );
+        assert_eq!(
+            s.queue(&second).expect("first is queued"),
+            Vec::<u64>::new()
+        );
+        assert_eq!(s.queue(&third).expect("both are queued"), Vec::<u64>::new());
+        assert_eq!(s.in_flight(), 3, "three images, three presents at the host");
+        // And they come back in the order the host shows them.
+        for t in [&first, &second, &third] {
+            s.complete(t).expect("queued");
+        }
+        assert_eq!(s.census().0, 3);
+    }
+
+    /// **A frame already handed to the host cannot be superseded.**
+    ///
+    /// Superseding replaces a frame *that has not been shown yet* — one this
+    /// stream still owns. A queued frame is one the host owns: its image is
+    /// being read by the presentation engine, and dropping it here frees that
+    /// image to the next acquire while the host still holds it. That is the
+    /// same second claim on one image that [`Refusal::UndrawnFrameAhead`]
+    /// names one phase earlier, and it ends with a `complete` for a frame the
+    /// host really did show being answered `Superseded`.
+    #[test]
+    fn superseding_passes_over_a_frame_the_host_already_has() {
+        let mut s = PresentStream::new(Order::Superseding);
+        s.configure(3, 3);
+        let first = s.acquire().expect("an image");
+        let second = s.acquire().expect("an image");
+        let third = s.acquire().expect("an image");
+        for t in [&first, &second, &third] {
+            s.ready(t).expect("acquired");
+        }
+        s.queue(&first).expect("nothing ahead");
+        // `second` is still this stream's to drop; `first` is not.
+        assert_eq!(
+            s.queue(&third).expect("superseding"),
+            vec![second.sequence],
+            "only the frame the host has not got"
+        );
+        assert_eq!(s.census().1, 1);
+        assert_eq!(
+            s.phase(&first),
+            Some(Phase::Queued),
+            "the host still has it and its image is still claimed"
+        );
+        assert_eq!(s.in_flight(), 2);
+        // Which is why the host's completion for it is still an answer.
+        s.complete(&first).expect("the host showed it");
+        s.complete(&third).expect("queued");
+        assert_eq!(s.census(), (2, 1, 0));
+    }
+
     /// A replaced swapchain is retired against a timeline point, not destroyed.
     #[test]
     fn replacing_a_swapchain_defers_it_to_its_last_use() {
@@ -1289,6 +1378,7 @@ mod tests {
     fn one_image_has_one_claim_across_acquire_supersede_and_replace() {
         let mut presented = 0usize;
         let mut superseded = 0usize;
+        let mut at_the_host = 0usize;
         let mut parked_admissions = 0usize;
         let mut woken = 0usize;
         let mut undrawn_refusals = 0usize;
@@ -1311,6 +1401,9 @@ mod tests {
             let mut ingress = 0u64;
             // This stream's own tally; `presented` is the whole sweep's.
             let mut presented_here = 0usize;
+            // Sequences this stream has handed to the host and not yet had
+            // back: the frames neither order may pass judgement on.
+            let mut queued: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
 
             for _ in 0..64 {
                 match rng.below(24) {
@@ -1365,16 +1458,24 @@ mod tests {
                             continue;
                         }
                         let i = rng.below(tickets.len() as u64) as usize;
+                        let named = tickets[i].sequence;
                         match s.queue(&tickets[i]) {
                             Ok(dropped) => {
                                 for d in &dropped {
+                                    assert!(
+                                        !queued.contains(d),
+                                        "seed {seed}: dropped {d}, which the host already has"
+                                    );
                                     let slot = owner
                                         .iter_mut()
                                         .find(|o| **o == Some(*d))
                                         .expect("a dropped frame held an image");
                                     *slot = None;
+                                    queued.remove(d);
                                 }
                                 superseded += dropped.len();
+                                queued.insert(named);
+                                at_the_host = at_the_host.max(queued.len());
                             }
                             Err(Refusal::UndrawnFrameAhead { .. }) => undrawn_refusals += 1,
                             Err(
@@ -1400,6 +1501,7 @@ mod tests {
                                     .find(|o| **o == Some(seq))
                                     .expect("a completed frame held an image");
                                 *slot = None;
+                                queued.remove(&seq);
                                 tickets.remove(i);
                                 presented += 1;
                                 presented_here += 1;
@@ -1421,6 +1523,7 @@ mod tests {
                         replaces += 1;
                         owner = vec![None; images];
                         tickets.clear();
+                        queued.clear();
                     }
                 }
 
@@ -1477,7 +1580,11 @@ mod tests {
 
         // Non-vacuity: every shape an assertion above depends on reaching.
         assert!(presented > 800, "frames presented: {presented}");
-        assert!(superseded > 120, "frames superseded: {superseded}");
+        assert!(superseded > 100, "frames superseded: {superseded}");
+        assert!(
+            at_the_host > 1,
+            "frames at the host at once: {at_the_host} --- a stream that holds              one present at a time cannot use the images it was given"
+        );
         assert!(
             undrawn_refusals > 100,
             "supersedes refused for an undrawn frame ahead: {undrawn_refusals}"
