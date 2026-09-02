@@ -175,6 +175,24 @@ pub enum Refusal {
     /// The plan asks this attachment to resolve and no resolve image was
     /// supplied — or one was supplied for an attachment that does not resolve.
     ResolveMismatch { index: usize, planned: bool },
+    /// The plan asks for a depth or stencil multisample resolve, and this rail
+    /// has no path that performs one.
+    ///
+    /// A depth-stencil resolve is `VK_KHR_depth_stencil_resolve`, core from
+    /// Vulkan 1.2: `VkSubpassDescriptionDepthStencilResolve` on the
+    /// render-pass rung — which also requires `VkRenderPass2` and
+    /// `VkSubpassDescription2`, neither of which is built here — and
+    /// `resolveMode` on the dynamic rung. Both need the device's reported
+    /// `depthResolveModes` and `stencilResolveModes`, because which reductions
+    /// a host performs is not fixed and `SAMPLE_ZERO` is the only one every
+    /// implementation must offer.
+    ///
+    /// Refused by name rather than dropped. The information reaches here —
+    /// [`crate::pass::plan`] produces the [`crate::pass::Resolve`] — and
+    /// building the pass without it produces a pass that runs and never writes
+    /// the guest's resolved depth image, which is exactly what
+    /// [`Self::ResolveMismatch`] exists to prevent on the colour side.
+    DepthStencilResolveUnsupported,
 }
 
 impl Refusal {
@@ -185,6 +203,7 @@ impl Refusal {
             Self::DepthStencilMismatch { .. } => "vk_renderpass_depth_stencil_count",
             Self::SampleCountMismatch { .. } => "vk_renderpass_sample_count",
             Self::ResolveMismatch { .. } => "vk_renderpass_resolve",
+            Self::DepthStencilResolveUnsupported => "vk_renderpass_depth_stencil_resolve",
         }
     }
 }
@@ -208,6 +227,7 @@ impl std::fmt::Display for Refusal {
             Self::ResolveMismatch { index, planned } => {
                 write!(f, "{} index={index} planned={planned}", self.slug())
             }
+            Self::DepthStencilResolveUnsupported => f.write_str(self.slug()),
         }
     }
 }
@@ -388,6 +408,23 @@ pub fn build(
                 planned: planned.resolve.is_some(),
             });
         }
+    }
+    // The depth-stencil pair, which the loop above does not reach. A resolve
+    // the plan asks for has no path here; a resolve image the caller supplied
+    // for an attachment the plan does not resolve is the colour side's own
+    // mismatch, at the index one past the last colour attachment.
+    if plan
+        .depth_stencil
+        .as_ref()
+        .is_some_and(|planned| planned.resolve.is_some())
+    {
+        return Err(Refusal::DepthStencilResolveUnsupported);
+    }
+    if depth_stencil.is_some_and(|bound| bound.resolve_view.is_some()) {
+        return Err(Refusal::ResolveMismatch {
+            index: plan.color.len(),
+            planned: false,
+        });
     }
 
     let mut attachments = Vec::new();
@@ -1309,6 +1346,111 @@ mod tests {
         .map(|r| r.slug())
         .collect();
         assert_eq!(slugs.len(), 4);
+    }
+    /// A depth-stencil plan that asks to resolve. The `Resolve` reaches here
+    /// --- `pass::plan` produced it from the guest's store action --- and
+    /// nothing in `build` reads it, so before this refusal existed the pass was
+    /// built without one and the guest's resolved depth image was never
+    /// written.
+    fn depth_stencil_that_resolves(resolves: bool) -> PassPlan {
+        let mut d = descriptor();
+        d.color[0].texture = Some(id(1));
+        d.color[0].load = LoadAction::Load;
+        d.color[0].store = StoreAction::Store;
+        d.depth.texture = Some(id(2));
+        d.depth.load = LoadAction::Load;
+        d.depth.store = if resolves {
+            StoreAction::StoreAndMultisampleResolve
+        } else {
+            StoreAction::Store
+        };
+        if resolves {
+            d.depth.resolve_texture = Some(id(3));
+        }
+        plan(&d, |_| MTL_FORMAT_DEPTH32_FLOAT).expect("a legal descriptor")
+    }
+
+    #[test]
+    fn a_depth_stencil_resolve_is_refused_and_not_quietly_left_out() {
+        let asking = depth_stencil_that_resolves(true);
+        assert!(
+            asking
+                .depth_stencil
+                .as_ref()
+                .expect("attached")
+                .resolve
+                .is_some(),
+            "the plan really does carry the resolve this build cannot make"
+        );
+        let depth = Bound {
+            format: vk::Format::D32_SFLOAT,
+            ..bound(2)
+        };
+        assert_eq!(
+            build(&asking, &[bound(1)], Some(depth)).expect_err("no path for it"),
+            Refusal::DepthStencilResolveUnsupported
+        );
+
+        // The same pass without the resolve builds, so the refusal is about the
+        // resolve and not about attaching depth at all.
+        assert!(build(
+            &depth_stencil_that_resolves(false),
+            &[bound(1)],
+            Some(depth)
+        )
+        .is_ok());
+    }
+
+    /// The other direction: a resolve image supplied for a depth-stencil
+    /// attachment the plan does not resolve was ignored, exactly as a colour
+    /// attachment's would not have been.
+    #[test]
+    fn a_depth_stencil_resolve_image_nobody_asked_for_is_a_mismatch() {
+        let quiet = depth_stencil_that_resolves(false);
+        let depth = Bound {
+            format: vk::Format::D32_SFLOAT,
+            resolve_view: Some(view(7)),
+            ..bound(2)
+        };
+        assert_eq!(
+            build(&quiet, &[bound(1)], Some(depth)).expect_err("nothing asked for it"),
+            Refusal::ResolveMismatch {
+                index: 1,
+                planned: false,
+            }
+        );
+    }
+
+    #[test]
+    fn every_refusal_names_itself() {
+        let refusals = [
+            Refusal::ColorCountMismatch {
+                planned: 1,
+                bound: 0,
+            },
+            Refusal::DepthStencilMismatch {
+                planned: true,
+                bound: false,
+            },
+            Refusal::SampleCountMismatch {
+                first: vk::SampleCountFlags::TYPE_1,
+                found: vk::SampleCountFlags::TYPE_4,
+            },
+            Refusal::ResolveMismatch {
+                index: 0,
+                planned: true,
+            },
+            Refusal::DepthStencilResolveUnsupported,
+        ];
+        let mut slugs: Vec<&str> = refusals.iter().map(|r| r.slug()).collect();
+        let count = slugs.len();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), count, "two refusals share a slug");
+        for refusal in refusals {
+            assert!(refusal.to_string().starts_with(refusal.slug()));
+            assert!(refusal.slug().starts_with("vk_renderpass_"));
+        }
     }
 }
 
