@@ -501,20 +501,31 @@ pub fn parallel_with(
         let tx = by_ordinal[&ordinal];
         let start = interpreter.trace().len();
         let owed = interpreter.complete(tx);
-        debug_assert!(
-            owed.is_ok(),
-            "the readiness service released {ordinal:?} and the interpreter refused it"
-        );
         run.spans.push((ordinal, start..interpreter.trace().len()));
 
         // Completion releases hazard dependents at once, because they wait for
         // the work. The stamp it owes is paid only when this channel's
         // publication order reaches it, and whatever waits on that stamp is
         // released then and not before.
+        //
+        // The scheduling side of that happens whether the interpreter accepted
+        // the transaction or refused it: the ordinal is no longer pending and
+        // the hazard graph no longer holds its accesses either way. What the
+        // outcome decides is publication.
         let scheduled = scheduler.complete(ordinal);
         graph.retire(ordinal);
-        let released =
-            publisher.complete(tx.identity.domain, tx.identity.domain_sequence, scheduled);
+        let released = match owed {
+            Ok(_) => publisher.complete(tx.identity.domain, tx.identity.domain_sequence, scheduled),
+            // `serial`'s arm, and for its reason: a refused position never
+            // publishes, and must not hold the ones behind it. Readiness is
+            // not the interpreter — `eligible` says ingress order is a legal
+            // schedule for the batch, not that the interpreter will accept
+            // every transaction in it — so a refusal here is a state this loop
+            // reaches rather than one it may assert away. Publishing it would
+            // hand the guest a completion word for work the model refused, and
+            // would diverge from the serial run that is the reference.
+            Err(_) => publisher.withdraw(tx.identity.domain, tx.identity.domain_sequence),
+        };
         pay(
             released,
             tx.identity.domain,

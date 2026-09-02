@@ -930,6 +930,59 @@ fn transactions_out_of_ingress_order_are_refused_before_anything_else() {
     );
 }
 
+/// `eligible` says ingress order is a legal schedule for the batch. It does not
+/// say the interpreter will accept every transaction in it — nothing hands it
+/// the interpreter's generation to compare against — so a refusal is a state
+/// both runs reach.
+///
+/// `serial` withdraws the refused position. `parallel_with` published it, and
+/// a completion word for work the model refused is the one thing publication
+/// exists to withhold: the guest is told its transaction finished. The
+/// equivalence relation caught the divergence only because both runs are
+/// compared; a production executor built on the parallel path alone would have
+/// had nothing to compare with.
+#[test]
+fn a_refused_transaction_publishes_nothing_however_the_schedule_runs() {
+    let mut b = ExecBuilder::new();
+    b.declare_access(whole(1, 1, AccessMode::Read));
+    let batch = vec![DeviceTransaction {
+        identity: TransactionIdentity {
+            // Not the generation `Interpreter::new` starts at, which is what
+            // makes the interpreter refuse. One transaction, so the batch is
+            // not a mixed one and `eligible` has nothing to say about it.
+            session: SessionGeneration::FIRST.next(),
+            domain: ChannelId(1),
+            domain_sequence: ChannelSequence(1),
+            ingress: IngressOrdinal(1),
+        },
+        stamp_waits: Vec::new(),
+        completion: Some(CompletionStamp {
+            slot: StampSlot(1),
+            value: StampValue(1),
+        }),
+        payload: Payload::Exec(b.finish().expect("frozen")),
+    }];
+    eligible(&batch).expect("one transaction, in ingress order, waiting on nothing");
+
+    let serial_run = serial(&batch);
+    assert!(
+        serial_run.releases.is_empty(),
+        "the reference publishes nothing for a refused transaction"
+    );
+    for seed in 0..8 {
+        let parallel_run = parallel(&batch, seed);
+        assert!(
+            parallel_run.releases.is_empty(),
+            "seed {seed}: a refused transaction published a completion word"
+        );
+        assert_eq!(
+            equivalent(&serial_run, &parallel_run),
+            Ok(()),
+            "seed {seed}"
+        );
+    }
+}
+
 #[test]
 fn a_second_generation_in_one_batch_is_refused() {
     let first = builder(1, 1).finish().expect("frozen");
