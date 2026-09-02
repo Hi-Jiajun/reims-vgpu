@@ -565,11 +565,35 @@ impl SetRing {
         Some(set)
     }
 
-    /// The holder was named by a submission and the GPU may read it until `at`.
+    /// The command buffer was submitted, and the GPU may read what it bound
+    /// until `at`.
     ///
     /// The end of the span [`SetState::Bound`] opened: from here the timeline,
-    /// and nothing else, says when the set may be written again. The holder
-    /// itself does not change, because its contents did not.
+    /// and nothing else, says when a set may be written again. No set's
+    /// contents change, so no set changes holder.
+    ///
+    /// # Every bound set, and not only the holder
+    ///
+    /// [`Self::abandoned`]'s doc states the law this keeps: a bound set is not
+    /// a leak because "the recording that bound it either reaches the queue or
+    /// says here that it never will". This is the reaching-the-queue half, and
+    /// it used to stamp the holder alone — which is one set, while a recording
+    /// can leave several bound.
+    ///
+    /// Two dirty draws in one command buffer are exactly that: the first
+    /// [`Self::emit`]s a set and binds it, the second finds that set
+    /// [`SetState::Bound`] and takes a fresh one, which becomes the holder. The
+    /// first set is then bound by a recorded draw, named by no receipt the
+    /// caller can return, and reachable by nothing — `recycle` acts on
+    /// `Submitted` alone and [`Self::reset`] refuses while anything is bound.
+    /// At ring depth *N* that lost a set per such command buffer until `emit`
+    /// answered `Exhausted { in_flight: 0 }` for the rest of the process and
+    /// the pool could never be reset.
+    ///
+    /// Every bound set in a per-worker ring was bound by a draw in the command
+    /// buffer being submitted, because a set bound by an *earlier* one is
+    /// already `Submitted`. So stamping all of them is exact rather than
+    /// conservative.
     ///
     /// A holder still [`SetState::Live`] is stamped too. It should not happen
     /// --- a submission that names no draw that bound the holder has no reason
@@ -581,16 +605,24 @@ impl SetRing {
     /// A holder already submitted has its point moved forward rather than kept:
     /// a second command buffer binding the same unchanged set means the GPU may
     /// read it until the later of the two, and keeping the earlier point would
-    /// recycle it while the second submission is still running.
+    /// recycle it while the second submission is still running. A *non*-holder
+    /// submitted set is untouched: nothing in this recording could name it, so
+    /// its own point is still the last read of it.
     ///
     /// Does nothing when nothing has been emitted, which is the case where the
     /// caller submitted a command buffer that bound no descriptors.
     pub fn submitted(&mut self, at: TimelinePoint) {
-        let Some(set) = self.holder else { return };
-        self.sets[set] = match self.sets[set] {
-            SetState::Submitted(previous) if previous > at => SetState::Submitted(previous),
-            _ => SetState::Submitted(at),
-        };
+        let holder = self.holder;
+        for (index, state) in self.sets.iter_mut().enumerate() {
+            *state = match *state {
+                SetState::Bound => SetState::Submitted(at),
+                SetState::Live if holder == Some(index) => SetState::Submitted(at),
+                SetState::Submitted(previous) if holder == Some(index) && at > previous => {
+                    SetState::Submitted(at)
+                }
+                unchanged => unchanged,
+            };
+        }
     }
 
     /// Release every set the timeline has passed. Returns how many.
@@ -1183,6 +1215,46 @@ mod tests {
         assert_eq!(ring.free(), 1, "no second set was ever taken");
     }
 
+    /// The command buffer this ring is written around: two dirty draws, two
+    /// sets, one submission. Both sets are the GPU's until the timeline says
+    /// otherwise, and both come back.
+    ///
+    /// Stamping the holder alone left the first set `Bound` with nothing
+    /// reachable to free it — `recycle` acts on submitted sets and `reset`
+    /// refuses while anything is bound — so a ring of depth two was down to
+    /// one set after one such command buffer and to none after two.
+    #[test]
+    fn a_submission_ends_the_span_of_every_set_the_command_buffer_bound() {
+        let mut ring = SetRing::new(2);
+        let first = ring.emit().expect("a free set");
+        // The second dirty draw finds the first set bound by a recorded draw
+        // and takes another, which becomes the holder.
+        let second = ring.emit().expect("a second free set");
+        assert_ne!(first.set, second.set);
+        assert_eq!(ring.bound(), 2);
+
+        ring.submitted(at(7));
+        assert_eq!(ring.bound(), 0, "the command buffer bound both of them");
+        assert_eq!(ring.in_flight(), 2);
+        assert_eq!(ring.state(first.set), Some(SetState::Submitted(at(7))));
+
+        assert_eq!(ring.recycle(at(7)), 2, "and the timeline frees both");
+        assert_eq!(
+            ring.state(first.set),
+            Some(SetState::Free),
+            "the set no draw holds is reusable"
+        );
+        assert_eq!(
+            ring.state(second.set),
+            Some(SetState::Live),
+            "and the holder keeps its contents"
+        );
+        assert!(
+            ring.resettable(),
+            "nothing is left that only a receipt frees"
+        );
+    }
+
     #[test]
     fn a_recycled_holder_keeps_its_contents_so_the_next_change_is_partial() {
         let mut ring = SetRing::new(2);
@@ -1475,7 +1547,13 @@ mod tests {
         let (mut emit_under_flight, mut emit_under_bound) = (0u64, 0u64);
 
         for depth in [1usize, 2, 3, 5] {
-            for _ in 0..600 {
+            // Seven hundred and fifty and not six hundred: a submission now
+            // ends every bound set's span rather than the holder's alone, so
+            // a ring stops filling up with sets nothing could free and the
+            // rarest arms — exhaustion, and an emission taken while another
+            // set is bound — arrive less often per history. The floors below
+            // are what they were; the number of histories is what moved.
+            for _ in 0..750 {
                 let mut ring = SetRing::new(depth);
                 let mut shadow: Vec<Shadow> = vec![Shadow::Free; depth];
                 let mut holder: Option<usize> = None;
@@ -1555,13 +1633,33 @@ mod tests {
                                 TimelinePoint(clock)
                             };
                             ring.submitted(at);
-                            if let Some(h) = holder {
+                            if holder.is_some() {
                                 submissions += 1;
-                                shadow[h] = Shadow::Submitted(match shadow[h] {
-                                    Shadow::Submitted(previous) if previous > at.0 => previous,
-                                    _ => at.0,
-                                });
                             }
+                            // A submission ends the span every bound set
+                            // opened, not the holder's alone: the command
+                            // buffer being submitted is the one whose draws
+                            // bound them.
+                            for (set, slot) in shadow.iter_mut().enumerate() {
+                                *slot = match *slot {
+                                    Shadow::Bound => Shadow::Submitted(at.0),
+                                    Shadow::Live if holder == Some(set) => Shadow::Submitted(at.0),
+                                    Shadow::Submitted(previous)
+                                        if holder == Some(set) && at.0 > previous =>
+                                    {
+                                        Shadow::Submitted(at.0)
+                                    }
+                                    unchanged => unchanged,
+                                };
+                            }
+                            // The claim in one line: after a submission there
+                            // is nothing left that only a returned receipt
+                            // could free.
+                            assert_eq!(
+                                ring.bound(),
+                                0,
+                                "a set bound by the submitted command buffer stayed bound"
+                            );
                         }
                         9..=13 => {
                             let reached = TimelinePoint(clock.saturating_sub(next() % 5));
