@@ -83,18 +83,7 @@ impl Slug {
 #[must_use]
 pub fn slugs_under(crates_dir: &Path) -> Vec<Slug> {
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(crates_dir).expect("the workspace can read its own crates");
-    let mut crates: Vec<_> = entries
-        .map(|e| e.expect("a readable entry").path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("reims-vgpu-"))
-        })
-        .collect();
-    crates.sort();
-    for krate in crates {
+    for krate in replacement_crates(crates_dir) {
         let name = krate
             .file_name()
             .and_then(|n| n.to_str())
@@ -214,7 +203,33 @@ fn literal(line: &str) -> Vec<String> {
 }
 
 /// Read every `.rs` file under a directory, as `(relative path, text)`.
-fn sources(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+/// The replacement crates under `crates_dir`, in name order.
+///
+/// Walked rather than listed, for [`slugs_under`]'s reason: a list is a thing
+/// to forget a crate from. The legacy `reims-vgpu` crate is not one of these —
+/// its directory name has no `reims-vgpu-` prefix — which is the exclusion
+/// [`slugs_under`] states its claim about.
+///
+/// # Panics
+///
+/// If `crates_dir` cannot be read.
+pub(crate) fn replacement_crates(crates_dir: &Path) -> Vec<std::path::PathBuf> {
+    let entries = std::fs::read_dir(crates_dir).expect("the workspace can read its own crates");
+    let mut crates: Vec<_> = entries
+        .map(|e| e.expect("a readable entry").path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("reims-vgpu-"))
+        })
+        .collect();
+    crates.sort();
+    crates
+}
+
+/// Every `.rs` file under `dir`, as (path relative to `root`, text).
+pub(crate) fn sources(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
     let entries = std::fs::read_dir(dir).expect("a crate can read its own sources");
     let mut paths: Vec<_> = entries
         .map(|e| e.expect("a readable entry").path())

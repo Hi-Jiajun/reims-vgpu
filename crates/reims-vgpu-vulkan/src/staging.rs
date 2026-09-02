@@ -540,6 +540,12 @@ impl Arena {
     }
 
     /// Every chunk's handles, in adoption order, with nothing left behind.
+    ///
+    /// `#[must_use]` on the method as well as on [`ChunkHandles`]: the lint
+    /// does not look inside a `Vec`, and this one consumes the arena — a
+    /// caller that drops the result has lost the only thing that named these
+    /// handles.
+    #[must_use = "the chunks are buffers and device memory the device never gets back"]
     fn take(self) -> Vec<ChunkHandles> {
         self.buffers
             .into_iter()

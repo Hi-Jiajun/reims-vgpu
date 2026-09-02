@@ -185,6 +185,12 @@ impl Publisher {
     }
 
     /// Release the finished prefix of a domain's FIFO.
+    ///
+    /// `#[must_use]` on the method as well as on [`Release`]: the lint does not
+    /// look inside a `Vec`, so the annotation on the element says nothing about
+    /// a call whose result is dropped — and that call is the one that publishes
+    /// nothing while the FIFO has moved on.
+    #[must_use = "the released positions are stamps the guest is waiting to read"]
     fn drain(queue: &mut Domain) -> Vec<Release> {
         let mut out = Vec::new();
         while let Some(head) = queue.order.front().copied() {
