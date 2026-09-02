@@ -767,8 +767,8 @@ pub fn bytes_per_texel(format: vk::Format) -> Option<u32> {
     // spellings of the colour orders. None is a guest linear texel layout, so
     // none has a contract width to derive from.
     Some(match format {
-        vk::Format::S8_UINT => 1,
-        vk::Format::D16_UNORM => 2,
+        vk::Format::S8_UINT | vk::Format::R8_UINT => 1,
+        vk::Format::D16_UNORM | vk::Format::R8G8_UINT => 2,
         vk::Format::R32_UINT
         | vk::Format::R32_SINT
         | vk::Format::R8G8B8A8_SRGB
@@ -2280,5 +2280,89 @@ mod tests {
                 "{mtl:#x} is sampled-only and must not be admitted as a storage image"
             );
         }
+    }
+
+    /// Every `VkFormat` any door in this module can hand out has a computable
+    /// footprint.
+    ///
+    /// A caller sizing a staging buffer, a row pitch or a footprint asks
+    /// [`vk_block_geometry`], and its `None` means "block-compressed or
+    /// multi-planar, ask differently". A format that is neither, and that this
+    /// module produced, answering `None` is therefore indistinguishable from a
+    /// format whose footprint is genuinely not one number --- and the caller
+    /// declines a legal guest texture by the wrong name. That is not
+    /// hypothetical: `bytes_per_texel`'s own documentation records the last
+    /// time a width was missing from it, and what it cost.
+    ///
+    /// The check is exhaustive over every `u16` and over every door, rather
+    /// than a hand-list of formats to try, because a hand-list is the second
+    /// copy that went wrong the first time. `R8_UINT` and `R8G8_UINT` were
+    /// missing when this test was written --- both reachable from an ordinary
+    /// integer guest texture.
+    #[test]
+    fn every_format_this_module_produces_has_a_footprint() {
+        let mut missing: Vec<String> = Vec::new();
+        let mut note = |door: &str, mtl: Option<u16>, format: vk::Format| {
+            if vk_block_geometry(format).is_none() {
+                missing.push(match mtl {
+                    Some(m) => format!("{door}({m:#x}) -> {format:?}"),
+                    None => format!("{door} -> {format:?}"),
+                });
+            }
+        };
+        for mtl in 0..=u16::MAX {
+            if let Ok(pf) = translate(mtl) {
+                note("translate.vk", Some(mtl), pf.vk);
+                note("translate.linear_vk", Some(mtl), pf.linear_vk);
+                note("storage_format", Some(mtl), storage_format(pf.vk));
+            }
+            if let Ok((format, _)) = color_attachment(mtl) {
+                note("color_attachment", Some(mtl), format);
+            }
+            if let Ok(image) = storage_image(mtl) {
+                note("storage_image", Some(mtl), vk_storage_image(image));
+            }
+            if let Ok(image) = sampled_image(mtl) {
+                note("sampled_image", Some(mtl), vk_storage_image(image));
+            }
+            if let Ok(sampled) = sampled_pixels(mtl) {
+                note("sampled_pixels", Some(mtl), vk_texel_layout(sampled.layout));
+                if let Some(format) = srgb_texel_layout(sampled.layout) {
+                    note("srgb_texel_layout", Some(mtl), format);
+                }
+            }
+            if let Some((format, _)) = verbatim_texel(mtl) {
+                note("verbatim_texel", Some(mtl), format);
+            }
+        }
+        note("resident_color(true)", None, resident_color(true));
+        note("resident_color(false)", None, resident_color(false));
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "no footprint for: {missing:?}");
+    }
+
+    /// The width the decode contract gave a format and the width this module
+    /// computes from the `VkFormat` are two derivations of one number, and
+    /// wherever the format is one texel to a block they have to agree.
+    #[test]
+    fn the_two_widths_of_an_uncompressed_format_are_one_number() {
+        let mut checked = 0usize;
+        for mtl in 0..=u16::MAX {
+            let Ok(pf) = translate(mtl) else { continue };
+            let Some(geometry) = vk_block_geometry(pf.vk) else {
+                continue;
+            };
+            if geometry.width != 1 || geometry.height != 1 {
+                continue;
+            }
+            assert_eq!(
+                geometry.bytes, pf.bytes_per_texel,
+                "{mtl:#x} ({:?}) is {} bytes by the contract and {} by the table",
+                pf.vk, pf.bytes_per_texel, geometry.bytes
+            );
+            checked += 1;
+        }
+        assert!(checked > 30, "only {checked} uncompressed formats reached");
     }
 }
