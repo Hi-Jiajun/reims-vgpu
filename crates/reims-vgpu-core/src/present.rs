@@ -394,12 +394,35 @@ impl PresentStream {
 
     /// Configure the first swapchain.
     ///
+    /// The first one of a stream, and the first one after
+    /// [`Self::device_lost`] left it unconfigured. A stream that already has a
+    /// swapchain is reconfigured through [`Self::replace`], which is the door
+    /// that retires the old one.
+    ///
     /// # Panics
     ///
     /// If the host returned no images. A swapchain of zero images cannot
     /// present, and admitting one would turn every acquire into backpressure
     /// that never lifts.
+    ///
+    /// If a swapchain already exists. The module's rule is that "a replaced
+    /// swapchain is retired, not destroyed", and overwriting the image count
+    /// here retires nothing: the old swapchain never reaches `retiring`, so no
+    /// [`Self::reached`] ever hands it back and nothing destroys it. Worse
+    /// than the leak, the generation does not advance, so the frames still in
+    /// flight on the old swapchain keep tickets that the generation check
+    /// accepts — including ones naming an image index the new swapchain does
+    /// not have.
     pub fn configure(&mut self, requested_depth: usize, returned_images: usize) {
+        assert!(
+            self.images.is_none(),
+            "a stream with a swapchain is reconfigured through `replace`, which retires the old one"
+        );
+        self.install(requested_depth, returned_images);
+    }
+
+    /// Take a swapchain's shape, whichever door asked.
+    fn install(&mut self, requested_depth: usize, returned_images: usize) {
         assert!(
             returned_images > 0,
             "a swapchain of no images cannot present"
@@ -424,13 +447,26 @@ impl PresentStream {
     ///
     /// # Panics
     ///
-    /// As [`Self::configure`].
+    /// If the host returned no images, as [`Self::configure`].
+    ///
+    /// If there is no swapchain to replace. The retirement this returns is a
+    /// promise that a swapchain exists and stops being read at `last_use`, and
+    /// a stream that never configured one — or whose [`Self::device_lost`]
+    /// took it — has none to promise about. Manufacturing the retirement
+    /// anyway hands the caller a generation to destroy that it never created.
+    /// It is the same question [`Self::device_lost`] already asks before
+    /// listing the current generation among the swapchains it returns.
+    /// [`Self::configure`] is the door to the first one.
     pub fn replace(
         &mut self,
         requested_depth: usize,
         returned_images: usize,
         last_use: TimelinePoint,
     ) -> Replaced {
+        assert!(
+            self.images.is_some(),
+            "there is no swapchain to replace; `configure` is the door to the first one"
+        );
         let retired = Retired {
             generation: self.generation,
             last_use,
@@ -439,7 +475,7 @@ impl PresentStream {
         self.generation = self.generation.next();
         let dropped = self.in_flight.drain(..).map(|f| f.sequence).collect();
         self.next_sequence = 0;
-        self.configure(requested_depth, returned_images);
+        self.install(requested_depth, returned_images);
         Replaced { retired, dropped }
     }
 
@@ -836,6 +872,45 @@ mod tests {
                 form.name()
             );
         }
+    }
+
+    /// The two swapchain doors are total between them: `configure` is the only
+    /// way in from unconfigured and `replace` the only way from configured.
+    ///
+    /// Configuring over a live swapchain retired nothing — so nothing ever
+    /// destroyed it — and left the frames in flight on it holding tickets a
+    /// generation that never advanced still accepts, one of which can name an
+    /// image index the new swapchain does not have.
+    #[test]
+    #[should_panic(expected = "reconfigured through `replace`")]
+    fn configuring_over_a_live_swapchain_is_not_a_door() {
+        let mut s = PresentStream::new(Order::Fifo);
+        s.configure(3, 3);
+        s.configure(2, 2);
+    }
+
+    /// And the mirror: the retirement `replace` returns promises a swapchain
+    /// exists and stops being read, which an unconfigured stream cannot
+    /// promise. `device_lost` already asks this question before listing the
+    /// current generation among the swapchains it hands back.
+    #[test]
+    #[should_panic(expected = "no swapchain to replace")]
+    fn replacing_a_swapchain_that_was_never_made_is_not_a_door() {
+        let mut s = PresentStream::new(Order::Fifo);
+        let _ = s.replace(2, 2, at(1));
+    }
+
+    /// The door a device loss leaves open is `configure`, because the loss
+    /// took the swapchain with it.
+    #[test]
+    fn a_stream_that_lost_its_device_configures_its_next_swapchain() {
+        let mut s = PresentStream::new(Order::Fifo);
+        s.configure(3, 3);
+        let lost = s.device_lost();
+        assert_eq!(lost.swapchains.len(), 1, "the one that existed");
+        assert_eq!(s.images(), None);
+        s.configure(2, 2);
+        assert_eq!(s.images(), Some(2));
     }
 
     /// The swap form's second word is unidentified, so nothing may report it as
