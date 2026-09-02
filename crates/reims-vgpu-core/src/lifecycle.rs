@@ -398,6 +398,37 @@ pub struct Effects {
     pub redefined: Vec<Redefinition>,
 }
 
+impl Effects {
+    /// Take everything `other` obliges into this one.
+    ///
+    /// Written as a destructure rather than a list of `extend` calls so that a
+    /// new obligation field is a compile error here instead of a silent drop.
+    /// The callers are the two commands that are lists of smaller deletes ---
+    /// [`Lifecycle::delete_task`] and [`Lifecycle::delete_backing`] --- and
+    /// each was reaching into two of the six fields by name. That is correct
+    /// only for as long as the delete they call fills exactly those two, which
+    /// is not a fact either call site can see, and the failure it produces is
+    /// an obligation that was owed and then discarded on the way out. That is
+    /// the loss this type's `#[must_use]` exists to make impossible, so the
+    /// merge is where it has to be caught.
+    fn absorb(&mut self, other: Self) {
+        let Self {
+            transfers,
+            teardowns,
+            storage_freed,
+            at_completion,
+            remapped,
+            redefined,
+        } = other;
+        self.transfers.extend(transfers);
+        self.teardowns.extend(teardowns);
+        self.storage_freed.extend(storage_freed);
+        self.at_completion.extend(at_completion);
+        self.remapped.extend(remapped);
+        self.redefined.extend(redefined);
+    }
+}
+
 /// A live task redefined: the whole address space replaced under one id.
 ///
 /// An obligation of the same kind [`Remap`] is, and a wider one. A remap moves
@@ -1423,9 +1454,7 @@ impl Lifecycle {
         }
         let mut effects = Effects::default();
         for name in self.tasks[&task].namespace.live_names() {
-            let one = self.delete_resource(task, name)?;
-            effects.teardowns.extend(one.teardowns);
-            effects.storage_freed.extend(one.storage_freed);
+            effects.absorb(self.delete_resource(task, name)?);
         }
         // Every allocation is gone, so each remaining heap frees its storage
         // now. A heap that still held one would have said so, and this would
@@ -1672,9 +1701,7 @@ impl Lifecycle {
             .collect();
         let mut effects = Effects::default();
         for resource in naming {
-            let one = self.delete_resource(task, resource)?;
-            effects.teardowns.extend(one.teardowns);
-            effects.storage_freed.extend(one.storage_freed);
+            effects.absorb(self.delete_resource(task, resource)?);
         }
         self.forget_backing(backing);
         Ok(effects)
@@ -1968,6 +1995,62 @@ mod tests {
             1,
             "the answer is asked at completion and not cached from admission"
         );
+    }
+
+    /// A merge that names its fields one by one is only correct for as long as
+    /// nobody adds a field, and the failure mode is an obligation dropped in
+    /// silence. This holds `absorb` to totality with a value in every field.
+    #[test]
+    fn absorbing_effects_keeps_every_obligation_and_not_only_the_two_a_delete_makes() {
+        let full = Effects {
+            transfers: vec![Transfer {
+                backing: BackingId(7),
+                from: Replica::GuestPages,
+                to: Replica::DeviceOwned,
+                bytes: crate::range_set::RangeSet::default(),
+                at: Vec::new(),
+            }],
+            teardowns: vec![Teardown::Now {
+                backing: BackingId(7),
+            }],
+            storage_freed: vec![BackingId(9)],
+            at_completion: vec![DeferredDiscard {
+                resource: name(3),
+                backing: BackingId(7),
+                bytes: range(0, 16),
+            }],
+            remapped: vec![Remap {
+                task: TASK,
+                span: GuestSpan {
+                    base: 0,
+                    length: 16,
+                },
+                established: true,
+            }],
+            redefined: vec![Redefinition {
+                task: TASK,
+                previous: DirectoryFrame(1),
+                directory: DirectoryFrame(2),
+            }],
+        };
+
+        let mut into = Effects::default();
+        into.absorb(full.clone());
+        assert_eq!(into, full, "a field was dropped on the way through");
+
+        // And it accumulates rather than replaces, which is what the two
+        // list-shaped deletes need from it.
+        into.absorb(full.clone());
+        for len in [
+            into.transfers.len(),
+            into.teardowns.len(),
+            into.storage_freed.len(),
+            into.at_completion.len(),
+            into.remapped.len(),
+            into.redefined.len(),
+        ] {
+            assert_eq!(len, 2);
+        }
     }
 
     #[test]
