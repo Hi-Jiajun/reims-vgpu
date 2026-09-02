@@ -147,6 +147,14 @@ pub struct Reported<'a> {
     pub depth_clamp: bool,
     /// `VkPhysicalDeviceFeatures::fillModeNonSolid`.
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::multiViewport`.
+    pub multi_viewport: bool,
+    /// `VkPhysicalDeviceLimits::maxViewports`.
+    ///
+    /// A limit rather than a feature, so it is always reported --- and it is
+    /// one exactly where the feature above is off, which is why both travel:
+    /// see [`crate::raster::ViewportCell`].
+    pub max_viewports: u32,
     /// `VkPhysicalDeviceFeatures::samplerAnisotropy`.
     pub sampler_anisotropy: bool,
     /// `VkPhysicalDeviceLimits::maxSamplerAnisotropy`.
@@ -381,6 +389,7 @@ pub struct Census {
     blend: crate::blend::BlendCell,
     topology: crate::topology::TopologyCell,
     vertex: crate::vertex::VertexCell,
+    viewports: crate::raster::ViewportCell,
     host_pointer_import: bool,
     synchronization2: bool,
     can_present: bool,
@@ -494,6 +503,10 @@ impl Census {
                     && reported.extended_dynamic_state3_polygon_mode,
                 dynamic_depth_clamp: dynamic_state_3
                     && reported.extended_dynamic_state3_depth_clamp_enable,
+            },
+            viewports: crate::raster::ViewportCell {
+                multi_viewport: reported.multi_viewport,
+                max_viewports: reported.max_viewports,
             },
             buffers: crate::buffer::BufferLimits {
                 max_buffer_size: reported.max_buffer_size,
@@ -701,6 +714,13 @@ impl Census {
         self.synchronization2
     }
 
+    /// How many viewports a pipeline built here may declare. See
+    /// [`crate::raster::viewport_slots`].
+    #[must_use]
+    pub const fn viewports(&self) -> crate::raster::ViewportCell {
+        self.viewports
+    }
+
     #[must_use]
     pub const fn can_present(&self) -> bool {
         self.can_present
@@ -726,7 +746,7 @@ impl Census {
              dyn_topology={} topology_unrestricted={} vertex_formats={} \
              vertex_divisor={} vertex_zero_divisor={} vertex_max_divisor={} \
              depth_clamp={} fill_non_solid={} dyn_cull_winding={} dyn_polygon={} \
-             dyn_depth_clamp={}",
+             dyn_depth_clamp={} multi_viewport={} max_viewports={}",
             self.api,
             self.memory.topology.slug(),
             self.memory.signal.slug(),
@@ -755,6 +775,8 @@ impl Census {
             self.raster.dynamic_cull_and_winding,
             self.raster.dynamic_polygon_mode,
             self.raster.dynamic_depth_clamp,
+            self.viewports.multi_viewport,
+            self.viewports.max_viewports,
         )
     }
 }
@@ -819,6 +841,8 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            multi_viewport: false,
+            max_viewports: 1,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
@@ -1075,6 +1099,38 @@ mod tests {
         );
     }
 
+    /// The viewport limits reach the cell `raster::viewport_slots` is asked
+    /// against, both halves, unchanged.
+    ///
+    /// A limit and its feature that the census did not carry is a check no
+    /// caller could have made: the census is the only thing the rest of the
+    /// crate is given.
+    #[test]
+    fn the_viewport_limits_reach_the_cell_that_admits_a_count() {
+        let memory = mem::nvidia_discrete();
+        let families = discrete_families();
+        let mut r = reported(packed(1, 2), BASELINE, &memory, &families);
+        r.multi_viewport = true;
+        r.max_viewports = 16;
+        let census = Census::take(r).expect("admitted");
+        assert_eq!(
+            census.viewports(),
+            crate::raster::ViewportCell {
+                multi_viewport: true,
+                max_viewports: 16,
+            }
+        );
+        assert!(crate::raster::viewport_slots(16, census.viewports()).is_ok());
+        assert!(crate::raster::viewport_slots(17, census.viewports()).is_err());
+
+        // And a device that reports neither admits exactly one, which is the
+        // cell every device answers.
+        let bare =
+            Census::take(reported(packed(1, 2), BASELINE, &memory, &families)).expect("admitted");
+        assert_eq!(bare.viewports(), crate::raster::ViewportCell::SINGLE);
+        assert!(crate::raster::viewport_slots(2, bare.viewports()).is_err());
+    }
+
     #[test]
     fn a_probe_cannot_qualify_what_the_device_does_not_report() {
         let memory = mem::intel_igpu();
@@ -1166,6 +1222,8 @@ mod tests {
             "vertex_max_divisor=0",
             "depth_clamp=false",
             "fill_non_solid=false",
+            "multi_viewport=false",
+            "max_viewports=1",
             "dyn_cull_winding=false",
             "dyn_polygon=false",
             "dyn_depth_clamp=false",

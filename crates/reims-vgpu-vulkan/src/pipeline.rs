@@ -134,7 +134,12 @@ pub struct GraphicsKey {
     /// a guest that binds three viewports and a guest that binds one are two
     /// pipelines here. One is overwhelmingly the common case, so this is a
     /// dimension that almost never divides.
-    pub viewports: u32,
+    ///
+    /// A [`raster::ViewportSlots`] rather than a `u32`, so a key cannot name a
+    /// count this host refuses: `multiViewport` and `maxViewports` are host
+    /// facts, and a check here would be one a caller assembling a key could
+    /// skip. See [`raster::viewport_slots`].
+    pub viewports: raster::ViewportSlots,
 }
 
 /// Why a set of individually translatable states cannot be one pipeline.
@@ -158,9 +163,6 @@ pub enum Refusal {
     /// Vulkan requires the structure, and its absence is undefined rather than
     /// a disabled test.
     AttachmentWithoutDepthState,
-    /// No viewport at all. A pipeline must declare at least one, and a draw
-    /// with none rasterizes nothing.
-    NoViewport,
     /// A pass with no colour attachment and no depth-stencil attachment.
     /// Nothing to write to.
     NoAttachment,
@@ -200,7 +202,6 @@ impl Refusal {
             Self::BlendAttachmentCount { .. } => "vk_pipeline_blend_attachment_count",
             Self::DepthStateWithoutAttachment => "vk_pipeline_depth_state_without_attachment",
             Self::AttachmentWithoutDepthState => "vk_pipeline_attachment_without_depth_state",
-            Self::NoViewport => "vk_pipeline_no_viewport",
             Self::NoAttachment => "vk_pipeline_no_attachment",
         }
     }
@@ -284,9 +285,6 @@ const ALWAYS_DYNAMIC: [vk::DynamicState; 3] = [
 /// [`Refusal`] for a composition that no individual plan could have caught.
 /// Nothing is partially built.
 pub fn build(key: GraphicsKey) -> Result<Build, Refusal> {
-    if key.viewports == 0 {
-        return Err(Refusal::NoViewport);
-    }
     if key.compatibility.color.is_empty() && key.compatibility.depth_stencil.is_none() {
         return Err(Refusal::NoAttachment);
     }
@@ -483,9 +481,9 @@ impl Build {
             s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
             p_next: core::ptr::null(),
             flags: vk::PipelineViewportStateCreateFlags::empty(),
-            viewport_count: self.key.viewports,
+            viewport_count: self.key.viewports.count(),
             p_viewports: core::ptr::null(),
-            scissor_count: self.key.viewports,
+            scissor_count: self.key.viewports.count(),
             p_scissors: core::ptr::null(),
             _marker: core::marker::PhantomData,
         };
@@ -988,9 +986,16 @@ mod tests {
             depth_stencil: None,
             blend: vec![blend_plan()],
             compatibility: compatibility(1, false),
-            viewports: 1,
+            viewports: raster::ViewportSlots::ONE,
         }
     }
+
+    /// A host that offers viewport arrays, for the keys that need more than
+    /// the one slot every device has.
+    const MULTI: raster::ViewportCell = raster::ViewportCell {
+        multi_viewport: true,
+        max_viewports: 16,
+    };
 
     fn hash_of<T: Hash>(value: &T) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -1250,18 +1255,13 @@ mod tests {
         .is_ok());
     }
 
-    /// A pass with nothing attached and a pipeline with no viewport are both
-    /// draws that produce nothing.
+    /// A pass with nothing attached is a draw that produces nothing.
+    ///
+    /// The pipeline with no viewport that used to be tested beside it is now
+    /// unrepresentable: `raster::viewport_slots` is the only constructor of a
+    /// count, and it refuses zero. Asserted there.
     #[test]
     fn a_pipeline_that_could_write_nowhere_is_refused() {
-        assert_eq!(
-            build(GraphicsKey {
-                viewports: 0,
-                ..key()
-            })
-            .unwrap_err(),
-            Refusal::NoViewport
-        );
         assert_eq!(
             build(GraphicsKey {
                 blend: vec![],
@@ -1410,7 +1410,8 @@ mod tests {
             (
                 "viewports",
                 GraphicsKey {
-                    viewports: 2,
+                    viewports: raster::viewport_slots(2, MULTI)
+                        .expect("two on a multi-viewport host"),
                     ..base.clone()
                 },
             ),
@@ -1474,7 +1475,7 @@ mod tests {
     #[test]
     fn the_create_info_is_the_build() {
         let build = build(GraphicsKey {
-            viewports: 3,
+            viewports: raster::viewport_slots(3, MULTI).expect("three on a multi-viewport host"),
             ..key()
         })
         .expect("built");
@@ -1701,7 +1702,7 @@ mod store_tests {
                 color_write_mask: vk::ColorComponentFlags::RGBA,
             }],
             compatibility: compat(),
-            viewports: 1,
+            viewports: raster::ViewportSlots::ONE,
         }
     }
 
@@ -1837,10 +1838,10 @@ mod store_tests {
     /// failure channel.
     #[test]
     fn the_two_refusals_do_not_read_alike() {
-        let composition = VariantRefusal::Composition(Refusal::NoViewport);
+        let composition = VariantRefusal::Composition(Refusal::NoVertexStage);
         let driver = VariantRefusal::Driver(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
         assert_ne!(composition, driver);
-        assert_eq!(composition.slug(), "vk_pipeline_no_viewport");
+        assert_eq!(composition.slug(), "vk_pipeline_no_vertex_stage");
         assert_eq!(driver.slug(), "vk_pipeline_driver_refused");
         assert!(driver.to_string().contains("ERROR_OUT_OF_DEVICE_MEMORY"));
     }

@@ -88,6 +88,14 @@ pub struct Enabled {
     /// `VkDeviceCreateInfo::pEnabledFeatures`.
     pub depth_clamp: bool,
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::multiViewport`, the 1.0 block again.
+    ///
+    /// A pipeline whose `viewportCount` is above one without it is invalid
+    /// (VUID-VkPipelineViewportStateCreateInfo-viewportCount-01216), and
+    /// [`crate::raster::viewport_slots`] refuses one against the same census
+    /// cell --- so what is requested here and what a count is checked against
+    /// are the same fact.
+    pub multi_viewport: bool,
     /// Also the 1.0 block. A sampler whose plan sets `anisotropyEnable` on a
     /// device that never requested this feature is undefined behaviour, so the
     /// census cell [`crate::sampler::plan`] reads and the feature requested
@@ -130,6 +138,7 @@ impl Enabled {
             descriptor_buffer: census.descriptors().descriptor_buffer,
             depth_clamp: census.raster().depth_clamp,
             fill_mode_non_solid: census.raster().fill_mode_non_solid,
+            multi_viewport: census.viewports().multi_viewport,
             sampler_anisotropy: census.samplers().anisotropy,
             dual_src_blend: census.blend().dual_source,
             independent_blend: census.blend().independent,
@@ -254,6 +263,7 @@ impl DeviceEpoch {
         let core_features = vk::PhysicalDeviceFeatures::default()
             .depth_clamp(enabled.depth_clamp)
             .fill_mode_non_solid(enabled.fill_mode_non_solid)
+            .multi_viewport(enabled.multi_viewport)
             .sampler_anisotropy(enabled.sampler_anisotropy)
             .dual_src_blend(enabled.dual_src_blend)
             .independent_blend(enabled.independent_blend);
@@ -424,6 +434,8 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            multi_viewport: false,
+            max_viewports: 1,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
@@ -563,48 +575,64 @@ mod tests {
         let families = families();
         for depth_clamp in [false, true] {
             for fill_mode_non_solid in [false, true] {
-                let census = Census::take(Reported {
-                    depth_clamp,
-                    fill_mode_non_solid,
-                    ..Reported {
-                        api_version: vk::make_api_version(0, 1, 2, 0),
-                        extensions: &[extension::SWAPCHAIN],
-                        timeline_semaphore: true,
-                        synchronization2: false,
-                        dynamic_rendering: false,
-                        depth_clamp: false,
-                        fill_mode_non_solid: false,
-                        sampler_anisotropy: false,
-                        max_sampler_anisotropy: 1.0,
-                        extended_dynamic_state: false,
-                        dynamic_primitive_topology_unrestricted: None,
-                        extended_dynamic_state3_polygon_mode: false,
-                        extended_dynamic_state3_depth_clamp_enable: false,
-                        vertex_attribute_instance_rate_divisor: false,
-                        vertex_attribute_instance_rate_zero_divisor: false,
-                        max_vertex_attrib_divisor: 0,
-                        vertex_formats: crate::vertex::VertexFormatSupport::NONE,
-                        dual_src_blend: false,
-                        independent_blend: false,
-                        sampler_mirror_clamp_to_edge: false,
-                        mesh_shader: false,
-                        descriptor_buffer: false,
-                        max_push_descriptors: 0,
-                        max_buffer_size: None,
-                        host_pointer_importable: false,
-                        min_imported_host_pointer_alignment: 0,
-                        memory: &memory,
-                        queue_families: &families,
-                    }
-                })
-                .expect("admitted");
-                let enabled = Enabled::for_census(&census);
-                assert_eq!(enabled.depth_clamp, depth_clamp);
-                assert_eq!(enabled.fill_mode_non_solid, fill_mode_non_solid);
-                // And the census agrees, so nothing can be enabled that the
-                // raster planner would not see.
-                assert_eq!(census.raster().depth_clamp, depth_clamp);
-                assert_eq!(census.raster().fill_mode_non_solid, fill_mode_non_solid);
+                for multi_viewport in [false, true] {
+                    let census = Census::take(Reported {
+                        depth_clamp,
+                        fill_mode_non_solid,
+                        multi_viewport,
+                        max_viewports: if multi_viewport { 16 } else { 1 },
+                        ..Reported {
+                            api_version: vk::make_api_version(0, 1, 2, 0),
+                            extensions: &[extension::SWAPCHAIN],
+                            timeline_semaphore: true,
+                            synchronization2: false,
+                            dynamic_rendering: false,
+                            depth_clamp: false,
+                            fill_mode_non_solid: false,
+                            multi_viewport: false,
+                            max_viewports: 1,
+                            sampler_anisotropy: false,
+                            max_sampler_anisotropy: 1.0,
+                            extended_dynamic_state: false,
+                            dynamic_primitive_topology_unrestricted: None,
+                            extended_dynamic_state3_polygon_mode: false,
+                            extended_dynamic_state3_depth_clamp_enable: false,
+                            vertex_attribute_instance_rate_divisor: false,
+                            vertex_attribute_instance_rate_zero_divisor: false,
+                            max_vertex_attrib_divisor: 0,
+                            vertex_formats: crate::vertex::VertexFormatSupport::NONE,
+                            dual_src_blend: false,
+                            independent_blend: false,
+                            sampler_mirror_clamp_to_edge: false,
+                            mesh_shader: false,
+                            descriptor_buffer: false,
+                            max_push_descriptors: 0,
+                            max_buffer_size: None,
+                            host_pointer_importable: false,
+                            min_imported_host_pointer_alignment: 0,
+                            memory: &memory,
+                            queue_families: &families,
+                        }
+                    })
+                    .expect("admitted");
+                    let enabled = Enabled::for_census(&census);
+                    assert_eq!(enabled.depth_clamp, depth_clamp);
+                    assert_eq!(enabled.fill_mode_non_solid, fill_mode_non_solid);
+                    // And the census agrees, so nothing can be enabled that the
+                    // raster planner would not see.
+                    assert_eq!(census.raster().depth_clamp, depth_clamp);
+                    assert_eq!(census.raster().fill_mode_non_solid, fill_mode_non_solid);
+                    // `multiViewport` is the same shape and the same hazard: a
+                    // count is admitted against the census cell, so requesting the
+                    // feature and admitting the count have to be one fact.
+                    assert_eq!(enabled.multi_viewport, multi_viewport);
+                    assert_eq!(census.viewports().multi_viewport, multi_viewport);
+                    assert_eq!(
+                        crate::raster::viewport_slots(2, census.viewports()).is_ok(),
+                        multi_viewport,
+                        "a second viewport is admitted exactly where the feature is"
+                    );
+                }
             }
         }
     }
@@ -631,6 +659,8 @@ mod tests {
                         dynamic_rendering: false,
                         depth_clamp: false,
                         fill_mode_non_solid: false,
+                        multi_viewport: false,
+                        max_viewports: 1,
                         sampler_anisotropy: false,
                         max_sampler_anisotropy: 16.0,
                         extended_dynamic_state: false,
@@ -684,6 +714,8 @@ mod tests {
                         dynamic_rendering: false,
                         depth_clamp: false,
                         fill_mode_non_solid: false,
+                        multi_viewport: false,
+                        max_viewports: 1,
                         sampler_anisotropy: false,
                         max_sampler_anisotropy: 16.0,
                         extended_dynamic_state: false,
@@ -803,6 +835,8 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            multi_viewport: false,
+            max_viewports: 1,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,

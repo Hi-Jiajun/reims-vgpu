@@ -161,6 +161,109 @@ pub struct RasterCell {
     pub dynamic_depth_clamp: bool,
 }
 
+/// How many viewport and scissor rectangles this host lets one pipeline
+/// declare.
+///
+/// Its own cell, like [`LineWidthCell`] and for the same reason: it is spent
+/// at the seam where the *count* is fixed, which is before a pipeline key
+/// exists, and it has nothing to say about how a pipeline is built once one
+/// does.
+///
+/// `Default` is one slot, which every device offers and no feature gates ---
+/// so a cell that was never filled in admits exactly the guest that never
+/// asked for more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewportCell {
+    /// `VkPhysicalDeviceFeatures::multiViewport`.
+    pub multi_viewport: bool,
+    /// `VkPhysicalDeviceLimits::maxViewports`.
+    ///
+    /// Required to be at least one on every device, and required to be one
+    /// exactly where `multiViewport` is off. Carried beside the feature rather
+    /// than folded into it because the two refuse differently: a host that
+    /// offers no multiple viewports at all is a different finding from one
+    /// that offers four and was asked for eight.
+    pub max_viewports: u32,
+}
+
+impl ViewportCell {
+    /// The one slot every device has.
+    pub const SINGLE: Self = Self {
+        multi_viewport: false,
+        max_viewports: 1,
+    };
+}
+
+impl Default for ViewportCell {
+    fn default() -> Self {
+        Self::SINGLE
+    }
+}
+
+/// How many viewport and scissor rectangles a pipeline declares, checked
+/// against the host that will build it.
+///
+/// A checked type rather than a `u32` because the count is a *pipeline member*
+/// --- `VkPipelineViewportStateCreateInfo::viewportCount`, which the with-count
+/// dynamic states are needed to move --- so the check has to happen before the
+/// pipeline key exists, and a key holding a bare number could be assembled by
+/// a caller that never asked. There is no constructor but [`viewport_slots`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ViewportSlots(u32);
+
+impl ViewportSlots {
+    /// One viewport, which needs no capability at all.
+    pub const ONE: Self = Self(1);
+
+    /// The count, for `viewportCount` and `scissorCount`.
+    ///
+    /// Vulkan requires those two to be equal unless both are dynamic with
+    /// count, so one number answers both.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        self.0
+    }
+}
+
+/// How many viewports this pipeline may declare on this host.
+///
+/// # Errors
+///
+/// [`Refusal::NoViewport`] for a pipeline that would rasterize nothing, and
+/// [`Refusal::ViewportSlots`] for a count past what this host offers.
+/// `VkPipelineViewportStateCreateInfo::viewportCount` must be at least one
+/// (VUID-VkPipelineViewportStateCreateInfo-scissorCount-arraylength), must not
+/// exceed `maxViewports` (VUID-…-viewportCount-01218), and must be exactly one
+/// where `multiViewport` is not enabled (VUID-…-viewportCount-01216).
+///
+/// Refused rather than clamped for the reason [`line_width`] refuses: a
+/// pipeline built with fewer viewports than the guest bound rasterizes the
+/// geometry it did bind through the wrong rectangle, and says nothing.
+pub fn viewport_slots(requested: u32, cell: ViewportCell) -> Result<ViewportSlots, Refusal> {
+    if requested == 0 {
+        return Err(Refusal::NoViewport);
+    }
+    // The feature first, because it is the more specific of the two answers:
+    // a host without `multiViewport` reports `maxViewports` of one, so the
+    // limit check alone would refuse it as "the limit is one" and lose the
+    // fact that it has no multiple viewports at all.
+    if requested > 1 && !cell.multi_viewport {
+        return Err(Refusal::ViewportSlots {
+            requested,
+            limit: 1,
+            multi_viewport: false,
+        });
+    }
+    if requested > cell.max_viewports {
+        return Err(Refusal::ViewportSlots {
+            requested,
+            limit: cell.max_viewports,
+            multi_viewport: cell.multi_viewport,
+        });
+    }
+    Ok(ViewportSlots(requested))
+}
+
 /// What this host will accept from `vkCmdSetLineWidth`.
 ///
 /// Separate from [`RasterCell`] because it is spent at a different seam: the
@@ -242,6 +345,21 @@ pub enum Refusal {
     /// The bits are the guest's own doubles, before the narrowing, because
     /// that is where the number came from and it is what a report should name.
     NonPositiveViewport { width_bits: u64, height_bits: u64 },
+    /// A pipeline that declares no viewport at all. It rasterizes nothing, and
+    /// `VkPipelineViewportStateCreateInfo` requires at least one.
+    NoViewport,
+    /// More viewports than this host offers.
+    ///
+    /// `limit` is `maxViewports` where `multiViewport` is enabled and one
+    /// where it is not, and both travel because "the host refused four" reads
+    /// very differently from "the host refused four because it offers no
+    /// multiple viewports at all" --- only the second is a whole missing
+    /// feature.
+    ViewportSlots {
+        requested: u32,
+        limit: u32,
+        multi_viewport: bool,
+    },
 }
 
 impl Refusal {
@@ -255,6 +373,8 @@ impl Refusal {
             Self::NoWideLines { .. } => "vk_raster_no_wide_lines",
             Self::LineWidthOutOfRange { .. } => "vk_raster_line_width_out_of_range",
             Self::NonPositiveViewport { .. } => "vk_raster_non_positive_viewport",
+            Self::NoViewport => "vk_raster_no_viewport",
+            Self::ViewportSlots { .. } => "vk_raster_viewport_slots",
         }
     }
 }
@@ -265,7 +385,19 @@ impl std::fmt::Display for Refusal {
             Self::UnknownOrdinal { state, ordinal } => {
                 write!(f, "{} state={state} ordinal={ordinal}", self.slug())
             }
-            Self::NoDepthClamp | Self::NoNonSolidFill => f.write_str(self.slug()),
+            Self::NoDepthClamp | Self::NoNonSolidFill | Self::NoViewport => {
+                f.write_str(self.slug())
+            }
+            Self::ViewportSlots {
+                requested,
+                limit,
+                multi_viewport,
+            } => write!(
+                f,
+                "{} requested={requested} limit={limit} multi_viewport={}",
+                self.slug(),
+                u8::from(*multi_viewport)
+            ),
             Self::OutOfRange { field, value } => {
                 write!(f, "{} field={field} value={value}", self.slug())
             }
@@ -894,6 +1026,76 @@ mod tests {
             z_far_bits: 1.0f64.to_bits(),
         }
     }
+
+    /// A viewport count is checked against the host that will build the
+    /// pipeline, and against both of the two facts that bound it.
+    ///
+    /// The regression: nothing checked it at all.
+    /// `pipeline::GraphicsKey::viewports` was a bare `u32` refused only for
+    /// being zero, so a key naming three viewports produced a
+    /// `VkPipelineViewportStateCreateInfo` with `viewportCount: 3` on a host
+    /// with `multiViewport` off --- invalid use
+    /// (VUID-VkPipelineViewportStateCreateInfo-viewportCount-01216) that no
+    /// census fact could have caught, because the census carried neither the
+    /// feature nor the limit.
+    #[test]
+    fn a_viewport_count_is_admitted_by_the_host_or_it_does_not_exist() {
+        // The one slot every device has needs no capability.
+        assert_eq!(
+            viewport_slots(1, ViewportCell::SINGLE),
+            Ok(ViewportSlots::ONE)
+        );
+        assert_eq!(ViewportSlots::ONE.count(), 1);
+
+        // Zero rasterizes nothing and is not a pipeline.
+        assert_eq!(viewport_slots(0, MULTI), Err(Refusal::NoViewport));
+        assert_eq!(
+            viewport_slots(0, ViewportCell::SINGLE).unwrap_err().slug(),
+            "vk_raster_no_viewport"
+        );
+
+        // The feature and the limit refuse differently, and the feature is
+        // asked first: a host without it reports a limit of one, so the limit
+        // alone would report "the limit is one" and lose the fact that this
+        // host has no viewport arrays at all.
+        let refused = viewport_slots(4, ViewportCell::SINGLE).expect_err("no multiViewport");
+        assert_eq!(
+            refused,
+            Refusal::ViewportSlots {
+                requested: 4,
+                limit: 1,
+                multi_viewport: false,
+            }
+        );
+        assert_eq!(refused.slug(), "vk_raster_viewport_slots");
+        assert!(refused.to_string().contains("multi_viewport=0"));
+
+        let over = viewport_slots(17, MULTI).expect_err("past maxViewports");
+        assert_eq!(
+            over,
+            Refusal::ViewportSlots {
+                requested: 17,
+                limit: 16,
+                multi_viewport: true,
+            }
+        );
+        assert!(over.to_string().contains("multi_viewport=1"));
+
+        // And the whole admitted range on a capable host, up to the limit and
+        // not past it.
+        for requested in 1..=MULTI.max_viewports {
+            assert_eq!(
+                viewport_slots(requested, MULTI).map(ViewportSlots::count),
+                Ok(requested)
+            );
+        }
+    }
+
+    /// A host that offers viewport arrays.
+    const MULTI: ViewportCell = ViewportCell {
+        multi_viewport: true,
+        max_viewports: 16,
+    };
 
     #[test]
     fn each_cull_ordinal_is_its_own_face_and_nothing_else_is_a_face() {

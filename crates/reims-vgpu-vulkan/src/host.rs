@@ -607,6 +607,11 @@ unsafe fn judge(
         dynamic_rendering: dynamic_rendering.dynamic_rendering == vk::TRUE,
         depth_clamp: core_features.depth_clamp == vk::TRUE,
         fill_mode_non_solid: core_features.fill_mode_non_solid == vk::TRUE,
+        multi_viewport: core_features.multi_viewport == vk::TRUE,
+        // Reported by every device and required to be one exactly where the
+        // feature above is off, so the two are read from the same properties
+        // and carried together --- see `crate::raster::ViewportCell`.
+        max_viewports: properties.limits.max_viewports,
         sampler_anisotropy: core_features.sampler_anisotropy == vk::TRUE,
         extended_dynamic_state: extended_dynamic_state.extended_dynamic_state == vk::TRUE,
         dynamic_primitive_topology_unrestricted,
@@ -664,6 +669,8 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            multi_viewport: false,
+            max_viewports: 1,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,
@@ -900,6 +907,8 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            multi_viewport: false,
+            max_viewports: 1,
             sampler_anisotropy: false,
             max_sampler_anisotropy: 1.0,
             extended_dynamic_state: false,

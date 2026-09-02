@@ -1562,7 +1562,7 @@ fn an_assembled_key_becomes_a_pipeline_this_driver_accepts() {
             stencil: false,
             samples: vk::SampleCountFlags::TYPE_1,
         },
-        viewports: 1,
+        viewports: reims_vgpu_vulkan::raster::ViewportSlots::ONE,
     };
     let built = pipeline::build(key).unwrap_or_else(|refusal| panic!("{refusal}"));
 
