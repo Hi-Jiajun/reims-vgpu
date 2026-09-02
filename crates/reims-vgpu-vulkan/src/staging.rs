@@ -52,6 +52,26 @@
 //! [`Chunk`] holds offsets and a timeline point and no Vulkan object, so every
 //! rule above is tested on a machine with no GPU. [`Arena`] is the chunks plus
 //! the handles they name.
+//!
+//! # And it hands every one of them back
+//!
+//! [`Arena::adopt`] takes the buffers, the allocations and the mappings by
+//! value, so from that moment the arena is the only thing that knows them. The
+//! rule this crate is under is that it allocates no Vulkan object it does not
+//! also hand back --- [`crate::pools::WorkerPool`] says so of its command
+//! pool, [`crate::resident::Residency::drain`] of its natives --- and an arena
+//! with no way out would make an epoch's staging memory unreclaimable *and*
+//! unnameable. A caller keeping its own copy of the three vectors to destroy
+//! them later would be two sources for one fact, which is the shape the arena
+//! exists to remove.
+//!
+//! So [`Arena::into_chunks`] is the door, and it asks the timeline first: a
+//! `vkDestroyBuffer` on a chunk a submission is reading is the use-after-submit
+//! this module spends its whole state machine preventing, arriving at teardown
+//! instead of at allocation. [`Arena::device_lost`] is the second door, and it
+//! asks nothing --- a device that is gone executes nothing, so no chunk is
+//! being read, and a lost arena that waited for a timeline reading that will
+//! never come would strand every allocation it holds.
 
 use ash::vk;
 use reims_vgpu_core::identity::TimelinePoint;
@@ -174,6 +194,47 @@ impl Chunk {
     #[must_use]
     pub const fn size(&self) -> u64 {
         self.size
+    }
+}
+
+/// One chunk's Vulkan objects, as a teardown takes them.
+///
+/// The three together, because they are one chunk: a buffer destroyed without
+/// its allocation freed is a leak, and an allocation freed while another chunk
+/// still names it is the mismatch [`Arena::adopt`] asserts against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a chunk's buffer and allocation are the device's until something destroys them"]
+pub struct ChunkHandles {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    /// The mapping. `vkFreeMemory` releases it, so a caller that frees the
+    /// allocation need not unmap; one that unmaps explicitly needs this.
+    pub mapped: *mut u8,
+}
+
+/// The arena cannot be taken apart yet: a submission may still be reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StillReading {
+    pub chunks: usize,
+    pub in_flight: usize,
+}
+
+impl StillReading {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        "vk_staging_still_reading"
+    }
+}
+
+impl std::fmt::Display for StillReading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} chunks={} in_flight={}",
+            self.slug(),
+            self.chunks,
+            self.in_flight
+        )
     }
 }
 
@@ -431,6 +492,67 @@ impl Arena {
         freed
     }
 
+    /// Whether the arena may be taken apart: no chunk is named by a
+    /// submission the timeline has not passed.
+    ///
+    /// The same question [`crate::pools::BufferRing::resettable`] asks about
+    /// command buffers, about the memory they copy from.
+    #[must_use]
+    pub fn retirable(&self) -> bool {
+        self.in_flight() == 0
+    }
+
+    /// Take the arena apart into the handles it was adopted with.
+    ///
+    /// # Errors
+    ///
+    /// [`StillReading`] with the arena returned whole and nothing destroyed,
+    /// when a submission may still be reading a chunk. The caller polls the
+    /// timeline, calls [`Self::recycle`], and asks again.
+    // A refused teardown returns the arena itself, which is the refusal's whole
+    // content: the caller has nothing else that names these handles. That makes
+    // the `Err` variant as large as the arena by construction, and boxing it
+    // would put an allocation on the refusal path of an operation that happens
+    // once per epoch, in exchange for nothing.
+    #[allow(clippy::result_large_err)]
+    pub fn into_chunks(self) -> Result<Vec<ChunkHandles>, (Self, StillReading)> {
+        if !self.retirable() {
+            let refusal = StillReading {
+                chunks: self.chunks.len(),
+                in_flight: self.in_flight(),
+            };
+            return Err((self, refusal));
+        }
+        Ok(self.take())
+    }
+
+    /// The device is gone, so take the arena apart whatever the timeline says.
+    ///
+    /// A lost device executes nothing further, so no chunk is being read and
+    /// the timeline that would have proved it will never advance again. The
+    /// handles still have to be destroyed: losing a device does not free its
+    /// memory, and an arena that insisted on [`Self::into_chunks`] here would
+    /// hold every staging allocation of the lost epoch for the life of the
+    /// process.
+    #[must_use = "a lost arena's chunks are buffers and device memory the device never gets back"]
+    pub fn device_lost(self) -> Vec<ChunkHandles> {
+        self.take()
+    }
+
+    /// Every chunk's handles, in adoption order, with nothing left behind.
+    fn take(self) -> Vec<ChunkHandles> {
+        self.buffers
+            .into_iter()
+            .zip(self.memory)
+            .zip(self.mapped)
+            .map(|((buffer, memory), mapped)| ChunkHandles {
+                buffer,
+                memory,
+                mapped,
+            })
+            .collect()
+    }
+
     /// The `(offset, size)` to flush or invalidate for a window.
     ///
     /// Rounded outward to `nonCoherentAtomSize`, so both ends are multiples of
@@ -478,6 +600,68 @@ mod tests {
                 .collect(),
             vec![ptr::null_mut(); chunks],
         )
+    }
+
+    /// The rule the crate states of every other handle-owning ring, applied
+    /// here: everything adopted comes back, once, in order.
+    #[test]
+    fn an_idle_arena_hands_back_every_chunk_it_was_adopted_with() {
+        let mut a = arena(3, 64);
+        let _staged = a.allocate(16, 16).expect("room");
+        a.submitted(at(5));
+        assert_eq!(a.recycle(at(5)), 1);
+        assert!(a.retirable());
+
+        let chunks = a.into_chunks().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+        assert_eq!(chunks.len(), 3);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let expected = index as u64 + 1;
+            assert_eq!(chunk.buffer.as_raw(), expected);
+            assert_eq!(chunk.memory.as_raw(), expected, "a chunk's own allocation");
+        }
+    }
+
+    #[test]
+    fn an_arena_a_submission_is_reading_is_returned_whole_rather_than_destroyed() {
+        let mut a = arena(2, 64);
+        let _staged = a.allocate(16, 16).expect("room");
+        a.submitted(at(9));
+        assert!(!a.retirable());
+
+        let (a, refusal) = a.into_chunks().expect_err("the GPU may be reading it");
+
+        assert_eq!(
+            refusal,
+            StillReading {
+                chunks: 2,
+                in_flight: 1,
+            }
+        );
+        assert!(refusal.to_string().starts_with(refusal.slug()));
+        // Nothing was destroyed, so the retry after a recycle has everything.
+        let mut a = a;
+        assert_eq!(a.recycle(at(9)), 1);
+        assert_eq!(
+            a.into_chunks().unwrap_or_else(|(_, e)| panic!("{e}")).len(),
+            2
+        );
+    }
+
+    /// A lost device advances no timeline, so the orderly door never opens
+    /// again — and the memory is still allocated.
+    #[test]
+    fn a_lost_device_hands_back_the_chunks_a_timeline_would_never_release() {
+        let mut a = arena(2, 64);
+        let _staged = a.allocate(16, 16).expect("room");
+        a.submitted(at(9));
+        assert!(!a.retirable(), "and it never will be again");
+
+        let chunks = a.device_lost();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].buffer.as_raw(), 1);
+        assert_eq!(chunks[1].memory.as_raw(), 2);
     }
 
     fn at(n: u64) -> TimelinePoint {
