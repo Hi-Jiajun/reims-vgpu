@@ -39,8 +39,9 @@
 //! that also chose layouts would be a second place image state is tracked.
 
 use ash::vk;
-use reims_vgpu_core::blit::{BlitOp, ImagePitch, Origin3, Size3, TexturePoint};
-use reims_vgpu_core::pixel_format::block_geometry;
+use reims_vgpu_core::blit::{BlitOp, BlitOptions, ImagePitch, Origin3, Size3, TexturePoint};
+use reims_vgpu_core::blit_option::{select_aspect, OptionRefusal};
+use reims_vgpu_core::pixel_format::{blit_aspect_bytes_per_pixel, block_geometry, BlitAspect};
 use reims_vgpu_core::texture_shape::Texture;
 
 use crate::buffer::BufferPlan;
@@ -187,6 +188,24 @@ pub enum Refusal {
     /// changes bytes it is also reading and needs a staging round-trip to
     /// define.
     OverlappingSelfImageCopy { level: u32, slice: u32 },
+    /// The guest's `MTLBlitOption` word names no plane this device can copy.
+    ///
+    /// Forwarded from the layer that owns the tag, so the reason the guest
+    /// gets is the reason that layer gave and not this rail's paraphrase.
+    BlitOption { refusal: OptionRefusal },
+    /// The option word selected a plane the texture's format does not have —
+    /// the stencil of a depth-only texture, or either plane of a colour one.
+    AspectNotInFormat { format: u16, aspect: &'static str },
+    /// A buffer↔image copy of a combined depth-stencil texture that named no
+    /// plane.
+    ///
+    /// `VkImageSubresourceLayers::aspectMask` in such a copy must have exactly
+    /// one bit — VUID-VkBufferImageCopy-aspectMask-00212 — and no other field
+    /// of the record says which of the two the guest's bytes are. Deriving the
+    /// mask from the format alone produced a two-bit one and recorded an
+    /// illegal copy; guessing a plane would move the right number of bytes
+    /// from the wrong half of the texture.
+    AmbiguousAspect { format: u16 },
     /// A blit-encoder operation that is not a copy, and so has no native
     /// transfer form at all.
     ///
@@ -213,6 +232,9 @@ impl Refusal {
             Self::OutsideBuffer { .. } => "vk_transfer_outside_buffer",
             Self::OverlappingSelfCopy { .. } => "vk_transfer_overlapping_self_copy",
             Self::OverlappingSelfImageCopy { .. } => "vk_transfer_overlapping_self_image_copy",
+            Self::BlitOption { refusal } => refusal.slug(),
+            Self::AspectNotInFormat { .. } => "vk_transfer_aspect_not_in_format",
+            Self::AmbiguousAspect { .. } => "vk_transfer_ambiguous_aspect",
             Self::NotACopy { .. } => "vk_transfer_not_a_copy",
         }
     }
@@ -296,6 +318,20 @@ impl std::fmt::Display for Refusal {
             ),
             Self::OverlappingSelfImageCopy { level, slice } => {
                 write!(f, "{} level={level} slice={slice}", self.slug())
+            }
+            Self::BlitOption { refusal } => match refusal {
+                OptionRefusal::UnknownBits { options } => {
+                    write!(f, "{} options={options:#x}", self.slug())
+                }
+                OptionRefusal::RowLinearPvrtc | OptionRefusal::ConflictingAspects => {
+                    f.write_str(self.slug())
+                }
+            },
+            Self::AspectNotInFormat { format, aspect } => {
+                write!(f, "{} format={format:#x} aspect={aspect}", self.slug())
+            }
+            Self::AmbiguousAspect { format } => {
+                write!(f, "{} format={format:#x}", self.slug())
             }
             Self::NotACopy { op } => write!(f, "{} op={op}", self.slug()),
         }
@@ -476,10 +512,9 @@ fn within_buffer(plan: &BufferPlan, offset: u64, length: u64) -> Result<(), Refu
 ///
 /// [`Refusal`] from the pitch conversion, or when the footprint does not fit
 /// 64 bits.
-pub fn region_bytes(texture: Texture, pitch: ImagePitch, size: Size3) -> Result<u64, Refusal> {
-    let format = texture.pixel_format();
-    let block = block_geometry(format).ok_or(Refusal::UnknownFormatGeometry { format })?;
-    let (row_length, image_height) = texel_pitch(texture, pitch, size)?;
+fn region_bytes(pitch: ImagePitch, size: Size3, plane: Plane) -> Result<u64, Refusal> {
+    let block = plane.block;
+    let (row_length, image_height) = texel_pitch(pitch, size, plane)?;
     if size.width == 0 || size.height == 0 || size.depth == 0 {
         return Ok(0);
     }
@@ -545,10 +580,92 @@ fn within(axis: &'static str, named: u64, available: u64) -> Result<(), Refusal>
 /// [`Refusal::OutsideTexture`] naming the first axis that does not fit, or
 /// [`Refusal::ExtentTooLarge`] when a dimension does not fit the 32-bit fields
 /// a native copy carries.
+/// Which plane of a texture a blit addresses, and what one texel of it costs
+/// on the buffer side.
+///
+/// # Why the format alone cannot answer this
+///
+/// [`crate::view::aspect`] answers "which aspects does this format have", and
+/// for `MTLPixelFormatDepth24Unorm_Stencil8` and `Depth32Float_Stencil8` that
+/// is two. `VkImageSubresourceLayers::aspectMask` in a buffer↔image copy must
+/// name exactly one — VUID-VkBufferImageCopy-aspectMask-00212 — so the format
+/// is not the whole question and reading it as if it were recorded an illegal
+/// copy whenever the guest touched a combined depth-stencil texture.
+///
+/// The half the format does not carry is the guest's `MTLBlitOption` word,
+/// which is exactly the plane selection. It also decides the buffer-side
+/// texel size: the depth plane of `Depth24Unorm_Stencil8` is four bytes and
+/// the stencil plane is one, where the packed cell is four — so a plane copy
+/// converted through the cell's size gets a row pitch the guest never meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Plane {
+    /// The aspect the copy names.
+    mask: vk::ImageAspectFlags,
+    /// The addressable unit on the buffer side. A selected plane is one texel
+    /// wide and its own width in bytes; the whole texel is the format's block,
+    /// which for a compressed format is not one texel at all.
+    block: reims_vgpu_core::extent::BlockGeometry,
+}
+
+/// Resolve the plane a blit addresses from its option word and the texture.
+///
+/// `single` is whether the copy has a buffer end, which is where "exactly one
+/// aspect" is a Vulkan requirement rather than a preference: `vkCmdCopyImage`
+/// accepts a combined mask and `vkCmdCopyBufferToImage` does not.
+///
+/// # Errors
+///
+/// [`Refusal::BlitOption`] for an option word this device cannot read as a
+/// plane, [`Refusal::AspectNotInFormat`] for a plane the format does not have,
+/// and [`Refusal::AmbiguousAspect`] for a buffer↔image copy of a combined
+/// depth-stencil texture that named no plane — which is a copy whose bytes
+/// nothing in the record identifies.
+fn plane_of(texture: Texture, options: BlitOptions, single: bool) -> Result<Plane, Refusal> {
+    let format = texture.pixel_format();
+    let selected = select_aspect(options.0).map_err(|refusal| Refusal::BlitOption { refusal })?;
+    let mask = match selected {
+        BlitAspect::Full => aspect(format),
+        BlitAspect::Depth => vk::ImageAspectFlags::DEPTH,
+        BlitAspect::Stencil => vk::ImageAspectFlags::STENCIL,
+    };
+    if !aspect(format).contains(mask) {
+        return Err(Refusal::AspectNotInFormat {
+            format,
+            aspect: match selected {
+                BlitAspect::Depth => "depth",
+                BlitAspect::Stencil => "stencil",
+                BlitAspect::Full => "full",
+            },
+        });
+    }
+    if single
+        && mask.contains(vk::ImageAspectFlags::DEPTH)
+        && mask.contains(vk::ImageAspectFlags::STENCIL)
+    {
+        return Err(Refusal::AmbiguousAspect { format });
+    }
+    let block = match selected {
+        BlitAspect::Full => {
+            block_geometry(format).ok_or(Refusal::UnknownFormatGeometry { format })?
+        }
+        BlitAspect::Depth | BlitAspect::Stencil => {
+            let bytes = blit_aspect_bytes_per_pixel(format, selected)
+                .ok_or(Refusal::UnknownFormatGeometry { format })?;
+            reims_vgpu_core::extent::BlockGeometry {
+                width: 1,
+                height: 1,
+                bytes,
+            }
+        }
+    };
+    Ok(Plane { mask, block })
+}
+
 fn endpoint(
     texture: Texture,
     point: TexturePoint,
     size: Size3,
+    plane: Plane,
 ) -> Result<(vk::ImageSubresourceLayers, vk::Offset3D, vk::Extent3D), Refusal> {
     within(
         "level",
@@ -582,7 +699,7 @@ fn endpoint(
     }
     Ok((
         vk::ImageSubresourceLayers {
-            aspect_mask: aspect(texture.pixel_format()),
+            aspect_mask: plane.mask,
             mip_level: u32::from(point.level),
             base_array_layer: u32::from(point.slice),
             layer_count: 1,
@@ -614,13 +731,8 @@ fn endpoint(
 /// [`Refusal`] when the byte pitch is not a whole number of blocks or rows,
 /// when it cannot describe a copy of `size`, or when this build has no
 /// geometry for the format.
-pub fn texel_pitch(
-    texture: Texture,
-    pitch: ImagePitch,
-    size: Size3,
-) -> Result<(u32, u32), Refusal> {
-    let format = texture.pixel_format();
-    let block = block_geometry(format).ok_or(Refusal::UnknownFormatGeometry { format })?;
+fn texel_pitch(pitch: ImagePitch, size: Size3, plane: Plane) -> Result<(u32, u32), Refusal> {
+    let block = plane.block;
     let block_bytes = u64::from(block.bytes);
 
     let row_length = if pitch.bytes_per_row == 0 {
@@ -801,14 +913,15 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
             source_pitch,
             size,
             dest,
-            options: _,
+            options,
         } => {
             let from = resolved(residency.buffer(source))?;
             let image = resolved(residency.image(dest.texture))?;
+            let plane = plane_of(image.texture, options, true)?;
             within_buffer(
                 &from.plan,
                 source_offset,
-                region_bytes(image.texture, source_pitch, size)?,
+                region_bytes(source_pitch, size, plane)?,
             )?;
             Command::CopyBufferToImage {
                 source: from.buffer,
@@ -819,6 +932,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
                     source_pitch,
                     dest,
                     size,
+                    plane,
                 )?),
             }
         }
@@ -828,14 +942,15 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
             dest,
             dest_offset,
             dest_pitch,
-            options: _,
+            options,
         } => {
             let image = resolved(residency.image(source.texture))?;
             let to = resolved(residency.buffer(dest))?;
+            let plane = plane_of(image.texture, options, true)?;
             within_buffer(
                 &to.plan,
                 dest_offset,
-                region_bytes(image.texture, dest_pitch, size)?,
+                region_bytes(dest_pitch, size, plane)?,
             )?;
             Command::CopyImageToBuffer {
                 source: image.image,
@@ -846,6 +961,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
                     dest_pitch,
                     source,
                     size,
+                    plane,
                 )?),
             }
         }
@@ -853,12 +969,21 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
             source,
             dest,
             size,
-            options: _,
+            options,
         } => {
             let from = resolved(residency.image(source.texture))?;
             let to = resolved(residency.image(dest.texture))?;
-            let (src_subresource, src_offset, extent) = endpoint(from.texture, source, size)?;
-            let (dst_subresource, dst_offset, _) = endpoint(to.texture, dest, size)?;
+            // Asked of each end, because the two textures are separately
+            // declared and the option word selects a plane of whichever
+            // format each one has. `single` is false: `vkCmdCopyImage` takes a
+            // combined mask, so an image-to-image copy that named no plane is
+            // the whole texel on both ends and not the ambiguity a buffer end
+            // makes it.
+            let src_plane = plane_of(from.texture, options, false)?;
+            let dst_plane = plane_of(to.texture, options, false)?;
+            let (src_subresource, src_offset, extent) =
+                endpoint(from.texture, source, size, src_plane)?;
+            let (dst_subresource, dst_offset, _) = endpoint(to.texture, dest, size, dst_plane)?;
             // One image, one subresource: the two regions are in the same
             // memory and `vkCmdCopyImage` forbids them overlapping. Different
             // levels or slices of one image are different memory, so this is
@@ -1233,9 +1358,10 @@ fn buffer_image_region(
     pitch: ImagePitch,
     point: TexturePoint,
     size: Size3,
+    plane: Plane,
 ) -> Result<vk::BufferImageCopy, Refusal> {
-    let (row_length, image_height) = texel_pitch(texture, pitch, size)?;
-    let (image_subresource, image_offset, image_extent) = endpoint(texture, point, size)?;
+    let (row_length, image_height) = texel_pitch(pitch, size, plane)?;
+    let (image_subresource, image_offset, image_extent) = endpoint(texture, point, size, plane)?;
     Ok(vk::BufferImageCopy {
         buffer_offset,
         buffer_row_length: row_length,
@@ -1251,11 +1377,16 @@ mod tests {
     use super::*;
     use ash::vk::Handle;
     use reims_vgpu_core::blit::{BufferSpan, FillPattern, SpanOrigin};
+    use reims_vgpu_core::blit_option::{
+        MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL, MTL_BLIT_OPTION_NONE,
+        MTL_BLIT_OPTION_ROW_LINEAR_PVRTC, MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL,
+    };
     use reims_vgpu_core::identity::{
         DeviceEpoch, ObjectListRef, ResourceId, SessionGeneration, SlotGeneration, TimelinePoint,
     };
     use reims_vgpu_core::pixel_format::{
-        MTL_FORMAT_BC3_RGBA, MTL_FORMAT_DEPTH32_FLOAT, MTL_FORMAT_RGBA8_UNORM,
+        MTL_FORMAT_BC3_RGBA, MTL_FORMAT_DEPTH32_FLOAT, MTL_FORMAT_DEPTH32_FLOAT_STENCIL8,
+        MTL_FORMAT_RGBA8_UNORM,
     };
     use reims_vgpu_core::retire::{Lifetime, NativeRetirement};
     use reims_vgpu_core::texture_shape::{TextureKind, TextureShape, TextureUsage};
@@ -1264,6 +1395,28 @@ mod tests {
     use crate::buffer::{BufferPlan, EVERY_CLASS};
     use crate::image::ImagePlan;
     use crate::resident::{Native, NativeBuffer, NativeImage};
+
+    /// The whole-texel plane of a texture, which is what every case that is
+    /// not about plane selection asks for.
+    fn whole(texture: Texture) -> Plane {
+        plane_of(texture, BlitOptions(0), true).expect("a single-aspect format")
+    }
+
+    /// The pitch conversion, in the shape the cases below drive it: a texture
+    /// rather than the plane derived from it. The plane is what the conversion
+    /// actually needs — a selected depth or stencil plane has its own texel
+    /// width — and every case here is a whole-texel one.
+    fn texel_pitch(
+        texture: Texture,
+        pitch: ImagePitch,
+        size: Size3,
+    ) -> Result<(u32, u32), Refusal> {
+        super::texel_pitch(pitch, size, whole(texture))
+    }
+
+    fn region_bytes(texture: Texture, pitch: ImagePitch, size: Size3) -> Result<u64, Refusal> {
+        super::region_bytes(pitch, size, whole(texture))
+    }
 
     const BUFFER_A: u32 = 1;
     const BUFFER_B: u32 = 2;
@@ -1594,19 +1747,12 @@ mod tests {
         }
         .checked()
         .expect("a declaration");
+        // Asked of the plane, which is where the addressable unit is decided:
+        // a selected depth or stencil plane has its own texel width, and a
+        // whole-texel copy has the format's block. Either way a format this
+        // build has no geometry for is refused before a pitch is converted.
         assert_eq!(
-            texel_pitch(
-                unknown,
-                ImagePitch {
-                    bytes_per_row: 16,
-                    bytes_per_image: 0,
-                },
-                Size3 {
-                    width: 4,
-                    height: 4,
-                    depth: 1,
-                },
-            ),
+            plane_of(unknown, BlitOptions(0), true),
             Err(Refusal::UnknownFormatGeometry { format: 0xFFFF })
         );
     }
@@ -1714,6 +1860,152 @@ mod tests {
         assert_eq!(
             regions[0].image_subresource.aspect_mask,
             vk::ImageAspectFlags::DEPTH
+        );
+    }
+
+    /// A combined depth-stencil texture with a buffer at the other end, and
+    /// the three answers the option word decides between.
+    ///
+    /// `VkImageSubresourceLayers::aspectMask` must have exactly one bit here
+    /// (VUID-VkBufferImageCopy-aspectMask-00212). The format alone answers
+    /// "depth and stencil", so a planner reading only the format recorded an
+    /// illegal copy for every guest that touched one of these textures, and
+    /// dropped the guest's plane selection while doing it.
+    #[test]
+    fn a_combined_depth_stencil_copy_takes_its_aspect_from_the_option_word() {
+        let mut residency = Residency::new();
+        let mut retire = NativeRetirement::new();
+        residency
+            .publish(
+                id(IMAGE_A),
+                Lifetime::new(SessionGeneration::FIRST, DeviceEpoch::FIRST),
+                native_image(0x1A, texture(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, 8, 8, 1, 1)),
+                &mut retire,
+            )
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        residency
+            .publish(
+                id(BUFFER_A),
+                Lifetime::new(SessionGeneration::FIRST, DeviceEpoch::FIRST),
+                native_buffer(0xB1),
+                &mut retire,
+            )
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+        let download = |options: u32, bytes_per_row: u64| {
+            plan(
+                &BlitOp::TextureToBuffer {
+                    source: point(IMAGE_A, 0, 0),
+                    size: size(8, 8),
+                    dest: id(BUFFER_A),
+                    dest_offset: 0,
+                    dest_pitch: ImagePitch {
+                        bytes_per_row,
+                        bytes_per_image: 0,
+                    },
+                    options: BlitOptions(options),
+                },
+                &residency,
+            )
+        };
+
+        // No plane named. Nothing in the record says which half of the texel
+        // the guest's bytes are, so there is nothing to derive and the copy is
+        // refused by name rather than recorded with a two-bit mask.
+        assert_eq!(
+            download(MTL_BLIT_OPTION_NONE, 32).expect_err("no plane is named"),
+            Refusal::AmbiguousAspect {
+                format: MTL_FORMAT_DEPTH32_FLOAT_STENCIL8
+            }
+        );
+
+        // The depth plane: four bytes a texel, so a row of eight is 32.
+        let depth = download(MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL, 32)
+            .expect("plannable")
+            .expect("native work");
+        let Command::CopyImageToBuffer { regions, .. } = depth else {
+            panic!("a download");
+        };
+        assert_eq!(
+            regions[0].image_subresource.aspect_mask,
+            vk::ImageAspectFlags::DEPTH
+        );
+        assert_eq!(
+            regions[0].buffer_row_length, 8,
+            "32 bytes of four-byte depth"
+        );
+
+        // The stencil plane: one byte a texel, so the same 32-byte row is
+        // thirty-two texels wide. Converted through the packed cell it would
+        // have been four, which is the pitch the guest never meant.
+        let stencil = download(MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL, 32)
+            .expect("plannable")
+            .expect("native work");
+        let Command::CopyImageToBuffer { regions, .. } = stencil else {
+            panic!("a download");
+        };
+        assert_eq!(
+            regions[0].image_subresource.aspect_mask,
+            vk::ImageAspectFlags::STENCIL
+        );
+        assert_eq!(
+            regions[0].buffer_row_length, 32,
+            "32 bytes of one-byte stencil"
+        );
+    }
+
+    /// The option word's own refusals reach the guest under the name the layer
+    /// that owns the tag gave them, and a plane the format does not have is
+    /// refused rather than silently widened.
+    #[test]
+    fn an_option_word_this_device_cannot_read_refuses_by_its_owners_name() {
+        let residency = populated();
+        let download = |options: u32| {
+            plan(
+                &BlitOp::TextureToBuffer {
+                    source: point(IMAGE_A, 0, 0),
+                    size: size(8, 8),
+                    dest: id(BUFFER_A),
+                    dest_offset: 0,
+                    dest_pitch: ImagePitch {
+                        bytes_per_row: 0,
+                        bytes_per_image: 0,
+                    },
+                    options: BlitOptions(options),
+                },
+                &residency,
+            )
+            .expect_err("refused")
+        };
+
+        assert_eq!(
+            download(1 << 20),
+            Refusal::BlitOption {
+                refusal: OptionRefusal::UnknownBits { options: 1 << 20 }
+            }
+        );
+        assert_eq!(
+            download(MTL_BLIT_OPTION_ROW_LINEAR_PVRTC),
+            Refusal::BlitOption {
+                refusal: OptionRefusal::RowLinearPvrtc
+            }
+        );
+        assert_eq!(
+            download(
+                MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL
+                    | MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL
+            ),
+            Refusal::BlitOption {
+                refusal: OptionRefusal::ConflictingAspects
+            }
+        );
+        // `IMAGE_A` is a colour texture, which has neither plane.
+        assert_eq!(
+            download(MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL),
+            Refusal::AspectNotInFormat {
+                format: MTL_FORMAT_RGBA8_UNORM,
+                aspect: "depth",
+            }
         );
     }
 

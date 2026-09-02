@@ -64,6 +64,15 @@ pub use reims_vgpu_protocol::storage_mode;
 /// re-exported from the protocol layer.
 pub use reims_vgpu_protocol::extent;
 
+/// The `MTLBlitOption` word's closed set, and the plane it selects.
+///
+/// Re-exported rather than restated: which plane a copy addresses is a term of
+/// the wire, and an executor deciding it for itself would be a second reading
+/// of the same word. The executor sees this crate rather than the protocol
+/// one, and the semantic model names the option in [`crate::blit`] without
+/// interpreting it.
+pub use reims_vgpu_protocol::blit as blit_option;
+
 /// The guest's pixel-format ordinals and what each one is made of,
 /// re-exported from the protocol layer.
 ///

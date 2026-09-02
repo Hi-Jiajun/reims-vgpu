@@ -24,7 +24,77 @@
 //! about a write is worse than refusing it — the guest reads back content it
 //! believes it wrote either way, and only the refusal says so.
 
+use crate::pixel_format::BlitAspect;
 use reims_vgpu_wire::ops::blit as wire;
+
+// `MTLBlitOption`. A closed set of flag bits, which is what makes it this
+// crate's to name: the first layer allowed to assign meaning to a wire tag.
+pub const MTL_BLIT_OPTION_NONE: u32 = 0;
+pub const MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL: u32 = 1 << 0;
+pub const MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL: u32 = 1 << 1;
+pub const MTL_BLIT_OPTION_ROW_LINEAR_PVRTC: u32 = 1 << 2;
+/// Every bit the option word defines. A word outside it is not an option this
+/// device declined to implement; it is a word this device cannot read.
+pub const MTL_BLIT_OPTION_KNOWN_MASK: u32 = MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL
+    | MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL
+    | MTL_BLIT_OPTION_ROW_LINEAR_PVRTC;
+
+/// Why an option word names no plane this device can copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptionRefusal {
+    /// A bit outside the defined set. Unknown stays unknown: a word this
+    /// device cannot read is not a word it may ignore, because the bit it
+    /// cannot read may be the one that says which bytes the guest meant.
+    UnknownBits { options: u32 },
+    /// `MTLBlitOptionRowLinearPVRTC`. The row-linear layout of a compressed
+    /// PVRTC surface is a different addressing rule for the same bytes, and
+    /// this device has no PVRTC path to apply it to.
+    RowLinearPvrtc,
+    /// Both plane bits at once. A copy addresses one plane or the whole texel,
+    /// and "the depth plane and the stencil plane, interleaved how" is not a
+    /// term the wire establishes.
+    ConflictingAspects,
+}
+
+impl OptionRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::UnknownBits { .. } => "blit_options_unknown_bits",
+            Self::RowLinearPvrtc => "blit_options_row_linear_pvrtc",
+            Self::ConflictingAspects => "blit_options_conflicting_aspects",
+        }
+    }
+}
+
+/// The plane a blit's `MTLBlitOption` word selects.
+///
+/// Zero selects the whole texel, which for every format but the two combined
+/// depth-stencil ones is the only plane there is.
+///
+/// # Errors
+///
+/// [`OptionRefusal`] for a word this device cannot read as a plane selection.
+pub fn select_aspect(options: u32) -> Result<BlitAspect, OptionRefusal> {
+    if options == MTL_BLIT_OPTION_NONE {
+        return Ok(BlitAspect::Full);
+    }
+    if options & !MTL_BLIT_OPTION_KNOWN_MASK != 0 {
+        return Err(OptionRefusal::UnknownBits { options });
+    }
+    if options & MTL_BLIT_OPTION_ROW_LINEAR_PVRTC != 0 {
+        return Err(OptionRefusal::RowLinearPvrtc);
+    }
+    match (
+        options & MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL != 0,
+        options & MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL != 0,
+    ) {
+        (true, false) => Ok(BlitAspect::Depth),
+        (false, true) => Ok(BlitAspect::Stencil),
+        (false, false) => Ok(BlitAspect::Full),
+        (true, true) => Err(OptionRefusal::ConflictingAspects),
+    }
+}
 
 /// The transfer an opcode names.
 ///
