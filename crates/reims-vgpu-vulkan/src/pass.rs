@@ -175,6 +175,19 @@ pub enum Refusal {
     /// the other side. `field` is the one the two slots differ on, so a report
     /// says whether the guest asked for two subresources or two resolves.
     DepthStencilDisagree { field: &'static str },
+    /// The depth slot clears to a value no depth buffer can hold.
+    ///
+    /// `VkClearDepthStencilValue::depth` is an `f32` and Vulkan requires it in
+    /// `[0, 1]`; a NaN or an infinity is neither, and it is what every
+    /// fragment's depth test in the pass is then against. The colour side
+    /// cannot reach this --- a colour clear is read through its format, and
+    /// every member of `VkClearColorValue` is a value conversion that
+    /// saturates. A depth clear is one number and this is its only door.
+    ///
+    /// The *range* is deliberately not narrowed here, for the reason
+    /// [`crate::raster::viewport`] gives about a depth range: both models use
+    /// `[0, 1]` and refusing on the boundary would lose passes that work.
+    NonFiniteDepthClear { value: u64 },
     /// The render-target extent does not fit the 32-bit fields a pass carries.
     ExtentTooLarge { axis: &'static str, value: u64 },
     /// The render target has no extent at all.
@@ -189,6 +202,7 @@ impl Refusal {
             Self::SplitDepthStencil { .. } => "vk_pass_split_depth_stencil",
             Self::ResolveWithoutTarget { .. } => "vk_pass_resolve_without_target",
             Self::DepthStencilDisagree { .. } => "vk_pass_depth_stencil_disagree",
+            Self::NonFiniteDepthClear { .. } => "vk_pass_non_finite_depth_clear",
             Self::ExtentTooLarge { .. } => "vk_pass_extent_too_large",
             Self::ZeroExtent { .. } => "vk_pass_zero_extent",
         }
@@ -219,6 +233,9 @@ impl std::fmt::Display for Refusal {
             }
             Self::DepthStencilDisagree { field } => {
                 write!(f, "{} field={field}", self.slug())
+            }
+            Self::NonFiniteDepthClear { value } => {
+                write!(f, "{} value={value:#x}", self.slug())
             }
             Self::ExtentTooLarge { axis, value } => {
                 write!(f, "{} axis={axis} value={value}", self.slug())
@@ -488,6 +505,28 @@ fn depth_stencil_of(descriptor: &PassDescriptor) -> Result<Option<DepthStencilPl
         }
     }
 
+    // Read only where the load action clears, which is the rule the colour side
+    // already states: the clear bits a `LOAD` attachment still carries are not
+    // a clear, and carrying them onward would put a value the pass never uses
+    // into a `VkClearValue` --- where, on the depth side, it can be a NaN.
+    let clear_depth = if descriptor.depth.load == LoadAction::Clear {
+        let value = descriptor.depth.clear_depth().unwrap_or(0.0);
+        let narrowed = value as f32;
+        if !narrowed.is_finite() {
+            return Err(Refusal::NonFiniteDepthClear {
+                value: value.to_bits(),
+            });
+        }
+        narrowed
+    } else {
+        0.0
+    };
+    let clear_stencil = if descriptor.stencil.load == LoadAction::Clear {
+        descriptor.stencil.clear_stencil().unwrap_or(0)
+    } else {
+        0
+    };
+
     Ok(Some(DepthStencilPlan {
         texture,
         level: u32::from(carrier.level),
@@ -502,8 +541,8 @@ fn depth_stencil_of(descriptor: &PassDescriptor) -> Result<Option<DepthStencilPl
         }),
         // Depth clears are `[0, 1]` in both models, so this is a narrowing and
         // not a mapping. The stencil clear is the guest's low word.
-        clear_depth: descriptor.depth.clear_depth().unwrap_or(0.0) as f32,
-        clear_stencil: descriptor.stencil.clear_stencil().unwrap_or(0),
+        clear_depth,
+        clear_stencil,
         resolve: resolve_of(carrier)?,
     }))
 }
@@ -759,7 +798,55 @@ mod tests {
             })
         );
         assert!((ds.clear_depth - 0.5).abs() < f32::EPSILON);
-        assert_eq!(ds.clear_stencil, 7);
+        // The stencil slot does not clear, so the bits it still carries are
+        // not a clear --- the same rule the colour side states, and the reason
+        // a `LOAD` attachment cannot carry a value the pass never uses into a
+        // `VkClearValue`.
+        assert_eq!(ds.clear_stencil, 0);
+    }
+
+    /// The stencil clear is the guest's low word, asserted where the slot
+    /// actually clears.
+    #[test]
+    fn a_clearing_stencil_slot_takes_the_low_word_of_its_bits() {
+        let mut descriptor = empty();
+        descriptor.stencil.texture = Some(id(9));
+        descriptor.stencil.load = LoadAction::Clear;
+        descriptor.stencil.store = StoreAction::Store;
+        descriptor.stencil.clear_bits = [0x1_0000_0007, 0, 0, 0];
+        let plan = plan(&descriptor, |_| MTL_FORMAT_DEPTH32_FLOAT).expect("plannable");
+        assert_eq!(
+            plan.depth_stencil.expect("attached").clear_stencil,
+            7,
+            "the low word, not the whole 64-bit value"
+        );
+    }
+
+    /// A depth clear that is not a number reaches `VkClearDepthStencilValue`
+    /// as one, and every fragment's depth test in the pass is against it.
+    #[test]
+    fn a_depth_clear_that_is_not_a_number_refuses() {
+        for bits in [
+            f64::NAN.to_bits(),
+            f64::INFINITY.to_bits(),
+            1.0e300f64.to_bits(),
+        ] {
+            let mut descriptor = empty();
+            descriptor.depth.texture = Some(id(9));
+            descriptor.depth.load = LoadAction::Clear;
+            descriptor.depth.clear_bits = [bits, 0, 0, 0];
+            assert_eq!(
+                plan(&descriptor, |_| MTL_FORMAT_DEPTH32_FLOAT).err(),
+                Some(Refusal::NonFiniteDepthClear { value: bits }),
+                "{bits:#x}"
+            );
+
+            // The same bits on a slot that does not clear are not a clear at
+            // all, so there is nothing to refuse.
+            descriptor.depth.load = LoadAction::Load;
+            let planned = plan(&descriptor, |_| MTL_FORMAT_DEPTH32_FLOAT).expect("plannable");
+            assert_eq!(planned.depth_stencil.expect("attached").clear_depth, 0.0);
+        }
     }
 
     #[test]
@@ -889,6 +976,7 @@ mod tests {
                 height: 0,
             },
             Refusal::DepthStencilDisagree { field: "level" },
+            Refusal::NonFiniteDepthClear { value: 1 },
         ];
         let slugs: BTreeSet<&str> = refusals.iter().map(|r| r.slug()).collect();
         assert_eq!(slugs.len(), refusals.len());
