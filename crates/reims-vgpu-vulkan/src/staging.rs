@@ -28,13 +28,24 @@
 //! # A flush range is rounded outward, and that is why it is computed here
 //!
 //! `vkFlushMappedMemoryRanges` requires offsets and sizes that are multiples
-//! of `nonCoherentAtomSize` (except a size reaching the end of the
-//! allocation). A caller flushing exactly its own sub-allocation would be
-//! passing an unaligned range on every host whose atom is larger than the
-//! alignment it asked for. Rounding *outward* is safe — a flush makes more
-//! writes visible than asked, never fewer — and rounding inward silently drops
-//! the edge bytes of every upload. [`Arena::flush_range`] does the rounding so
-//! no call site has to know the rule.
+//! of `nonCoherentAtomSize`, or a size reaching the end of the *allocation*.
+//! A caller flushing exactly its own sub-allocation would be passing an
+//! unaligned range on every host whose atom is larger than the alignment it
+//! asked for. Rounding *outward* is safe — a flush makes more writes visible
+//! than asked, never fewer — and rounding inward silently drops the edge bytes
+//! of every upload. [`Arena::flush_range`] does the rounding so no call site
+//! has to know the rule.
+//!
+//! The escape clause is the one this arena cannot use. "Reaching the end of
+//! the allocation" is a fact about the `VkDeviceMemory`, whose size is
+//! `VkMemoryRequirements::size` and is routinely larger than the buffer the
+//! chunk was sized from — so a range clamped to the *chunk* is neither a
+//! multiple of the atom nor the end of anything, which is invalid use with no
+//! validation message on a coherent host and a partial flush on an incoherent
+//! one. So the chunk size is required to be a multiple of the atom instead:
+//! every window lies inside a chunk, so both rounded ends are then multiples
+//! of the atom by construction, the clamp has nothing left to do, and the
+//! range is valid whatever the allocation turns out to be.
 //!
 //! # Bookkeeping without handles
 //!
@@ -195,9 +206,11 @@ impl Arena {
     /// # Panics
     ///
     /// If the three arrays disagree in length, if any is empty, if `size` is
-    /// zero, or if `atom` is not a power of two. Each is a caller that built
-    /// the arena from mismatched pieces, and every one of them produces a
-    /// pointer into the wrong allocation later.
+    /// zero or not a multiple of `atom`, or if `atom` is not a power of two.
+    /// Each is a caller that built the arena from mismatched pieces, and every
+    /// one of them produces a pointer into the wrong allocation later — or, in
+    /// the case of the chunk size, a flush range Vulkan does not accept. See
+    /// the module doc.
     #[must_use]
     pub fn adopt(
         size: u64,
@@ -218,6 +231,10 @@ impl Arena {
         assert!(
             atom.is_power_of_two(),
             "nonCoherentAtomSize is a power of two"
+        );
+        assert!(
+            size.is_multiple_of(atom),
+            "a chunk not a whole number of atoms has a tail no flush range can name"
         );
         let chunks = vec![
             Chunk {
@@ -402,16 +419,26 @@ impl Arena {
 
     /// The `(offset, size)` to flush or invalidate for a window.
     ///
-    /// Rounded outward to `nonCoherentAtomSize` and clamped to the chunk, so
-    /// the range is always one Vulkan accepts. A caller passing its own
+    /// Rounded outward to `nonCoherentAtomSize`, so both ends are multiples of
+    /// it and the range is always one Vulkan accepts. A caller passing its own
     /// offsets would be passing an unaligned range on every host whose atom is
     /// larger than the alignment it asked for, and rounding inward instead
     /// would silently drop the edge bytes of every upload.
+    ///
+    /// No clamp to the chunk. The rounded end cannot pass it: a window lies
+    /// inside its chunk and [`Self::adopt`] requires the chunk to be a whole
+    /// number of atoms, so rounding up reaches the chunk's end at the furthest.
+    /// A clamp would be the thing that *broke* the range rather than saved it —
+    /// see the module doc for why the "end of the allocation" escape clause is
+    /// not one this arena can invoke.
     #[must_use]
     pub fn flush_range(&self, window: Window) -> (u64, u64) {
         let start = window.offset & !(self.atom - 1);
         let end = window.end().next_multiple_of(self.atom);
-        let end = end.min(self.chunks[window.chunk].size);
+        debug_assert!(
+            end <= self.chunks[window.chunk].size,
+            "a window's rounded end left its chunk"
+        );
         (start, end - start)
     }
 }
@@ -593,8 +620,19 @@ mod tests {
         assert_eq!(arena.flush_range(aligned), (128, 128));
     }
 
+    /// The last window in a chunk rounds up to the chunk's end and no further,
+    /// and the range is a whole number of atoms like every other.
+    ///
+    /// The regression: the end was *clamped* to the chunk, which for a chunk
+    /// that was not a whole number of atoms produced a size that is neither a
+    /// multiple of `nonCoherentAtomSize` nor the end of the allocation ---
+    /// invalid use of `vkFlushMappedMemoryRanges`, since a chunk's
+    /// `VkDeviceMemory` is `VkMemoryRequirements::size` and is routinely
+    /// larger than the buffer. `adopt` now requires the chunk to be a whole
+    /// number of atoms, which makes the clamp unreachable and the range valid
+    /// whatever the allocation turns out to be.
     #[test]
-    fn a_flush_at_the_end_of_a_chunk_is_clamped_to_it() {
+    fn a_flush_at_the_end_of_a_chunk_reaches_it_and_stops() {
         let arena = arena(1, 64);
         let tail = Window {
             chunk: 0,
@@ -602,10 +640,23 @@ mod tests {
             size: 10,
         };
         let (offset, size) = arena.flush_range(tail);
-        // Rounding the end up would run past the allocation, which Vulkan only
-        // permits when the size reaches the end — so it is clamped there.
         assert_eq!(offset + size, CHUNK);
         assert_eq!(offset, CHUNK - 64);
+        assert_eq!(size % 64, 0, "and it is a whole number of atoms");
+    }
+
+    /// A chunk with a tail no flush range can name is refused at adoption
+    /// rather than producing one later.
+    #[test]
+    #[should_panic(expected = "whole number of atoms")]
+    fn a_chunk_that_is_not_a_whole_number_of_atoms_is_refused() {
+        let _ = Arena::adopt(
+            1000,
+            64,
+            vec![vk::Buffer::from_raw(1)],
+            vec![vk::DeviceMemory::from_raw(1)],
+            vec![ptr::null_mut()],
+        );
     }
 
     #[test]
