@@ -2755,10 +2755,22 @@ pub enum HeapReference {
 /// That is a modelling gap and not a decode failure — the placement executes,
 /// and correctly, as long as nothing aliases. Reported on the always-on channel
 /// because a guest that does alias gets a wrong surface with no refusal
-/// anywhere, and because the reading here is the one thing that would close it:
-/// a canonical identity for a heap needs some value to be canonical *about*,
-/// and whether this reference names a decodable object is what says whether
-/// such a value is already on the wire.
+/// anywhere, and because the reading here is what closes it.
+///
+/// # The claim this tests, and which reading falsifies it
+///
+/// The claim is that a heap is an ordinary object-list object: the reference
+/// arrives in the same `u32` form as the resource's own, immediately after it
+/// in the same record, and [`RESOURCE_CONSTRUCTOR_TYPE_MASK`] already accepts
+/// heap object tags. If that holds, a heap's canonical identity is the same
+/// address-named identity every other object-list object has, and what is left
+/// to recover is only the heap's *extent* — the length a placement is bounded
+/// by, which the descriptor at this slot would declare.
+///
+/// [`HeapReference::Unlisted`] is the reading that falsifies it: the heap is
+/// then named somewhere this device does not look, and both halves are open
+/// again. [`HeapReference::Listed`] confirms it and hands over the two values
+/// that say where the extent is — which tag, and how many descriptor bytes.
 ///
 /// One 12-byte guest read per distinct shape. `first_sight` is keyed on the
 /// answer rather than on the reference, so a boot placing ten thousand textures
@@ -2786,17 +2798,25 @@ pub fn note_heap_reference<M: HostMemory>(
     if !crate::observe::first_sight("heap_reference", shape) {
         return found;
     }
-    let names = match found {
-        HeapReference::Unlisted => "nothing".to_string(),
+    let (names, verdict) = match found {
+        HeapReference::Unlisted => (
+            "nothing".to_string(),
+            "a heap is not an object-list object after all, so its identity is open again",
+        ),
         HeapReference::Listed {
             object_type,
             descriptor_length,
-        } => format!("type={object_type} desc_len={descriptor_length}"),
+        } => (
+            format!("type={object_type} desc_len={descriptor_length}"),
+            "a heap is an object-list object, so it takes the address-named identity; \
+             read the extent out of this descriptor",
+        ),
     };
     crate::observe::fail(format!(
         "heap_reference_unresolved task={task_id} heap={heap_ref} names={names} \
          (the placement becomes host-only storage keyed by the texture's own name, \
-         so two placements sharing bytes in this heap are two independent images)"
+         so two placements sharing bytes in this heap are two independent images; \
+         {verdict})"
     ));
     found
 }

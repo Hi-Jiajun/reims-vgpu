@@ -123,15 +123,32 @@ use crate::identity::{ChannelId, ResourceId};
 ///
 /// [`Claim`]: crate::namespace::Claim
 ///
-/// ## Open: heap identity
+/// ## Open: a heap's extent — but not, any longer, its identity
 ///
-/// [`crate::heap`] requires a placement to take its heap's id and a byte range,
-/// because two windows the guest chose to overlap are the same bytes. A
-/// heap-placed texture names a heap reference and an offset, and the device
-/// keeps neither: there is no heap object, no heap extent, and no value that
-/// could be a heap's canonical identity. That is a decode-and-model gap rather
-/// than a wiring one, and nothing above it can be right until it is closed —
-/// two placements in one heap must not come out distinct.
+/// [`crate::heap`] takes a placement as its heap's [`BackingId`] and a byte
+/// range, because two windows the guest chose to overlap are the same bytes.
+/// A heap-placed texture names a heap reference and an offset, and neither had
+/// anything behind it. The identity half is no longer the hard part: a heap
+/// reference is a reference in the packet's own task, in the same object list
+/// every other reference in that record resolves through — the record puts it
+/// in the same `u32` form immediately after the resource's own — and the
+/// device's resource constructor already accepts heap object tags. So a heap
+/// is an object-list object, and an object-list object's canonical identity is
+/// the address-named form the join above settles: the same window, the same
+/// per-reference incarnation.
+///
+/// That claim is under test rather than asserted. The device probes what the
+/// reference names on the always-on failure channel, and a reading of *nothing
+/// listed* is what would falsify it — the reading is the point of the
+/// instrument, and no driven boot has produced one yet because none placed a
+/// heap texture.
+///
+/// What is still missing is the heap's **extent**, which [`crate::heap`] wants
+/// as a length and no packet has yet been shown to carry. Until it is
+/// recovered, a placement cannot be bounded, and an unbounded heap cannot say
+/// which two offsets overlap — so two placements in one heap would still come
+/// out distinct. That is the whole of what remains, and it is a decode question
+/// with a named place to look: the descriptor at the slot the reference names.
 ///
 /// ## Not this
 ///
