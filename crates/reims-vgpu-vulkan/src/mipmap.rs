@@ -42,8 +42,8 @@
 //!
 //! # One level is a refusal, not a no-op
 //!
-//! `generateMipmapsForTexture:` on a texture whose `mipmapLevelCount` is one
-//! is rejected by the reference implementation — it is not a call that quietly
+//! `generateMipmapsForTexture:` requires a `mipmapLevelCount` greater than one
+//! and fails on a texture that declares one — it is not a call that quietly
 //! does nothing. So an empty plan is the wrong answer twice over: it hides a
 //! command the guest's own hardware would have failed, and it drops decoded
 //! guest work off the failure channel entirely, leaving a guest whose upper
