@@ -164,6 +164,28 @@ pub enum Refusal {
     /// A pass with no colour attachment and no depth-stencil attachment.
     /// Nothing to write to.
     NoAttachment,
+    /// One vertex buffer binding number declared twice.
+    ///
+    /// `VkPipelineVertexInputStateCreateInfo`'s binding descriptions must each
+    /// name a distinct binding
+    /// (VUID-VkPipelineVertexInputStateCreateInfo-pVertexBindingDescriptions-00616).
+    /// The two carry a stride and an input rate, so a duplicate is two
+    /// different answers for how one buffer is walked and there is no rule
+    /// saying which wins.
+    DuplicateVertexBinding { binding: u32 },
+    /// One vertex attribute location declared twice.
+    ///
+    /// Attribute descriptions must each name a distinct location
+    /// (VUID-VkPipelineVertexInputStateCreateInfo-pVertexAttributeDescriptions-00617).
+    /// A duplicate is two formats and two offsets feeding one shader input.
+    DuplicateVertexLocation { location: u32 },
+    /// An attribute reading from a binding the pipeline does not declare.
+    ///
+    /// Every attribute's `binding` must be one of the binding descriptions
+    /// (VUID-VkPipelineVertexInputStateCreateInfo-binding-00615). Without one
+    /// there is no buffer, no stride and no input rate for it to be fetched
+    /// through, so the attribute names a walk of nothing.
+    AttributeWithoutBinding { location: u32, binding: u32 },
 }
 
 impl Refusal {
@@ -172,6 +194,9 @@ impl Refusal {
         match self {
             Self::NoVertexStage => "vk_pipeline_no_vertex_stage",
             Self::DuplicateStage { .. } => "vk_pipeline_duplicate_stage",
+            Self::DuplicateVertexBinding { .. } => "vk_pipeline_duplicate_vertex_binding",
+            Self::DuplicateVertexLocation { .. } => "vk_pipeline_duplicate_vertex_location",
+            Self::AttributeWithoutBinding { .. } => "vk_pipeline_attribute_without_binding",
             Self::BlendAttachmentCount { .. } => "vk_pipeline_blend_attachment_count",
             Self::DepthStateWithoutAttachment => "vk_pipeline_depth_state_without_attachment",
             Self::AttachmentWithoutDepthState => "vk_pipeline_attachment_without_depth_state",
@@ -186,6 +211,15 @@ impl std::fmt::Display for Refusal {
         match *self {
             Self::DuplicateStage { stage } => {
                 write!(f, "{} stage={:#x}", self.slug(), stage.as_raw())
+            }
+            Self::DuplicateVertexBinding { binding } => {
+                write!(f, "{} binding={binding}", self.slug())
+            }
+            Self::DuplicateVertexLocation { location } => {
+                write!(f, "{} location={location}", self.slug())
+            }
+            Self::AttributeWithoutBinding { location, binding } => {
+                write!(f, "{} location={location} binding={binding}", self.slug())
             }
             Self::BlendAttachmentCount { blend, color } => {
                 write!(f, "{} blend={blend} color={color}", self.slug())
@@ -264,6 +298,37 @@ pub fn build(key: GraphicsKey) -> Result<Build, Refusal> {
     for (index, stage) in key.stages.iter().enumerate() {
         if key.stages[..index].iter().any(|s| s.stage == stage.stage) {
             return Err(Refusal::DuplicateStage { stage: stage.stage });
+        }
+    }
+    // The same three questions the stage loop above asks, for the vertex
+    // input. Each is a Vulkan requirement on the two description arrays and
+    // none of them is a property of a single description, so this is the only
+    // place they can be asked --- `crate::vertex` plans one binding and one
+    // attribute at a time and never sees the set.
+    for (index, binding) in key.bindings.iter().enumerate() {
+        if key.bindings[..index]
+            .iter()
+            .any(|b| b.binding == binding.binding)
+        {
+            return Err(Refusal::DuplicateVertexBinding {
+                binding: binding.binding,
+            });
+        }
+    }
+    for (index, attribute) in key.attributes.iter().enumerate() {
+        if key.attributes[..index]
+            .iter()
+            .any(|a| a.location == attribute.location)
+        {
+            return Err(Refusal::DuplicateVertexLocation {
+                location: attribute.location,
+            });
+        }
+        if !key.bindings.iter().any(|b| b.binding == attribute.binding) {
+            return Err(Refusal::AttributeWithoutBinding {
+                location: attribute.location,
+                binding: attribute.binding,
+            });
         }
     }
     if key.blend.len() != key.compatibility.color.len() {
@@ -803,6 +868,83 @@ mod tests {
         )
         .expect("the defaults need no feature")
         .state
+    }
+
+    /// The failure this exists to prevent: three Vulkan requirements on the
+    /// two vertex-input description arrays, none of which is a property of a
+    /// single description — so `crate::vertex`, which plans one binding and
+    /// one attribute at a time, cannot ask any of them. `build` asked the same
+    /// three questions about the *stages* and none about the vertex input.
+    #[test]
+    fn a_vertex_input_that_vulkan_forbids_refuses_by_name() {
+        let base = key();
+        let binding = |n: u32| vertex::BindingPlan {
+            binding: n,
+            stride: 16,
+            input_rate: vk::VertexInputRate::VERTEX,
+            divisor: 1,
+        };
+        let attribute = |location: u32, binding: u32| vertex::AttributePlan {
+            location,
+            binding,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: 0,
+            widened_from: None,
+        };
+
+        // Two bindings that carry different strides under one number: two
+        // answers for how one buffer is walked.
+        assert_eq!(
+            build(GraphicsKey {
+                bindings: vec![binding(0), binding(0)],
+                ..base.clone()
+            })
+            .expect_err("one binding number twice"),
+            Refusal::DuplicateVertexBinding { binding: 0 }
+        );
+
+        // Two attributes feeding one shader input.
+        assert_eq!(
+            build(GraphicsKey {
+                bindings: vec![binding(0), binding(1)],
+                attributes: vec![attribute(3, 0), attribute(3, 1)],
+                ..base.clone()
+            })
+            .expect_err("one location twice"),
+            Refusal::DuplicateVertexLocation { location: 3 }
+        );
+
+        // An attribute fetched through a binding that does not exist, so it
+        // has no buffer, no stride and no input rate.
+        assert_eq!(
+            build(GraphicsKey {
+                bindings: vec![binding(0)],
+                attributes: vec![attribute(0, 0), attribute(1, 7)],
+                ..base.clone()
+            })
+            .expect_err("no binding seven"),
+            Refusal::AttributeWithoutBinding {
+                location: 1,
+                binding: 7,
+            }
+        );
+
+        // And the shapes that are legal: distinct numbers on both arrays,
+        // several attributes sharing one binding — which is how an interleaved
+        // vertex is fed — and no vertex input at all, which is what a shader
+        // generating its own positions declares.
+        assert!(build(GraphicsKey {
+            bindings: vec![binding(0), binding(2)],
+            attributes: vec![attribute(0, 0), attribute(1, 0), attribute(2, 2)],
+            ..base.clone()
+        })
+        .is_ok());
+        assert!(build(GraphicsKey {
+            bindings: Vec::new(),
+            attributes: Vec::new(),
+            ..base
+        })
+        .is_ok());
     }
 
     /// One colour attachment, no depth, one vertex and one fragment stage.
