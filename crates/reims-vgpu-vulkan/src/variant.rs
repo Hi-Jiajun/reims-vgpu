@@ -150,6 +150,16 @@ impl<V> std::ops::Deref for Variant<V> {
 pub enum Readiness<V, R> {
     /// Nobody has asked for this key yet. The caller may take a flight.
     Absent,
+    /// The family's semantic generation has ended and this key was never
+    /// compiled, so no flight will ever be granted for it.
+    ///
+    /// Distinct from [`Self::Absent`] because the two lead a caller to
+    /// opposite actions and [`VariantFamily::begin_flight`] cannot tell them
+    /// apart: its `None` means "somebody else is on it" for a key that is
+    /// already an entry and "never" for a retired family, and a caller reading
+    /// `Absent`, taking no flight and then waiting for readiness waits for a
+    /// compile that nothing will start.
+    Retired,
     /// A flight is outstanding. The caller waits; it does not start a second.
     Compiling,
     Ready(Variant<V>),
@@ -161,6 +171,7 @@ impl<V, R: Clone> Clone for Readiness<V, R> {
     fn clone(&self) -> Self {
         match self {
             Self::Absent => Self::Absent,
+            Self::Retired => Self::Retired,
             Self::Compiling => Self::Compiling,
             Self::Ready(v) => Self::Ready(v.clone()),
             Self::Refused(r) => Self::Refused(r.clone()),
@@ -171,7 +182,9 @@ impl<V, R: Clone> Clone for Readiness<V, R> {
 impl<V, R: PartialEq> PartialEq for Readiness<V, R> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Absent, Self::Absent) | (Self::Compiling, Self::Compiling) => true,
+            (Self::Absent, Self::Absent)
+            | (Self::Retired, Self::Retired)
+            | (Self::Compiling, Self::Compiling) => true,
             (Self::Ready(a), Self::Ready(b)) => a == b,
             (Self::Refused(a), Self::Refused(b)) => a == b,
             _ => false,
@@ -189,9 +202,9 @@ impl<V, R> Readiness<V, R> {
 
     /// Whether a caller should take a flight for this key.
     ///
-    /// Only `Absent`. `Compiling` is somebody else's flight, and `Refused` is
+    /// Only `Absent`. `Compiling` is somebody else's flight, `Refused` is
     /// terminal — a retry there is the per-frame refusal storm the module doc
-    /// describes.
+    /// describes — and `Retired` is terminal for the whole family.
     #[must_use]
     pub const fn wants_a_flight(&self) -> bool {
         matches!(self, Self::Absent)
@@ -329,9 +342,19 @@ impl<K: Eq + Hash + Clone + Debug, V, R: Clone> VariantFamily<K, V, R> {
     }
 
     /// Ask about a key without changing anything.
+    ///
+    /// A key with no entry in a retired family answers [`Readiness::Retired`]
+    /// and not [`Readiness::Absent`]: `Absent` invites a flight, and
+    /// [`Self::begin_flight`] refuses every one a retired family is asked for,
+    /// so the caller that followed the protocol would wait on a compile
+    /// nothing was ever going to start. Entries the family already holds
+    /// answer for themselves — a variant somebody compiled before the
+    /// retirement is still the reason a recorded command buffer is safe, and a
+    /// refusal's reason still has to reach whoever reads it.
     #[must_use]
     pub fn peek(&self, key: &K) -> Readiness<V, R> {
         match self.entries.get(key) {
+            None if self.retired => Readiness::Retired,
             None => Readiness::Absent,
             Some(Entry::Compiling) => Readiness::Compiling,
             Some(Entry::Ready(inner)) => Readiness::Ready(Variant {
@@ -351,7 +374,7 @@ impl<K: Eq + Hash + Clone + Debug, V, R: Clone> VariantFamily<K, V, R> {
             Readiness::Ready(_) => self.census.hits += 1,
             Readiness::Compiling => self.census.joined += 1,
             Readiness::Absent => self.census.misses += 1,
-            Readiness::Refused(_) => {}
+            Readiness::Refused(_) | Readiness::Retired => {}
         }
         answer
     }
@@ -412,9 +435,10 @@ impl<K: Eq + Hash + Clone + Debug, V, R: Clone> VariantFamily<K, V, R> {
 
     /// The family's semantic generation has ended.
     ///
-    /// No further flight may start and no further variant may be acquired, but
-    /// nothing is destroyed: work already recorded against these variants is
-    /// still going to run, and [`Variant`] holders keep theirs alive. Call
+    /// No further flight may start, and a key the family never compiled
+    /// answers [`Readiness::Retired`] rather than inviting one. Nothing is
+    /// destroyed: work already recorded against these variants is still going
+    /// to run, and [`Variant`] holders keep theirs alive. Call
     /// [`Self::collect`] once the timeline says that work is retired.
     pub fn retire(&mut self) {
         self.retired = true;
@@ -609,6 +633,56 @@ mod tests {
         assert_eq!(freed, vec![Native(42)]);
         assert_eq!(family.outstanding(), 0);
         assert!(family.is_empty());
+    }
+
+    /// The livelock this variant exists to prevent. `Absent` tells a caller to
+    /// take a flight; a retired family grants none. A caller following the
+    /// module's own protocol — read readiness, take a flight if it wants one,
+    /// otherwise wait — would have waited on a compile nothing was ever going
+    /// to start, because `begin_flight`'s single `None` says "somebody else is
+    /// on it" and "never" with the same value.
+    #[test]
+    fn a_key_a_retired_family_never_compiled_says_so_instead_of_inviting_a_flight() {
+        let mut family = Family::new();
+        assert_eq!(family.peek(&7), Readiness::Absent);
+        assert!(family.peek(&7).wants_a_flight());
+
+        family.retire();
+
+        assert_eq!(family.peek(&7), Readiness::Retired);
+        assert!(!family.peek(&7).wants_a_flight());
+        assert!(!family.peek(&7).is_ready());
+        assert!(
+            family.begin_flight(7).is_none(),
+            "and the answer matches what a flight would have been given"
+        );
+        // Terminal, not a miss: nothing is ever going to service it, so it is
+        // not counted as work somebody has to do.
+        assert_eq!(family.request(&7), Readiness::Retired);
+        assert_eq!(family.census().misses, 0);
+    }
+
+    /// Retirement does not erase what the family already knows. A variant
+    /// compiled before it is still why a recorded command buffer is safe, and
+    /// a refusal's reason still has to reach whoever reads the fail channel.
+    #[test]
+    fn a_retired_family_still_answers_for_the_keys_it_holds() {
+        let mut family = Family::new();
+        let ready = family.begin_flight(1).expect("first");
+        family.publish(ready, Ok(Native(5))).expect("own");
+        let refused = family.begin_flight(2).expect("first");
+        family
+            .publish(refused, Err(Refusal::NoDualSourceBlend))
+            .expect("own");
+        let outstanding = family.begin_flight(3).expect("first");
+
+        family.retire();
+
+        assert!(family.peek(&1).is_ready());
+        assert!(matches!(family.peek(&2), Readiness::Refused(_)));
+        assert_eq!(family.peek(&3), Readiness::Compiling, "the flight lands");
+        assert_eq!(family.peek(&4), Readiness::Retired, "and nothing else will");
+        drop(outstanding);
     }
 
     #[test]

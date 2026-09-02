@@ -633,6 +633,11 @@ impl Store {
         }
         match family.request(key) {
             variant::Readiness::Absent => Answer::Absent,
+            // Subsumed by the check above, which is the stronger of the two
+            // rules: this store retires a whole semantic pipeline, so a key
+            // the family *did* compile answers `Retired` here as well.
+            // Translated anyway, so the two levels cannot disagree.
+            variant::Readiness::Retired => Answer::Retired,
             variant::Readiness::Compiling => Answer::Compiling,
             variant::Readiness::Ready(native) => Answer::Ready(native),
             variant::Readiness::Refused(reason) => Answer::Refused(reason),
