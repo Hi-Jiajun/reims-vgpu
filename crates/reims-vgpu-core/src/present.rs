@@ -593,9 +593,15 @@ impl PresentStream {
             match self.take_image() {
                 Ok(ticket) => return Admission::Acquired { request, ticket },
                 Err(Refusal::NotConfigured) => return Admission::NotConfigured,
-                Err(_) => self.backpressured += 1,
+                Err(_) => {}
             }
         }
+        // Charged where the frame waits and not where the acquire failed. A
+        // present that parks *behind* a parked one never asks for an image at
+        // all, and charging only the acquire made a guest pushing a hundred
+        // frames at a two-image swapchain report one — the exact wrong answer
+        // to the question the number exists for.
+        self.backpressured += 1;
         let ahead = self.parked.len();
         self.parked.push_back(request);
         Admission::Parked { ahead }
@@ -820,11 +826,13 @@ impl PresentStream {
         self.retiring.len()
     }
 
-    /// Frames presented, frames superseded, and acquires that found no free
+    /// Frames presented, frames superseded, and frames that waited for an
     /// image.
     ///
     /// The third number is what says whether the host's returned count is the
-    /// bottleneck, which is not something a requested depth could answer.
+    /// bottleneck, which is not something a requested depth could answer — so
+    /// it counts every frame that waited, whether it waited because no image
+    /// was free or because another frame was already waiting for one.
     #[must_use]
     pub const fn census(&self) -> (usize, usize, usize) {
         (self.presented, self.superseded, self.backpressured)
@@ -872,6 +880,33 @@ mod tests {
                 form.name()
             );
         }
+    }
+
+    /// The number that says whether the returned image count is the
+    /// bottleneck counts every frame that waited.
+    ///
+    /// A present that parks behind a parked one never asks for an image, so
+    /// charging the failed acquire counted the first frame of a queue and none
+    /// of the rest — a guest pushing frames at a two-image swapchain reported
+    /// one, whatever the depth of the queue behind it.
+    #[test]
+    fn every_frame_that_waited_for_an_image_is_counted() {
+        let mut s = PresentStream::new(Order::Fifo);
+        s.configure(2, 2);
+        let mut waited = 0;
+        for n in 0..10 {
+            match s.submit(request(n)) {
+                Admission::Acquired { .. } => {}
+                Admission::Parked { .. } => waited += 1,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(waited, 8, "two images, ten frames");
+        assert_eq!(
+            s.census().2,
+            waited,
+            "and the census says so, not just about the first one"
+        );
     }
 
     /// The two swapchain doors are total between them: `configure` is the only
