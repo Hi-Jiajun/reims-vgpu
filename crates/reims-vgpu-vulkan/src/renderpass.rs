@@ -1904,9 +1904,8 @@ mod cache_tests {
                             Ok::<_, ()>(vk::RenderPass::from_raw(handles))
                         });
                         let after = cache.census();
-                        pass_hits += (after.render_pass_hits - before.render_pass_hits) as u64;
-                        pass_misses +=
-                            (after.render_pass_misses - before.render_pass_misses) as u64;
+                        pass_hits += after.render_pass_hits - before.render_pass_hits;
+                        pass_misses += after.render_pass_misses - before.render_pass_misses;
                     }
                     // Gated inside the arm rather than given a narrower
                     // range: a retirement empties the cache, and too many of
