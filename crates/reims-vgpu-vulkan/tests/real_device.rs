@@ -828,18 +828,22 @@ fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
     const TEXEL: [u8; 4] = [0x10, 0x20, 0x30, 0x40];
     let format = vk::Format::R8G8B8A8_UNORM;
 
-    // Measured, not assumed: a format that cannot be linearly filtered here
-    // must refuse rather than drop to nearest.
+    // Measured, not assumed: all three bits `vkCmdBlitImage` with a linear
+    // filter demands, read off this device for this format.
     let format_properties = unsafe {
         host.instance()
             .get_physical_device_format_properties(host.physical_device(), format)
     };
+    let features = format_properties.optimal_tiling_features;
     let support = mipmap::FilterSupport {
-        linear_blit_source: format_properties
-            .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR),
+        blit_source: features.contains(vk::FormatFeatureFlags::BLIT_SRC),
+        blit_dest: features.contains(vk::FormatFeatureFlags::BLIT_DST),
+        linear_blit_source: features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR),
     };
-    println!("linear blit source={}", support.linear_blit_source);
+    println!(
+        "blit src={} dst={} linear={}",
+        support.blit_source, support.blit_dest, support.linear_blit_source
+    );
 
     let declaration = TextureShape {
         kind: TextureKind::D2.ordinal(),
