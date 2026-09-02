@@ -26,7 +26,7 @@
 //! would make the same guest stream mean different things on two hosts.
 
 use crate::access::{BackingId, ByteRange, ContentVersion};
-use crate::coverage::{Applied, VersionCoverage};
+use crate::coverage::{Applied, Span, VersionCoverage};
 use crate::range_set::RangeSet;
 use std::collections::HashMap;
 
@@ -68,6 +68,14 @@ pub struct Transfer {
     pub to: Replica,
     /// Exactly the bytes the destination is behind on.
     pub bytes: RangeSet,
+    /// The version current in each part of `bytes` when the copy was planned —
+    /// which is to say, *what* is being copied and not only from where.
+    ///
+    /// A transfer is planned at admission and recorded at completion, and the
+    /// content can move in between. Without this the recording would mark the
+    /// destination fresh for bytes it holds an older copy of, and the next read
+    /// would find it fresh and serve them. See [`ContentLedger::record_transfer`].
+    pub at: Vec<Span>,
 }
 
 /// What has happened to one backing's content.
@@ -321,6 +329,14 @@ impl ContentLedger {
             self.census.reads_with_no_source += 1;
             return None;
         }
+        // What is being copied, taken while the answer is still the plan's.
+        // `fresh` is only ever set from bytes `canonical` covers, so every part
+        // of `movable` has a version here.
+        let at: Vec<Span> = movable
+            .ranges()
+            .iter()
+            .flat_map(|r| e.canonical.over(*r))
+            .collect();
         self.census.transfers_planned += 1;
         self.census.transfer_bytes += movable.len();
         Some(Transfer {
@@ -328,20 +344,47 @@ impl ContentLedger {
             from: source,
             to: replica,
             bytes: movable,
+            at,
         })
     }
 
     /// Record that a planned transfer has completed.
     ///
-    /// The destination becomes fresh for exactly the bytes that moved, and the
-    /// source keeps what it had: a copy does not change where content is
-    /// authoritative, only how many places hold it.
+    /// The destination becomes fresh for the bytes that moved *and are still
+    /// what the plan said they were*, and the source keeps what it had: a copy
+    /// does not change where content is authoritative, only how many places
+    /// hold it.
+    ///
+    /// # Why the version is checked here and not assumed
+    ///
+    /// A transfer is planned when a transaction is admitted and recorded when
+    /// it completes, and the guest may write the same bytes in between — that
+    /// is an ordinary sequence, not a race the device can forbid. The copy then
+    /// carried the older content, and marking the destination fresh for it
+    /// makes the next read of those bytes find a replica that is fresh by the
+    /// ledger and stale in fact, with no transfer owed and nothing to say so.
+    ///
+    /// [`Self::materialize`] already refuses a write beaten by newer content,
+    /// for the same reason and in the same words: the loser's bytes must not be
+    /// readable from anywhere. A completed copy is the other kind of completion
+    /// and was the one not asking.
+    ///
+    /// A backing this ledger has forgotten takes nothing: there are no content
+    /// facts left to update, and creating an entry for one would publish
+    /// freshness over coverage nobody declared.
     pub fn record_transfer(&mut self, transfer: &Transfer) {
-        let e = self.backings.entry(transfer.backing).or_default();
-        e.fresh
-            .entry(transfer.to)
-            .or_default()
-            .union_with(&transfer.bytes);
+        let Some(e) = self.backings.get_mut(&transfer.backing) else {
+            return;
+        };
+        let mut landed = RangeSet::new();
+        for planned in &transfer.at {
+            for now in e.canonical.over(planned.range) {
+                if now.version == planned.version {
+                    landed.insert(now.range);
+                }
+            }
+        }
+        e.fresh.entry(transfer.to).or_default().union_with(&landed);
     }
 
     /// Discard a replica's copy of some bytes without changing the content.
@@ -451,6 +494,62 @@ mod tests {
             .is_none());
         assert_eq!(c.census().transfers_planned, 1);
         assert_eq!(c.census().reads_already_fresh, 1);
+    }
+
+    /// **A copy that landed after the content moved on is not the content.**
+    ///
+    /// The plan and the recording are two moments — admission and completion —
+    /// and a guest write between them is ordinary. The copy then carried the
+    /// older bytes, so the destination must not come out of the recording fresh
+    /// for them: a replica fresh by the ledger and stale in fact owes no
+    /// transfer, and every later read of those bytes is served the old content
+    /// with nothing anywhere saying so.
+    #[test]
+    fn a_transfer_overtaken_by_a_write_does_not_make_the_destination_fresh() {
+        let mut c = ContentLedger::new();
+        c.declare(B, r(0, 256), Replica::GuestPages);
+        let t = c
+            .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
+            .expect("the device holds nothing yet");
+        assert_eq!(t.bytes.ranges(), &[r(0, 64)]);
+
+        // The guest rewrites the front half while the copy is in flight.
+        c.write(B, r(0, 32), Replica::GuestPages);
+        c.record_transfer(&t);
+
+        let again = c
+            .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
+            .expect("the front half is still owed");
+        assert_eq!(
+            again.bytes.ranges(),
+            &[r(0, 32)],
+            "exactly the bytes the copy was overtaken on, and not the ones it \
+             delivered"
+        );
+        assert!(
+            c.is_fresh(B, r(32, 32), Replica::DeviceOwned),
+            "the back half moved unchallenged and did land"
+        );
+
+        // And recording that one, unovertaken, finishes the job.
+        c.record_transfer(&again);
+        assert!(c
+            .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
+            .is_none());
+    }
+
+    /// A backing the ledger has forgotten has no content facts to update, and a
+    /// late recording must not invent one.
+    #[test]
+    fn a_transfer_recorded_after_the_backing_was_forgotten_publishes_nothing() {
+        let mut c = ContentLedger::new();
+        c.declare(B, r(0, 256), Replica::GuestPages);
+        let t = c
+            .transfer_for_read(B, r(0, 64), Replica::DeviceOwned)
+            .expect("owed");
+        c.forget(B);
+        c.record_transfer(&t);
+        assert!(!c.knows(B), "a recording is not a declaration");
     }
 
     /// And a write is what makes it owed again.
