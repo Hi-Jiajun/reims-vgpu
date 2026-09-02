@@ -199,8 +199,17 @@ impl Shadow {
     }
 
     fn declare(&mut self, backing: BackingId, extent: ByteRange, authority: Replica) {
-        // A declaration says what was there is gone: no replica holds anything
-        // of this backing, and nothing outside the new extent has content.
+        // A backing this shadow already answers for is *joined*: a second name
+        // for one backing is a claim about the bytes it names, and the bytes
+        // it does not name keep whatever they held. Written from what the
+        // guest did — a name appearing over pages another name also holds — and
+        // not from what the ledger does with it.
+        if self.written.contains_key(&backing) {
+            self.write(backing, extent, authority);
+            return;
+        }
+        // A backing nothing knows has nothing to lose: no replica holds
+        // anything of it, and nothing outside the new extent has content.
         for side in [Replica::GuestPages, Replica::DeviceOwned] {
             self.side(side).insert(backing, Held::new());
         }
@@ -343,9 +352,26 @@ fn run(seed: u64, steps: usize, counts: &mut Counts) {
         // backing's whole history away, and a generator that reset every
         // sixteenth step would only ever test shallow ones.
         match rng.below(100) {
-            0 | 1 => {
-                // Re-declare: the guest re-pointed the resource.
+            0 => {
+                // A second name over pages this backing already answers for,
+                // which joins rather than resets.
                 let extent = rng.range();
+                ledger.declare(backing, extent, replica);
+                shadow.declare(backing, extent, replica);
+                counts.declares += 1;
+                // A join *is* a write: it advances the version over the bytes
+                // it names and takes them from the other replica, which is
+                // what the census counts and what makes the cost visible.
+                writes_here += 1;
+            }
+            1 => {
+                // And the creation the clearing form is for: a backing nothing
+                // knows, which is the only way to reach it now that a known
+                // one is joined.
+                let extent = rng.range();
+                ledger.forget(backing);
+                shadow.forget(backing);
+                counts.forgets += 1;
                 ledger.declare(backing, extent, replica);
                 shadow.declare(backing, extent, replica);
                 counts.declares += 1;

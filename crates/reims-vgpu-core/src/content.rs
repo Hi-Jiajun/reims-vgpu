@@ -270,13 +270,56 @@ impl ContentLedger {
     }
 
     /// Declare that a backing's content originates in one replica and is
-    /// entirely current there.
+    /// current there over `extent`.
     ///
     /// This is creation, not a write: a resource whose pages the guest supplied
     /// starts with the guest fresh for all of it and the device owning nothing.
-    /// Calling it on a live backing resets the authority, which is what a
-    /// replace-physical does and what nothing else may do.
+    ///
+    /// # A backing this ledger already knows is joined, not reset
+    ///
+    /// Two live names for one backing is a first-class state, not a corner —
+    /// [`crate::namespace::Teardown::HeldByAnotherName`] is a whole variant
+    /// about it, and an `IOSurface` reachable from two tasks is the ordinary
+    /// case. This used to clear the coverage and overwrite the extent whenever
+    /// it was called, so the second name's creation discarded the first name's
+    /// content: a range the device had rendered into became "content nothing
+    /// has ever written", so a later read planned no transfer and found no
+    /// source, and the backing's extent shrank to the newcomer's — which is
+    /// what turns a whole-resource participation into bytes, so every
+    /// whole-backing access of the older name was then planned over a window
+    /// of itself.
+    ///
+    /// So a known backing takes the declaration as a claim about *those*
+    /// bytes: the extent grows to cover both and the named range becomes the
+    /// declaring replica's at a new version, leaving every other byte's
+    /// authority where it was. That is the same answer a placed resource's
+    /// creation already gives for the same reason — "declaring the whole
+    /// backing would discard the neighbours' content" — and the same one
+    /// [`crate::lifecycle`]'s invalidate gives for "the guest's pages are the
+    /// current content".
+    ///
+    /// The clearing form is therefore reachable only for a backing nothing
+    /// knows, where there is nothing to clear. [`Self::forget`] is the one
+    /// door that drops what a backing holds.
     pub fn declare(&mut self, backing: BackingId, extent: ByteRange, authority: Replica) {
+        if let Some(known) = self.backings.get_mut(&backing) {
+            known.extent = Some(match known.extent {
+                Some(old) => {
+                    let end = old
+                        .offset
+                        .saturating_add(old.length)
+                        .max(extent.offset.saturating_add(extent.length));
+                    let offset = old.offset.min(extent.offset);
+                    ByteRange {
+                        offset,
+                        length: end - offset,
+                    }
+                }
+                None => extent,
+            });
+            self.write(backing, extent, authority);
+            return;
+        }
         let version = self.reserve(backing);
         let e = self.backings.entry(backing).or_default();
         e.extent = Some(extent);

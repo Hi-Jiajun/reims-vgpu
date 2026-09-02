@@ -2260,6 +2260,63 @@ mod tests {
         );
     }
 
+    /// The dedicated arm's half of the same rule.
+    ///
+    /// Two live names for one backing is a first-class state — an `IOSurface`
+    /// reachable from two tasks is the ordinary case, and `Namespace::delete`
+    /// carries a whole variant for it. Creating the second one used to reset
+    /// the backing's authority: the first name's rendered bytes became content
+    /// nothing had ever written, so a read planned no transfer and found no
+    /// source, and the backing's extent shrank to the newcomer's — which is
+    /// what turns a whole-resource participation into bytes.
+    #[test]
+    fn a_second_name_for_one_backing_leaves_the_first_ones_content_alone() {
+        let mut l = Lifecycle::new();
+        apply_inert(
+            &mut l,
+            &LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+                directory: DirectoryFrame(0x1000),
+            },
+        );
+        let declare = |l: &mut Lifecycle, slot: u32, extent: ByteRange| {
+            apply_inert(
+                l,
+                &LifecycleOp::CreateResource {
+                    task: TASK,
+                    slot: ObjectListRef(slot),
+                    storage: Storage::Dedicated {
+                        backing: BackingId(10),
+                        extent,
+                    },
+                },
+            );
+        };
+        declare(&mut l, 0, range(0, 256));
+        l.record_write(TASK, name(0), 0, 256, Replica::DeviceOwned)
+            .expect("inside the resource");
+
+        // A second name over the first sixty-four bytes of the same pages.
+        declare(&mut l, 1, range(0, 64));
+
+        assert!(
+            l.content()
+                .is_fresh(BackingId(10), range(64, 192), Replica::DeviceOwned),
+            "the bytes the second name did not claim are still the device's"
+        );
+        assert!(
+            l.content()
+                .is_fresh(BackingId(10), range(0, 64), Replica::GuestPages),
+            "and the ones it did are the guest's"
+        );
+        assert_eq!(
+            l.content().extent(BackingId(10)),
+            Some(range(0, 256)),
+            "the backing is still as big as the name that declared it"
+        );
+    }
+
     /// Two resources in one heap share a backing, so creating the second must
     /// not declare the backing's authority — that would discard the first's
     /// content.
