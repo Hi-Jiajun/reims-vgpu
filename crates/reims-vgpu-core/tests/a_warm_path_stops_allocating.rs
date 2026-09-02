@@ -265,3 +265,106 @@ fn a_heap_placed_draw_does_not_allocate_per_candidate_list() {
         "{large} trips for twenty-four heap-placed accesses against {small} for six"
     );
 }
+
+/// The read a warm frame takes: a replica that already holds the bytes.
+///
+/// This is the overwhelmingly common shape once a frame's resources have been
+/// resident for a frame or two, and it is the shape the per-byte freshness
+/// representation exists to answer cheaply. Answering it by computing the owed
+/// set and finding it empty built a `RangeSet` per read; asking whether the
+/// bytes are covered asks the same question and builds nothing.
+#[test]
+fn a_read_a_replica_already_holds_allocates_nothing() {
+    use reims_vgpu_core::access::{ByteRange as Bytes, ContentVersion};
+    use reims_vgpu_core::content::{ContentLedger, Replica};
+
+    let backing = BackingId(1);
+    let whole = Bytes {
+        offset: 0,
+        length: 1 << 20,
+    };
+    let mut ledger = ContentLedger::new();
+    ledger.declare(backing, whole, Replica::GuestPages);
+    // A frame's worth of scattered device-side production, so the freshness
+    // set has real members rather than one.
+    for n in 0..64u64 {
+        ledger.write(
+            backing,
+            Bytes {
+                offset: n * 4096,
+                length: 2048,
+            },
+            Replica::DeviceOwned,
+        );
+    }
+
+    let read = Bytes {
+        offset: 8192,
+        length: 512,
+    };
+    let (answer, allocations) =
+        measure(|| ledger.transfer_for_read(backing, read, Replica::DeviceOwned));
+    assert!(answer.is_none(), "the device wrote these bytes itself");
+    assert_eq!(
+        allocations, 0,
+        "a read of bytes the replica already holds builds nothing"
+    );
+
+    // And the version query beside it, which a planner asks for the same read.
+    let (version, none) = measure(|| ledger.version_of(backing, read));
+    assert!(version.is_some());
+    assert_eq!(
+        none, 0,
+        "asking which version covers a range builds nothing"
+    );
+    assert_ne!(ledger.newest_version(backing), Some(ContentVersion(0)));
+}
+
+/// The read that does owe a transfer still says what it owes, and the cost of
+/// saying so does not scale with how fragmented the backing is.
+#[test]
+fn a_read_that_owes_a_transfer_pays_for_the_answer_and_not_for_the_search() {
+    use reims_vgpu_core::access::ByteRange as Bytes;
+    use reims_vgpu_core::content::{ContentLedger, Replica};
+
+    let backing = BackingId(2);
+    let build = |pieces: u64| {
+        let mut ledger = ContentLedger::new();
+        ledger.declare(
+            backing,
+            Bytes {
+                offset: 0,
+                length: 1 << 22,
+            },
+            Replica::GuestPages,
+        );
+        for n in 0..pieces {
+            ledger.write(
+                backing,
+                Bytes {
+                    offset: n * 4096,
+                    length: 2048,
+                },
+                Replica::DeviceOwned,
+            );
+        }
+        ledger
+    };
+
+    let read = Bytes {
+        offset: 0,
+        length: 1 << 16,
+    };
+    let mut few = build(16);
+    let mut many = build(256);
+    let (owed_few, cost_few) =
+        measure(|| few.transfer_for_read(backing, read, Replica::GuestPages));
+    let (owed_many, cost_many) =
+        measure(|| many.transfer_for_read(backing, read, Replica::GuestPages));
+    assert!(owed_few.is_some() && owed_many.is_some());
+    assert!(
+        cost_many <= cost_few + 4,
+        "{cost_many} trips over 256 pieces against {cost_few} over 16: the \
+         search is allocating per member"
+    );
+}

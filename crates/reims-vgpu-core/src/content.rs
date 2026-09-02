@@ -300,11 +300,16 @@ impl ContentLedger {
             return None;
         };
         let empty = RangeSet::new();
-        let owed = e.fresh.get(&replica).unwrap_or(&empty).missing_from(bytes);
-        if owed.is_empty() {
+        let fresh = e.fresh.get(&replica).unwrap_or(&empty);
+        // The steady-state answer, asked without building anything. A replica
+        // that already holds every byte is the common case on a warm frame,
+        // and computing the owed set only to find it empty put an allocation
+        // on the path every read takes.
+        if fresh.covers(bytes) {
             self.census.reads_already_fresh += 1;
             return None;
         }
+        let owed = fresh.missing_from(bytes);
         // Only the other replica can supply them, and only the parts it is
         // itself fresh for. Bytes neither replica holds have never been
         // written, so there is nothing to move and no version to preserve —
