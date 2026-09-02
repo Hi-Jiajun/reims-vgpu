@@ -486,6 +486,23 @@ impl<V> InFlight<V> {
     pub const fn epoch(&self) -> DeviceEpoch {
         self.held.epoch
     }
+
+    /// The device incarnation this recording belongs to is gone.
+    ///
+    /// The terminal state of a recording no timeline will ever pass. Named
+    /// rather than left to a drop: the `#[must_use]` on this type says a
+    /// dropped recording "destroys pipelines the GPU is still reading", which
+    /// is true while the device lives and is the reason a caller must not take
+    /// that route — so the case where it is *not* true needs a door of its
+    /// own, or the only way through is the one the type forbids.
+    ///
+    /// This is also where a [`Retirements::register`] refusal ends. That
+    /// refusal hands the recording back because its epoch is not the
+    /// registry's, and the reason that happens is that its own epoch is gone.
+    #[must_use = "an abandoned recording is still the caller's to take apart"]
+    pub fn abandon(self) -> Abandoned<V> {
+        Abandoned { held: self.held }
+    }
 }
 
 /// A recording whose timeline point the GPU has passed.
@@ -533,6 +550,46 @@ impl<V> Retired<V> {
     }
 }
 
+/// A recording whose device incarnation ended.
+///
+/// The other terminal state, and a different obligation from [`Retired`]:
+/// `Retired::release` proves the pools it names are the live ones before
+/// handing the pipelines back, and the pools of a lost epoch are not live —
+/// they were destroyed with the device that made them. So an abandoned
+/// recording's pipelines come back without that check and its command buffers
+/// are not touched at all, which is [`reims_vgpu_core::retire::Abandoned`]'s
+/// distinction expressed in this crate's own types.
+#[derive(Debug)]
+#[must_use = "an abandoned recording's pipelines are the caller's to release and its emissions the caller's to report"]
+pub struct Abandoned<V> {
+    held: Held<V>,
+}
+
+impl<V> Abandoned<V> {
+    #[must_use]
+    pub const fn worker(&self) -> WorkerId {
+        self.held.worker
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> DeviceEpoch {
+        self.held.epoch
+    }
+
+    /// The descriptor emissions this recording wrote, for a caller that
+    /// reports. The sets themselves went with the pool.
+    pub fn emissions(&self) -> &[SetEmission] {
+        &self.held.emissions
+    }
+
+    /// The pipelines it was keeping alive, released without the live-pool
+    /// check the epoch can no longer answer.
+    #[must_use = "the pipelines are released by dropping them, and a caller that keeps them keeps a dead epoch's leases alive"]
+    pub fn into_variants(self) -> Vec<Variant<V>> {
+        self.held.variants
+    }
+}
+
 /// The in-flight recordings of one device epoch, and the timeline readings
 /// that retire them.
 ///
@@ -570,7 +627,9 @@ impl<V> Retirements<V> {
     /// # Errors
     ///
     /// [`Mismatch::WrongEpoch`] with the recording returned intact and nothing
-    /// registered.
+    /// registered. A caller holding that recording has one lawful move —
+    /// [`InFlight::abandon`] — because the registry that would have taken it
+    /// belonged to the epoch that ended.
     pub fn register(&mut self, recording: InFlight<V>) -> Result<(), (InFlight<V>, Mismatch)> {
         if recording.held.epoch != self.epoch {
             let mismatch = Mismatch::WrongEpoch {
@@ -611,6 +670,26 @@ impl<V> Retirements<V> {
         }
         self.in_flight = still;
         retired
+    }
+
+    /// The device is gone: take every registered recording at once, whatever
+    /// the timeline says.
+    ///
+    /// No timeline is consulted, because the thing that would advance it is
+    /// what was lost — the same argument [`crate::staging::Arena::device_lost`]
+    /// makes, and the same shape. A registry that insisted on
+    /// [`Self::retire`] here would hold every recording of the lost epoch for
+    /// the life of the process, waiting for a semaphore that will never be
+    /// signalled again.
+    ///
+    /// They come back as [`Abandoned`] and not as [`Retired`]: the pools a
+    /// retirement's release checks against were destroyed with the device, so
+    /// the check cannot be made and the pipelines are released without it.
+    ///
+    /// `#[must_use]` on the method for [`Self::retire`]'s reason.
+    #[must_use = "an abandoned epoch's recordings hold pipeline leases nothing else releases"]
+    pub fn device_lost(self) -> Vec<Abandoned<V>> {
+        self.in_flight.into_iter().map(InFlight::abandon).collect()
     }
 }
 
@@ -930,6 +1009,48 @@ mod tests {
         own.register(returned)
             .unwrap_or_else(|(_, m)| panic!("{m}"));
         assert_eq!(own.outstanding(), 1);
+    }
+
+    /// The lost-device door, and the reason it is not the retirement one: no
+    /// timeline will ever pass these points, so waiting for one holds every
+    /// recording of the dead epoch for the life of the process.
+    #[test]
+    fn a_lost_epoch_hands_back_every_recording_without_asking_a_timeline() {
+        let mut pools = one_worker(4);
+        let mut retirements = Retirements::new(epoch(1));
+        for point in [5u64, 9, 40] {
+            retirements
+                .register(registered(&mut pools, point))
+                .unwrap_or_else(|(_, m)| panic!("{m}"));
+        }
+        assert!(
+            retirements.retire(TimelinePoint(4)).is_empty(),
+            "the timeline has passed none of them"
+        );
+
+        let abandoned = retirements.device_lost();
+        assert_eq!(abandoned.len(), 3, "all of them, whatever their points");
+        for one in abandoned {
+            assert_eq!(one.epoch(), epoch(1));
+            // Released without the live-pool check a retirement makes: the
+            // pools that check names went with the device.
+            let _ = one.into_variants();
+        }
+    }
+
+    /// And the refusal path terminates: a recording whose epoch is not this
+    /// registry's has one lawful move, because the registry that would have
+    /// taken it belonged to the epoch that ended.
+    #[test]
+    fn a_recording_refused_by_a_foreign_registry_can_be_abandoned() {
+        let mut pools = one_worker(4);
+        let in_flight = registered(&mut pools, 5);
+        let mut retirements = Retirements::<u64>::new(epoch(2));
+        let (returned, _) = retirements.register(in_flight).expect_err("a stale epoch");
+        let abandoned = returned.abandon();
+        assert_eq!(abandoned.epoch(), epoch(1));
+        assert!(abandoned.emissions().is_empty());
+        let _ = abandoned.into_variants();
     }
 
     #[test]
