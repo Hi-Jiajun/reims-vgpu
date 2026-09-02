@@ -1247,6 +1247,39 @@ pub fn decode_exec_resource_table(
     Ok(descs)
 }
 
+/// `CmdDisplaySetSharedStatePage`'s payload: `{u32 pipe index, u32 page PFN}`.
+///
+/// The page itself — what the device reads out of it and writes back into it —
+/// is the display layer's. This is only where the two words are.
+pub const CHILD_SHARED_STATE_INDEX: usize = 0x00;
+pub const CHILD_SHARED_STATE_PFN: usize = 0x04;
+pub const CHILD_SHARED_STATE_LEN: usize = 8;
+
+/// Which display pipe, and the page frame its shared state lives in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedStatePage {
+    pub index: u32,
+    pub pfn: u32,
+}
+
+/// Decode `CmdDisplaySetSharedStatePage` (`0x01`, on either channel).
+///
+/// # Errors
+///
+/// [`ShortPayload`] when the payload cannot hold the two words.
+pub fn decode_shared_state(payload: &[u8]) -> Result<SharedStatePage, ShortPayload> {
+    if payload.len() < CHILD_SHARED_STATE_LEN {
+        return Err(ShortPayload {
+            plen: payload.len(),
+            need: CHILD_SHARED_STATE_LEN,
+        });
+    }
+    Ok(SharedStatePage {
+        index: ld32(&payload[CHILD_SHARED_STATE_INDEX..]),
+        pfn: ld32(&payload[CHILD_SHARED_STATE_PFN..]),
+    })
+}
+
 // --- the two cursor commands' records --------------------------------------
 
 /// `CmdSetCursorGlyph`: where the sprite is, and how to read it.

@@ -353,17 +353,6 @@ fn apply_delete_object(
     );
 }
 
-fn packet_short(op: &'static str, channel: Option<u32>, have: usize, need: usize) -> bool {
-    if have >= need {
-        return false;
-    }
-    crate::observe::fail(format!(
-        "packet_short reason={op}_short site={} plen={have} need={need}",
-        packet_site(channel)
-    ));
-    true
-}
-
 /// Which FIFO a packet arrived on, for a log line.
 ///
 /// One spelling, because several opcodes are carried on **both** the root FIFO
@@ -417,16 +406,15 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
     // A short SETUP_SHARED_STATE drops display registration:
     // shared_gpa/index never latch, so the display NEVER onlines and the
     // boot wedges on a blank/console frame. The loudest of this class.
-    if packet_short(
-        "setup_shared_state",
-        channel,
-        payload.len(),
-        CHILD_SHARED_STATE_LEN,
-    ) {
-        return;
-    }
-    let index = ld32(&payload[CHILD_SHARED_STATE_INDEX..]);
-    let pfn = ld32(&payload[CHILD_SHARED_STATE_PFN..]);
+    let page = match crate::protocol::fifo::decode_shared_state(payload) {
+        Ok(page) => page,
+        Err(short) => {
+            note_short_payload("setup_shared_state", channel, &short);
+            return;
+        }
+    };
+    let index = page.index;
+    let pfn = page.pfn;
     // reinit=1 means the guest tears down + re-registers the display
     // shared page while it was already ONLINE — the AppleParavirtDisplayPipe
     // setupSharedState/teardownSharedState re-init that makes WindowServer

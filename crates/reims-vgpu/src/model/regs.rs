@@ -312,9 +312,8 @@ pub const STAMP_SLOT_LEN: u32 = 4;
 /// second header parse and no sub-packet loop. Opcode 1's entry is the display
 /// pipe's shared-state page setup, whose payload is
 /// `{u32 pipe index, u32 page PFN}` — which is byte-for-byte what
-/// [`CHILD_SHARED_STATE_INDEX`], [`CHILD_SHARED_STATE_PFN`] and
-/// [`CHILD_SHARED_STATE_LEN`] already say, decoded independently from live
-/// traffic on the child channel.
+/// `reims_vgpu_protocol::fifo::decode_shared_state` reads, recovered
+/// independently from live traffic on the child channel.
 ///
 /// So the old arm read a **display pipe index** and dispatched the root table on
 /// it. Nothing has ever sent opcode 1 on the root channel here, which is why no
@@ -716,9 +715,11 @@ pub const DEVICE_INFO_REPLY_PAIR_LEN: usize = crate::protocol::info_reply::PAIR_
 // needs the display count this device advertises, which no boot on this rig has
 // measured.
 
-pub const CHILD_SHARED_STATE_INDEX: usize = 0x00;
-pub const CHILD_SHARED_STATE_PFN: usize = 0x04;
-pub const CHILD_SHARED_STATE_LEN: usize = 8;
+// `CmdDisplaySetSharedStatePage`'s two words moved to
+// `reims_vgpu_protocol::fifo` with the rest of the payload layouts, for the
+// reason the note above gives: this file's table is opcodes and registers, and
+// a record's field offsets belong to the crate that owns layouts. What the
+// device does with the page it names is still the display layer's.
 
 pub const DISPLAY_SHARED_PENDING: u64 = 0x100;
 pub const DISPLAY_SHARED_ENABLE_MASK: u64 = 0x104;

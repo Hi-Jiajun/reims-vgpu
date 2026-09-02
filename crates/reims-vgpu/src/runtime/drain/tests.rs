@@ -1,7 +1,10 @@
 use super::*;
 
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
-use crate::protocol::fifo::{DeviceInfoForm, DEFINE_TASK_LEN, SET_OBJECT_LIST_LEN};
+use crate::protocol::fifo::{
+    DeviceInfoForm, CHILD_SHARED_STATE_INDEX, CHILD_SHARED_STATE_LEN, CHILD_SHARED_STATE_PFN,
+    DEFINE_TASK_LEN, SET_OBJECT_LIST_LEN,
+};
 
 /// The two device-info request forms these tests build, named once so a test
 /// cannot pin an offset the decoder does not read.
