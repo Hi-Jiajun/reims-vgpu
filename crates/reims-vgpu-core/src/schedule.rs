@@ -846,7 +846,8 @@ fn monotone(run: &Run) -> Result<(), Divergence> {
             | Observation::Refused { .. }
             | Observation::OperationDeclined { .. }
             | Observation::FramePresented { .. }
-            | Observation::QueryUnanswered { .. } => {}
+            | Observation::QueryUnanswered { .. }
+            | Observation::DiscardDeclined { .. } => {}
         }
     }
     Ok(())
@@ -973,6 +974,16 @@ impl Summary {
                     kind,
                     reason,
                 } => out.unanswered.push((ingress, kind, reason)),
+                // Not part of the outcome, and the variant's own doc says
+                // why: whether a spare copy existed when a discard completed
+                // is a function of which transfers had finished, so two
+                // schedules the graph permits may decline different discards
+                // and neither is wrong --- the bytes a later read returns are
+                // the same either way. Requiring them to match would be the
+                // strict-direction error the module doc warns about. It is in
+                // the trace because it is guest work the device declined, not
+                // because it is a difference in meaning.
+                Observation::DiscardDeclined { .. } => {}
             }
         }
         out

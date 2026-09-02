@@ -142,6 +142,33 @@ pub enum Observation {
         kind: crate::query::QueryKind,
         reason: crate::query::Stall,
     },
+    /// A discard the guest asked for freed nothing, because the copy it named
+    /// was the only one holding those bytes.
+    ///
+    /// The safe branch, and the reason it is nonetheless observed: it is guest
+    /// work the device declined to carry out, and this crate's rule is that
+    /// such work gets a typed reason rather than a silent return. Before this
+    /// [`crate::lifecycle::Lifecycle::complete`]'s answer was dropped at the
+    /// call site with no comment, so a device that never freed anything the
+    /// guest discarded read exactly like one that freed all of it.
+    ///
+    /// **Deliberately not part of the equivalence outcome.** Whether a spare
+    /// copy existed at the moment a discard completed is a function of which
+    /// transfers had finished, so two schedules the dependency graph permits
+    /// may legitimately decline different discards — and neither is wrong,
+    /// because [`crate::lifecycle::Lifecycle::complete`] drops bytes only
+    /// where another replica already holds them. The content a later read
+    /// returns is identical either way. Requiring the two to match would be
+    /// requiring the device to serialise work the guest left independent,
+    /// which is the strict-direction error [`crate::schedule`] warns about.
+    DiscardDeclined {
+        ingress: IngressOrdinal,
+        resource: ResourceId,
+        backing: crate::access::BackingId,
+        /// Bytes that exist in no other replica, so dropping them would have
+        /// destroyed content rather than freed a copy.
+        sole_authority_bytes: u64,
+    },
 }
 
 /// Why the interpreter would not run a transaction.
@@ -376,7 +403,20 @@ impl Interpreter {
                     // operation owes have executed by the time its completion
                     // word could be read, so the content-authority changes it
                     // deferred to that point are taken here.
-                    let _ = self.model.complete(&effects);
+                    //
+                    // The discards it offered and could not take are observed
+                    // rather than dropped. See
+                    // [`Observation::DiscardDeclined`]: the guest asked for
+                    // something the device did not do, which is a typed reason
+                    // whether or not it changes a later read.
+                    for declined in self.model.complete(&effects) {
+                        self.trace.push(Observation::DiscardDeclined {
+                            ingress: tx.identity.ingress,
+                            resource: declined.resource,
+                            backing: declined.backing,
+                            sole_authority_bytes: declined.sole_authority_bytes,
+                        });
+                    }
                 }
                 Err(reason) => self.trace.push(Observation::OperationDeclined {
                     ingress: tx.identity.ingress,
@@ -1644,6 +1684,99 @@ mod tests {
     /// performed. A reference that refused the transaction would publish no
     /// stamp where the device publishes one, and the guest would wait forever
     /// for a word that agreed with the reference.
+    /// A discard the device did not carry out reaches the trace.
+    ///
+    /// The regression: `Lifecycle::complete`'s answer --- the discards it
+    /// offered and could not take --- was dropped at the call site with
+    /// `let _ =` and no comment, so a device that freed nothing the guest
+    /// discarded produced a trace identical to one that freed all of it. It is
+    /// guest work the device declined, and this crate's rule is that such work
+    /// gets a typed reason.
+    #[test]
+    fn a_discard_the_device_could_not_take_is_observed() {
+        use crate::identity::{ObjectListRef, SlotGeneration, TaskId};
+        use crate::lifecycle::{LifecycleOp, Storage};
+
+        let task = TaskId(1);
+        let backing = BackingId(10);
+        let resource = ResourceId {
+            slot: ObjectListRef(0),
+            generation: SlotGeneration::default().next(),
+        };
+
+        let mut interp = Interpreter::new();
+        for op in [
+            LifecycleOp::DefineTask {
+                task,
+                kernel: false,
+                directory: crate::identity::DirectoryFrame(0x1000),
+            },
+            LifecycleOp::CreateResource {
+                task,
+                slot: ObjectListRef(0),
+                storage: Storage::Dedicated {
+                    backing,
+                    extent: ByteRange {
+                        offset: 0,
+                        length: 256,
+                    },
+                },
+            },
+        ] {
+            // `Effects` is `#[must_use]`; neither of these owes anything.
+            assert_eq!(
+                interp.model_mut().apply(&op).expect("resolves"),
+                crate::lifecycle::Effects::default()
+            );
+        }
+        // The device wrote the whole resource and nothing else holds a copy,
+        // so the discard below has nothing to free.
+        interp
+            .model_mut()
+            .record_write(task, resource, 0, 256, crate::content::Replica::DeviceOwned)
+            .expect("inside the resource");
+
+        let tx = DeviceTransaction {
+            identity: crate::testing::identity(1, 1),
+            stamp_waits: Vec::new(),
+            completion: None,
+            payload: crate::transaction::Payload::ResourceLifecycle(
+                crate::transaction::LifecyclePayload::new(
+                    LifecycleOp::Discard {
+                        task,
+                        resources: vec![resource],
+                    },
+                    vec![(
+                        resource,
+                        AccessIntent {
+                            domain: ChannelId(1),
+                            key: AccessKey::Whole(ResourceKey {
+                                backing,
+                                heap: None,
+                            }),
+                            mode: AccessMode::Read,
+                            api_stages: 0,
+                            input_content_version: None,
+                            output_content_version: None,
+                        },
+                    )],
+                )
+                .expect("one access for the one resource the op names"),
+            ),
+        };
+        assert_eq!(interp.run(&tx), Outcome::Ran);
+        assert_eq!(
+            interp.trace(),
+            &[Observation::DiscardDeclined {
+                ingress: tx.identity.ingress,
+                resource,
+                backing,
+                sole_authority_bytes: 256,
+            }],
+            "the guest asked to drop 256 bytes nothing else holds, and it did not happen"
+        );
+    }
+
     #[test]
     fn a_declined_operation_still_owes_its_completion_word() {
         let mut interp = Interpreter::new();
