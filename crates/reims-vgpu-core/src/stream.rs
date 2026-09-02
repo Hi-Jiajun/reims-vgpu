@@ -773,4 +773,375 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), before);
     }
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    const KINDS: [SegmentKind; 5] = [
+        SegmentKind::Render,
+        SegmentKind::Compute,
+        SegmentKind::Blit,
+        SegmentKind::Event,
+        SegmentKind::Info,
+    ];
+
+    const RAILS: [Rail; 5] = [
+        Rail::Render,
+        Rail::Compute,
+        Rail::Blit,
+        Rail::Event,
+        Rail::Info,
+    ];
+
+    /// Everything a caller of the cursor can be affected by.
+    ///
+    /// The private fields, because a refusal that moved the position counter
+    /// would be invisible from outside until the next accepted record landed
+    /// somewhere nothing expects it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct State {
+        phase: Phase,
+        pending: Option<ProtectionOptions>,
+        segment: u32,
+        record: u32,
+    }
+
+    fn state(c: &StreamCursor) -> State {
+        State {
+            phase: c.phase,
+            pending: c.pending_protection,
+            segment: c.segment,
+            record: c.record,
+        }
+    }
+
+    #[derive(Default)]
+    struct Census {
+        opened: u32,
+        continued: u32,
+        records: u32,
+        ended: u32,
+        held: u32,
+        finished: u32,
+        refusals: std::collections::BTreeMap<&'static str, u32>,
+    }
+
+    impl Census {
+        fn refusal(&mut self, refusal: StreamRefusal) {
+            *self.refusals.entry(refusal.reason()).or_insert(0) += 1;
+        }
+    }
+
+    /// **Every position is distinct and moves forward, an encoder's record
+    /// count survives its continuations, and a refusal moves nothing.**
+    ///
+    /// Not checked against a second state machine, because a second state
+    /// machine would be this one written twice and would agree with it about
+    /// everything including a mistake. What it is checked against is the
+    /// *history*: the whole list of positions the run handed out, the whole
+    /// count of records the run accepted, and a snapshot of the cursor taken
+    /// before every call.
+    ///
+    /// The refusal snapshot is the sharp one. Six of the ten refusals are
+    /// decided part-way through a call — after a kind has been read, after a
+    /// phase has been matched — and a refusal that had already moved the
+    /// segment counter or taken the pending envelope would leave the next
+    /// accepted record at a position nothing expects, with no failure anywhere
+    /// to attribute it to.
+    ///
+    /// Floors on all ten refusal reasons, so "this stream shape is unreachable"
+    /// cannot pass as "this stream shape was never tried".
+    #[test]
+    fn a_position_is_handed_out_once_and_a_refusal_hands_out_nothing() {
+        let mut census = Census::default();
+        for seed in 0..600u64 {
+            let mut rng = Rng::new(seed + 1);
+            let mut cursor = StreamCursor::new();
+            let mut positions: Vec<StreamPosition> = Vec::new();
+            // Records accepted since the current encoder opened, which a
+            // continuation must carry across a segment boundary.
+            let mut in_encoder = 0u32;
+            let mut ends = 0u32;
+            // Which encoder the driver believes is alive and whether it is
+            // inside a segment. Followed from the cursor's answers, never
+            // predicted: it steers the driver towards streams a serializer
+            // would actually write and asserts nothing.
+            let mut alive: Option<(SegmentKind, bool)> = None;
+
+            for _ in 0..20 {
+                let before = state(&cursor);
+                // A quarter of the steps are whatever, which is what keeps all
+                // ten refusals reachable; the rest follow the shape a stream
+                // has, which is what gets records past admission at all.
+                let step = if rng.below(4) == 0 {
+                    rng.below(10)
+                } else {
+                    match alive {
+                        None => {
+                            if rng.below(8) == 0 {
+                                0
+                            } else {
+                                3
+                            }
+                        }
+                        Some((_, true)) => {
+                            if rng.below(3) == 0 {
+                                8
+                            } else {
+                                6
+                            }
+                        }
+                        Some((_, false)) => 3,
+                    }
+                };
+                let refusal = match step {
+                    0 => cursor
+                        .protection_envelope(ProtectionOptions(rng.below(3) + 1))
+                        .err(),
+                    1 => {
+                        // The byte door, so an unknown segment type is driven
+                        // through the same call a real header takes.
+                        let byte = rng.below(0x30) as u8;
+                        let lifetime = SegmentLifetime {
+                            continues_previous: rng.below(3) == 0,
+                            continues_into_next: rng.below(3) == 0,
+                        };
+                        match cursor.begin(byte, lifetime) {
+                            Ok(opening) => {
+                                took(&mut census, opening, &mut in_encoder);
+                                None
+                            }
+                            Err(refusal) => Some(refusal),
+                        }
+                    }
+                    2..=4 => {
+                        // A held encoder is continued by naming its own kind;
+                        // anything else is a stream nobody writes, and the
+                        // random quarter above is where those come from.
+                        let (kind, continues_previous) = match alive {
+                            Some((held, false)) if rng.below(4) != 0 => (held, true),
+                            _ => (
+                                KINDS[rng.below(KINDS.len() as u64) as usize],
+                                rng.below(4) == 0,
+                            ),
+                        };
+                        let lifetime = SegmentLifetime {
+                            continues_previous,
+                            continues_into_next: rng.below(2) == 0,
+                        };
+                        match cursor.begin_kind(kind, lifetime) {
+                            Ok(opening) => {
+                                took(&mut census, opening, &mut in_encoder);
+                                alive = Some((kind, true));
+                                None
+                            }
+                            Err(refusal) => Some(refusal),
+                        }
+                    }
+                    5..=7 => {
+                        let rail = match alive {
+                            Some((kind, true)) if rng.below(5) != 0 => kind.rail(),
+                            _ => RAILS[rng.below(RAILS.len() as u64) as usize],
+                        };
+                        match cursor.record(rail) {
+                            Ok(at) => {
+                                census.records += 1;
+                                in_encoder += 1;
+                                // The open encoder took it, so it was open and
+                                // it was this rail's.
+                                assert_eq!(
+                                    before.phase_kind().map(SegmentKind::rail),
+                                    Some(rail),
+                                    "seed {seed}: a record was taken by the wrong encoder"
+                                );
+                                positions.push(at);
+                                None
+                            }
+                            Err(refusal) => {
+                                match refusal {
+                                    StreamRefusal::RecordOutsideEncoder => assert_eq!(
+                                        before.phase_kind(),
+                                        None,
+                                        "seed {seed}: an open encoder refused a record as if none \
+                                         were open"
+                                    ),
+                                    StreamRefusal::RailMismatch { segment, .. } => {
+                                        assert_eq!(before.phase_kind(), Some(segment));
+                                        assert_ne!(segment.rail(), rail);
+                                    }
+                                    other => panic!("seed {seed}: a record refused as {other:?}"),
+                                }
+                                Some(refusal)
+                            }
+                        }
+                    }
+                    _ => match cursor.end() {
+                        Ok(SegmentEnd::EncoderEnded { records }) => {
+                            census.ended += 1;
+                            ends += 1;
+                            alive = None;
+                            assert_eq!(
+                                records, in_encoder,
+                                "seed {seed}: the encoder's record count is not what it took"
+                            );
+                            in_encoder = 0;
+                            None
+                        }
+                        Ok(SegmentEnd::EncoderHeld { records }) => {
+                            census.held += 1;
+                            ends += 1;
+                            alive = alive.map(|(kind, _)| (kind, false));
+                            assert_eq!(
+                                records, in_encoder,
+                                "seed {seed}: a held encoder's count is not what it took"
+                            );
+                            None
+                        }
+                        Err(refusal) => Some(refusal),
+                    },
+                };
+
+                if let Some(refusal) = refusal {
+                    census.refusal(refusal);
+                    assert_eq!(
+                        state(&cursor),
+                        before,
+                        "seed {seed}: {refusal:?} moved the cursor"
+                    );
+                }
+            }
+
+            // Every position handed out is distinct and later than the one
+            // before it, over the whole run rather than per call.
+            let mut sorted = positions.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                positions.len(),
+                "seed {seed}: a position was handed out twice"
+            );
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "seed {seed}: positions went backwards"
+            );
+            // And a position's record index is its index *within its segment*,
+            // which is what makes an encoder spanning three segments give its
+            // records three distinct segment indices rather than one long
+            // count. Checked by grouping, because the property is about the
+            // grouping and not about the sequence.
+            let mut by_segment: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+            for at in &positions {
+                by_segment.entry(at.segment).or_default().push(at.record);
+            }
+            for (segment, records) in &by_segment {
+                assert_eq!(
+                    records,
+                    &(0..records.len() as u32).collect::<Vec<u32>>(),
+                    "seed {seed}: segment {segment} does not number its records from zero"
+                );
+            }
+
+            let before = state(&cursor);
+            match cursor.finish() {
+                Ok(segments) => {
+                    census.finished += 1;
+                    assert_eq!(
+                        segments, ends,
+                        "seed {seed}: the segment count is not the segments that ended"
+                    );
+                    assert_eq!(before.phase, Phase::Closed);
+                    assert_eq!(before.pending, None);
+                }
+                Err(refusal) => {
+                    census.refusal(refusal);
+                    match refusal {
+                        StreamRefusal::EncoderNeverEnded(kind) => {
+                            assert_eq!(before.phase_kind_including_held(), Some(kind));
+                        }
+                        StreamRefusal::ProtectionEnvelopeUnclaimed => {
+                            assert!(before.pending.is_some());
+                            assert_eq!(before.phase, Phase::Closed);
+                        }
+                        other => panic!("seed {seed}: finish refused as {other:?}"),
+                    }
+                }
+            }
+        }
+
+        assert!(census.opened > 1000, "{}", census.opened);
+        assert!(census.continued > 500, "{}", census.continued);
+        assert!(census.records > 2000, "{}", census.records);
+        assert!(census.ended > 800, "{}", census.ended);
+        assert!(census.held > 800, "{}", census.held);
+        assert!(census.finished > 50, "{}", census.finished);
+
+        // Every refusal this module names, reached. A reason with no count is
+        // a stream shape the sweep never built, and a floor that only says
+        // "some refusals happened" would let nine of the ten go undriven.
+        for reason in [
+            "stream_segment_type_unknown",
+            "stream_encoder_begin_while_open",
+            "stream_continuation_without_encoder",
+            "stream_continuation_kind_mismatch",
+            "stream_continuation_not_offered",
+            "stream_record_outside_encoder",
+            "stream_record_rail_mismatch",
+            "stream_encoder_end_without_begin",
+            "stream_protection_envelope_unclaimed",
+            "stream_encoder_never_ended",
+        ] {
+            let count = census.refusals.get(reason).copied().unwrap_or(0);
+            assert!(count > 50, "{reason} was reached {count} times");
+        }
+    }
+
+    fn took(census: &mut Census, opening: SegmentOpening, in_encoder: &mut u32) {
+        match opening {
+            SegmentOpening::Opened(..) => {
+                census.opened += 1;
+                // A new encoder starts with no records, whatever the last one
+                // had.
+                *in_encoder = 0;
+            }
+            SegmentOpening::Continued(_) => census.continued += 1,
+        }
+    }
+
+    impl State {
+        /// The kind of the encoder that would take a record right now.
+        const fn phase_kind(self) -> Option<SegmentKind> {
+            match self.phase {
+                Phase::Open { kind, .. } => Some(kind),
+                Phase::Held { .. } | Phase::Closed => None,
+            }
+        }
+
+        /// The kind of the encoder that is alive, open or held.
+        const fn phase_kind_including_held(self) -> Option<SegmentKind> {
+            match self.phase {
+                Phase::Open { kind, .. } | Phase::Held { kind, .. } => Some(kind),
+                Phase::Closed => None,
+            }
+        }
+    }
 }
