@@ -70,7 +70,7 @@
 //! worse, a silently ignored piece of guest state.
 
 use ash::vk;
-use reims_vgpu_core::identity::ResourceId;
+use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
 use std::collections::HashMap;
 use std::ffi::CStr;
 
@@ -644,6 +644,11 @@ pub struct StoreCensus {
     pub variants: usize,
     /// Asked about a semantic pipeline whose family had retired.
     pub retired_lookups: u64,
+    /// Semantic pipelines this store has retired, whether or not a family for
+    /// them is still here. Bounded by the object-list slots the guest has used
+    /// — a slot's record is replaced, not appended to — which is what makes
+    /// remembering every retirement affordable.
+    pub retired: usize,
     /// Published a flight into the wrong family. Always a caller bug, and
     /// never a mutation.
     pub foreign_flights: u64,
@@ -669,9 +674,26 @@ pub struct StoreCensus {
 /// holder was the store, and the caller destroys them — a store that called
 /// `vkDestroyPipeline` itself would be destroying handles a recorded command
 /// buffer still names.
+///
+/// # The family map is not the record of what retired
+///
+/// [`Store::collect`] drops a family once there is nothing left in it, so that
+/// a guest creating and deleting pipelines all session does not leave one
+/// entry per deletion behind. That makes the map unable to answer the question
+/// [`Answer::Retired`] exists for: an id whose family has been dropped looks
+/// exactly like an id never seen, and the two lead a caller to opposite
+/// actions — one must not compile and the other must.
+///
+/// So retirement is recorded beside the map, per object-list slot, as the
+/// highest [`SlotGeneration`] whose pipeline has retired. A slot's record is
+/// replaced rather than appended to and generations are monotone within a
+/// slot, so the whole record is bounded by the slots the guest has used
+/// however many pipelines pass through them.
 #[derive(Debug, Default)]
 pub struct Store {
     families: HashMap<ResourceId, variant::VariantFamily<GraphicsKey, Native, VariantRefusal>>,
+    /// Per object-list slot, the highest generation whose pipeline retired.
+    retired: HashMap<ObjectListRef, SlotGeneration>,
     census: StoreCensus,
 }
 
@@ -690,6 +712,7 @@ impl Store {
                 .values()
                 .map(variant::VariantFamily::len)
                 .sum(),
+            retired: self.retired.len(),
             ..self.census
         }
     }
@@ -698,13 +721,15 @@ impl Store {
     ///
     /// Creates the family on first sight, which is what makes the first draw
     /// of a newly created guest pipeline a miss rather than a refusal. It does
-    /// **not** resurrect a retired one.
+    /// **not** resurrect a retired one, and asks [`Self::has_retired`] rather
+    /// than the family so that an id whose family has already been collected
+    /// answers the same way one whose family is still here does.
     pub fn request(&mut self, id: ResourceId, key: &GraphicsKey) -> Answer {
-        let family = self.families.entry(id).or_default();
-        if family.is_retired() {
+        if self.has_retired(id) {
             self.census.retired_lookups += 1;
             return Answer::Retired;
         }
+        let family = self.families.entry(id).or_default();
         match family.request(key) {
             variant::Readiness::Absent => Answer::Absent,
             // Subsumed by the check above, which is the stronger of the two
@@ -721,13 +746,19 @@ impl Store {
     /// Take the right to compile `key` under `id`.
     ///
     /// `None` where [`Answer::wants_a_flight`] would have said no, including a
-    /// retired family — a variant compiled into one nobody can acquire from is
-    /// work with no consumer.
+    /// retired pipeline — a variant compiled into a family nobody can acquire
+    /// from is work with no consumer. Retirement is asked of
+    /// [`Self::has_retired`] and not of the family, because a family that has
+    /// been collected is gone and `or_default` would hand back a fresh one
+    /// that has never retired.
     pub fn begin_flight(
         &mut self,
         id: ResourceId,
         key: GraphicsKey,
     ) -> Option<variant::Flight<GraphicsKey>> {
+        if self.has_retired(id) {
+            return None;
+        }
         self.families.entry(id).or_default().begin_flight(key)
     }
 
@@ -760,40 +791,70 @@ impl Store {
         }
     }
 
+    /// Whether this store has already retired `id`.
+    ///
+    /// The authority on the question, and deliberately not the family map. A
+    /// slot's record is the highest generation retired in it, so an id at or
+    /// below that generation has retired whether or not anything of it is
+    /// still held.
+    #[must_use]
+    pub fn has_retired(&self, id: ResourceId) -> bool {
+        self.retired
+            .get(&id.slot)
+            .is_some_and(|high| id.generation <= *high)
+    }
+
     /// The guest deleted this pipeline, or its generation closed.
     ///
     /// Nothing is destroyed: work already recorded against these variants is
-    /// still going to run. Returns whether there was a family to retire.
+    /// still going to run. Returns whether this is the first time `id` has
+    /// retired — which is not the same as whether there was a family, because
+    /// a pipeline the guest created and deleted without drawing has none and
+    /// still retires.
     pub fn retire(&mut self, id: ResourceId) -> bool {
-        match self.families.get_mut(&id) {
-            Some(family) if !family.is_retired() => {
-                family.retire();
-                true
-            }
-            _ => false,
+        let first = !self.has_retired(id);
+        let high = self.retired.entry(id.slot).or_insert(id.generation);
+        if id.generation > *high {
+            *high = id.generation;
         }
+        if let Some(family) = self.families.get_mut(&id) {
+            family.retire();
+        }
+        first
     }
 
     /// Every family, at the end of the device epoch or the session generation.
     pub fn retire_all(&mut self) {
-        for family in self.families.values_mut() {
-            family.retire();
+        let ids: Vec<ResourceId> = self.families.keys().copied().collect();
+        for id in ids {
+            self.retire(id);
         }
     }
 
     /// Take back every native nobody else is holding, from every retired
     /// family.
     ///
-    /// A family that has retired and has nothing left is dropped, so a guest
+    /// A family that has retired and is owed nothing is dropped, so a guest
     /// that creates and deletes pipelines all session does not leave one empty
-    /// family per deletion behind. A family with variants an outstanding
-    /// [`variant::Variant`] still names is kept and collected by a later call.
+    /// family per deletion behind. Dropping it loses no answer: retirement is
+    /// remembered by [`Self::has_retired`], which is why the map can forget.
+    ///
+    /// "Owed nothing" is not "empty". [`variant::VariantFamily::collect`]
+    /// deliberately keeps two kinds of entry — a refused key, which holds no
+    /// native object, and a flight taken before the retirement, which still
+    /// has to be publishable somewhere — so a family that will never hand out
+    /// another variant can hold entries forever. Asked as `is_empty`, one
+    /// refused variant pinned a deleted pipeline's family for the life of the
+    /// process, once per deletion. What has to be kept is a variant an
+    /// outstanding [`variant::Variant`] still names, and a flight not yet
+    /// published; a refusal a retired family can no longer be asked for is
+    /// neither.
     #[must_use = "the collected pipelines are handles that need destroying"]
     pub fn collect(&mut self) -> Vec<Native> {
         let mut freed = Vec::new();
         self.families.retain(|_, family| {
             freed.extend(family.collect());
-            !(family.is_retired() && family.is_empty())
+            !(family.is_retired() && family.outstanding() == 0 && family.compiling() == 0)
         });
         freed
     }
@@ -1801,8 +1862,117 @@ mod store_tests {
         assert_eq!(store.census().retired_lookups, 10);
         // Retiring twice is not a second retirement.
         assert!(!store.retire(pipeline));
-        // And a pipeline that was never there has nothing to retire.
-        assert!(!store.retire(id(99, 1)));
+        // A pipeline nothing ever drew still retires: it has no family, and
+        // the record of its retirement is what makes a later request for it
+        // `Retired` rather than an invitation to compile.
+        let undrawn = id(99, 1);
+        assert!(store.retire(undrawn));
+        assert!(!store.retire(undrawn));
+        assert!(matches!(store.request(undrawn, &key(1)), Answer::Retired));
+        assert!(store.begin_flight(undrawn, key(1)).is_none());
+    }
+
+    /// **A retirement survives the family that carried it.** `collect` drops a
+    /// family once nothing in it is owed, and the map cannot then tell an id
+    /// it has forgotten from one it has never seen. Those lead a caller to
+    /// opposite actions: `Absent` says compile, `Retired` says do not.
+    ///
+    /// Answered from the family map, the sequence below ends with the store
+    /// granting a flight to compile a `VkPipeline` for a pipeline the guest
+    /// deleted — and leaving a family for it that has never retired, so
+    /// nothing will ever drop it.
+    #[test]
+    fn a_collected_family_does_not_come_back_as_a_fresh_one() {
+        let mut store = Store::new();
+        let pipeline = id(7, 1);
+        let flight = store.begin_flight(pipeline, key(1)).expect("first");
+        store
+            .publish(pipeline, flight, Ok(native(0xAA)))
+            .expect("own");
+        assert!(store.retire(pipeline));
+
+        // Nobody holds the variant, so the collect frees it and the family has
+        // nothing left to keep.
+        assert_eq!(store.collect().len(), 1);
+        assert_eq!(store.census().families, 0, "the family was dropped");
+        assert_eq!(store.census().retired, 1, "and its retirement was not");
+
+        assert!(matches!(store.request(pipeline, &key(1)), Answer::Retired));
+        assert!(matches!(store.request(pipeline, &key(2)), Answer::Retired));
+        assert!(store.begin_flight(pipeline, key(2)).is_none());
+        assert_eq!(
+            store.census().families,
+            0,
+            "asking about a retired pipeline created a family to answer from"
+        );
+    }
+
+    /// **A refused variant must not pin its family after retirement.**
+    /// `VariantFamily::collect` keeps a refused key on purpose — it holds no
+    /// native object and its reason still has to reach a reader — but a
+    /// retired family is one this store answers `Retired` for before it ever
+    /// consults an entry, so the reason can reach nobody. Kept, it is one
+    /// permanent map entry per deleted pipeline that ever refused a variant.
+    #[test]
+    fn a_refusal_does_not_outlive_the_pipeline_that_refused_it() {
+        let mut store = Store::new();
+        for slot in 0..8 {
+            let pipeline = id(slot, 1);
+            let flight = store.begin_flight(pipeline, key(1)).expect("first");
+            store
+                .publish(
+                    pipeline,
+                    flight,
+                    Err(VariantRefusal::Composition(Refusal::NoVertexStage)),
+                )
+                .expect("own");
+            assert!(store.retire(pipeline));
+            assert!(store.collect().is_empty(), "a refusal owns no native");
+        }
+        assert_eq!(
+            store.census().families,
+            0,
+            "every deleted pipeline left its refusal behind"
+        );
+        assert_eq!(store.census().variants, 0);
+        assert_eq!(store.retiring(), 0);
+        assert_eq!(store.census().retired, 8);
+    }
+
+    /// The two entries `collect` does keep, and why each one is not the
+    /// refusal above: a variant somebody still names, and a flight that has
+    /// not landed.
+    #[test]
+    fn a_held_variant_and_an_unpublished_flight_each_keep_their_family() {
+        let mut store = Store::new();
+
+        let held = id(1, 1);
+        let flight = store.begin_flight(held, key(1)).expect("first");
+        store.publish(held, flight, Ok(native(0xAA))).expect("own");
+        let Answer::Ready(keep) = store.request(held, &key(1)) else {
+            panic!("just published")
+        };
+        assert!(store.retire(held));
+        assert!(store.collect().is_empty(), "somebody still names it");
+        assert_eq!(store.retiring(), 1);
+        drop(keep);
+        assert_eq!(store.collect().len(), 1);
+        assert_eq!(store.retiring(), 0);
+
+        let flying = id(2, 1);
+        let flight = store.begin_flight(flying, key(1)).expect("first");
+        assert!(store.retire(flying));
+        assert!(store.collect().is_empty());
+        assert_eq!(
+            store.retiring(),
+            1,
+            "the flight has nowhere else to be published"
+        );
+        store
+            .publish(flying, flight, Ok(native(0xBB)))
+            .expect("its own family, retired or not");
+        assert_eq!(store.collect().len(), 1);
+        assert_eq!(store.census().families, 0);
     }
 
     /// A refusal is terminal and is not a retirement: the family is alive, the

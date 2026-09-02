@@ -488,6 +488,22 @@ impl<K: Eq + Hash + Clone + Debug, V, R: Clone> VariantFamily<K, V, R> {
             .filter(|e| matches!(e, Entry::Ready(_)))
             .count()
     }
+
+    /// Flights taken and not yet published.
+    ///
+    /// Retirement does not end them: [`Self::begin_flight`] grants no new one,
+    /// but one already outstanding has to be publishable, and the family that
+    /// issued it is the only place its key belongs. So a retired family with
+    /// this above zero is still owed something, which is a different question
+    /// from [`Self::outstanding`] and from [`Self::is_empty`] — the entries a
+    /// [`Self::collect`] deliberately leaves behind make all three disagree.
+    #[must_use]
+    pub fn compiling(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|e| matches!(e, Entry::Compiling))
+            .count()
+    }
 }
 
 impl<K: Eq + Hash + Clone + Debug, V, R: Clone> Default for VariantFamily<K, V, R> {
