@@ -715,6 +715,21 @@ pub fn plan(guest: GuestRasterState, cell: RasterCell) -> Result<Plan, Refusal> 
 ///
 /// [`Refusal::OutOfRange`] for a dimension outside the `f32` fields Vulkan
 /// carries. The guest's are doubles.
+///
+/// # The narrowing is where the check has to be
+///
+/// Finiteness of the guest's own doubles is not the same question. A finite
+/// double past `f32::MAX` casts to an infinity rather than saturating at it,
+/// so a viewport that passes every input check can still hand a driver an
+/// infinite width --- and the bottom edge is a *sum*, so two halves that each
+/// fit can produce one that does not. Both are decided on the value that
+/// actually lands in the field.
+///
+/// The depth pair goes through the same door. `minDepth` and `maxDepth` are
+/// `f32` like the rest, and a NaN in either is a viewport a driver may hang
+/// on; they were the two of six nothing looked at. Their *range* is
+/// deliberately not narrowed here: Metal and Vulkan agree on `[0, 1]` and a
+/// guest that reverses its own range is doing something both models allow.
 pub fn viewport(guest: Viewport) -> Result<vk::Viewport, Refusal> {
     let x = f64::from_bits(guest.origin_x_bits);
     let y = f64::from_bits(guest.origin_y_bits);
@@ -722,28 +737,26 @@ pub fn viewport(guest: Viewport) -> Result<vk::Viewport, Refusal> {
     let height = f64::from_bits(guest.height_bits);
     let near = f64::from_bits(guest.z_near_bits);
     let far = f64::from_bits(guest.z_far_bits);
-    for (field, value) in [
-        ("origin_x", x),
-        ("origin_y", y),
-        ("width", width),
-        ("height", height),
-    ] {
-        if !value.is_finite() {
-            return Err(Refusal::OutOfRange {
+    let narrowed = |field: &'static str, value: f64| -> Result<f32, Refusal> {
+        let narrow = value as f32;
+        if narrow.is_finite() {
+            Ok(narrow)
+        } else {
+            Err(Refusal::OutOfRange {
                 field,
                 value: value.to_bits(),
-            });
+            })
         }
-    }
+    };
     Ok(vk::Viewport {
-        x: x as f32,
+        x: narrowed("origin_x", x)?,
         // The bottom edge, because the height below is negative and a viewport
         // is measured from its `y`.
-        y: (y + height) as f32,
-        width: width as f32,
-        height: -(height as f32),
-        min_depth: near as f32,
-        max_depth: far as f32,
+        y: narrowed("origin_y", y + height)?,
+        width: narrowed("width", width)?,
+        height: -narrowed("height", height)?,
+        min_depth: narrowed("z_near", near)?,
+        max_depth: narrowed("z_far", far)?,
     })
 }
 
@@ -962,6 +975,59 @@ mod tests {
                 Err(Refusal::OutOfRange { field: "width", .. })
             ));
         }
+    }
+
+    /// The two of six nothing looked at. A NaN depth bound reaches a driver as
+    /// a NaN, and the range is what every fragment's depth test is against.
+    #[test]
+    fn a_depth_bound_that_is_not_a_number_refuses_like_every_other_field() {
+        for (field, set) in [
+            (
+                "z_near",
+                (|v: &mut Viewport, b| v.z_near_bits = b) as fn(&mut Viewport, u64),
+            ),
+            ("z_far", |v: &mut Viewport, b| v.z_far_bits = b),
+        ] {
+            for bits in [f64::NAN.to_bits(), f64::INFINITY.to_bits()] {
+                let mut guest = guest_viewport(0.0, 0.0, 1.0, 1.0);
+                set(&mut guest, bits);
+                assert_eq!(
+                    viewport(guest).expect_err("not a number"),
+                    Refusal::OutOfRange { field, value: bits }
+                );
+            }
+        }
+    }
+
+    /// A finite double past `f32::MAX` casts to an infinity rather than
+    /// saturating, so the input being finite proves nothing about the field it
+    /// lands in --- which is what the doc claimed and the code did not check.
+    #[test]
+    fn a_finite_dimension_that_does_not_fit_an_f32_refuses_rather_than_becoming_infinite() {
+        let huge = 1.0e300_f64;
+        assert!(huge.is_finite() && !(huge as f32).is_finite());
+        let mut guest = guest_viewport(0.0, 0.0, 1.0, 1.0);
+        guest.width_bits = huge.to_bits();
+        assert_eq!(
+            viewport(guest).expect_err("infinite once narrowed"),
+            Refusal::OutOfRange {
+                field: "width",
+                value: huge.to_bits(),
+            }
+        );
+
+        // The bottom edge is a sum, so two halves that each fit can produce one
+        // that does not. Nothing checking the inputs alone can see this.
+        let half = f64::from(f32::MAX) * 0.75;
+        assert!((half as f32).is_finite() && !((half + half) as f32).is_finite());
+        let composed = guest_viewport(0.0, half, 1.0, half);
+        assert_eq!(
+            viewport(composed).expect_err("the sum does not fit"),
+            Refusal::OutOfRange {
+                field: "origin_y",
+                value: (half + half).to_bits(),
+            }
+        );
     }
 
     #[test]
