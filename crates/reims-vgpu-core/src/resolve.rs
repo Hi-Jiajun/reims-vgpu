@@ -760,6 +760,16 @@ fn attachment(
     prefix: &AttachmentPrefix,
     clear_bits: [u64; 4],
 ) -> Result<Attachment, ResolveRefusal> {
+    // Refused rather than folded, for the reason the two beside it give. The
+    // fold `LoadAction::from_declared` performs is written for a caller with no
+    // refusal channel; this one has one, and a value outside the closed set
+    // here is a corrupt record or a wrong offset. Folding it to `DontCare`
+    // silently composites onto whatever was in the attachment.
+    let raw_load = prefix.load_action.get();
+    let load = LoadAction::parse(raw_load).ok_or(ResolveRefusal::UndefinedOrdinal {
+        field: "load_action",
+        value: u32::from(raw_load),
+    })?;
     let raw_store = prefix.store_action.get();
     let store = StoreAction::parse(raw_store).ok_or(ResolveRefusal::UndefinedOrdinal {
         field: "store_action",
@@ -787,7 +797,7 @@ fn attachment(
         resolve_level: prefix.resolve_level.get(),
         resolve_slice: prefix.resolve_slice.get(),
         resolve_depth_plane: prefix.resolve_depth_plane.get(),
-        load: LoadAction::from_declared(prefix.load_action.get()),
+        load,
         store,
         store_options,
         clear_bits,
@@ -1660,6 +1670,30 @@ mod tests {
             Err(ResolveRefusal::UndefinedOrdinal {
                 field: "store_action",
                 value: 9,
+            })
+        );
+    }
+
+    /// And the load action beside them, which was the one field of the three
+    /// that folded.
+    ///
+    /// `LoadAction::from_declared` is total on purpose and its doc leaves the
+    /// *reporting* of an out-of-contract ordinal to the caller, because its
+    /// callers are the ones with no packet to refuse. This resolver has one.
+    /// Folded to `DontCare` a corrupt ordinal means "composite onto whatever
+    /// was there", with nothing on the failure channel to say the record was
+    /// not read as written.
+    #[test]
+    fn an_undefined_load_action_refuses_like_the_store_action_beside_it() {
+        let live = Live(vec![4242]);
+        let mut body = pass_body();
+        body.color[0].prefix.texture_ref = u32le(4242);
+        body.color[0].prefix.load_action = u16le(7);
+        assert_eq!(
+            pass_descriptor(&body, &live),
+            Err(ResolveRefusal::UndefinedOrdinal {
+                field: "load_action",
+                value: 7,
             })
         );
     }

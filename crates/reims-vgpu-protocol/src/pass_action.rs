@@ -93,6 +93,22 @@ impl LoadAction {
         }
     }
 
+    /// The action a declared ordinal names, and `None` for anything outside
+    /// the closed set.
+    ///
+    /// The other half of [`Self::from_declared`], for a caller that *has* a
+    /// refusal channel. `from_declared` folds because its callers are the ones
+    /// that cannot refuse — a Metal encoder handing the wire word straight on
+    /// has no packet to reject — and it leaves the reporting to them. A caller
+    /// resolving a record into the semantic model is not in that position: an
+    /// ordinal outside the set there is a corrupt record or a wrong offset,
+    /// which is the same thing the store action beside it in the same prefix
+    /// already refuses for.
+    #[must_use]
+    pub fn parse(raw: u16) -> Option<Self> {
+        is_declared_load_action(raw).then(|| Self::from_declared(raw))
+    }
+
     /// Whether a pass with this action composites onto the attachment's prior
     /// contents, so this device has to resolve those contents rather than let
     /// the attachment begin at a value it invented.
