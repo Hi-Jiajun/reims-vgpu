@@ -108,6 +108,24 @@ pub enum Refusal {
     /// slice. Refused rather than guessed at the packed row size, which is a
     /// term this wire has not established.
     ImagePitchWithoutRowPitch { bytes_per_image: u64, depth: u64 },
+    /// A texture endpoint names a subresource, or a region of one, that the
+    /// texture it resolved to does not have.
+    ///
+    /// A level or slice past the declared count, or an origin plus extent past
+    /// the level's own size, is invalid usage on every axis it happens on --- a
+    /// copy the driver may execute against memory belonging to another
+    /// resource. It is checked against the *resolved* texture and not against
+    /// the declaration the guest is working from, because the two can differ:
+    /// a name reused across a delete resolves to a texture of a different
+    /// shape, and the shape that matters is the one the copy will run on.
+    ///
+    /// One variant with an axis rather than five, because the report is the
+    /// same sentence each time and the axis is the only thing that varies.
+    OutsideTexture {
+        axis: &'static str,
+        named: u64,
+        available: u64,
+    },
     /// A blit-encoder operation that is not a copy, and so has no native
     /// transfer form at all.
     ///
@@ -131,6 +149,7 @@ impl Refusal {
             Self::RowPitchShorterThanCopy { .. } => "vk_transfer_row_pitch_shorter_than_copy",
             Self::ImagePitchShorterThanCopy { .. } => "vk_transfer_image_pitch_shorter_than_copy",
             Self::ImagePitchWithoutRowPitch { .. } => "vk_transfer_image_pitch_without_row_pitch",
+            Self::OutsideTexture { .. } => "vk_transfer_outside_texture",
             Self::NotACopy { .. } => "vk_transfer_not_a_copy",
         }
     }
@@ -184,6 +203,15 @@ impl std::fmt::Display for Refusal {
             } => write!(
                 f,
                 "{} bytes_per_image={bytes_per_image} depth={depth}",
+                self.slug()
+            ),
+            Self::OutsideTexture {
+                axis,
+                named,
+                available,
+            } => write!(
+                f,
+                "{} axis={axis} named={named} available={available}",
                 self.slug()
             ),
             Self::NotACopy { op } => write!(f, "{} op={op}", self.slug()),
@@ -251,14 +279,77 @@ fn offset(origin: Origin3) -> Result<vk::Offset3D, Refusal> {
     })
 }
 
-/// The subresource layers one texture endpoint names.
-fn layers(texture: Texture, point: TexturePoint) -> Result<vk::ImageSubresourceLayers, Refusal> {
-    Ok(vk::ImageSubresourceLayers {
-        aspect_mask: aspect(texture.pixel_format()),
-        mip_level: u32::from(point.level),
-        base_array_layer: u32::from(point.slice),
-        layer_count: 1,
-    })
+/// `named` must not exceed `available`, on one axis of one texture.
+fn within(axis: &'static str, named: u64, available: u64) -> Result<(), Refusal> {
+    if named > available {
+        return Err(Refusal::OutsideTexture {
+            axis,
+            named,
+            available,
+        });
+    }
+    Ok(())
+}
+
+/// One texture endpoint and the region it names, checked against the texture
+/// it resolved to.
+///
+/// The three answers come back together because they are one decision: the
+/// level chooses the extent the origin and size are bounded by, so a caller
+/// given the subresource alone would have to look the extent up a second time
+/// to bound the region — and the reason this check did not exist is that
+/// nobody did.
+///
+/// # Errors
+///
+/// [`Refusal::OutsideTexture`] naming the first axis that does not fit, or
+/// [`Refusal::ExtentTooLarge`] when a dimension does not fit the 32-bit fields
+/// a native copy carries.
+fn endpoint(
+    texture: Texture,
+    point: TexturePoint,
+    size: Size3,
+) -> Result<(vk::ImageSubresourceLayers, vk::Offset3D, vk::Extent3D), Refusal> {
+    within(
+        "level",
+        u64::from(point.level) + 1,
+        u64::from(texture.mip_levels()),
+    )?;
+    within(
+        "slice",
+        u64::from(point.slice) + 1,
+        u64::from(texture.layers()),
+    )?;
+    // Narrowed before the region is bounded: a dimension that does not fit the
+    // field a native copy carries is not a copy at all, and reporting it as
+    // "outside the texture" names the wrong thing about it --- every such value
+    // is outside every texture, because a level extent is 32 bits wide.
+    let native_offset = offset(point.origin)?;
+    let native_extent = extent(size)?;
+    let level = texture
+        .level_extent(u32::from(point.level))
+        .expect("the level count was just checked");
+    // Origin plus extent, per axis, against the level's own size. A copy
+    // bounded only by the whole texture reads past every level below zero.
+    for (axis, origin, span, available) in [
+        ("x", point.origin.x, size.width, level.x),
+        ("y", point.origin.y, size.height, level.y),
+        ("z", point.origin.z, size.depth, level.z),
+    ] {
+        // Both were narrowed above --- the origin to `i32` and the span to
+        // `u32` --- so the sum is bounded well inside `u64` and cannot wrap.
+        within(axis, origin + span, u64::from(available))?;
+    }
+    Ok((
+        vk::ImageSubresourceLayers {
+            aspect_mask: aspect(texture.pixel_format()),
+            mip_level: u32::from(point.level),
+            base_array_layer: u32::from(point.slice),
+            layer_count: 1,
+        },
+        native_offset,
+        native_extent,
+    ))
 }
 
 /// The buffer-side pitch of a linear image, in texels, for a copy of `size`.
@@ -448,21 +539,39 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
         } => {
             let from = resolved(residency.image(source.texture))?;
             let to = resolved(residency.image(dest.texture))?;
+            let (src_subresource, src_offset, extent) = endpoint(from.texture, source, size)?;
+            let (dst_subresource, dst_offset, _) = endpoint(to.texture, dest, size)?;
             Ok(Command::CopyImage {
                 source: from.image,
                 dest: to.image,
                 regions: vec![vk::ImageCopy {
-                    src_subresource: layers(from.texture, source)?,
-                    src_offset: offset(source.origin)?,
-                    dst_subresource: layers(to.texture, dest)?,
-                    dst_offset: offset(dest.origin)?,
-                    extent: extent(size)?,
+                    src_subresource,
+                    src_offset,
+                    dst_subresource,
+                    dst_offset,
+                    extent,
                 }],
             })
         }
         BlitOp::TextureSlices { source, dest } => {
             let from = resolved(residency.image(source.texture))?;
             let to = resolved(residency.image(dest.texture))?;
+            // Both spans, both endpoints, before a single region is built: a
+            // span that runs off the end of the destination is the same
+            // invalid usage as one that runs off the source, and expanding
+            // first would have found only the source's.
+            for (texture, span) in [(from.texture, source), (to.texture, dest)] {
+                within(
+                    "level",
+                    u64::from(span.base_level) + u64::from(span.level_count),
+                    u64::from(texture.mip_levels()),
+                )?;
+                within(
+                    "slice",
+                    u64::from(span.base_slice) + u64::from(span.slice_count),
+                    u64::from(texture.layers()),
+                )?;
+            }
             let mut regions = Vec::with_capacity(usize::from(source.level_count));
             for level in 0..u32::from(source.level_count) {
                 // One region per level and not per slice: `layerCount` covers
@@ -683,13 +792,14 @@ fn buffer_image_region(
     size: Size3,
 ) -> Result<vk::BufferImageCopy, Refusal> {
     let (row_length, image_height) = texel_pitch(texture, pitch, size)?;
+    let (image_subresource, image_offset, image_extent) = endpoint(texture, point, size)?;
     Ok(vk::BufferImageCopy {
         buffer_offset,
         buffer_row_length: row_length,
         buffer_image_height: image_height,
-        image_subresource: layers(texture, point)?,
-        image_offset: offset(point.origin)?,
-        image_extent: extent(size)?,
+        image_subresource,
+        image_offset,
+        image_extent,
     })
 }
 
@@ -1066,7 +1176,7 @@ mod tests {
                 source: id(BUFFER_A),
                 source_offset: 128,
                 source_pitch: pitch,
-                size: size(64, 32),
+                size: size(32, 16),
                 dest: point(IMAGE_A, 1, 2),
                 options: Default::default(),
             },
@@ -1076,7 +1186,7 @@ mod tests {
         let down = plan(
             &BlitOp::TextureToBuffer {
                 source: point(IMAGE_A, 1, 2),
-                size: size(64, 32),
+                size: size(32, 16),
                 dest: id(BUFFER_A),
                 dest_offset: 128,
                 dest_pitch: pitch,
@@ -1107,7 +1217,10 @@ mod tests {
             u[0].image_subresource.aspect_mask,
             vk::ImageAspectFlags::COLOR
         );
-        assert_eq!(u[0].image_extent.width, 64);
+        // Level one of a 64x32 texture is 32x16, and the row pitch describes the
+        // wider image the copy is a window into --- the ordinary reason a pitch
+        // is named at all.
+        assert_eq!(u[0].image_extent.width, 32);
         assert_eq!(u[0].buffer_row_length, 64);
     }
 
@@ -1494,7 +1607,7 @@ mod tests {
         let planned = plan(
             &BlitOp::TextureRegion {
                 source: TexturePoint {
-                    origin: Origin3 { x: 4, y: 8, z: 0 },
+                    origin: Origin3 { x: 4, y: 4, z: 0 },
                     ..point(IMAGE_A, 2, 1)
                 },
                 dest: TexturePoint {
@@ -1518,7 +1631,8 @@ mod tests {
         assert_eq!(source.as_raw(), 0x1A);
         assert_eq!(dest.as_raw(), 0x1B);
         assert_eq!(regions[0].src_offset.x, 4);
-        assert_eq!(regions[0].src_offset.y, 8);
+        // Level two is 16x8, and the window ends exactly on its edge.
+        assert_eq!(regions[0].src_offset.y, 4);
         assert_eq!(regions[0].dst_offset.x, 1);
         assert_eq!(regions[0].src_subresource.mip_level, 2);
         assert_eq!(regions[0].src_subresource.base_array_layer, 1);
@@ -1594,6 +1708,11 @@ mod tests {
             Refusal::ImagePitchWithoutRowPitch {
                 bytes_per_image: 1,
                 depth: 2,
+            },
+            Refusal::OutsideTexture {
+                axis: "level",
+                named: 2,
+                available: 1,
             },
             Refusal::NotACopy { op: "x" },
         ];
@@ -1727,5 +1846,157 @@ mod tests {
             ),
             Ok((0, 0))
         );
+    }
+
+    /// The failure this exists to prevent: a copy naming a level, a slice or a
+    /// region the resolved texture does not have. Every one of them is invalid
+    /// usage a driver may carry out anyway, against memory that belongs to
+    /// something else.
+    #[test]
+    fn a_copy_outside_the_texture_it_names_refuses_on_the_axis_that_does_not_fit() {
+        let residency = populated();
+        // 64x32, four levels, three slices. Level three is 8x4.
+        let cases = [
+            (point(IMAGE_A, 4, 0), size(1, 1), "level", 5_u64, 4_u64),
+            (point(IMAGE_A, 0, 3), size(1, 1), "slice", 4, 3),
+            (point(IMAGE_A, 3, 0), size(9, 1), "x", 9, 8),
+            (point(IMAGE_A, 3, 0), size(8, 5), "y", 5, 4),
+            (
+                TexturePoint {
+                    origin: Origin3 { x: 4, y: 0, z: 0 },
+                    ..point(IMAGE_A, 3, 0)
+                },
+                size(8, 4),
+                "x",
+                12,
+                8,
+            ),
+            (
+                point(IMAGE_A, 0, 0),
+                Size3 {
+                    width: 1,
+                    height: 1,
+                    depth: 2,
+                },
+                "z",
+                2,
+                1,
+            ),
+        ];
+        for (dest, size, axis, named, available) in cases {
+            assert_eq!(
+                plan(
+                    &BlitOp::BufferToTexture {
+                        source: id(BUFFER_A),
+                        source_offset: 0,
+                        source_pitch: ImagePitch {
+                            bytes_per_row: 0,
+                            bytes_per_image: 0,
+                        },
+                        size,
+                        dest,
+                        options: Default::default(),
+                    },
+                    &residency,
+                )
+                .expect_err("outside the texture"),
+                Refusal::OutsideTexture {
+                    axis,
+                    named,
+                    available
+                },
+                "{axis} of {dest:?} {size:?}"
+            );
+        }
+    }
+
+    /// The same rule for the endpoint that is only ever a destination. A copy
+    /// checked on its source alone passes whatever the destination cannot hold.
+    #[test]
+    fn a_region_copy_checks_the_destination_and_not_only_the_source() {
+        let residency = populated();
+        assert_eq!(
+            plan(
+                &BlitOp::TextureRegion {
+                    // Level zero is 64x32 and holds this window.
+                    source: point(IMAGE_A, 0, 0),
+                    // Level three is 8x4 and does not.
+                    dest: point(IMAGE_B, 3, 0),
+                    size: size(16, 4),
+                    options: Default::default(),
+                },
+                &residency,
+            )
+            .expect_err("outside the destination"),
+            Refusal::OutsideTexture {
+                axis: "x",
+                named: 16,
+                available: 8,
+            }
+        );
+    }
+
+    /// A level or slice *span* that runs off the end, on either endpoint,
+    /// before a single region is built --- expanding first would have found
+    /// only the source's.
+    #[test]
+    fn a_slice_span_that_runs_off_either_end_refuses_before_any_region_is_built() {
+        let residency = populated();
+        let whole = TextureSpan {
+            texture: id(IMAGE_A),
+            base_level: 0,
+            level_count: 4,
+            base_slice: 0,
+            slice_count: 3,
+        };
+        assert!(plan(
+            &BlitOp::TextureSlices {
+                source: whole,
+                dest: TextureSpan {
+                    texture: id(IMAGE_B),
+                    ..whole
+                },
+            },
+            &residency,
+        )
+        .is_ok());
+        for (source, dest, axis, named, available) in [
+            (
+                TextureSpan {
+                    base_level: 2,
+                    level_count: 4,
+                    ..whole
+                },
+                TextureSpan {
+                    texture: id(IMAGE_B),
+                    ..whole
+                },
+                "level",
+                6_u64,
+                4_u64,
+            ),
+            (
+                whole,
+                TextureSpan {
+                    texture: id(IMAGE_B),
+                    base_slice: 1,
+                    slice_count: 3,
+                    ..whole
+                },
+                "slice",
+                4,
+                3,
+            ),
+        ] {
+            assert_eq!(
+                plan(&BlitOp::TextureSlices { source, dest }, &residency)
+                    .expect_err("a span off the end"),
+                Refusal::OutsideTexture {
+                    axis,
+                    named,
+                    available
+                }
+            );
+        }
     }
 }
