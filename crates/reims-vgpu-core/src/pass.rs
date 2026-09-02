@@ -219,25 +219,19 @@ impl Attachment {
     /// property, and only one of the fields is non-zero for a given one.
     #[must_use]
     pub const fn subresource(&self) -> SubresourceRange {
-        SubresourceRange {
-            base_level: self.level as u32,
-            level_count: 1,
-            base_slice: self.slice as u32 + self.depth_plane as u32,
-            slice_count: 1,
-            plane: 0,
-        }
+        SubresourceRange::one(
+            self.slice as u32 + self.depth_plane as u32,
+            self.level as u32,
+        )
     }
 
     /// The subresource the resolve target receives.
     #[must_use]
     pub const fn resolve_subresource(&self) -> SubresourceRange {
-        SubresourceRange {
-            base_level: self.resolve_level as u32,
-            level_count: 1,
-            base_slice: self.resolve_slice as u32 + self.resolve_depth_plane as u32,
-            slice_count: 1,
-            plane: 0,
-        }
+        SubresourceRange::one(
+            self.resolve_slice as u32 + self.resolve_depth_plane as u32,
+            self.resolve_level as u32,
+        )
     }
 
     /// How the pass accesses the attached texture, if it is attached.

@@ -97,18 +97,10 @@ pub struct TexturePoint {
 impl TexturePoint {
     /// The one level and one slice this endpoint names.
     ///
-    /// Plane is zero: no blit record on this wire carries one, so naming a
-    /// plane here would be inventing a field. A planar format's second plane is
-    /// a separate resource in the guest's own model.
+    /// See [`SubresourceRange::one`] for why the plane is zero.
     #[must_use]
     pub const fn subresource(self) -> SubresourceRange {
-        SubresourceRange {
-            base_level: self.level as u32,
-            level_count: 1,
-            base_slice: self.slice as u32,
-            slice_count: 1,
-            plane: 0,
-        }
+        SubresourceRange::one(self.slice as u32, self.level as u32)
     }
 }
 

@@ -52,13 +52,7 @@ impl SliceLevel {
     /// The one level and one slice this names.
     #[must_use]
     pub const fn subresource(self) -> SubresourceRange {
-        SubresourceRange {
-            base_level: self.level as u32,
-            level_count: 1,
-            base_slice: self.slice as u32,
-            slice_count: 1,
-            plane: 0,
-        }
+        SubresourceRange::one(self.slice as u32, self.level as u32)
     }
 }
 

@@ -148,6 +148,28 @@ pub struct SubresourceRange {
 }
 
 impl SubresourceRange {
+    /// The single level and slice a record names.
+    ///
+    /// Plane is zero, and that is a contract statement rather than a default:
+    /// no record on this wire carries a plane, so naming one here would be
+    /// inventing a field — a planar format's second plane is a separate
+    /// resource in the guest's own model.
+    ///
+    /// Written once because four records spell this same shape — a blit
+    /// endpoint, a `slice:level:` content directive, and an attachment's
+    /// target and resolve target — and a fifth spelling it by hand is where a
+    /// `level_count` of zero, or a plane taken from somewhere, gets in.
+    #[must_use]
+    pub const fn one(slice: u32, level: u32) -> Self {
+        Self {
+            base_level: level,
+            level_count: 1,
+            base_slice: slice,
+            slice_count: 1,
+            plane: 0,
+        }
+    }
+
     #[must_use]
     pub const fn overlaps(self, other: SubresourceRange) -> bool {
         if self.plane != other.plane {
