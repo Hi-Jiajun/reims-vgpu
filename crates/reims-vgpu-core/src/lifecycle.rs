@@ -1364,7 +1364,13 @@ impl Lifecycle {
     /// This is also what keeps a deferred teardown deferred. A backing whose
     /// accepted uses have not retired is still held, so the answer is no, and
     /// a caller that retires the last use asks again.
-    fn forget_backing(&mut self, backing: BackingId) {
+    /// Returns whether it was forgotten — which is the same fact as "no name
+    /// and no heap in this session answers for this storage any more", and so
+    /// is the only thing that may be reported as freed storage. A `Heaps` is
+    /// per task like a `Namespace` is, so `Retirement::StorageFree` is the
+    /// same per-task answer a `Teardown::Now` is, and reporting it as a
+    /// session-wide free is the split this exists to close.
+    fn forget_backing(&mut self, backing: BackingId) -> bool {
         let held = self
             .tasks
             .values()
@@ -1372,6 +1378,7 @@ impl Lifecycle {
         if !held {
             self.content.forget(backing);
         }
+        !held
     }
 
     /// Record that work wrote a window of a resource in one replica.
@@ -1460,18 +1467,22 @@ impl Lifecycle {
         // now. A heap that still held one would have said so, and this would
         // be the leak that answer exists to prevent.
         let t = self.tasks.get_mut(&task).expect("checked above");
+        let mut released = Vec::new();
         for heap in t.heaps.live_heaps() {
             if let Ok(Retirement::StorageFree { backing }) = t.heaps.delete(heap) {
-                effects.storage_freed.push(backing);
+                released.push(backing);
             }
         }
-        // Taken by value: forgetting asks every task whether it still answers
-        // for the backing, which needs the whole model rather than a borrow of
-        // one field of it.
-        let freed = effects.storage_freed.clone();
+        // Asked after the task is gone, because forgetting asks every task
+        // whether it still answers for the backing and this one no longer
+        // does. Reported only where the answer is yes: a heap's retirement is
+        // its own task's answer, and another task's heap may hold the same
+        // storage.
         self.tasks.remove(&task);
-        for backing in freed {
-            self.forget_backing(backing);
+        for backing in released {
+            if self.forget_backing(backing) {
+                effects.storage_freed.push(backing);
+            }
         }
         Ok(effects)
     }
@@ -1552,8 +1563,14 @@ impl Lifecycle {
             Some(Resident::Placed(placement)) => {
                 if let Ok(Retirement::StorageFree { backing }) = t.heaps.remove(placement, resource)
                 {
-                    effects.storage_freed.push(backing);
-                    self.forget_backing(backing);
+                    // Reported as freed only if the session agrees. The
+                    // retirement is this task's heaps answering, and another
+                    // task's heap may hold the same storage --- `Heaps::create`
+                    // refuses storage a heap of *its own* task holds and knows
+                    // nothing of the others.
+                    if self.forget_backing(backing) {
+                        effects.storage_freed.push(backing);
+                    }
                 }
             }
             // Its own pages: nothing else names them, so the content goes with
@@ -1562,7 +1579,11 @@ impl Lifecycle {
                 // Nothing in this task reads it and nothing in this task names
                 // it. Whether that is true of the session is the question
                 // `forget_backing` asks.
-                Teardown::Now { .. } => self.forget_backing(backing),
+                // A dedicated backing is the guest's own pages and not a
+                // heap's storage, so nothing is reported freed either way.
+                Teardown::Now { .. } => {
+                    let _ = self.forget_backing(backing);
+                }
                 // Someone else still answers for these bytes. Forgetting here
                 // would drop the content authority out from under a reader or
                 // a live name.
@@ -1624,7 +1645,9 @@ impl Lifecycle {
         // memory this resource no longer names.
         self.content.declare(backing, extent, Replica::GuestPages);
         match teardown {
-            Teardown::Now { backing: old } => self.forget_backing(old),
+            Teardown::Now { backing: old } => {
+                let _ = self.forget_backing(old);
+            }
             // The old bytes are still read by accepted work, or still named by
             // another slot. Either way their authority is not ours to drop.
             Teardown::WhenUsesRetire { .. } | Teardown::HeldByAnotherName { .. } => {}
@@ -2315,6 +2338,53 @@ mod tests {
             Some(range(0, 256)),
             "the backing is still as big as the name that declared it"
         );
+    }
+
+    /// Freed storage is a session-wide fact and a heap's retirement is a
+    /// per-task answer.
+    ///
+    /// `Heaps` is per task exactly as `Namespace` is, and `Heaps::create`
+    /// refuses storage a heap of *its own* task already holds — it knows
+    /// nothing of the others. So two tasks may each declare a heap over one
+    /// backing, and one of them retiring its last placement says only that
+    /// *it* is finished. Reported as `storage_freed`, that told the caller to
+    /// tear down an allocation the other task's heap still holds, while
+    /// `forget_backing` — asked the session-wide question — correctly kept the
+    /// content entry. The model said both at once.
+    #[test]
+    fn storage_two_tasks_hold_is_not_reported_freed_when_one_lets_go() {
+        let mut l = Lifecycle::new();
+        for task in [TaskId(1), TaskId(2)] {
+            apply_inert(
+                &mut l,
+                &LifecycleOp::DefineTask {
+                    task,
+                    kernel: false,
+                    directory: DirectoryFrame(0x1000),
+                },
+            );
+        }
+        l.declare_heap(TaskId(1), 3, BackingId(50), 4096)
+            .expect("a heap");
+        l.declare_heap(TaskId(2), 7, BackingId(50), 4096)
+            .expect("the same storage, in another task's registry");
+
+        // Task one ends, and its heaps retire their storage. That answer is
+        // task one's alone.
+        let effects = l
+            .apply(&LifecycleOp::DeleteTask { task: TaskId(1) })
+            .expect("resolves");
+        assert!(
+            effects.storage_freed.is_empty(),
+            "task two's heap still holds this storage"
+        );
+
+        // Once the last holder lets go, the storage is free and is reported
+        // once.
+        let effects = l
+            .apply(&LifecycleOp::DeleteTask { task: TaskId(2) })
+            .expect("resolves");
+        assert_eq!(effects.storage_freed, vec![BackingId(50)]);
     }
 
     /// Two resources in one heap share a backing, so creating the second must
