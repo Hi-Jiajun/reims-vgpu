@@ -88,6 +88,14 @@ pub struct Enabled {
     /// `VkDeviceCreateInfo::pEnabledFeatures`.
     pub depth_clamp: bool,
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::wideLines`, the 1.0 block again.
+    ///
+    /// `vkCmdSetLineWidth` with anything but 1.0 on a device without it is
+    /// invalid (VUID-vkCmdSetLineWidth-lineWidth-00788), and
+    /// [`crate::raster::line_width`] refuses one against the same census cell
+    /// --- so what is requested here and what a width is checked against are
+    /// the same fact.
+    pub wide_lines: bool,
     /// `VkPhysicalDeviceFeatures::multiViewport`, the 1.0 block again.
     ///
     /// A pipeline whose `viewportCount` is above one without it is invalid
@@ -138,6 +146,7 @@ impl Enabled {
             descriptor_buffer: census.descriptors().descriptor_buffer,
             depth_clamp: census.raster().depth_clamp,
             fill_mode_non_solid: census.raster().fill_mode_non_solid,
+            wide_lines: census.line_widths().wide_lines,
             multi_viewport: census.viewports().multi_viewport,
             sampler_anisotropy: census.samplers().anisotropy,
             dual_src_blend: census.blend().dual_source,
@@ -263,6 +272,7 @@ impl DeviceEpoch {
         let core_features = vk::PhysicalDeviceFeatures::default()
             .depth_clamp(enabled.depth_clamp)
             .fill_mode_non_solid(enabled.fill_mode_non_solid)
+            .wide_lines(enabled.wide_lines)
             .multi_viewport(enabled.multi_viewport)
             .sampler_anisotropy(enabled.sampler_anisotropy)
             .dual_src_blend(enabled.dual_src_blend)
@@ -434,6 +444,8 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
             multi_viewport: false,
             max_viewports: 1,
             sampler_anisotropy: false,
@@ -589,6 +601,8 @@ mod tests {
                             dynamic_rendering: false,
                             depth_clamp: false,
                             fill_mode_non_solid: false,
+                            wide_lines: false,
+                            line_width_range: [1.0, 1.0],
                             multi_viewport: false,
                             max_viewports: 1,
                             sampler_anisotropy: false,
@@ -626,6 +640,11 @@ mod tests {
                     // count is admitted against the census cell, so requesting the
                     // feature and admitting the count have to be one fact.
                     assert_eq!(enabled.multi_viewport, multi_viewport);
+                    // `wideLines` shares the shape and the hazard, and the bare
+                    // cell above it is what every device reports: the one width
+                    // that needs no feature.
+                    assert!(!enabled.wide_lines);
+                    assert_eq!(census.line_widths(), crate::raster::LineWidthCell::NARROW);
                     assert_eq!(census.viewports().multi_viewport, multi_viewport);
                     assert_eq!(
                         crate::raster::viewport_slots(2, census.viewports()).is_ok(),
@@ -659,6 +678,8 @@ mod tests {
                         dynamic_rendering: false,
                         depth_clamp: false,
                         fill_mode_non_solid: false,
+                        wide_lines: false,
+                        line_width_range: [1.0, 1.0],
                         multi_viewport: false,
                         max_viewports: 1,
                         sampler_anisotropy: false,
@@ -714,6 +735,8 @@ mod tests {
                         dynamic_rendering: false,
                         depth_clamp: false,
                         fill_mode_non_solid: false,
+                        wide_lines: false,
+                        line_width_range: [1.0, 1.0],
                         multi_viewport: false,
                         max_viewports: 1,
                         sampler_anisotropy: false,
@@ -835,6 +858,8 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
             multi_viewport: false,
             max_viewports: 1,
             sampler_anisotropy: false,

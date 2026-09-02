@@ -607,6 +607,8 @@ unsafe fn judge(
         dynamic_rendering: dynamic_rendering.dynamic_rendering == vk::TRUE,
         depth_clamp: core_features.depth_clamp == vk::TRUE,
         fill_mode_non_solid: core_features.fill_mode_non_solid == vk::TRUE,
+        wide_lines: core_features.wide_lines == vk::TRUE,
+        line_width_range: properties.limits.line_width_range,
         multi_viewport: core_features.multi_viewport == vk::TRUE,
         // Reported by every device and required to be one exactly where the
         // feature above is off, so the two are read from the same properties
@@ -669,6 +671,8 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
             multi_viewport: false,
             max_viewports: 1,
             sampler_anisotropy: false,
@@ -907,6 +911,8 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
             multi_viewport: false,
             max_viewports: 1,
             sampler_anisotropy: false,

@@ -147,6 +147,15 @@ pub struct Reported<'a> {
     pub depth_clamp: bool,
     /// `VkPhysicalDeviceFeatures::fillModeNonSolid`.
     pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::wideLines`.
+    pub wide_lines: bool,
+    /// `VkPhysicalDeviceLimits::lineWidthRange`, `[min, max]`.
+    ///
+    /// A limit rather than a feature, so it is always reported --- and it is
+    /// required to contain 1.0 on every device, which is why a guest that
+    /// never sets a width needs no capability. See
+    /// [`crate::raster::LineWidthCell`].
+    pub line_width_range: [f32; 2],
     /// `VkPhysicalDeviceFeatures::multiViewport`.
     pub multi_viewport: bool,
     /// `VkPhysicalDeviceLimits::maxViewports`.
@@ -390,6 +399,7 @@ pub struct Census {
     topology: crate::topology::TopologyCell,
     vertex: crate::vertex::VertexCell,
     viewports: crate::raster::ViewportCell,
+    line_widths: crate::raster::LineWidthCell,
     host_pointer_import: bool,
     synchronization2: bool,
     can_present: bool,
@@ -507,6 +517,14 @@ impl Census {
             viewports: crate::raster::ViewportCell {
                 multi_viewport: reported.multi_viewport,
                 max_viewports: reported.max_viewports,
+            },
+            // Carried as reported, like `max_sampler_anisotropy`: the range a
+            // device states is the range a width is admitted against, and a
+            // floor substituted here would hide a driver that reported one
+            // not containing 1.0.
+            line_widths: crate::raster::LineWidthCell {
+                wide_lines: reported.wide_lines,
+                range: reported.line_width_range,
             },
             buffers: crate::buffer::BufferLimits {
                 max_buffer_size: reported.max_buffer_size,
@@ -721,6 +739,13 @@ impl Census {
         self.viewports
     }
 
+    /// What width a draw that rasterizes lines may be given. See
+    /// [`crate::raster::line_width`].
+    #[must_use]
+    pub const fn line_widths(&self) -> crate::raster::LineWidthCell {
+        self.line_widths
+    }
+
     #[must_use]
     pub const fn can_present(&self) -> bool {
         self.can_present
@@ -746,7 +771,8 @@ impl Census {
              dyn_topology={} topology_unrestricted={} vertex_formats={} \
              vertex_divisor={} vertex_zero_divisor={} vertex_max_divisor={} \
              depth_clamp={} fill_non_solid={} dyn_cull_winding={} dyn_polygon={} \
-             dyn_depth_clamp={} multi_viewport={} max_viewports={}",
+             dyn_depth_clamp={} multi_viewport={} max_viewports={} wide_lines={} \
+             line_width_max={}",
             self.api,
             self.memory.topology.slug(),
             self.memory.signal.slug(),
@@ -777,6 +803,8 @@ impl Census {
             self.raster.dynamic_depth_clamp,
             self.viewports.multi_viewport,
             self.viewports.max_viewports,
+            self.line_widths.wide_lines,
+            self.line_widths.range[1],
         )
     }
 }
@@ -841,6 +869,8 @@ mod tests {
             dynamic_rendering: false,
             depth_clamp: false,
             fill_mode_non_solid: false,
+            wide_lines: false,
+            line_width_range: [1.0, 1.0],
             multi_viewport: false,
             max_viewports: 1,
             sampler_anisotropy: false,
@@ -1131,6 +1161,37 @@ mod tests {
         assert!(crate::raster::viewport_slots(2, bare.viewports()).is_err());
     }
 
+    /// The line-width facts reach the cell `raster::line_width` is asked
+    /// against, and a device that reports neither admits exactly the width
+    /// that needs no feature.
+    #[test]
+    fn the_line_width_limits_reach_the_cell_that_admits_a_width() {
+        let memory = mem::nvidia_discrete();
+        let families = discrete_families();
+        let mut r = reported(packed(1, 2), BASELINE, &memory, &families);
+        r.wide_lines = true;
+        r.line_width_range = [0.5, 8.0];
+        let census = Census::take(r).expect("admitted");
+        assert!(census.line_widths().wide_lines);
+        assert_eq!(census.line_widths().range, [0.5, 8.0]);
+        assert_eq!(
+            crate::raster::line_width(Some(4.0), true, census.line_widths()),
+            Ok(4.0)
+        );
+        assert!(crate::raster::line_width(Some(9.0), true, census.line_widths()).is_err());
+
+        // A device that reports no `wideLines` rasterizes lines at exactly the
+        // one width every device carries, and refuses any other.
+        let bare =
+            Census::take(reported(packed(1, 2), BASELINE, &memory, &families)).expect("admitted");
+        assert_eq!(bare.line_widths(), crate::raster::LineWidthCell::NARROW);
+        assert_eq!(
+            crate::raster::line_width(Some(1.0), true, bare.line_widths()),
+            Ok(1.0)
+        );
+        assert!(crate::raster::line_width(Some(2.0), true, bare.line_widths()).is_err());
+    }
+
     #[test]
     fn a_probe_cannot_qualify_what_the_device_does_not_report() {
         let memory = mem::intel_igpu();
@@ -1224,6 +1285,8 @@ mod tests {
             "fill_non_solid=false",
             "multi_viewport=false",
             "max_viewports=1",
+            "wide_lines=false",
+            "line_width_max=1",
             "dyn_cull_winding=false",
             "dyn_polygon=false",
             "dyn_depth_clamp=false",
