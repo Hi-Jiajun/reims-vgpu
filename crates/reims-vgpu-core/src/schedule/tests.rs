@@ -527,6 +527,25 @@ fn a_batch_of_mixed_classes_schedules_equivalently() {
     ] {
         assert!(present, "the reference trace has no {kind}");
     }
+    // And the comparison actually reads them. The assertion above says the
+    // reference trace *contains* a stalled query; that a stall reaches
+    // `equivalent` at all is a separate fact, and it was not true --- the
+    // summary collected the stalls and nothing compared them, so this sweep
+    // looked like it covered queries while proving nothing about them.
+    let mut answered = reference.clone();
+    answered
+        .trace
+        .retain(|o| !matches!(o, crate::interpret::Observation::QueryUnanswered { .. }));
+    assert_eq!(
+        equivalent(&reference, &answered).expect_err("a stall that vanished is a divergence"),
+        Divergence::QueriesUnanswered {
+            serial: Summary::of(&reference.trace).unanswered,
+            parallel: Vec::new(),
+        },
+        "a schedule that answered a query the serial run stalled reads the same \
+         everywhere else: same versions, same stamps, same releases"
+    );
+
     let mut orders = std::collections::BTreeSet::new();
     for seed in 0..64u64 {
         let run = parallel(&batch, seed);

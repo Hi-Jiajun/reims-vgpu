@@ -594,6 +594,20 @@ pub enum Divergence {
         serial: Vec<(IngressOrdinal, crate::lifecycle::Refusal)>,
         parallel: Vec<(IngressOrdinal, crate::lifecycle::Refusal)>,
     },
+    /// A query completed with no answer written under one schedule and with
+    /// one under the other.
+    ///
+    /// The failure this names has no other symptom. The completion word is
+    /// published either way, so a guest that polls the stamp and then reads
+    /// the destination is handed a fresh flag over bytes nobody wrote --- and
+    /// every other part of this comparison agrees, because the versions, the
+    /// stamps, the events and the releases are all identical. Compared by
+    /// ingress like the two channels above it: which transaction stalled is
+    /// the fact, and the order the stalls reached the trace in is not.
+    QueriesUnanswered {
+        serial: Vec<(IngressOrdinal, crate::query::QueryKind, crate::query::Stall)>,
+        parallel: Vec<(IngressOrdinal, crate::query::QueryKind, crate::query::Stall)>,
+    },
     /// One transaction's publications were interrupted by another's.
     SplitPublication { ordinal: IngressOrdinal },
     /// A transaction published its completion stamp before its content
@@ -632,6 +646,7 @@ impl Divergence {
             Self::SplitPublication { .. } => "diverge_split_publication",
             Self::StampBeforeVersions { .. } => "diverge_stamp_before_versions",
             Self::ContentBeaten { .. } => "diverge_content_beaten",
+            Self::QueriesUnanswered { .. } => "diverge_queries_unanswered",
         }
     }
 }
@@ -750,6 +765,16 @@ pub fn equivalent(serial: &Run, parallel: &Run) -> Result<(), Divergence> {
         return Err(Divergence::Declined {
             serial: declined_left,
             parallel: declined_right,
+        });
+    }
+
+    let (mut stalled_left, mut stalled_right) = (left.unanswered.clone(), right.unanswered.clone());
+    stalled_left.sort_by_key(|(o, _, _)| *o);
+    stalled_right.sort_by_key(|(o, _, _)| *o);
+    if stalled_left != stalled_right {
+        return Err(Divergence::QueriesUnanswered {
+            serial: stalled_left,
+            parallel: stalled_right,
         });
     }
 
