@@ -59,40 +59,65 @@ use crate::identity::{ChannelId, ResourceId};
 /// that was ordering a real read against a real write. Nothing refuses, nothing
 /// logs, and the frame is wrong intermittently.
 ///
-/// Three joins are unresolved. Each one is a pair of names this device can see
-/// and cannot prove equal or distinct:
+/// One of the three joins is settled, and the two that are not are named here
+/// with what would settle them.
 ///
-/// 1. **One address space, and one task.** Some objects name a mapping the
-///    device tracks; the rest name pages by a handle in the owning task. Those
-///    are *not* two namespaces: both are guest-virtual page numbers at the
-///    device's own page shift, resolved through the same task's page directory,
-///    which the device states at both ends. So within a task the join is
-///    settled and overlap is the test — a mapping and a linear texture over the
-///    same pages are one window and can be seen to be one. What is **not**
-///    settled is the same storage reached from two tasks: one imported surface
-///    is a different guest-virtual address in each address space, and nothing
-///    above the page walk equates them. An id keyed on task and address is
-///    false distinctness for exactly that case, which is the one an imported
-///    surface exists to create.
-/// 2. **Heap identity.** [`crate::heap`] requires a placement to take its
-///    heap's id and a byte range, because two windows the guest chose to
-///    overlap are the same bytes. The device decodes a heap reference and an
-///    offset for a heap-placed texture and keeps neither: there is no heap
-///    object, no heap extent, and no value that could be a heap's canonical
-///    identity.
-/// 3. **When the id is minted against when it can be known.**
-///    [`crate::namespace::Namespace::declare`] wants one at declaration, and on
-///    this interface a declaration is the guest writing a record into its own
-///    object-list page — which happens before it has finished mapping the
-///    backing. So an id derived from the descriptor is available at
-///    declaration and cannot span the cross-task half of join 1, and one
-///    derived from resolved pages spans it and is neither available at
-///    declaration nor stable across a physical replacement.
+/// ## Settled: every name this device can see is a window of one address space
 ///
-/// Until those are answered, an id derived from a resource's own name — a
-/// per-resource counter, a slot number — is the tempting shape and the
-/// forbidden one: it is what the first paragraph rules out, it gets every
-/// sharing relationship wrong in the dangerous direction, and it would compile.
+/// Some objects name a mapping the device tracks; the rest name pages by a
+/// handle in the owning task. Those are *not* two namespaces. Both are
+/// guest-virtual page numbers at the device's own page shift, resolved through
+/// the same task's page directory, and the device states it at both ends — a
+/// linear descriptor's backing is its handle shifted, and a mapping's page
+/// number is documented in the attach path as a guest-virtual page walked
+/// through that task's directory. So two names are the same storage exactly
+/// when their windows overlap, which is a test rather than a rule that has to
+/// be supplied.
+///
+/// The cross-task worry that leaves — one imported surface being a different
+/// address in each address space — does not arise, and this is the load-bearing
+/// part. A surface's backing is registered in the accelerator's kernel task,
+/// whose id is fixed; the guest says so on the wire in the ref-texture view's
+/// owner field; and a client naming that surface reaches it through the mapping
+/// rather than through its own address space. The device holds itself to it
+/// with two always-on instruments: one counts how many tasks claim a surface
+/// id and reports anything above one, the other reports a ref-texture view
+/// whose owner field is not the kernel task. Either reading would mean this
+/// paragraph has stopped being true, which is why they are failures and not
+/// counters.
+///
+/// So a window in the owning task is a sufficient canonical identity for
+/// everything this device can name today — buffers, textures, shader blobs,
+/// indirect command memory and imported surfaces alike.
+///
+/// ## Open: heap identity
+///
+/// [`crate::heap`] requires a placement to take its heap's id and a byte range,
+/// because two windows the guest chose to overlap are the same bytes. A
+/// heap-placed texture names a heap reference and an offset, and the device
+/// keeps neither: there is no heap object, no heap extent, and no value that
+/// could be a heap's canonical identity. That is a decode-and-model gap rather
+/// than a wiring one, and nothing above it can be right until it is closed —
+/// two placements in one heap must not come out distinct.
+///
+/// ## Open: when the id is minted against when it can be known
+///
+/// [`crate::namespace::Namespace::declare`] wants one at declaration, and on
+/// this interface a declaration is the guest writing a record into its own
+/// object-list page — which happens before it has finished mapping the backing.
+/// A descriptor-derived window is available then; a page-derived one is not,
+/// and is also not stable, because a physical replacement re-points the same
+/// object at different pages. The settled join above says a window is
+/// sufficient, so the descriptor is the side to derive from — but a window and
+/// a *resolved* window are different values, and which one two overlapping
+/// names have to agree on is the part still to state.
+///
+/// ## Not this
+///
+/// An id derived from a resource's own name — a per-resource counter, a slot
+/// number — is the tempting shape and the forbidden one: it is what the first
+/// paragraph of this type rules out, it gets every sharing relationship wrong
+/// in the dangerous direction, and it would compile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BackingId(pub u64);
 
