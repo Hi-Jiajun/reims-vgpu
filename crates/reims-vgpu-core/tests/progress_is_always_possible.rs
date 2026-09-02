@@ -351,7 +351,7 @@ fn drive_withdrawing(
 
     let mut withdrawn: BTreeSet<IngressOrdinal> = BTreeSet::new();
     if let Some(i) = doomed {
-        model.withdraw(ordinals[i]);
+        let _ = model.withdraw(ordinals[i]);
         gate.retire(ordinals[i]);
         withdrawn.insert(ordinals[i]);
     }
@@ -444,7 +444,7 @@ fn drive_withdrawing(
         } else {
             let indices: Vec<usize> = (0..completable.len()).collect();
             let chosen = completable[policy.pick(&indices, &mut rng)];
-            model.complete(chosen);
+            let _ = model.complete(chosen);
             gate.retire(chosen);
             completed.insert(chosen);
             ready.remove(&chosen);
@@ -620,7 +620,7 @@ fn order(seed: u64, policy: Policy) -> Vec<u64> {
         if !completable.is_empty() && (submittable.is_empty() || rng.below(2) == 0) {
             let indices: Vec<usize> = (0..completable.len()).collect();
             let chosen = completable[policy.pick(&indices, &mut rng)];
-            model.complete(chosen);
+            let _ = model.complete(chosen);
             gate.retire(chosen);
             done.insert(chosen);
             ready.remove(&chosen);

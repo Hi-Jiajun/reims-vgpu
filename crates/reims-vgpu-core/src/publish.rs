@@ -37,6 +37,7 @@ use std::collections::{HashMap, VecDeque};
 
 /// What a released position publishes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a release nobody publishes is a completion word the guest polls forever"]
 pub struct Release {
     pub sequence: ChannelSequence,
     /// The stamp the guest may now read, if this position carries one. A
@@ -130,6 +131,7 @@ impl Publisher {
     ///
     /// If the position was never admitted, or has already completed.
     /// Completing twice would publish a stamp twice.
+    #[must_use = "the released positions are stamps the guest is waiting to read"]
     pub fn complete(
         &mut self,
         domain: ChannelId,
@@ -161,6 +163,7 @@ impl Publisher {
     /// If the position was never admitted, or has already completed —
     /// withdrawing completed work would discard publication the guest is owed
     /// rather than one it never will be.
+    #[must_use = "the positions behind a withdrawal are stamps the guest is waiting to read"]
     pub fn withdraw(&mut self, domain: ChannelId, sequence: ChannelSequence) -> Vec<Release> {
         let queue = self
             .domains
@@ -394,7 +397,7 @@ mod tests {
             p.retire(ChannelId(1)),
             Err(RetireRefusal::LivePositions { outstanding: 1 })
         );
-        p.complete(ChannelId(1), seq(1), None);
+        let _ = p.complete(ChannelId(1), seq(1), None);
         assert_eq!(p.retire(ChannelId(1)), Ok(()));
         // And a later definition starts at position one without joining the
         // lifetime that just ended.
@@ -416,8 +419,8 @@ mod tests {
         let mut p = Publisher::new();
         p.admit(ChannelId(1), seq(1));
         p.admit(ChannelId(1), seq(2));
-        p.complete(ChannelId(1), seq(2), None);
-        p.complete(ChannelId(1), seq(2), None);
+        let _ = p.complete(ChannelId(1), seq(2), None);
+        let _ = p.complete(ChannelId(1), seq(2), None);
     }
 
     /// A channel that has published everything it admitted still may not go

@@ -506,6 +506,7 @@ impl SessionModel {
     /// possibly a queue of them, possibly nothing. Whatever it published is
     /// also published to the readiness service, because a packet waiting on a
     /// completion word waits for the word the guest would read.
+    #[must_use = "what the channel published is what the guest may now read"]
     pub fn complete(&mut self, ingress: IngressOrdinal) -> Vec<Release> {
         let owed = self.scheduler.complete(ingress);
         self.graph.retire(ingress);
@@ -544,6 +545,7 @@ impl SessionModel {
     /// **Its own completion word is not published.** The work never ran, and a
     /// stamp published for it is a value the guest acts on. What the guest is
     /// owed instead is the typed reason, which is why the caller names one.
+    #[must_use = "what the channel published is what the guest may now read"]
     pub fn withdraw(&mut self, ingress: IngressOrdinal) -> Vec<Release> {
         // Releases this transaction's dependents and forgets what it was
         // waiting on. The stamp it owed comes back and is deliberately dropped:
@@ -717,6 +719,7 @@ impl SessionModel {
     }
 
     /// Transactions that have become ready since the last call.
+    #[must_use = "a transaction taken off the ready list and not run is one that never runs"]
     pub fn take_ready(&mut self) -> Vec<IngressOrdinal> {
         self.scheduler.take_ready()
     }
@@ -1393,7 +1396,7 @@ mod tests {
         assert_eq!(a.hazard_waits, vec![d.transaction.identity.ingress]);
         assert_eq!(s.take_ready(), vec![d.transaction.identity.ingress]);
 
-        s.withdraw(d.transaction.identity.ingress);
+        let _ = s.withdraw(d.transaction.identity.ingress);
         assert_eq!(
             s.take_ready(),
             vec![a.transaction.identity.ingress],
@@ -1521,7 +1524,7 @@ mod tests {
             s.retire_channel(ChannelId(2)),
             Err(RetireRefusal::LivePositions { outstanding: 1 })
         );
-        s.complete(a.transaction.identity.ingress);
+        let _ = s.complete(a.transaction.identity.ingress);
         assert_eq!(s.retire_channel(ChannelId(2)), Ok(()));
         assert!(
             !s.channel_open(ChannelId(2)),
@@ -1587,7 +1590,7 @@ mod tests {
         );
         assert!(s.channel_open(ChannelId(2)));
 
-        s.complete(admitted.transaction.identity.ingress);
+        let _ = s.complete(admitted.transaction.identity.ingress);
         assert_eq!(s.apply_control(free), Ok(()));
         assert_eq!(
             s.admit(&packet(0x37)),

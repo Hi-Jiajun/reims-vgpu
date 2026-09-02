@@ -338,6 +338,12 @@ impl Scheduler {
     }
 
     /// Take the transactions that have become ready since the last call.
+    ///
+    /// Taken, not read: they leave the list, so a caller that drops the answer
+    /// has transactions nothing will ever run and a channel head nothing will
+    /// ever release. Same obligation as [`Self::pipeline_refused`], arriving
+    /// through the success path instead of the refusal one.
+    #[must_use = "a transaction taken off the ready list and not run is one that never runs"]
     pub fn take_ready(&mut self) -> Vec<IngressOrdinal> {
         std::mem::take(&mut self.ready).into_iter().collect()
     }
@@ -530,7 +536,7 @@ mod tests {
         s.admit(ord(1), &[], &[], &[], Some(stamp(7, 1)));
         s.admit(ord(2), &[ord(1)], &[], &[], None);
         s.admit(ord(3), &[], &[wait(7, 1)], &[], None);
-        s.take_ready();
+        let _ = s.take_ready();
         let owed = s.complete(ord(1));
         assert_eq!(owed, Some(stamp(7, 1)));
         assert_eq!(
@@ -547,7 +553,7 @@ mod tests {
         let mut s = Scheduler::new();
         s.admit(ord(1), &[], &[], &[], None);
         s.admit(ord(2), &[ord(1)], &[wait(3, 5)], &[], None);
-        s.take_ready();
+        let _ = s.take_ready();
         s.complete(ord(1));
         assert!(s.take_ready().is_empty(), "the stamp is still unpublished");
         s.publish(stamp(3, 5));
@@ -639,7 +645,7 @@ mod tests {
         let mut s = Scheduler::new();
         s.admit(ord(1), &[], &[], &[], None);
         assert!(!s.admit(ord(2), &[ord(1)], &[wait(0, 5)], &[pipe(4)], None));
-        s.take_ready();
+        let _ = s.take_ready();
 
         s.pipeline_ready(pipe(4));
         assert!(s.take_ready().is_empty(), "the hazard and the stamp remain");
@@ -657,7 +663,7 @@ mod tests {
         let mut s = Scheduler::new();
         s.admit(ord(1), &[], &[], &[], None);
         s.admit(ord(2), &[ord(1)], &[wait(0, 5)], &[pipe(4)], None);
-        s.take_ready();
+        let _ = s.take_ready();
         s.complete(ord(1));
         assert!(s.take_ready().is_empty());
         s.publish(stamp(0, 5));
@@ -701,7 +707,7 @@ mod tests {
         let mut s = Scheduler::new();
         s.admit(ord(1), &[], &[], &[pipe(4)], None);
         s.pipeline_ready(pipe(4));
-        s.take_ready();
+        let _ = s.take_ready();
         s.complete(ord(1));
         assert_eq!(s.waiting_on_pipelines(), 0);
         s.pipeline_ready(pipe(4));

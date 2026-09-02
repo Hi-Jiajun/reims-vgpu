@@ -507,7 +507,7 @@ impl PresentStream {
     /// Call after an image is released — [`Self::complete`] — or after a
     /// swapchain is replaced with more images. Returns nothing when nothing is
     /// waiting, which is the ordinary case and is not a refusal.
-    #[must_use]
+    #[must_use = "a woken present nobody takes is a completion word nothing publishes and an image nothing releases"]
     pub fn wake(&mut self) -> Vec<(PresentRequest, Ticket)> {
         let mut woken = Vec::new();
         while !self.parked.is_empty() {

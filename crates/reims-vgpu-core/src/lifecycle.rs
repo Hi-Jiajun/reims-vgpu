@@ -359,6 +359,7 @@ impl LifecycleOp {
 
 /// A copy the device offered to drop and did not, with the reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a declined discard nobody reports is guest work the device dropped in silence"]
 pub struct Declined {
     pub resource: ResourceId,
     pub backing: BackingId,
@@ -1289,6 +1290,7 @@ impl Lifecycle {
     /// question is asked here rather than when the operation was admitted,
     /// because the transfers this transaction owed are exactly what may have
     /// changed the answer.
+    #[must_use = "the declined discards belong on the always-on failure channel"]
     pub fn complete(&mut self, effects: &Effects) -> Vec<Declined> {
         for transfer in &effects.transfers {
             self.content.record_transfer(transfer);
