@@ -255,24 +255,26 @@ impl std::fmt::Debug for Build {
 }
 
 /// The dynamic states every pipeline this rail builds declares, whatever the
-/// host offers.
+/// host offers and whatever it is drawing into.
 ///
-/// All four are Vulkan 1.0 dynamic states, so there is no capability to check
-/// and no rung to fall off. All four are also encoder commands in Metal — a
+/// All three are Vulkan 1.0 dynamic states, so there is no capability to check
+/// and no rung to fall off, and all three are encoder commands in Metal — a
 /// guest may set any of them between two draws of one pass — so a pipeline
-/// that baked one would be a pipeline per value. [`raster::RasterDynamic`]
-/// adds `DEPTH_BIAS` to this list for the same reason, and the states it adds
-/// beyond that are the ones that *do* need a capability.
-const ALWAYS_DYNAMIC: [vk::DynamicState; 5] = [
+/// that baked one would be a pipeline per value.
+///
+/// It is *only* the three that belong to no plan. Every other dynamic state
+/// this rail declares is read off the plan that decided to leave the
+/// corresponding pipeline member a placeholder — [`raster::RasterDynamic`],
+/// [`topology::InputAssemblyPlan`], [`depth_stencil::DepthStencilPlan`] — so
+/// that the placeholder and the state that replaces it are one decision. A
+/// state listed here as well would be a second decision about the same member,
+/// and the two spellings of "when is the stencil reference dynamic" are how
+/// the eight extended-dynamic-state members came to be placeheld and not
+/// declared.
+const ALWAYS_DYNAMIC: [vk::DynamicState; 3] = [
     vk::DynamicState::VIEWPORT,
     vk::DynamicState::SCISSOR,
     vk::DynamicState::BLEND_CONSTANTS,
-    vk::DynamicState::STENCIL_REFERENCE,
-    // Metal's `setStencilFrontReferenceValue:` moves the reference; the two
-    // masks are on the depth-stencil state object and are baked with it. So
-    // this list has the reference and not the masks, which is the split
-    // `depth_stencil::FacePlan` already makes by zeroing the reference.
-    vk::DynamicState::DEPTH_BOUNDS,
 ];
 
 /// Assemble a graphics pipeline from plans that have each already been checked.
@@ -386,6 +388,18 @@ pub fn build(key: GraphicsKey) -> Result<Build, Refusal> {
     // a key that also serves strips, without declaring the state, draws
     // triangle lists for every strip the guest sends.
     dynamic.extend(key.topology.input_assembly().states());
+    // The stencil reference, and — on a host that supplies the whole
+    // `MTLDepthStencilState` per draw — the eight states that go with it. Read
+    // off the plan for the same reason the two lists above are: a pipeline
+    // whose depth-stencil state is `depth_stencil`'s placeholder and which
+    // does not declare these *runs the placeholder*, which is no depth test,
+    // no depth write, a `NEVER` compare and no stencil. A pass with no
+    // depth-stencil attachment has no such state at all, so the plan is
+    // `None` and there is nothing to declare — including the reference, which
+    // would otherwise be a dynamic state with no member to move.
+    if let Some(plan) = key.depth_stencil {
+        dynamic.extend_from_slice(plan.states());
+    }
 
     Ok(Build {
         key,
@@ -991,8 +1005,8 @@ mod tests {
         assert!(!build.has_divisors());
     }
 
-    /// The six states no key carries, because a draw varies them without a
-    /// rebuild and all six are encoder commands in Metal.
+    /// The states no key carries, because a draw varies them without a rebuild
+    /// and each is an encoder command in Metal.
     #[test]
     fn every_pipeline_declares_the_states_a_draw_may_move() {
         let build = build(key()).expect("built");
@@ -1001,7 +1015,6 @@ mod tests {
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
-            vk::DynamicState::STENCIL_REFERENCE,
             vk::DynamicState::DEPTH_BIAS,
         ] {
             assert!(
@@ -1009,11 +1022,94 @@ mod tests {
                 "{wanted:?} is not dynamic"
             );
         }
+        // And not the stencil reference, on a pass with no depth-stencil
+        // attachment: there is no depth-stencil state for it to move.
+        assert!(!states.contains(&vk::DynamicState::STENCIL_REFERENCE.as_raw()));
         assert_eq!(
             states.len(),
             build.dynamic_states().len(),
             "a state is declared twice"
         );
+    }
+
+    /// Every member the depth-stencil plan left a placeholder is declared
+    /// dynamic, on both of its rungs.
+    ///
+    /// The regression: `build` read the raster plan's dynamic list and the
+    /// topology plan's and not this one, so a pipeline on a host with
+    /// `VK_EXT_extended_dynamic_state` was created with
+    /// `depth_stencil::PLACEHOLDER` baked — no depth test, no depth write, a
+    /// `NEVER` compare, no stencil — and declared none of the eight states
+    /// that were supposed to replace it. Every depth-tested draw would have
+    /// rendered with the depth test off.
+    #[test]
+    fn a_placeheld_depth_stencil_state_declares_the_states_that_replace_it() {
+        let depth_pass = |plan| GraphicsKey {
+            depth_stencil: Some(plan),
+            compatibility: compatibility(1, true),
+            ..key()
+        };
+
+        // A guest state with a stencil test, so the baked rung below has a
+        // reference to move and the dynamic rung has all nine.
+        let guest = reims_vgpu_core::depth_stencil::DepthStencilShape {
+            depth_compare_function: reims_vgpu_core::sampler::MTL_COMPARE_FUNCTION_LESS_EQUAL,
+            depth_write_enabled: true,
+            front_stencil_enabled: true,
+            back_stencil_enabled: true,
+            front: reims_vgpu_core::depth_stencil::StencilFaceShape::default(),
+            back: reims_vgpu_core::depth_stencil::StencilFaceShape::default(),
+        }
+        .checked()
+        .expect("a declaration the guest API admits");
+
+        // The dynamic rung: the whole state is supplied per draw.
+        let placeholder = depth_stencil::plan(
+            &guest,
+            depth_stencil::DepthStencilCell {
+                extended_dynamic_state: true,
+            },
+            true,
+        );
+        assert!(
+            placeholder.dynamic.is_some(),
+            "a capable host placeholds the state"
+        );
+        let built = build(depth_pass(placeholder.state)).expect("built");
+        let states: BTreeSet<_> = built.dynamic_states().iter().map(|s| s.as_raw()).collect();
+        for wanted in placeholder.state.states() {
+            assert!(
+                states.contains(&wanted.as_raw()),
+                "{wanted:?} is placeheld and not declared"
+            );
+        }
+        assert_eq!(
+            states.len(),
+            built.dynamic_states().len(),
+            "a state is declared twice"
+        );
+
+        // The baked rung: only the reference, and only where the stencil test
+        // has something to apply it to.
+        let baked = depth_stencil::plan(
+            &guest,
+            depth_stencil::DepthStencilCell {
+                extended_dynamic_state: false,
+            },
+            true,
+        );
+        assert!(baked.dynamic.is_none());
+        let built = build(depth_pass(baked.state)).expect("built");
+        let states: BTreeSet<_> = built.dynamic_states().iter().map(|s| s.as_raw()).collect();
+        for wanted in baked.state.states() {
+            assert!(
+                states.contains(&wanted.as_raw()),
+                "{wanted:?} is placeheld and not declared"
+            );
+        }
+        assert!(states.contains(&vk::DynamicState::STENCIL_REFERENCE.as_raw()));
+        assert!(!states.contains(&vk::DynamicState::DEPTH_TEST_ENABLE.as_raw()));
+        assert_eq!(states.len(), built.dynamic_states().len());
     }
 
     /// The raster cell's dynamic states join the unconditional ones, and a
