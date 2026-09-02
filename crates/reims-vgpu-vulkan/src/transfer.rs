@@ -86,6 +86,28 @@ pub enum Refusal {
     /// and it is checked rather than truncated because a truncated extent is a
     /// copy that succeeds and moves the wrong bytes.
     ExtentTooLarge { axis: &'static str, value: u64 },
+    /// The row pitch names fewer texels than the copy is wide.
+    ///
+    /// `bufferRowLength` must be zero or at least `imageExtent.width`, and a
+    /// smaller one is invalid usage: every row after the first would be read
+    /// from, or written to, an offset that overlaps the row before it. Refused
+    /// rather than widened to the extent, which would silently disagree with
+    /// the stride the guest said its bytes are at.
+    RowPitchShorterThanCopy { row_length: u32, width: u64 },
+    /// The image pitch names fewer rows than the copy is tall, for
+    /// `bufferImageHeight`'s half of the same rule.
+    ImagePitchShorterThanCopy { image_height: u32, height: u64 },
+    /// A slice stride with no row stride, on a copy of more than one slice.
+    ///
+    /// `bufferImageHeight` is texels and the only conversion from a byte
+    /// slice stride runs through the byte row stride, so with no row pitch
+    /// there is no conversion at all. Coercing it to "tightly packed" would
+    /// drop a stride the guest named and land every slice after the first at
+    /// the wrong offset --- and it is the one shape where the drop is
+    /// guest-visible, because a single-slice copy never addresses a second
+    /// slice. Refused rather than guessed at the packed row size, which is a
+    /// term this wire has not established.
+    ImagePitchWithoutRowPitch { bytes_per_image: u64, depth: u64 },
     /// A blit-encoder operation that is not a copy, and so has no native
     /// transfer form at all.
     ///
@@ -106,6 +128,9 @@ impl Refusal {
             Self::NoStaging { .. } => "vk_transfer_no_staging",
             Self::EmptyRange => "vk_transfer_empty_range",
             Self::ExtentTooLarge { .. } => "vk_transfer_extent_too_large",
+            Self::RowPitchShorterThanCopy { .. } => "vk_transfer_row_pitch_shorter_than_copy",
+            Self::ImagePitchShorterThanCopy { .. } => "vk_transfer_image_pitch_shorter_than_copy",
+            Self::ImagePitchWithoutRowPitch { .. } => "vk_transfer_image_pitch_without_row_pitch",
             Self::NotACopy { .. } => "vk_transfer_not_a_copy",
         }
     }
@@ -142,6 +167,25 @@ impl std::fmt::Display for Refusal {
             Self::ExtentTooLarge { axis, value } => {
                 write!(f, "{} axis={axis} value={value}", self.slug())
             }
+            Self::RowPitchShorterThanCopy { row_length, width } => {
+                write!(f, "{} row_length={row_length} width={width}", self.slug())
+            }
+            Self::ImagePitchShorterThanCopy {
+                image_height,
+                height,
+            } => write!(
+                f,
+                "{} image_height={image_height} height={height}",
+                self.slug()
+            ),
+            Self::ImagePitchWithoutRowPitch {
+                bytes_per_image,
+                depth,
+            } => write!(
+                f,
+                "{} bytes_per_image={bytes_per_image} depth={depth}",
+                self.slug()
+            ),
             Self::NotACopy { op } => write!(f, "{} op={op}", self.slug()),
         }
     }
@@ -217,18 +261,33 @@ fn layers(texture: Texture, point: TexturePoint) -> Result<vk::ImageSubresourceL
     })
 }
 
-/// The buffer-side pitch of a linear image, in texels.
+/// The buffer-side pitch of a linear image, in texels, for a copy of `size`.
 ///
 /// Zero is the guest saying "tightly packed", and Vulkan spells that with zero
 /// too, so it passes through rather than being computed — computing it would
 /// produce the same number for a tightly packed copy and a different one for a
 /// copy whose extent is not the whole row.
 ///
+/// # The copy's extent is a parameter because the pitch is only legal against it
+///
+/// A pitch is not well-formed on its own: `bufferRowLength` must be zero or at
+/// least the copy's width and `bufferImageHeight` zero or at least its height,
+/// and a byte slice stride with no byte row stride cannot be converted at all.
+/// Those are three facts about a *pair*, so taking the size here is what lets
+/// the pair be refused in one place instead of leaving a caller to re-derive
+/// them — or, as this did, to record a copy the guest's own numbers say is
+/// something else.
+///
 /// # Errors
 ///
-/// [`Refusal`] when the byte pitch is not a whole number of blocks or rows, or
-/// when this build has no geometry for the format.
-pub fn texel_pitch(texture: Texture, pitch: ImagePitch) -> Result<(u32, u32), Refusal> {
+/// [`Refusal`] when the byte pitch is not a whole number of blocks or rows,
+/// when it cannot describe a copy of `size`, or when this build has no
+/// geometry for the format.
+pub fn texel_pitch(
+    texture: Texture,
+    pitch: ImagePitch,
+    size: Size3,
+) -> Result<(u32, u32), Refusal> {
     let format = texture.pixel_format();
     let block = block_geometry(format).ok_or(Refusal::UnknownFormatGeometry { format })?;
     let block_bytes = u64::from(block.bytes);
@@ -251,7 +310,25 @@ pub fn texel_pitch(texture: Texture, pitch: ImagePitch) -> Result<(u32, u32), Re
         )?
     };
 
-    let image_height = if pitch.bytes_per_image == 0 || pitch.bytes_per_row == 0 {
+    if row_length != 0 && u64::from(row_length) < size.width {
+        return Err(Refusal::RowPitchShorterThanCopy {
+            row_length,
+            width: size.width,
+        });
+    }
+
+    let image_height = if pitch.bytes_per_image == 0 {
+        0
+    } else if pitch.bytes_per_row == 0 {
+        // No row stride to divide by. A copy one slice deep never addresses a
+        // second slice, so the stride changes nothing and the tight answer is
+        // exact; a deeper one has no answer at all.
+        if size.depth > 1 {
+            return Err(Refusal::ImagePitchWithoutRowPitch {
+                bytes_per_image: pitch.bytes_per_image,
+                depth: size.depth,
+            });
+        }
         0
     } else {
         if !pitch.bytes_per_image.is_multiple_of(pitch.bytes_per_row) {
@@ -265,6 +342,13 @@ pub fn texel_pitch(texture: Texture, pitch: ImagePitch) -> Result<(u32, u32), Re
             (pitch.bytes_per_image / pitch.bytes_per_row) * u64::from(block.height),
         )?
     };
+
+    if image_height != 0 && u64::from(image_height) < size.height {
+        return Err(Refusal::ImagePitchShorterThanCopy {
+            image_height,
+            height: size.height,
+        });
+    }
 
     Ok((row_length, image_height))
 }
@@ -598,7 +682,7 @@ fn buffer_image_region(
     point: TexturePoint,
     size: Size3,
 ) -> Result<vk::BufferImageCopy, Refusal> {
-    let (row_length, image_height) = texel_pitch(texture, pitch)?;
+    let (row_length, image_height) = texel_pitch(texture, pitch, size)?;
     Ok(vk::BufferImageCopy {
         buffer_offset,
         buffer_row_length: row_length,
@@ -822,7 +906,12 @@ mod tests {
                 ImagePitch {
                     bytes_per_row: 256,
                     bytes_per_image: 256 * 32,
-                }
+                },
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 1,
+                },
             ),
             Ok((64, 32))
         );
@@ -841,7 +930,12 @@ mod tests {
                 ImagePitch {
                     bytes_per_row: 256,
                     bytes_per_image: 256 * 8,
-                }
+                },
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 1,
+                },
             ),
             // Eight rows of blocks, each spanning four texels vertically.
             Ok((64, 32))
@@ -857,19 +951,30 @@ mod tests {
                 ImagePitch {
                     bytes_per_row: 0,
                     bytes_per_image: 0,
-                }
+                },
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 1,
+                },
             ),
             Ok((0, 0))
         );
-        // An image pitch with no row pitch has nothing to be a multiple of, so
-        // it is tight too rather than a division by zero.
+        // An image pitch with no row pitch has nothing to be a multiple of.
+        // On a copy one slice deep the stride is never addressed, so the tight
+        // answer is exact rather than a division by zero.
         assert_eq!(
             texel_pitch(
                 flat,
                 ImagePitch {
                     bytes_per_row: 0,
                     bytes_per_image: 1024,
-                }
+                },
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 1,
+                },
             ),
             Ok((0, 0))
         );
@@ -884,7 +989,12 @@ mod tests {
                 ImagePitch {
                     bytes_per_row: 258,
                     bytes_per_image: 0,
-                }
+                },
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 1,
+                },
             ),
             Err(Refusal::RowPitchNotWholeBlocks {
                 bytes_per_row: 258,
@@ -897,7 +1007,12 @@ mod tests {
                 ImagePitch {
                     bytes_per_row: 256,
                     bytes_per_image: 300,
-                }
+                },
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 1,
+                },
             ),
             Err(Refusal::ImagePitchNotWholeRows {
                 bytes_per_image: 300,
@@ -928,7 +1043,12 @@ mod tests {
                 ImagePitch {
                     bytes_per_row: 16,
                     bytes_per_image: 0,
-                }
+                },
+                Size3 {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                },
             ),
             Err(Refusal::UnknownFormatGeometry { format: 0xFFFF })
         );
@@ -1463,6 +1583,18 @@ mod tests {
                 axis: "width",
                 value: 1,
             },
+            Refusal::RowPitchShorterThanCopy {
+                row_length: 1,
+                width: 2,
+            },
+            Refusal::ImagePitchShorterThanCopy {
+                image_height: 1,
+                height: 2,
+            },
+            Refusal::ImagePitchWithoutRowPitch {
+                bytes_per_image: 1,
+                depth: 2,
+            },
             Refusal::NotACopy { op: "x" },
         ];
         let slugs: BTreeSet<&str> = refusals.iter().map(|r| r.slug()).collect();
@@ -1471,5 +1603,129 @@ mod tests {
             assert!(refusal.to_string().starts_with(refusal.slug()));
             assert!(refusal.slug().starts_with("vk_transfer_"));
         }
+    }
+
+    /// The failure this exists to prevent: a `bufferRowLength` shorter than the
+    /// copy is wide is invalid usage, and every row after the first lands
+    /// overlapping the one before it. The guest's own numbers say the copy is
+    /// something other than what a widened pitch would record.
+    #[test]
+    fn a_row_pitch_shorter_than_the_copy_is_wide_refuses() {
+        let flat = texture(MTL_FORMAT_RGBA8_UNORM, 64, 32, 1, 1);
+        assert_eq!(
+            texel_pitch(
+                flat,
+                ImagePitch {
+                    bytes_per_row: 128,
+                    bytes_per_image: 0,
+                },
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 1,
+                },
+            ),
+            Err(Refusal::RowPitchShorterThanCopy {
+                row_length: 32,
+                width: 64,
+            })
+        );
+        // Exactly the width is legal, and so is a wider row --- a copy of part
+        // of a wider image is the ordinary reason a pitch exists.
+        for bytes_per_row in [256, 512] {
+            assert!(texel_pitch(
+                flat,
+                ImagePitch {
+                    bytes_per_row,
+                    bytes_per_image: 0,
+                },
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 1,
+                },
+            )
+            .is_ok());
+        }
+    }
+
+    /// `bufferImageHeight`'s half of the same rule.
+    #[test]
+    fn an_image_pitch_shorter_than_the_copy_is_tall_refuses() {
+        let flat = texture(MTL_FORMAT_RGBA8_UNORM, 64, 32, 1, 1);
+        assert_eq!(
+            texel_pitch(
+                flat,
+                ImagePitch {
+                    bytes_per_row: 256,
+                    bytes_per_image: 256 * 16,
+                },
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 1,
+                },
+            ),
+            Err(Refusal::ImagePitchShorterThanCopy {
+                image_height: 16,
+                height: 32,
+            })
+        );
+    }
+
+    /// A slice stride the conversion cannot reach, on the one copy shape where
+    /// dropping it is visible. Coerced to "tightly packed" this planned a copy
+    /// whose second slice lands wherever the packed size happens to put it,
+    /// while the semantic model's own `ImagePitch::span_bytes` reserved
+    /// `bytes_per_image * depth` for the same operation --- two layers
+    /// disagreeing about one guest field.
+    #[test]
+    fn a_slice_stride_with_no_row_stride_refuses_once_a_second_slice_exists() {
+        let volume = TextureShape {
+            kind: TextureKind::D3.ordinal(),
+            width: 64,
+            height: 32,
+            depth: 4,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            pixel_format: MTL_FORMAT_RGBA8_UNORM,
+            usage: TextureUsage::SHADER_READ,
+        }
+        .checked()
+        .expect("a valid declaration");
+        let pitch = ImagePitch {
+            bytes_per_row: 0,
+            bytes_per_image: 256 * 32,
+        };
+        assert_eq!(
+            texel_pitch(
+                volume,
+                pitch,
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 4,
+                },
+            ),
+            Err(Refusal::ImagePitchWithoutRowPitch {
+                bytes_per_image: 256 * 32,
+                depth: 4,
+            })
+        );
+        // One slice deep, the stride is never addressed and the tight answer
+        // is exact. Refusing here would lose a copy that is entirely correct.
+        assert_eq!(
+            texel_pitch(
+                volume,
+                pitch,
+                Size3 {
+                    width: 64,
+                    height: 32,
+                    depth: 1,
+                },
+            ),
+            Ok((0, 0))
+        );
     }
 }
