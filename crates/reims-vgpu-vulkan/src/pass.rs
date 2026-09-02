@@ -192,6 +192,21 @@ pub enum Refusal {
     ExtentTooLarge { axis: &'static str, value: u64 },
     /// The render target has no extent at all.
     ZeroExtent { width: u64, height: u64 },
+    /// One attachment named both an array slice and a depth plane.
+    ///
+    /// They are the same axis — [`Attachment::subresource`] says so and adds
+    /// them for exactly that reason — and which of the two a texture has is
+    /// the texture's property, so only one of them is ever non-zero. Both
+    /// non-zero is a contradiction for every texture there is: a volume has no
+    /// array slices and an array has no depth planes. Summing them anyway
+    /// attaches a third slice, and the pass runs and renders into it.
+    SliceAndDepthPlane {
+        slot: AttachmentSlot,
+        /// The attachment itself, or the target it resolves to.
+        which: &'static str,
+        slice: u16,
+        depth_plane: u16,
+    },
 }
 
 impl Refusal {
@@ -205,6 +220,7 @@ impl Refusal {
             Self::NonFiniteDepthClear { .. } => "vk_pass_non_finite_depth_clear",
             Self::ExtentTooLarge { .. } => "vk_pass_extent_too_large",
             Self::ZeroExtent { .. } => "vk_pass_zero_extent",
+            Self::SliceAndDepthPlane { .. } => "vk_pass_slice_and_depth_plane",
         }
     }
 }
@@ -243,6 +259,17 @@ impl std::fmt::Display for Refusal {
             Self::ZeroExtent { width, height } => {
                 write!(f, "{} width={width} height={height}", self.slug())
             }
+            Self::SliceAndDepthPlane {
+                slot,
+                which,
+                slice,
+                depth_plane,
+            } => write!(
+                f,
+                "{} slot={} which={which} slice={slice} depth_plane={depth_plane}",
+                self.slug(),
+                slot_name(*slot)
+            ),
         }
     }
 }
@@ -371,6 +398,33 @@ pub const fn store_op(action: StoreAction) -> vk::AttachmentStoreOp {
     }
 }
 
+/// The one subresource an attachment names, and the one its resolve target
+/// receives.
+///
+/// [`Attachment::subresource`] and [`Attachment::resolve_subresource`] already
+/// derive these, and the model owns the rule they rest on: the array slice and
+/// the depth plane are the same axis, and "only one of the fields is non-zero
+/// for a given" texture. Read from there rather than added again here — a
+/// second derivation of one decision is how two layers come to disagree about
+/// which slice a pass renders into.
+///
+/// The rule is checked and not assumed, and it needs no texture to check: a
+/// volume has no array slices and an array has no depth planes, so both
+/// non-zero contradicts every texture there is. Summing them regardless names
+/// a third slice, and a pass that renders into it runs.
+fn subresource_of(attachment: &Attachment) -> Result<(u32, u32), Refusal> {
+    if attachment.slice != 0 && attachment.depth_plane != 0 {
+        return Err(Refusal::SliceAndDepthPlane {
+            slot: attachment.slot,
+            which: "attachment",
+            slice: attachment.slice,
+            depth_plane: attachment.depth_plane,
+        });
+    }
+    let range = attachment.subresource();
+    Ok((range.base_level, range.base_slice))
+}
+
 fn resolve_of(attachment: &Attachment) -> Result<Option<Resolve>, Refusal> {
     if !attachment.store.resolves() {
         return Ok(None);
@@ -380,10 +434,19 @@ fn resolve_of(attachment: &Attachment) -> Result<Option<Resolve>, Refusal> {
         .ok_or(Refusal::ResolveWithoutTarget {
             slot: attachment.slot,
         })?;
+    if attachment.resolve_slice != 0 && attachment.resolve_depth_plane != 0 {
+        return Err(Refusal::SliceAndDepthPlane {
+            slot: attachment.slot,
+            which: "resolve",
+            slice: attachment.resolve_slice,
+            depth_plane: attachment.resolve_depth_plane,
+        });
+    }
+    let range = attachment.resolve_subresource();
     Ok(Some(Resolve {
         texture,
-        level: u32::from(attachment.resolve_level),
-        slice: u32::from(attachment.resolve_slice) + u32::from(attachment.resolve_depth_plane),
+        level: range.base_level,
+        slice: range.base_slice,
     }))
 }
 
@@ -435,11 +498,12 @@ pub fn plan(
                     .map(|components| ClearColor::of(format_of(texture), components))
             })
             .flatten();
+        let (level, slice) = subresource_of(attachment)?;
         color.push(AttachmentPlan {
             slot: attachment.slot,
             texture,
-            level: u32::from(attachment.level),
-            slice: u32::from(attachment.slice) + u32::from(attachment.depth_plane),
+            level,
+            slice,
             load: load_op(attachment.load),
             store: store_op(attachment.store),
             clear,
@@ -527,10 +591,11 @@ fn depth_stencil_of(descriptor: &PassDescriptor) -> Result<Option<DepthStencilPl
         0
     };
 
+    let (level, slice) = subresource_of(carrier)?;
     Ok(Some(DepthStencilPlan {
         texture,
-        level: u32::from(carrier.level),
-        slice: u32::from(carrier.slice) + u32::from(carrier.depth_plane),
+        level,
+        slice,
         depth: depth.map(|_| Ops {
             load: load_op(descriptor.depth.load),
             store: store_op(descriptor.depth.store),
@@ -646,6 +711,81 @@ mod tests {
             .dynamic_rendering,
             Some(Declined::Narrowed)
         );
+    }
+
+    /// The array slice and the depth plane are one axis, and the model says so
+    /// by adding them. Both non-zero contradicts every texture there is — a
+    /// volume has no array slices, an array has no depth planes — so the sum
+    /// would name a third slice and the pass would render into it. Refused on
+    /// the attachment and on its resolve target, which are two subresources
+    /// and two chances to say it.
+    #[test]
+    fn an_attachment_that_names_both_a_slice_and_a_depth_plane_is_refused() {
+        let mut descriptor = empty();
+        attach(&mut descriptor, 0, id(10));
+        descriptor.color[0].slice = 1;
+        descriptor.color[0].depth_plane = 2;
+        assert_eq!(
+            plan(&descriptor, colour()),
+            Err(Refusal::SliceAndDepthPlane {
+                slot: AttachmentSlot::Color(0),
+                which: "attachment",
+                slice: 1,
+                depth_plane: 2,
+            })
+        );
+
+        // Either one alone is the same slice on the one axis, and legal.
+        descriptor.color[0].depth_plane = 0;
+        assert_eq!(
+            plan(&descriptor, colour()).expect("plannable").color[0].slice,
+            1
+        );
+        descriptor.color[0].slice = 0;
+        descriptor.color[0].depth_plane = 2;
+        assert_eq!(
+            plan(&descriptor, colour()).expect("plannable").color[0].slice,
+            2
+        );
+
+        // And the resolve target is checked in its own right.
+        descriptor.color[0].depth_plane = 0;
+        descriptor.color[0].store = StoreAction::StoreAndMultisampleResolve;
+        descriptor.color[0].resolve_texture = Some(id(11));
+        descriptor.color[0].resolve_slice = 3;
+        descriptor.color[0].resolve_depth_plane = 4;
+        assert_eq!(
+            plan(&descriptor, colour()),
+            Err(Refusal::SliceAndDepthPlane {
+                slot: AttachmentSlot::Color(0),
+                which: "resolve",
+                slice: 3,
+                depth_plane: 4,
+            })
+        );
+    }
+
+    /// One derivation, not two: the subresources this plan carries are the
+    /// model's own answer for the same attachment.
+    #[test]
+    fn the_plans_subresources_are_the_models_own() {
+        let mut descriptor = empty();
+        attach(&mut descriptor, 0, id(10));
+        descriptor.color[0].level = 3;
+        descriptor.color[0].depth_plane = 5;
+        descriptor.color[0].store = StoreAction::StoreAndMultisampleResolve;
+        descriptor.color[0].resolve_texture = Some(id(11));
+        descriptor.color[0].resolve_level = 2;
+        descriptor.color[0].resolve_slice = 6;
+
+        let plan = plan(&descriptor, colour()).expect("plannable");
+        let model = descriptor.color[0].subresource();
+        assert_eq!(plan.color[0].level, model.base_level);
+        assert_eq!(plan.color[0].slice, model.base_slice);
+        let resolve = plan.color[0].resolve.expect("a resolve target");
+        let model = descriptor.color[0].resolve_subresource();
+        assert_eq!(resolve.level, model.base_level);
+        assert_eq!(resolve.slice, model.base_slice);
     }
 
     #[test]
@@ -977,6 +1117,12 @@ mod tests {
             },
             Refusal::DepthStencilDisagree { field: "level" },
             Refusal::NonFiniteDepthClear { value: 1 },
+            Refusal::SliceAndDepthPlane {
+                slot: AttachmentSlot::Depth,
+                which: "attachment",
+                slice: 1,
+                depth_plane: 2,
+            },
         ];
         let slugs: BTreeSet<&str> = refusals.iter().map(|r| r.slug()).collect();
         assert_eq!(slugs.len(), refusals.len());
