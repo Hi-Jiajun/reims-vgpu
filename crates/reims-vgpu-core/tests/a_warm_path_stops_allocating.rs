@@ -578,16 +578,42 @@ fn walking_an_exec_does_not_allocate_per_record() {
         allocations
     };
 
-    let small = cost(32);
-    let large = cost(128);
+    // The marginal cost, measured twice a decade apart. Anything per record
+    // shows up here as a factor of four; amortised vector growth shows up as
+    // a couple of doublings.
+    let (one, eight) = (cost(1), cost(8));
+    let (small, large) = (cost(32), cost(128));
     assert!(
-        small < 32,
-        "{small} trips for thirty-two binds and thirty-two draws is one per \
-         record"
+        eight - one <= 8,
+        "one pair costs {one} and eight cost {eight}: eight times the records \
+         for {} more trips",
+        eight - one
     );
     assert!(
-        large <= small + 16,
-        "{large} trips for 128 pairs against {small} for 32: the cost is \
-         linear in the records rather than logarithmic"
+        large - small <= 8,
+        "32 pairs cost {small} and 128 cost {large}: four times the records \
+         for {} more trips",
+        large - small
+    );
+
+    // And the fixed cost, named rather than left implicit --- it is what the
+    // two bounds above are differences of, and a bound written only as
+    // "fewer than one per record" would have been satisfied by it alone.
+    //
+    // Every vector the builder and the arenas carry starts empty, so the
+    // first record that reaches each one allocates it. That is why walking a
+    // single pair already costs twenty-odd trips and walking a hundred and
+    // twenty-eight costs barely more.
+    //
+    // It is per EXEC rather than per draw, so it is outside the plan's zero.
+    // What would remove it is a recycled builder: `walk::exec` consumes one
+    // and `ExecWork` does not hand its storage back, so every EXEC starts
+    // cold. That door is deliberately not opened here --- there is no
+    // production caller to size a pool against, and a pool with no caller is
+    // a guess. Pinning the number is what makes adding one a visible
+    // improvement and losing the arenas a visible regression.
+    assert!(
+        (16..=32).contains(&one),
+        "{one} trips to walk one bind and one draw through a fresh builder"
     );
 }
