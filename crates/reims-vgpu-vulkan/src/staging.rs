@@ -319,6 +319,10 @@ impl Arena {
             if index == self.open {
                 continue;
             }
+            // Redundant with `take_from`'s own state check, which is the one
+            // that decides. Kept because it is the half a reader of this loop
+            // can see, and because it skips the alignment arithmetic for a
+            // chunk that cannot answer.
             if self.chunks[index].state != ChunkState::Open {
                 continue;
             }
@@ -668,5 +672,244 @@ mod tests {
     #[should_panic(expected = "nonCoherentAtomSize is a power of two")]
     fn an_atom_that_is_not_a_power_of_two_is_refused() {
         let _ = arena(1, 96);
+    }
+
+    // ---- A driven history of the arena's capacity and its lifetime -------
+    //
+    // Two claims, and neither is visible in one call. The first is that two
+    // live windows never overlap --- an overlap is one upload writing over
+    // another's bytes between the `memcpy` and the copy command, which
+    // produces a wrong frame and no error anywhere. The second is that a
+    // chunk's bytes are only reused after the timeline says the submission
+    // that read them has completed; reusing them earlier is a write into
+    // memory the GPU is still reading.
+    //
+    // The shadow follows the calls' arguments. It never asks the arena which
+    // chunk is open, what a chunk's state is, or how much is used.
+
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            if bound == 0 {
+                return 0;
+            }
+            self.next() % bound
+        }
+    }
+
+    /// One chunk, as the shadow holds it: what submission owns it, and every
+    /// window handed out of it since it was last reset.
+    #[derive(Default, Clone)]
+    struct ShadowChunk {
+        /// `None` is open. `Some(point)` is named by a submission signalling
+        /// that point.
+        submitted: Option<u64>,
+        /// Whether anything has been taken from it since the last reset ---
+        /// the shadow's own answer to "does a submission cost this chunk".
+        dirty: bool,
+        live: Vec<(u64, u64)>,
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        allocated: usize,
+        out_of_order: usize,
+        rolled: usize,
+        bad_alignment: usize,
+        too_large: usize,
+        exhausted: usize,
+        submitted: usize,
+        recycled: usize,
+        flushes: usize,
+    }
+
+    #[test]
+    fn a_driven_history_never_hands_out_bytes_that_are_still_in_flight() {
+        const CHUNKS: usize = 3;
+        let mut tally = Tally::default();
+
+        for seed in 0..500_u64 {
+            let mut rng = Rng::new(seed);
+            let atom = 1 << (1 + rng.below(7));
+            let mut arena = arena(CHUNKS, atom);
+            let mut shadow = vec![ShadowChunk::default(); CHUNKS];
+            let mut clock = 0_u64;
+
+            for _ in 0..60 {
+                match rng.below(16) {
+                    0..=9 => {
+                        // Sizes that mostly fit and sometimes do not, and one
+                        // alignment in eight that is not a power of two.
+                        let size = match rng.below(8) {
+                            0 => CHUNK + 1 + rng.below(64),
+                            _ => 1 + rng.below(CHUNK / 3),
+                        };
+                        let alignment = match rng.below(8) {
+                            0 => 3 + rng.below(5) * 2,
+                            n => 1 << (n - 1),
+                        };
+                        // A bump pointer per chunk, which is what the module
+                        // says it is --- and the padding an alignment costs is
+                        // part of the room question, not a detail beside it.
+                        let open_with_room = alignment.is_power_of_two()
+                            && size <= CHUNK
+                            && shadow.iter().any(|c| {
+                                let used = c.live.last().map_or(0, |&(_, end)| end);
+                                c.submitted.is_none()
+                                    && used.next_multiple_of(alignment) + size <= CHUNK
+                            });
+                        match arena.allocate(size, alignment) {
+                            Ok(window) => {
+                                assert!(alignment.is_power_of_two());
+                                assert!(size <= CHUNK);
+                                assert!(window.chunk < CHUNKS);
+                                assert_eq!(window.size, size);
+                                assert_eq!(
+                                    window.offset % alignment,
+                                    0,
+                                    "a window that is not aligned is one a driver rejects"
+                                );
+                                assert!(window.end() <= CHUNK, "past the end of the chunk");
+                                let chunk = &mut shadow[window.chunk];
+                                assert!(
+                                    chunk.submitted.is_none(),
+                                    "handed out bytes of a chunk a submission is still reading"
+                                );
+                                for &(start, end) in &chunk.live {
+                                    assert!(
+                                        window.end() <= start || window.offset >= end,
+                                        "window {}..{} overlaps a live {start}..{end}",
+                                        window.offset,
+                                        window.end()
+                                    );
+                                }
+                                chunk.live.push((window.offset, window.end()));
+                                chunk.dirty = true;
+                                tally.allocated += 1;
+
+                                // Every window is flushable, and the range a
+                                // flush covers must be one Vulkan accepts.
+                                let (start, length) = arena.flush_range(window);
+                                assert_eq!(start % atom, 0, "an unaligned flush offset");
+                                assert!(start <= window.offset);
+                                assert!(start + length >= window.end(), "the flush misses bytes");
+                                assert!(start + length <= CHUNK);
+                                assert!(
+                                    length % atom == 0 || start + length == CHUNK,
+                                    "a flush size Vulkan refuses: {length} against atom {atom}"
+                                );
+                                tally.flushes += 1;
+                            }
+                            Err(Refusal::BadAlignment { alignment: named }) => {
+                                assert_eq!(named, alignment);
+                                assert!(!alignment.is_power_of_two());
+                                tally.bad_alignment += 1;
+                            }
+                            Err(Refusal::TooLarge { requested, chunk }) => {
+                                assert_eq!((requested, chunk), (size, CHUNK));
+                                assert!(size > CHUNK);
+                                tally.too_large += 1;
+                            }
+                            Err(Refusal::Exhausted { chunks, .. }) => {
+                                assert_eq!(chunks, CHUNKS);
+                                assert!(
+                                    !open_with_room,
+                                    "refused an allocation an open chunk had room for"
+                                );
+                                tally.exhausted += 1;
+                            }
+                        }
+                    }
+                    10..=12 => {
+                        clock += 1;
+                        // Mostly the newest point, and sometimes an older one.
+                        // A monotone driver can never tell whether the arena
+                        // keeps the later of two points, because with a
+                        // monotone clock the later one is always the new one
+                        // --- so the rule the module states about a chunk named
+                        // twice would go undriven.
+                        let at = if rng.below(3) == 0 {
+                            clock.saturating_sub(1 + rng.below(3))
+                        } else {
+                            clock
+                        };
+                        arena.submitted(TimelinePoint(at));
+                        for chunk in &mut shadow {
+                            if !chunk.dirty {
+                                continue;
+                            }
+                            // Forward only: two submissions may read one chunk
+                            // and the later one is what frees it.
+                            chunk.submitted =
+                                Some(chunk.submitted.map_or(at, |prior| prior.max(at)));
+                        }
+                        if shadow.iter().any(|c| c.dirty) {
+                            tally.submitted += 1;
+                            if at < clock {
+                                tally.out_of_order += 1;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Sometimes short of the newest point, so a chunk that
+                        // is still in flight stays that way.
+                        let reached = clock.saturating_sub(rng.below(3));
+                        let expected = shadow
+                            .iter()
+                            .filter(|c| c.submitted.is_some_and(|at| reached >= at))
+                            .count();
+                        assert_eq!(arena.recycle(TimelinePoint(reached)), expected);
+                        for chunk in &mut shadow {
+                            if chunk.submitted.is_some_and(|at| reached >= at) {
+                                *chunk = ShadowChunk::default();
+                            }
+                        }
+                        tally.recycled += 1;
+                    }
+                }
+
+                // Whatever the arena believes about its own chunks, the shadow
+                // believes the same --- derived from the calls and nothing else.
+                for (index, chunk) in arena.chunks().iter().enumerate() {
+                    let expected = match shadow[index].submitted {
+                        None => ChunkState::Open,
+                        Some(at) => ChunkState::Submitted(TimelinePoint(at)),
+                    };
+                    assert_eq!(chunk.state(), expected, "chunk {index}");
+                    assert_eq!(
+                        chunk.used(),
+                        shadow[index].live.last().map_or(0, |&(_, end)| end),
+                        "chunk {index} used"
+                    );
+                }
+                assert_eq!(
+                    arena.in_flight(),
+                    shadow.iter().filter(|c| c.submitted.is_some()).count()
+                );
+            }
+            tally.rolled += arena.census().rolled;
+        }
+
+        assert!(tally.allocated > 5_000, "{}", tally.allocated);
+        assert!(tally.rolled > 500, "{}", tally.rolled);
+        assert!(tally.bad_alignment > 500, "{}", tally.bad_alignment);
+        assert!(tally.too_large > 500, "{}", tally.too_large);
+        assert!(tally.exhausted > 500, "{}", tally.exhausted);
+        assert!(tally.submitted > 2_000, "{}", tally.submitted);
+        assert!(tally.out_of_order > 500, "{}", tally.out_of_order);
+        assert!(tally.recycled > 2_000, "{}", tally.recycled);
+        assert!(tally.flushes > 5_000, "{}", tally.flushes);
     }
 }
