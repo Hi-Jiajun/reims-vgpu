@@ -50,8 +50,15 @@ use reims_vgpu_core::storage_mode::StorageMode;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostCell {
     pub topology: MemoryTopology,
-    /// `VK_EXT_external_memory_host` is present, so guest pages can be imported
-    /// as device memory.
+    /// Guest pages can be imported as device memory.
+    ///
+    /// Not "`VK_EXT_external_memory_host` is present": the extension publishes
+    /// no feature structure, so the name says only that the entry points
+    /// resolve. [`crate::census::Census::take`] qualifies it against the
+    /// device's own answers --- the host-allocation handle type is importable,
+    /// and the stated import alignment is one a pointer can meet --- because
+    /// [`Route::DirectAlias`] is the one route with no copy left to fall back
+    /// to if the import is then refused.
     pub host_pointer_import: bool,
 }
 

@@ -206,6 +206,23 @@ pub struct Reported<'a> {
     /// device reported one. See [`crate::buffer::BufferLimits`] for why the
     /// absence is carried rather than substituted.
     pub max_buffer_size: Option<u64>,
+    /// Whether `vkGetPhysicalDeviceExternalBufferProperties` reported
+    /// `VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT` for
+    /// `HOST_ALLOCATION_EXT`.
+    ///
+    /// `VK_EXT_external_memory_host` has no feature structure, so this is the
+    /// only thing that plays the part one would: the extension name says the
+    /// entry points resolve, and this says the handle type can actually be
+    /// imported. Measured by the caller because the census asks no driver
+    /// anything, exactly like `vertex_formats`.
+    pub host_pointer_importable: bool,
+    /// `VkPhysicalDeviceExternalMemoryHostPropertiesEXT::minImportedHostPointerAlignment`.
+    ///
+    /// The granularity a host pointer and an allocation size must both meet.
+    /// It is a device fact and not a page size — MoltenVK reports Apple's and
+    /// a Linux driver may report more — so it is asked for rather than
+    /// assumed. Zero means the device never filled it in.
+    pub min_imported_host_pointer_alignment: u64,
     pub memory: &'a vk::PhysicalDeviceMemoryProperties,
     pub queue_families: &'a [vk::QueueFamilyProperties],
 }
@@ -419,6 +436,31 @@ impl Census {
         // the two facts was missing.
         let push_descriptor = reported.has(extension::PUSH_DESCRIPTOR) || api.at_least(1, 4);
 
+        // `VK_EXT_external_memory_host` publishes no feature structure, so the
+        // extension list is the whole of what a name can say about it --- and
+        // the module's rule is that a name is not a capability. Two measured
+        // facts stand in for the missing feature bit, and both are needed:
+        //
+        // - the device reports the host-allocation handle type as importable
+        //   at all, which is a `vkGetPhysicalDeviceExternalBufferProperties`
+        //   answer and not an entry-point question;
+        // - it states an alignment a pointer can actually meet. Zero is a
+        //   device that never filled the property in, and a value that is not
+        //   a power of two is one no pointer is aligned to and no span mask
+        //   can round to.
+        //
+        // Without these this rail would offer `Route::DirectAlias` on the
+        // strength of a name, and the refusal would arrive at
+        // `vkAllocateMemory` --- after placement had already promised the
+        // guest's pages *are* the resource, which is the one route with no
+        // copy to fall back to.
+        let host_pointer_import = reported.has(extension::EXTERNAL_MEMORY_HOST)
+            && reported.host_pointer_importable
+            && reported.min_imported_host_pointer_alignment != 0
+            && reported
+                .min_imported_host_pointer_alignment
+                .is_power_of_two();
+
         Ok(Self {
             api,
             memory: classify_memory(reported.memory),
@@ -493,7 +535,7 @@ impl Census {
                 // a driver that reported less than one.
                 max_anisotropy: reported.max_sampler_anisotropy,
             },
-            host_pointer_import: reported.has(extension::EXTERNAL_MEMORY_HOST),
+            host_pointer_import,
             // 1.3 promoted it to core, so a 1.3 device has it whether or not it
             // enumerates the extension. Below that both facts are needed, for
             // the reason above.
@@ -508,7 +550,12 @@ impl Census {
                 push_descriptor: reported.has(extension::PUSH_DESCRIPTOR) && !api.at_least(1, 4),
                 descriptor_buffer,
                 mesh_shader,
-                external_memory_host: reported.has(extension::EXTERNAL_MEMORY_HOST),
+                // The qualified answer, like `descriptor_buffer` and
+                // `mesh_shader` above: an extension enabled for a capability
+                // this device does not offer is a name in
+                // `ppEnabledExtensionNames` that no decision here will ever
+                // read.
+                external_memory_host: host_pointer_import,
                 synchronization2: reported.has(extension::SYNCHRONIZATION_2)
                     && reported.synchronization2
                     && !api.at_least(1, 3),
@@ -789,6 +836,11 @@ mod tests {
             descriptor_buffer: false,
             max_push_descriptors: 0,
             max_buffer_size: None,
+            // The two facts that qualify the import capability, at the values
+            // an import-capable device reports. A test that wants the
+            // extension present and the capability absent clears one of them.
+            host_pointer_importable: true,
+            min_imported_host_pointer_alignment: 4096,
             memory,
             queue_families: families,
         }
@@ -949,6 +1001,77 @@ mod tests {
         assert_eq!(
             select(census.descriptors(), Narrowing::default()).tier,
             Tier::PushDescriptor { max: 32 }
+        );
+    }
+
+    /// The extension name is not the capability, and this is the one
+    /// capability with no feature bit to say so.
+    ///
+    /// The regression: `host_pointer_import` was `has(EXTERNAL_MEMORY_HOST)`
+    /// alone, so a device that enumerates the extension and declines the
+    /// handle type --- or states an alignment no pointer can meet --- was
+    /// offered `Route::DirectAlias`, which is the one route with no copy to
+    /// fall back to once the allocation refuses.
+    #[test]
+    fn the_import_capability_needs_the_two_facts_the_extension_name_does_not_carry() {
+        let memory = mem::apple_m3_max();
+        let families = integrated_families();
+        let named = &[extension::SWAPCHAIN, extension::EXTERNAL_MEMORY_HOST];
+        let taken = |mutate: &dyn Fn(&mut Reported<'_>)| {
+            let mut r = reported(packed(1, 2), named, &memory, &families);
+            mutate(&mut r);
+            Census::take(r).expect("admitted")
+        };
+
+        // All three facts: the capability, and the extension asked for.
+        let whole = taken(&|_| {});
+        assert!(whole.host_cell().host_pointer_import);
+        assert!(whole
+            .extensions()
+            .names()
+            .contains(&extension::EXTERNAL_MEMORY_HOST));
+
+        // Each fact alone withdraws it, and withdraws the extension with it:
+        // a name enabled for a capability this device does not offer is one
+        // no decision here would read.
+        /// A named way for one reported fact to fall short.
+        type Withdraws<'a> = (&'a str, &'a dyn Fn(&mut Reported<'_>));
+        let cases: [Withdraws<'_>; 3] = [
+            ("the handle type is not importable", &|r| {
+                r.host_pointer_importable = false;
+            }),
+            ("the device stated no alignment", &|r| {
+                r.min_imported_host_pointer_alignment = 0;
+            }),
+            ("the alignment is not a power of two", &|r| {
+                r.min_imported_host_pointer_alignment = 3072;
+            }),
+        ];
+        for (what, mutate) in cases {
+            let census = taken(mutate);
+            assert!(
+                !census.host_cell().host_pointer_import,
+                "admitted when {what}"
+            );
+            assert!(
+                !census
+                    .extensions()
+                    .names()
+                    .contains(&extension::EXTERNAL_MEMORY_HOST),
+                "enabled the extension when {what}"
+            );
+        }
+
+        // And the two facts do not admit it without the extension: there are
+        // no entry points to import through.
+        let mut unnamed = reported(packed(1, 2), BASELINE, &memory, &families);
+        unnamed.host_pointer_importable = true;
+        unnamed.min_imported_host_pointer_alignment = 4096;
+        assert!(
+            !Census::take(unnamed)
+                .expect("admitted")
+                .host_cell()
+                .host_pointer_import
         );
     }
 

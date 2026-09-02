@@ -441,6 +441,8 @@ mod tests {
             descriptor_buffer: features.2,
             max_push_descriptors: 32,
             max_buffer_size: None,
+            host_pointer_importable: true,
+            min_imported_host_pointer_alignment: 4096,
             memory: &memory,
             queue_families: &families,
         })
@@ -589,6 +591,8 @@ mod tests {
                         descriptor_buffer: false,
                         max_push_descriptors: 0,
                         max_buffer_size: None,
+                        host_pointer_importable: false,
+                        min_imported_host_pointer_alignment: 0,
                         memory: &memory,
                         queue_families: &families,
                     }
@@ -644,6 +648,8 @@ mod tests {
                         descriptor_buffer: false,
                         max_push_descriptors: 0,
                         max_buffer_size: None,
+                        host_pointer_importable: false,
+                        min_imported_host_pointer_alignment: 0,
                         memory: &memory,
                         queue_families: &families,
                     }
@@ -695,6 +701,8 @@ mod tests {
                         descriptor_buffer: false,
                         max_push_descriptors: 0,
                         max_buffer_size: None,
+                        host_pointer_importable: false,
+                        min_imported_host_pointer_alignment: 0,
                         memory: &memory,
                         queue_families: &families,
                     }
@@ -812,6 +820,8 @@ mod tests {
             descriptor_buffer: false,
             max_push_descriptors: 0,
             max_buffer_size: None,
+            host_pointer_importable: false,
+            min_imported_host_pointer_alignment: 0,
             memory: &memory,
             queue_families: &families,
         });

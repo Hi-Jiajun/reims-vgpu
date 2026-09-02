@@ -556,6 +556,46 @@ unsafe fn judge(
             .contains(vk::FormatFeatureFlags::VERTEX_BUFFER)
     });
 
+    // The two facts that stand in for the feature bit
+    // `VK_EXT_external_memory_host` does not have, asked only where the
+    // extension is present --- a device that does not enumerate it has no
+    // structure to fill in and no handle type to be asked about, exactly as
+    // for the dynamic-state-3 property above.
+    //
+    // `vkGetPhysicalDeviceExternalBufferProperties` is Vulkan 1.1 core and the
+    // baseline is 1.2, so once the handle type is spelled by an advertised
+    // extension the question is always answerable. It takes a usage, and the
+    // usage asked is [`crate::buffer::EVERY_CLASS`], which is exactly what it
+    // says: a `Route::DirectAlias` makes the guest's own pages the resource,
+    // so the import has to serve whichever class that resource turns out to
+    // be. A narrower question would admit a device for a binding it declines.
+    let (host_pointer_importable, min_imported_host_pointer_alignment) =
+        if has(extension::EXTERNAL_MEMORY_HOST) {
+            let info = vk::PhysicalDeviceExternalBufferInfo::default()
+                .usage(crate::buffer::EVERY_CLASS)
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+            let mut external = vk::ExternalBufferProperties::default();
+            unsafe {
+                instance.get_physical_device_external_buffer_properties(
+                    physical,
+                    &info,
+                    &mut external,
+                );
+            }
+            let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
+            unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+            (
+                external
+                    .external_memory_properties
+                    .external_memory_features
+                    .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE),
+                host.min_imported_host_pointer_alignment,
+            )
+        } else {
+            (false, 0)
+        };
+
     let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
     let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
 
@@ -591,6 +631,8 @@ unsafe fn judge(
         descriptor_buffer: descriptor_buffer.descriptor_buffer == vk::TRUE,
         max_push_descriptors: push.max_push_descriptors,
         max_buffer_size,
+        host_pointer_importable,
+        min_imported_host_pointer_alignment,
         memory: &memory,
         queue_families: &queue_families,
     });
@@ -639,6 +681,8 @@ mod tests {
             descriptor_buffer: false,
             max_push_descriptors: 0,
             max_buffer_size: None,
+            host_pointer_importable: false,
+            min_imported_host_pointer_alignment: 0,
             memory: &memory,
             queue_families: &families,
         });
@@ -873,6 +917,8 @@ mod tests {
             descriptor_buffer: false,
             max_push_descriptors: 0,
             max_buffer_size: None,
+            host_pointer_importable: false,
+            min_imported_host_pointer_alignment: 0,
             memory: &memory,
             queue_families: &families,
         })
