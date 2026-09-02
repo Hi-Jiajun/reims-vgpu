@@ -402,6 +402,33 @@ pub const fn effective_api(device: u32, requested: u32) -> u32 {
     }
 }
 
+/// The extension names a device enumerated, or the floor it failed by not
+/// answering.
+///
+/// A driver may fail this query for host or device memory rather than answer
+/// an empty list, and the two are not the same fact. Treating a failure as an
+/// empty list refuses the device for missing whichever extension is checked
+/// first — a reason it never gave — and the operator reading the failure
+/// channel then debugs a swapchain that works. So the failure is its own
+/// floor, and it is the reason this step is separated from the unsafe call
+/// that produces its input.
+fn enumerated_names(
+    enumerated: Result<Vec<vk::ExtensionProperties>, vk::Result>,
+) -> Result<Vec<String>, Floor> {
+    let properties = enumerated.map_err(|result| Floor::Unenumerable { result })?;
+    Ok(properties
+        .iter()
+        .filter_map(|e| {
+            // SAFETY: the driver fills `extension_name` with a NUL-terminated
+            // name; the array is the storage it was written into.
+            unsafe { CStr::from_ptr(e.extension_name.as_ptr()) }
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        })
+        .collect())
+}
+
 /// Read one physical device and hand it to the census.
 ///
 /// `requested` is the instance's `VkApplicationInfo::apiVersion`. It is not
@@ -422,19 +449,12 @@ unsafe fn judge(
     let effective = effective_api(properties.api_version, requested);
     let api = ApiVersion::decode(effective);
 
-    let extension_properties =
-        unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
-    let names: Vec<String> = extension_properties
-        .iter()
-        .filter_map(|e| {
-            // SAFETY: the driver fills `extension_name` with a NUL-terminated
-            // name; the array is the storage it was written into.
-            unsafe { CStr::from_ptr(e.extension_name.as_ptr()) }
-                .to_str()
-                .ok()
-                .map(str::to_owned)
-        })
-        .collect();
+    let names =
+        match enumerated_names(unsafe { instance.enumerate_device_extension_properties(physical) })
+        {
+            Ok(names) => names,
+            Err(floor) => return (class, Err(floor)),
+        };
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let has = |name: &str| names.contains(&name);
 
@@ -650,6 +670,60 @@ unsafe fn judge(
 mod tests {
     use super::*;
     use crate::census::DescriptorBufferProbe;
+
+    fn extension(name: &str) -> vk::ExtensionProperties {
+        let mut properties = vk::ExtensionProperties::default();
+        for (slot, byte) in properties
+            .extension_name
+            .iter_mut()
+            .zip(name.as_bytes().iter().copied().chain(std::iter::once(0)))
+        {
+            *slot = byte as std::ffi::c_char;
+        }
+        properties
+    }
+
+    /// The rule: a driver that could not answer said nothing, and nothing is
+    /// not "no extensions".
+    #[test]
+    fn an_unreadable_extension_list_is_its_own_floor() {
+        assert_eq!(
+            enumerated_names(Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)),
+            Err(Floor::Unenumerable {
+                result: vk::Result::ERROR_OUT_OF_HOST_MEMORY
+            }),
+            "the query failing is the fact, not the empty list it would have produced"
+        );
+        assert_ne!(
+            Floor::Unenumerable {
+                result: vk::Result::ERROR_OUT_OF_HOST_MEMORY
+            }
+            .slug(),
+            Floor::NoSwapchain.slug(),
+            "an operator must not read a presentable device as one that cannot present"
+        );
+    }
+
+    /// The other half: a device that genuinely enumerated nothing is judged,
+    /// not refused here.
+    #[test]
+    fn an_empty_extension_list_is_an_answer() {
+        assert_eq!(enumerated_names(Ok(Vec::new())), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn enumerated_names_decodes_what_the_driver_wrote() {
+        assert_eq!(
+            enumerated_names(Ok(vec![
+                extension(extension::SWAPCHAIN),
+                extension(extension::MESH_SHADER),
+            ])),
+            Ok(vec![
+                extension::SWAPCHAIN.to_owned(),
+                extension::MESH_SHADER.to_owned(),
+            ])
+        );
+    }
 
     fn admitted(index: usize, class: DeviceClass) -> Candidate {
         let memory = crate::memory::fixtures::nvidia_discrete();

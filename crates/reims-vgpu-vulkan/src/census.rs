@@ -270,6 +270,15 @@ pub enum Floor {
     NoUsableQueue { decline: queues::Decline },
     /// The device cannot present.
     NoSwapchain,
+    /// The device's extension list could not be read, so no fact about it was
+    /// ever reported.
+    ///
+    /// Every other variant names a fact the device reported and this rail
+    /// needs. This one names the absence of the report itself: a judgement
+    /// built on an empty list would refuse the device for missing whichever
+    /// extension is checked first, which is a reason the device never gave.
+    /// See the module doc.
+    Unenumerable { result: vk::Result },
 }
 
 impl Floor {
@@ -280,6 +289,7 @@ impl Floor {
             Self::NoTimelineSemaphores { .. } => "vk_census_no_timeline_semaphores",
             Self::NoUsableQueue { .. } => "vk_census_no_usable_queue",
             Self::NoSwapchain => "vk_census_no_swapchain",
+            Self::Unenumerable { .. } => "vk_census_unenumerable",
         }
     }
 }
@@ -292,6 +302,7 @@ impl std::fmt::Display for Floor {
             }
             Self::NoUsableQueue { decline } => write!(f, "{} {decline}", self.slug()),
             Self::NoSwapchain => f.write_str(self.slug()),
+            Self::Unenumerable { result } => write!(f, "{} result={result:?}", self.slug()),
         }
     }
 }
