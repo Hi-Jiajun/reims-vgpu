@@ -56,6 +56,38 @@ impl RangeSet {
         self.ranges.iter().map(|r| r.length).sum()
     }
 
+    /// Add a range that begins at or after every range already here.
+    ///
+    /// The constant-time form of [`Self::insert`], for a producer that already
+    /// walks in offset order — [`crate::coverage::VersionCoverage::apply`]
+    /// scans its spans left to right and emits one piece per span it meets, so
+    /// every piece it produces begins where the previous one ended. `insert`
+    /// rebuilds the whole member list per call, which makes such a scan
+    /// quadratic in the coverage's own size on the path every write takes.
+    ///
+    /// `pub(crate)` and debug-asserted rather than public: the precondition is
+    /// on the caller, and a caller outside this crate that got it wrong would
+    /// leave an unsorted member list, which every later answer silently
+    /// depends on.
+    pub(crate) fn push_ascending(&mut self, range: ByteRange) {
+        if range.length == 0 {
+            return;
+        }
+        if let Some(last) = self.ranges.last_mut() {
+            debug_assert!(
+                range.offset >= last.offset,
+                "push_ascending went backwards: {range:?} after {last:?}"
+            );
+            // Touching counts as overlapping, as everywhere else here.
+            if range.offset <= end_of(*last) {
+                let end = end_of(*last).max(end_of(range));
+                last.length = end - last.offset;
+                return;
+            }
+        }
+        self.ranges.push(range);
+    }
+
     /// Add a range, coalescing with anything it touches.
     pub fn insert(&mut self, range: ByteRange) {
         if range.length == 0 {
@@ -404,6 +436,29 @@ mod tests {
         a.union_with(&b);
         assert_sorted_disjoint_coalesced(&a);
         assert_eq!(a.ranges(), &[r(0, 16), r(100, 4)]);
+    }
+
+    /// The ascending fast path must build the same value `insert` does, or a
+    /// set assembled by a scan and one assembled by a caller stop comparing
+    /// equal --- and equality here is how a caller asks "did this change".
+    #[test]
+    fn pushing_in_order_builds_what_inserting_would_have() {
+        let mut rng = Rng::new(7);
+        for _ in 0..2_000 {
+            let mut pushed = RangeSet::new();
+            let mut inserted = RangeSet::new();
+            let mut cursor = 0u64;
+            for _ in 0..1 + rng.below(6) {
+                cursor += rng.below(4);
+                let length = rng.below(5);
+                let x = r(cursor, length);
+                cursor += length;
+                pushed.push_ascending(x);
+                inserted.insert(x);
+            }
+            assert_sorted_disjoint_coalesced(&pushed);
+            assert_eq!(pushed, inserted);
+        }
     }
 
     /// Coalescing makes equality structural, which is what lets a caller ask

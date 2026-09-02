@@ -146,9 +146,11 @@ impl VersionCoverage {
     /// The parts of `range` no version covers.
     #[must_use]
     pub fn uncovered(&self, range: ByteRange) -> RangeSet {
+        // `overlapping` walks the spans in order, so the clipped pieces
+        // already arrive ascending.
         let mut covered = RangeSet::new();
         for (clipped, _) in self.overlapping(range) {
-            covered.insert(clipped);
+            covered.push_ascending(clipped);
         }
         covered.missing_from(range)
     }
@@ -182,7 +184,7 @@ impl VersionCoverage {
             }
             if start > cursor {
                 // A gap in the coverage: nothing holds these bytes.
-                out.taken.insert(ByteRange {
+                out.taken.push_ascending(ByteRange {
                     offset: cursor,
                     length: start - cursor,
                 });
@@ -195,15 +197,15 @@ impl VersionCoverage {
                     length: overlap_end - cursor,
                 };
                 if span.version < version {
-                    out.taken.insert(piece);
+                    out.taken.push_ascending(piece);
                 } else {
-                    out.refused.insert(piece);
+                    out.refused.push_ascending(piece);
                 }
                 cursor = overlap_end;
             }
         }
         if cursor < end {
-            out.taken.insert(ByteRange {
+            out.taken.push_ascending(ByteRange {
                 offset: cursor,
                 length: end - cursor,
             });
@@ -242,10 +244,9 @@ impl VersionCoverage {
         for span in &self.spans {
             // What is left of this span once the new version has taken its
             // share. A span fully overwritten leaves nothing and disappears.
-            let mut left = RangeSet::from_range(span.range);
-            for taken in bytes.ranges() {
-                left.remove(*taken);
-            }
+            // `missing_from` is that question already: the parts of a range a
+            // set does not cover.
+            let left = bytes.missing_from(span.range);
             for range in left.ranges() {
                 next.push(Span {
                     range: *range,
