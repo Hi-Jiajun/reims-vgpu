@@ -138,6 +138,29 @@ pub enum Refusal {
     /// and not its texel count: a pitch wider than the copy makes the two
     /// differ, and it is the footprint that reaches memory.
     OutsideBuffer { offset: u64, length: u64, size: u64 },
+    /// A copy whose source and destination are the same buffer, over windows
+    /// that overlap.
+    ///
+    /// `vkCmdCopyBuffer` requires the regions not to overlap when `srcBuffer`
+    /// and `dstBuffer` are the same (VUID-vkCmdCopyBuffer-pRegions-00117), and
+    /// the guest API states the same restriction on its own caller. A copy that
+    /// breaks it has no defined result: a driver copying forward and one
+    /// copying backward produce different bytes from the same command, and
+    /// which one ran is not observable from here.
+    ///
+    /// Compared on the resolved native buffer and not on the two guest names,
+    /// because one buffer may answer to several: two names aliasing one
+    /// allocation overlap exactly as much as one name used twice, and a check
+    /// on the names alone would miss the case that is harder to notice.
+    ///
+    /// Refused rather than staged. A staging round-trip would define it, and
+    /// it needs scratch this signature has no access to --- the same reason
+    /// [`plan_fill`] is a separate door.
+    OverlappingSelfCopy {
+        source_offset: u64,
+        dest_offset: u64,
+        size: u64,
+    },
     /// A blit-encoder operation that is not a copy, and so has no native
     /// transfer form at all.
     ///
@@ -163,6 +186,7 @@ impl Refusal {
             Self::ImagePitchWithoutRowPitch { .. } => "vk_transfer_image_pitch_without_row_pitch",
             Self::OutsideTexture { .. } => "vk_transfer_outside_texture",
             Self::OutsideBuffer { .. } => "vk_transfer_outside_buffer",
+            Self::OverlappingSelfCopy { .. } => "vk_transfer_overlapping_self_copy",
             Self::NotACopy { .. } => "vk_transfer_not_a_copy",
         }
     }
@@ -234,6 +258,15 @@ impl std::fmt::Display for Refusal {
             } => write!(
                 f,
                 "{} offset={offset} length={length} size={size}",
+                self.slug()
+            ),
+            Self::OverlappingSelfCopy {
+                source_offset,
+                dest_offset,
+                size,
+            } => write!(
+                f,
+                "{} source_offset={source_offset} dest_offset={dest_offset} size={size}",
                 self.slug()
             ),
             Self::NotACopy { op } => write!(f, "{} op={op}", self.slug()),
@@ -659,6 +692,19 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Command, Refusal> {
             let to = resolved(residency.buffer(dest))?;
             within_buffer(&from.plan, source_offset, size)?;
             within_buffer(&to.plan, dest_offset, size)?;
+            // Both windows are inside their buffers, so the sums below cannot
+            // wrap. On the native handle rather than the two names: one
+            // allocation may answer to several of them.
+            if from.buffer == to.buffer
+                && source_offset < dest_offset + size
+                && dest_offset < source_offset + size
+            {
+                return Err(Refusal::OverlappingSelfCopy {
+                    source_offset,
+                    dest_offset,
+                    size,
+                });
+            }
             Ok(Command::CopyBuffer {
                 source: from.buffer,
                 dest: to.buffer,
@@ -2298,6 +2344,109 @@ mod tests {
                 options: Default::default(),
             },
             &residency
+        )
+        .is_ok());
+    }
+
+    /// The failure this exists to prevent: `vkCmdCopyBuffer` requires the
+    /// regions not to overlap when the source and destination buffers are the
+    /// same. A copy that breaks it has no defined result — a driver copying
+    /// forward and one copying backward produce different bytes from one
+    /// command — and nothing downstream can see which ran.
+    #[test]
+    fn a_self_copy_over_windows_that_overlap_refuses() {
+        let residency = populated();
+        let copy = |source_offset: u64, dest: u32, dest_offset: u64, size: u64| {
+            plan(
+                &BlitOp::BufferToBuffer {
+                    source: id(BUFFER_A),
+                    source_offset,
+                    dest: id(dest),
+                    dest_offset,
+                    size,
+                },
+                &residency,
+            )
+        };
+        // Touching but not overlapping, on both sides, is a copy.
+        assert!(
+            copy(0, BUFFER_A, 256, 256).is_ok(),
+            "source ends where the destination starts"
+        );
+        assert!(
+            copy(256, BUFFER_A, 0, 256).is_ok(),
+            "and the other way round"
+        );
+        // One byte of overlap, on both sides, is not.
+        for (source_offset, dest_offset) in [(0, 255), (255, 0)] {
+            assert_eq!(
+                copy(source_offset, BUFFER_A, dest_offset, 256).expect_err("one byte of overlap"),
+                Refusal::OverlappingSelfCopy {
+                    source_offset,
+                    dest_offset,
+                    size: 256,
+                }
+            );
+        }
+        // The exact self-copy is the maximal overlap and not an exception:
+        // Vulkan states the rule as "must not overlap" with no identity case,
+        // so a driver is free to produce anything from it.
+        assert_eq!(
+            copy(64, BUFFER_A, 64, 128).expect_err("a window onto itself"),
+            Refusal::OverlappingSelfCopy {
+                source_offset: 64,
+                dest_offset: 64,
+                size: 128,
+            }
+        );
+        // And two different buffers overlap at no offset, which is what makes
+        // this a rule about one allocation rather than about two numbers.
+        assert!(copy(0, BUFFER_B, 0, 256).is_ok());
+    }
+
+    /// Two names, one allocation. The rule is Vulkan's about `srcBuffer` and
+    /// `dstBuffer`, which are handles — so a check comparing the guest's two
+    /// object refs would pass exactly the case that is harder to notice.
+    #[test]
+    fn two_names_for_one_buffer_overlap_as_much_as_one_name_twice() {
+        let mut residency = Residency::new();
+        let mut retire = NativeRetirement::new();
+        let lifetime = Lifetime::new(SessionGeneration::FIRST, DeviceEpoch::FIRST);
+        // The same `vk::Buffer` under both names, which is what an aliased
+        // import or a suballocation of one allocation produces.
+        for slot in [BUFFER_A, BUFFER_B] {
+            residency
+                .publish(id(slot), lifetime, native_buffer(0xB1), &mut retire)
+                .unwrap_or_else(|(_, e)| panic!("{e}"));
+        }
+        assert_eq!(
+            plan(
+                &BlitOp::BufferToBuffer {
+                    source: id(BUFFER_A),
+                    source_offset: 0,
+                    dest: id(BUFFER_B),
+                    dest_offset: 128,
+                    size: 256,
+                },
+                &residency,
+            )
+            .expect_err("two names, one allocation, overlapping windows"),
+            Refusal::OverlappingSelfCopy {
+                source_offset: 0,
+                dest_offset: 128,
+                size: 256,
+            }
+        );
+        // Disjoint windows in the same allocation are still a copy.
+        assert!(plan(
+            &BlitOp::BufferToBuffer {
+                source: id(BUFFER_A),
+                source_offset: 0,
+                dest: id(BUFFER_B),
+                dest_offset: 256,
+                size: 256,
+            },
+            &residency,
         )
         .is_ok());
     }
