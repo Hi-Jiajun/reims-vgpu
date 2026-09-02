@@ -1299,6 +1299,35 @@ impl Lifecycle {
         declined
     }
 
+    /// Forget a backing's content authority, if nothing still answers for it.
+    ///
+    /// **The check a [`Teardown`] cannot make, and the reason this is here.**
+    /// A [`Namespace`] is per task and the content ledger is per session —
+    /// deliberately, because an IOSurface backing is reachable from more than
+    /// one task — so `Teardown::Now` means "no name in *this* task" and says
+    /// nothing about the others. Forgetting on it drops the authority out from
+    /// under a live name in a second task, and it is worse than losing
+    /// freshness: a forgotten backing's versions restart at zero, so a reader
+    /// already ordered against version two would be satisfied by an unrelated
+    /// later write.
+    ///
+    /// A task's heaps are asked too. Heap storage is declared per task and the
+    /// same storage may be a heap's in one task and a resource's in another,
+    /// which is the same question with a different registry answering it.
+    ///
+    /// This is also what keeps a deferred teardown deferred. A backing whose
+    /// accepted uses have not retired is still held, so the answer is no, and
+    /// a caller that retires the last use asks again.
+    fn forget_backing(&mut self, backing: BackingId) {
+        let held = self
+            .tasks
+            .values()
+            .any(|t| t.namespace.holds(backing) || t.heaps.holds_storage(backing));
+        if !held {
+            self.content.forget(backing);
+        }
+    }
+
     /// Record that work wrote a window of a resource in one replica.
     ///
     /// The one place a resource-relative window becomes a backing-relative one
@@ -1393,10 +1422,14 @@ impl Lifecycle {
                 effects.storage_freed.push(backing);
             }
         }
-        for backing in &effects.storage_freed {
-            self.content.forget(*backing);
-        }
+        // Taken by value: forgetting asks every task whether it still answers
+        // for the backing, which needs the whole model rather than a borrow of
+        // one field of it.
+        let freed = effects.storage_freed.clone();
         self.tasks.remove(&task);
+        for backing in freed {
+            self.forget_backing(backing);
+        }
         Ok(effects)
     }
 
@@ -1477,15 +1510,16 @@ impl Lifecycle {
                 if let Ok(Retirement::StorageFree { backing }) = t.heaps.remove(placement, resource)
                 {
                     effects.storage_freed.push(backing);
-                    self.content.forget(backing);
+                    self.forget_backing(backing);
                 }
             }
             // Its own pages: nothing else names them, so the content goes with
             // the backing the namespace just handed back.
             Some(Resident::Dedicated { backing, .. }) => match teardown {
-                // Nothing reads it and nothing names it: the content dies with
-                // the backing the namespace just handed back.
-                Teardown::Now { .. } => self.content.forget(backing),
+                // Nothing in this task reads it and nothing in this task names
+                // it. Whether that is true of the session is the question
+                // `forget_backing` asks.
+                Teardown::Now { .. } => self.forget_backing(backing),
                 // Someone else still answers for these bytes. Forgetting here
                 // would drop the content authority out from under a reader or
                 // a live name.
@@ -1547,7 +1581,7 @@ impl Lifecycle {
         // memory this resource no longer names.
         self.content.declare(backing, extent, Replica::GuestPages);
         match teardown {
-            Teardown::Now { backing: old } => self.content.forget(old),
+            Teardown::Now { backing: old } => self.forget_backing(old),
             // The old bytes are still read by accepted work, or still named by
             // another slot. Either way their authority is not ours to drop.
             Teardown::WhenUsesRetire { .. } | Teardown::HeldByAnotherName { .. } => {}
@@ -1628,7 +1662,7 @@ impl Lifecycle {
             effects.teardowns.extend(one.teardowns);
             effects.storage_freed.extend(one.storage_freed);
         }
-        self.content.forget(backing);
+        self.forget_backing(backing);
         Ok(effects)
     }
 
@@ -3228,5 +3262,150 @@ mod tests {
                 resources: Vec::new(),
             }
         );
+    }
+
+    const SECOND: TaskId = TaskId(2);
+
+    /// A task holding one dedicated resource on `backing`, added to a model
+    /// that already has one.
+    fn second_task_on(l: &mut Lifecycle, task: TaskId, backing: u64, length: u64) -> ResourceId {
+        apply_inert(
+            l,
+            &LifecycleOp::DefineTask {
+                task,
+                kernel: false,
+                directory: DirectoryFrame(0x2000),
+            },
+        );
+        apply_inert(
+            l,
+            &LifecycleOp::CreateResource {
+                task,
+                slot: ObjectListRef(0),
+                storage: dedicated(backing, length),
+            },
+        );
+        name(0)
+    }
+
+    /// **A name in one task does not take another task's content with it.**
+    ///
+    /// The teardown a namespace gives is a per-task answer, because a namespace
+    /// is per task; the content ledger is per session, because an IOSurface
+    /// backing is reachable from several. Forgetting on `Teardown::Now` reads
+    /// the first answer as the second.
+    ///
+    /// And what is lost is not only freshness. A forgotten backing loses its
+    /// version counter too, so the next write reserves a version already
+    /// issued, and a reader ordered against that number is satisfied by a write
+    /// that has nothing to do with it.
+    #[test]
+    fn deleting_a_name_in_one_task_leaves_a_second_tasks_content_alone() {
+        let (mut l, first) = with_one_resource(64);
+        let _second = second_task_on(&mut l, SECOND, 10, 64);
+        let reserved = l.content_mut().reserve(BackingId(10));
+
+        let effects = l
+            .apply(&LifecycleOp::DeleteResource {
+                task: TASK,
+                resource: first,
+            })
+            .expect("resolves");
+        assert_eq!(
+            effects.teardowns,
+            vec![Teardown::Now {
+                backing: BackingId(10)
+            }],
+            "the first task owes the teardown, because no name of *its* holds it"
+        );
+        assert_eq!(
+            l.content().extent(BackingId(10)),
+            Some(range(0, 64)),
+            "the second task still names the backing"
+        );
+        assert_ne!(
+            l.content_mut().reserve(BackingId(10)),
+            reserved,
+            "a version already issued was issued again"
+        );
+    }
+
+    /// The same for a physical replacement, which hands back the old backing by
+    /// the same per-task answer.
+    #[test]
+    fn repointing_a_name_in_one_task_leaves_a_second_tasks_content_alone() {
+        let (mut l, first) = with_one_resource(64);
+        let _second = second_task_on(&mut l, SECOND, 10, 64);
+        let reserved = l.content_mut().reserve(BackingId(10));
+
+        let effects = l
+            .apply(&LifecycleOp::ReplacePhysical {
+                task: TASK,
+                resource: first,
+                backing: BackingId(11),
+                extent: range(0, 64),
+            })
+            .expect("resolves");
+        assert_eq!(
+            effects.teardowns,
+            vec![Teardown::Now {
+                backing: BackingId(10)
+            }]
+        );
+        assert_eq!(l.content().extent(BackingId(10)), Some(range(0, 64)));
+        assert_ne!(l.content_mut().reserve(BackingId(10)), reserved);
+    }
+
+    /// Deleting a backing is the same question asked about every task at once.
+    #[test]
+    fn retiring_a_backing_in_one_task_leaves_a_second_tasks_content_alone() {
+        let (mut l, _first) = with_one_resource(64);
+        let _second = second_task_on(&mut l, SECOND, 10, 64);
+        let reserved = l.content_mut().reserve(BackingId(10));
+
+        let effects = l
+            .apply(&LifecycleOp::DeleteBacking {
+                task: TASK,
+                backing: BackingId(10),
+            })
+            .expect("resolves");
+        assert_eq!(effects.teardowns.len(), 1);
+        assert_eq!(
+            l.content().extent(BackingId(10)),
+            Some(range(0, 64)),
+            "the retirement is of the first task's names, not of the storage"
+        );
+        assert_ne!(l.content_mut().reserve(BackingId(10)), reserved);
+
+        // And once the second task lets go, nothing holds it and the authority
+        // does go.
+        let effects = l
+            .apply(&LifecycleOp::DeleteTask { task: SECOND })
+            .expect("resolves");
+        assert_eq!(
+            effects.teardowns,
+            vec![Teardown::Now {
+                backing: BackingId(10)
+            }]
+        );
+        assert_eq!(l.content().extent(BackingId(10)), None);
+    }
+
+    /// Deleting a task takes its content with it when nothing else holds it —
+    /// the check narrows what is forgotten and must not stop it happening.
+    #[test]
+    fn deleting_the_last_task_that_names_a_backing_does_forget_it() {
+        let (mut l, _first) = with_one_resource(64);
+        assert_eq!(l.content().extent(BackingId(10)), Some(range(0, 64)));
+        let effects = l
+            .apply(&LifecycleOp::DeleteTask { task: TASK })
+            .expect("resolves");
+        assert_eq!(
+            effects.teardowns,
+            vec![Teardown::Now {
+                backing: BackingId(10)
+            }]
+        );
+        assert_eq!(l.content().extent(BackingId(10)), None);
     }
 }

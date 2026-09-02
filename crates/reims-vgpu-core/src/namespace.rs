@@ -155,6 +155,17 @@ pub struct Namespace {
     /// be several counters over one piece of storage, each reaching zero on its
     /// own and each handing the same storage back.
     retiring: HashMap<BackingId, usize>,
+    /// Live names per backing, so "does another name still answer for this
+    /// storage" is a lookup rather than a scan of every slot.
+    ///
+    /// Derived from `slots` and never read from anywhere else, so the two
+    /// cannot drift into two answers: an entry appears when a declaration
+    /// points a slot at a backing and goes when the slot is deleted or
+    /// repointed, which are the only three ways the set can change. A backing
+    /// with no live name holds no entry at all rather than an entry of zero —
+    /// the count is the membership, and one spelled the other way would make
+    /// "present" and "held" different questions.
+    live_by_backing: HashMap<BackingId, usize>,
     resolved: usize,
     refused: usize,
 }
@@ -193,6 +204,7 @@ impl Namespace {
                 outstanding: 0,
             },
         );
+        self.enter(backing);
         Ok(ResourceId { slot, generation })
     }
 
@@ -298,6 +310,7 @@ impl Namespace {
         slot.deleted = true;
         let outstanding = slot.outstanding;
         slot.outstanding = 0;
+        self.leave(lease.backing);
         Ok(self.detach(lease.backing, outstanding))
     }
 
@@ -320,6 +333,8 @@ impl Namespace {
         let outstanding = slot.outstanding;
         slot.backing = backing;
         slot.outstanding = 0;
+        self.leave(lease.backing);
+        self.enter(backing);
         Ok(self.detach(lease.backing, outstanding))
     }
 
@@ -345,11 +360,38 @@ impl Namespace {
         Teardown::Now { backing }
     }
 
+    /// Record that a live slot now names this backing.
+    fn enter(&mut self, backing: BackingId) {
+        *self.live_by_backing.entry(backing).or_insert(0) += 1;
+    }
+
+    /// Record that a slot has stopped naming it.
+    fn leave(&mut self, backing: BackingId) {
+        if let Some(count) = self.live_by_backing.get_mut(&backing) {
+            *count -= 1;
+            if *count == 0 {
+                self.live_by_backing.remove(&backing);
+            }
+        }
+    }
+
     /// Whether any undeleted slot still resolves to this backing.
     fn named_by_a_live_slot(&self, backing: BackingId) -> bool {
-        self.slots
-            .values()
-            .any(|s| !s.deleted && s.backing == backing)
+        self.live_by_backing.contains_key(&backing)
+    }
+
+    /// Whether anything in this namespace still answers for a backing — a live
+    /// name, or a detachment whose accepted uses have not retired.
+    ///
+    /// The question a *session-wide* owner has to ask before dropping anything
+    /// keyed by a backing, and it is not the same question a [`Teardown`]
+    /// answers. A teardown says what *this* namespace owes; one namespace is
+    /// one task, and a backing an IOSurface supplies is reachable from several.
+    /// See [`crate::lifecycle::Lifecycle`], which asks every task before it
+    /// forgets a backing's content.
+    #[must_use]
+    pub fn holds(&self, backing: BackingId) -> bool {
+        self.named_by_a_live_slot(backing) || self.retiring.contains_key(&backing)
     }
 
     /// Accepted uses of a name's current backing that have not retired.
@@ -1107,6 +1149,18 @@ mod tests {
                     "seed {seed}: awaiting_teardown"
                 );
                 assert_eq!(ns.census(), (resolved, refused), "seed {seed}: census");
+                // The per-backing membership index against the scan it
+                // replaced. `holds` is the session-wide owner's question, so a
+                // count that drifted from `slots` would let a backing another
+                // name still resolves to be dropped out from under it.
+                for n in 0..BACKINGS {
+                    let b = backing(n);
+                    assert_eq!(
+                        ns.holds(b),
+                        named_live(&shadow, b) || detached.get(&b).copied().unwrap_or(0) > 0,
+                        "seed {seed}: holds {b:?}"
+                    );
+                }
                 for id in &names {
                     let expected = shadow
                         .get(&id.slot)
