@@ -204,6 +204,24 @@ pub struct OwnershipTransfer {
     /// The layout on both sides. An ownership transfer may change layout too,
     /// but the two halves must agree, so it is one value rather than two.
     pub layout: vk::ImageLayout,
+    /// What the releasing queue has to make available: the stages and accesses
+    /// of the last use recorded on the family giving the image up.
+    ///
+    /// **A transfer is a memory dependency and not only a change of owner.**
+    /// Vulkan ignores a release's destination masks and an acquire's source
+    /// masks, which leaves exactly these two halves carrying the availability
+    /// and visibility operations. Carried on the plan rather than left to the
+    /// recorder because only the tracker knows what the previous owner did:
+    /// with both halves empty the source queue's writes are never made
+    /// available and nothing becomes visible to the destination, so the image
+    /// holds whatever that queue happens to see — a race with no failing call
+    /// in it.
+    pub src_stages: vk::PipelineStageFlags2,
+    pub src_access: vk::AccessFlags2,
+    /// What the acquiring queue needs visible: the use it is taking the image
+    /// for.
+    pub dst_stages: vk::PipelineStageFlags2,
+    pub dst_access: vk::AccessFlags2,
 }
 
 /// Why a plan could not be made.
@@ -459,6 +477,12 @@ impl LayoutTracker {
     /// `Ok(None)` when the family already owns it. The two halves come back
     /// together because recording one of them makes the contents undefined.
     ///
+    /// `use_` is what the acquiring family is taking the image for. It is
+    /// required, not optional: it is the visibility half of the transfer's
+    /// memory dependency, and a transfer planned without it hands the new
+    /// owner an image whose contents were never made visible to it. See
+    /// [`OwnershipTransfer::src_stages`].
+    ///
     /// # Errors
     ///
     /// If the image or subresource was never declared, or the image has no
@@ -468,6 +492,7 @@ impl LayoutTracker {
         image: ImageId,
         subresource: Subresource,
         to_family: u32,
+        use_: Use,
     ) -> Result<Option<OwnershipTransfer>, Decline> {
         let current = *self.state(image, subresource)?;
         let Some(from_family) = current.family else {
@@ -489,6 +514,12 @@ impl LayoutTracker {
             from_family,
             to_family,
             layout: current.layout,
+            // The releasing family's last recorded use is what has to be made
+            // available; the tracker is the only thing that knows it.
+            src_stages: current.last_stages,
+            src_access: current.last_access,
+            dst_stages: use_.stages(),
+            dst_access: use_.access(),
         }))
     }
 
@@ -774,11 +805,22 @@ mod tests {
             .expect("declared");
         assert_eq!(t.family(IMG, sub), Ok(Some(0)));
         let transfer = t
-            .plan_family(IMG, sub, 1)
+            .plan_family(IMG, sub, 1, Use::SampledRead)
             .expect("declared")
             .expect("family 0 to family 1");
         assert_eq!(transfer.from_family, 0);
         assert_eq!(transfer.to_family, 1);
+        // The dependency the transfer carries: what the releasing family last
+        // did, and what the acquiring family is taking it for. Empty on either
+        // side is a move of ownership that orders no memory.
+        assert_eq!(transfer.src_stages, Use::TransferDst.stages());
+        assert_eq!(transfer.src_access, Use::TransferDst.access());
+        assert_eq!(transfer.dst_stages, Use::SampledRead.stages());
+        assert_eq!(transfer.dst_access, Use::SampledRead.access());
+        assert!(
+            !transfer.src_stages.is_empty() && !transfer.dst_stages.is_empty(),
+            "a transfer with an empty half orders nothing across the queues"
+        );
         assert_eq!(
             transfer.layout,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -786,7 +828,7 @@ mod tests {
         );
         assert_eq!(t.family(IMG, sub), Ok(Some(1)));
         assert_eq!(
-            t.plan_family(IMG, sub, 1),
+            t.plan_family(IMG, sub, 1, Use::SampledRead),
             Ok(None),
             "the family already owns it"
         );
@@ -802,7 +844,7 @@ mod tests {
         let sub = Subresource::new(0, 0);
         assert_eq!(t.family(ImageId(2), sub), Ok(None));
         assert_eq!(
-            t.plan_family(ImageId(2), sub, 1),
+            t.plan_family(ImageId(2), sub, 1, Use::SampledRead),
             Err(Decline::NoRecordedFamily { image: ImageId(2) })
         );
     }
@@ -1095,7 +1137,7 @@ mod tests {
                     4..=6 => {
                         let to = rng.below(3) as u32;
                         let before = shadow.get(image, sub);
-                        match tracker.plan_family(image, sub, to) {
+                        match tracker.plan_family(image, sub, to, Use::SampledRead) {
                             Ok(moved) => {
                                 let before = before.expect("the tracker accepted it");
                                 let from = before.family.expect("an accepted move had an owner");
