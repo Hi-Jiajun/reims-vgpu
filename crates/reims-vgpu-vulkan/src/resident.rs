@@ -28,6 +28,16 @@
 //! anything: two natives for one guest object is not a lifetime event, it is a
 //! defect, and the second native is handed straight back rather than leaked.
 //!
+//! A publication naming an *older* generation than the slot holds is refused
+//! for a stronger reason. Generations only ever advance, so an older one is a
+//! publication that arrived after the declaration replacing it. Taking it
+//! would retire the newer native --- destroying the object the guest's current
+//! name means --- and leave that name resolving to [`Miss::Stale`] against a
+//! generation from the past. That is the same defect [`Residency::delete`]
+//! already refuses, where a delete naming a stale generation must not take the
+//! live object with it; publication is the other door into it, and the two
+//! must answer alike.
+//!
 //! # This table holds handles and calls nothing
 //!
 //! Retirement produces the objects to destroy; the caller destroys them
@@ -226,29 +236,58 @@ impl std::fmt::Display for Miss {
     }
 }
 
-/// A second native for a guest object that already has one.
+/// Why a native object could not be bound to a guest name.
+///
+/// Both variants are a publication this slot's history does not admit, and
+/// both hand the native back; they are separate because they are opposite
+/// defects, the same way [`Miss::Unknown`] and [`Miss::Stale`] are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Occupied {
-    pub slot: ObjectListRef,
-    pub generation: SlotGeneration,
+pub enum Refusal {
+    /// A second native for a guest object that already has one.
+    Occupied {
+        slot: ObjectListRef,
+        generation: SlotGeneration,
+    },
+    /// A publication naming a generation this slot has already moved past.
+    ///
+    /// Carries both numbers for the reason [`Miss::Stale`] does: the distance
+    /// says whether one declaration was reordered or a whole run of them was.
+    Rewound {
+        slot: ObjectListRef,
+        held: SlotGeneration,
+        named: SlotGeneration,
+    },
 }
 
-impl Occupied {
+impl Refusal {
     #[must_use]
     pub const fn slug(self) -> &'static str {
-        "vk_resident_already_published"
+        match self {
+            Self::Occupied { .. } => "vk_resident_already_published",
+            Self::Rewound { .. } => "vk_resident_generation_rewound",
+        }
     }
 }
 
-impl std::fmt::Display for Occupied {
+impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} slot={} generation={}",
-            self.slug(),
-            self.slot.0,
-            self.generation.0
-        )
+        match self {
+            Self::Occupied { slot, generation } => write!(
+                f,
+                "{} slot={} generation={}",
+                self.slug(),
+                slot.0,
+                generation.0
+            ),
+            Self::Rewound { slot, held, named } => write!(
+                f,
+                "{} slot={} held={} named={}",
+                self.slug(),
+                slot.0,
+                held.0,
+                named.0
+            ),
+        }
     }
 }
 
@@ -302,7 +341,7 @@ impl Residency {
     ///
     /// # Errors
     ///
-    /// [`Occupied`] when the same generation is already published, with the
+    /// [`Refusal`] when this slot's generation is not moving forward, with the
     /// native handed back so the caller can destroy what it just made.
     pub fn publish(
         &mut self,
@@ -310,14 +349,24 @@ impl Residency {
         lifetime: Lifetime,
         native: Native,
         retire: &mut NativeRetirement<Native>,
-    ) -> Result<(), (Native, Occupied)> {
+    ) -> Result<(), (Native, Refusal)> {
         if let Some(previous) = self.slots.get(&id.slot.0) {
             if previous.generation == id.generation {
                 return Err((
                     native,
-                    Occupied {
+                    Refusal::Occupied {
                         slot: id.slot,
                         generation: id.generation,
+                    },
+                ));
+            }
+            if previous.generation > id.generation {
+                return Err((
+                    native,
+                    Refusal::Rewound {
+                        slot: id.slot,
+                        held: previous.generation,
+                        named: id.generation,
                     },
                 ));
             }
@@ -701,7 +750,7 @@ mod tests {
 
         assert_eq!(
             occupied,
-            Occupied {
+            Refusal::Occupied {
                 slot: ObjectListRef(3),
                 generation: SlotGeneration(1),
             }
@@ -719,6 +768,49 @@ mod tests {
             0xB1
         );
         assert_eq!(residency.census(), (1, 0));
+    }
+
+    #[test]
+    fn publishing_a_generation_the_slot_has_moved_past_does_not_retire_the_live_one() {
+        let mut residency = Residency::new();
+        let mut retire = NativeRetirement::new();
+        residency
+            .publish(id(3, 1), lifetime(), native_buffer(0xB1), &mut retire)
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        residency
+            .publish(id(3, 4), lifetime(), native_buffer(0xB4), &mut retire)
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        assert_eq!(residency.census(), (2, 1));
+
+        // A publication of generation 2 arriving now is one the guest has
+        // already declared past. Taking it would destroy 0xB4 --- the object
+        // the guest's current name means --- and leave that name resolving
+        // against a generation from the past.
+        let (returned, refusal) = residency
+            .publish(id(3, 2), lifetime(), native_buffer(0xB2), &mut retire)
+            .expect_err("a slot's generation only advances");
+
+        assert_eq!(
+            refusal,
+            Refusal::Rewound {
+                slot: ObjectListRef(3),
+                held: SlotGeneration(4),
+                named: SlotGeneration(2),
+            }
+        );
+        assert_eq!(handle(&returned), 0xB2);
+        // Nothing retired beyond the one lawful replacement, and the live name
+        // still answers.
+        assert_eq!(retire.outstanding(), 1);
+        assert_eq!(
+            residency
+                .buffer(id(3, 4))
+                .expect("the live one")
+                .buffer
+                .as_raw(),
+            0xB4
+        );
+        assert_eq!(residency.census(), (2, 1));
     }
 
     #[test]
@@ -895,12 +987,23 @@ mod tests {
             assert!(miss.to_string().starts_with(miss.slug()));
             assert!(miss.slug().starts_with("vk_resident_"));
         }
-        let occupied = Occupied {
-            slot: ObjectListRef(1),
-            generation: SlotGeneration(1),
-        };
-        assert!(occupied.to_string().starts_with(occupied.slug()));
-        assert!(occupied.slug().starts_with("vk_resident_"));
+        let refusals = [
+            Refusal::Occupied {
+                slot: ObjectListRef(1),
+                generation: SlotGeneration(1),
+            },
+            Refusal::Rewound {
+                slot: ObjectListRef(1),
+                held: SlotGeneration(2),
+                named: SlotGeneration(1),
+            },
+        ];
+        let slugs: BTreeSet<&str> = refusals.iter().map(|r| r.slug()).collect();
+        assert_eq!(slugs.len(), refusals.len());
+        for refusal in refusals {
+            assert!(refusal.to_string().starts_with(refusal.slug()));
+            assert!(refusal.slug().starts_with("vk_resident_"));
+        }
     }
 
     // ---- A driven history of the table's lifetime bookkeeping ------------
@@ -953,6 +1056,7 @@ mod tests {
     struct Tally {
         published: usize,
         occupied: usize,
+        rewound: usize,
         replaced: usize,
         deleted: usize,
         used: usize,
@@ -983,11 +1087,13 @@ mod tests {
             for _ in 0..80 {
                 let slot = rng.below(5) as u32;
                 // Mostly the generation the shadow holds, so the resolving
-                // paths are driven; sometimes a neighbour, so both directions
-                // of `Stale` are.
+                // paths are driven; sometimes a neighbour on either side, so
+                // both directions of `Stale` are, and so a publication naming
+                // a generation the slot has already moved past is.
                 let generation = match shadow.get(&slot) {
                     Some(held) if rng.below(4) != 0 => held.generation,
-                    Some(held) => held.generation + 1 + rng.below(2),
+                    Some(held) if rng.below(2) == 0 => held.generation + 1 + rng.below(2),
+                    Some(held) => held.generation.saturating_sub(1 + rng.below(2)).max(1),
                     None => 1 + rng.below(3),
                 };
                 let id = id(slot, generation);
@@ -1005,8 +1111,8 @@ mod tests {
                         match table.publish(id, lifetime(), native, &mut retire) {
                             Ok(()) => {
                                 assert!(
-                                    displaced.is_none_or(|d| d.generation != generation),
-                                    "the same generation was published twice"
+                                    displaced.is_none_or(|d| d.generation < generation),
+                                    "a slot's generation only ever advances"
                                 );
                                 minted.push(handle);
                                 publishes += 1;
@@ -1026,16 +1132,38 @@ mod tests {
                                     },
                                 );
                             }
-                            Err((back, occupied)) => {
+                            Err((back, refusal)) => {
                                 let held = displaced.expect("something refused it");
-                                assert_eq!(held.generation, generation);
-                                assert_eq!(occupied.slot, id.slot);
-                                assert_eq!(occupied.generation, id.generation);
+                                // Which refusal, derived from the history and
+                                // never from the table.
+                                if held.generation == generation {
+                                    assert_eq!(
+                                        refusal,
+                                        Refusal::Occupied {
+                                            slot: id.slot,
+                                            generation: id.generation,
+                                        }
+                                    );
+                                    tally.occupied += 1;
+                                } else {
+                                    assert!(
+                                        held.generation > generation,
+                                        "a publication that advances the slot is lawful"
+                                    );
+                                    assert_eq!(
+                                        refusal,
+                                        Refusal::Rewound {
+                                            slot: id.slot,
+                                            held: SlotGeneration(held.generation),
+                                            named: id.generation,
+                                        }
+                                    );
+                                    tally.rewound += 1;
+                                }
                                 // Handed back rather than leaked, and it is the
                                 // one the caller passed in.
                                 assert_eq!(raw_of(&back), handle);
                                 handle -= 1;
-                                tally.occupied += 1;
                             }
                         }
                     }
@@ -1152,6 +1280,7 @@ mod tests {
         // still read as covered.
         assert!(tally.published > 5_000, "{}", tally.published);
         assert!(tally.occupied > 2_000, "{}", tally.occupied);
+        assert!(tally.rewound > 100, "{}", tally.rewound);
         assert!(tally.replaced > 700, "{}", tally.replaced);
         assert!(tally.deleted > 800, "{}", tally.deleted);
         assert!(tally.used > 1_000, "{}", tally.used);
