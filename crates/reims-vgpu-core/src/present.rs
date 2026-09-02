@@ -247,6 +247,24 @@ pub struct Retired {
     pub last_use: TimelinePoint,
 }
 
+/// What replacing a swapchain left behind.
+///
+/// Two obligations, not one. The swapchain is the caller's to destroy once
+/// [`PresentStream::reached`] gives it back, and the frames are the caller's
+/// to answer to the guest now: each was an admitted present with a completion
+/// word owed, and the generation they were acquired from no longer exists, so
+/// they will never be shown. Handing them back by name is the same discipline
+/// [`PresentStream::queue`] applies to a superseded frame and
+/// [`PresentStream::abandon_parked`] to a parked one — there is no path here
+/// that discards an admitted present without giving it to somebody.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "a retired swapchain nothing retires is a leak, and a dropped frame nobody answers for is a completion word nothing publishes"]
+pub struct Replaced {
+    pub retired: Retired,
+    /// The sequences that were in flight on the old generation, in order.
+    pub dropped: Vec<u64>,
+}
+
 /// A present packet that has not got an image yet.
 ///
 /// Carries the completion word because the packet's obligation travels with it:
@@ -365,9 +383,15 @@ impl PresentStream {
     /// retirement.
     ///
     /// Frames in flight on the old generation are dropped from this stream's
-    /// order — they belong to a swapchain that no longer exists — but the
-    /// swapchain itself is not destroyed: `last_use` is when its images stop
-    /// being read, and the caller gets it back from [`Self::reached`] then.
+    /// order — they belong to a swapchain that no longer exists — and returned
+    /// by name in [`Replaced::dropped`], because each is a present the guest is
+    /// still waiting on. The swapchain itself is not destroyed: `last_use` is
+    /// when its images stop being read, and the caller gets it back from
+    /// [`Self::reached`] then.
+    ///
+    /// Parked presents are not touched. They never got an image, so they never
+    /// belonged to the old generation, and the new one may have room for them:
+    /// see [`Self::wake`].
     ///
     /// # Panics
     ///
@@ -377,17 +401,17 @@ impl PresentStream {
         requested_depth: usize,
         returned_images: usize,
         last_use: TimelinePoint,
-    ) -> Retired {
+    ) -> Replaced {
         let retired = Retired {
             generation: self.generation,
             last_use,
         };
         self.retiring.push(retired);
         self.generation = self.generation.next();
-        self.in_flight.clear();
+        let dropped = self.in_flight.drain(..).map(|f| f.sequence).collect();
         self.next_sequence = 0;
         self.configure(requested_depth, returned_images);
-        retired
+        Replaced { retired, dropped }
     }
 
     /// The timeline reached `at`: take the swapchains nothing reads any more.
@@ -1131,8 +1155,13 @@ mod tests {
         s.configure(2, 2);
         let old = present(&mut s);
 
-        let retired = s.replace(2, 3, at(40));
+        let Replaced { retired, dropped } = s.replace(2, 3, at(40));
         assert_eq!(retired.generation, SwapchainGeneration::FIRST);
+        assert_eq!(
+            dropped,
+            vec![old.sequence],
+            "the frame is gone and the guest is still owed its word"
+        );
         assert_eq!(s.generation(), SwapchainGeneration::FIRST.next());
         assert_eq!(s.images(), Some(3));
         assert_eq!(s.in_flight(), 0, "frames of a gone swapchain are gone");
@@ -1160,8 +1189,8 @@ mod tests {
     fn several_retired_swapchains_come_back_in_order() {
         let mut s = PresentStream::new(Order::Fifo);
         s.configure(2, 2);
-        let first = s.replace(2, 2, at(10));
-        let second = s.replace(2, 2, at(5));
+        let first = s.replace(2, 2, at(10)).retired;
+        let second = s.replace(2, 2, at(5)).retired;
         assert_eq!(s.reached(at(7)), vec![second]);
         assert_eq!(s.reached(at(10)), vec![first]);
     }
@@ -1282,8 +1311,13 @@ mod tests {
             panic!("the first image was free");
         };
         assert_eq!(s.submit(request(1)), Admission::Parked { ahead: 0 });
-        let retired = s.replace(3, 3, at(7));
+        let Replaced { retired, dropped } = s.replace(3, 3, at(7));
         assert_eq!(retired.generation, SwapchainGeneration::FIRST);
+        assert_eq!(
+            dropped,
+            vec![ticket.sequence],
+            "the frame that had an image is owed; the parked one never had one"
+        );
         assert_eq!(
             s.phase(&ticket),
             None,
@@ -1379,6 +1413,7 @@ mod tests {
         let mut presented = 0usize;
         let mut superseded = 0usize;
         let mut at_the_host = 0usize;
+        let mut dropped_by_replace = 0usize;
         let mut parked_admissions = 0usize;
         let mut woken = 0usize;
         let mut undrawn_refusals = 0usize;
@@ -1518,7 +1553,17 @@ mod tests {
                     _ => {
                         let before = s.awaiting_retirement();
                         images = (rng.below(3) + 1) as usize;
-                        let _ = s.replace(images + 1, images, at(rng.below(8) + 1));
+                        let replaced = s.replace(images + 1, images, at(rng.below(8) + 1));
+                        assert_eq!(
+                            replaced.dropped.len(),
+                            owner.iter().filter(|o| o.is_some()).count(),
+                            "seed {seed}: a frame holding an image was dropped unnamed"
+                        );
+                        assert!(
+                            replaced.dropped.windows(2).all(|w| w[0] < w[1]),
+                            "seed {seed}: frames handed back out of order"
+                        );
+                        dropped_by_replace += replaced.dropped.len();
                         assert_eq!(s.awaiting_retirement(), before + 1, "seed {seed}");
                         replaces += 1;
                         owner = vec![None; images];
@@ -1595,6 +1640,10 @@ mod tests {
         );
         assert!(woken > 1_500, "parked presents woken: {woken}");
         assert!(replaces > 1_000, "swapchain replacements: {replaces}");
+        assert!(
+            dropped_by_replace > 800,
+            "frames a replacement handed back: {dropped_by_replace}"
+        );
         assert!(abandoned > 800, "parked presents handed back: {abandoned}");
     }
 }
