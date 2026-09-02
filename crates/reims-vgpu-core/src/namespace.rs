@@ -122,15 +122,63 @@ impl Teardown {
     }
 }
 
-/// A resolved name, held by work that was accepted against it.
+/// A resolved name, and the right to take one claim on the memory it named.
 ///
 /// Carries the generation, so it cannot be confused with a later occupant of
 /// the same slot, and the backing it resolved to, so work planned against those
 /// bytes keeps reading those bytes even after the name is pointed elsewhere.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Not `Clone` and not constructible outside this module. Resolving twice is
+/// how a caller gets two of these, and two resolutions are two claims — a
+/// forged or copied one would be a claim [`Namespace::release`] pays off
+/// without [`Namespace::acquire`] ever having taken it.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Lease {
-    pub id: ResourceId,
-    pub backing: BackingId,
+    id: ResourceId,
+    backing: BackingId,
+}
+
+impl Lease {
+    /// Which object, at which generation, this resolved to.
+    #[must_use]
+    pub const fn id(&self) -> ResourceId {
+        self.id
+    }
+
+    /// The memory it resolved to, which stays the same afterwards even if the
+    /// name is pointed elsewhere.
+    #[must_use]
+    pub const fn backing(&self) -> BackingId {
+        self.backing
+    }
+}
+
+/// One accepted use of a backing, outstanding until the work retires.
+///
+/// The thing [`Namespace::release`] pays off, and the reason it can be paid off
+/// exactly once. Not `Clone`, not `Copy`, no public constructor, and consumed
+/// by `release` — because `release` is what decides a backing has no uses left
+/// and hands it to the caller to free. A second release of one claim retires a
+/// use that never existed, and the backing goes back to the caller while work
+/// that took the *other* claim is still reading it. That is a use-after-free
+/// with no failing call in it: every step returns what it always returns.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a claim that is never released keeps its backing alive forever"]
+pub struct Claim {
+    id: ResourceId,
+    backing: BackingId,
+}
+
+impl Claim {
+    #[must_use]
+    pub const fn id(&self) -> ResourceId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn backing(&self) -> BackingId {
+        self.backing
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -251,50 +299,58 @@ impl Namespace {
         self.resolve(ResourceId { slot, generation })
     }
 
-    /// Record that accepted work holds this lease.
+    /// Record that accepted work holds this lease, and hand back the claim.
     ///
     /// Keeps the backing alive past a delete. A caller that resolved and then
     /// did not acquire has a name it may read and no claim on the memory, which
-    /// is the shape of a use-after-free.
-    pub fn acquire(&mut self, lease: Lease) {
+    /// is the shape of a use-after-free — so the lease is consumed here and the
+    /// [`Claim`] is the only thing [`Self::release`] takes. A release that
+    /// never acquired, and a second release of one acquisition, are both
+    /// unrepresentable rather than merely discouraged.
+    pub fn acquire(&mut self, lease: Lease) -> Claim {
+        let claim = Claim {
+            id: lease.id,
+            backing: lease.backing,
+        };
         if let Some(slot) = self.slots.get_mut(&lease.id.slot) {
             if slot.generation == lease.id.generation
                 && !slot.deleted
                 && slot.backing == lease.backing
             {
                 slot.outstanding += 1;
-                return;
+                return claim;
             }
         }
         if let Some(claims) = self.retiring.get_mut(&lease.backing) {
             *claims += 1;
         }
+        claim
     }
 
-    /// Record that work holding this lease has retired.
+    /// Record that work holding this claim has retired.
     ///
     /// Returns the backing if this was the last use of one whose name has
     /// already moved on — the deferred half of [`Teardown::WhenUsesRetire`].
-    pub fn release(&mut self, lease: Lease) -> Option<BackingId> {
-        if let Some(slot) = self.slots.get_mut(&lease.id.slot) {
-            if slot.generation == lease.id.generation
+    pub fn release(&mut self, claim: Claim) -> Option<BackingId> {
+        if let Some(slot) = self.slots.get_mut(&claim.id.slot) {
+            if slot.generation == claim.id.generation
                 && !slot.deleted
-                && slot.backing == lease.backing
+                && slot.backing == claim.backing
                 && slot.outstanding > 0
             {
                 slot.outstanding -= 1;
                 return None;
             }
         }
-        let claims = self.retiring.get_mut(&lease.backing)?;
+        let claims = self.retiring.get_mut(&claim.backing)?;
         *claims -= 1;
         if *claims > 0 {
             return None;
         }
-        self.retiring.remove(&lease.backing);
+        self.retiring.remove(&claim.backing);
         // Nothing is owed any more, but the storage is only the caller's to
         // free if no name still resolves to it.
-        (!self.named_by_a_live_slot(lease.backing)).then_some(lease.backing)
+        (!self.named_by_a_live_slot(claim.backing)).then_some(claim.backing)
     }
 
     /// Delete an object: stop it resolving, and leave accepted work alone.
@@ -495,7 +551,7 @@ mod tests {
         let mut ns = Namespace::new();
         let id = ns.declare(slot(1), backing(10)).expect("free slot");
         let lease = ns.resolve(id).expect("live");
-        ns.acquire(lease);
+        let lease = ns.acquire(lease);
 
         assert_eq!(
             ns.delete(id),
@@ -573,7 +629,7 @@ mod tests {
         let mut ns = Namespace::new();
         let id = ns.declare(slot(1), backing(10)).expect("free slot");
         let old = ns.resolve(id).expect("live");
-        ns.acquire(old);
+        let old = ns.acquire(old);
 
         assert_eq!(
             ns.replace_physical(id, backing(20)),
@@ -583,12 +639,12 @@ mod tests {
             })
         );
         assert_eq!(
-            ns.resolve(id).expect("still live").backing,
+            ns.resolve(id).expect("still live").backing(),
             backing(20),
             "the name resolves to the new memory at once"
         );
         assert_eq!(
-            old.backing,
+            old.backing(),
             backing(10),
             "and the lease already taken still names the old"
         );
@@ -601,9 +657,9 @@ mod tests {
         let mut ns = Namespace::new();
         let id = ns.declare(slot(1), backing(10)).expect("free slot");
         let a = ns.resolve(id).expect("live");
+        let a = ns.acquire(a);
         let b = ns.resolve(id).expect("live");
-        ns.acquire(a);
-        ns.acquire(b);
+        let b = ns.acquire(b);
         assert_eq!(ns.outstanding(id), 2);
         assert_eq!(
             ns.delete(id).expect("live"),
@@ -710,8 +766,13 @@ mod tests {
 
         let lease = ns.resolve_slot(slot(1)).expect("live");
         assert_eq!(ns.census(), (before.0 + 1, before.1));
-        ns.acquire(lease);
-        assert_eq!(ns.outstanding(id), 1, "the lease is the claim");
+        let claim = ns.acquire(lease);
+        assert_eq!(
+            ns.outstanding(id),
+            1,
+            "the lease is where the claim comes from"
+        );
+        assert_eq!(claim.id(), id);
     }
 
     /// Several live names over one backing is the ordinary path —
@@ -724,9 +785,9 @@ mod tests {
         let a = ns.declare(slot(1), b).expect("free slot");
         let c = ns.declare(slot(2), b).expect("free slot");
         let la = ns.resolve(a).expect("live");
-        ns.acquire(la);
+        let la = ns.acquire(la);
         let lc = ns.resolve(c).expect("live");
-        ns.acquire(lc);
+        let lc = ns.acquire(lc);
 
         assert_eq!(
             ns.delete(a),
@@ -740,7 +801,7 @@ mod tests {
             None,
             "storage handed back while another name still resolves to it"
         );
-        assert_eq!(ns.resolve(c).expect("still live").backing, b);
+        assert_eq!(ns.resolve(c).expect("still live").backing(), b);
         assert_eq!(ns.outstanding(c), 1);
 
         // Only the last name out carries it.
@@ -780,7 +841,7 @@ mod tests {
         let b = backing(7);
         let id = ns.declare(slot(1), b).expect("free slot");
         let lease = ns.resolve(id).expect("live");
-        ns.acquire(lease);
+        let lease = ns.acquire(lease);
 
         assert_eq!(
             ns.replace_physical(id, backing(8)),
@@ -818,7 +879,7 @@ mod tests {
         let b = backing(7);
         let first = ns.declare(slot(1), b).expect("free slot");
         let lease = ns.resolve(first).expect("live");
-        ns.acquire(lease);
+        let lease = ns.acquire(lease);
         assert_eq!(
             ns.delete(first),
             Ok(Teardown::WhenUsesRetire {
@@ -829,7 +890,7 @@ mod tests {
 
         let second = ns.declare(slot(1), b).expect("deleted slot");
         let fresh = ns.resolve(second).expect("live");
-        ns.acquire(fresh);
+        let _fresh = ns.acquire(fresh);
         assert_eq!(ns.outstanding(second), 1);
 
         assert_eq!(
@@ -919,7 +980,7 @@ mod tests {
             // several names may have shared it.
             let mut detached: HashMap<BackingId, usize> = HashMap::new();
             let mut names: Vec<ResourceId> = Vec::new();
-            let mut leases: Vec<Lease> = Vec::new();
+            let mut leases: Vec<Claim> = Vec::new();
             let mut resolved = 0usize;
             let mut refused = 0usize;
 
@@ -980,11 +1041,10 @@ mod tests {
                                 resolved += 1;
                                 let sh = shadow.get_mut(&sl).expect("resolved");
                                 assert!(!sh.deleted, "seed {seed}: a deleted slot resolved");
-                                assert_eq!(lease.backing, sh.backing, "seed {seed}");
-                                assert_eq!(lease.id.generation, sh.generation, "seed {seed}");
-                                ns.acquire(lease);
+                                assert_eq!(lease.backing(), sh.backing, "seed {seed}");
+                                assert_eq!(lease.id().generation, sh.generation, "seed {seed}");
                                 sh.claims += 1;
-                                leases.push(lease);
+                                leases.push(ns.acquire(lease));
                             }
                             Err(Refusal::NotDeclared { .. }) => {
                                 refused += 1;
@@ -1002,11 +1062,12 @@ mod tests {
                     // Release a lease, in any order, however late.
                     6..=8 if !leases.is_empty() => {
                         let which = rng.below(leases.len() as u64) as usize;
-                        let lease = leases.swap_remove(which);
-                        let live_here = shadow.get_mut(&lease.id.slot).filter(|s| {
-                            s.generation == lease.id.generation
+                        let claim = leases.swap_remove(which);
+                        let (id, held) = (claim.id(), claim.backing());
+                        let live_here = shadow.get_mut(&id.slot).filter(|s| {
+                            s.generation == id.generation
                                 && !s.deleted
-                                && s.backing == lease.backing
+                                && s.backing == held
                                 && s.claims > 0
                         });
                         let expected = if let Some(sh) = live_here {
@@ -1015,22 +1076,21 @@ mod tests {
                         } else {
                             late_releases += 1;
                             let pool = detached
-                                .get_mut(&lease.backing)
+                                .get_mut(&held)
                                 .expect("a released claim was taken somewhere");
                             *pool -= 1;
                             if *pool > 0 {
                                 None
                             } else {
-                                detached.remove(&lease.backing);
-                                (!named_live(&shadow, lease.backing)).then_some(lease.backing)
+                                detached.remove(&held);
+                                (!named_live(&shadow, held)).then_some(held)
                             }
                         };
-                        assert_eq!(ns.release(lease), expected, "seed {seed}: release");
+                        assert_eq!(ns.release(claim), expected, "seed {seed}: release");
                         if expected.is_some() {
                             assert!(
-                                unowned(&shadow, &detached, lease.backing),
-                                "seed {seed}: {:?} handed back under a live holder",
-                                lease.backing
+                                unowned(&shadow, &detached, held),
+                                "seed {seed}: {held:?} handed back under a live holder",
                             );
                             handbacks_on_release += 1;
                         }
