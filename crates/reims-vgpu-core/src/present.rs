@@ -433,9 +433,12 @@ impl PresentStream {
         if self.in_flight.len() >= images {
             return Err(Refusal::NoFreeImage { images });
         }
-        let used: Vec<usize> = self.in_flight.iter().map(|f| f.image).collect();
+        // Scanned rather than collected: the in-flight list is at most the
+        // returned image count long — three or four — so building a `Vec` of
+        // the used indexes costs an allocation per acquired frame to save
+        // nothing.
         let image = (0..images)
-            .find(|i| !used.contains(i))
+            .find(|i| !self.in_flight.iter().any(|f| f.image == *i))
             .expect("fewer frames in flight than images");
         let sequence = self.next_sequence;
         self.next_sequence += 1;

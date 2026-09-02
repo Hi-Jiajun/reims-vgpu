@@ -392,3 +392,63 @@ fn appending_records_to_a_transaction_does_not_allocate_per_record() {
          linear in the records rather than logarithmic"
     );
 }
+
+/// A frame through the present stream with the previous one still in flight.
+///
+/// A device that does not stall between frames acquires the next image while
+/// the last one is still queued, completes it, and then queues the new one —
+/// FIFO allows exactly that much overlap and no more, since a frame may only
+/// be queued at the head of the order. The overlap is the point: the in-flight
+/// list is non-empty at every acquire, and an implementation that collects the
+/// used image indexes into a `Vec` per acquire looks free when nothing is in
+/// flight (an empty iterator does not allocate) and costs a trip per frame the
+/// moment the pipeline fills.
+///
+/// Nothing on this path is proportional to anything. The in-flight list is at
+/// most the returned image count long and its entries are plain values, so a
+/// trip into the allocator here is a per-frame heap cost with nothing to buy
+/// it.
+///
+/// `queue` returns the frames a superseding order dropped, which is a `Vec` its
+/// signature owns; under FIFO it is always empty, and an empty `Vec` does not
+/// allocate. FIFO is also the steady state of every pathway that ships.
+#[test]
+fn a_frame_through_an_overlapped_present_stream_allocates_nothing() {
+    use reims_vgpu_core::present::{Order, PresentStream, Ticket};
+
+    let mut stream = PresentStream::new(Order::Fifo);
+    stream.configure(3, 3);
+
+    fn cycle(stream: &mut PresentStream, queued: &mut Option<Ticket>) {
+        let ticket = stream.acquire().expect("a free image");
+        stream.ready(&ticket).expect("drawn");
+        if let Some(previous) = queued.take() {
+            stream.complete(&previous).expect("shown");
+        }
+        assert!(
+            stream.queue(&ticket).expect("at the head").is_empty(),
+            "nothing is superseded under FIFO"
+        );
+        *queued = Some(ticket);
+    }
+
+    let mut queued = None;
+    for _ in 0..16 {
+        cycle(&mut stream, &mut queued);
+    }
+    assert_eq!(
+        stream.in_flight(),
+        1,
+        "a frame is still queued when the next one is acquired"
+    );
+
+    let ((), allocations) = measure(|| {
+        for _ in 0..16 {
+            cycle(&mut stream, &mut queued);
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "sixteen overlapped frames over three images"
+    );
+}
