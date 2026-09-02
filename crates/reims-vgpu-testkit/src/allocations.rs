@@ -26,6 +26,15 @@
 //! let (answer, trips) = reims_vgpu_testkit::allocations::measure(|| warm_path());
 //! ```
 //!
+//! # A trip is not a size
+//!
+//! [`measure`] counts *trips*, which is the right number for "this per-draw
+//! path must not enter the allocator at all". It is the wrong number for "this
+//! path must not turn a guest-chosen index into host memory": one `Vec` grown
+//! to an index the guest wrote is a single trip and can be every byte the host
+//! has. [`measure_cost`] answers both, and a suite asks for the one its claim
+//! is about.
+//!
 //! It has to be an integration test rather than a unit test wherever the crate
 //! under measurement forbids `unsafe`, which `reims-vgpu-core` does — a claim
 //! about the semantic model worth more than the convenience of measuring from
@@ -48,6 +57,11 @@ thread_local! {
     /// initialisation matters: a lazily initialised thread-local allocates on
     /// first use, from inside the allocator.
     static COUNT: Cell<usize> = const { Cell::new(0) };
+    /// Bytes this thread asked the allocator to hold since counting began.
+    /// A trip is not a size: one `Vec` growing to a slot number the guest
+    /// chose is a single trip and can be every byte the host has, so a claim
+    /// about *how much* a path may hold needs its own number.
+    static BYTES: Cell<usize> = const { Cell::new(0) };
     static ON: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -76,7 +90,7 @@ impl Default for Counting {
 // aborts the process.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        bump();
+        bump(layout.size());
         System.alloc(layout)
     }
 
@@ -86,20 +100,23 @@ unsafe impl GlobalAlloc for Counting {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // A `Vec` growing is an allocation by the measure that matters here:
-        // it is a trip into the allocator and the bytes may move.
-        bump();
+        // it is a trip into the allocator and the bytes may move. The size
+        // charged is the new one, because that is what the caller asked the
+        // host to hold.
+        bump(new_size);
         System.realloc(ptr, layout, new_size)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        bump();
+        bump(layout.size());
         System.alloc_zeroed(layout)
     }
 }
 
-fn bump() {
+fn bump(size: usize) {
     if ON.try_with(Cell::get).unwrap_or(false) {
         let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+        let _ = BYTES.try_with(|c| c.set(c.get().saturating_add(size)));
     }
 }
 
@@ -109,9 +126,38 @@ fn bump() {
 /// and a measurement inside a measurement would mean the inner path is not the
 /// thing being measured.
 pub fn measure<T>(body: impl FnOnce() -> T) -> (T, usize) {
+    let (out, cost) = measure_cost(body);
+    (out, cost.trips)
+}
+
+/// What one measured region cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cost {
+    /// Trips into the allocator.
+    pub trips: usize,
+    /// Bytes asked for across them.
+    pub bytes: usize,
+}
+
+/// Run `body` and return both what it cost.
+///
+/// The two numbers answer different questions and neither implies the other. A
+/// per-draw path that must not enter the allocator at all is a claim about
+/// `trips`; a path handed a guest-chosen index that must not turn it into a
+/// footprint is a claim about `bytes`, and that one is a single trip.
+///
+/// Not nestable, for [`measure`]'s reason.
+pub fn measure_cost<T>(body: impl FnOnce() -> T) -> (T, Cost) {
     COUNT.with(|c| c.set(0));
+    BYTES.with(|c| c.set(0));
     ON.with(|c| c.set(true));
     let out = body();
     ON.with(|c| c.set(false));
-    (out, COUNT.with(Cell::get))
+    (
+        out,
+        Cost {
+            trips: COUNT.with(Cell::get),
+            bytes: BYTES.with(Cell::get),
+        },
+    )
 }

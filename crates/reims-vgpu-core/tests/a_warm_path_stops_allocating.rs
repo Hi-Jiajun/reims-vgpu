@@ -615,8 +615,13 @@ fn walking_an_exec_does_not_allocate_per_record() {
     //
     // Every vector the builder and the arenas carry starts empty, so the
     // first record that reaches each one allocates it. That is why walking a
-    // single pair already costs twenty-odd trips and walking a hundred and
+    // single pair already costs a dozen-odd trips and walking a hundred and
     // twenty-eight costs barely more.
+    //
+    // The window moved down when `SlotTable` stopped storing a slot per index
+    // the guest reached: a table is one vector rather than two, and marking a
+    // draw's declarations is a write over the bound slots rather than a
+    // `clear` and a `resize` that reallocates.
     //
     // It is per EXEC rather than per draw, so it is outside the plan's zero.
     // What would remove it is a recycled builder: `walk::exec` consumes one
@@ -626,7 +631,7 @@ fn walking_an_exec_does_not_allocate_per_record() {
     // a guess. Pinning the number is what makes adding one a visible
     // improvement and losing the arenas a visible regression.
     assert!(
-        (16..=32).contains(&one),
+        (12..=24).contains(&one),
         "{one} trips to walk one bind and one draw through a fresh builder"
     );
 }

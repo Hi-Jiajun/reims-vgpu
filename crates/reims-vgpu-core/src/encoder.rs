@@ -52,9 +52,27 @@ mod table_hint {
 
 /// One resource class's slots for one stage.
 ///
-/// Indexed by slot, sparse in content and dense in storage: the guest binds
-/// low slots and leaves gaps, and a `Vec<Option<T>>` answers a lookup with one
-/// bounds check where a map would hash.
+/// Sparse in content and sparse in storage: the bound slots in slot order,
+/// and nothing at all for the gaps between them.
+///
+/// # The slot number is the guest's and the storage is not
+///
+/// The module doc's law is that nothing refuses a slot above the argument
+/// table's size, and it is about *meaning*: a high slot is a slot, not an
+/// error. Storing the table as a `Vec<Option<T>>` indexed by slot read that as
+/// a claim about layout too, and the two are not the same claim. One plural
+/// bind record naming `first = 0xF000_0000` made the table materialise four
+/// billion empty slots — a `handle_alloc_error` abort on guest data, which is
+/// the one failure this model may not have, and below the abort a guest could
+/// buy hundreds of megabytes per record and keep them.
+///
+/// So the law stands and the storage does not follow the slot number: an entry
+/// costs what a binding costs whatever its slot is, and the gap between two
+/// bound slots costs nothing. A lookup is a binary search over the bound slots
+/// rather than an index into the reached ones, which for a table the guest
+/// actually binds — tens of entries — is the same handful of cache lines, and
+/// every walk over the table is now over what is bound rather than over how
+/// far the guest reached.
 ///
 /// # A slot remembers whether the footprint already has it
 ///
@@ -70,80 +88,88 @@ mod table_hint {
 /// the ones that have not are built. A transaction's footprint is a set; the
 /// declaration order inside it orders nothing, which is why declaring once is
 /// the same answer and not an approximation of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **Declaration is an epoch and not a flag**, for the reason
+/// [`SlotTable::undeclare`] gives: the guest binds a pipeline per draw and a
+/// pipeline change takes back every declaration, so that has to be one write
+/// rather than a walk.
+#[derive(Clone, Debug)]
 pub struct SlotTable<T> {
-    slots: Vec<Option<T>>,
-    /// Whether the current binding is already in the footprint.
-    ///
-    /// **Shorter than `slots` is legal and means the tail is undeclared.**
-    /// That is the encoding [`SlotTable::undeclare`] rests on: a pipeline
-    /// change takes back every declaration in constant time by truncating this
-    /// rather than by walking the table, which matters because the guest binds
-    /// a pipeline per draw. Nothing indexes it — [`SlotTable::is_declared`] and
-    /// [`SlotTable::undeclare_slot`] are the two doors, and both answer for a
-    /// slot past the end.
-    declared: Vec<bool>,
+    /// Bound slots, ascending and unique. Nothing is stored for an unbound
+    /// slot, so this is as long as the guest has bound and not as far as it
+    /// has reached.
+    bound: Vec<Slot<T>>,
+    /// The declaration epoch. A slot is declared exactly when it carries this
+    /// value, so [`SlotTable::undeclare`] is one increment and never a walk.
+    /// Starts at one, because zero is what a freshly bound slot carries and
+    /// means "declared under no epoch at all".
+    epoch: u64,
+}
+
+/// One bound slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slot<T> {
+    slot: u32,
+    value: T,
+    /// The epoch this slot was declared under. See [`SlotTable::epoch`].
+    declared: u64,
 }
 
 impl<T: Copy + PartialEq> SlotTable<T> {
     #[must_use]
     pub fn with_hint(hint: u32) -> Self {
         Self {
-            slots: Vec::with_capacity(hint as usize),
-            declared: Vec::with_capacity(hint as usize),
+            bound: Vec::with_capacity(hint as usize),
+            epoch: 1,
         }
     }
 
-    /// Bind `value` at `slot`, growing the table if the guest reached past it.
+    /// Where `slot` is, or where it would go.
+    fn find(&self, slot: u32) -> Result<usize, usize> {
+        self.bound.binary_search_by_key(&slot, |s| s.slot)
+    }
+
+    /// Bind `value` at `slot`, or unbind it with `None`.
     ///
     /// A bind of what the slot already holds changes nothing, including whether
     /// the footprint has it. That is what the comparability of the binding
     /// types is for: a guest that re-binds its whole table between draws — and
     /// they do — must not make the next draw declare everything again.
-    pub fn set(&mut self, slot: u32, value: Option<T>) {
-        let index = slot as usize;
-        if index >= self.slots.len() {
-            // Nothing between the old end and the new slot was bound, so the
-            // gap is empty rather than a copy of anything. `declared` is not
-            // grown with it: the slots past its end are undeclared, which is
-            // what a slot that has just been bound is.
-            self.slots.resize(index + 1, None);
-        }
-        if self.slots[index] == value {
-            return;
-        }
-        self.slots[index] = value;
-        self.undeclare_slot(index);
-    }
-
-    /// Whether the footprint already has the binding at `index`.
-    fn is_declared(&self, index: usize) -> bool {
-        self.declared.get(index).copied().unwrap_or(false)
-    }
-
-    /// Take back one slot's declaration.
     ///
-    /// A slot past the end of `declared` is already undeclared, so there is
-    /// nothing to write. Indexing instead would panic on exactly the ordinary
-    /// sequence [`Self::undeclare`] produces — bind, draw, bind a different
-    /// pipeline, re-bind the slot — because the pipeline change left `declared`
-    /// empty and the slot is still inside `slots`.
-    fn undeclare_slot(&mut self, index: usize) {
-        if let Some(flag) = self.declared.get_mut(index) {
-            *flag = false;
+    /// Unbinding a slot nothing bound is not a write: the gap was already the
+    /// absence of an entry, and storing one for it would be the layout the
+    /// type doc refuses.
+    pub fn set(&mut self, slot: u32, value: Option<T>) {
+        match (self.find(slot), value) {
+            (Ok(at), Some(value)) => {
+                if self.bound[at].value == value {
+                    return;
+                }
+                self.bound[at].value = value;
+                // A new binding is a new question for the footprint.
+                self.bound[at].declared = 0;
+            }
+            (Ok(at), None) => {
+                self.bound.remove(at);
+            }
+            (Err(at), Some(value)) => self.bound.insert(
+                at,
+                Slot {
+                    slot,
+                    value,
+                    declared: 0,
+                },
+            ),
+            (Err(_), None) => {}
         }
     }
 
     /// Every bound slot the open encoder has not declared yet.
-    ///
-    /// A slot past the end of `declared` is undeclared. The two vectors are not
-    /// zipped for exactly that reason: [`Self::undeclare`] empties one of them,
-    /// and a zip would then yield nothing at all rather than everything.
     pub fn undeclared(&self) -> impl Iterator<Item = (u32, T)> + '_ {
-        self.slots
+        self.bound
             .iter()
-            .enumerate()
-            .filter_map(|(i, v)| v.filter(|_| !self.is_declared(i)).map(|v| (i as u32, v)))
+            .filter(move |s| s.declared != self.epoch)
+            .map(|s| (s.slot, s.value))
     }
 
     /// Record that the footprint now has every bound slot.
@@ -152,48 +178,66 @@ impl<T: Copy + PartialEq> SlotTable<T> {
     /// they contribute nothing, and that is as much an answer as a
     /// participation. A pipeline change is what takes it back.
     pub fn mark_declared(&mut self) {
-        self.declared.clear();
-        self.declared.resize(self.slots.len(), true);
+        let epoch = self.epoch;
+        for slot in &mut self.bound {
+            slot.declared = epoch;
+        }
     }
 
     /// Forget what the footprint has, keeping the bindings.
     ///
     /// The pipeline decides what a bound slot contributes, so a new one makes
-    /// every slot's contribution a fresh question.
+    /// every slot's contribution a fresh question — and the guest binds a
+    /// pipeline per draw, so this is one increment and touches no slot.
     pub fn undeclare(&mut self) {
-        self.declared.clear();
+        self.epoch += 1;
     }
 
     #[must_use]
     pub fn get(&self, slot: u32) -> Option<T> {
-        self.slots.get(slot as usize).copied().flatten()
+        self.find(slot).ok().map(|at| self.bound[at].value)
     }
 
     /// Every bound slot, with its index.
     pub fn bound(&self) -> impl Iterator<Item = (u32, T)> + '_ {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, v)| v.map(|v| (i as u32, v)))
+        self.bound.iter().map(|s| (s.slot, s.value))
     }
 
     /// How far the guest has reached, which is not how many are bound.
     #[must_use]
     pub fn extent(&self) -> usize {
-        self.slots.len()
+        self.bound.last().map_or(0, |s| s.slot as usize + 1)
     }
 
     pub fn clear(&mut self) {
-        self.slots.clear();
-        self.declared.clear();
+        self.bound.clear();
     }
 }
+
+/// Two tables are equal when the same slots hold the same bindings and the
+/// same ones are declared.
+///
+/// Written out rather than derived: the epoch is how declaration is *stored*
+/// and not what it *is*, so two tables that have declared the same slots after
+/// different numbers of pipeline changes are the same table.
+impl<T: PartialEq> PartialEq for SlotTable<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.bound.len() == other.bound.len()
+            && self.bound.iter().zip(&other.bound).all(|(a, b)| {
+                a.slot == b.slot
+                    && a.value == b.value
+                    && (a.declared == self.epoch) == (b.declared == other.epoch)
+            })
+    }
+}
+
+impl<T: Eq> Eq for SlotTable<T> {}
 
 impl<T: Copy> Default for SlotTable<T> {
     fn default() -> Self {
         Self {
-            slots: Vec::new(),
-            declared: Vec::new(),
+            bound: Vec::new(),
+            epoch: 1,
         }
     }
 }
