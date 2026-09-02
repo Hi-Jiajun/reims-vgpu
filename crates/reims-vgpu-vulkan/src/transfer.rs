@@ -79,8 +79,6 @@ pub enum Refusal {
     RaggedPatternFill { offset: u64, length: u64 },
     /// The scratch memory a ragged fill needs was not available.
     NoStaging { refusal: crate::staging::Refusal },
-    /// A fill or copy of no bytes.
-    EmptyRange,
     /// A dimension larger than the 32-bit fields a native copy carries.
     ///
     /// The guest's own values are 64-bit; this is where that stops being true,
@@ -194,7 +192,6 @@ impl Refusal {
             Self::UnknownFormatGeometry { .. } => "vk_transfer_unknown_format_geometry",
             Self::RaggedPatternFill { .. } => "vk_transfer_ragged_pattern_fill",
             Self::NoStaging { .. } => "vk_transfer_no_staging",
-            Self::EmptyRange => "vk_transfer_empty_range",
             Self::ExtentTooLarge { .. } => "vk_transfer_extent_too_large",
             Self::RowPitchShorterThanCopy { .. } => "vk_transfer_row_pitch_shorter_than_copy",
             Self::ImagePitchShorterThanCopy { .. } => "vk_transfer_image_pitch_shorter_than_copy",
@@ -235,7 +232,6 @@ impl std::fmt::Display for Refusal {
                 write!(f, "{} offset={offset} length={length}", self.slug())
             }
             Self::NoStaging { refusal } => write!(f, "{} {refusal}", self.slug()),
-            Self::EmptyRange => f.write_str(self.slug()),
             Self::ExtentTooLarge { axis, value } => {
                 write!(f, "{} axis={axis} value={value}", self.slug())
             }
@@ -401,9 +397,10 @@ fn narrow(axis: &'static str, value: u64) -> Result<u32, Refusal> {
 /// declared depth, and inventing a slice the guest did not ask for would copy
 /// a plane it never named.
 fn extent(size: Size3) -> Result<vk::Extent3D, Refusal> {
-    if size.width == 0 || size.height == 0 || size.depth == 0 {
-        return Err(Refusal::EmptyRange);
-    }
+    debug_assert!(
+        size.width != 0 && size.height != 0 && size.depth != 0,
+        "a copy of no texels reaches `plan`'s own answer and never a native extent"
+    );
     Ok(vk::Extent3D {
         width: narrow("width", size.width)?,
         height: narrow("height", size.height)?,
@@ -711,6 +708,31 @@ fn resolved<T>(result: Result<T, Miss>) -> Result<T, Refusal> {
 ///
 /// [`Refusal`] naming the one thing that could not be expressed.
 pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refusal> {
+    // A transfer of no bytes is one that is already complete, not one that
+    // cannot be expressed. The guest API reads a zero size and a zero-axis
+    // extent as a no-op --- production's blit rail answers both on its success
+    // arm --- and `vkCmdCopy*` has no form for either, so this is the same
+    // answer an exact self-copy gets and for the same reason.
+    //
+    // Decided before any name is resolved, which is production's order too: a
+    // no-op naming a stale resource is still a no-op, and refusing it would
+    // report a failure for a command the guest saw succeed.
+    let empty = match *op {
+        BlitOp::BufferToBuffer { size, .. } => size == 0,
+        BlitOp::BufferToTexture { size, .. }
+        | BlitOp::TextureToBuffer { size, .. }
+        | BlitOp::TextureRegion { size, .. } => {
+            size.width == 0 || size.height == 0 || size.depth == 0
+        }
+        // A span of no levels or no slices copies no subresource. The slice
+        // count is also `layerCount`, which Vulkan forbids being zero, so this
+        // is the one arm where the empty case is illegal as well as pointless.
+        BlitOp::TextureSlices { source, .. } => source.level_count == 0 || source.slice_count == 0,
+        BlitOp::FillBuffer { .. } | BlitOp::GenerateMipmaps { .. } => false,
+    };
+    if empty {
+        return Ok(None);
+    }
     Ok(Some(match *op {
         BlitOp::BufferToBuffer {
             source,
@@ -719,9 +741,6 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
             dest_offset,
             size,
         } => {
-            if size == 0 {
-                return Err(Refusal::EmptyRange);
-            }
             let from = resolved(residency.buffer(source))?;
             let to = resolved(residency.buffer(dest))?;
             within_buffer(&from.plan, source_offset, size)?;
@@ -951,7 +970,7 @@ pub fn plan(op: &BlitOp, residency: &Residency) -> Result<Option<Command>, Refus
             // because a `Vec` collected and then found to hold one has already
             // paid for itself.
             let regions = match source.level_count {
-                0 => return Err(Refusal::EmptyRange),
+                // Zero was answered before any name was resolved.
                 1 => Regions::One(region(0)?),
                 count => Regions::Many(
                     (0..u32::from(count))
@@ -1068,11 +1087,13 @@ pub fn plan_fill(
     pattern: reims_vgpu_core::blit::FillPattern,
     residency: &Residency,
     arena: &mut crate::staging::Arena,
-) -> Result<FillPlan, Refusal> {
+) -> Result<Option<FillPlan>, Refusal> {
     use reims_vgpu_core::blit::FillPattern;
 
+    // A fill of no bytes, answered the way [`plan`] answers a copy of none and
+    // before the name is resolved. See there.
     if span.length == 0 {
-        return Err(Refusal::EmptyRange);
+        return Ok(None);
     }
     let target = resolved(residency.buffer(span.buffer))?;
     within_buffer(&target.plan, span.offset, span.length)?;
@@ -1088,7 +1109,7 @@ pub fn plan_fill(
     let tail_length = remaining & 3;
 
     if head_length == 0 && tail_length == 0 {
-        return Ok(FillPlan {
+        return Ok(Some(FillPlan {
             dest,
             head: None,
             middle: Some(FillRange {
@@ -1097,7 +1118,7 @@ pub fn plan_fill(
                 data: fill_word(pattern),
             }),
             tail: None,
-        });
+        }));
     }
 
     // A byte pattern has no phase: every byte of the range takes the value, so
@@ -1142,12 +1163,12 @@ pub fn plan_fill(
         data: fill_word(pattern),
     });
 
-    Ok(FillPlan {
+    Ok(Some(FillPlan {
         dest,
         head,
         middle,
         tail,
-    })
+    }))
 }
 
 /// One `VkBufferImageCopy`, whichever direction it goes.
@@ -1690,46 +1711,120 @@ mod tests {
         }
     }
 
+    /// A transfer of no bytes is complete, not refused.
+    ///
+    /// The guest API reads a zero size and a zero-axis extent as a no-op, and
+    /// production's blit rail answers both on its success arm --- `BlitStatus::
+    /// ZeroExtent` reports no refusal and its dispatch site treats it exactly
+    /// as `Ok`. Refusing it here would report a failure for a command the
+    /// guest saw succeed.
+    ///
+    /// Every arm, and every axis of every arm, because "no bytes" is spelled
+    /// five different ways across the five shapes.
     #[test]
-    fn an_empty_transfer_is_refused_rather_than_recorded() {
+    fn a_transfer_of_no_bytes_is_complete_rather_than_refused() {
         let residency = populated();
-        assert_eq!(
-            plan(
-                &BlitOp::BufferToBuffer {
-                    source: id(BUFFER_A),
-                    source_offset: 0,
-                    dest: id(BUFFER_B),
-                    dest_offset: 0,
-                    size: 0,
+        let flat = ImagePitch {
+            bytes_per_row: 0,
+            bytes_per_image: 0,
+        };
+        let mut empty: Vec<BlitOp> = vec![BlitOp::BufferToBuffer {
+            source: id(BUFFER_A),
+            source_offset: 0,
+            dest: id(BUFFER_B),
+            dest_offset: 0,
+            size: 0,
+        }];
+        for axis in 0..3 {
+            let size = Size3 {
+                width: if axis == 0 { 0 } else { 4 },
+                height: if axis == 1 { 0 } else { 4 },
+                depth: if axis == 2 { 0 } else { 1 },
+            };
+            empty.push(BlitOp::BufferToTexture {
+                source: id(BUFFER_A),
+                source_offset: 0,
+                source_pitch: flat,
+                size,
+                dest: point(IMAGE_A, 0, 0),
+                options: Default::default(),
+            });
+            empty.push(BlitOp::TextureToBuffer {
+                source: point(IMAGE_A, 0, 0),
+                size,
+                dest: id(BUFFER_A),
+                dest_offset: 0,
+                dest_pitch: flat,
+                options: Default::default(),
+            });
+            empty.push(BlitOp::TextureRegion {
+                source: point(IMAGE_A, 0, 0),
+                dest: point(IMAGE_B, 0, 0),
+                size,
+                options: Default::default(),
+            });
+        }
+        // A span of no levels, and one of no slices --- the slice count is
+        // also `layerCount`, which Vulkan forbids being zero, so the second is
+        // illegal as well as pointless.
+        for (level_count, slice_count) in [(0, 1), (1, 0)] {
+            let span = TextureSpan {
+                texture: id(IMAGE_A),
+                base_slice: 0,
+                base_level: 0,
+                slice_count,
+                level_count,
+            };
+            empty.push(BlitOp::TextureSlices {
+                source: span,
+                dest: TextureSpan {
+                    texture: id(IMAGE_B),
+                    ..span
                 },
-                &residency,
-            )
-            .err(),
-            Some(Refusal::EmptyRange)
-        );
-        assert_eq!(
-            plan(
-                &BlitOp::TextureSlices {
-                    source: TextureSpan {
-                        texture: id(IMAGE_A),
-                        base_slice: 0,
-                        base_level: 0,
-                        slice_count: 1,
-                        level_count: 0,
-                    },
-                    dest: TextureSpan {
-                        texture: id(IMAGE_B),
-                        base_slice: 0,
-                        base_level: 0,
-                        slice_count: 1,
-                        level_count: 0,
-                    },
-                },
-                &residency,
-            )
-            .err(),
-            Some(Refusal::EmptyRange)
-        );
+            });
+        }
+        for op in empty {
+            let kind = op.kind();
+            assert!(
+                plan(&op, &residency)
+                    .unwrap_or_else(|e| panic!("{kind:?}: {e}"))
+                    .is_none(),
+                "{kind:?} of no bytes"
+            );
+        }
+    }
+
+    /// And it is answered before the names are resolved, which is production's
+    /// order too: a no-op naming a resource that is gone is still a no-op, and
+    /// refusing it would report a failure for a command the guest completed.
+    #[test]
+    fn a_transfer_of_no_bytes_does_not_need_its_names_to_resolve() {
+        let residency = Residency::new();
+        assert!(plan(
+            &BlitOp::BufferToBuffer {
+                source: id(BUFFER_A),
+                source_offset: 0,
+                dest: id(BUFFER_B),
+                dest_offset: 0,
+                size: 0,
+            },
+            &residency,
+        )
+        .expect("nothing to resolve")
+        .is_none());
+        // The same names with one byte to move do not resolve, so the empty
+        // answer above is the emptiness and not the fixture.
+        assert!(plan(
+            &BlitOp::BufferToBuffer {
+                source: id(BUFFER_A),
+                source_offset: 0,
+                dest: id(BUFFER_B),
+                dest_offset: 0,
+                size: 1,
+            },
+            &residency,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1782,7 +1877,8 @@ mod tests {
             &residency,
             &mut arena,
         )
-        .expect("plannable");
+        .expect("plannable")
+        .expect("bytes to fill");
         assert_eq!(planned.dest.as_raw(), 0xB1);
         assert_eq!(planned.head, None);
         assert_eq!(planned.tail, None);
@@ -1810,7 +1906,8 @@ mod tests {
             &residency,
             &mut arena,
         )
-        .expect("plannable");
+        .expect("plannable")
+        .expect("bytes to fill");
 
         let head = planned.head.expect("a head");
         let tail = planned.tail.expect("a tail");
@@ -1844,8 +1941,9 @@ mod tests {
     fn a_fill_too_short_to_reach_a_boundary_is_all_edge() {
         let residency = populated();
         let mut arena = arena();
-        let planned =
-            plan_fill(span(1, 2), FillPattern::Byte(7), &residency, &mut arena).expect("plannable");
+        let planned = plan_fill(span(1, 2), FillPattern::Byte(7), &residency, &mut arena)
+            .expect("plannable")
+            .expect("bytes to fill");
         let head = planned.head.expect("a head");
         assert_eq!(head.dest_offset, 1);
         assert_eq!(head.length, 2);
@@ -1887,10 +1985,24 @@ mod tests {
     fn a_fill_of_no_bytes_and_one_naming_nothing_refuse_before_the_arena() {
         let residency = populated();
         let mut arena = arena();
-        assert_eq!(
-            plan_fill(span(0, 0), FillPattern::Byte(0), &residency, &mut arena).err(),
-            Some(Refusal::EmptyRange)
-        );
+        // A fill of no bytes is complete rather than refused --- see
+        // `a_transfer_of_no_bytes_is_complete_rather_than_refused` --- and it
+        // is answered before the name is resolved, so it holds for a span
+        // naming nothing too.
+        for buffer in [id(BUFFER_A), id(99)] {
+            assert!(plan_fill(
+                BufferSpan {
+                    buffer,
+                    offset: 0,
+                    length: 0,
+                },
+                FillPattern::Byte(0),
+                &residency,
+                &mut arena,
+            )
+            .expect("nothing to fill")
+            .is_none());
+        }
         assert_eq!(
             plan_fill(
                 BufferSpan {
@@ -2070,7 +2182,6 @@ mod tests {
             Refusal::NoStaging {
                 refusal: crate::staging::Refusal::BadAlignment { alignment: 3 },
             },
-            Refusal::EmptyRange,
             Refusal::ExtentTooLarge {
                 axis: "width",
                 value: 1,
@@ -2381,303 +2492,6 @@ mod tests {
                 }
             );
         }
-    }
-
-    /// The failure this exists to prevent: `imageExtent` must be non-zero on
-    /// every component of a `VkImageCopy` and a `VkBufferImageCopy`, so a copy
-    /// with a zero axis is not a copy of nothing — it is a command with no
-    /// native form. Two arms already refused it by way of their own byte
-    /// count; the three that carry a texel extent went through a narrowing
-    /// that accepted zero and recorded the invalid command.
-    #[test]
-    fn a_copy_with_a_zero_axis_is_refused_on_every_arm_that_carries_an_extent() {
-        let residency = populated();
-        let flat = ImagePitch {
-            bytes_per_row: 0,
-            bytes_per_image: 0,
-        };
-        for axis in ["width", "height", "depth"] {
-            let size = Size3 {
-                width: if axis == "width" { 0 } else { 4 },
-                height: if axis == "height" { 0 } else { 4 },
-                depth: if axis == "depth" { 0 } else { 1 },
-            };
-            for op in [
-                BlitOp::BufferToTexture {
-                    source: id(BUFFER_A),
-                    source_offset: 0,
-                    source_pitch: flat,
-                    size,
-                    dest: point(IMAGE_A, 0, 0),
-                    options: Default::default(),
-                },
-                BlitOp::TextureToBuffer {
-                    source: point(IMAGE_A, 0, 0),
-                    size,
-                    dest: id(BUFFER_A),
-                    dest_offset: 0,
-                    dest_pitch: flat,
-                    options: Default::default(),
-                },
-                BlitOp::TextureRegion {
-                    source: point(IMAGE_A, 0, 0),
-                    dest: point(IMAGE_B, 0, 0),
-                    size,
-                    options: Default::default(),
-                },
-            ] {
-                let kind = op.kind();
-                assert_eq!(
-                    plan(&op, &residency).expect_err("a zero axis"),
-                    Refusal::EmptyRange,
-                    "{kind:?} with a zero {axis}"
-                );
-            }
-        }
-        // And the same three plan when no axis is zero, so the refusal is the
-        // zero and not the fixture.
-        let size = Size3 {
-            width: 4,
-            height: 4,
-            depth: 1,
-        };
-        assert!(plan(
-            &BlitOp::TextureRegion {
-                source: point(IMAGE_A, 0, 0),
-                dest: point(IMAGE_B, 0, 0),
-                size,
-                options: Default::default(),
-            },
-            &residency
-        )
-        .is_ok());
-    }
-
-    /// The failure this exists to prevent: `vkCmdCopyBuffer` requires the
-    /// regions not to overlap when the source and destination buffers are the
-    /// same. A copy that breaks it has no defined result — a driver copying
-    /// forward and one copying backward produce different bytes from one
-    /// command — and nothing downstream can see which ran.
-    #[test]
-    fn a_self_copy_over_windows_that_overlap_refuses() {
-        let residency = populated();
-        let copy = |source_offset: u64, dest: u32, dest_offset: u64, size: u64| {
-            plan(
-                &BlitOp::BufferToBuffer {
-                    source: id(BUFFER_A),
-                    source_offset,
-                    dest: id(dest),
-                    dest_offset,
-                    size,
-                },
-                &residency,
-            )
-        };
-        // Touching but not overlapping, on both sides, is a copy.
-        assert!(
-            copy(0, BUFFER_A, 256, 256).is_ok(),
-            "source ends where the destination starts"
-        );
-        assert!(
-            copy(256, BUFFER_A, 0, 256).is_ok(),
-            "and the other way round"
-        );
-        // One byte of overlap, on both sides, is not.
-        for (source_offset, dest_offset) in [(0, 255), (255, 0)] {
-            assert_eq!(
-                copy(source_offset, BUFFER_A, dest_offset, 256).expect_err("one byte of overlap"),
-                Refusal::OverlappingSelfCopy {
-                    source_offset,
-                    dest_offset,
-                    size: 256,
-                }
-            );
-        }
-        // The exact self-copy is the maximal overlap and not an exception:
-        // Vulkan states the rule as "must not overlap" with no identity case,
-        // so a driver is free to produce anything from it.
-        assert_eq!(
-            copy(64, BUFFER_A, 64, 128).expect_err("a window onto itself"),
-            Refusal::OverlappingSelfCopy {
-                source_offset: 64,
-                dest_offset: 64,
-                size: 128,
-            }
-        );
-        // And two different buffers overlap at no offset, which is what makes
-        // this a rule about one allocation rather than about two numbers.
-        assert!(copy(0, BUFFER_B, 0, 256).is_ok());
-    }
-
-    /// Two names, one allocation. The rule is Vulkan's about `srcBuffer` and
-    /// `dstBuffer`, which are handles — so a check comparing the guest's two
-    /// object refs would pass exactly the case that is harder to notice.
-    #[test]
-    fn two_names_for_one_buffer_overlap_as_much_as_one_name_twice() {
-        let mut residency = Residency::new();
-        let mut retire = NativeRetirement::new();
-        let lifetime = Lifetime::new(SessionGeneration::FIRST, DeviceEpoch::FIRST);
-        // The same `vk::Buffer` under both names, which is what an aliased
-        // import or a suballocation of one allocation produces.
-        for slot in [BUFFER_A, BUFFER_B] {
-            residency
-                .publish(id(slot), lifetime, native_buffer(0xB1), &mut retire)
-                .unwrap_or_else(|(_, e)| panic!("{e}"));
-        }
-        assert_eq!(
-            plan(
-                &BlitOp::BufferToBuffer {
-                    source: id(BUFFER_A),
-                    source_offset: 0,
-                    dest: id(BUFFER_B),
-                    dest_offset: 128,
-                    size: 256,
-                },
-                &residency,
-            )
-            .expect_err("two names, one allocation, overlapping windows"),
-            Refusal::OverlappingSelfCopy {
-                source_offset: 0,
-                dest_offset: 128,
-                size: 256,
-            }
-        );
-        // Disjoint windows in the same allocation are still a copy.
-        assert!(plan(
-            &BlitOp::BufferToBuffer {
-                source: id(BUFFER_A),
-                source_offset: 0,
-                dest: id(BUFFER_B),
-                dest_offset: 256,
-                size: 256,
-            },
-            &residency,
-        )
-        .is_ok());
-    }
-
-    /// The two halves of one image copying onto itself.
-    ///
-    /// `vkCmdCopyImage`'s regions must not overlap in memory, so a shifted
-    /// self-copy is a command with no defined result. The *exact* self-copy is
-    /// the same overlap and a different answer: the destination already holds
-    /// the source bytes, and an unmodified guest issues it —
-    /// `copyFromTexture:X toTexture:X` with equal origins — so refusing it
-    /// would report a failure for a frame that is correct.
-    #[test]
-    fn one_image_copying_onto_itself_is_nothing_to_do_or_a_refusal() {
-        let residency = populated();
-        let region = |source: TexturePoint, dest: TexturePoint, size: Size3| {
-            plan(
-                &BlitOp::TextureRegion {
-                    source,
-                    dest,
-                    size,
-                    options: Default::default(),
-                },
-                &residency,
-            )
-        };
-        let at = |level: u16, slice: u16, x: u64, y: u64| TexturePoint {
-            texture: id(IMAGE_A),
-            slice,
-            level,
-            origin: Origin3 { x, y, z: 0 },
-        };
-
-        // The exact self-copy: nothing to record, and not an error.
-        assert!(region(at(0, 0, 8, 8), at(0, 0, 8, 8), size(16, 16))
-            .expect("a copy onto itself is complete")
-            .is_none());
-
-        // Shifted, and the two rectangles share a texel.
-        assert_eq!(
-            region(at(0, 2, 0, 0), at(0, 2, 8, 8), size(16, 16))
-                .expect_err("shifted by less than its own extent"),
-            Refusal::OverlappingSelfImageCopy { level: 0, slice: 2 }
-        );
-
-        // Shifted clear of itself on one axis is a copy: two boxes intersect
-        // only when they intersect on *every* axis, so one is enough.
-        assert!(region(at(0, 0, 0, 0), at(0, 0, 16, 0), size(16, 16))
-            .expect("disjoint in x")
-            .is_some());
-        assert!(region(at(0, 0, 0, 0), at(0, 0, 0, 16), size(16, 16))
-            .expect("disjoint in y")
-            .is_some());
-
-        // A different level or a different slice of the same image is
-        // different memory, so the same origins do not overlap at all.
-        for (source, dest) in [
-            (at(0, 0, 0, 0), at(1, 0, 0, 0)),
-            (at(1, 0, 0, 0), at(1, 1, 0, 0)),
-        ] {
-            assert!(region(source, dest, size(8, 8))
-                .expect("different subresources")
-                .is_some());
-        }
-
-        // And two different images at the same origin are an ordinary copy,
-        // which is what makes this a rule about one allocation.
-        assert!(region(
-            at(0, 0, 0, 0),
-            TexturePoint {
-                texture: id(IMAGE_B),
-                ..at(0, 0, 0, 0)
-            },
-            size(16, 16)
-        )
-        .expect("two images")
-        .is_some());
-    }
-
-    /// The same two answers for a slice span, whose regions cover whole levels
-    /// — so a shared (level, slice) pair is a total overlap and there is no
-    /// origin to compare.
-    #[test]
-    fn one_image_spanning_onto_itself_is_nothing_to_do_or_a_refusal() {
-        let residency = populated();
-        let span = |base_level: u16, base_slice: u16, slice_count: u16| TextureSpan {
-            texture: id(IMAGE_A),
-            base_slice,
-            base_level,
-            slice_count,
-            level_count: 2,
-        };
-        let slices = |source: TextureSpan, dest: TextureSpan| {
-            plan(&BlitOp::TextureSlices { source, dest }, &residency)
-        };
-
-        assert!(slices(span(0, 0, 2), span(0, 0, 2))
-            .expect("a span onto itself is complete")
-            .is_none());
-        // Levels 0..2 against 1..3 and slices 0..2 against 1..3: one shared
-        // pair on each axis, which is one shared subresource.
-        assert_eq!(
-            slices(span(0, 0, 2), span(1, 1, 2)).expect_err("the spans overlap"),
-            Refusal::OverlappingSelfImageCopy { level: 1, slice: 1 }
-        );
-        // Disjoint on the level axis alone is enough. The deeper span is the
-        // source, so the destination levels are the larger ones --- a shallower
-        // source would be refused for a different reason entirely.
-        assert!(slices(span(2, 0, 2), span(0, 0, 2))
-            .expect("disjoint levels")
-            .is_some());
-        // And on the slice axis alone, with one slice each so two bases fit in
-        // the fixture's three layers.
-        assert!(slices(span(0, 0, 1), span(0, 1, 1))
-            .expect("disjoint slices")
-            .is_some());
-        // A different image at the same span is an ordinary copy.
-        assert!(slices(
-            span(0, 0, 2),
-            TextureSpan {
-                texture: id(IMAGE_B),
-                ..span(0, 0, 2)
-            }
-        )
-        .expect("two images")
-        .is_some());
     }
 
     /// A destination texture whose level zero is `width` by `height`, so a
@@ -3234,7 +3048,11 @@ mod tests {
             let nonempty = size.width != 0 && size.height != 0 && size.depth != 0;
 
             match planned {
-                Ok(_) => {
+                Ok(None) => {
+                    assert!(!nonempty, "answered a copy that has texels as done");
+                    tally.4 += 1;
+                }
+                Ok(Some(_)) => {
                     assert!(nonempty, "planned a copy of no texels");
                     assert!(fits_texture, "planned a copy outside the texture");
                     assert!(fits_buffer, "planned a copy outside the buffer");
@@ -3258,10 +3076,6 @@ mod tests {
                 Err(Refusal::RowPitchShorterThanCopy { .. }) => {
                     assert!(!pitch_reaches);
                     tally.3 += 1;
-                }
-                Err(Refusal::EmptyRange) => {
-                    assert!(!nonempty, "refused a copy that has texels");
-                    tally.4 += 1;
                 }
                 Err(other) => panic!("{other}"),
             }

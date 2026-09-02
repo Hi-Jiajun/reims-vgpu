@@ -632,7 +632,8 @@ fn a_ragged_fill_writes_exactly_the_range_the_guest_named() {
         &residency,
         &mut arena,
     )
-    .unwrap_or_else(|refusal| panic!("{refusal}"));
+    .unwrap_or_else(|refusal| panic!("{refusal}"))
+    .expect("bytes to fill");
     let head = plan
         .head
         .expect("a head, because 1 is not a multiple of four");
