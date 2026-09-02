@@ -265,6 +265,35 @@ pub struct Replaced {
     pub dropped: Vec<u64>,
 }
 
+/// Everything a presentation stream was holding when its device incarnation
+/// ended.
+///
+/// Three obligations, and the third is the one that could not be met any other
+/// way. A swapchain normally leaves through [`PresentStream::reached`], at the
+/// timeline point after which nothing reads its images — and a lost device
+/// will never reach any point, because the thing that would advance the
+/// timeline is what was lost. Waiting for it is how a device loss becomes a
+/// leak and a hang instead of a transition, which is the argument
+/// [`crate::retire::NativeRetirement::epoch_lost`] makes for the same shape.
+///
+/// The swapchains come back as bare generations rather than as [`Retired`],
+/// for the reason `retire` returns [`crate::retire::Abandoned`] rather than
+/// [`crate::retire::Retired`] there: a `Retired` carries the point its images
+/// stop being read, and offering one for a swapchain whose device is gone
+/// would be offering a caller a wait it must not take.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "a lost stream's frames are completion words nothing publishes and its swapchains are objects nothing tears down"]
+pub struct Lost {
+    /// Frames that held an image of the current swapchain, oldest first. Each
+    /// was an admitted present the guest is still waiting on.
+    pub dropped: Vec<u64>,
+    /// Presents that never got an image, in arrival order.
+    pub parked: Vec<PresentRequest>,
+    /// Every swapchain the stream held — the current one and the ones already
+    /// deferred — oldest first. None of them may be waited for.
+    pub swapchains: Vec<SwapchainGeneration>,
+}
+
 /// A present packet that has not got an image yet.
 ///
 /// Carries the completion word because the packet's obligation travels with it:
@@ -412,6 +441,40 @@ impl PresentStream {
         self.next_sequence = 0;
         self.configure(requested_depth, returned_images);
         Replaced { retired, dropped }
+    }
+
+    /// The host device incarnation ended: take everything the stream held.
+    ///
+    /// No timeline is consulted and nothing is left behind — see [`Lost`] for
+    /// why waiting is not available here. The stream keeps its [`Order`],
+    /// which is a property of the presentation contract rather than of the
+    /// device, and is left unconfigured: there is no swapchain, so
+    /// [`Self::acquire`] answers [`Refusal::NotConfigured`] until one is made
+    /// against the replacement device.
+    ///
+    /// The generation advances, so a ticket that outlived the loss names a
+    /// swapchain that is gone and is refused as [`Refusal::StaleGeneration`]
+    /// rather than matching the first swapchain of the next device.
+    pub fn device_lost(&mut self) -> Lost {
+        let dropped = self.in_flight.drain(..).map(|f| f.sequence).collect();
+        let parked = self.parked.drain(..).collect();
+        let mut swapchains: Vec<SwapchainGeneration> =
+            self.retiring.drain(..).map(|r| r.generation).collect();
+        // The current one is the newest, and it is held only while a swapchain
+        // exists at all: an unconfigured stream has none.
+        if self.images.is_some() {
+            swapchains.push(self.generation);
+        }
+        swapchains.sort_unstable();
+        self.generation = self.generation.next();
+        self.next_sequence = 0;
+        self.images = None;
+        self.requested_depth = None;
+        Lost {
+            dropped,
+            parked,
+            swapchains,
+        }
     }
 
     /// The timeline reached `at`: take the swapchains nothing reads any more.
@@ -1189,6 +1252,64 @@ mod tests {
         assert_eq!(s.awaiting_retirement(), 0);
     }
 
+    /// **A lost device leaves nothing to wait for.**
+    ///
+    /// Every other way out of this stream consults something the lost device
+    /// was going to provide: a swapchain leaves at a timeline point, a frame
+    /// leaves when the host says it showed it, a parked present leaves when an
+    /// image frees. After the loss none of those will ever happen, so all
+    /// three come back at once — and the swapchains come back as generations
+    /// rather than as `Retired`, because a `Retired` is an offer to wait.
+    #[test]
+    fn a_lost_device_hands_back_everything_the_stream_was_holding() {
+        let mut s = PresentStream::new(Order::Fifo);
+        s.configure(2, 2);
+        // One swapchain already deferred, one current with a frame on it, and
+        // a present that never got an image.
+        let old = present(&mut s);
+        let replaced = s.replace(2, 1, at(40));
+        assert_eq!(replaced.dropped, vec![old.sequence]);
+        let Admission::Acquired { ticket, .. } = s.submit(request(1)) else {
+            panic!("the one image was free");
+        };
+        assert_eq!(s.submit(request(2)), Admission::Parked { ahead: 0 });
+        assert_eq!(s.awaiting_retirement(), 1);
+
+        let current = s.generation();
+        let lost = s.device_lost();
+        assert_eq!(lost.dropped, vec![ticket.sequence]);
+        assert_eq!(lost.parked, vec![request(2)]);
+        assert_eq!(
+            lost.swapchains,
+            vec![replaced.retired.generation, current],
+            "the deferred one and the live one, and neither with a point"
+        );
+
+        assert_eq!(s.in_flight(), 0);
+        assert_eq!(s.parked(), 0);
+        assert_eq!(s.awaiting_retirement(), 0, "nothing is left waiting");
+        assert!(
+            s.reached(at(u64::MAX)).is_empty(),
+            "and no timeline can produce one afterwards"
+        );
+        assert_eq!(s.images(), None);
+        assert_eq!(s.acquire(), Err(Refusal::NotConfigured));
+
+        // A ticket that outlived the loss names a swapchain that is gone, and
+        // is not mistaken for the first one of the next device.
+        s.configure(2, 2);
+        assert_eq!(
+            s.complete(&ticket),
+            Err(Refusal::StaleGeneration {
+                named: current,
+                current: current.next(),
+            })
+        );
+        assert_eq!(s.order(), Order::Fifo, "the contract is not the device's");
+        let fresh = s.acquire().expect("the replacement swapchain");
+        assert_eq!(fresh.sequence, 0, "a new order starts at its own beginning");
+    }
+
     /// Two replacements in flight retire independently and in generation order.
     #[test]
     fn several_retired_swapchains_come_back_in_order() {
@@ -1424,6 +1545,7 @@ mod tests {
         let mut undrawn_refusals = 0usize;
         let mut replaces = 0usize;
         let mut abandoned = 0usize;
+        let mut lost_devices = 0usize;
 
         for seed in 0..512u64 {
             let mut rng = Rng::new(seed);
@@ -1444,11 +1566,16 @@ mod tests {
             // Sequences this stream has handed to the host and not yet had
             // back: the frames neither order may pass judgement on.
             let mut queued: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+            // Every swapchain generation this stream has handed back, by
+            // whichever door: a deferred retirement reaching its point, or a
+            // device loss taking it with no point at all. One list, because
+            // handing one back twice is the failure however it left.
+            let mut generations: Vec<u64> = Vec::new();
 
             for _ in 0..64 {
-                match rng.below(24) {
+                match rng.below(48) {
                     // Acquire directly.
-                    0..=4 => match s.acquire() {
+                    0..=9 => match s.acquire() {
                         Ok(t) => {
                             assert!(
                                 owner[t.image].is_none(),
@@ -1469,7 +1596,7 @@ mod tests {
                         Err(other) => panic!("seed {seed}: acquire refused as {other:?}"),
                     },
                     // Admit a present packet, which parks when nothing is free.
-                    5..=7 => {
+                    10..=15 => {
                         ingress += 1;
                         let request = PresentRequest {
                             ingress: IngressOrdinal(ingress),
@@ -1486,14 +1613,14 @@ mod tests {
                         }
                     }
                     // Draw a frame.
-                    8..=12 => {
+                    16..=25 => {
                         if !tickets.is_empty() {
                             let i = rng.below(tickets.len() as u64) as usize;
                             let _ = s.ready(&tickets[i]);
                         }
                     }
                     // Hand a frame to the presentation queue.
-                    13..=17 => {
+                    26..=35 => {
                         if tickets.is_empty() {
                             continue;
                         }
@@ -1528,7 +1655,7 @@ mod tests {
                         }
                     }
                     // The host showed a frame.
-                    18..=22 => {
+                    36..=45 => {
                         if tickets.is_empty() {
                             continue;
                         }
@@ -1553,6 +1680,49 @@ mod tests {
                             ) => {}
                             Err(other) => panic!("seed {seed}: complete refused as {other:?}"),
                         }
+                    }
+                    // The device incarnation ended: everything comes back at
+                    // once, and nothing is left waiting for a timeline that
+                    // will never advance.
+                    46 => {
+                        let held = owner.iter().filter(|o| o.is_some()).count();
+                        let waiting = s.parked();
+                        let deferred = s.awaiting_retirement();
+                        let live = s.images().is_some();
+                        let lost = s.device_lost();
+                        assert_eq!(
+                            lost.dropped.len(),
+                            held,
+                            "seed {seed}: a frame went unnamed"
+                        );
+                        assert!(
+                            lost.dropped.windows(2).all(|w| w[0] < w[1]),
+                            "seed {seed}: frames handed back out of order"
+                        );
+                        assert_eq!(lost.parked.len(), waiting, "seed {seed}");
+                        assert_eq!(
+                            lost.swapchains.len(),
+                            deferred + usize::from(live),
+                            "seed {seed}: a swapchain went unnamed"
+                        );
+                        for g in &lost.swapchains {
+                            assert!(
+                                !generations.contains(&g.get()),
+                                "seed {seed}: {g:?} handed back twice"
+                            );
+                            generations.push(g.get());
+                        }
+                        assert_eq!(s.awaiting_retirement(), 0, "seed {seed}");
+                        assert!(s.reached(at(u64::MAX)).is_empty(), "seed {seed}");
+                        lost_devices += 1;
+                        abandoned += lost.parked.len();
+                        // No swapchain until one is made against the next
+                        // device.
+                        images = (rng.below(3) + 1) as usize;
+                        s.configure(images + 1, images);
+                        owner = vec![None; images];
+                        tickets.clear();
+                        queued.clear();
                     }
                     // Resize: a whole new generation, and the old one deferred.
                     _ => {
@@ -1608,7 +1778,6 @@ mod tests {
             abandoned += s.abandon_parked().len();
             assert_eq!(s.parked(), 0);
             // The deferred swapchains all come back, and only once.
-            let mut generations: Vec<u64> = Vec::new();
             for r in s.reached(at(u64::MAX)) {
                 assert!(
                     !generations.contains(&r.generation.get()),
@@ -1629,8 +1798,8 @@ mod tests {
         }
 
         // Non-vacuity: every shape an assertion above depends on reaching.
-        assert!(presented > 800, "frames presented: {presented}");
-        assert!(superseded > 100, "frames superseded: {superseded}");
+        assert!(presented > 900, "frames presented: {presented}");
+        assert!(superseded > 90, "frames superseded: {superseded}");
         assert!(
             at_the_host > 1,
             "frames at the host at once: {at_the_host} --- a stream that holds              one present at a time cannot use the images it was given"
@@ -1643,8 +1812,12 @@ mod tests {
             parked_admissions > 2_000,
             "presents parked for an image: {parked_admissions}"
         );
-        assert!(woken > 1_500, "parked presents woken: {woken}");
-        assert!(replaces > 1_000, "swapchain replacements: {replaces}");
+        assert!(woken > 1_000, "parked presents woken: {woken}");
+        assert!(replaces > 500, "swapchain replacements: {replaces}");
+        assert!(
+            lost_devices > 500,
+            "device incarnations lost: {lost_devices}"
+        );
         assert!(
             dropped_by_replace > 800,
             "frames a replacement handed back: {dropped_by_replace}"
