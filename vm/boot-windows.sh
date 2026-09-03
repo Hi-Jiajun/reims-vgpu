@@ -29,7 +29,7 @@ ARGS=(
   -device "${MACHDD_DEV:-ide-hd,bus=sata.4},drive=MacHDD"
   -qmp "tcp:127.0.0.1:${QMP_PORT:-4444},server=on,wait=off"
   -action reboot=shutdown
-  -netdev user,id=net0,ipv6=off,hostfwd=tcp::2322-:22
+  -netdev user,id=net0,ipv6=off,hostfwd=tcp::2222-:22
   -device virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:c9:18:27
   -serial "file:$VM_DIR/serial-windows.log"
 )
