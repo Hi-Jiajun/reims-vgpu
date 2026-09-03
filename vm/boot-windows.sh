@@ -5,11 +5,11 @@ set -euo pipefail
 VM_DIR="C:/hackintosh/vm"
 QEMU="${QEMU_BIN:-$(dirname "$0")/../vendor/qemu/build/qemu-system-x86_64.exe}"
 DEVICE="${DEVICE:-reims-vgpu-pci}"
-ACCEL="${ACCEL:-whpx}"
+ACCEL="${ACCEL:-whpx,hyperv=off,ignore-unknown-msr=on}"
 
 ARGS=(
   -accel "$ACCEL"
-  -m 16G
+  -m "${RAM:-16G}"
   -cpu "Skylake-Client,-hle,-rtm,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,check"
   -machine q35
   -vga none
@@ -17,7 +17,7 @@ ARGS=(
   -device qemu-xhci,id=xhci
   -device usb-kbd,bus=xhci.0
   -device usb-tablet,bus=xhci.0
-  -smp 16,cores=16,sockets=1
+  -smp ${SMP:-16},cores=${SMP:-16},sockets=1
   -device 'isa-applesmc,osk=ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc'
   -drive if=pflash,format=raw,readonly=on,file="$VM_DIR/OVMF_CODE_4M.fd"
   -drive if=pflash,format=raw,file="$VM_DIR/OVMF_VARS.fd"
@@ -26,13 +26,16 @@ ARGS=(
   -drive id=OpenCoreBoot,if=none,format=qcow2,file="$VM_DIR/OpenCore.qcow2"
   -device ide-hd,bus=sata.2,drive=OpenCoreBoot
   -drive id=MacHDD,if=none,format=qcow2,file="$VM_DIR/macos.img"
-  -device ide-hd,bus=sata.4,drive=MacHDD
-  -qmp tcp:127.0.0.1:4444,server=on,wait=off
+  -device "${MACHDD_DEV:-ide-hd,bus=sata.4},drive=MacHDD"
+  -qmp "tcp:127.0.0.1:${QMP_PORT:-4444},server=on,wait=off"
   -action reboot=shutdown
-  -netdev user,id=net0,ipv6=off,hostfwd=tcp::2222-:22
+  -netdev user,id=net0,ipv6=off,hostfwd=tcp::2322-:22
   -device virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:c9:18:27
   -serial "file:$VM_DIR/serial-windows.log"
 )
+if [ "${GDB:-0}" = "1" ]; then
+  ARGS+=(-s)
+fi
 
 EXTRA_ARGS=()
 if [ "$DEVICE" = "reims-vgpu-pci" ]; then
