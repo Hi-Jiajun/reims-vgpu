@@ -50,7 +50,7 @@
 use crate::backend::Backend as _;
 use crate::runtime::guest_ram::{
     granularity, import_budget, import_span_max, GuestRamError, GuestRamImport, GuestRamRegion,
-    GuestRef,
+    GuestRef, ImportId,
 };
 use crate::runtime::host::{GuestRamRegionsError, HostOps};
 use std::sync::Arc;
@@ -346,6 +346,124 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
         .as_ref()
         .map(|r| r.imports.clone())
         .unwrap_or_default()
+}
+
+/// One import this process holds, described the way a provider's `HostRegion`
+/// registration needs it.
+///
+/// # What this is, and what it is not
+///
+/// A **read-only projection**, not a registration. Reading one hands nothing to
+/// a backend, takes no lease, and changes no state: it is the same import list
+/// [`imports`] returns, named field by field.
+///
+/// It exists because the two coordinates had no meeting point. A provider's
+/// `HostRegion` wants `{host_pointer, length, page_size}` plus an identity it can
+/// derive a lease from, and this module holds all four — while nothing in the
+/// tree can currently say "these are the bytes this device imports". The
+/// provider-side registration itself does not exist yet; this is the projection
+/// it will be written against, and it is deliberately answerable on any host,
+/// GPU or not.
+///
+/// # Why a type of its own rather than [`GuestRamRegion`]
+///
+/// [`GuestRamRegion`] is the *shim's* shape: what QEMU reported, before this
+/// module bounded any of it. What an import *covers* is that answer after
+/// chunking and trimming, and it carries two things the shim never said — the
+/// import's identity ([`ImportId`], process-monotonic and never reused, so it is
+/// the one thing a lease id can be derived from without inventing a second id
+/// space) and the granularity the registration must declare as `page_size`.
+/// Neither belongs in the ABI-mirrored `GuestRamRegion`, and dropping them would
+/// leave the projection unable to answer the question it was added for. So the
+/// shape lives here, beside the map it is a view of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostRegion {
+    /// Identity of the import this projects — [`GuestRamImport::id`]. Distinct
+    /// for every region, including two chunks of one RAMBlock, and never
+    /// reused: a lease derived from it cannot resolve against the *replacement*
+    /// import over the same RAMBlock after a device recreate.
+    pub import: ImportId,
+    /// First guest physical address this import covers, or `None` for an import
+    /// with no linear GPA coordinate — the packed-alias shape
+    /// ([`GuestRamImport::new_host_allocation`]). Every RAMBlock import has a
+    /// base, and every import in this projection is one today; the `Option` is
+    /// how the underlying type answers, carried rather than unwrapped so a
+    /// future alias registered here stays describable instead of a panic.
+    pub gpa_base: Option<u64>,
+    /// Host virtual address covered, after any trim. This is the address the
+    /// import call was given, and never a subrange of it.
+    pub host_va: u64,
+    /// Bytes covered, in both address spaces. Always a multiple of
+    /// [`Self::page_size`].
+    pub len: u64,
+    /// The backend's import granularity this import was built against, which is
+    /// the only legal `page_size` for a window over it — 0 and non-powers-of-two
+    /// are refused at the registration, not clamped.
+    pub page_size: u64,
+}
+
+/// Project every guest RAM import this process holds into [`HostRegion`] shape.
+///
+/// A projection and not a registration: nothing is handed to a backend, no
+/// lease is taken, and no state is written. Callers that only want to *read* an
+/// established map without taking the import should use [`imports`] instead.
+///
+/// # When it runs, and what that does to [`warm`]
+///
+/// Resolution here is the same one a reference takes and the same one [`warm`]
+/// takes, so calling this first is `warm`'s first half: the import is
+/// established, and the guest's first draw does not pay for it — including the
+/// driver's page pinning, which is seconds on a large guest. Calling it again
+/// changes nothing, and the shim is still asked exactly once per boot.
+///
+/// The guard is [`warm`]'s guard, for [`warm`]'s reason. Before a backend
+/// publishes a granularity this returns an empty projection rather than
+/// resolving: `resolve` answers `NoBackendImport` when there is no granularity,
+/// that answer is latched in `MAP` for the rest of the boot, and a
+/// projection taken one instant too early would therefore turn a host that can
+/// import into one that refuses every window — reported, worse, as a host
+/// lacking the extension.
+///
+/// An empty list has two readings, both correct and both boring: nothing has
+/// been resolved yet, or the host cannot import. They are told apart by
+/// [`standing_refusal`], which is the question that has an answer.
+///
+/// # Errors
+///
+/// The shim's own refusal, carried as itself. A host without the
+/// `guest_ram_regions` callback — every pre-v17 shim and every fixture host —
+/// answers [`GuestRamRegionsError::CallbackMissing`], and this hands that back
+/// rather than folding it into an empty list. "This host cannot say where guest
+/// RAM lives" and "this host has imported nothing yet" are different things to
+/// go fix, and a projection whose whole job is to be compared against a
+/// registration is the wrong place to lose the difference.
+///
+/// The other latched refusals ([`MapRefusal::NoUsableRegion`],
+/// [`MapRefusal::ImportExceedsHeap`], [`MapRefusal::NoBackendImport`]) are not
+/// host errors and project as the empty list they describe; a caller that needs
+/// the reason asks [`standing_refusal`].
+pub fn host_regions<H: HostOps + ?Sized>(
+    host: &mut H,
+) -> Result<Vec<HostRegion>, GuestRamRegionsError> {
+    if granularity().is_none() {
+        return Ok(Vec::new());
+    }
+    with_map(host, |resolved| {
+        if let Some(MapRefusal::HostRefused(why)) = resolved.refusal {
+            return Err(why);
+        }
+        Ok(resolved
+            .imports
+            .iter()
+            .map(|import| HostRegion {
+                import: import.id(),
+                gpa_base: import.gpa_base(),
+                host_va: import.host_base() as u64,
+                len: import.len(),
+                page_size: import.align(),
+            })
+            .collect())
+    })
 }
 
 /// Take the whole guest-RAM import now, so the guest's first draw does not pay
@@ -1294,6 +1412,175 @@ mod tests {
                 span_census(),
                 (2, 0x1_0000_0000),
                 "both spans are reported though only the second was referenced"
+            );
+        });
+    }
+
+    /// The projection describes every import this process holds, field for
+    /// field, inventing no byte and dropping none.
+    ///
+    /// Asserted against [`imports()`] rather than against a written-out list of
+    /// expected regions. A list here would pin whatever this file happened to do
+    /// the day it was written, and the chunk count is a consequence of a
+    /// ceiling the test itself sets; what matters is that the two views of one
+    /// map agree, that every region carries a distinct identity, and that the
+    /// covered bytes are exactly the RAMBlocks the shim reported.
+    #[test]
+    fn the_projection_describes_every_import_this_process_holds() {
+        const CEILING: u64 = 0x2000_0000;
+        with_span_max(0x1000, CEILING, || {
+            let mut host = two_spans();
+            let projected = host_regions(&mut host).expect("a shim that answered can be projected");
+            let imported = imports();
+
+            assert_eq!(
+                projected.len(),
+                8,
+                "two 2 GiB blocks at a 512 MiB ceiling are four chunks each"
+            );
+            assert_eq!(
+                projected.len(),
+                imported.len(),
+                "the projection and the import list are two views of one map"
+            );
+            for (projected, import) in projected.iter().zip(imported.iter()) {
+                assert_eq!(projected.import, import.id());
+                assert_eq!(projected.gpa_base, import.gpa_base());
+                assert_eq!(projected.host_va as usize, import.host_base());
+                assert_eq!(projected.len, import.len());
+                assert_eq!(
+                    projected.page_size,
+                    import.align(),
+                    "the projection must name the granularity the import was built against"
+                );
+                assert_eq!(
+                    projected.len % projected.page_size,
+                    0,
+                    "an import is a whole number of granules by construction"
+                );
+            }
+
+            // The shape a reader uses this for: two blocks with the PCI hole
+            // between them, in ascending order, each region a distinct identity.
+            // The field comparison above would still pass against a projection
+            // that collapsed the machine into one range.
+            let bases: Vec<u64> = projected.iter().filter_map(|r| r.gpa_base).collect();
+            assert_eq!(bases.first(), Some(&0), "the first RAMBlock is missing");
+            assert!(
+                bases.contains(&0x1_0000_0000),
+                "the second RAMBlock is missing"
+            );
+            assert!(
+                bases.windows(2).all(|w| w[0] < w[1]),
+                "the projection is not in ascending GPA order: {bases:x?}"
+            );
+            let identities: std::collections::HashSet<_> =
+                projected.iter().map(|r| r.import).collect();
+            assert_eq!(
+                identities.len(),
+                projected.len(),
+                "two regions share an import identity"
+            );
+            assert_eq!(
+                projected.iter().map(|r| r.len).sum::<u64>(),
+                two_spans_bytes(),
+                "the projection must cover exactly the RAM the shim reported"
+            );
+        });
+    }
+
+    /// Nothing has been resolved yet, so nothing is projected — and the attempt
+    /// latches no refusal on its way out.
+    ///
+    /// This is [`warm`]'s hazard in another spelling: a projection that resolved
+    /// before the backend published a granularity would latch `NoBackendImport`
+    /// in `MAP` for the rest of the boot, and the late backend's import would
+    /// never appear. The second half is what makes this a test rather than a
+    /// tautology — once the granularity arrives, the same call has to describe
+    /// both spans.
+    #[test]
+    fn a_projection_before_the_backend_publishes_a_granularity_is_empty_and_latches_nothing() {
+        with_granularity(None, || {
+            let mut host = two_spans();
+            assert!(
+                host_regions(&mut host)
+                    .expect("no callback was asked, so nothing can have refused")
+                    .is_empty(),
+                "nothing has been resolved, so there is nothing to project"
+            );
+            assert!(
+                MAP.lock().unwrap_or_else(|p| p.into_inner()).is_none(),
+                "a projection with no granularity must not latch a refusal"
+            );
+
+            latch_granularity(0x1000);
+            assert_eq!(
+                host_regions(&mut host)
+                    .expect("the late backend's import resolves")
+                    .len(),
+                2,
+                "the late backend's import must still be there to project"
+            );
+        });
+    }
+
+    /// A host that answers with nothing importable projects an empty list, and
+    /// the emptiness is the host's rather than a refusal this dropped.
+    ///
+    /// The reason stays askable, which is the property that lets a caller treat
+    /// "empty" as a fact about the device instead of inferring one.
+    #[test]
+    fn a_host_with_no_importable_span_projects_nothing() {
+        with_granularity(Some(0x1000), || {
+            let mut host = Spans(Vec::new());
+            assert_eq!(
+                host_regions(&mut host).expect("an empty answer is not a refusal"),
+                Vec::new()
+            );
+            assert_eq!(
+                standing_refusal(&mut host),
+                Some(MapRefusal::NoUsableRegion { spans: 0 }),
+                "the empty projection must be the host's answer, not a swallowed refusal"
+            );
+        });
+    }
+
+    /// A host that cannot say where guest RAM lives is an error and not an empty
+    /// projection, and it keeps the name of its refusal.
+    ///
+    /// This is the difference the projection exists to preserve: "this shim
+    /// cannot answer" sends a reader to a version mismatch, while "nothing is
+    /// imported yet" is a device that has not been asked. A projection that
+    /// folded the first into the second would read, on every fixture host and
+    /// every pre-v17 shim, exactly like a device waiting for its first draw.
+    #[test]
+    fn a_host_without_the_callback_is_an_error_rather_than_an_empty_projection() {
+        with_granularity(Some(0x1000), || {
+            /// Implements everything but the one callback under test, so it
+            /// takes `HostOps`'s own default for it — which is what a fixture
+            /// host and a pre-v17 shim look like from here.
+            struct NoCallback;
+            impl HostOps for NoCallback {
+                fn mono_ns(&self) -> u64 {
+                    0
+                }
+                fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
+                fn schedule_bh(&mut self) {}
+            }
+            assert_eq!(
+                host_regions(&mut NoCallback).err(),
+                Some(GuestRamRegionsError::CallbackMissing),
+                "'no callback' must not read as 'no imports'"
+            );
+
+            // `MAP` latched that refusal for the boot — which is what a device
+            // teardown drops — and every other shim refusal has to keep its own
+            // name rather than arriving as the one latched first.
+            reset();
+            assert_eq!(
+                host_regions(&mut Refusing).err(),
+                Some(GuestRamRegionsError::NoRam),
+                "a machine with no RAM span is a different thing to go fix"
             );
         });
     }
