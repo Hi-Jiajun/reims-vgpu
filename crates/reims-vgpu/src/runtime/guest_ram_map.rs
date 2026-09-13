@@ -53,6 +53,7 @@ use crate::runtime::guest_ram::{
     GuestRef, ImportId,
 };
 use crate::runtime::host::{GuestRamRegionsError, HostOps};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Why a guest physical address did not become a bindable reference.
@@ -668,6 +669,719 @@ pub fn registration_candidates(
         });
     }
     Ok(candidates)
+}
+
+/// The registrations this process has handed to a provider, and the lease
+/// bookkeeping that says when a window cut from one may be reclaimed.
+///
+/// # What this closes
+///
+/// [`registration_candidates`] answers *which* ranges a registration may name.
+/// Nothing in the tree answers what happens *after* that: who holds the
+/// registration, how many submissions may be inside a window derived from it,
+/// and what a device recreate invalidates. The provider side of that lifecycle
+/// already exists and is wired against (`research/docs/20` step 5); the fork
+/// side did not, so the two could only be joined by a caller who happened to
+/// remember the rules. This is the fork's half of the agreement, kept where it
+/// can be tested on a host with no GPU.
+///
+/// It carries **no provider dependency** and no GPU handle: a registration here
+/// is the same [`RegistrationCandidate`] plus the epoch and the binding count,
+/// which is everything the lifecycle needs and nothing that would tie this
+/// module to a backend.
+///
+/// # The three coordinates, kept apart
+///
+/// `research/docs/20` §3.2 fixes what each number means, and this type carries
+/// that split rather than a second interpretation of it:
+///
+/// - a **registration** is one whole candidate — `aligned_base` and
+///   `aligned_len`, the range a provider is told to import;
+/// - a **window** is a page-aligned slice of one registration, produced by
+///   [`GuestRamRegistrations::window`] and addressed by
+///   [`RegisteredWindow::base`], which is already `aligned_base + offset`;
+/// - the **buffer view offset** inside a window is the caller's business and is
+///   deliberately not modelled here.
+///
+/// # It does not own the epoch
+///
+/// `owner_epoch` is the device epoch, and a provider refuses a zero one as it
+/// refuses a zero lease id (`metal-api-core` `HostRegion::validate`). Who
+/// *allocates* the fork's epoch is still open — `research/docs/20` §7 item 2
+/// and §3.1's `owner_epoch` row both leave it to the owner — so this type takes
+/// the epoch from its caller and never invents one.
+///
+/// What it does own is the pairing those same sections demand: [`Self::reset`]
+/// drops every registration and moves the epoch forward in one step, so a
+/// registration or a window taken before a device recreate cannot resolve after
+/// it. Call it from the one place that calls [`reset`], which is the same place
+/// that tears the backend's device down — the two must not come apart, because
+/// an import from before the recreate and a registration from before it have
+/// the same lifetime.
+#[derive(Debug)]
+pub struct GuestRamRegistrations {
+    /// The device epoch every registration in this ledger belongs to. Nonzero
+    /// by construction: [`GuestRamRegistrations::new`] refuses zero rather than
+    /// letting a provider refuse every region later.
+    epoch: u64,
+    /// Live and reclaimed registrations, keyed by the import identity they were
+    /// built from. A `BTreeMap` because lookups arrive from a guest command's
+    /// own reference in no particular order, and the population is a dozen or
+    /// so — the same shape and the same reason as the import list itself.
+    regions: BTreeMap<ImportId, Registration>,
+}
+
+/// One registration as the ledger holds it.
+#[derive(Clone, Copy, Debug)]
+struct Registration {
+    /// The candidate's position in the projection it came from, carried so a
+    /// refusal names the same element a reader can count to.
+    region_index: usize,
+    /// The import this registration was derived from — the key it is stored
+    /// under, kept here too so the two cannot drift.
+    import: ImportId,
+    /// The projected GPA base, for a caller that needs to describe the range in
+    /// guest coordinates. `None` for the packed-alias shape.
+    gpa_base: Option<u64>,
+    /// First host address the registration covers, already a whole number of
+    /// `page_size` granules from the import's own base.
+    aligned_base: u64,
+    /// Bytes covered, a nonzero whole number of granules.
+    aligned_len: u64,
+    /// The only legal granularity for a window over this registration.
+    page_size: u64,
+    /// The ledger epoch the registration was made under, stamped at
+    /// registration time rather than read from the ledger, so a window carries
+    /// the same number without a second lookup.
+    epoch: u64,
+    /// Submissions that have bound this registration and not yet retired.
+    /// Reclaiming waits for this to reach zero — the provider's
+    /// `release_ready`/`GuestWindowStillActive` pair, kept here as the one
+    /// number that decides it.
+    outstanding: usize,
+    /// Set by [`GuestRamRegistrations::reclaim`]. The registration stays in the
+    /// map, for two reasons rather than one: a late window or reclaim is then
+    /// refused by name — "this was reclaimed" is a different thing to go look
+    /// at than "this was never registered" — and a second registration of the
+    /// same import is refused for the same reason a provider refuses a reused
+    /// lease id.
+    reclaimed: bool,
+}
+
+impl Registration {
+    /// This registration as a reader needs it: the candidate's fields plus the
+    /// epoch, which is exactly what a provider registration is built from.
+    fn view(&self) -> GuestRamRegistration {
+        GuestRamRegistration {
+            region_index: self.region_index,
+            import: self.import,
+            gpa_base: self.gpa_base,
+            aligned_base: self.aligned_base,
+            aligned_len: self.aligned_len,
+            page_size: self.page_size,
+            epoch: self.epoch,
+        }
+    }
+}
+
+/// One live registration, described the way a provider registration needs it.
+///
+/// The fields `research/docs/20` §3.1 lists for the registration — identity,
+/// base, length, page size, epoch — plus the projection's own `region_index`
+/// and `gpa_base`, which cost nothing to carry and are what a log line or an
+/// assertion names the range by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestRamRegistration {
+    /// This region's position in the projection the candidate came from.
+    pub region_index: usize,
+    /// The import this registration was derived from. A provider lease id is
+    /// derived from this identity and from no other, so it is also the key a
+    /// stale lease can be compared against.
+    pub import: ImportId,
+    /// First guest physical address covered, or `None` for an import with no
+    /// linear GPA coordinate — the packed-alias shape.
+    pub gpa_base: Option<u64>,
+    /// First host address the registration covers.
+    pub aligned_base: u64,
+    /// Bytes covered.
+    pub aligned_len: u64,
+    /// The granularity a window over this registration must be aligned to.
+    pub page_size: u64,
+    /// The device epoch this registration belongs to.
+    pub epoch: u64,
+}
+
+/// A page-aligned window cut from one registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegisteredWindow {
+    /// The registration the window was cut from.
+    pub import: ImportId,
+    /// Host address of the window's first byte: the registration's
+    /// `aligned_base` plus the window's offset into it. This is the address a
+    /// provider's `borrowed_window` derives its pointer from, so a caller never
+    /// adds the two coordinates itself.
+    pub base: u64,
+    /// Window length, in bytes.
+    pub length: u64,
+    /// The epoch the registration was made under. A window carrying an epoch
+    /// the ledger has since left is stale by construction.
+    pub epoch: u64,
+}
+
+/// Why a registration, a window or a reclaim was refused.
+///
+/// One variant per distinct check, so a line in the fail log says which bound
+/// refused rather than that something about a registration did. The window
+/// variants mirror a provider's own refusals (`metal-api-core`
+/// `HostRegion::borrowed_window`), because the point of stopping them here is
+/// that the two sides agree about which input is legal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistrationLedgerRefusal {
+    /// A ledger was asked for with epoch zero, which a provider refuses too. A
+    /// registration carrying it would be a silently unowned range.
+    ZeroEpoch,
+    /// [`GuestRamRegistrations::reset`] was called at `u64::MAX`. Refused
+    /// rather than wrapped: a reused epoch is the one way a registration from a
+    /// previous device could look current.
+    EpochExhausted { epoch: u64 },
+    /// A candidate's `page_size` is zero or not a power of two, so no window
+    /// alignment mask exists. [`registration_candidates`] refuses this shape,
+    /// and a hand-built candidate must not reach a provider through here.
+    CandidatePageSizeNotPowerOfTwo { region_index: usize, page_size: u64 },
+    /// `aligned_base + aligned_len` leaves the address space, so the
+    /// registration has no end a window could be bounded inside.
+    CandidateLeavesAddressSpace {
+        region_index: usize,
+        aligned_base: u64,
+        aligned_len: u64,
+    },
+    /// A candidate's base or length is not a whole number of `page_size`
+    /// granules. A provider refuses this at the registration
+    /// (`ContractError::UnalignedHostRegion`), and a ledger that accepted it
+    /// would pre-approve a region that cannot be imported.
+    CandidateUnaligned {
+        region_index: usize,
+        field: &'static str,
+        value: u64,
+        page_size: u64,
+    },
+    /// The import already has a registration in this epoch. Refused rather than
+    /// replaced, including when the existing one was reclaimed: a lease id is
+    /// derived from the import and never reused, so a second registration would
+    /// be a second lease over one identity.
+    DuplicateImport { import: ImportId },
+    /// No registration under this import in this epoch. Ordinary for a range
+    /// that was never registered; also what a window asked for after
+    /// [`GuestRamRegistrations::reset`] earns.
+    UnregisteredImport { import: ImportId },
+    /// The registration exists and was reclaimed. Distinct from
+    /// [`Self::UnregisteredImport`] because it names a different thing to go
+    /// look at: a range whose window was given back, not one never handed over.
+    ReclaimedImport { import: ImportId },
+    /// A retirement with no matching binding. Refused rather than saturated: a
+    /// silently clamped count would let a reclaim through while a submission is
+    /// still inside.
+    NothingBound { import: ImportId },
+    /// A reclaim while submissions are still bound. The registration is left in
+    /// place, which is the property that keeps a host range alive while
+    /// anything may still touch it.
+    WindowStillBound {
+        import: ImportId,
+        outstanding: usize,
+    },
+    /// A window whose `offset` or `length` is not a whole number of granules.
+    /// The provider refuses this as `ContractError::UnalignedHostRegion`; it is
+    /// stopped here so the failure is a named refusal on this side instead of a
+    /// submission that never runs on the other.
+    UnalignedWindow {
+        import: ImportId,
+        field: &'static str,
+        value: u64,
+        page_size: u64,
+    },
+    /// A zero-length window. A provider refuses it as
+    /// `ContractError::ZeroLength`; a window that covers no byte is a caller
+    /// mistake and not an empty success.
+    ZeroLengthWindow { import: ImportId },
+    /// The window's end leaves the registration. A provider refuses it as
+    /// `ContractError::HostRegionWindowOutOfBounds`, and nothing here truncates:
+    /// a window shortened to fit would name bytes the caller did not ask for.
+    WindowPastRegistration {
+        import: ImportId,
+        end: u64,
+        region_len: u64,
+    },
+    /// `offset + length` leaves the address space, so the window has no end to
+    /// compare against the registration at all.
+    WindowOverflow {
+        import: ImportId,
+        offset: u64,
+        length: u64,
+    },
+}
+
+impl crate::observe::Decline for RegistrationLedgerRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::ZeroEpoch => "guest_ram_registration_zero_epoch",
+            Self::EpochExhausted { .. } => "guest_ram_registration_epoch_exhausted",
+            Self::CandidatePageSizeNotPowerOfTwo { .. } => {
+                "guest_ram_registration_candidate_page_size_not_power_of_two"
+            }
+            Self::CandidateLeavesAddressSpace { .. } => {
+                "guest_ram_registration_candidate_leaves_address_space"
+            }
+            Self::CandidateUnaligned { .. } => "guest_ram_registration_candidate_unaligned",
+            Self::DuplicateImport { .. } => "guest_ram_registration_duplicate_import",
+            Self::UnregisteredImport { .. } => "guest_ram_registration_unregistered_import",
+            Self::ReclaimedImport { .. } => "guest_ram_registration_reclaimed_import",
+            Self::NothingBound { .. } => "guest_ram_registration_nothing_bound",
+            Self::WindowStillBound { .. } => "guest_ram_registration_window_still_bound",
+            Self::UnalignedWindow { .. } => "guest_ram_registration_unaligned_window",
+            Self::ZeroLengthWindow { .. } => "guest_ram_registration_zero_length_window",
+            Self::WindowPastRegistration { .. } => {
+                "guest_ram_registration_window_past_registration"
+            }
+            Self::WindowOverflow { .. } => "guest_ram_registration_window_overflow",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match *self {
+            Self::ZeroEpoch => Vec::new(),
+            Self::EpochExhausted { epoch } => vec![("epoch", epoch.to_string())],
+            Self::CandidatePageSizeNotPowerOfTwo {
+                region_index,
+                page_size,
+            } => vec![
+                ("region_index", region_index.to_string()),
+                ("page_size", page_size.to_string()),
+            ],
+            Self::CandidateLeavesAddressSpace {
+                region_index,
+                aligned_base,
+                aligned_len,
+            } => vec![
+                ("region_index", region_index.to_string()),
+                ("aligned_base", format!("{aligned_base:#x}")),
+                ("aligned_len", aligned_len.to_string()),
+            ],
+            Self::CandidateUnaligned {
+                region_index,
+                field,
+                value,
+                page_size,
+            } => vec![
+                ("region_index", region_index.to_string()),
+                ("field", field.to_string()),
+                ("value", format!("{value:#x}")),
+                ("page_size", page_size.to_string()),
+            ],
+            Self::DuplicateImport { import } => vec![("import", import.to_string())],
+            Self::UnregisteredImport { import } => vec![("import", import.to_string())],
+            Self::ReclaimedImport { import } => vec![("import", import.to_string())],
+            Self::NothingBound { import } => vec![("import", import.to_string())],
+            Self::WindowStillBound {
+                import,
+                outstanding,
+            } => vec![
+                ("import", import.to_string()),
+                ("outstanding", outstanding.to_string()),
+            ],
+            Self::UnalignedWindow {
+                import,
+                field,
+                value,
+                page_size,
+            } => vec![
+                ("import", import.to_string()),
+                ("field", field.to_string()),
+                ("value", format!("{value:#x}")),
+                ("page_size", page_size.to_string()),
+            ],
+            Self::ZeroLengthWindow { import } => vec![("import", import.to_string())],
+            Self::WindowPastRegistration {
+                import,
+                end,
+                region_len,
+            } => vec![
+                ("import", import.to_string()),
+                ("end", format!("{end:#x}")),
+                ("region_len", region_len.to_string()),
+            ],
+            Self::WindowOverflow {
+                import,
+                offset,
+                length,
+            } => vec![
+                ("import", import.to_string()),
+                ("offset", format!("{offset:#x}")),
+                ("length", length.to_string()),
+            ],
+        }
+    }
+}
+
+crate::observe::decline_display!(RegistrationLedgerRefusal);
+
+impl GuestRamRegistrations {
+    /// A ledger for one device epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistrationLedgerRefusal::ZeroEpoch`]. The epoch is supplied by the
+    /// caller because the fork has no allocator for one yet — see the type docs
+    /// — but zero is not a legal value for it anywhere, so it is refused at the
+    /// one place that could make it this ledger's problem.
+    pub fn new(epoch: u64) -> Result<Self, RegistrationLedgerRefusal> {
+        if epoch == 0 {
+            return Err(RegistrationLedgerRefusal::ZeroEpoch);
+        }
+        Ok(Self {
+            epoch,
+            regions: BTreeMap::new(),
+        })
+    }
+
+    /// The device epoch every registration in this ledger belongs to.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// How many registrations are live. A reclaimed one no longer counts: it is
+    /// kept only so a late question about it can be answered by name.
+    pub fn len(&self) -> usize {
+        self.regions
+            .values()
+            .filter(|registration| !registration.reclaimed)
+            .count()
+    }
+
+    /// Whether there is no live registration.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// One live registration, or `None` if this import has none — because the
+    /// range was never registered, or because its window was reclaimed.
+    pub fn registration(&self, import: ImportId) -> Option<GuestRamRegistration> {
+        self.regions
+            .get(&import)
+            .filter(|registration| !registration.reclaimed)
+            .map(Registration::view)
+    }
+
+    /// Every live registration, in import order.
+    pub fn registrations(&self) -> impl Iterator<Item = GuestRamRegistration> + '_ {
+        self.regions
+            .values()
+            .filter(|registration| !registration.reclaimed)
+            .map(Registration::view)
+    }
+
+    /// Submissions bound to a registration and not yet retired, or `None` if
+    /// there is no live registration under this import.
+    pub fn outstanding(&self, import: ImportId) -> Option<usize> {
+        self.regions
+            .get(&import)
+            .filter(|registration| !registration.reclaimed)
+            .map(|registration| registration.outstanding)
+    }
+
+    /// Register a whole projection's candidates — or register none of them.
+    ///
+    /// # All or nothing
+    ///
+    /// The first pass checks every candidate and every identity; the second
+    /// moves the map. A batch with one unregistrable candidate therefore leaves
+    /// the ledger exactly as it was, which is the same answer
+    /// [`registration_candidates`] gives for a projection: a registration set
+    /// that is partly old and partly new is a set no caller can reason about,
+    /// and the ranges on this rail are all-or-nothing everywhere else.
+    ///
+    /// # The candidate's own bounds are re-checked
+    ///
+    /// [`registration_candidates`] already produces aligned, registerable
+    /// ranges, so over its output every check below is a no-op. They are here
+    /// because [`RegistrationCandidate`] is a public value that can be built by
+    /// hand — including by the caller that passes a shim's raw `host_va`
+    /// instead of the import's trimmed base, which is the mistake the bound
+    /// exists for — and a ledger that accepted one would be pre-approving a
+    /// region a provider refuses at the registration.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistrationLedgerRefusal`]: `CandidatePageSizeNotPowerOfTwo`,
+    /// `CandidateUnaligned`, `CandidateLeavesAddressSpace`, `DuplicateImport`.
+    pub fn register(
+        &mut self,
+        candidates: &[RegistrationCandidate],
+    ) -> Result<(), RegistrationLedgerRefusal> {
+        // The batch is built before the map is touched, so a refusal from
+        // anywhere in this loop leaves no partial registration behind — and a
+        // duplicate *within* the batch is caught here rather than silently
+        // overwriting its own earlier entry.
+        let mut incoming: Vec<Registration> = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let page_size = candidate.page_size;
+            if page_size == 0 || !page_size.is_power_of_two() {
+                return Err(RegistrationLedgerRefusal::CandidatePageSizeNotPowerOfTwo {
+                    region_index: candidate.region_index,
+                    page_size,
+                });
+            }
+            if candidate.aligned_base % page_size != 0 {
+                return Err(RegistrationLedgerRefusal::CandidateUnaligned {
+                    region_index: candidate.region_index,
+                    field: "base",
+                    value: candidate.aligned_base,
+                    page_size,
+                });
+            }
+            if candidate.aligned_len == 0 || candidate.aligned_len % page_size != 0 {
+                return Err(RegistrationLedgerRefusal::CandidateUnaligned {
+                    region_index: candidate.region_index,
+                    field: "length",
+                    value: candidate.aligned_len,
+                    page_size,
+                });
+            }
+            if candidate
+                .aligned_base
+                .checked_add(candidate.aligned_len)
+                .is_none()
+            {
+                return Err(RegistrationLedgerRefusal::CandidateLeavesAddressSpace {
+                    region_index: candidate.region_index,
+                    aligned_base: candidate.aligned_base,
+                    aligned_len: candidate.aligned_len,
+                });
+            }
+            if self.regions.contains_key(&candidate.import)
+                || incoming.iter().any(|held| held.import == candidate.import)
+            {
+                return Err(RegistrationLedgerRefusal::DuplicateImport {
+                    import: candidate.import,
+                });
+            }
+            incoming.push(Registration {
+                region_index: candidate.region_index,
+                import: candidate.import,
+                gpa_base: candidate.gpa_base,
+                aligned_base: candidate.aligned_base,
+                aligned_len: candidate.aligned_len,
+                page_size,
+                epoch: self.epoch,
+                outstanding: 0,
+                reclaimed: false,
+            });
+        }
+        for registration in incoming {
+            self.regions.insert(registration.import, registration);
+        }
+        Ok(())
+    }
+
+    /// Cut a page-aligned window out of one registration.
+    ///
+    /// Returns the window's host base — `aligned_base + offset` — and its
+    /// length: the pair a provider's `HostRegion::borrowed_window` is given.
+    ///
+    /// # The provider's window bounds, applied here
+    ///
+    /// A provider refuses a window whose `offset` or `length` is not a whole
+    /// number of `page_size` granules (`UnalignedHostRegion`), one that leaves
+    /// the registration (`HostRegionWindowOutOfBounds`), and a zero-length one
+    /// (`ZeroLength`). All three are refused here, by name, before anything is
+    /// handed over. The failure they replace is specific: a registration that
+    /// is correct on this side and refused on the other surfaces as a
+    /// submission that never runs, one round trip away from the arithmetic that
+    /// got it wrong.
+    ///
+    /// Nothing is truncated to fit. A window shortened to the registration's
+    /// end would name a host range the caller did not ask for, which is the one
+    /// answer that is worse than the refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistrationLedgerRefusal`]: `ZeroLengthWindow`, `UnalignedWindow`,
+    /// `WindowOverflow`, `WindowPastRegistration`, plus `UnregisteredImport` or
+    /// `ReclaimedImport` when the import has no live registration.
+    pub fn window(
+        &self,
+        import: ImportId,
+        offset: u64,
+        length: u64,
+    ) -> Result<RegisteredWindow, RegistrationLedgerRefusal> {
+        let registration = self.live(import)?;
+        if length == 0 {
+            return Err(RegistrationLedgerRefusal::ZeroLengthWindow { import });
+        }
+        for (field, value) in [("offset", offset), ("length", length)] {
+            if value % registration.page_size != 0 {
+                return Err(RegistrationLedgerRefusal::UnalignedWindow {
+                    import,
+                    field,
+                    value,
+                    page_size: registration.page_size,
+                });
+            }
+        }
+        let Some(end) = offset.checked_add(length) else {
+            return Err(RegistrationLedgerRefusal::WindowOverflow {
+                import,
+                offset,
+                length,
+            });
+        };
+        if end > registration.aligned_len {
+            return Err(RegistrationLedgerRefusal::WindowPastRegistration {
+                import,
+                end,
+                region_len: registration.aligned_len,
+            });
+        }
+        Ok(RegisteredWindow {
+            import,
+            // `offset + length <= aligned_len`, and `aligned_base +
+            // aligned_len` was checked at the registration, so this sum cannot
+            // leave the address space.
+            base: registration.aligned_base + offset,
+            length,
+            epoch: registration.epoch,
+        })
+    }
+
+    /// Record one submission entering a registration.
+    ///
+    /// A binding is what the ledger's reclaim latch counts, so a caller that
+    /// submits against a window has to say so before the submission is issued
+    /// and retire it after the fence says the GPU is done. The provider's own
+    /// `LeaseLedger::bind` is keyed by a completion token and is therefore
+    /// idempotent per token; the fork side has no token at this layer, so this
+    /// counts bindings and leaves token-keyed deduplication to the caller that
+    /// holds the token.
+    ///
+    /// # Errors
+    ///
+    /// `UnregisteredImport` or `ReclaimedImport`.
+    pub fn bind(&mut self, import: ImportId) -> Result<(), RegistrationLedgerRefusal> {
+        let registration = self.live_mut(import)?;
+        // A `usize` cannot hold enough simultaneous bindings for this to
+        // overflow: the count is bounded by submissions in flight.
+        registration.outstanding += 1;
+        Ok(())
+    }
+
+    /// Record one submission leaving a registration.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistrationLedgerRefusal::NothingBound`] when nothing is bound.
+    /// Refused rather than clamped to zero, because a retirement with no
+    /// matching binding means the count no longer describes what is in flight —
+    /// and that is exactly the state in which a reclaim would be let through
+    /// while a submission is still inside. Also `UnregisteredImport` or
+    /// `ReclaimedImport`.
+    pub fn retire(&mut self, import: ImportId) -> Result<(), RegistrationLedgerRefusal> {
+        let registration = self.live_mut(import)?;
+        if registration.outstanding == 0 {
+            return Err(RegistrationLedgerRefusal::NothingBound { import });
+        }
+        registration.outstanding -= 1;
+        Ok(())
+    }
+
+    /// Give up a registration, once nothing is bound to it.
+    ///
+    /// This is the latch a provider states as `GuestWindowStillActive`: while
+    /// any submission is still bound, the reclaim is refused **and the
+    /// registration stays**, so the host range cannot be handed back
+    /// underneath work the GPU may still be doing. After it succeeds the import
+    /// derives no further window and cannot be registered again.
+    ///
+    /// Note what is *not* reclaimed: the import itself. A RAMBlock import lives
+    /// for the VM's lifetime, and what a reclaim ends is one registration over
+    /// it — `research/docs/20` §3.4 step 4 says the same thing for the packed
+    /// alias case.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistrationLedgerRefusal::WindowStillBound`] while bindings are
+    /// outstanding; `UnregisteredImport` or `ReclaimedImport` otherwise.
+    pub fn reclaim(&mut self, import: ImportId) -> Result<(), RegistrationLedgerRefusal> {
+        let registration = self.live_mut(import)?;
+        if registration.outstanding > 0 {
+            return Err(RegistrationLedgerRefusal::WindowStillBound {
+                import,
+                outstanding: registration.outstanding,
+            });
+        }
+        registration.reclaimed = true;
+        Ok(())
+    }
+
+    /// Whether a window still belongs to this ledger.
+    ///
+    /// A window carries the epoch it was cut under, so one taken before
+    /// [`Self::reset`] is refused by the same question that refuses a
+    /// registration from before it, and one whose registration has since been
+    /// reclaimed is refused too. Without this the pairing would be a rule every
+    /// use site has to remember.
+    pub fn accepts(&self, window: &RegisteredWindow) -> bool {
+        window.epoch == self.epoch && self.live(window.import).is_ok()
+    }
+
+    /// Drop every registration and move to the next epoch — the fork half of a
+    /// device recreate.
+    ///
+    /// **Call this in the same place that calls [`reset`]**, which is the place
+    /// the backend's device and its imports die. The two lifetimes are one
+    /// lifetime: an import from before a recreate must not have a registration
+    /// from before it either, and the epoch is how a provider is told so.
+    ///
+    /// Returns the new epoch, so the caller that owns the device epoch can keep
+    /// its own copy in step instead of asking again.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistrationLedgerRefusal::EpochExhausted`] at `u64::MAX`. Refused
+    /// rather than wrapped: a reused epoch is the one way a registration from a
+    /// previous device could look current, which is the failure the epoch
+    /// exists to prevent.
+    pub fn reset(&mut self) -> Result<u64, RegistrationLedgerRefusal> {
+        let Some(next) = self.epoch.checked_add(1) else {
+            return Err(RegistrationLedgerRefusal::EpochExhausted { epoch: self.epoch });
+        };
+        self.regions.clear();
+        self.epoch = next;
+        Ok(next)
+    }
+
+    /// One live registration by import identity.
+    fn live(&self, import: ImportId) -> Result<&Registration, RegistrationLedgerRefusal> {
+        match self.regions.get(&import) {
+            None => Err(RegistrationLedgerRefusal::UnregisteredImport { import }),
+            Some(registration) if registration.reclaimed => {
+                Err(RegistrationLedgerRefusal::ReclaimedImport { import })
+            }
+            Some(registration) => Ok(registration),
+        }
+    }
+
+    /// The same, mutably, for the three calls that move the binding count.
+    fn live_mut(
+        &mut self,
+        import: ImportId,
+    ) -> Result<&mut Registration, RegistrationLedgerRefusal> {
+        match self.regions.get_mut(&import) {
+            None => Err(RegistrationLedgerRefusal::UnregisteredImport { import }),
+            Some(registration) if registration.reclaimed => {
+                Err(RegistrationLedgerRefusal::ReclaimedImport { import })
+            }
+            Some(registration) => Ok(registration),
+        }
+    }
 }
 
 /// Take the whole guest-RAM import now, so the guest's first draw does not pay
@@ -2476,5 +3190,649 @@ mod tests {
                 "a host that cannot import has not lost guest work to fragmentation"
             );
         });
+    }
+
+    /// A registration candidate over a **fresh** import, an aligned range with
+    /// a whole number of granules.
+    ///
+    /// Every ledger test below starts from one of these, so a test about the
+    /// lease lifecycle is not also a test about the bounds — the bounds have
+    /// their own tests, and one of them builds its candidate by hand.
+    fn a_candidate(host_va: u64, len: u64, page_size: u64) -> RegistrationCandidate {
+        let import = a_live_import();
+        let projected = projected_region(import, host_va, len, page_size);
+        registration_candidates(std::slice::from_ref(&projected))
+            .expect("an aligned region is registerable")
+            .pop()
+            .expect("a region of at least one granule yields a candidate")
+    }
+
+    /// A ledger at a legal epoch. Nothing below is about the epoch itself
+    /// except the tests that say so.
+    fn a_ledger() -> GuestRamRegistrations {
+        GuestRamRegistrations::new(1).expect("a nonzero epoch is a legal ledger epoch")
+    }
+
+    /// The whole point of the type: a candidate becomes a registration that
+    /// carries its fields, and a page-aligned window over it resolves to the
+    /// host address the provider will name.
+    ///
+    /// The assertion that matters is `base == aligned_base + offset`. A ledger
+    /// that returned the offset, or the registration's base, would still look
+    /// like a window and would name the wrong host bytes for every window that
+    /// does not start at the registration's own base.
+    #[test]
+    fn a_registration_carries_the_candidate_and_derives_an_aligned_window() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x4000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("an aligned candidate registers");
+
+        assert_eq!(ledger.len(), 1);
+        assert!(!ledger.is_empty());
+        assert_eq!(ledger.epoch(), 1);
+        let recorded = ledger.registration(import).expect("it is live");
+        assert_eq!(recorded.region_index, candidate.region_index);
+        assert_eq!(recorded.import, import);
+        assert_eq!(recorded.gpa_base, candidate.gpa_base);
+        assert_eq!(recorded.aligned_base, BASE);
+        assert_eq!(recorded.aligned_len, 0x4000);
+        assert_eq!(recorded.page_size, 0x1000);
+        assert_eq!(recorded.epoch, 1, "the registration carries its epoch");
+        assert_eq!(ledger.registrations().collect::<Vec<_>>(), vec![recorded]);
+        assert_eq!(ledger.outstanding(import), Some(0));
+
+        let window = ledger
+            .window(import, 0x1000, 0x2000)
+            .expect("aligned and inside the registration");
+        assert_eq!(
+            window.base,
+            BASE + 0x1000,
+            "the window's base is the registration's base plus its offset"
+        );
+        assert_eq!(window.length, 0x2000, "the window is the length asked for");
+        assert_eq!(window.import, import);
+        assert_eq!(window.epoch, 1);
+        assert!(ledger.accepts(&window));
+
+        // A window at the registration's own base is the degenerate case, and
+        // it must not be the only one that works.
+        assert_eq!(
+            ledger.window(import, 0, 0x1000).expect("at the base").base,
+            BASE
+        );
+        // As is one flush against the end.
+        assert_eq!(
+            ledger
+                .window(import, 0x3000, 0x1000)
+                .expect("flush against the end")
+                .base,
+            BASE + 0x3000
+        );
+    }
+
+    /// One import, one registration. A second one is refused rather than
+    /// replacing the first, because a lease id is derived from the import and
+    /// never reused — so a replaced registration would leave the first lease
+    /// naming a range this ledger no longer has.
+    ///
+    /// The second half is the batch case: two candidates for one import in a
+    /// single call must not silently overwrite each other.
+    #[test]
+    fn registering_one_import_twice_is_refused() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("the first registration is fine");
+
+        assert_eq!(
+            ledger.register(std::slice::from_ref(&candidate)).err(),
+            Some(RegistrationLedgerRefusal::DuplicateImport { import }),
+            "a second registration of one import is refused by name"
+        );
+        assert_eq!(ledger.len(), 1, "the refused call changed nothing");
+
+        let mut fresh = a_ledger();
+        assert_eq!(
+            fresh.register(&[candidate, candidate]).err(),
+            Some(RegistrationLedgerRefusal::DuplicateImport { import }),
+            "a duplicate inside one batch must not overwrite its own entry"
+        );
+        assert!(
+            fresh.is_empty(),
+            "a refused batch registers none of its candidates"
+        );
+    }
+
+    /// A window whose offset is not a whole number of granules is refused here,
+    /// where the caller's arithmetic is, rather than at the provider that would
+    /// refuse it as `UnalignedHostRegion`.
+    #[test]
+    fn an_unaligned_window_offset_is_refused() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x4000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+
+        for offset in [0x800u64, 0x1001, 0xfff] {
+            assert_eq!(
+                ledger.window(import, offset, 0x1000).err(),
+                Some(RegistrationLedgerRefusal::UnalignedWindow {
+                    import,
+                    field: "offset",
+                    value: offset,
+                    page_size: 0x1000,
+                }),
+                "offset {offset:#x} is inside a granule and must not be rounded"
+            );
+        }
+        assert_eq!(
+            crate::observe::Decline::slug(
+                &ledger.window(import, 0x800, 0x1000).expect_err("refused")
+            ),
+            "guest_ram_registration_unaligned_window",
+            "the reason reaches the fail log under its own slug"
+        );
+    }
+
+    /// The same for the length. This is the shape a caller produces by passing
+    /// a `GuestSlice`'s requested length straight through instead of its
+    /// granule-rounded bound — `research/docs/20` §3.2 says that fires
+    /// `UnalignedHostRegion` 100% of the time on a real window.
+    #[test]
+    fn an_unaligned_window_length_is_refused() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x4000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+
+        for length in [0x1u64, 0x1800, 0xfff] {
+            assert_eq!(
+                ledger.window(import, 0, length).err(),
+                Some(RegistrationLedgerRefusal::UnalignedWindow {
+                    import,
+                    field: "length",
+                    value: length,
+                    page_size: 0x1000,
+                }),
+                "length {length:#x} is not a whole number of granules"
+            );
+        }
+        // One granule exactly is the boundary that must stay legal, and one
+        // granule more than the registration must still be the *bounds*
+        // refusal rather than the alignment one.
+        assert!(ledger.window(import, 0, 0x1000).is_ok());
+        assert_eq!(
+            ledger.window(import, 0, 0x5000).err(),
+            Some(RegistrationLedgerRefusal::WindowPastRegistration {
+                import,
+                end: 0x5000,
+                region_len: 0x4000,
+            })
+        );
+    }
+
+    /// A window that leaves the registration is refused and never truncated,
+    /// and one whose end cannot be represented is refused for that reason
+    /// rather than being compared against the registration by accident.
+    #[test]
+    fn a_window_past_the_registration_is_refused() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x4000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+
+        assert_eq!(
+            ledger.window(import, 0x3000, 0x2000).err(),
+            Some(RegistrationLedgerRefusal::WindowPastRegistration {
+                import,
+                end: 0x5000,
+                region_len: 0x4000,
+            }),
+            "one granule past the end is out of bounds, not truncated to fit"
+        );
+        assert_eq!(
+            ledger
+                .window(import, 0x3000, 0x1000)
+                .expect("the last granule is inside")
+                .base,
+            BASE + 0x3000
+        );
+
+        // An aligned offset near the top of the address space: the sum leaves
+        // it, so there is no end to compare with the registration at all.
+        let top = u64::MAX - 0xfff;
+        assert_eq!(
+            ledger.window(import, top, 0x1000).err(),
+            Some(RegistrationLedgerRefusal::WindowOverflow {
+                import,
+                offset: top,
+                length: 0x1000,
+            })
+        );
+    }
+
+    /// The latch: while a submission is bound the registration cannot be given
+    /// back, and the refusal leaves it registered so the next binding still
+    /// resolves. This is the fork's half of the provider's
+    /// `GuestWindowStillActive`, and the reason a reclaim is a return value
+    /// rather than a drop.
+    #[test]
+    fn a_bound_registration_cannot_be_reclaimed() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x4000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+
+        ledger.bind(import).expect("a submission enters");
+        ledger.bind(import).expect("and a second one");
+        assert_eq!(ledger.outstanding(import), Some(2));
+        assert_eq!(
+            ledger.reclaim(import).err(),
+            Some(RegistrationLedgerRefusal::WindowStillBound {
+                import,
+                outstanding: 2,
+            }),
+            "two submissions are still inside"
+        );
+        assert!(
+            ledger.registration(import).is_some(),
+            "a refused reclaim must leave the registration in place"
+        );
+        assert!(
+            ledger.window(import, 0, 0x1000).is_ok(),
+            "and its windows must still resolve"
+        );
+
+        ledger.retire(import).expect("one leaves");
+        assert_eq!(
+            ledger.reclaim(import).err(),
+            Some(RegistrationLedgerRefusal::WindowStillBound {
+                import,
+                outstanding: 1,
+            }),
+            "one submission is still inside"
+        );
+
+        // A retirement with nothing bound is refused too: a clamped count would
+        // be exactly how a reclaim gets let through with work in flight.
+        ledger.retire(import).expect("the last one leaves");
+        assert_eq!(
+            ledger.retire(import).err(),
+            Some(RegistrationLedgerRefusal::NothingBound { import })
+        );
+        assert_eq!(
+            crate::observe::Decline::slug(&RegistrationLedgerRefusal::NothingBound { import }),
+            "guest_ram_registration_nothing_bound"
+        );
+    }
+
+    /// Count to zero and the registration can be given back — and the ledger
+    /// stops counting it, while the import itself is emphatically not reclaimed
+    /// (`research/docs/20` §3.4 step 4).
+    #[test]
+    fn a_retired_registration_can_be_reclaimed() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+        ledger.bind(import).expect("a submission enters");
+        ledger.retire(import).expect("and leaves");
+
+        assert_eq!(ledger.outstanding(import), Some(0));
+        ledger
+            .reclaim(import)
+            .expect("nothing is bound, so the window may be given back");
+        assert_eq!(ledger.len(), 0);
+        assert!(ledger.is_empty());
+        assert_eq!(ledger.outstanding(import), None);
+    }
+
+    /// A reclaimed registration derives no window and takes no binding, and the
+    /// answer is a different one from "never registered" — the distinction
+    /// costs one `bool` and is the difference between looking at a shutdown
+    /// path and looking at a registration that never happened.
+    #[test]
+    fn a_reclaimed_registration_derives_no_window() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+        ledger.reclaim(import).expect("nothing is bound");
+
+        for outcome in [
+            ledger.window(import, 0, 0x1000).err(),
+            ledger.bind(import).err(),
+            ledger.retire(import).err(),
+            ledger.reclaim(import).err(),
+        ] {
+            assert_eq!(
+                outcome,
+                Some(RegistrationLedgerRefusal::ReclaimedImport { import }),
+                "every question about a reclaimed registration has one answer"
+            );
+        }
+        assert!(ledger.registration(import).is_none());
+        assert_eq!(ledger.registrations().count(), 0);
+
+        // And it cannot be registered again: a lease id is derived from the
+        // import and never reused, so a second registration would be a second
+        // lease over one identity.
+        assert_eq!(
+            ledger.register(std::slice::from_ref(&candidate)).err(),
+            Some(RegistrationLedgerRefusal::DuplicateImport { import })
+        );
+    }
+
+    /// [`reset`] is the fork half of a device recreate: every registration
+    /// dies and the epoch moves once, so a window taken under the old epoch is
+    /// refused by the ledger rather than by the caller remembering to compare
+    /// epochs itself.
+    #[test]
+    fn a_reset_invalidates_every_registration_and_window() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+        ledger.bind(import).expect("a submission enters");
+        let window = ledger.window(import, 0x1000, 0x1000).expect("inside");
+        assert!(ledger.accepts(&window));
+
+        let next = ledger.reset().expect("an epoch can move one step");
+        assert_eq!(next, 2);
+        assert_eq!(ledger.epoch(), 2, "the ledger moved its own epoch");
+        assert!(
+            ledger.is_empty(),
+            "a device recreate leaves no registration behind"
+        );
+        assert!(
+            !ledger.accepts(&window),
+            "a window cut under the previous epoch is stale by construction"
+        );
+        assert_eq!(
+            ledger.window(import, 0x1000, 0x1000).err(),
+            Some(RegistrationLedgerRefusal::UnregisteredImport { import }),
+            "and a fresh window over the old import is refused by name"
+        );
+        assert_eq!(ledger.registration(import), None);
+    }
+
+    /// A batch is all or nothing. Without this the ledger can end up holding a
+    /// registration set that is partly old and partly new, which is the state
+    /// nobody can reason about — and the one a partially-failed registration
+    /// over a device recreate would produce.
+    #[test]
+    fn a_refused_batch_registers_nothing() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        const OTHER: u64 = 0x7f80_0000_0000;
+        let held = a_candidate(BASE, 0x2000, 0x1000);
+        let fresh = a_candidate(OTHER, 0x2000, 0x1000);
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&held))
+            .expect("the first registration is fine");
+
+        assert_eq!(
+            ledger.register(&[fresh, held]).err(),
+            Some(RegistrationLedgerRefusal::DuplicateImport {
+                import: held.import,
+            })
+        );
+        assert_eq!(ledger.len(), 1, "the batch changed nothing");
+        assert!(
+            ledger.registration(fresh.import).is_none(),
+            "the batch's own new candidate must not have landed"
+        );
+    }
+
+    /// Zero is not an epoch anywhere, including here. The one place that could
+    /// make it this ledger's problem refuses it, rather than passing it to a
+    /// provider that would refuse every region later with less context.
+    #[test]
+    fn a_zeroth_epoch_is_refused() {
+        assert_eq!(
+            GuestRamRegistrations::new(0).err(),
+            Some(RegistrationLedgerRefusal::ZeroEpoch)
+        );
+        assert_eq!(
+            crate::observe::Decline::slug(&RegistrationLedgerRefusal::ZeroEpoch),
+            "guest_ram_registration_zero_epoch"
+        );
+        // And an epoch that cannot move is refused rather than wrapped: a
+        // reused epoch is the one way an old registration could look current.
+        let mut top = GuestRamRegistrations::new(u64::MAX).expect("a legal epoch");
+        assert_eq!(
+            top.reset().err(),
+            Some(RegistrationLedgerRefusal::EpochExhausted { epoch: u64::MAX })
+        );
+        assert_eq!(top.epoch(), u64::MAX, "a refused reset moves nothing");
+    }
+
+    /// An import this ledger never registered answers every question by name —
+    /// the same answer `MapRefusal::GpaNotInAnyImport` gives one layer down,
+    /// and for the same reason: an address nothing backs is not a bound
+    /// violation.
+    #[test]
+    fn an_unregistered_import_answers_every_question_by_name() {
+        let import = a_live_import();
+        let mut ledger = a_ledger();
+        assert_eq!(ledger.registration(import), None);
+        assert_eq!(ledger.outstanding(import), None);
+        for outcome in [
+            ledger.window(import, 0, 0x1000).err(),
+            ledger.bind(import).err(),
+            ledger.retire(import).err(),
+            ledger.reclaim(import).err(),
+        ] {
+            assert_eq!(
+                outcome,
+                Some(RegistrationLedgerRefusal::UnregisteredImport { import })
+            );
+        }
+    }
+
+    /// A zero-length window is refused, and it is refused *before* the
+    /// alignment question — which is the order a provider asks them in
+    /// (`HostRegion::borrowed_window` checks `length == 0` first). A zero
+    /// length is aligned to every granularity, so the two orders disagree about
+    /// which refusal a caller gets.
+    #[test]
+    fn a_zero_length_window_is_refused() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+
+        assert_eq!(
+            ledger.window(import, 0, 0).err(),
+            Some(RegistrationLedgerRefusal::ZeroLengthWindow { import })
+        );
+        assert_eq!(
+            ledger.window(import, 0x800, 0).err(),
+            Some(RegistrationLedgerRefusal::ZeroLengthWindow { import }),
+            "zero length is not an unaligned offset"
+        );
+    }
+
+    /// A hand-built candidate is bounded before it is registered, because
+    /// [`RegistrationCandidate`] is a public value: the caller that passes a
+    /// shim's raw `host_va` instead of the import's trimmed base produces
+    /// exactly these shapes, and a ledger that accepted one would pre-approve a
+    /// region a provider refuses at the registration.
+    #[test]
+    fn a_hand_built_candidate_is_bounded_before_it_is_registered() {
+        let import = a_live_import();
+        let mut ledger = a_ledger();
+        let shaped = |region_index: usize,
+                      page_size: u64,
+                      aligned_base: u64,
+                      aligned_len: u64|
+         -> RegistrationCandidate {
+            RegistrationCandidate {
+                region_index,
+                import,
+                gpa_base: Some(0),
+                host_va: aligned_base,
+                len: aligned_len,
+                page_size,
+                aligned_base,
+                aligned_len,
+            }
+        };
+
+        assert_eq!(
+            ledger
+                .register(&[shaped(2, 0x3000, 0x7f00_0000_0000, 0x3000)])
+                .err(),
+            Some(RegistrationLedgerRefusal::CandidatePageSizeNotPowerOfTwo {
+                region_index: 2,
+                page_size: 0x3000,
+            })
+        );
+        assert_eq!(
+            ledger
+                .register(&[shaped(3, 0x1000, 0x7f00_0000_0800, 0x1000)])
+                .err(),
+            Some(RegistrationLedgerRefusal::CandidateUnaligned {
+                region_index: 3,
+                field: "base",
+                value: 0x7f00_0000_0800,
+                page_size: 0x1000,
+            }),
+            "a base inside a granule is what the shim's raw host_va looks like"
+        );
+        assert_eq!(
+            ledger
+                .register(&[shaped(4, 0x1000, 0x7f00_0000_0000, 0x1800)])
+                .err(),
+            Some(RegistrationLedgerRefusal::CandidateUnaligned {
+                region_index: 4,
+                field: "length",
+                value: 0x1800,
+                page_size: 0x1000,
+            }),
+            "a partial trailing granule is not registerable either"
+        );
+        assert_eq!(
+            ledger
+                .register(&[shaped(5, 0x1000, u64::MAX - 0xfff, 0x2000)])
+                .err(),
+            Some(RegistrationLedgerRefusal::CandidateLeavesAddressSpace {
+                region_index: 5,
+                aligned_base: u64::MAX - 0xfff,
+                aligned_len: 0x2000,
+            })
+        );
+        assert!(
+            ledger.is_empty(),
+            "not one hand-built shape reached the map"
+        );
+        assert_eq!(
+            crate::observe::Decline::slug(&RegistrationLedgerRefusal::CandidateUnaligned {
+                region_index: 0,
+                field: "base",
+                value: 0,
+                page_size: 0,
+            }),
+            "guest_ram_registration_candidate_unaligned"
+        );
+    }
+
+    /// No two checks in this vocabulary share a slug. That is the invariant the
+    /// fail log depends on — `fail_once` latches on the slug — and it is the one
+    /// property no single arm can see, so it is asserted over the vocabulary
+    /// itself rather than left to a reader.
+    #[test]
+    fn every_registration_refusal_spells_its_own_reason() {
+        let import = a_live_import();
+        let refusals = [
+            RegistrationLedgerRefusal::ZeroEpoch,
+            RegistrationLedgerRefusal::EpochExhausted { epoch: 0 },
+            RegistrationLedgerRefusal::CandidatePageSizeNotPowerOfTwo {
+                region_index: 0,
+                page_size: 0,
+            },
+            RegistrationLedgerRefusal::CandidateLeavesAddressSpace {
+                region_index: 0,
+                aligned_base: 0,
+                aligned_len: 0,
+            },
+            RegistrationLedgerRefusal::CandidateUnaligned {
+                region_index: 0,
+                field: "base",
+                value: 0,
+                page_size: 0,
+            },
+            RegistrationLedgerRefusal::DuplicateImport { import },
+            RegistrationLedgerRefusal::UnregisteredImport { import },
+            RegistrationLedgerRefusal::ReclaimedImport { import },
+            RegistrationLedgerRefusal::NothingBound { import },
+            RegistrationLedgerRefusal::WindowStillBound {
+                import,
+                outstanding: 0,
+            },
+            RegistrationLedgerRefusal::UnalignedWindow {
+                import,
+                field: "offset",
+                value: 0,
+                page_size: 0,
+            },
+            RegistrationLedgerRefusal::ZeroLengthWindow { import },
+            RegistrationLedgerRefusal::WindowPastRegistration {
+                import,
+                end: 0,
+                region_len: 0,
+            },
+            RegistrationLedgerRefusal::WindowOverflow {
+                import,
+                offset: 0,
+                length: 0,
+            },
+        ];
+        let slugs: std::collections::HashSet<&str> = refusals
+            .iter()
+            .map(|refusal| crate::observe::Decline::slug(refusal))
+            .collect();
+        assert_eq!(
+            slugs.len(),
+            refusals.len(),
+            "two checks share a slug, which is the defect the vocabulary exists to prevent"
+        );
+        assert!(
+            refusals.iter().all(|refusal| {
+                crate::observe::Decline::slug(refusal).starts_with("guest_ram_registration_")
+            }),
+            "every slug names the rail it came from"
+        );
     }
 }
