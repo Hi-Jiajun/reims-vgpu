@@ -466,6 +466,210 @@ pub fn host_regions<H: HostOps + ?Sized>(
     })
 }
 
+/// One import this process holds, bounded to the shape a registration may
+/// name.
+///
+/// # Why a second type, when the projection is already registration-shaped
+///
+/// [`HostRegion`] is the projection: what this process holds, field by field.
+/// This is that same range after the two bounds a registration imposes on
+/// itself have been made *explicit* — the covered base is a whole number of
+/// `page_size` granules from the region's start, and the covered length is a
+/// whole number of granules.
+///
+/// The projection satisfies both today, but nothing in it says so: the fields
+/// are plain `u64`s, and the one value a reader could compare them against, the
+/// shim's `host_va` in [`GuestRamRegion`], is not rounded at all. A registration
+/// that names an unaligned base or a partial granule is refused outright, so the
+/// step between "these are the bytes we hold" and "this is the range that may be
+/// registered" needs a name, one place for the arithmetic, and tests that run on
+/// a host with no GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistrationCandidate {
+    /// This region's position in the projection it came from, so a refusal or a
+    /// log line names the same element the reader can count to.
+    ///
+    /// The projection's own index rather than the candidate list's: a region
+    /// that produced no candidate must not renumber the ones that did.
+    pub region_index: usize,
+    /// The import this candidate registers — [`HostRegion::import`], carried so
+    /// a lease can be derived from an identity that is process-monotonic and
+    /// never reused.
+    pub import: ImportId,
+    /// First guest physical address the *candidate* covers: [`HostRegion::gpa_base`]
+    /// moved forward by however far the base had to be rounded, and `None` for
+    /// an import with no linear GPA coordinate — the packed-alias shape.
+    pub gpa_base: Option<u64>,
+    /// The projected host base, before rounding.
+    pub host_va: u64,
+    /// The projected length, before rounding.
+    pub len: u64,
+    /// The granularity the import was built against, which is the only legal
+    /// `page_size` for a window over it.
+    pub page_size: u64,
+    /// `host_va` rounded **up** to the next whole granule.
+    ///
+    /// Up rather than down because a registration covers bytes it names: a base
+    /// rounded down would start before the region, which is the range the
+    /// provider refuses rather than truncates. Never past `host_va + len` either
+    /// — a base that lands on the region's own end leaves no candidate, below.
+    pub aligned_base: u64,
+    /// Whole granules from [`Self::aligned_base`] to the region's own end, i.e.
+    /// that end rounded **down**. At least one granule, or the region produces
+    /// no candidate at all.
+    pub aligned_len: u64,
+}
+
+/// Why a projected region could not become a registration candidate.
+///
+/// One variant per distinct check, so a line in the fail log says which bound
+/// refused rather than that something about a registration did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistrationRefusal {
+    /// The region's `page_size` is zero or not a power of two. Every rounding
+    /// below is a mask, and the provider refuses the same input with its own
+    /// `InvalidHostRegionPageSize`; refused rather than clamped, because a
+    /// registration at an invented granularity is a window the provider and
+    /// this side would disagree about.
+    PageSizeNotPowerOfTwo { region_index: usize, page_size: u64 },
+    /// `host_va + len` leaves the address space, so the region has no end a
+    /// registration could be bounded to.
+    ///
+    /// A projection cannot be in this shape — [`GuestRamImport::new`] does this
+    /// check when it builds the import — so this fires on a hand-built value,
+    /// which is exactly what makes it worth naming.
+    RegionLeavesAddressSpace {
+        region_index: usize,
+        host_va: u64,
+        len: u64,
+    },
+}
+
+impl crate::observe::Decline for RegistrationRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::PageSizeNotPowerOfTwo { .. } => {
+                "guest_ram_registration_page_size_not_power_of_two"
+            }
+            Self::RegionLeavesAddressSpace { .. } => {
+                "guest_ram_registration_region_leaves_address_space"
+            }
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match *self {
+            Self::PageSizeNotPowerOfTwo {
+                region_index,
+                page_size,
+            } => vec![
+                ("region_index", region_index.to_string()),
+                ("page_size", page_size.to_string()),
+            ],
+            Self::RegionLeavesAddressSpace {
+                region_index,
+                host_va,
+                len,
+            } => vec![
+                ("region_index", region_index.to_string()),
+                ("host_va", format!("{host_va:#x}")),
+                ("len", len.to_string()),
+            ],
+        }
+    }
+}
+
+crate::observe::decline_display!(RegistrationRefusal);
+
+/// Bound a projection to what a registration may name, or say why it cannot.
+///
+/// Pure: no host, no lock, no state, nothing latched. [`host_regions`] answers
+/// what this process holds; this answers which of those ranges is registerable,
+/// and it answers with one descriptor per region rather than a bool because the
+/// caller has to hand each one over.
+///
+/// # Both bounds move inward
+///
+/// The base rounds up and the end rounds down, so every candidate sits inside
+/// the region it came from: `aligned_base >= host_va` and `aligned_base +
+/// aligned_len <= host_va + len`. Rounding outward is the tempting mistake — it
+/// keeps all the bytes the region covers — and it is the one that cannot be
+/// registered, because a window past the end of the registration is refused
+/// rather than truncated.
+///
+/// A region whose end lands in a partial granule, or which is shorter than one
+/// granule to begin with, yields **no** candidate rather than an illegal one:
+/// such a range cannot be expressed as a registration, and inventing the
+/// difference here would put a window over bytes this import does not own. The
+/// regions around it are unaffected, and their `region_index` values stay the
+/// projection's, so a dropped region is visible from the list alone.
+///
+/// Over a projection from [`host_regions`] both roundings are no-ops — every
+/// import was trimmed to its granularity when it was built — which is what makes
+/// this testable against the real projection and not only against hand-written
+/// shapes. The guards are for the caller that is *not* handing over a projection,
+/// and the one that matters at wiring time is exactly that: passing the shim's
+/// raw `host_va` instead of the import's already-trimmed base.
+///
+/// # Errors
+///
+/// [`RegistrationRefusal`]. Reported by the caller as
+/// `Emit::decline("guest_ram_registration", &refusal)` rather than emitted here:
+/// this is a pure function, and a test of it should not have to read the fail
+/// log to learn what it answered.
+pub fn registration_candidates(
+    regions: &[HostRegion],
+) -> Result<Vec<RegistrationCandidate>, RegistrationRefusal> {
+    let mut candidates = Vec::with_capacity(regions.len());
+    for (region_index, region) in regions.iter().enumerate() {
+        let page_size = region.page_size;
+        if page_size == 0 || !page_size.is_power_of_two() {
+            return Err(RegistrationRefusal::PageSizeNotPowerOfTwo {
+                region_index,
+                page_size,
+            });
+        }
+        let end = region.host_va.checked_add(region.len).ok_or(
+            RegistrationRefusal::RegionLeavesAddressSpace {
+                region_index,
+                host_va: region.host_va,
+                len: region.len,
+            },
+        )?;
+        // Checked, because a base in the last granule of the address space has
+        // no representable aligned form at all. That reads the same way as a
+        // region with no whole granule in it — no candidate — rather than as a
+        // second refusal: the check below would skip it too, and a wrapped base
+        // is the one answer that must not be produced.
+        let aligned_base = match region.host_va.checked_add(page_size - 1) {
+            Some(last) => last & !(page_size - 1),
+            None => continue,
+        };
+        let aligned_len = (end & !(page_size - 1)).saturating_sub(aligned_base);
+        if aligned_len < page_size {
+            continue;
+        }
+        candidates.push(RegistrationCandidate {
+            region_index,
+            import: region.import,
+            // Moved with the base: the candidate's first byte is the first
+            // aligned one, and the GPA naming it is the import's own base plus
+            // however far the base had to move. Both coordinates came out of
+            // one `GuestRamImport`, which bounded them together, so the sum
+            // cannot leave its space here.
+            gpa_base: region
+                .gpa_base
+                .map(|base| base + (aligned_base - region.host_va)),
+            host_va: region.host_va,
+            len: region.len,
+            page_size,
+            aligned_base,
+            aligned_len,
+        });
+    }
+    Ok(candidates)
+}
+
 /// Take the whole guest-RAM import now, so the guest's first draw does not pay
 /// for it.
 ///
@@ -1582,6 +1786,295 @@ mod tests {
                 Some(GuestRamRegionsError::NoRam),
                 "a machine with no RAM span is a different thing to go fix"
             );
+        });
+    }
+
+    /// A live import identity to stamp on hand-built regions.
+    ///
+    /// `ImportId` is allocated inside the memory crate and cannot be forged
+    /// here, so resolving a map is the only way to obtain a value of the type.
+    /// Nothing in the bound reads the identity, which is why one resolution
+    /// covers every hand-built shape below.
+    fn a_live_import() -> ImportId {
+        with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            host_regions(&mut host)
+                .expect("a shim that answered can be projected")
+                .into_iter()
+                .next()
+                .expect("two spans resolve")
+                .import
+        })
+    }
+
+    /// A projected region with a GPA base over it, since every import this
+    /// process holds today is a RAMBlock one.
+    fn projected_region(import: ImportId, host_va: u64, len: u64, page_size: u64) -> HostRegion {
+        HostRegion {
+            import,
+            gpa_base: Some(0x1_0000_0000),
+            host_va,
+            len,
+            page_size,
+        }
+    }
+
+    /// A region that is already a whole number of granules registers exactly as
+    /// projected: the rounding is a no-op and not a shift in either direction.
+    #[test]
+    fn an_already_aligned_region_registers_unchanged() {
+        let import = a_live_import();
+        let projected = projected_region(import, 0x7f00_0000_0000, 0x2000, 0x1000);
+        let candidates =
+            registration_candidates(std::slice::from_ref(&projected)).expect("registerable");
+        assert_eq!(
+            candidates,
+            vec![RegistrationCandidate {
+                region_index: 0,
+                import,
+                gpa_base: Some(0x1_0000_0000),
+                host_va: 0x7f00_0000_0000,
+                len: 0x2000,
+                page_size: 0x1000,
+                aligned_base: 0x7f00_0000_0000,
+                aligned_len: 0x2000,
+            }],
+            "an aligned region with a whole number of granules is carried through"
+        );
+    }
+
+    /// Nothing projected is nothing to bound — and not an error.
+    #[test]
+    fn a_projection_with_no_regions_has_no_candidates() {
+        assert_eq!(
+            registration_candidates(&[]).expect("nothing to bound"),
+            Vec::new()
+        );
+    }
+
+    /// A base inside a granule rounds *forward*: the candidate never starts
+    /// before the bytes it names.
+    ///
+    /// Both roundings are exercised at once here, because a range that starts
+    /// mid-granule and ends mid-granule is the ordinary shape a caller passing
+    /// the shim's raw `host_va` produces — and the shape whose two mistakes are
+    /// a base rounded down (outside the region) and a length that keeps the
+    /// partial first granule it just rounded past.
+    #[test]
+    fn a_base_inside_a_granule_rounds_forward_into_the_region() {
+        let import = a_live_import();
+        // Three and a half granules, starting 0x180 in: the base moves up 0xE80
+        // to the next granule and the end comes back 0x980, leaving the two
+        // whole granules between them.
+        let projected = projected_region(import, 0x7f00_0000_0180, 0x3800, 0x1000);
+        let candidates = registration_candidates(&[projected]).expect("registerable");
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates[0];
+        assert_eq!(
+            candidate.aligned_base, 0x7f00_0000_1000,
+            "the base must round up, not down"
+        );
+        assert_eq!(candidate.aligned_len, 0x2000, "the end must round down");
+        assert!(
+            candidate.aligned_base >= candidate.host_va,
+            "a candidate may not start before the region"
+        );
+        assert!(
+            candidate.aligned_base + candidate.aligned_len <= candidate.host_va + candidate.len,
+            "a candidate may not end past the region"
+        );
+        assert_eq!(
+            candidate.gpa_base,
+            Some(0x1_0000_0000 + 0xE80),
+            "the GPA must move with the base, or the window would name the wrong guest bytes"
+        );
+        assert_eq!(
+            candidate.len, 0x3800,
+            "the projection is carried, not rewritten"
+        );
+    }
+
+    /// A ragged end rounds back to the last whole granule, and the partial one
+    /// is not covered.
+    #[test]
+    fn a_ragged_end_rounds_back_to_a_whole_granule() {
+        let import = a_live_import();
+        let projected = projected_region(import, 0x7f00_0000_0000, 0x2800, 0x1000);
+        let candidates = registration_candidates(&[projected]).expect("registerable");
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates[0];
+        assert_eq!(candidate.aligned_base, 0x7f00_0000_0000);
+        assert_eq!(
+            candidate.aligned_len, 0x2000,
+            "the last partial granule is outside the candidate"
+        );
+        assert_eq!(
+            candidate.gpa_base,
+            Some(0x1_0000_0000),
+            "an aligned base moves no GPA"
+        );
+    }
+
+    /// A region with no whole granule left produces nothing, and the regions
+    /// around it keep their own indices.
+    ///
+    /// Three shapes, each one granule or less of usable range: a region already
+    /// aligned but shorter than a granule, a region whose aligned base lands
+    /// exactly on its end, and an unaligned region whose tail is a partial
+    /// granule that the base rounds past. The kept region is last so the index
+    /// assertion can only pass if the index is the projection's own position
+    /// rather than a running count over the survivors.
+    #[test]
+    fn a_region_with_no_whole_granule_left_produces_no_candidate() {
+        let import = a_live_import();
+        let shorter_than_a_granule = projected_region(import, 0x7f00_0000_0000, 0x800, 0x1000);
+        let ends_on_the_boundary = projected_region(import, 0x7f00_0000_0800, 0x800, 0x1000);
+        let kept = projected_region(import, 0x7f00_1000_0000, 0x1000, 0x1000);
+        let candidates =
+            registration_candidates(&[shorter_than_a_granule, ends_on_the_boundary, kept])
+                .expect("a region with no granule is skipped, not refused");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a range shorter than a granule is not registerable and must not be invented"
+        );
+        assert_eq!(
+            candidates[0].region_index, 2,
+            "the index is the projection's position, not a count of the survivors"
+        );
+        assert_eq!(candidates[0].import, kept.import);
+        assert_eq!(candidates[0].aligned_base, 0x7f00_1000_0000);
+        assert_eq!(candidates[0].aligned_len, 0x1000);
+    }
+
+    /// A granularity no mask can express is refused, and the refusal names the
+    /// region it came from.
+    #[test]
+    fn a_granularity_no_mask_can_express_is_refused() {
+        let import = a_live_import();
+        for page_size in [0, 0x600, 0x1001] {
+            let projected = projected_region(import, 0x7f00_0000_0000, 0x2000, page_size);
+            assert_eq!(
+                registration_candidates(&[projected]).err(),
+                Some(RegistrationRefusal::PageSizeNotPowerOfTwo {
+                    region_index: 0,
+                    page_size,
+                }),
+                "page_size {page_size:#x} must be refused, not clamped"
+            );
+        }
+        // One byte is a power of two, so it is a legal granule: the check is
+        // about the mask the rounding needs, not about a minimum page size. An
+        // over-eager refusal here would take a host's import away for no reason.
+        let one_byte_granule = projected_region(import, 0x7f00_0000_0000, 0x10, 1);
+        assert_eq!(
+            registration_candidates(&[one_byte_granule])
+                .expect("one byte is a power of two")
+                .len(),
+            1
+        );
+
+        // The index travels with the refusal, so a log line points at the region
+        // a reader can count to rather than at whichever one was first.
+        let good = projected_region(import, 0x7f00_0000_0000, 0x1000, 0x1000);
+        let bad = projected_region(import, 0x7f00_1000_0000, 0x1000, 3);
+        let refusal = registration_candidates(&[good, bad]).err();
+        assert_eq!(
+            refusal,
+            Some(RegistrationRefusal::PageSizeNotPowerOfTwo {
+                region_index: 1,
+                page_size: 3,
+            })
+        );
+        assert_eq!(
+            crate::observe::Decline::slug(&refusal.expect("refused")),
+            "guest_ram_registration_page_size_not_power_of_two",
+            "each check spells its own reason in the fail log"
+        );
+    }
+
+    /// A region whose end leaves the address space is refused, while a base
+    /// that merely cannot be rounded up is skipped.
+    ///
+    /// The two are different judgements and must stay different: the first is a
+    /// malformed region with no end to bound, the second is a region whose last
+    /// granule is incomplete — the same thing every other sub-granule region is.
+    #[test]
+    fn a_region_whose_end_leaves_the_address_space_is_refused() {
+        let import = a_live_import();
+        let host_va = u64::MAX - 0x10;
+        let wraps = projected_region(import, host_va, 0x100, 0x1000);
+        assert_eq!(
+            registration_candidates(&[wraps]).err(),
+            Some(RegistrationRefusal::RegionLeavesAddressSpace {
+                region_index: 0,
+                host_va,
+                len: 0x100,
+            })
+        );
+        assert_eq!(
+            crate::observe::Decline::slug(&RegistrationRefusal::RegionLeavesAddressSpace {
+                region_index: 0,
+                host_va,
+                len: 0x100,
+            }),
+            "guest_ram_registration_region_leaves_address_space"
+        );
+
+        // Ends exactly at the top of the address space, so nothing wraps — and
+        // no aligned base exists, which leaves no whole granule behind.
+        let flush_against_the_top = projected_region(import, u64::MAX - 0x10, 0x10, 0x1000);
+        assert_eq!(
+            registration_candidates(&[flush_against_the_top]).expect("nothing wrapped"),
+            Vec::new()
+        );
+    }
+
+    /// Over a stood-up map the candidates are the projection, bounded — and on a
+    /// real projection both bounds are no-ops.
+    ///
+    /// This is the pairing the two functions exist for: [`host_regions`] says
+    /// what this process holds and [`registration_candidates`] says what a
+    /// registration may name, and on the imports this module actually builds the
+    /// second answer is the first one unchanged. The equality assertions are the
+    /// regression: a bound that started trimming a real import would mean the
+    /// import was never trimmed at construction, which every other rail depends
+    /// on.
+    #[test]
+    fn every_candidate_over_a_stood_up_map_is_the_projection_it_came_from() {
+        with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            let projected = host_regions(&mut host).expect("a shim that answered can be projected");
+            let candidates =
+                registration_candidates(&projected).expect("a projection is registerable");
+            assert_eq!(
+                candidates.len(),
+                projected.len(),
+                "every import is registerable, so none may be dropped"
+            );
+            for (index, (candidate, region)) in candidates.iter().zip(projected.iter()).enumerate()
+            {
+                assert_eq!(
+                    candidate.region_index, index,
+                    "the projection's own position"
+                );
+                assert_eq!(candidate.import, region.import);
+                assert_eq!(candidate.page_size, region.page_size);
+                assert_eq!(candidate.host_va, region.host_va);
+                assert_eq!(candidate.len, region.len);
+                assert_eq!(
+                    candidate.aligned_base, region.host_va,
+                    "an import is trimmed to its granularity when it is built"
+                );
+                assert_eq!(candidate.aligned_len, region.len);
+                assert_eq!(
+                    candidate.gpa_base, region.gpa_base,
+                    "a bound that moves nothing must move no GPA"
+                );
+                assert_eq!(candidate.aligned_base % candidate.page_size, 0);
+                assert_eq!(candidate.aligned_len % candidate.page_size, 0);
+                assert!(candidate.aligned_len > 0, "a candidate covers a granule");
+            }
         });
     }
 
