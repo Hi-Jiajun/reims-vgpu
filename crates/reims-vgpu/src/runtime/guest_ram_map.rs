@@ -311,8 +311,24 @@ impl Resolved {
 /// Called when the backend tears its device down. The next reference rebuilds,
 /// against fresh identities, so nothing made before the teardown resolves after
 /// it — see [`crate::runtime::guest_ram::ImportId`] for why that matters.
+///
+/// The registrations die with the imports they were derived from, and the epoch
+/// moves in the same step: one recreate, not three statements that happen to be
+/// adjacent. An import from before the teardown must not have a registration
+/// from before it (the range is gone), and a registration from before it must
+/// not look current to a provider afterwards (the identity is gone). Splitting
+/// them is exactly how a stale lease would resolve against the new device — see
+/// [`GuestRamRegistrations::reset`], whose pairing this is the *other* half of.
+///
+/// The ledger is dropped rather than reset in place so the next pass builds it
+/// from [`EPOCH`] with no window in which an empty-but-current ledger exists.
+/// The lock is held across the epoch bump so a concurrent pass cannot read the
+/// old epoch and install a ledger under it.
 pub fn reset() {
     *MAP.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+    EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    *guard = None;
 }
 
 /// How many RAMBlock spans the shim reported, and how many bytes they cover.
@@ -1384,6 +1400,290 @@ impl GuestRamRegistrations {
     }
 }
 
+/// The device epoch the next ledger is built under.
+///
+/// Starts at 1 rather than 0 because a provider refuses a zero epoch exactly as
+/// it refuses a zero lease id ([`GuestRamRegistrations::new`] refuses it too, so
+/// the two cannot disagree), and moves only in [`reset`].
+///
+/// # Why this module owns the number for now
+///
+/// `research/docs/20` §3.1 lists `owner_epoch` as a field of the registration
+/// and §7 item 2 leaves the allocator open: the value is the *device* epoch, and
+/// the device is the thing whose recreate it describes. No device epoch reaches
+/// this module today — the backend's recreate calls [`reset`] with nothing to
+/// say which incarnation it is on — so the counter lives where the lifetime it
+/// tracks lives: beside the imports that `reset` drops. When the device's own
+/// epoch is threadable, it should be passed in and this should be deleted; two
+/// counters for one lifetime is a disagreement waiting to happen, and the epoch
+/// exists precisely because such a disagreement is silent.
+static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The registrations this process holds for the epoch [`EPOCH`] names.
+///
+/// # Why this lives beside [`MAP`] rather than on a device
+///
+/// A registration is a statement about an *import*, and [`MAP`] is where the
+/// imports live: one resolution per boot, one teardown per recreate, one
+/// identity space that is never reused. Putting the ledger anywhere else would
+/// give the two the chance to disagree about when an import died — which is the
+/// one question [`GuestRamRegistrations`]' epoch is there to answer. Nothing in
+/// the ledger names a provider or a GPU handle, so it has no reason to be
+/// reachable only from the Vulkan arm, and every decision it makes is testable
+/// on a host with no device at all.
+static REGISTRATIONS: std::sync::Mutex<Option<GuestRamRegistrations>> = std::sync::Mutex::new(None);
+
+/// The event class for the registration wiring's own lines.
+///
+/// Distinct from [`EVENT`] because these are statements about what this process
+/// *registered*, not about why a reference refused, and the two are read by
+/// different questions.
+const REGISTRATION_EVENT: &str = "guest_ram_registration";
+
+/// What one registration pass did, in the numbers the diagnostic line carries.
+///
+/// Returned rather than only emitted so a test — or a future caller that wants
+/// to assert the wiring ran — reads the same numbers the log printed instead of
+/// re-deriving them and checking its own arithmetic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegistrationReport {
+    /// The epoch the pass ran under: the ledger's own, which is [`EPOCH`]'s
+    /// value at the moment the ledger was built rather than at the moment it
+    /// was read. A pass that could not build a ledger returns an error instead,
+    /// so a report never carries an epoch nothing was registered under.
+    pub epoch: u64,
+    /// Regions [`host_regions`] returned. Empty until a backend has published a
+    /// granularity, which is the same guard [`warm`] takes.
+    pub imports: usize,
+    /// Candidates [`registration_candidates`] bounded those regions to.
+    pub candidates: usize,
+    /// Regions that produced no candidate: shorter than one granule, or with a
+    /// partial granule at its end. `imports - candidates` as a number rather
+    /// than a second count, but carried because a non-zero value is the only
+    /// reading that separates "this host has no registerable range" from "this
+    /// host has no RAM to register" — and those send a reader somewhere
+    /// different.
+    pub skipped: usize,
+    /// Candidates this pass handed to the ledger for the first time.
+    pub registered: usize,
+    /// Candidates the ledger already held under this epoch. Non-zero only when
+    /// a pass runs twice without an intervening teardown — the guest's
+    /// handshake may be replayed — which is why it is reported rather than
+    /// treated as an error.
+    pub already: usize,
+}
+
+/// Why a registration pass refused.
+///
+/// One wrapper so the boot path can call [`register_imports`] and ignore its
+/// answer while a caller that wants the reason — a test today, an assert
+/// tomorrow — still gets the exact check that refused. Every arm forwards its
+/// own slug, owner and fields rather than restating them, the same way
+/// [`MapRefusal::HostRefused`] forwards its host error: this type adds no
+/// vocabulary, so the slug registry sees one claimant per check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistrationWiringRefusal {
+    /// The host would not say where its guest RAM lives. [`host_regions`]'s own
+    /// error, which is [`GuestRamRegionsError::CallbackMissing`] on every host
+    /// without the v17 shim and on every fixture host.
+    Host(GuestRamRegionsError),
+    /// The projection could not be bounded to what a registration may name.
+    Projection(RegistrationRefusal),
+    /// The ledger refused the batch, or could not be built at all.
+    Ledger(RegistrationLedgerRefusal),
+}
+
+impl crate::observe::Decline for RegistrationWiringRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Host(inner) => crate::observe::Decline::slug(inner),
+            Self::Projection(inner) => crate::observe::Decline::slug(inner),
+            Self::Ledger(inner) => crate::observe::Decline::slug(inner),
+        }
+    }
+
+    /// Delegated with `slug`; see [`crate::observe::slugs`]. This wrapper holds
+    /// no check of its own, so claiming a slug for its name would report a
+    /// collision that is not one.
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::Host(inner) => crate::observe::Decline::owner(inner),
+            Self::Projection(inner) => crate::observe::Decline::owner(inner),
+            Self::Ledger(inner) => crate::observe::Decline::owner(inner),
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Host(inner) => crate::observe::Decline::fields(inner),
+            Self::Projection(inner) => crate::observe::Decline::fields(inner),
+            Self::Ledger(inner) => crate::observe::Decline::fields(inner),
+        }
+    }
+}
+
+crate::observe::decline_display!(RegistrationWiringRefusal);
+
+/// Record this boot's registerable guest-RAM ranges in the ledger, and say what
+/// that came to.
+///
+/// This is the fork's half of `research/docs/20` step 5: the projection
+/// ([`host_regions`]) and the bound ([`registration_candidates`]) existed with
+/// no caller, so a reader could not tell a registration nobody attempted from
+/// one that failed. Called once per boot from [`warm`].
+///
+/// # It changes no import decision
+///
+/// The projection is built from the same resolution a reference takes and the
+/// candidates are a pure function of it; every branch below either records a
+/// registration or emits a line. A host that cannot answer, a granularity that
+/// was never published, a region with no whole granule in it and a ledger that
+/// refuses all leave the guest-memory rail exactly as it was — which is the
+/// whole of what "wiring, not policy" means here. A registration that could
+/// change which rail a reference took would be a second import policy written
+/// by accident, and the copying rails are the guest's answer for a range this
+/// device cannot import.
+///
+/// # Idempotence
+///
+/// Candidates the ledger already holds under this epoch are counted in
+/// [`RegistrationReport::already`] and not offered again:
+/// [`GuestRamRegistrations::register`] refuses a repeated import
+/// (`DuplicateImport`) because a lease id derives from the import identity and
+/// is never reused, so the second pass of a replayed handshake must not ask.
+/// Nothing is emitted for a pass that registers nothing.
+///
+/// # The line
+///
+/// `guest_ram_registration imports=<n> candidates=<m> skipped=<k> epoch=<e>
+/// registered=<r>`, once per epoch, at the first pass that saw a region. That
+/// closes the gap `research/docs/20` §4 step A named: `guest_ram_span` says
+/// which spans this device imports, and no line said which of those ranges
+/// could be registered against a provider.
+///
+/// # Errors
+///
+/// [`RegistrationWiringRefusal`]. The refusal is emitted here, so the boot path
+/// may ignore the value; a caller that wants to branch on it still has it.
+pub fn register_imports<H: HostOps + ?Sized>(
+    host: &mut H,
+) -> Result<RegistrationReport, RegistrationWiringRefusal> {
+    let regions = match host_regions(host) {
+        Ok(regions) => regions,
+        Err(why) => {
+            crate::observe::Emit::decline(REGISTRATION_EVENT, &why).fail_once(0);
+            return Err(RegistrationWiringRefusal::Host(why));
+        }
+    };
+    let candidates = match registration_candidates(&regions) {
+        Ok(candidates) => candidates,
+        Err(refusal) => {
+            crate::observe::Emit::decline(REGISTRATION_EVENT, &refusal).fail_once(0);
+            return Err(RegistrationWiringRefusal::Projection(refusal));
+        }
+    };
+
+    let mut report = RegistrationReport {
+        imports: regions.len(),
+        candidates: candidates.len(),
+        skipped: regions.len().saturating_sub(candidates.len()),
+        ..RegistrationReport::default()
+    };
+
+    // One acquisition for the ledger's whole life in this pass, and taken after
+    // `host_regions` released `MAP` rather than inside it: the two process-global
+    // locks are never held at once, which is the ordering `reset` relies on.
+    let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.is_none() {
+        let epoch = EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        match GuestRamRegistrations::new(epoch) {
+            Ok(ledger) => *guard = Some(ledger),
+            Err(refusal) => {
+                drop(guard);
+                let refusal = RegistrationWiringRefusal::Ledger(refusal);
+                crate::observe::Emit::decline(REGISTRATION_EVENT, &refusal).fail_once(0);
+                return Err(refusal);
+            }
+        }
+    }
+    let ledger = guard.as_mut().expect("a ledger was just built");
+    report.epoch = ledger.epoch();
+    let fresh: Vec<RegistrationCandidate> = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| ledger.registration(candidate.import).is_none())
+        .collect();
+    report.already = candidates.len() - fresh.len();
+    if let Err(refusal) = ledger.register(&fresh) {
+        drop(guard);
+        let refusal = RegistrationWiringRefusal::Ledger(refusal);
+        crate::observe::Emit::decline(REGISTRATION_EVENT, &refusal).fail_once(0);
+        return Err(refusal);
+    }
+    report.registered = fresh.len();
+    drop(guard);
+
+    // Once per epoch, and only for a boot that has a region to talk about: a
+    // host without the extension registers nothing and should not read as a
+    // device that registered an empty set. The latch is the epoch rather than a
+    // bool so a recreate speaks again under its own number.
+    if report.imports > 0 && crate::observe::first_sight(REGISTRATION_EVENT, report.epoch) {
+        crate::observe::off(format!(
+            "guest_ram_registration imports={} candidates={} skipped={} epoch={} registered={}",
+            report.imports, report.candidates, report.skipped, report.epoch, report.registered,
+        ));
+    }
+    Ok(report)
+}
+
+/// Every live registration this process holds, in import order.
+///
+/// The reading [`GuestRamRegistrations`] answers, taken against the ledger this
+/// module keeps, so a census or a test can ask what this boot registered
+/// without holding the lock or a device. Empty before the first pass and on any
+/// host the pass refused — the same polarity as [`imports`], and for the same
+/// reason: a range that was not registered has no window, and saying so with an
+/// empty list is the honest answer rather than an error.
+pub fn registrations() -> Vec<GuestRamRegistration> {
+    REGISTRATIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|ledger| ledger.registrations().collect())
+        .unwrap_or_default()
+}
+
+/// Cut a page-aligned window out of the registration the current epoch holds
+/// for `import`.
+///
+/// The ledger's own [`GuestRamRegistrations::window`] against the ledger this
+/// module keeps, so a caller does not have to hold a borrow of it across a
+/// submission. A boot that has not registered `import` — one whose handshake
+/// has not run, or a range the projection skipped — answers
+/// `UnregisteredImport`, which is the question a caller reaching the window
+/// rail early is actually asking.
+///
+/// This is the derivation half of `research/docs/20` §3.2 and nothing more: the
+/// window it returns is not yet bound, retained or retired anywhere, because
+/// the bind path is the next slice rather than this one.
+///
+/// # Errors
+///
+/// [`RegistrationLedgerRefusal`]: the window bounds the ledger applies
+/// (`UnalignedWindow`, `ZeroLengthWindow`, `WindowPastRegistration`,
+/// `WindowOverflow`) plus `UnregisteredImport` or `ReclaimedImport`.
+pub fn window_for(
+    import: ImportId,
+    offset: u64,
+    length: u64,
+) -> Result<RegisteredWindow, RegistrationLedgerRefusal> {
+    let guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+    match guard.as_ref() {
+        Some(ledger) => ledger.window(import, offset, length),
+        None => Err(RegistrationLedgerRefusal::UnregisteredImport { import }),
+    }
+}
+
 /// Take the whole guest-RAM import now, so the guest's first draw does not pay
 /// for it.
 ///
@@ -1423,6 +1723,15 @@ pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
     if !already {
         with_map(host, |_| ());
     }
+    // The registration pass rides the same handshake for the same reason the
+    // import does: it is a fact about the boot, its cost is a walk over a dozen
+    // spans, and the guest's first frame is the worst place to discover a
+    // refusal. It is called here rather than from `resolve` because the ledger
+    // must not be built while `MAP` is held — see `reset` for the ordering —
+    // and it is keyed on registration rather than on `already` so a boot whose
+    // first reference resolved the map lazily is still registered when its
+    // handshake arrives.
+    let _ = register_imports(host);
     let imports = imports();
     if !imports.is_empty() {
         let (warmed, bytes) = crate::backend::selected().warm_guest_ram_imports(&imports);
@@ -3834,5 +4143,254 @@ mod tests {
             }),
             "every slug names the rail it came from"
         );
+    }
+
+    /// A host that never implements the callback. The default
+    /// [`HostOps::guest_ram_regions`] answers `CallbackMissing` by name, which
+    /// is what every pre-v17 shim and every fixture host does — so "no
+    /// callback" needs no stub of its own, only a host that leaves the default
+    /// alone.
+    struct NoCallback;
+
+    impl HostOps for NoCallback {
+        fn mono_ns(&self) -> u64 {
+            0
+        }
+        fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
+        fn schedule_bh(&mut self) {}
+    }
+
+    /// The one always-on registration line in the capture.
+    ///
+    /// `FailCapture::one` keys on the line's first whitespace token, and an
+    /// off-channel line's first token is the literal `OFF` — the same reading
+    /// trap `AGENTS.md` records for ranking `reason=`. The event is the second
+    /// token there, so this looks for the whole prefix instead.
+    fn registration_line(capture: &crate::observe::FailCapture) -> String {
+        let hits: Vec<String> = capture
+            .lines()
+            .into_iter()
+            .filter(|line| line.starts_with("OFF guest_ram_registration "))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one registration line, got {hits:?}"
+        );
+        hits.into_iter().next().unwrap_or_default()
+    }
+
+    /// `warm` must not answer for a host that cannot say where its RAM lives:
+    /// no registration, no panic, and the host's own reason as the line.
+    ///
+    /// The refusal is what separates "this shim cannot answer" from "this host
+    /// has no RAM", and the two send a reader to different places — a version
+    /// mismatch against a machine wiring problem. Folding the first into an empty
+    /// registration list would lose that, which is why `host_regions` hands it
+    /// back rather than emptying.
+    #[test]
+    fn a_host_without_the_callback_registers_nothing_and_does_not_panic() {
+        with_granularity(Some(0x1000), || {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = NoCallback;
+            let refusal =
+                register_imports(&mut host).expect_err("a host without the callback is a refusal");
+            assert_eq!(
+                refusal,
+                RegistrationWiringRefusal::Host(GuestRamRegionsError::CallbackMissing)
+            );
+            assert!(
+                registrations().is_empty(),
+                "a host that cannot answer registers nothing"
+            );
+            let line = capture.one(REGISTRATION_EVENT);
+            assert!(
+                line.contains("reason=guest_ram_regions_callback_missing"),
+                "the host's own reason, not a registration-class slug: {line}"
+            );
+        });
+    }
+
+    /// Before the backend publishes a granularity there is no projection, so
+    /// there is nothing to register and nothing to say — and the map is not
+    /// latched, so a backend that arrives late still resolves.
+    ///
+    /// The second half is the load-bearing one. `resolve` answers
+    /// `NoBackendImport` when there is no granularity and that answer is latched
+    /// for the rest of the boot, so a registration pass taken one instant too
+    /// early would turn a capable host into one that refuses every window.
+    #[test]
+    fn nothing_is_registered_before_the_backend_publishes_a_granularity() {
+        with_granularity(None, || {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            let report = register_imports(&mut host).expect("no granularity is not a refusal");
+            assert_eq!(
+                (
+                    report.imports,
+                    report.candidates,
+                    report.skipped,
+                    report.registered
+                ),
+                (0, 0, 0, 0)
+            );
+            assert!(registrations().is_empty());
+            assert!(
+                capture.lines().is_empty(),
+                "an empty projection is a state, not a refusal: {:?}",
+                capture.lines()
+            );
+            assert!(
+                MAP.lock().unwrap_or_else(|p| p.into_inner()).is_none(),
+                "the pass must not latch the refusal `warm` refuses to cache"
+            );
+        });
+    }
+
+    /// A two-span host registers one candidate per span, and a window cut from
+    /// one of them lands on the ledger's own page-size boundaries.
+    ///
+    /// The window assertions are the ones that matter for `research/docs/20`
+    /// §3.2: the registration covers the whole import, the window names a
+    /// subrange of it by host address, and the *provider's* alignment rule is
+    /// applied on this side rather than discovered as a submission that never
+    /// ran.
+    #[test]
+    fn a_normal_projection_registers_every_candidate_and_derives_an_aligned_window() {
+        with_granularity(Some(0x1000), || {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            let report = register_imports(&mut host).expect("a two-span host registers");
+            assert_eq!(
+                (
+                    report.imports,
+                    report.candidates,
+                    report.skipped,
+                    report.registered
+                ),
+                (2, 2, 0, 2)
+            );
+
+            let held = registrations();
+            assert_eq!(
+                held.len(),
+                report.candidates,
+                "every candidate became a registration"
+            );
+            assert!(
+                held.iter()
+                    .all(|registration| registration.epoch == report.epoch
+                        && registration.epoch != 0),
+                "and every one carries the pass's own nonzero epoch"
+            );
+
+            let registration = held[0];
+            assert_eq!(registration.page_size, 0x1000);
+            let window =
+                window_for(registration.import, 0, 0x2000).expect("an aligned window of two pages");
+            assert_eq!(window.import, registration.import);
+            assert_eq!(
+                window.base, registration.aligned_base,
+                "a window at offset zero is the registration's own base"
+            );
+            assert_eq!(window.length, 0x2000);
+            assert_eq!(window.epoch, registration.epoch);
+            assert_eq!(
+                window_for(registration.import, 0x100, 0x1000).err(),
+                Some(RegistrationLedgerRefusal::UnalignedWindow {
+                    import: registration.import,
+                    field: "offset",
+                    value: 0x100,
+                    page_size: registration.page_size,
+                }),
+                "the ledger refuses here what the provider refuses there"
+            );
+
+            let line = registration_line(&capture);
+            assert!(line.contains("imports=2"), "{line}");
+            assert!(line.contains("candidates=2"), "{line}");
+            assert!(line.contains("skipped=0"), "{line}");
+            assert!(line.contains(&format!("epoch={}", report.epoch)), "{line}");
+            assert!(line.contains("registered=2"), "{line}");
+        });
+    }
+
+    /// Asking the ledger for one import twice is refused rather than served
+    /// twice, and none of it moves the import rail underneath.
+    ///
+    /// The refusal is structural — `DuplicateImport` names the import — because
+    /// a provider lease id derives from the import identity and is never reused:
+    /// a second registration would be a second lease over one identity, which is
+    /// the state the ledger exists to make unrepresentable. The wiring pass
+    /// never provokes it: a replayed handshake counts what it already holds.
+    #[test]
+    fn a_second_registration_of_the_same_import_is_refused_and_the_rail_is_unchanged() {
+        with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            let first = register_imports(&mut host).expect("the first pass registers");
+            assert_eq!(first.registered, 2);
+            let before = reference(&mut host, 0x2000, 8).expect("the rail resolves");
+            let held = registrations();
+
+            // The guest's handshake may be replayed, and a pass that offered the
+            // same imports again would earn the refusal below.
+            let second = register_imports(&mut host).expect("a replayed pass is not a refusal");
+            assert_eq!((second.registered, second.already), (0, 2));
+            assert_eq!(registrations(), held, "and it changed no registration");
+
+            let regions = host_regions(&mut host).expect("the projection still answers");
+            let candidates = registration_candidates(&regions).expect("and still bounds");
+            let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+            let ledger = guard.as_mut().expect("the passes above built it");
+            assert_eq!(
+                ledger.register(&candidates),
+                Err(RegistrationLedgerRefusal::DuplicateImport {
+                    import: candidates[0].import,
+                }),
+                "the ledger's answer to the same import twice"
+            );
+            drop(guard);
+
+            // And the import itself is the same import: same identity, same
+            // slice. A registration that changed this would be a second import
+            // policy, which is exactly what this slice must not introduce.
+            let after = reference(&mut host, 0x2000, 8).expect("still resolves");
+            assert_eq!(before.import().id(), after.import().id());
+            assert_eq!(
+                before.bound().expect("bound"),
+                after.bound().expect("bound")
+            );
+        });
+    }
+
+    /// The registration is reachable from the boot path and not only from the
+    /// function that performs it: `warm` is what the guest's protocol handshake
+    /// calls, and a pass nothing invokes is the gap this slice exists to close.
+    #[test]
+    fn the_handshake_warm_is_what_registers_the_projection() {
+        with_granularity(Some(0x1000), || {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            assert!(registrations().is_empty(), "nothing before the handshake");
+
+            warm(&mut host);
+            assert_eq!(
+                registrations().len(),
+                2,
+                "the handshake registers both spans"
+            );
+            let line = registration_line(&capture);
+            assert!(line.contains("imports=2"), "{line}");
+            assert!(line.contains("candidates=2"), "{line}");
+
+            // A replayed handshake registers nothing new and says nothing more:
+            // one line per epoch, not one per write of the version register.
+            warm(&mut host);
+            assert_eq!(registrations().len(), 2);
+            // `registration_line` asserts there is exactly one, so a second
+            // pass that spoke again fails here rather than passing on a count
+            // this test derived for itself.
+            registration_line(&capture);
+        });
     }
 }
