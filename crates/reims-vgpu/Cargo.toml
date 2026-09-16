@@ -136,6 +136,12 @@ reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["testing"] }
 # produced — so `wire_fixtures_reach_the_decoders` can run them through this
 # crate's decoders. Test-only: nothing here reaches the staticlib QEMU links.
 serde_json = "1"
+# Gate 2 spike: the canonical provider contract and its Vulkan implementation,
+# referenced only by the off-VM integration tests below. The shipped staticlib
+# does not depend on either crate yet — this is the dependency edge the Gate 2
+# entry test proves, not the production rail.
+metal-api-core = { path = "../../../../metal-api-emulator/crates/metal-api-core" }
+metal-api-vulkan = { path = "../../../../metal-api-emulator/crates/metal-api-vulkan" }
 
 [build-dependencies]
 # The oracle-capture presence probe, shared with every suite that reads it.
