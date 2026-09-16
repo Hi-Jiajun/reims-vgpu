@@ -136,6 +136,20 @@ pub enum Channel {
     Staged,
 }
 
+impl Channel {
+    /// The word this channel is reported under.
+    ///
+    /// A method rather than a `Debug` formatting at each site: the two names
+    /// are read off a log line beside a lease id, and `Borrowed` against
+    /// `borrowed` is the kind of difference a grep for one of them misses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Borrowed => "borrowed",
+            Self::Staged => "staged",
+        }
+    }
+}
+
 /// The owner channel one binding takes, or the device-gated refusal.
 ///
 /// This is the whole capability gate, and the submission path calls it for
@@ -695,6 +709,20 @@ impl Plan {
             }
             release_import(provider, hold)?;
             hold.released = true;
+            // The retirement chain, in the order it ran, once per lease. This
+            // is the `research/docs/20` §3.4 evidence a report about a
+            // completed no-copy submission is written from, and it was the
+            // half of the chain with no line at all.
+            crate::observe::off(format!(
+                "provider_owner_release lease={} channel={} reason=settled window={} import=released",
+                hold.lease.get(),
+                hold.channel.name(),
+                if hold.window.is_some() {
+                    "retired+reclaimed"
+                } else {
+                    "none"
+                },
+            ));
         }
         Ok(())
     }
@@ -732,6 +760,16 @@ fn release_abandoned_lease(state: &mut State, hold: &Hold) -> bool {
 /// Returns whether the hold is now given up.
 fn abandon_hold(state: &mut State, provider: &VulkanComputeProvider, hold: &mut Hold) -> bool {
     if !release_abandoned_lease(state, hold) {
+        // The kept half, named. A lease bound to a token that never retired has
+        // no release short of a device-loss teardown, and the window and the
+        // provider import stay with it; a line here is what says the rail chose
+        // that on purpose rather than leaking it.
+        crate::observe::off(format!(
+            "provider_owner_lease_kept lease={} channel={} reason=ledger_still_holds \
+             (the window and the provider import are kept with it)",
+            hold.lease.get(),
+            hold.channel.name(),
+        ));
         return false;
     }
     if let Some(window) = hold.window {
@@ -748,6 +786,16 @@ fn abandon_hold(state: &mut State, provider: &VulkanComputeProvider, hold: &mut 
         return false;
     }
     hold.released = true;
+    crate::observe::off(format!(
+        "provider_owner_release lease={} channel={} reason=abandoned window={} import=released",
+        hold.lease.get(),
+        hold.channel.name(),
+        if hold.window.is_some() {
+            "retired+reclaimed"
+        } else {
+            "none"
+        },
+    ));
     true
 }
 
@@ -955,6 +1003,25 @@ pub fn plan_with_epoch<'a>(
                 },
             ));
         }
+        // The success path, named. A refusal has always been emitted — by the
+        // caller of `plan` for the `Decline` this returns — and the import that
+        // *worked* was silent, which is the half a report about the no-copy
+        // rail actually needs: "which window, how big, and did it go in
+        // without a copy" cannot be answered from a log that only has the
+        // failures. Emitted once per lease, so a narrow-class dispatch adds a
+        // handful of lines and the copying path adds the same handful with
+        // `no_copy=0`.
+        crate::observe::off(format!(
+            "provider_owner_lease channel=borrowed no_copy=1 lease={} import={} binding={} \
+             window_offset={} window_length={} pages={} region_bytes={}",
+            lease.get(),
+            import,
+            binding,
+            offset,
+            end - offset,
+            (end - offset) / alignment.max(1),
+            region.length,
+        ));
         holds.push(Hold {
             channel: Channel::Borrowed,
             binding: *binding,
@@ -1067,6 +1134,12 @@ pub fn plan_with_epoch<'a>(
                 },
             ));
         }
+        crate::observe::off(format!(
+            "provider_owner_lease channel=staged no_copy=0 lease={} bytes={} binding={}",
+            lease.get(),
+            length,
+            binding,
+        ));
         holds.push(Hold {
             channel: Channel::Staged,
             binding,
@@ -1087,6 +1160,21 @@ pub fn plan_with_epoch<'a>(
     }
 
     views.sort_by_key(|view| view.binding);
+    // One line per plan, so a boot can be read for "how much of this
+    // submission went in without copying" without walking the lease lines
+    // above: a plan whose windows are all borrowed is the narrow class on a
+    // registered guest-RAM block, and one whose bindings are all staged is the
+    // same class with no window behind its bytes.
+    let borrowed = holds
+        .iter()
+        .filter(|hold| hold.channel == Channel::Borrowed)
+        .count();
+    crate::observe::off(format!(
+        "provider_owner_plan leases={} borrowed={} staged={}",
+        holds.len(),
+        borrowed,
+        holds.len() - borrowed,
+    ));
     Ok(Plan { holds, views })
 }
 

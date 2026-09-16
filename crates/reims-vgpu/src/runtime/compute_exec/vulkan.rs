@@ -527,6 +527,7 @@ fn owner_window_for_staged<M: HostMemory + HostOps>(
         len,
         state.page_shift,
     );
+    note_narrow_guest_pages(staged, &ordered, page_size);
     // Every page of the span must resolve, and to a page no earlier one named:
     // a dropped page is not a window over the bytes that were staged, and a
     // repeated one is not a single contiguous range. (Contiguity itself is
@@ -575,6 +576,50 @@ fn owner_window_for_staged<M: HostMemory + HostOps>(
         head: guest.head(),
         bytes_len: len,
     })
+}
+
+/// Note the guest physical range one narrow-class staging resolves to.
+///
+/// Always on, capped at one line per distinct GVA per boot, because this is the
+/// only place a reader can learn *which RAMBlock the narrow class's own buffers
+/// are in* — the number a `REIMS_VGPU_GUEST_IMPORT_ONLY` value is chosen from.
+/// The window derivation below answers that only when the bytes *did* resolve to
+/// a registered window; with the rail off, or with the buffer's block not
+/// imported, the GPAs are still resolved here and are the answer.
+///
+/// The cap is a boot-level budget rather than a latch because the desktop's own
+/// compute traffic runs through this function too: one line per distinct buffer
+/// is a handful of lines on a driven boot, and a hundred buffers should not turn
+/// a diagnostic into the log.
+fn note_narrow_guest_pages(staged: &StagedBuffer, gpas: &[u64], page_size: u64) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NOTE_BUDGET: AtomicUsize = AtomicUsize::new(64);
+    if staged.gva == 0 || NOTE_BUDGET.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    if !crate::observe::first_sight("compute_guest_pages", staged.gva) {
+        return;
+    }
+    NOTE_BUDGET.fetch_sub(1, Ordering::Relaxed);
+    let bytes = staged.bytes.len();
+    match (gpas.first(), gpas.last()) {
+        (Some(&first), Some(&last)) => crate::observe::off(format!(
+            "compute_guest_pages gva={:#x} bytes={} pages={} page_size={} gpa_first={first:#x} \
+             gpa_last={last:#x} block_mib={}",
+            staged.gva,
+            bytes,
+            gpas.len(),
+            page_size,
+            ((last.saturating_sub(first)) >> 20) + 1,
+        )),
+        // A span whose pages did not resolve has no GPA to name, and saying so
+        // is the reading that separates "this buffer is in a block the rail did
+        // not import" from "this buffer's pages are not in the guest's table".
+        _ => crate::observe::off(format!(
+            "compute_guest_pages gva={:#x} bytes={} pages=0 page_size={page_size} (no page resolved)",
+            staged.gva, bytes,
+        )),
+    }
 }
 
 pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
