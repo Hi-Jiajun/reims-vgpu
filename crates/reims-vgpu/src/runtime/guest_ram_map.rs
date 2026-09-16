@@ -53,7 +53,7 @@ use crate::runtime::guest_ram::{
     GuestRamRegion, GuestRef, ImportId,
 };
 use crate::runtime::host::{GuestRamRegionsError, HostOps};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Why a guest physical address did not become a bindable reference.
@@ -329,6 +329,14 @@ pub fn reset() {
     let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
     EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     *guard = None;
+    // Deferred reclaims name registrations that died with the ledger, so
+    // nothing may retry them against the next epoch. Cleared in the same
+    // step, for the same one-recreate reason the ledger is dropped rather
+    // than reset in place.
+    PENDING_RECLAIM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
 }
 
 /// How many RAMBlock spans the shim reported, and how many bytes they cover.
@@ -1616,6 +1624,20 @@ static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1
 /// on a host with no device at all.
 static REGISTRATIONS: std::sync::Mutex<Option<GuestRamRegistrations>> = std::sync::Mutex::new(None);
 
+/// Alias imports whose address-layer resolution has retired but whose reclaim
+/// is still waiting on submissions in flight.
+///
+/// The address rail retires a packed alias the moment the guest announces the
+/// mapping moved, which can precede the GPU retiring every submission that
+/// borrowed its window. The reclaim latch rightly refuses that case
+/// ([`RegistrationLedgerRefusal::WindowStillBound`]) and the registration
+/// stays; this set is the "retry at slot retirement" half of
+/// `research/docs/20` §3.4: [`reclaim_alias`] parks the import here and
+/// [`retire_submission`] retries it each time a slot fence releases bindings,
+/// so the reclaim completes exactly when the last submission leaves.
+static PENDING_RECLAIM: std::sync::Mutex<BTreeSet<ImportId>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
 /// The event class for the registration wiring's own lines.
 ///
 /// Distinct from [`EVENT`] because these are statements about what this process
@@ -2067,7 +2089,9 @@ pub fn bind_for_submission(token: Option<u64>, imports: &[ImportId]) -> Option<u
 
 /// The completion rail's seam on [`retire_token`]: release whatever the
 /// retiring ring slot carried under its token. A `None` slot is the ordinary
-/// no-op for a submission that bound nothing.
+/// no-op for a submission that bound nothing. After the release it retries
+/// every alias reclaim the address rail parked while that work was in flight —
+/// the "wait for the slot to retire" half of [`reclaim_alias`]'s deferral.
 ///
 /// The refusals split on evidence, not on severity: an [`UnknownToken`] is
 /// emitted once — a double retirement is a wiring bug, and a retirement that
@@ -2082,6 +2106,112 @@ pub fn retire_submission(token: Option<u64>) {
     let Some(token) = token else { return };
     if let Err(refusal) = retire_token(token) {
         crate::observe::Emit::decline(SUBMISSION_EVENT, &refusal).fail_once(0);
+    }
+    retry_pending_reclaims();
+}
+
+/// End the registration behind an alias whose address-layer resolution just
+/// retired: the production trigger for `research/docs/20` §3.4 step 3, called
+/// by the address rail (`BoundBuffers::retire_*`) the moment the guest
+/// announces a mapping change.
+///
+/// # The reclaim and its deferral
+///
+/// The reclaim itself is one latch check. While submissions are still bound
+/// the ledger refuses ([`RegistrationLedgerRefusal::WindowStillBound`]) and
+/// the registration stays — correct, since a host range must not be handed
+/// back underneath work the GPU may still be doing. The deferral is the other
+/// half of the §3.4 pairing: the import joins [`PENDING_RECLAIM`], and
+/// [`retire_submission`] retries it each time a slot fence releases bindings,
+/// so the reclaim completes as soon as the last submission leaves.
+///
+/// # RAMBlock registrations are deliberately not reclaimed
+///
+/// A RAMBlock import lives for the VM's lifetime and its registration was
+/// made by the boot pass; an address rule must not end it (`research/docs/20`
+/// §3.4 step 4: what a reclaim ends is one window registration, never the
+/// import). The alias shape is the only one this seam will reclaim, so the
+/// address rail can offer every retired packed import without deciding which
+/// of the two shapes it was — the ledger's own `gpa_base` answers that.
+///
+/// A refusal that is not one of the three [`GuestRamRegistrations::reclaim`]
+/// answers is unreachable, and is emitted as evidence rather than swallowed.
+pub fn reclaim_alias(import: ImportId) {
+    enum Step {
+        /// Reclaimed now, or the registration is gone and there is nothing to
+        /// guard — both end the address rail's business with this import.
+        Done,
+        /// The reclaim latch refused; retry at the next slot retirement.
+        Defer,
+        /// A refusal [`GuestRamRegistrations::reclaim`] cannot produce.
+        Refused(RegistrationLedgerRefusal),
+    }
+
+    let step = {
+        let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_mut() {
+            None => Step::Done,
+            Some(ledger) => {
+                // The RAMBlock shape check runs before the reclaim rather than
+                // being a refusal: an address rule retiring a VM-lifetime
+                // registration is the ordinary contiguous-packed case, not an
+                // error.
+                let is_alias = ledger
+                    .registration(import)
+                    .is_some_and(|registration| registration.gpa_base.is_none());
+                if !is_alias {
+                    Step::Done
+                } else {
+                    match ledger.reclaim(import) {
+                        Ok(()) => Step::Done,
+                        Err(RegistrationLedgerRefusal::WindowStillBound { .. }) => Step::Defer,
+                        Err(RegistrationLedgerRefusal::UnregisteredImport { .. })
+                        | Err(RegistrationLedgerRefusal::ReclaimedImport { .. }) => Step::Done,
+                        Err(refusal) => Step::Refused(refusal),
+                    }
+                }
+            }
+        }
+    };
+
+    match step {
+        Step::Done => {}
+        Step::Defer => {
+            PENDING_RECLAIM
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(import);
+        }
+        Step::Refused(refusal) => {
+            crate::observe::Emit::decline(SUBMISSION_EVENT, &refusal).fail_once(0);
+        }
+    }
+}
+
+/// How many alias reclaims are parked, waiting on a submission to retire.
+///
+/// The reading half of [`PENDING_RECLAIM`]: a test asserts the deferral
+/// happened and cleared, and a census can say how far the completion rail is
+/// from settling the address rail's retirements.
+pub fn pending_alias_reclaims() -> usize {
+    PENDING_RECLAIM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .len()
+}
+
+/// Retry every parked alias reclaim, once the slot fence has released this
+/// submission's bindings.
+///
+/// Takes the whole pending set rather than iterating it under the lock, so the
+/// ledger and pending locks are never held at once. Each import goes back
+/// through [`reclaim_alias`]: one whose last submission just left is reclaimed
+/// now, one with work still in flight re-parks itself, and one whose ledger
+/// died in a recreate is dropped.
+fn retry_pending_reclaims() {
+    let parked = std::mem::take(&mut *PENDING_RECLAIM.lock().unwrap_or_else(|p| p.into_inner()));
+    for import in parked {
+        reclaim_alias(import);
     }
 }
 
@@ -4115,6 +4245,152 @@ mod tests {
                 "no ledger exists to hold the alias"
             );
             assert_eq!(window_of(&alias_ref), None);
+        });
+    }
+
+    /// The address rail's reclaim trigger ends the registration at once when
+    /// nothing is in flight: the ordinary packed-alias retirement, where the
+    /// guest moved the mapping before any draw borrowed the window.
+    #[test]
+    fn an_alias_with_nothing_bound_reclaims_the_moment_the_address_rail_retires() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            let alias = std::sync::Arc::new(
+                GuestRamImport::new_host_allocation(0x7000_0000_0000, 0x4000, PAGE)
+                    .expect("an aligned host allocation"),
+            );
+            register_alias(&alias).expect("an alias registers against the ledger");
+            assert!(
+                registrations()
+                    .iter()
+                    .any(|registration| registration.import == alias.id()),
+                "the alias joined the ledger"
+            );
+
+            reclaim_alias(alias.id());
+
+            assert!(
+                registrations()
+                    .iter()
+                    .all(|registration| registration.import != alias.id()),
+                "nothing bound, so the reclaim completed in place"
+            );
+            assert_eq!(
+                pending_alias_reclaims(),
+                0,
+                "an immediate reclaim parks nothing"
+            );
+        });
+    }
+
+    /// The deferral half of §3.4: a reclaim refused while a submission is
+    /// still bound parks the import, and the next slot retirement releases the
+    /// binding and completes the reclaim — the registration never outlives the
+    /// last submission by more than one fence.
+    #[test]
+    fn an_alias_reclaim_parked_while_bound_completes_at_slot_retirement() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            let alias = std::sync::Arc::new(
+                GuestRamImport::new_host_allocation(0x7000_0000_0000, 0x4000, PAGE)
+                    .expect("an aligned host allocation"),
+            );
+            register_alias(&alias).expect("an alias registers against the ledger");
+            assert_eq!(
+                bind_for_submission(Some(7), &[alias.id()]),
+                Some(7),
+                "the submission borrowed the alias window"
+            );
+
+            reclaim_alias(alias.id());
+
+            assert!(
+                registrations()
+                    .iter()
+                    .any(|registration| registration.import == alias.id()),
+                "work is still bound, so the registration stays"
+            );
+            assert_eq!(
+                pending_alias_reclaims(),
+                1,
+                "the refused reclaim was parked, not dropped"
+            );
+
+            retire_submission(Some(7));
+
+            assert!(
+                registrations()
+                    .iter()
+                    .all(|registration| registration.import != alias.id()),
+                "the slot fence released the binding and the retry reclaimed"
+            );
+            assert_eq!(
+                pending_alias_reclaims(),
+                0,
+                "the completed reclaim left nothing parked"
+            );
+        });
+    }
+
+    /// A RAMBlock import's registration is the VM-lifetime shape and an
+    /// address rule must not end it: the seam sees the ledger's `gpa_base` and
+    /// leaves the registration alone, whatever packed resolution retired it.
+    #[test]
+    fn an_address_rule_never_reclaims_a_ramblock_registration() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            let ramblock = registrations()
+                .into_iter()
+                .find(|registration| registration.gpa_base.is_some())
+                .expect("the boot pass registered a RAMBlock");
+
+            reclaim_alias(ramblock.import);
+
+            assert!(
+                registrations()
+                    .iter()
+                    .any(|registration| registration.import == ramblock.import),
+                "the VM-lifetime registration survives an address retirement"
+            );
+            assert_eq!(pending_alias_reclaims(), 0);
+        });
+    }
+
+    /// The device-recreate pairing: a reset drops the ledger and every parked
+    /// alias reclaim together, so a retry can never name an import the next
+    /// epoch did not make.
+    #[test]
+    fn a_reset_drops_parked_alias_reclaims() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            let alias = std::sync::Arc::new(
+                GuestRamImport::new_host_allocation(0x7000_0000_0000, 0x4000, PAGE)
+                    .expect("an aligned host allocation"),
+            );
+            register_alias(&alias).expect("an alias registers against the ledger");
+            assert_eq!(bind_for_submission(Some(3), &[alias.id()]), Some(3));
+            reclaim_alias(alias.id());
+            assert_eq!(pending_alias_reclaims(), 1);
+
+            reset();
+
+            assert_eq!(
+                pending_alias_reclaims(),
+                0,
+                "parked reclaims die with the ledger they named"
+            );
+            assert!(
+                registrations().is_empty(),
+                "and no registration survives the recreate"
+            );
         });
     }
 

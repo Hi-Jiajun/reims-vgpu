@@ -95,11 +95,23 @@
 //! The extent cap widens that population only where two shaders declare
 //! different extents over one bind; the retirement rules are all keyed on task
 //! and reference and so are indifferent to it.
+//!
+//! # Retirement ends the alias lease too
+//!
+//! Dropping a packed resolution is the address half of the alias lifecycle,
+//! not its end: the import behind an available packed buffer was registered
+//! with the guest-RAM ledger, and each retirement rule offers its identity to
+//! [`crate::runtime::guest_ram_map::reclaim_alias`] once the entry is gone.
+//! The seam reclaims the registration when no submission is still bound and
+//! otherwise parks it until a slot fence releases the last one — the pairing
+//! `research/docs/20` §3.4 draws between the address layer and the GPU layer.
+//! A RAMBlock import is the other packed shape; it is offered to the same
+//! seam, whose ledger shape check leaves the VM-lifetime registration alone.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::runtime::guest_ram::GuestRun;
+use crate::runtime::guest_ram::{GuestRun, ImportId};
 use crate::runtime::guest_ram_map::GuestWindowRun;
 
 /// One task buffer reconstructed as a stable, contiguous host allocation.
@@ -347,7 +359,11 @@ impl BoundBuffers {
     pub fn retire_task(&mut self, task_id: u32) -> usize {
         let before = self.held.len();
         self.held.retain(|k, _| k.task != task_id);
+        let retiring = Self::retiring_packed_imports(
+            self.packed.iter().filter(|((task, _), _)| *task == task_id),
+        );
         self.packed.retain(|(task, _), _| *task != task_id);
+        retire_packed_aliases(retiring);
         before - self.held.len()
     }
 
@@ -380,7 +396,11 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held
             .retain(|k, _| k.task != task_id || k.buffer_ref != buffer_ref);
-        self.packed.remove(&(task_id, buffer_ref));
+        if let Some(PackedBufferResolution::Available(buffer)) =
+            self.packed.remove(&(task_id, buffer_ref))
+        {
+            crate::runtime::guest_ram_map::reclaim_alias(buffer.import.id());
+        }
         before - self.held.len()
     }
 
@@ -391,12 +411,23 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held
             .retain(|k, b| k.task != task_id || !b.overlaps(gva, len));
+        let retiring = Self::retiring_packed_imports(
+            self.packed
+                .iter()
+                .filter(|((task, _), b)| *task == task_id && b.overlaps(gva, len)),
+        );
         self.packed
             .retain(|(task, _), b| *task != task_id || !b.overlaps(gva, len));
+        retire_packed_aliases(retiring);
         before - self.held.len()
     }
 
     /// Drop everything. Device reset, where no guest state survives.
+    ///
+    /// No reclaim rides this rule: the device teardown that precedes a clear
+    /// drops the whole registration ledger and its pending reclaims in one
+    /// step ([`crate::runtime::guest_ram_map::reset`]), so there is nothing an
+    /// alias reclaim here could meaningfully end.
     pub fn clear(&mut self) {
         self.held.clear();
         self.packed.clear();
@@ -440,6 +471,40 @@ impl BoundBuffers {
     /// Whether nothing is held.
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
+    }
+
+    /// The import identities behind the packed resolutions a retirement rule
+    /// is about to drop.
+    ///
+    /// Collected before the drop so the address layer can offer each one to
+    /// the alias-reclaim rail after it leaves the map: an `Available`
+    /// resolution carries an import, an `Unavailable` one never got far enough
+    /// to build one. Whether the import is the alias shape or a VM-lifetime
+    /// RAMBlock is the reclaim seam's question, not this registry's.
+    fn retiring_packed_imports<'a>(
+        retiring: impl Iterator<Item = (&'a (u32, u32), &'a PackedBufferResolution)>,
+    ) -> Vec<ImportId> {
+        retiring
+            .filter_map(|(_, resolution)| match resolution {
+                PackedBufferResolution::Available(buffer) => Some(buffer.import.id()),
+                PackedBufferResolution::Unavailable { .. } => None,
+            })
+            .collect()
+    }
+}
+
+/// Offer every retired packed import to the alias-reclaim rail.
+///
+/// The address half of `research/docs/20` §3.4 step 3: the guest's map/unmap,
+/// replace-physical, object-list, delete-object and delete-task packets all
+/// end here, and each import a rule dropped is offered to
+/// [`crate::runtime::guest_ram_map::reclaim_alias`] — which reclaims the
+/// alias-shaped registration now or parks it until the slot fence releases the
+/// submissions still inside. A RAMBlock import's registration is VM-lifetime
+/// and the seam leaves it alone.
+fn retire_packed_aliases(retiring: Vec<ImportId>) {
+    for import in retiring {
+        crate::runtime::guest_ram_map::reclaim_alias(import);
     }
 }
 
