@@ -703,7 +703,8 @@ pub fn registration_candidates(
 ///
 /// It carries **no provider dependency** and no GPU handle: a registration here
 /// is the same [`RegistrationCandidate`] plus the epoch and the binding count,
-/// which is everything the lifecycle needs and nothing that would tie this
+/// plus the token-keyed map of submissions that are still bound — everything
+/// the `research/docs/20` §3.4 lifecycle needs and nothing that would tie this
 /// module to a backend.
 ///
 /// # The three coordinates, kept apart
@@ -745,6 +746,17 @@ pub struct GuestRamRegistrations {
     /// own reference in no particular order, and the population is a dozen or
     /// so — the same shape and the same reason as the import list itself.
     regions: BTreeMap<ImportId, Registration>,
+    /// Submissions this ledger is holding a binding count for, keyed by their
+    /// completion token.
+    ///
+    /// Populated by [`Self::bind_token`] and drained by [`Self::retire_token`],
+    /// so a retried submission binds once and a completed one retires once.
+    /// The token is the submit rail's completion identity — the timeline value
+    /// `stamp_completion` reserves per `vkQueueSubmit` — which is nonzero and
+    /// monotonic for a device's lifetime, and a device recreate rebuilds this
+    /// ledger and that timeline together, so a token from one incarnation can
+    /// never be read as another submission's.
+    pending: BTreeMap<u64, Vec<ImportId>>,
 }
 
 /// One registration as the ledger holds it.
@@ -950,6 +962,18 @@ pub enum RegistrationLedgerRefusal {
         bound_offset: u64,
         bound_len: u64,
     },
+    /// A completion token was bound a second time with a different import set.
+    /// Two submissions sharing a token would let one retirement release both,
+    /// which is the one state the token exists to rule out — and the exact
+    /// failure a reused timeline value or a crossed completion note produces.
+    TokenReused { token: u64 },
+    /// A completion token was retired with no pending binding under it. A
+    /// double retirement, or a retirement that crossed a device recreate
+    /// (whose ledger, and therefore every pending token, died with the
+    /// device). Refused rather than silently dropped: a retirement that did
+    /// not release the binding it should would be how a reclaim is let through
+    /// with work in flight.
+    UnknownToken { token: u64 },
 }
 
 impl crate::observe::Decline for RegistrationLedgerRefusal {
@@ -976,6 +1000,8 @@ impl crate::observe::Decline for RegistrationLedgerRefusal {
             }
             Self::WindowOverflow { .. } => "guest_ram_registration_window_overflow",
             Self::WindowMismatch { .. } => "guest_ram_registration_window_mismatch",
+            Self::TokenReused { .. } => "guest_ram_registration_token_reused",
+            Self::UnknownToken { .. } => "guest_ram_registration_unknown_token",
         }
     }
 
@@ -1066,6 +1092,8 @@ impl crate::observe::Decline for RegistrationLedgerRefusal {
                 ("bound_offset", format!("{bound_offset:#x}")),
                 ("bound_len", bound_len.to_string()),
             ],
+            Self::TokenReused { token } => vec![("token", token.to_string())],
+            Self::UnknownToken { token } => vec![("token", token.to_string())],
         }
     }
 }
@@ -1088,6 +1116,7 @@ impl GuestRamRegistrations {
         Ok(Self {
             epoch,
             regions: BTreeMap::new(),
+            pending: BTreeMap::new(),
         })
     }
 
@@ -1304,11 +1333,10 @@ impl GuestRamRegistrations {
     ///
     /// A binding is what the ledger's reclaim latch counts, so a caller that
     /// submits against a window has to say so before the submission is issued
-    /// and retire it after the fence says the GPU is done. The provider's own
-    /// `LeaseLedger::bind` is keyed by a completion token and is therefore
-    /// idempotent per token; the fork side has no token at this layer, so this
-    /// counts bindings and leaves token-keyed deduplication to the caller that
-    /// holds the token.
+    /// and retire it after the fence says the GPU is done. This is the
+    /// per-import half of that pair; [`Self::bind_token`] is the token-keyed
+    /// whole, and a submit rail should use that rather than this directly, so
+    /// a retried submission cannot bind twice.
     ///
     /// # Errors
     ///
@@ -1338,6 +1366,121 @@ impl GuestRamRegistrations {
         }
         registration.outstanding -= 1;
         Ok(())
+    }
+
+    /// Record one submission's window bindings against its completion token.
+    ///
+    /// The fork's half of the provider's `LeaseLedger::bind(lease_id, token)`:
+    /// every import the submission binds is counted once, and the token is
+    /// remembered so [`Self::retire_token`] can undo exactly this set when the
+    /// completion observation says the GPU is done. The token is supplied by
+    /// the caller because this ledger is one layer below the submit rail —
+    /// the value `stamp_completion` reserves per `vkQueueSubmit` is the
+    /// natural one, and nothing here invents a second numbering.
+    ///
+    /// # Idempotence, and what it refuses
+    ///
+    /// A token that is already pending with the *same* import set is a retry
+    /// of the submission that recorded it, and is accepted without counting
+    /// again. The same token with a *different* set is refused
+    /// ([`RegistrationLedgerRefusal::TokenReused`]): two submissions sharing
+    /// a token would let one retirement release both, which is the one state
+    /// the token exists to rule out.
+    ///
+    /// The whole batch is all-or-nothing. One import in it that is
+    /// unregistered or reclaimed refuses the batch and changes nothing, so a
+    /// half-applied bind cannot leave a submission partly counted. Duplicates
+    /// in the list count once — `outstanding` is per submission, not per
+    /// window — and an empty list is an ordinary no-op: a submission that
+    /// bound no registered import has nothing to guard.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistrationLedgerRefusal::UnregisteredImport`] or
+    /// [`RegistrationLedgerRefusal::ReclaimedImport`] for any import in the
+    /// batch, [`RegistrationLedgerRefusal::TokenReused`] for a token already
+    /// bound to a different set.
+    pub fn bind_token(
+        &mut self,
+        token: u64,
+        imports: &[ImportId],
+    ) -> Result<(), RegistrationLedgerRefusal> {
+        let bound: Vec<ImportId> = imports
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if let Some(existing) = self.pending.get(&token) {
+            return if existing == &bound {
+                Ok(())
+            } else {
+                Err(RegistrationLedgerRefusal::TokenReused { token })
+            };
+        }
+        if bound.is_empty() {
+            return Ok(());
+        }
+        // Check every import before moving any count, so a refusal leaves the
+        // ledger exactly as it was. `bind` re-checks below, but by then no
+        // refusal is possible.
+        for import in &bound {
+            self.live(*import)?;
+        }
+        for import in &bound {
+            self.bind(*import)?;
+        }
+        self.pending.insert(token, bound);
+        Ok(())
+    }
+
+    /// Record the completion of the submission `token` named at bind.
+    ///
+    /// Releases exactly the set [`Self::bind_token`] recorded under `token`,
+    /// which is what makes the observation safe to route through a completion
+    /// worker: the worker knows only the token, and the ledger is where the
+    /// token's imports live. The return value is the number of bindings
+    /// released, so an observation site can count what it settled.
+    ///
+    /// The release is all-or-nothing too. A token is released only after every
+    /// import it bound is verified to have a matching binding; one that does
+    /// not means the count no longer describes what is in flight, and retiring
+    /// the rest of the set would be a partial release exactly like a partial
+    /// bind.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistrationLedgerRefusal::UnknownToken`] for a token with no pending
+    /// binding — a double retirement, or a retirement of a token this ledger
+    /// has already released (including one from a previous device incarnation,
+    /// whose whole ledger died at the recreate).
+    pub fn retire_token(&mut self, token: u64) -> Result<usize, RegistrationLedgerRefusal> {
+        let Some(bound) = self.pending.get(&token).cloned() else {
+            return Err(RegistrationLedgerRefusal::UnknownToken { token });
+        };
+        // Every binding must be releasable before any is released.
+        for import in &bound {
+            let registration = self.live(*import)?;
+            if registration.outstanding == 0 {
+                return Err(RegistrationLedgerRefusal::NothingBound { import: *import });
+            }
+        }
+        for import in &bound {
+            self.retire(*import)?;
+        }
+        self.pending.remove(&token);
+        Ok(bound.len())
+    }
+
+    /// How many submissions have bound windows and not yet retired.
+    ///
+    /// The count of [`Self::pending`]'s keys rather than the sum of
+    /// `outstanding`: a census asking how much the completion rail owes reads
+    /// submissions, while a reclaim asks one registration's count. Empty bind
+    /// sets are never stored, so the two agree about which token is owed
+    /// anything.
+    pub fn pending_tokens(&self) -> usize {
+        self.pending.len()
     }
 
     /// Give up a registration, once nothing is bound to it.
@@ -1402,6 +1545,11 @@ impl GuestRamRegistrations {
             return Err(RegistrationLedgerRefusal::EpochExhausted { epoch: self.epoch });
         };
         self.regions.clear();
+        // Every pending token names imports that just died, and the new
+        // device's timeline restarts its tokens. Dropping the map here rather
+        // than letting a retirement from the old device name a token the new
+        // device will reuse is the pairing that keeps the two lifetimes one.
+        self.pending.clear();
         self.epoch = next;
         Ok(next)
     }
@@ -1696,8 +1844,9 @@ pub fn registrations() -> Vec<GuestRamRegistration> {
 /// rail early is actually asking.
 ///
 /// This is the derivation half of `research/docs/20` §3.2 and nothing more: the
-/// window it returns is not yet bound, retained or retired anywhere, because
-/// the bind path is the next slice rather than this one.
+/// window it returns is the one the bind rail validates against its reference
+/// ([`window_range`]), and its submission-side binding is the token rail
+/// [`bind_for_token`] starts.
 ///
 /// # Errors
 ///
@@ -1730,6 +1879,74 @@ pub fn window_for(
 pub fn window_of(guest: &GuestRef) -> Option<RegisteredWindow> {
     let guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
     guard.as_ref().and_then(|ledger| run_window(ledger, guest))
+}
+
+/// Record one submission's window bindings against its completion token, in
+/// the ledger this module keeps.
+///
+/// The submit rail's entry point to [`GuestRamRegistrations::bind_token`]: the
+/// submit path collects the imports one submission bound and reports them here
+/// with the token that submission will be observed by, so a completion worker
+/// can later call [`retire_token`] knowing nothing but the token. All the
+/// token rules are the method's — a retry with the same set binds once, a
+/// different set under a used token is refused, and the batch is
+/// all-or-nothing.
+///
+/// Before the registration pass has built a ledger, a nonempty set refuses as
+/// [`RegistrationLedgerRefusal::UnregisteredImport`] naming the first import:
+/// a submission that reached the submit rail with a window import but no
+/// ledger is a wiring bug, not a boot with nothing to guard. An empty set is
+/// an ordinary no-op, with or without a ledger — a submission that bound no
+/// registered import has nothing to count, and its caller does not retire it.
+///
+/// # Errors
+///
+/// [`RegistrationLedgerRefusal`], forwarded from the ledger or raised here for
+/// the no-ledger case.
+pub fn bind_for_token(token: u64, imports: &[ImportId]) -> Result<(), RegistrationLedgerRefusal> {
+    let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+    match guard.as_mut() {
+        Some(ledger) => ledger.bind_token(token, imports),
+        None => match imports.first() {
+            Some(import) => Err(RegistrationLedgerRefusal::UnregisteredImport { import: *import }),
+            None => Ok(()),
+        },
+    }
+}
+
+/// Release the submission `token` named at bind, in the ledger this module
+/// keeps.
+///
+/// The completion rail's entry point to
+/// [`GuestRamRegistrations::retire_token`]: the observation site — the slot
+/// retirement that has waited a fence, or the stamp-completion worker that has
+/// waited a timeline point — knows the token and nothing about which imports
+/// the submission bound, and that pairing is exactly what the ledger holds.
+/// Returns the number of bindings released, so the observation site can count
+/// what it settled.
+///
+/// # Errors
+///
+/// [`RegistrationLedgerRefusal::UnknownToken`] when this process holds no
+/// pending binding under `token` — a double retirement, or one that arrived
+/// after a device recreate cleared the ledger.
+pub fn retire_token(token: u64) -> Result<usize, RegistrationLedgerRefusal> {
+    let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+    match guard.as_mut() {
+        Some(ledger) => ledger.retire_token(token),
+        None => Err(RegistrationLedgerRefusal::UnknownToken { token }),
+    }
+}
+
+/// How many submissions have bound windows in the ledger this module keeps and
+/// not yet retired. Zero before the first registration pass, by construction.
+pub fn pending_tokens() -> usize {
+    REGISTRATIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(GuestRamRegistrations::pending_tokens)
+        .unwrap_or_default()
 }
 
 /// [`window_of`] against a ledger the caller already holds, so a list of runs
@@ -4161,6 +4378,240 @@ mod tests {
         assert_eq!(ledger.outstanding(import), None);
     }
 
+    /// One token binds a whole submission's import set at once, and retiring it
+    /// releases exactly that set: the reclaim latch moves per submission rather
+    /// than per window, and the completion worker needs to know only the token.
+    #[test]
+    fn a_token_bind_and_retire_moves_the_reclaim_latch_together() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let first = a_candidate(BASE, 0x4000, 0x1000);
+        let second = a_candidate(BASE + 0x8000, 0x4000, 0x1000);
+        let (first_import, second_import) = (first.import, second.import);
+        let mut ledger = a_ledger();
+        ledger
+            .register(&[first, second])
+            .expect("two aligned candidates register");
+
+        ledger
+            .bind_token(7, &[first_import, second_import])
+            .expect("one submission binds both");
+        assert_eq!(ledger.outstanding(first_import), Some(1));
+        assert_eq!(ledger.outstanding(second_import), Some(1));
+        assert_eq!(ledger.pending_tokens(), 1);
+        assert_eq!(
+            ledger.reclaim(first_import).err(),
+            Some(RegistrationLedgerRefusal::WindowStillBound {
+                import: first_import,
+                outstanding: 1,
+            }),
+            "a submission is still bound"
+        );
+
+        assert_eq!(
+            ledger.retire_token(7).expect("the completion arrives"),
+            2,
+            "both bindings release with the one token"
+        );
+        assert_eq!(ledger.pending_tokens(), 0);
+        assert_eq!(ledger.outstanding(first_import), Some(0));
+        assert_eq!(ledger.outstanding(second_import), Some(0));
+        ledger
+            .reclaim(first_import)
+            .expect("nothing is bound, so the window may be given back");
+        ledger
+            .reclaim(second_import)
+            .expect("both are released together");
+    }
+
+    /// A retried submission binds once, but a token reused by a different
+    /// submission is refused and changes nothing — the token is what tells a
+    /// completion worker which bindings to release, and two submissions under
+    /// one token would make one retirement release both.
+    #[test]
+    fn a_retried_token_binds_once_and_a_reused_token_with_another_set_is_refused() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let other = a_candidate(BASE + 0x8000, 0x2000, 0x1000);
+        let import = candidate.import;
+        let other_import = other.import;
+        let mut ledger = a_ledger();
+        ledger.register(&[candidate, other]).expect("both register");
+
+        ledger
+            .bind_token(3, &[import])
+            .expect("the submission binds");
+        ledger
+            .bind_token(3, &[import])
+            .expect("a retry of the same submission binds once, not twice");
+        assert_eq!(ledger.outstanding(import), Some(1));
+
+        assert_eq!(
+            ledger.bind_token(3, &[import, other_import]).err(),
+            Some(RegistrationLedgerRefusal::TokenReused { token: 3 }),
+            "a different submission under a used token is refused"
+        );
+        assert_eq!(
+            ledger.bind_token(3, &[other_import]).err(),
+            Some(RegistrationLedgerRefusal::TokenReused { token: 3 }),
+            "the same token with a different set is a reuse, not a retry"
+        );
+        assert_eq!(ledger.outstanding(import), Some(1));
+        assert_eq!(ledger.outstanding(other_import), Some(0));
+        assert_eq!(ledger.pending_tokens(), 1);
+    }
+
+    /// A token bind is all-or-nothing across its imports: one unregistered
+    /// import refuses the whole batch and leaves every count where it was, so
+    /// a submission can never be half counted.
+    #[test]
+    fn a_token_bind_is_all_or_nothing_across_its_imports() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let stray = a_live_import();
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+
+        assert_eq!(
+            ledger.bind_token(5, &[import, stray]).err(),
+            Some(RegistrationLedgerRefusal::UnregisteredImport { import: stray }),
+            "the unregistered import refuses the whole batch"
+        );
+        assert_eq!(ledger.outstanding(import), Some(0));
+        assert_eq!(ledger.pending_tokens(), 0);
+        assert_eq!(
+            ledger.retire_token(5).err(),
+            Some(RegistrationLedgerRefusal::UnknownToken { token: 5 }),
+            "a refused batch leaves no token to retire"
+        );
+    }
+
+    /// Duplicates in one token's list count once, because `outstanding` is per
+    /// submission and not per window: a submission that touches two windows of
+    /// one import must not hold two reclaim latches.
+    #[test]
+    fn a_token_bind_counts_each_import_once() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+
+        ledger
+            .bind_token(9, &[import, import])
+            .expect("one submission, two windows of one import");
+        assert_eq!(ledger.outstanding(import), Some(1));
+        assert_eq!(
+            ledger.retire_token(9).expect("the completion arrives"),
+            1,
+            "one binding to release"
+        );
+        assert_eq!(ledger.outstanding(import), Some(0));
+    }
+
+    /// A token retired twice — or never bound — is refused rather than
+    /// silently dropped, because a retirement that did not release a binding
+    /// would be how a reclaim is let through with work in flight.
+    #[test]
+    fn an_unknown_or_double_retired_token_is_refused() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+        ledger.bind_token(11, &[import]).expect("binds");
+
+        assert_eq!(
+            ledger.retire_token(12).err(),
+            Some(RegistrationLedgerRefusal::UnknownToken { token: 12 }),
+            "a token this ledger never bound"
+        );
+        ledger
+            .retire_token(11)
+            .expect("the first retirement releases");
+        assert_eq!(
+            ledger.retire_token(11).err(),
+            Some(RegistrationLedgerRefusal::UnknownToken { token: 11 }),
+            "the second retirement finds no pending binding"
+        );
+        assert_eq!(
+            crate::observe::Decline::slug(&RegistrationLedgerRefusal::UnknownToken { token: 11 }),
+            "guest_ram_registration_unknown_token"
+        );
+    }
+
+    /// An empty import set is an ordinary no-op: a submission that bound no
+    /// registered import has nothing to guard, and it is never retired because
+    /// it was never stored.
+    #[test]
+    fn an_empty_token_bind_guards_nothing_and_is_not_stored() {
+        let mut ledger = a_ledger();
+        ledger.bind_token(1, &[]).expect("nothing to bind");
+        assert_eq!(ledger.pending_tokens(), 0);
+        assert_eq!(
+            ledger.retire_token(1).err(),
+            Some(RegistrationLedgerRefusal::UnknownToken { token: 1 }),
+            "an empty bind stores no token, so nothing retires it"
+        );
+    }
+
+    /// A bind against a reclaimed registration refuses by name, exactly as the
+    /// import-keyed path does: a window given back takes no further binding.
+    #[test]
+    fn a_token_bind_refuses_a_reclaimed_import() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+        ledger.reclaim(import).expect("nothing is bound");
+
+        assert_eq!(
+            ledger.bind_token(2, &[import]).err(),
+            Some(RegistrationLedgerRefusal::ReclaimedImport { import })
+        );
+        assert_eq!(ledger.pending_tokens(), 0);
+    }
+
+    /// A device recreate clears the pending token map with the registrations it
+    /// belongs to, so a completion that arrives late — after the new device has
+    /// restarted its timeline — is refused as unknown instead of releasing a
+    /// binding that no longer exists.
+    #[test]
+    fn a_reset_drops_pending_tokens() {
+        const BASE: u64 = 0x7f00_0000_0000;
+        let candidate = a_candidate(BASE, 0x2000, 0x1000);
+        let import = candidate.import;
+        let mut ledger = a_ledger();
+        ledger
+            .register(std::slice::from_ref(&candidate))
+            .expect("registrable");
+        ledger
+            .bind_token(1, &[import])
+            .expect("a submission enters");
+        assert_eq!(ledger.pending_tokens(), 1);
+
+        ledger.reset().expect("a recreate moves the epoch");
+        assert_eq!(
+            ledger.pending_tokens(),
+            0,
+            "the recreate clears the tokens with the registrations"
+        );
+        assert_eq!(
+            ledger.retire_token(1).err(),
+            Some(RegistrationLedgerRefusal::UnknownToken { token: 1 }),
+            "the new device's timeline restarts, and the old token has nothing to release"
+        );
+    }
+
     /// A reclaimed registration derives no window and takes no binding, and the
     /// answer is a different one from "never registered" — the distinction
     /// costs one `bool` and is the difference between looking at a shutdown
@@ -4734,6 +5185,67 @@ mod tests {
             // pass that spoke again fails here rather than passing on a count
             // this test derived for itself.
             registration_line(&capture);
+        });
+    }
+
+    /// The submit and completion rails can reach the process ledger through
+    /// nothing but a token: bind reports the imports beside the submission's
+    /// token, and retire releases them from the token alone.
+    #[test]
+    fn bind_for_token_and_retire_token_round_trip_through_the_process_ledger() {
+        with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            register_imports(&mut host).expect("a two-span host registers");
+            let imports: Vec<_> = registrations()
+                .iter()
+                .map(|registration| registration.import)
+                .collect();
+            assert_eq!(imports.len(), 2);
+
+            bind_for_token(1, &imports).expect("the submit rail reports both");
+            assert_eq!(pending_tokens(), 1);
+            bind_for_token(1, &imports).expect("a retried submit is not a second bind");
+            assert_eq!(pending_tokens(), 1);
+
+            assert_eq!(
+                retire_token(1).expect("the completion rail retires by token"),
+                2,
+                "both bindings release"
+            );
+            assert_eq!(pending_tokens(), 0);
+            assert_eq!(
+                retire_token(1).err(),
+                Some(RegistrationLedgerRefusal::UnknownToken { token: 1 }),
+                "a double retirement is refused"
+            );
+        });
+    }
+
+    /// Before the registration pass built a ledger, a nonempty bind refuses by
+    /// name rather than silently succeeding: a submission at the submit rail
+    /// with a window import and no ledger is a wiring bug. An empty bind is
+    /// the ordinary no-op a submission with nothing registered takes.
+    #[test]
+    fn bind_for_token_before_a_registration_pass_refuses_by_name() {
+        with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            let import = reference(&mut host, 0x2000, 8)
+                .expect("the import rail resolves")
+                .import()
+                .id();
+            assert!(registrations().is_empty(), "no pass has run");
+
+            assert_eq!(
+                bind_for_token(4, &[import]).err(),
+                Some(RegistrationLedgerRefusal::UnregisteredImport { import }),
+                "a bind against a ledger that was never built refuses by name"
+            );
+            bind_for_token(4, &[]).expect("an empty bind guards nothing");
+            assert_eq!(pending_tokens(), 0);
+            assert_eq!(
+                retire_token(4).err(),
+                Some(RegistrationLedgerRefusal::UnknownToken { token: 4 })
+            );
         });
     }
 }
