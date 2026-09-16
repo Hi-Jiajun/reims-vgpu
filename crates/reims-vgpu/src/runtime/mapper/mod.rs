@@ -2051,6 +2051,11 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     let import = std::sync::Arc::new(
         crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?,
     );
+    // One construction, one registration: the mapping import joins the ledger
+    // here so the sampled and target rails that consume it can carry a window.
+    // A refusal is emitted once and the mapping stays usable exactly as
+    // before, with no window derived for it.
+    let _ = crate::runtime::guest_ram_map::register_alias(&import);
     state.mappings.get_mut(&mapping_id)?.contig_import = Some(std::sync::Arc::clone(&import));
     Some((import, footprint))
 }

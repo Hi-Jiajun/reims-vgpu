@@ -508,6 +508,8 @@ pub struct RegistrationCandidate {
     ///
     /// The projection's own index rather than the candidate list's: a region
     /// that produced no candidate must not renumber the ones that did.
+    /// [`ALIAS_REGION_INDEX`] for a candidate with no projection behind it —
+    /// a packed alias, whose whole registration is the import it names.
     pub region_index: usize,
     /// The import this candidate registers — [`HostRegion::import`], carried so
     /// a lease can be derived from an identity that is process-monotonic and
@@ -821,6 +823,7 @@ impl Registration {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GuestRamRegistration {
     /// This region's position in the projection the candidate came from.
+    /// [`ALIAS_REGION_INDEX`] for a packed alias, which has no projection.
     pub region_index: usize,
     /// The import this registration was derived from. A provider lease id is
     /// derived from this identity and from no other, so it is also the key a
@@ -1836,6 +1839,85 @@ pub fn registrations() -> Vec<GuestRamRegistration> {
         .unwrap_or_default()
 }
 
+/// The region index a packed-alias registration carries: no projection
+/// position exists to name, and a sentinel says that rather than borrowing
+/// some RAMBlock's index.
+///
+/// A reader only ever sees it through [`GuestRamRegistration::region_index`],
+/// and the candidate-shape refusals that carry an index cannot fire for an
+/// alias — [`GuestRamImport::new_host_allocation`] already validated the base,
+/// length and granularity the ledger would check again.
+const ALIAS_REGION_INDEX: usize = usize::MAX;
+
+/// The registration candidate one packed-alias import is, with no projection
+/// behind it.
+///
+/// A packed alias is a host allocation this process arranged itself
+/// ([`GuestRamImport::new_host_allocation`]), so it has no span in the shim's
+/// list and no GPA coordinate. The import *is* the region: its base and
+/// length were validated as whole granules at construction, so the candidate
+/// is the import's own bounds with `gpa_base = None` and the region index
+/// [`ALIAS_REGION_INDEX`].
+fn alias_candidate(import: &GuestRamImport) -> RegistrationCandidate {
+    RegistrationCandidate {
+        region_index: ALIAS_REGION_INDEX,
+        import: import.id(),
+        gpa_base: None,
+        host_va: import.host_base() as u64,
+        len: import.len(),
+        page_size: import.align(),
+        aligned_base: import.host_base() as u64,
+        aligned_len: import.len(),
+    }
+}
+
+/// Register one packed-alias host allocation in the ledger this module keeps,
+/// so a window over it can carry a lease exactly as a RAMBlock import's does.
+///
+/// The boot pass [`register_imports`] registers the RAMBlock spans the shim
+/// reported; a packed alias is created later, on the draw rail, over a host
+/// allocation this process arranged itself, so it needs its own entry point
+/// called at the allocation's one construction site. Once it is registered,
+/// [`window_of`] derives a window for the alias run and the submit rail
+/// collects the import into its token set like any other — the pair that
+/// closes `research/docs/20` §3.2's derivation half for the alias shape.
+///
+/// # The refusal is advisory
+///
+/// The alias is already built and its bytes stay bindable exactly as before
+/// whether or not this succeeds: a refusal is emitted once per boot as
+/// evidence and the caller proceeds, and the alias's windows read `None`
+/// through [`window_of`] for the rest of the boot. That is the same
+/// "wiring, not policy" rule the submission-side seams hold — the
+/// registration adds the lease bookkeeping, it does not decide which rail a
+/// reference takes.
+///
+/// # Errors
+///
+/// [`RegistrationLedgerRefusal::UnregisteredImport`] when the ledger does not
+/// exist yet — the handshake runs before any draw, so this is a wiring-order
+/// bug — plus the candidate-shape and duplicate refusals [`GuestRamRegistrations::register`]
+/// raises.
+pub fn register_alias(import: &GuestRamImport) -> Result<(), RegistrationLedgerRefusal> {
+    let candidate = alias_candidate(import);
+    // The guard is scoped so the lock is not held across the emit below: the
+    // same ordering `register_imports` keeps, and for the same reason — a
+    // global ledger lock is not the place a log sink may want to run.
+    let answer = {
+        let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_mut() {
+            Some(ledger) => ledger.register(&[candidate]),
+            None => Err(RegistrationLedgerRefusal::UnregisteredImport {
+                import: import.id(),
+            }),
+        }
+    };
+    if let Err(refusal) = answer {
+        crate::observe::Emit::decline(REGISTRATION_EVENT, &refusal).fail_once(0);
+    }
+    answer
+}
+
 /// Cut a page-aligned window out of the registration the current epoch holds
 /// for `import`.
 ///
@@ -1874,11 +1956,12 @@ pub fn window_for(
 ///
 /// The single-reference counterpart of the derivation
 /// [`references_for_runs`] performs for a whole run list: a caller that built
-/// one run by hand — the packed RAMBlock arm, whose import *is* registered —
-/// takes the window here rather than re-deriving the host coordinates.
-/// `None` is the honest answer for an import the pass never registered
-/// (a packed alias, or a boot whose handshake has not run), and is never a
-/// refusal: the reference stays bindable exactly as before.
+/// one run by hand — the packed arms, whose import the boot pass or
+/// [`register_alias`] registered — takes the window here rather than
+/// re-deriving the host coordinates. `None` is the honest answer for an
+/// import no pass registered (an alias whose registration was refused, or a
+/// boot whose handshake has not run), and is never a refusal: the reference
+/// stays bindable exactly as before.
 pub fn window_of(guest: &GuestRef) -> Option<RegisteredWindow> {
     let guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
     guard.as_ref().and_then(|ledger| run_window(ledger, guest))
@@ -3907,10 +3990,10 @@ mod tests {
     }
 
     /// The single-reference helper answers the same way the run-list walk
-    /// does, and it is what names the one real difference between the two
-    /// rails: a packed alias import has no registration, so it has no window.
+    /// does, and once a packed alias is registered it derives the same window
+    /// a provider would — the §3.1 gap the alias seam closes.
     #[test]
-    fn window_of_answers_like_the_run_list_and_names_the_alias_gap() {
+    fn window_of_answers_like_the_run_list_and_registers_the_alias() {
         const PAGE: u64 = 4096;
         with_granularity(Some(PAGE), || {
             let mut host = two_spans();
@@ -3937,8 +4020,101 @@ mod tests {
             assert_eq!(
                 window_of(&alias_ref),
                 None,
-                "an alias import is not registered, so it derives no window"
+                "before its registration an alias derives no window"
             );
+            register_alias(&alias).expect("an alias registers against the ledger");
+            let bound = alias_ref.bound().expect("bound");
+            assert_eq!(
+                window_of(&alias_ref),
+                window_for(alias.id(), bound.offset, bound.len).ok(),
+                "a registered alias derives the window its run binds"
+            );
+        });
+    }
+
+    /// The alias seam joins the same bind/retire rail the RAMBlock pass does:
+    /// a submission that binds a registered alias carries its token, and the
+    /// slot-fence retirement releases exactly that binding.
+    #[test]
+    fn a_registered_alias_joins_the_token_bind_and_retire_rail() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            let alias = std::sync::Arc::new(
+                GuestRamImport::new_host_allocation(0x7000_0000_0000, 0x4000, PAGE)
+                    .expect("an aligned host allocation"),
+            );
+            register_alias(&alias).expect("an alias registers against the ledger");
+            let alias_ref = GuestRef::new(
+                std::sync::Arc::clone(&alias),
+                alias.slice(0, PAGE).expect("inside the allocation"),
+            )
+            .expect("its own import");
+            assert!(
+                window_of(&alias_ref).is_some(),
+                "the registration produced a window"
+            );
+
+            assert_eq!(
+                bind_for_submission(Some(7), &[alias.id()]),
+                Some(7),
+                "a bound alias window joins the submission's token set"
+            );
+            assert_eq!(pending_tokens(), 1);
+            retire_submission(Some(7));
+            assert_eq!(
+                pending_tokens(),
+                0,
+                "the slot fence releases the alias binding it guarded"
+            );
+        });
+    }
+
+    /// Registering one import twice is refused rather than replaced: a lease
+    /// id derives from the import identity and is never reused, so the second
+    /// pass must not silently overwrite the first.
+    #[test]
+    fn registering_an_alias_twice_is_refused_not_replaced() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            let alias = std::sync::Arc::new(
+                GuestRamImport::new_host_allocation(0x7000_0000_0000, 0x4000, PAGE)
+                    .expect("an aligned host allocation"),
+            );
+            register_alias(&alias).expect("the first pass registers");
+            assert_eq!(
+                register_alias(&alias),
+                Err(RegistrationLedgerRefusal::DuplicateImport { import: alias.id() }),
+                "a second registration of one identity is a named refusal"
+            );
+        });
+    }
+
+    /// Before the handshake builds a ledger the seam refuses rather than
+    /// inventing one, and the alias still reads as no window: the refusal is
+    /// advisory, so the bytes stay bindable on the rail they were on.
+    #[test]
+    fn an_alias_before_any_ledger_is_refused_and_still_has_no_window() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let alias = std::sync::Arc::new(
+                GuestRamImport::new_host_allocation(0x7000_0000_0000, 0x4000, PAGE)
+                    .expect("an aligned host allocation"),
+            );
+            let alias_ref = GuestRef::new(
+                std::sync::Arc::clone(&alias),
+                alias.slice(0, PAGE).expect("inside the allocation"),
+            )
+            .expect("its own import");
+            assert_eq!(
+                register_alias(&alias),
+                Err(RegistrationLedgerRefusal::UnregisteredImport { import: alias.id() }),
+                "no ledger exists to hold the alias"
+            );
+            assert_eq!(window_of(&alias_ref), None);
         });
     }
 

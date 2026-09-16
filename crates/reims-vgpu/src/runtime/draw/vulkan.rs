@@ -3257,15 +3257,20 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
                 let guest =
                     crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&import), whole)
                         .ok()?;
+                // The one construction site of a packed-alias import, so this
+                // is where it joins the registration ledger: a refusal is
+                // emitted once and the bytes stay bindable, but the run below
+                // then derives no window — the advisory shape of the seam.
+                let _ = crate::runtime::guest_ram_map::register_alias(&import);
                 (import, head, guest)
             }
         };
         // The provider-shaped window for the one run this resource binds:
         // `Some` on the RAMBlock arm, whose import the handshake registered,
-        // and `None` on the alias arm, whose import is not registered yet —
-        // the `research/docs/20` §3.1 packed-alias registration gap. Both
-        // bind exactly as before; the window only names the lease a provider
-        // would derive.
+        // and on the alias arm once its registration was accepted; `None`
+        // when the alias registration was refused or the handshake has not
+        // run. Both bind exactly as before; the window only names the lease a
+        // provider would derive.
         let window = crate::runtime::guest_ram_map::window_of(&guest);
         Some(PackedBufferResolution::Available(PackedBuffer {
             gva: backing.gva,
@@ -3430,6 +3435,11 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
         owner,
         origin,
     });
+    // The mapping import is registered at its construction site, so the
+    // window is derived the same way a RAMBlock run's is; `None` when that
+    // registration was refused, which is the advisory reading rather than a
+    // second bind policy.
+    let window = crate::runtime::guest_ram_map::window_of(&guest);
     Some(GuestRunSource {
         // The whole import, which is the mapping and the window at once.
         runs: std::sync::Arc::new(vec![GuestRun::whole(import.host_base(), import.len())?]),
@@ -3440,11 +3450,7 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
             crate::runtime::guest_ram_map::GuestWindowRun {
                 window_offset: 0,
                 guest,
-                // A packed alias over a mapping the guest owns is not a
-                // RAMBlock import, and its import has no registration in the
-                // ledger — the `research/docs/20` §3.1 alias-registration
-                // gap. `None` says that by name rather than by accident.
-                window: None,
+                window,
             },
         ])),
         direct_image,
