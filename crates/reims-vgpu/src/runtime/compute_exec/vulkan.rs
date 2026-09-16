@@ -1282,6 +1282,45 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         engine_done.store(true, std::sync::atomic::Ordering::Release);
         out
     };
+    // Gate 2 production seam: while `provider-compute` is on, the narrow
+    // reviewed class (pure storage buffers, single-region exact threads) is
+    // submitted through the canonical provider. Out-of-class shapes fall
+    // through to the self-contained engine unchanged; an in-class provider
+    // refusal declines the dispatch instead of silently switching rails.
+    #[cfg(feature = "provider-compute")]
+    let out_result = {
+        use crate::backend::provider_compute::{self, ComputeRailOutcome};
+        // The canonical translator names the AIR entry point (`apv_cs`), while
+        // this rail's own SPIR-V entry is `main`; reflection already carried
+        // the AIR name, so it travels with the request instead of being
+        // re-derived inside the provider rail.
+        let air_entry = kernel_shader
+            .reflection
+            .entry_point
+            .as_deref()
+            .unwrap_or(&req.entry);
+        match provider_compute::submit_compute(air, air_entry, &req) {
+            ComputeRailOutcome::ProviderCompleted(out) => {
+                crate::runtime::drain::note_store_route("compute_provider_canonical");
+                crate::observe::off(format!(
+                    "compute_provider dispatch pipe={}",
+                    acc.pipeline_ref
+                ));
+                Ok(out)
+            }
+            ComputeRailOutcome::NotInNarrowClass(_reason) => {
+                crate::runtime::drain::note_store_route("compute_provider_out_of_class");
+                run_engine(&req)
+            }
+            ComputeRailOutcome::ProviderDeclined(decline) => {
+                crate::observe::Emit::decline("compute_provider", &decline)
+                    .field("pipe", acc.pipeline_ref)
+                    .fail_once(u64::from(acc.pipeline_ref));
+                return ComputeStatus::MetalFailed("compute_provider_declined");
+            }
+        }
+    };
+    #[cfg(not(feature = "provider-compute"))]
     let out_result = run_engine(&req);
     let out = match out_result {
         Ok(o) => o,

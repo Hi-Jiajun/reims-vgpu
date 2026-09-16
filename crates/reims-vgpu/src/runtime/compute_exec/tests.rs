@@ -1052,6 +1052,66 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
     all(feature = "backend-metal", target_os = "macos")
 ))]
 fn dispatch_buffer_kernel_mul3add1() {
+    let (st, out) = run_mul3add1_dispatch(5, 6, 7, 0x100);
+    assert!(
+        matches!(
+            st,
+            ComputeStatus::Ok
+                | ComputeStatus::MetalFailed(_)
+                | ComputeStatus::BadGrid(_)
+                | ComputeStatus::Unsupported(_)
+        ),
+        "unexpected {st:?}"
+    );
+    if st == ComputeStatus::Ok {
+        assert_eq!(out, Some(vec![4, 7, 10, 13]));
+    }
+}
+
+/// Gate 2: the same guest dispatch, under `provider-compute`, must be carried
+/// by the canonical provider — not the self-contained engine. The wire shape
+/// is identical to [`dispatch_buffer_kernel_mul3add1`]; the object refs are
+/// disjoint (25/26/27) so the always-on provider submission line can be
+/// attributed to this exact dispatch inside the shared test fail log.
+#[test]
+#[cfg(all(feature = "backend-vulkan", feature = "provider-compute"))]
+fn dispatch_mul3add1_submits_through_the_canonical_provider() {
+    // Descriptor GVAs start at 0x20 so the 32-byte descriptors do not overlap
+    // the object-list slots 25/26/27 this run reads (entries are 12 bytes, so
+    // slot 26's bytes are 0x138..0x144).
+    let (st, out) = run_mul3add1_dispatch(25, 26, 27, 0x20);
+    assert_eq!(
+        st,
+        ComputeStatus::Ok,
+        "the canonical provider must carry this dispatch on a pinned Lavapipe ICD"
+    );
+    assert_eq!(out, Some(vec![4, 7, 10, 13]), "readback must be byte-exact");
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let line = format!("compute_provider dispatch pipe=26");
+    assert!(
+        log.lines().any(|l| l.contains(&line)),
+        "the production rail must log the provider submission; missing `{line}`"
+    );
+}
+
+/// The shared mul3add1 guest-dispatch harness: loads the reviewed `compute_mul3add1.mtlb`
+/// fixture into fake guest memory, stages one 16-byte buffer, and dispatches
+/// 1×1×1 threadgroups of 4×1×1 threads. The refs name the function, pipeline,
+/// and buffer object-list slots so two tests can run the same wire shape with
+/// disjoint object identities; `desc_gva` is the base of the three descriptor
+/// allocations (function, pipeline, buffer), 0x40 apart, so a run whose slots
+/// would overlap them can move the descriptors clear.
+#[cfg(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+))]
+fn run_mul3add1_dispatch(
+    func_ref: u32,
+    pipeline_ref: u32,
+    buffer_ref: u32,
+    desc_gva: u64,
+) -> (ComputeStatus, Option<Vec<u32>>) {
     use std::path::PathBuf;
     let mtlb_paths = [
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb"),
@@ -1072,10 +1132,10 @@ fn dispatch_buffer_kernel_mul3add1() {
     let mut fdesc = vec![0u8; 32];
     st64(&mut fdesc[0..], blob_gva);
     st32(&mut fdesc[8..], mtlb.len() as u32);
-    let fdesc_gva = 0x100u64;
+    let fdesc_gva = desc_gva;
     write_task_gva_arm64e(&mut host, &state.tasks[1], fdesc_gva, &fdesc);
     {
-        let off = list_object_entry_offset(5, 32).unwrap();
+        let off = list_object_entry_offset(func_ref, 32).unwrap();
         let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_FUNCTION as u32) | (32u32 << 8);
         st32(&mut le[0..], packed);
@@ -1089,11 +1149,11 @@ fn dispatch_buffer_kernel_mul3add1() {
     pdesc[SERIALIZER_OBJECT_FIRST_TLVS] = 1;
     pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
     pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 3..], 5);
-    let pdesc_gva = 0x140u64;
+    st32(&mut pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 3..], func_ref);
+    let pdesc_gva = desc_gva + 0x40;
     write_task_gva_arm64e(&mut host, &state.tasks[1], pdesc_gva, &pdesc);
     {
-        let off = list_object_entry_offset(6, 32).unwrap();
+        let off = list_object_entry_offset(pipeline_ref, 32).unwrap();
         let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_SERIALIZER_OBJECT as u32) | (32u32 << 8);
         st32(&mut le[0..], packed);
@@ -1108,10 +1168,10 @@ fn dispatch_buffer_kernel_mul3add1() {
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 5);
-    let bdesc_gva = 0x180u64;
+    let bdesc_gva = desc_gva + 0x80;
     write_task_gva_arm64e(&mut host, &state.tasks[1], bdesc_gva, &bdesc);
     {
-        let off = list_object_entry_offset(7, 32).unwrap();
+        let off = list_object_entry_offset(buffer_ref, 32).unwrap();
         let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
         st32(&mut le[0..], packed);
@@ -1120,9 +1180,9 @@ fn dispatch_buffer_kernel_mul3add1() {
     }
 
     let mut acc = ComputeAccum::default();
-    acc.set_pipeline(6);
+    acc.set_pipeline(pipeline_ref);
     let mut bindings = vec![BufferBinding {
-        ref_: 7,
+        ref_: buffer_ref,
         offset: 0,
         attribute_stride: 0,
         has_attribute_stride: false,
@@ -1149,32 +1209,23 @@ fn dispatch_buffer_kernel_mul3add1() {
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 4, y: 1, z: 1 };
     let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
-    assert!(
-        matches!(
-            st,
-            ComputeStatus::Ok
-                | ComputeStatus::MetalFailed(_)
-                | ComputeStatus::BadGrid(_)
-                | ComputeStatus::Unsupported(_)
-        ),
-        "unexpected {st:?}"
-    );
-    if st == ComputeStatus::Ok {
-        let mut back = [0u8; 16];
-        assert!(gva_mem::read_task_gva(
-            &host,
-            &state.tasks[1],
-            buf_gva,
-            &mut back,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
-        let out: Vec<u32> = back
-            .chunks(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        assert_eq!(out, vec![4, 7, 10, 13]);
+    if st != ComputeStatus::Ok {
+        return (st, None);
     }
+    let mut back = [0u8; 16];
+    assert!(gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        buf_gva,
+        &mut back,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let out: Vec<u32> = back
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    (st, Some(out))
 }
 
 #[test]

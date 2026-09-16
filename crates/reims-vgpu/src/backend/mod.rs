@@ -113,6 +113,14 @@ pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
+/// The canonical-provider compute rail, present only when
+/// `feature = "provider-compute"`. It submits the narrow admitted compute
+/// class through `metal-api-core` / `metal-api-vulkan` instead of the
+/// self-contained [`vulkan::engine`]; everything outside that class stays on
+/// the engine exactly as a build without the feature would run it.
+#[cfg(feature = "provider-compute")]
+pub mod provider_compute;
+
 /// The encoder one rail holds open across a compute segment — the one type
 /// besides [`SelectedBackend`] whose shape is neutral and whose contents are a
 /// rail's.
