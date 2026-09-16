@@ -982,6 +982,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
                     .expect("inside the import"),
             )
             .expect("the slice came from this import"),
+            window: None,
         });
         runs.push(
             GuestRun::whole((base + import_offset) as usize, STRETCH)
@@ -1212,6 +1213,7 @@ void main() {{
                     .expect("inside the import"),
             )
             .expect("the slice came from this import"),
+            window: None,
         });
         runs.push(
             GuestRun::whole((base + import_offset) as usize, STRETCH)
@@ -1393,6 +1395,7 @@ void main() {{
                     .expect("inside the import"),
             )
             .expect("the slice came from this import"),
+            window: None,
         });
         runs.push(
             GuestRun::whole((base + import_offset) as usize, STRETCH)
@@ -1558,6 +1561,7 @@ void main() {{
             import.slice(0, WINDOW).expect("inside the import"),
         )
         .expect("the slice came from this import"),
+        window: None,
     }];
     let runs =
         vec![GuestRun::whole(base as usize, WINDOW).expect("a fixture run covers its own span")];
@@ -1671,6 +1675,7 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
             import.slice(0, block_len).expect("inside the import"),
         )
         .expect("the slice came from this import"),
+        window: None,
     }];
     let source = GuestRunSource {
         runs: std::sync::Arc::new(vec![

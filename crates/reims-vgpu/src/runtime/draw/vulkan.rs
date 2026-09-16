@@ -3260,6 +3260,13 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
                 (import, head, guest)
             }
         };
+        // The provider-shaped window for the one run this resource binds:
+        // `Some` on the RAMBlock arm, whose import the handshake registered,
+        // and `None` on the alias arm, whose import is not registered yet —
+        // the `research/docs/20` §3.1 packed-alias registration gap. Both
+        // bind exactly as before; the window only names the lease a provider
+        // would derive.
+        let window = crate::runtime::guest_ram_map::window_of(&guest);
         Some(PackedBufferResolution::Available(PackedBuffer {
             gva: backing.gva,
             size: backing.size,
@@ -3270,6 +3277,7 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
             pages: std::sync::Arc::new(vec![crate::runtime::guest_ram_map::GuestWindowRun {
                 window_offset: 0,
                 guest,
+                window,
             }]),
         }))
     })()
@@ -3432,6 +3440,11 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
             crate::runtime::guest_ram_map::GuestWindowRun {
                 window_offset: 0,
                 guest,
+                // A packed alias over a mapping the guest owns is not a
+                // RAMBlock import, and its import has no registration in the
+                // ledger — the `research/docs/20` §3.1 alias-registration
+                // gap. `None` says that by name rather than by accident.
+                window: None,
             },
         ])),
         direct_image,

@@ -6614,6 +6614,7 @@ mod tests {
                         import.slice(offset, len).expect("inside the import"),
                     )
                     .expect("the slice came from this import"),
+                    window: None,
                 },
             )
             .collect()
@@ -6965,6 +6966,7 @@ mod tests {
                 window_offset: 512,
                 guest: GuestRef::new(std::sync::Arc::clone(&import), slice)
                     .expect("the slice came from this import"),
+                window: None,
             }],
             0,
             512 + 100,

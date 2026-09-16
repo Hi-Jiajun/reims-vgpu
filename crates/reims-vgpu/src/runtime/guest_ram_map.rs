@@ -1684,6 +1684,45 @@ pub fn window_for(
     }
 }
 
+/// The provider-shaped window the ledger this module keeps derives for one
+/// bindable reference, or `None` when the import has no registration in the
+/// current epoch.
+///
+/// The single-reference counterpart of the derivation
+/// [`references_for_runs`] performs for a whole run list: a caller that built
+/// one run by hand — the packed RAMBlock arm, whose import *is* registered —
+/// takes the window here rather than re-deriving the host coordinates.
+/// `None` is the honest answer for an import the pass never registered
+/// (a packed alias, or a boot whose handshake has not run), and is never a
+/// refusal: the reference stays bindable exactly as before.
+pub fn window_of(guest: &GuestRef) -> Option<RegisteredWindow> {
+    let guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().and_then(|ledger| run_window(ledger, guest))
+}
+
+/// [`window_of`] against a ledger the caller already holds, so a list of runs
+/// pays one acquisition rather than one per run.
+///
+/// `None` for an import the ledger does not hold, and for a reference whose
+/// bound range the ledger would refuse on shape grounds. The first is the
+/// ordinary unregistered reading; the second is unreachable from a
+/// [`GuestRef`] — [`GuestRef::new`] validates the slice against its import and
+/// the slice is widened to the import's granularity — so reaching it means the
+/// run and the ledger disagree about the provider's window rules, which is a
+/// wiring bug worth failing a debug build for.
+fn run_window(ledger: &GuestRamRegistrations, guest: &GuestRef) -> Option<RegisteredWindow> {
+    let bound = guest.bound().ok()?;
+    match ledger.window(guest.import().id(), bound.offset, bound.len) {
+        Ok(window) => Some(window),
+        Err(RegistrationLedgerRefusal::UnregisteredImport { .. })
+        | Err(RegistrationLedgerRefusal::ReclaimedImport { .. }) => None,
+        Err(refusal) => {
+            debug_assert!(false, "a bound run lost its window: {refusal:?}");
+            None
+        }
+    }
+}
+
 /// Take the whole guest-RAM import now, so the guest's first draw does not pay
 /// for it.
 ///
@@ -1850,12 +1889,34 @@ pub fn reference<H: HostOps + ?Sized>(
 /// not from the start of a page and not from the start of the import. It is
 /// what a copy's source offset is measured in, which is the only thing a
 /// consumer needs and the only thing it may not compute for itself.
+///
+/// # The window a provider would derive
+///
+/// [`RegisteredWindow`] is the same stretch in the registration ledger's
+/// coordinates: the page-aligned base and length a provider's
+/// `HostRegion::borrowed_window` returns, stamped with the epoch it was cut
+/// under. It is derived here — once per window, under the one ledger
+/// acquisition the whole run list shares — because this is the single place
+/// every bind rail gets its runs from. A caller that hands a provider a lease
+/// reads it from here rather than re-deriving host coordinates, which is the
+/// division `research/docs/20` §3.2 draws between the aligned window and the
+/// byte precision `head`/`requested` carry.
+///
+/// `None` has one meaning: no registration exists for this import in the
+/// current epoch, so no provider window can be derived. The two ways that
+/// happens are the packed-alias rail (its imports are not registered yet —
+/// `research/docs/20` §3.1) and a boot whose registration pass has not run.
+/// Neither is a refusal: the bytes are still bindable exactly as before, and
+/// the pass is observable as `guest_ram_registration`.
 #[derive(Debug)]
 pub struct GuestWindowRun {
     /// Byte offset of this run's first byte within the requested window.
     pub window_offset: u64,
     /// The bindable reference for this run's bytes.
     pub guest: GuestRef,
+    /// The page-aligned window a provider would derive for this run, when the
+    /// registration ledger holds its import under the current epoch.
+    pub window: Option<RegisteredWindow>,
 }
 
 /// [`reference_for_pages`] for a window that is *not* one contiguous stretch:
@@ -1915,7 +1976,7 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
         first: gpas[0],
     })?;
 
-    with_map(host, |resolved| {
+    let mut runs = with_map(host, |resolved| {
         if let Some(refusal) = resolved.refusal {
             return Err(report_once(refusal));
         }
@@ -1959,6 +2020,7 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
                 out.push(GuestWindowRun {
                     window_offset: piece - window_start,
                     guest: resolved.reference(gpa, piece_end - piece)?,
+                    window: None,
                 });
                 piece = piece_end;
             }
@@ -1971,7 +2033,21 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
             }));
         }
         Ok(out)
-    })
+    })?;
+
+    // Derive the provider-shaped window for every run under one ledger
+    // acquisition, after `with_map` released `MAP`: the two process-global
+    // locks are never held at once, which is the ordering `reset` relies on.
+    // One acquisition for the list rather than one per run is the same design
+    // as the walk above — this runs on the draw-time rail at thousands of
+    // windows a second, and a run list is a dozen entries for one answer.
+    let guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+    for run in &mut runs {
+        run.window = guard
+            .as_ref()
+            .and_then(|ledger| run_window(ledger, &run.guest));
+    }
+    Ok(runs)
 }
 
 /// [`reference`] for a decoded page list: `len` bytes starting `in_page` bytes
@@ -3404,6 +3480,112 @@ mod tests {
             assert_eq!(
                 expected_offset, len,
                 "the runs together must cover exactly the window asked for"
+            );
+        });
+    }
+
+    /// A run built by the widened path carries the page-aligned window a
+    /// provider would derive for it, and the two derivations agree field for
+    /// field rather than merely both being aligned.
+    ///
+    /// This is the proof that `research/docs/20` §3.2 asks for and the one a
+    /// log line cannot give: the host base, the length and the epoch a
+    /// `HostRegion::borrowed_window` would answer are the ones this rail hands
+    /// onward, so the provider-side refusal a misaligned window earns is
+    /// unreachable from a run that carries `Some`.
+    #[test]
+    fn a_run_carries_the_window_a_provider_would_derive() {
+        const PAGE: u64 = 4096;
+        // Two stretches: a contiguous pair and a lone page, so the walk that
+        // derives the windows sees a multi-run list and not a degenerate one.
+        let gpas: Vec<u64> = vec![0x1000, 0x2000, 0x9000];
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            assert_eq!(
+                registrations().len(),
+                2,
+                "the handshake registers both spans"
+            );
+            let epoch = registrations()[0].epoch;
+
+            let runs = references_for_runs(&mut host, &gpas, PAGE, 0, PAGE * 3)
+                .expect("the window resolves");
+            assert_eq!(runs.len(), 2, "two stretches");
+            for run in &runs {
+                let bound = run.guest.bound().expect("each run resolves in its import");
+                let expected = window_for(run.guest.import().id(), bound.offset, bound.len)
+                    .expect("a registered import derives its window");
+                assert_eq!(run.window, Some(expected));
+                assert_eq!(
+                    expected.base,
+                    run.guest.import().host_base() as u64 + bound.offset,
+                    "the window's base is the import base plus the bound offset"
+                );
+                assert_eq!(expected.length, bound.len);
+                assert_eq!(expected.epoch, epoch, "cut under the ledger's epoch");
+                assert_eq!(expected.base % PAGE, 0, "the base is page-aligned");
+                assert_eq!(expected.length % PAGE, 0, "and so is the length");
+            }
+        });
+    }
+
+    /// A run over an import the registration pass never saw carries no window,
+    /// and the absence is not a refusal: the bytes stay on the same rail.
+    ///
+    /// The pass runs at the protocol handshake, and the map resolves lazily on
+    /// the first reference, so a reference that beats the handshake — or a
+    /// fixture host — has imports with no ledger behind them. Reading that as
+    /// `None` keeps the derivation advisory about identity, where refusing
+    /// would silently re-route a bind the import rail has already accepted.
+    #[test]
+    fn a_run_over_an_unregistered_import_carries_no_window() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            let runs = references_for_runs(&mut host, &[0x1000], PAGE, 0, PAGE)
+                .expect("the import resolves without a registration");
+            assert_eq!(runs.len(), 1);
+            assert!(registrations().is_empty(), "no pass ran");
+            assert_eq!(
+                runs[0].window, None,
+                "registration lag reads as no window, never as a refusal"
+            );
+        });
+    }
+
+    /// The single-reference helper answers the same way the run-list walk
+    /// does, and it is what names the one real difference between the two
+    /// rails: a packed alias import has no registration, so it has no window.
+    #[test]
+    fn window_of_answers_like_the_run_list_and_names_the_alias_gap() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            let gpas: Vec<u64> = vec![0x1000, 0x2000];
+            let guest = reference_for_pages(&mut host, &gpas, PAGE, 0, PAGE)
+                .expect("a contiguous reference resolves");
+            let bound = guest.bound().expect("bound");
+            assert_eq!(
+                window_of(&guest),
+                window_for(guest.import().id(), bound.offset, bound.len).ok(),
+                "the helper and the entry point derive one window"
+            );
+
+            let alias = std::sync::Arc::new(
+                GuestRamImport::new_host_allocation(0x7000_0000_0000, 0x4000, PAGE)
+                    .expect("an aligned host allocation"),
+            );
+            let alias_ref = GuestRef::new(
+                std::sync::Arc::clone(&alias),
+                alias.slice(0, PAGE).expect("inside the allocation"),
+            )
+            .expect("its own import");
+            assert_eq!(
+                window_of(&alias_ref),
+                None,
+                "an alias import is not registered, so it derives no window"
             );
         });
     }

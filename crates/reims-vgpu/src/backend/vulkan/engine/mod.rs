@@ -6002,6 +6002,7 @@ mod guest_page_target_tests {
             runs: vec![crate::runtime::guest_ram_map::GuestWindowRun {
                 window_offset: 0,
                 guest: GuestRef::new(import, slice).expect("its own import"),
+                window: None,
             }],
             row_length_texels,
             width,
