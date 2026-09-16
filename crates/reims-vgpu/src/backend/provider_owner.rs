@@ -37,16 +37,32 @@
 //! the owner rail look wired while its registrations were never consumed.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::{Mutex, OnceLock};
 
 use metal_api_core::provider::{
-    disposition_retires_resources, AllocationId, BufferLease, CompletionDisposition, DeviceEpoch,
-    GuestWindow, GuestWindows, HostRegion, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation,
-    LeaseReservation, NoCopyLeaseImporter, ProviderError, StagedLease,
+    disposition_retires_resources, AllocationId, BufferLease, CompletionDisposition, ContractError,
+    DeviceEpoch, GuestWindow, GuestWindows, HostRegion, LeaseId, LeaseImporter, LeaseLedger,
+    LeaseObservation, LeaseReservation, NoCopyLeaseImporter, ProviderError, StagedLease,
 };
 use metal_api_vulkan::VulkanComputeProvider;
 
 use crate::observe::Decline as ObserveDecline;
+
+/// What one device-loss teardown released, as the owner ledger saw it.
+///
+/// The contract's guarantee is that a device loss releases every lease
+/// regardless of outstanding tokens (`ProviderHealth::DeviceLost`,
+/// `research/docs/13` §3.2), so this census is the evidence that the teardown
+/// ran against real state rather than an empty ledger: it is carried in the
+/// refuse log line and asserted by the injection test.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceLossTeardown {
+    /// Leases the ledger held when the teardown started.
+    pub leases: usize,
+    /// Windows the teardown retired and reclaimed.
+    pub windows: usize,
+}
 
 /// One guest RAM region registered with the provider contract.
 ///
@@ -286,9 +302,19 @@ struct State {
     regions: BTreeMap<u64, Record>,
     /// Imports the address rail retired: the registration stays (so a late
     /// question is answered by name) but derives no further window.
-    retired: std::collections::BTreeSet<u64>,
+    retired: BTreeSet<u64>,
     ledger: LeaseLedger,
     windows: GuestWindows,
+    /// Lease ids whose window this rail registered, kept because the provider's
+    /// own `GuestWindows` type has no iterator: a device-loss teardown must
+    /// retire and reclaim every window explicitly (`research/docs/20` §3.4
+    /// step 3) rather than silently dropping the registry that exists to keep
+    /// an active window's backing alive.
+    window_leases: BTreeSet<u64>,
+    /// How many device-loss teardowns this rail has run, and the census of the
+    /// most recent one. Both are read back by the fail log and by tests.
+    teardowns: usize,
+    last_teardown: DeviceLossTeardown,
     next_allocation: u64,
     next_lease: u64,
 }
@@ -297,12 +323,32 @@ impl State {
     fn new() -> Self {
         Self {
             regions: BTreeMap::new(),
-            retired: std::collections::BTreeSet::new(),
+            retired: BTreeSet::new(),
             ledger: LeaseLedger::new(),
             windows: GuestWindows::new(),
+            window_leases: BTreeSet::new(),
+            teardowns: 0,
+            last_teardown: DeviceLossTeardown::default(),
             next_allocation: 1,
             next_lease: 1,
         }
+    }
+
+    /// Register one window and remember its lease, so a later teardown can
+    /// retire and reclaim it by name.
+    fn register_window(&mut self, window: GuestWindow) -> Result<(), ContractError> {
+        self.windows.register(window)?;
+        self.window_leases.insert(window.lease.get());
+        Ok(())
+    }
+
+    /// Retire and reclaim one window, in the contract's order
+    /// (`research/docs/20` §3.4 step 3), and forget its lease.
+    fn reclaim_window(&mut self, lease: LeaseId) -> Result<(), ContractError> {
+        self.windows.retire(lease)?;
+        self.windows.reclaim(lease)?;
+        self.window_leases.remove(&lease.get());
+        Ok(())
     }
 
     fn allocate(&mut self) -> u64 {
@@ -387,11 +433,66 @@ pub fn registered_regions() -> usize {
 /// from the previous incarnation must never name a lease of the next one.
 pub fn reset() {
     let mut state = lock();
+    let _ = teardown(&mut state);
+    state.teardowns = 0;
+    state.last_teardown = DeviceLossTeardown::default();
+}
+
+/// Apply the provider's device-loss teardown guarantee to this rail and report
+/// what it released.
+///
+/// `ProviderHealth::DeviceLost` is the one event that releases every lease
+/// regardless of outstanding tokens (`research/docs/13` §3.2), and
+/// `research/docs/20` §3.4 step 3 is the order the owner owes the windows: the
+/// ledger marks the loss first, then every window is retired and reclaimed, and
+/// only then is the rail's state replaced. Registrations are dropped as well:
+/// every one of them was imported under the dead incarnation's epoch, and
+/// re-registration after a rebuild is the recovery path's job. Identity
+/// counters are deliberately not reset (`reset`'s reason).
+///
+/// Idempotent: a second call on an already-torn-down rail releases nothing and
+/// reports a zero census, so a caller may run it on every refusal that names a
+/// device loss without checking first.
+pub fn teardown_device_lost() -> DeviceLossTeardown {
+    let mut state = lock();
+    let census = teardown(&mut state);
+    state.teardowns += 1;
+    state.last_teardown = census;
+    census
+}
+
+/// The teardown body both entry points share: what was held, then the
+/// contract's release order.
+fn teardown(state: &mut State) -> DeviceLossTeardown {
+    let census = DeviceLossTeardown {
+        leases: state.ledger.leased().len(),
+        windows: state.window_leases.len(),
+    };
+    for lease in std::mem::take(&mut state.window_leases) {
+        let lease = LeaseId::new(lease);
+        let _ = state.windows.retire(lease);
+        let _ = state.windows.reclaim(lease);
+    }
+    debug_assert!(
+        state.windows.is_empty(),
+        "every registered window is tracked in `window_leases`"
+    );
     state.ledger.device_lost();
     state.ledger = LeaseLedger::new();
     state.windows = GuestWindows::new();
     state.regions.clear();
     state.retired.clear();
+    census
+}
+
+/// How many device-loss teardowns this rail has run.
+pub fn device_loss_teardowns() -> usize {
+    lock().teardowns
+}
+
+/// The census of the most recent device-loss teardown, zero before the first.
+pub fn last_device_loss_teardown() -> DeviceLossTeardown {
+    lock().last_teardown
 }
 
 /// The address rail announced that the mapping behind `import` is gone.
@@ -406,7 +507,7 @@ pub fn retire_region(import: u64) {
     if let Some(lease_id) = lease_id {
         let lease = LeaseId::new(lease_id);
         if state.windows.is_reclaimable(lease) {
-            let _ = state.windows.reclaim(lease);
+            let _ = state.reclaim_window(lease);
         }
     }
 }
@@ -580,6 +681,7 @@ impl Plan {
                         binding: hold.binding,
                         detail: error.to_string(),
                     })?;
+                state.window_leases.remove(&window.lease.get());
             }
             if state.ledger.release(hold.lease).is_none() {
                 return Err(Decline::LeaseNotHeld {
@@ -602,8 +704,7 @@ impl Plan {
                 // A window that never reached a completion is retired by the
                 // owner's own decision, which is the only authority left once
                 // the submission is abandoned.
-                let _ = state.windows.retire(window.lease);
-                let _ = state.windows.reclaim(window.lease);
+                let _ = state.reclaim_window(window.lease);
             }
             let _ = state.ledger.release(hold.lease);
             if release_import(provider, hold).is_err() {
@@ -793,7 +894,7 @@ pub fn plan_with_epoch<'a>(
             offset: *offset,
             length: end - offset,
         };
-        if let Err(error) = state.windows.register(window) {
+        if let Err(error) = state.register_window(window) {
             return Err(abort_with(
                 provider,
                 &mut state,
@@ -810,8 +911,7 @@ pub fn plan_with_epoch<'a>(
         // the lease is released in `settle`/`abort` before this call returns.
         if let Err(error) = unsafe { provider.import_borrowed_lease(borrowed) } {
             let _ = state.ledger.release(lease);
-            let _ = state.windows.retire(lease);
-            let _ = state.windows.reclaim(lease);
+            let _ = state.reclaim_window(lease);
             return Err(abort_with(
                 provider,
                 &mut state,
@@ -971,8 +1071,7 @@ fn abort_with(
     };
     for hold in &mut plan.holds {
         if let Some(window) = hold.window {
-            let _ = state.windows.retire(window.lease);
-            let _ = state.windows.reclaim(window.lease);
+            let _ = state.reclaim_window(window.lease);
         }
         let _ = state.ledger.release(hold.lease);
         if release_import(provider, hold).is_ok() {

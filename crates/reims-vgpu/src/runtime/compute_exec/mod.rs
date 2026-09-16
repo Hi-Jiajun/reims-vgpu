@@ -3256,6 +3256,10 @@ pub(crate) fn write_linear_guest_within<M: HostMemory + HostOps>(
     LinearWrite::Written
 }
 
+/// The whole-staged-span writeback the Metal rail's own readback carries. The
+/// Vulkan rail goes through [`writeback_buffer_at`] for both rails, because the
+/// canonical provider's readback is an interval rather than a whole span.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn writeback_buffer<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3264,24 +3268,71 @@ fn writeback_buffer<M: HostMemory + HostOps>(
     context: &str,
     staged: &StagedBuffer,
 ) -> Result<(), ComputeStatus> {
-    if let Err(e) = gva_mem::write_task_gva_product_within(
+    writeback_buffer_at(
         state,
         host,
         task_id,
-        staged.gva,
+        pipe_ref,
+        context,
+        staged,
+        0,
         &staged.bytes,
-        (!staged.pages.is_empty()).then_some(&staged.pages),
-    ) {
+    )
+}
+
+/// Land one readback interval in guest memory through the existing guest write
+/// channel.
+///
+/// `offset` is the byte offset of `bytes` inside the staged span. The caller
+/// takes that pair from whatever produced the readback: the engine's whole-span
+/// readback is `(0, staged bytes)`, while the canonical provider's completion
+/// names an interval the caller re-bases onto the staged span. Only those bytes
+/// move, so the pages this channel records as host-written
+/// (`DeviceState::note_host_wrote_pages`) are exactly the interval's pages — the
+/// write set comes from the producer, never from "assume the whole buffer".
+/// Those are the device half of the write witness
+/// ([`crate::runtime::host_writes`]): the hypervisor's dirty bitmap sees guest
+/// CPU stores and nothing else, so a page this device wrote but did not record
+/// would read as quiet to every later gather.
+fn writeback_buffer_at<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    pipe_ref: Option<u32>,
+    context: &str,
+    staged: &StagedBuffer,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), ComputeStatus> {
+    let Some(gva) = staged.gva.checked_add(offset) else {
         crate::observe::fail(format!(
-            "compute_writeback_buf fail reason=task_gva_write task={task_id} pipe={} context={context} idx={} ref={} gva={:#x} len={} off={:#x} err={e:?}",
+            "compute_writeback_buf fail reason=task_gva_overflow task={task_id} pipe={} context={context} idx={} ref={} gva={:#x} off={offset:#x} len={}",
             pipe_ref
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".into()),
             staged.bind.index,
             staged.bind.buffer_ref,
             staged.gva,
-            staged.bytes.len(),
-            staged.bind.offset
+            bytes.len(),
+        ));
+        return Err(ComputeStatus::GuestIo("compute_wb_buf_task_gva_overflow"));
+    };
+    if let Err(e) = gva_mem::write_task_gva_product_within(
+        state,
+        host,
+        task_id,
+        gva,
+        bytes,
+        (!staged.pages.is_empty()).then_some(&staged.pages),
+    ) {
+        crate::observe::fail(format!(
+            "compute_writeback_buf fail reason=task_gva_write task={task_id} pipe={} context={context} idx={} ref={} gva={gva:#x} len={} off={offset:#x} err={e:?}",
+            pipe_ref
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            staged.bind.index,
+            staged.bind.buffer_ref,
+            bytes.len(),
         ));
         return Err(ComputeStatus::GuestIo("compute_wb_buf_task_gva_write"));
     }

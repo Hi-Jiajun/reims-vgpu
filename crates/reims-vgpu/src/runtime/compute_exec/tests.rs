@@ -1095,6 +1095,114 @@ fn dispatch_mul3add1_submits_through_the_canonical_provider() {
     );
 }
 
+/// Gate 2 writeback discipline (`research/docs/20` §3.3): the guest write channel
+/// moves exactly the interval its producer named — byte-for-byte and page-for-page
+/// — rather than assuming the whole staged buffer was written.
+///
+/// The staged span deliberately crosses a page boundary (the last 8 bytes of one
+/// page plus the first 24 of the next), so both halves of the claim are visible:
+/// an interval at offset zero moves the first page's tail only, and one at
+/// offset 8 moves the second page's head only. `HostWrites` — the device half of
+/// the write witness, which every later zero-copy gather consults — records
+/// exactly the pages of each interval.
+#[test]
+#[cfg(all(feature = "backend-vulkan", feature = "provider-compute"))]
+fn the_writeback_channel_moves_exactly_the_interval_it_is_given() {
+    use crate::runtime::host_writes::HostWriteVerdict;
+
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // A staged span over the boundary between GVA page 5 and page 6.
+    let gva = 6 * page - 8;
+    let span = 32u64;
+    let sentinel = 0xEEu8;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &[sentinel; 32]);
+    let ordered = gva_mem::task_gva_page_gpas(&host, &state.tasks, 1, gva, span, PAGE_SHIFT_ARM64E);
+    assert_eq!(ordered.len(), 2, "the span covers exactly two pages");
+    let (first_page, second_page) = (ordered[0], ordered[1]);
+    assert_ne!(first_page, second_page);
+
+    let staged = StagedBuffer {
+        bind: ComputeBufferBind {
+            index: 0,
+            buffer_ref: 7,
+            offset: 0,
+            attribute_stride: 0,
+            has_attribute_stride: false,
+        },
+        gva,
+        bytes: Vec::new(),
+        pages: ordered.iter().copied().collect(),
+    };
+
+    // Interval A: the first 8 bytes, all of them in the first page's tail. This
+    // is the shape a provider writeback for a view inside a granule has.
+    let epoch = state.host_writes.epoch();
+    let first = [0x11u8; 8];
+    writeback_buffer_at(
+        &mut state,
+        &mut host,
+        1,
+        Some(26),
+        "provider_interval_a",
+        &staged,
+        0,
+        &first,
+    )
+    .expect("the provider's interval lands");
+    let mut seen = vec![0u8; span as usize];
+    gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut seen, PAGE_SHIFT_ARM64E)
+        .expect("the staged span reads back");
+    assert_eq!(&seen[..8], &first[..], "the interval landed where it named");
+    assert!(
+        seen[8..].iter().all(|byte| *byte == sentinel),
+        "no byte outside the interval moved: {seen:?}"
+    );
+    assert_eq!(
+        state.host_writes.wrote_any_since(epoch, &[first_page]),
+        HostWriteVerdict::Overlap,
+        "the page the interval landed in is recorded as host-written"
+    );
+    assert_eq!(
+        state.host_writes.wrote_any_since(epoch, &[second_page]),
+        HostWriteVerdict::Quiet,
+        "a page the interval did not touch is not recorded as host-written"
+    );
+
+    // Interval B: 16 bytes at offset 8, all of them in the second page's head.
+    let epoch = state.host_writes.epoch();
+    let second = [0x22u8; 16];
+    writeback_buffer_at(
+        &mut state,
+        &mut host,
+        1,
+        Some(26),
+        "provider_interval_b",
+        &staged,
+        8,
+        &second,
+    )
+    .expect("the second interval lands");
+    let mut seen = vec![0u8; span as usize];
+    gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut seen, PAGE_SHIFT_ARM64E)
+        .expect("the staged span reads back");
+    assert_eq!(&seen[..8], &first[..], "the first interval is untouched");
+    assert_eq!(&seen[8..24], &second[..], "the second interval landed");
+    assert!(
+        seen[24..].iter().all(|byte| *byte == sentinel),
+        "the span's tail is still untouched: {seen:?}"
+    );
+    assert_eq!(
+        state.host_writes.wrote_any_since(epoch, &[second_page]),
+        HostWriteVerdict::Overlap,
+        "the second interval's page is recorded as host-written"
+    );
+}
+
 /// The shared mul3add1 guest-dispatch harness: loads the reviewed `compute_mul3add1.mtlb`
 /// fixture into fake guest memory, stages one 16-byte buffer, and dispatches
 /// 1×1×1 threadgroups of 4×1×1 threads. The refs name the function, pipeline,

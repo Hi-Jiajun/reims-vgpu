@@ -37,32 +37,63 @@
 //! lease and the completion retires it before the import is released, so the
 //! owner-side `LeaseLedger`/`GuestWindows` bookkeeping is the provider's own
 //! state rather than a mirror kept beside it.
+//!
+//! # Writeback and the guest write channel
+//!
+//! Which guest bytes were written comes from the completion, not from this
+//! rail: the provider's own `BufferWriteback` list (allocation coordinates,
+//! one complete final writeback per written view) is re-based onto the staged
+//! span each binding carried, with the view bounds checked
+//! ([`ProviderComputeDecline::WritebackOutsideView`]). The caller writes back
+//! exactly those intervals through the existing guest write channel, and only
+//! after this function returns — i.e. after [`provider_owner::Plan::settle`]
+//! retired the leases and reclaimed the windows (`research/docs/20` §3.4:
+//! retirement first, bytes into guest memory second, guest reads last).
+//!
+//! # Error mapping
+//!
+//! Every refusal the provider boundary returns is mapped onto this rail's own
+//! typed decline: one slug per normalized `ProviderErrorClass`
+//! ([`ProviderRefusalClass`]), with the provider's own slug and detail text in
+//! the `detail` field so the always-on fail line carries both. `DeviceLost` is
+//! the one class whose mapping is not just a name: the contract's teardown
+//! guarantee runs over the owner ledger
+//! ([`provider_owner::teardown_device_lost`]) and the refusal reports the
+//! census of what it released. A rail whose provider is not usable refuses
+//! in-class work fail-closed (`provider_unavailable`) rather than re-running it
+//! on the self-contained engine, and [`recover_after_device_loss`] is the
+//! in-place rebuild entry (`v64`'s `rebuild_after_device_loss`) a device
+//! recreate calls.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use metal_api_core::provider::{
-    AllocationRecord, BufferSource, BufferView, CompiledComputePipeline, CompletionDisposition,
-    ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType,
-    NoCopyLeaseImporter, OperationId, ProviderError, ResourceTableSnapshot, SemanticDigest,
-    TracePass, ViewId, PROVIDER_SCHEMA_VERSION,
+    AllocationId, AllocationRecord, BufferSource, BufferView, BufferWriteback,
+    CompiledComputePipeline, CompletionDisposition, ComputePass, ComputeProvider, ComputeTrace,
+    Dispatch, DispatchKind, DispatchType, NoCopyLeaseImporter, OperationId, ProviderError,
+    ProviderErrorClass, ProviderHealth, ResourceTableSnapshot, SemanticDigest, TracePass, ViewId,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{VulkanComputeProvider, VulkanExecutor};
 
-use super::provider_owner::{self, Request as OwnerRequest, Staged as OwnerStaged, Window};
-use super::vulkan::engine::types::ComputeBufferOutput;
-use super::vulkan::engine::{ComputeDispatch, ComputeOutput, ComputeRequest};
+use super::provider_owner::{
+    self, DeviceLossTeardown, Request as OwnerRequest, Staged as OwnerStaged, Window,
+};
+use super::vulkan::engine::types::ComputeImageResult;
+use super::vulkan::engine::{ComputeDispatch, ComputeRequest};
 use crate::observe::{decline_display, Decline};
 
 /// Why one reims compute request did not leave this rail for the engine.
 #[derive(Debug)]
 pub enum ComputeRailOutcome {
-    /// The canonical provider executed the dispatch. `buffers` carries one
-    /// readback per writable binding, in canonical binding order; `images` is
-    /// empty because the narrow class carries no storage images.
-    ProviderCompleted(ComputeOutput),
+    /// The canonical provider executed the dispatch. `writebacks` carries one
+    /// provider-reported interval per writable binding, in canonical binding
+    /// order; `images` is empty because the narrow class carries no storage
+    /// images.
+    ProviderCompleted(ProviderComputeOutput),
     /// Outside the narrow admitted class. The caller must run the
     /// self-contained engine, exactly as a build without the feature would.
     NotInNarrowClass(&'static str),
@@ -71,24 +102,159 @@ pub enum ComputeRailOutcome {
     ProviderDeclined(ProviderComputeDecline),
 }
 
+/// Reims' own name for one normalized provider refusal class
+/// (`metal_api_core::provider::ProviderErrorClass`, `research/docs/13` §3.2).
+///
+/// One slug per class, so a fail line answers "which kind of provider refusal
+/// stopped this dispatch" without parsing provider prose, while the provider's
+/// own words stay in the decline's `detail` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderRefusalClass {
+    Args,
+    Capability,
+    Resource,
+    Compile,
+    Execute,
+    DeviceLost,
+    Internal,
+}
+
+impl ProviderRefusalClass {
+    /// Every class, in the order `ProviderErrorClass` declares them. A census
+    /// or a test walks this to prove the mapping is total.
+    pub const ALL: [Self; 7] = [
+        Self::Args,
+        Self::Capability,
+        Self::Resource,
+        Self::Compile,
+        Self::Execute,
+        Self::DeviceLost,
+        Self::Internal,
+    ];
+
+    /// The class in the provider's own vocabulary (the `class=` log field).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Args => "args",
+            Self::Capability => "capability",
+            Self::Resource => "resource",
+            Self::Compile => "compile",
+            Self::Execute => "execute",
+            Self::DeviceLost => "device_lost",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The reims slug this class is named by.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Args => "provider_args",
+            Self::Capability => "provider_capability",
+            Self::Resource => "provider_resource",
+            Self::Compile => "provider_compile",
+            Self::Execute => "provider_execute",
+            Self::DeviceLost => "provider_device_lost",
+            Self::Internal => "provider_internal",
+        }
+    }
+
+    /// The class the provider boundary reported.
+    pub const fn from_provider(class: ProviderErrorClass) -> Self {
+        match class {
+            ProviderErrorClass::Args => Self::Args,
+            ProviderErrorClass::Capability => Self::Capability,
+            ProviderErrorClass::Resource => Self::Resource,
+            ProviderErrorClass::Compile => Self::Compile,
+            ProviderErrorClass::Execute => Self::Execute,
+            ProviderErrorClass::DeviceLost => Self::DeviceLost,
+            ProviderErrorClass::Internal => Self::Internal,
+        }
+    }
+}
+
+/// One provider-reported writeback, mapped onto the staged binding it belongs
+/// to.
+///
+/// The completion is the only source of "which bytes were written": `offset`
+/// is the provider's own `BufferWriteback.offset` (allocation coordinates)
+/// re-based onto the staged span, so a provider that reports a sub-range
+/// produces an interval at *that* offset instead of a write at the start of
+/// the buffer. `allocation`/`allocation_offset` keep the provider's own
+/// coordinates as evidence for the log and for tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderWriteback {
+    pub binding: u32,
+    /// Byte offset of `bytes` inside the staged span the binding carried.
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+    /// The allocation the provider's writeback named.
+    pub allocation: AllocationId,
+    /// The writeback's offset in the provider's own allocation coordinates.
+    pub allocation_offset: u64,
+}
+
+/// What one completed narrow-class submission returns.
+#[derive(Debug)]
+pub struct ProviderComputeOutput {
+    /// One writeback per writable binding, in canonical binding order.
+    pub writebacks: Vec<ProviderWriteback>,
+    /// Storage-image results. The admitted class carries no images, so this is
+    /// always empty; it exists so the runtime seam's count check keeps the same
+    /// shape on both rails.
+    pub images: Vec<ComputeImageResult>,
+}
+
 /// A typed refusal of the canonical-provider rail, nameable in the fail log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderComputeDecline {
-    /// The process-global provider could not be created: no usable Vulkan
-    /// device for the canonical rail, or a capability snapshot refused.
-    ProviderUnavailable { detail: String },
+    /// The process-global provider could not be created, or its lifecycle
+    /// reports a terminal health (`device_lost`/`exhausted`). In-class work is
+    /// refused fail-closed — the caller declines the dispatch and nothing
+    /// falls back to the self-contained engine (`research/docs/13` §3.2).
+    /// `health` names the state the refusal was raised on (`"create"` when
+    /// there is no provider to ask), and `teardown` reports the leases and
+    /// windows a device-loss teardown released, when this refusal ran it.
+    ProviderUnavailable {
+        detail: String,
+        health: &'static str,
+        teardown: Option<DeviceLossTeardown>,
+    },
     /// Compiling the reviewed AIR in the canonical translator failed.
     PipelineCompile { detail: String },
+    /// The canonical provider refused, named by its normalized class: `step`
+    /// names the provider call that answered, and `detail` carries the
+    /// provider's own slug and detail text.
+    ProviderRefused {
+        class: ProviderRefusalClass,
+        step: &'static str,
+        detail: String,
+    },
+    /// The canonical provider answered `device_lost`. The contract's teardown
+    /// guarantee has already run over the owner ledger: every lease was
+    /// released regardless of outstanding tokens and every window was retired
+    /// and reclaimed (`teardown` is the census of that pass).
+    ProviderDeviceLost {
+        step: &'static str,
+        detail: String,
+        teardown: DeviceLossTeardown,
+    },
     /// The canonical admission refused the translated trace.
     TraceAdmission { detail: String },
-    /// The provider refused or lost the submission.
-    Submission { detail: String },
     /// The completion was not host-visible, so there are no bytes to write
     /// back.
     CompletionNotVisible,
     /// A writable binding's readback did not come back through the provider
     /// completion channel.
     WritebackMissing { binding: u32 },
+    /// The provider's writeback for one binding lies outside the view the trace
+    /// carried, so its bytes cannot be placed in the staged span.
+    WritebackOutsideView {
+        binding: u32,
+        offset: u64,
+        length: u64,
+        view_offset: u64,
+        view_length: u64,
+    },
     /// The owner rail refused a registration, an import, a retirement or a
     /// release. Delegated, so the slug names the owner check that refused.
     Owner(provider_owner::Decline),
@@ -99,10 +265,12 @@ impl Decline for ProviderComputeDecline {
         match self {
             Self::ProviderUnavailable { .. } => "provider_unavailable",
             Self::PipelineCompile { .. } => "pipeline_compile",
+            Self::ProviderRefused { class, .. } => class.slug(),
+            Self::ProviderDeviceLost { .. } => ProviderRefusalClass::DeviceLost.slug(),
             Self::TraceAdmission { .. } => "trace_admission",
-            Self::Submission { .. } => "submission",
             Self::CompletionNotVisible => "completion_not_visible",
             Self::WritebackMissing { .. } => "writeback_missing",
+            Self::WritebackOutsideView { .. } => "writeback_outside_view",
             Self::Owner(inner) => inner.slug(),
         }
     }
@@ -119,12 +287,56 @@ impl Decline for ProviderComputeDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::ProviderUnavailable { detail }
-            | Self::PipelineCompile { detail }
-            | Self::TraceAdmission { detail }
-            | Self::Submission { detail } => vec![("detail", detail.clone())],
+            Self::ProviderUnavailable {
+                detail,
+                health,
+                teardown,
+            } => {
+                let mut fields = vec![("health", health.to_string()), ("detail", detail.clone())];
+                if let Some(teardown) = teardown {
+                    fields.push(("teardown_leases", teardown.leases.to_string()));
+                    fields.push(("teardown_windows", teardown.windows.to_string()));
+                }
+                fields
+            }
+            Self::PipelineCompile { detail } | Self::TraceAdmission { detail } => {
+                vec![("detail", detail.clone())]
+            }
+            Self::ProviderRefused {
+                class,
+                step,
+                detail,
+            } => vec![
+                ("class", class.name().to_string()),
+                ("step", step.to_string()),
+                ("detail", detail.clone()),
+            ],
+            Self::ProviderDeviceLost {
+                step,
+                detail,
+                teardown,
+            } => vec![
+                ("class", ProviderRefusalClass::DeviceLost.name().to_string()),
+                ("step", step.to_string()),
+                ("detail", detail.clone()),
+                ("teardown_leases", teardown.leases.to_string()),
+                ("teardown_windows", teardown.windows.to_string()),
+            ],
             Self::CompletionNotVisible => Vec::new(),
             Self::WritebackMissing { binding } => vec![("binding", binding.to_string())],
+            Self::WritebackOutsideView {
+                binding,
+                offset,
+                length,
+                view_offset,
+                view_length,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("offset", offset.to_string()),
+                ("length", length.to_string()),
+                ("view_offset", view_offset.to_string()),
+                ("view_length", view_length.to_string()),
+            ],
             Self::Owner(inner) => inner.fields(),
         }
     }
@@ -148,6 +360,9 @@ fn provider_error_detail(error: &ProviderError) -> String {
 struct ProviderRail {
     provider: VulkanComputeProvider,
     device: Device,
+    /// The executor the provider was built from. Kept so the test-only driver
+    /// loss injection can arm the very provider this rail submits through.
+    executor: Arc<VulkanExecutor>,
     /// AIR identity → compiled pipeline. Compiled pipelines are metadata
     /// handles into the provider's own registry, so the cache bounds pipeline
     /// registrations by distinct kernel AIR rather than by dispatch count.
@@ -162,16 +377,19 @@ fn rail() -> Result<&'static ProviderRail, ProviderComputeDecline> {
         let executor = VulkanExecutor::new().map_err(|error| error.to_string())?;
         let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
             .map_err(|error| provider_error_detail(&error))?;
-        let device = Device::new(executor as Arc<dyn ComputeExecutor>);
+        let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
         Ok(ProviderRail {
             provider,
             device,
+            executor,
             pipelines: Mutex::new(HashMap::new()),
         })
     })
     .as_ref()
     .map_err(|detail| ProviderComputeDecline::ProviderUnavailable {
         detail: detail.clone(),
+        health: "create",
+        teardown: None,
     })
 }
 
@@ -216,11 +434,116 @@ pub fn device_epoch() -> Result<u64, ProviderComputeDecline> {
     Ok(rail()?.provider.device_epoch().get())
 }
 
+/// Rebuild the rail's provider after a confirmed device loss and drop the
+/// pipeline handles that belonged to the dead device.
+///
+/// This is the in-process recovery entry for the terminal `DeviceLost` health
+/// the refusal mapping already reports: `v64`'s `rebuild_after_device_loss`
+/// refuses every other state fail-closed, installs a fresh Vulkan device and
+/// advances the `DeviceEpoch`, and the compiled pipelines the rail cached are
+/// device children of the dead incarnation. The owner rail was already torn
+/// down when the loss was observed ([`provider_owner::teardown_device_lost`]),
+/// so callers re-register guest RAM and resubmit afterwards: old-epoch leases
+/// and tokens keep being refused by the provider, and nothing is silently
+/// re-admitted. No production caller exists in this increment — the
+/// device-recreate path is where the call belongs.
+pub fn recover_after_device_loss() -> Result<(), ProviderComputeDecline> {
+    let rail = rail()?;
+    rail.provider
+        .rebuild_after_device_loss()
+        .map_err(|error| refusal_decline(&error, "recovery"))?;
+    rail.pipelines
+        .lock()
+        .map_err(|_| ProviderComputeDecline::PipelineCompile {
+            detail: "pipeline cache poisoned".into(),
+        })?
+        .clear();
+    Ok(())
+}
+
+/// Arm the rail's own provider so its next queue-boundary answer is
+/// `VK_ERROR_DEVICE_LOST`.
+///
+/// This is the emulator's own test injection (`v64`), pointed at the very
+/// provider this rail submits through, so a test observes the rail's reaction —
+/// typed refusal, owner teardown, `provider_unavailable` on later work — rather
+/// than its own setup. The lifecycle is deliberately untouched: the provider
+/// reaches `DeviceLost` only through the path a real driver answer takes.
+/// Tests only; the runtime never calls it.
+#[doc(hidden)]
+pub fn inject_driver_device_loss_for_test(
+    point: metal_api_vulkan::DeviceLossPoint,
+) -> Result<(), ProviderComputeDecline> {
+    rail()?.executor.inject_driver_device_loss_for_test(point);
+    Ok(())
+}
+
+/// The lifecycle states in the provider's own vocabulary.
+fn health_name(health: ProviderHealth) -> &'static str {
+    match health {
+        ProviderHealth::Usable => "usable",
+        ProviderHealth::DeviceLost => "device_lost",
+        ProviderHealth::Exhausted => "exhausted",
+    }
+}
+
+/// The explicit policy for a rail whose provider is not usable
+/// (`research/docs/13` §3.2): refuse in-class work fail-closed with
+/// `provider_unavailable` — never re-run it on the self-contained engine — and
+/// run the contract's device-loss teardown over the owner ledger first when the
+/// terminal state is `DeviceLost`, so no lease stays imported against the dead
+/// incarnation. Returns `None` while the provider is `Usable`.
+fn refuse_unhealthy(
+    provider: &VulkanComputeProvider,
+    step: &'static str,
+) -> Option<ProviderComputeDecline> {
+    let health = provider.health();
+    if health.is_usable() {
+        return None;
+    }
+    let teardown = match health {
+        ProviderHealth::DeviceLost => Some(provider_owner::teardown_device_lost()),
+        ProviderHealth::Usable | ProviderHealth::Exhausted => None,
+    };
+    Some(ProviderComputeDecline::ProviderUnavailable {
+        detail: format!("health={} step={step}", health_name(health)),
+        health: health_name(health),
+        teardown,
+    })
+}
+
+/// Map one canonical provider refusal onto this rail's typed decline.
+///
+/// Every [`ProviderErrorClass`] is named by its own slug
+/// ([`ProviderRefusalClass`]), and `detail` keeps the provider's own slug and
+/// detail text. `DeviceLost` is the one class whose mapping is more than a
+/// name: the contract treats it as a teardown guarantee, so the owner ledger is
+/// released here and the refusal carries the census of what that released.
+fn refusal_decline(error: &ProviderError, step: &'static str) -> ProviderComputeDecline {
+    let class = ProviderRefusalClass::from_provider(error.class);
+    let detail = provider_error_detail(error);
+    match class {
+        ProviderRefusalClass::DeviceLost => {
+            let teardown = provider_owner::teardown_device_lost();
+            ProviderComputeDecline::ProviderDeviceLost {
+                step,
+                detail,
+                teardown,
+            }
+        }
+        class => ProviderComputeDecline::ProviderRefused {
+            class,
+            step,
+            detail,
+        },
+    }
+}
+
 /// A narrow submission's success answers: completed by the provider, or
 /// discovered to be outside the class once the canonical contract is known.
 /// Provider refusals travel through the `Err` arm instead.
 enum NarrowOutcome {
-    Completed(ComputeOutput),
+    Completed(ProviderComputeOutput),
     Outside(&'static str),
 }
 
@@ -249,6 +572,12 @@ fn submit_narrow(
 ) -> Result<NarrowOutcome, ProviderComputeDecline> {
     let rail = rail()?;
     let provider = &rail.provider;
+    // The health gate runs before anything is compiled or imported: a provider
+    // the lifecycle already reports terminal cannot take this dispatch, and the
+    // answer is a refusal, never a silent switch to the other rail.
+    if let Some(decline) = refuse_unhealthy(provider, "admission") {
+        return Err(decline);
+    }
 
     let ComputeDispatch::Regions { regions, .. } = &req.dispatch else {
         unreachable!("narrow_class_reason admitted the class");
@@ -295,9 +624,7 @@ fn submit_narrow(
                 })?;
             let compiled = provider
                 .compile_pipeline(&function, digest)
-                .map_err(|error| ProviderComputeDecline::PipelineCompile {
-                    detail: provider_error_detail(&error),
-                })?;
+                .map_err(|error| refusal_decline(&error, "pipeline_compile"))?;
             cache.insert(air.to_vec(), compiled.clone());
             compiled
         }
@@ -414,18 +741,19 @@ fn submit_narrow(
         Ok(validated) => validated,
         Err(error) => {
             leases.abort(provider);
-            return Err(ProviderComputeDecline::TraceAdmission {
-                detail: provider_error_detail(&error),
-            });
+            return Err(refusal_decline(&error, "trace_admission"));
         }
     };
     let result = match provider.submit(validated) {
         Ok(result) => result,
         Err(error) => {
+            // The refusal is mapped first: a `DeviceLost` refusal runs the
+            // contract's teardown over the owner ledger, and the census it
+            // reports is the state the teardown found — before this plan's own
+            // unwind below releases what it imported.
+            let decline = refusal_decline(&error, "submission");
             leases.abort(provider);
-            return Err(ProviderComputeDecline::Submission {
-                detail: provider_error_detail(&error),
-            });
+            return Err(decline);
         }
     };
     if !matches!(
@@ -436,43 +764,334 @@ fn submit_narrow(
         return Err(ProviderComputeDecline::CompletionNotVisible);
     }
 
-    // Writable bindings only, in canonical binding order. The writeback's
-    // view/allocation identity is the same `binding + 1` mapping the view
-    // carried in, so it maps back to the reims binding without a second table.
-    let mut output_buffers = Vec::new();
-    for (binding, access, _) in &bindings {
-        if !access.is_writable() {
-            continue;
+    // Which bytes the provider wrote comes from the completion itself
+    // (`BufferWriteback`, allocation coordinates). They are re-based onto the
+    // staged spans here, with the view bounds checked, so the caller's guest
+    // write is exactly the interval the provider named.
+    let writable: Vec<u32> = bindings
+        .iter()
+        .filter(|(_, access, _)| access.is_writable())
+        .map(|(binding, _, _)| *binding)
+        .collect();
+    let writebacks = match staged_writebacks(&writable, leases.views(), &result.writebacks) {
+        Ok(writebacks) => writebacks,
+        Err(decline) => {
+            leases.abort(provider);
+            return Err(decline);
         }
-        let view = leases
-            .view(*binding)
-            .expect("the owner plan covers every staged binding");
-        let view_id = ViewId::new(u64::from(*binding) + 1);
-        let writeback = match result
-            .writebacks
-            .iter()
-            .find(|writeback| writeback.view_id == view_id)
-        {
-            Some(writeback) if writeback.allocation_id == view.allocation => writeback,
-            _ => {
-                leases.abort(provider);
-                return Err(ProviderComputeDecline::WritebackMissing { binding: *binding });
-            }
-        };
-        output_buffers.push(ComputeBufferOutput {
-            binding: *binding,
-            bytes: writeback.bytes.clone(),
-        });
-    }
+    };
     // The retirement chain: the completion token binds every lease, the
     // completion retires it, the window is reclaimed and the provider's import
-    // is released — `research/docs/20` §3.4 in order. A refusal here declines
-    // the dispatch rather than letting the import outlive its evidence.
+    // is released — `research/docs/20` §3.4 in order. It runs before the caller
+    // writes anything back, so no provider-visible byte reaches guest memory
+    // before the leases that cover it are known to be retired. A refusal here
+    // declines the dispatch rather than letting the import outlive its
+    // evidence.
     leases
         .settle(provider, result.completion)
         .map_err(ProviderComputeDecline::Owner)?;
-    Ok(NarrowOutcome::Completed(ComputeOutput {
-        buffers: output_buffers,
+    Ok(NarrowOutcome::Completed(ProviderComputeOutput {
+        writebacks,
         images: Vec::new(),
     }))
+}
+
+/// Re-base one submission's provider writebacks onto the staged spans.
+///
+/// Writable bindings only, in the caller's binding order. The writeback's
+/// view/allocation identity is the same `binding + 1` mapping the view carried
+/// in, so one table is enough; a missing writeback is
+/// [`ProviderComputeDecline::WritebackMissing`], and one that does not lie
+/// inside the view the trace carried is
+/// [`ProviderComputeDecline::WritebackOutsideView`] — a provider-reported range
+/// the staged span cannot hold is never truncated into place.
+fn staged_writebacks(
+    writable: &[u32],
+    views: &[provider_owner::View],
+    writebacks: &[BufferWriteback],
+) -> Result<Vec<ProviderWriteback>, ProviderComputeDecline> {
+    let mut out = Vec::with_capacity(writable.len());
+    for binding in writable {
+        let view = views
+            .iter()
+            .find(|view| view.binding == *binding)
+            .expect("the owner plan covers every staged binding");
+        let view_id = ViewId::new(u64::from(*binding) + 1);
+        let writeback = match writebacks.iter().find(|writeback| {
+            writeback.view_id == view_id && writeback.allocation_id == view.allocation
+        }) {
+            Some(writeback) => writeback,
+            None => {
+                return Err(ProviderComputeDecline::WritebackMissing { binding: *binding });
+            }
+        };
+        let length = u64::try_from(writeback.bytes.len()).unwrap_or(u64::MAX);
+        let view_end = view.view_offset.checked_add(view.view_length).ok_or(
+            ProviderComputeDecline::WritebackOutsideView {
+                binding: *binding,
+                offset: writeback.offset,
+                length,
+                view_offset: view.view_offset,
+                view_length: view.view_length,
+            },
+        )?;
+        let writeback_end = writeback.offset.checked_add(length).ok_or(
+            ProviderComputeDecline::WritebackOutsideView {
+                binding: *binding,
+                offset: writeback.offset,
+                length,
+                view_offset: view.view_offset,
+                view_length: view.view_length,
+            },
+        )?;
+        if writeback.offset < view.view_offset || writeback_end > view_end {
+            return Err(ProviderComputeDecline::WritebackOutsideView {
+                binding: *binding,
+                offset: writeback.offset,
+                length,
+                view_offset: view.view_offset,
+                view_length: view.view_length,
+            });
+        }
+        out.push(ProviderWriteback {
+            binding: *binding,
+            offset: writeback.offset - view.view_offset,
+            bytes: writeback.bytes.clone(),
+            allocation: writeback.allocation_id,
+            allocation_offset: writeback.offset,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metal_api_core::provider::{
+        AllocationId, BufferLease, DeviceEpoch, LeaseId, LeaseReservation, ProviderPhase,
+    };
+
+    /// One view whose geometry the trace would carry: a window inside a larger
+    /// allocation, exactly the owner rail's borrowed shape.
+    fn window_view(binding: u32, view_offset: u64, view_length: u64) -> provider_owner::View {
+        let lease = LeaseId::new(u64::from(binding) + 1);
+        let allocation = AllocationId::new(u64::from(binding) + 11);
+        provider_owner::View {
+            binding,
+            channel: provider_owner::Channel::Borrowed,
+            lease,
+            allocation,
+            allocation_size: 2 * 4096,
+            reservation: LeaseReservation {
+                lease: BufferLease {
+                    lease_id: lease,
+                    allocation_id: allocation,
+                    owner_epoch: DeviceEpoch::new(1),
+                },
+                offset: view_offset,
+                length: view_length,
+            },
+            view_offset,
+            view_length,
+        }
+    }
+
+    fn writeback(allocation: u64, offset: u64, bytes: Vec<u8>) -> BufferWriteback {
+        BufferWriteback {
+            view_id: ViewId::new(1),
+            allocation_id: AllocationId::new(allocation),
+            offset,
+            bytes,
+        }
+    }
+
+    /// Every normalized provider class is named by its own reims slug, and the
+    /// non-loss classes carry the provider's own slug/detail text through the
+    /// refusal builder.
+    ///
+    /// The `DeviceLost` arm is asserted here only through its slug and its
+    /// census-bearing decline: mapping it runs the owner-ledger teardown, which
+    /// belongs to the integration test that owns that ledger, not to a unit
+    /// test sharing this process's global rail.
+    #[test]
+    fn every_provider_refusal_class_has_its_own_reims_slug() {
+        let table = [
+            (
+                ProviderErrorClass::Args,
+                ProviderRefusalClass::Args,
+                "provider_args",
+            ),
+            (
+                ProviderErrorClass::Capability,
+                ProviderRefusalClass::Capability,
+                "provider_capability",
+            ),
+            (
+                ProviderErrorClass::Resource,
+                ProviderRefusalClass::Resource,
+                "provider_resource",
+            ),
+            (
+                ProviderErrorClass::Compile,
+                ProviderRefusalClass::Compile,
+                "provider_compile",
+            ),
+            (
+                ProviderErrorClass::Execute,
+                ProviderRefusalClass::Execute,
+                "provider_execute",
+            ),
+            (
+                ProviderErrorClass::DeviceLost,
+                ProviderRefusalClass::DeviceLost,
+                "provider_device_lost",
+            ),
+            (
+                ProviderErrorClass::Internal,
+                ProviderRefusalClass::Internal,
+                "provider_internal",
+            ),
+        ];
+        assert_eq!(
+            table.len(),
+            ProviderRefusalClass::ALL.len(),
+            "the mapping covers every normalized class"
+        );
+        for (provider_class, class, slug) in table {
+            assert_eq!(ProviderRefusalClass::from_provider(provider_class), class);
+            assert_eq!(class.slug(), slug);
+            assert!(ProviderRefusalClass::ALL.contains(&class));
+            if class == ProviderRefusalClass::DeviceLost {
+                continue;
+            }
+            let error =
+                ProviderError::new(ProviderPhase::Submit, provider_class, "boundary_refusal")
+                    .expect("a static non-empty slug");
+            let decline = refusal_decline(&error, "submission");
+            assert_eq!(decline.slug(), slug);
+            let fields = decline.fields();
+            assert!(fields
+                .iter()
+                .any(|(key, value)| *key == "class" && value == class.name()));
+            assert!(fields
+                .iter()
+                .any(|(key, value)| *key == "step" && value == "submission"));
+            assert!(
+                fields
+                    .iter()
+                    .any(|(key, value)| *key == "detail" && value.contains("boundary_refusal")),
+                "the provider's own text must ride along: {fields:?}"
+            );
+        }
+
+        // The device-loss refusal is its own typed variant, and its census is
+        // rendered on the same line as the provider's text.
+        let lost = ProviderComputeDecline::ProviderDeviceLost {
+            step: "submission",
+            detail: "vulkan-queue-submit: VK_ERROR_DEVICE_LOST".into(),
+            teardown: DeviceLossTeardown {
+                leases: 2,
+                windows: 1,
+            },
+        };
+        assert_eq!(lost.slug(), "provider_device_lost");
+        let fields = lost.fields();
+        assert!(fields
+            .iter()
+            .any(|(key, value)| *key == "teardown_leases" && value == "2"));
+        assert!(fields
+            .iter()
+            .any(|(key, value)| *key == "teardown_windows" && value == "1"));
+        assert!(fields
+            .iter()
+            .any(|(key, value)| *key == "detail" && value.contains("VK_ERROR_DEVICE_LOST")));
+    }
+
+    /// The provider's writeback keeps its own offset: an interval in the middle
+    /// of a view maps to that offset inside the staged span, and the whole-view
+    /// writeback maps to zero. Nothing here assumes "the whole buffer was
+    /// written".
+    #[test]
+    fn a_provider_writeback_keeps_its_offset_inside_the_view() {
+        let views = [window_view(0, 4096, 16)];
+
+        let partial = [writeback(11, 4104, vec![0xAB; 8])];
+        let mapped =
+            staged_writebacks(&[0], &views, &partial).expect("a writeback inside its view");
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].binding, 0);
+        assert_eq!(
+            mapped[0].offset, 8,
+            "the interval keeps its offset instead of being moved to the start \
+             of the staged span"
+        );
+        assert_eq!(mapped[0].bytes, vec![0xAB; 8]);
+        assert_eq!(
+            mapped[0].allocation_offset, 4104,
+            "the provider's own coordinates stay on the writeback as evidence"
+        );
+        assert_eq!(mapped[0].allocation, AllocationId::new(11));
+
+        let whole = [writeback(11, 4096, vec![0xCD; 16])];
+        let mapped = staged_writebacks(&[0], &views, &whole).expect("the whole view");
+        assert_eq!(mapped[0].offset, 0);
+        assert_eq!(mapped[0].bytes, vec![0xCD; 16]);
+
+        // A writeback for a binding the trace wrote nothing to is the provider
+        // saying more than the trace asked for: read-only bindings are skipped,
+        // so it is simply not collected.
+        let mapped = staged_writebacks(&[], &views, &[writeback(11, 4096, vec![0xCD; 16])])
+            .expect("no writable binding, no interval");
+        assert!(mapped.is_empty());
+    }
+
+    /// A writeback the staged span cannot hold is refused by name — past the
+    /// view's end, straddling it, or before its start — and a missing writeback
+    /// keeps its own slug. Neither is truncated into place.
+    #[test]
+    fn a_writeback_outside_its_view_is_refused_by_name() {
+        let views = [window_view(0, 4096, 16)];
+
+        let past_end = [writeback(11, 4112, vec![0u8; 8])];
+        assert_eq!(
+            staged_writebacks(&[0], &views, &past_end)
+                .expect_err("past the view end")
+                .slug(),
+            "writeback_outside_view"
+        );
+        let straddling = [writeback(11, 4104, vec![0u8; 16])];
+        let decline = staged_writebacks(&[0], &views, &straddling).expect_err("straddling the end");
+        assert_eq!(decline.slug(), "writeback_outside_view");
+        assert_eq!(
+            decline.fields(),
+            vec![
+                ("binding", "0".to_string()),
+                ("offset", "4104".to_string()),
+                ("length", "16".to_string()),
+                ("view_offset", "4096".to_string()),
+                ("view_length", "16".to_string()),
+            ],
+            "the refusal names the interval and the view it missed"
+        );
+        let before_start = [writeback(11, 4090, vec![0u8; 8])];
+        assert_eq!(
+            staged_writebacks(&[0], &views, &before_start)
+                .expect_err("before the view start")
+                .slug(),
+            "writeback_outside_view"
+        );
+        assert_eq!(
+            staged_writebacks(&[0], &views, &[])
+                .expect_err("no writeback")
+                .slug(),
+            "writeback_missing"
+        );
+        let foreign_allocation = [writeback(99, 4096, vec![0u8; 16])];
+        assert_eq!(
+            staged_writebacks(&[0], &views, &foreign_allocation)
+                .expect_err("another allocation's writeback")
+                .slug(),
+            "writeback_missing"
+        );
+    }
 }

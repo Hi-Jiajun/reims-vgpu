@@ -74,9 +74,14 @@ fn the_production_seam_submits_the_reviewed_fixture_through_the_canonical_provid
     match submit_compute(&air, "apv_cs", &request, &[]) {
         ComputeRailOutcome::ProviderCompleted(out) => {
             assert_eq!(out.images.len(), 0, "the narrow class carries no images");
-            assert_eq!(out.buffers.len(), 1, "one writable binding readback");
-            assert_eq!(out.buffers[0].binding, 0);
-            let readback: Vec<u32> = out.buffers[0]
+            assert_eq!(out.writebacks.len(), 1, "one writable binding readback");
+            assert_eq!(out.writebacks[0].binding, 0);
+            // This submission had no registered window, so the binding left as
+            // a staged lease whose allocation *is* the staged span: the
+            // provider's writeback covers it from offset zero.
+            assert_eq!(out.writebacks[0].offset, 0);
+            assert_eq!(out.writebacks[0].allocation_offset, 0);
+            let readback: Vec<u32> = out.writebacks[0]
                 .bytes
                 .chunks(4)
                 .map(|word| u32::from_le_bytes(word.try_into().expect("4-byte chunk")))
@@ -188,6 +193,11 @@ fn a_registered_guest_window_is_imported_without_copying_and_released_after_comp
     let window_offset = page;
     let head = 0usize;
     let input = input_words([1, 2, 3, 4]);
+    // Sentinel every byte of the registration first. What the provider and the
+    // rail must both leave alone is the rest of the window — the part of the
+    // import granule the kernel's 16 bytes do not cover — so a writeback that
+    // moved "the whole buffer" would be visible here.
+    owner.as_mut_slice().fill(0xA5);
     owner.as_mut_slice()[window_offset + head..window_offset + head + input.len()]
         .copy_from_slice(&input);
 
@@ -227,8 +237,24 @@ fn a_registered_guest_window_is_imported_without_copying_and_released_after_comp
     for expected in [[4u32, 7, 10, 13], [13, 22, 31, 40]] {
         match submit_compute(&air, "apv_cs", &request, &[window]) {
             ComputeRailOutcome::ProviderCompleted(out) => {
-                assert_eq!(out.buffers.len(), 1);
-                assert_eq!(readback_words(&out.buffers[0].bytes), expected.to_vec());
+                assert_eq!(out.writebacks.len(), 1);
+                let writeback = &out.writebacks[0];
+                assert_eq!(readback_words(&writeback.bytes), expected.to_vec());
+                // The interval is the provider's own, in both coordinate
+                // systems: allocation offset = where the window starts inside
+                // the registration (+ the view head), staged offset = the head
+                // itself. Nothing here assumes the writeback starts at zero.
+                assert_eq!(
+                    writeback.allocation_offset,
+                    window_offset as u64 + head as u64
+                );
+                assert_eq!(writeback.offset, head as u64);
+                assert_eq!(writeback.bytes.len(), input.len());
+                assert_eq!(
+                    writeback.allocation.is_zero(),
+                    false,
+                    "the writeback names the allocation the trace carried"
+                );
             }
             ComputeRailOutcome::NotInNarrowClass(reason) => {
                 panic!("the reviewed fixture is in the narrow class; refused: {reason}")
@@ -246,6 +272,22 @@ fn a_registered_guest_window_is_imported_without_copying_and_released_after_comp
                 .flat_map(|word| word.to_le_bytes())
                 .collect::<Vec<u8>>(),
             "the writeback must land in the owner mapping itself"
+        );
+        // Byte-exact partial write, at the provider's own granularity: the
+        // kernel's 16 bytes moved, and nothing else inside the registered
+        // window did — neither the first granule (outside the window) nor the
+        // remaining 4064 bytes of the window's own granule.
+        assert!(
+            owner.as_slice()[..window_offset]
+                .iter()
+                .all(|byte| *byte == 0xA5),
+            "the registration before the window must be untouched"
+        );
+        assert!(
+            owner.as_slice()[window_offset + head + input.len()..]
+                .iter()
+                .all(|byte| *byte == 0xA5),
+            "the rest of the window's granule must be untouched"
         );
     }
     // The loop above submitted twice over one registration. The second import

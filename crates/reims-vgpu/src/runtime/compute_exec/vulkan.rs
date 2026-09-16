@@ -13,6 +13,31 @@
 use super::*;
 use crate::runtime::draw::vulkan::gva_span_identity;
 
+/// What one compute dispatch's readback is, before the shared writeback loop
+/// lands it in guest memory.
+enum ComputeReadback {
+    /// The self-contained engine's own readback: one whole staged span per
+    /// writable binding, so every writeback offset is zero by construction.
+    Engine(crate::backend::vulkan::engine::ComputeOutput),
+    /// The canonical provider's readback: the interval each binding's
+    /// completion reported, in staged coordinates.
+    #[cfg(feature = "provider-compute")]
+    Provider(crate::backend::provider_compute::ProviderComputeOutput),
+}
+
+/// One readback the writeback loop must land in guest memory.
+///
+/// `offset` is the byte offset of `bytes` inside the staged span the binding
+/// carried. The engine's whole-span readback is offset zero; the canonical
+/// rail's offset is the interval the provider's completion named, so a
+/// provider that wrote a sub-range moves exactly those bytes and the write
+/// channel records exactly that interval's guest pages as host-written.
+struct StagedReadback {
+    binding: u32,
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
 /// The sampled-image bindings that need a neutral texture: those the module
 /// statically uses and `bound` does not cover.
 ///
@@ -1390,11 +1415,11 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     "compute_provider dispatch pipe={}",
                     acc.pipeline_ref
                 ));
-                Ok(out)
+                Ok(ComputeReadback::Provider(out))
             }
             ComputeRailOutcome::NotInNarrowClass(_reason) => {
                 crate::runtime::drain::note_store_route("compute_provider_out_of_class");
-                run_engine(&req)
+                run_engine(&req).map(ComputeReadback::Engine)
             }
             ComputeRailOutcome::ProviderDeclined(decline) => {
                 crate::observe::Emit::decline("compute_provider", &decline)
@@ -1405,7 +1430,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     };
     #[cfg(not(feature = "provider-compute"))]
-    let out_result = run_engine(&req);
+    let out_result = run_engine(&req).map(ComputeReadback::Engine);
     let out = match out_result {
         Ok(o) => o,
         Err(e) => {
@@ -1419,21 +1444,47 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_engine_run");
         }
     };
-    if out.buffers.len() != buffer_writable_count || out.images.len() != storage_count {
+    // One readback list, two sources with different writeback geometry: the
+    // engine reads a whole staged span back (offset zero by construction), the
+    // canonical rail reports the interval the provider's completion named. The
+    // writeback loop below is the same guest write channel for both, and it
+    // writes exactly the interval each entry carries.
+    let (output_buffers, output_images) = match out {
+        ComputeReadback::Engine(out) => (
+            out.buffers
+                .into_iter()
+                .map(|buffer| StagedReadback {
+                    binding: buffer.binding,
+                    offset: 0,
+                    bytes: buffer.bytes,
+                })
+                .collect::<Vec<_>>(),
+            out.images,
+        ),
+        #[cfg(feature = "provider-compute")]
+        ComputeReadback::Provider(out) => (
+            out.writebacks
+                .into_iter()
+                .map(|writeback| StagedReadback {
+                    binding: writeback.binding,
+                    offset: writeback.offset,
+                    bytes: writeback.bytes,
+                })
+                .collect::<Vec<_>>(),
+            out.images,
+        ),
+    };
+    if output_buffers.len() != buffer_writable_count || output_images.len() != storage_count {
         crate::observe::fail(format!(
             "compute_linux readback count mismatch pipe={} buf={}/{} img={}/{}",
             acc.pipeline_ref,
-            out.buffers.len(),
+            output_buffers.len(),
             buffer_writable_count,
-            out.images.len(),
+            output_images.len(),
             storage_count
         ));
         return ComputeStatus::MetalFailed("compute_vk_readback_count");
     }
-    let vk_engine::ComputeOutput {
-        buffers: output_buffers,
-        images: output_images,
-    } = out;
     for buffer in output_buffers {
         let Some(s) = staged_bufs
             .iter_mut()
@@ -1447,14 +1498,18 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             ));
             return ComputeStatus::MetalFailed("compute_vk_readback_binding");
         };
-        s.bytes = buffer.bytes;
-        if let Err(e) = writeback_buffer(
+        // The interval the readback named, at the offset it named: the guest
+        // bytes that land and the pages the write channel records as
+        // host-written are both that interval's, never "the whole buffer".
+        if let Err(e) = writeback_buffer_at(
             state,
             host,
             task_id,
             Some(acc.pipeline_ref),
             "vulkan_dispatch",
             s,
+            buffer.offset,
+            &buffer.bytes,
         ) {
             return e;
         }
@@ -1462,11 +1517,11 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     for (t, result) in staged_tex
         .iter_mut()
         .filter(|texture| texture.is_storage)
-        .zip(output_images)
+        .zip(output_images.iter())
     {
         match result {
             ComputeImageResult::Bytes(bytes) => {
-                t.bytes = bytes;
+                t.bytes = bytes.clone();
                 if let Err(e) = writeback_texture(state, host, task_id, t) {
                     return e;
                 }
