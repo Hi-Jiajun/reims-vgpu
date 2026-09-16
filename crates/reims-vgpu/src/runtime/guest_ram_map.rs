@@ -2417,13 +2417,32 @@ pub fn retire_submission(token: Option<u64>) {
 /// address rail can offer every retired packed import without deciding which
 /// of the two shapes it was — the ledger's own `gpa_base` answers that.
 ///
+/// # The owner rail hears the same answer
+///
+/// The provider's owner rail is told about one retirement and only one: a
+/// registration this seam actually reclaimed. Announcing a RAMBlock-shaped
+/// import there would make the two ledgers disagree — the registration would
+/// stay in this ledger while the provider refused every later window over it
+/// (`owner_region_retired`), which is what a boot measured while the narrow
+/// class was the first thing to cut a window from an imported block
+/// (`evidence/gate3-zerocopy-narrow-2026-09-17`). A retirement that finds no
+/// ledger at all is a device recreate winding down: [`reset`] dropped the
+/// owner rail's records in the same step, so there is nothing left to stop
+/// and nothing may be announced into the next epoch.
+///
 /// A refusal that is not one of the three [`GuestRamRegistrations::reclaim`]
 /// answers is unreachable, and is emitted as evidence rather than swallowed.
 pub fn reclaim_alias(import: ImportId) {
     enum Step {
-        /// Reclaimed now, or the registration is gone and there is nothing to
-        /// guard — both end the address rail's business with this import.
-        Done,
+        /// An alias-shaped registration was reclaimed — now, or by the earlier
+        /// retirement this one is a replay of. The provider's owner rail must
+        /// stop deriving windows under this import.
+        AliasReclaimed,
+        /// Nothing ended: the ledger is gone (the recreate already reset the
+        /// owner rail beside it), the import holds no live registration, or it
+        /// is the VM-lifetime RAMBlock shape. The owner rail keeps whatever it
+        /// holds, so windows over a live registration keep resolving.
+        NothingEnded,
         /// The reclaim latch refused; retry at the next slot retirement.
         Defer,
         /// A refusal [`GuestRamRegistrations::reclaim`] cannot produce.
@@ -2433,7 +2452,7 @@ pub fn reclaim_alias(import: ImportId) {
     let step = {
         let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_mut() {
-            None => Step::Done,
+            None => Step::NothingEnded,
             Some(ledger) => {
                 // The RAMBlock shape check runs before the reclaim rather than
                 // being a refusal: an address rule retiring a VM-lifetime
@@ -2443,13 +2462,21 @@ pub fn reclaim_alias(import: ImportId) {
                     .registration(import)
                     .is_some_and(|registration| registration.gpa_base.is_none());
                 if !is_alias {
-                    Step::Done
+                    Step::NothingEnded
                 } else {
                     match ledger.reclaim(import) {
-                        Ok(()) => Step::Done,
+                        Ok(()) => Step::AliasReclaimed,
                         Err(RegistrationLedgerRefusal::WindowStillBound { .. }) => Step::Defer,
+                        // The only path that reclaims a registration is this
+                        // seam, and it announces the reclaim when it lands; a
+                        // second retirement of the same import has nothing to
+                        // add. Both arms are unreachable while the lock is held
+                        // — `registration` above hides a reclaimed entry — and
+                        // are answered rather than swallowed.
                         Err(RegistrationLedgerRefusal::UnregisteredImport { .. })
-                        | Err(RegistrationLedgerRefusal::ReclaimedImport { .. }) => Step::Done,
+                        | Err(RegistrationLedgerRefusal::ReclaimedImport { .. }) => {
+                            Step::NothingEnded
+                        }
                         Err(refusal) => Step::Refused(refusal),
                     }
                 }
@@ -2458,13 +2485,14 @@ pub fn reclaim_alias(import: ImportId) {
     };
 
     match step {
-        Step::Done => {
+        Step::AliasReclaimed => {
             // The provider's owner rail hears the same retirement: the
             // registration stops deriving windows, and any window still
             // registered under it is reclaimed.
             #[cfg(feature = "provider-compute")]
             crate::backend::provider_owner::retire_region(import.get());
         }
+        Step::NothingEnded => {}
         Step::Defer => {
             PENDING_RECLAIM
                 .lock()
@@ -4696,6 +4724,13 @@ mod tests {
     /// A RAMBlock import's registration is the VM-lifetime shape and an
     /// address rule must not end it: the seam sees the ledger's `gpa_base` and
     /// leaves the registration alone, whatever packed resolution retired it.
+    ///
+    /// Both halves are locked here. The ledger half alone is what let the bug
+    /// through: the provider's owner rail heard the same retirement and refused
+    /// every later window over the import (`owner_region_retired`) while the
+    /// registration this test asserts stayed in place — measured on a boot
+    /// whose narrow class was the first thing to cut a window from an imported
+    /// block (`evidence/gate3-zerocopy-narrow-2026-09-17`, import=9).
     #[test]
     fn an_address_rule_never_reclaims_a_ramblock_registration() {
         const PAGE: u64 = 4096;
@@ -4716,6 +4751,76 @@ mod tests {
                 "the VM-lifetime registration survives an address retirement"
             );
             assert_eq!(pending_alias_reclaims(), 0);
+            #[cfg(feature = "provider-compute")]
+            {
+                let retired = crate::backend::provider_owner::retired_regions();
+                assert!(
+                    !retired.contains(&ramblock.import.get()),
+                    "the owner rail must keep deriving windows under the RAMBlock: \
+                     retired={retired:?}"
+                );
+                assert!(
+                    crate::backend::provider_owner::registered(ramblock.import.get()).is_some(),
+                    "the owner rail keeps the registration itself, not only the \
+                     ledger's copy"
+                );
+            }
+        });
+    }
+
+    /// The other half of the same decision, so neither can pass alone: a packed
+    /// alias the address rail retires **is** reclaimed, and the registrations it
+    /// ends are that alias's own — the RAMBlock entries beside it keep their
+    /// ledger record and their owner-rail record, and stay able to derive
+    /// windows.
+    #[test]
+    fn a_packed_alias_retirement_ends_only_the_alias_registration() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            let ramblocks: Vec<u64> = registrations()
+                .iter()
+                .filter(|registration| registration.gpa_base.is_some())
+                .map(|registration| registration.import.get())
+                .collect();
+            assert_eq!(ramblocks.len(), 2, "the boot pass registered both spans");
+
+            let alias = std::sync::Arc::new(
+                GuestRamImport::new_host_allocation(0x7000_0000_0000, 0x4000, PAGE)
+                    .expect("an aligned host allocation"),
+            );
+            register_alias(&alias).expect("an alias registers against the ledger");
+
+            reclaim_alias(alias.id());
+
+            assert!(
+                registrations()
+                    .iter()
+                    .all(|registration| registration.import != alias.id()),
+                "the retired alias leaves the ledger"
+            );
+            assert_eq!(pending_alias_reclaims(), 0, "nothing was parked");
+            #[cfg(feature = "provider-compute")]
+            {
+                let retired = crate::backend::provider_owner::retired_regions();
+                assert!(
+                    retired.contains(&alias.id().get()),
+                    "the owner rail stops deriving windows under the reclaimed \
+                     alias: retired={retired:?}"
+                );
+                for import in &ramblocks {
+                    assert!(
+                        !retired.contains(import),
+                        "the RAMBlock entries beside it are untouched: \
+                         retired={retired:?}"
+                    );
+                    assert!(
+                        crate::backend::provider_owner::registered(*import).is_some(),
+                        "import {import} keeps its owner-rail registration"
+                    );
+                }
+            }
         });
     }
 
