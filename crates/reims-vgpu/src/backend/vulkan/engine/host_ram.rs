@@ -36,6 +36,7 @@ use ash::vk;
 use crate::backend::vulkan::caps::host_pointer::ImportTypeRefusal;
 use crate::observe::Decline;
 use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
+use crate::runtime::guest_ram_map::{RegisteredWindow, RegistrationLedgerRefusal};
 
 /// One host allocation living on the GPU as a bindable buffer, with no copy
 /// between it and the guest's own view of those bytes.
@@ -131,6 +132,15 @@ pub enum HostRamDecline {
     /// The reference did not survive its own bound. Carries the check that
     /// refused, from [`crate::runtime::guest_ram`].
     Bound { inner: GuestRamError },
+    /// The run carried a provider window that does not name the range this
+    /// reference binds.
+    ///
+    /// The ledger cut the window from the same bound the reference carries, so
+    /// this is the fail-closed half of `research/docs/20` §3.2: a window that
+    /// disagrees with its reference stops the bind instead of binding
+    /// whichever range happens to look right. Carries the ledger's own
+    /// refusal, so one check keeps one name.
+    Window { inner: RegistrationLedgerRefusal },
 }
 
 impl Decline for HostRamDecline {
@@ -147,6 +157,7 @@ impl Decline for HostRamDecline {
             // The inner check is the diagnosis. Forwarding rather than adding a
             // slug keeps one name per check across the two modules.
             Self::Bound { inner } => inner.slug(),
+            Self::Window { inner } => inner.slug(),
         }
     }
 
@@ -195,6 +206,7 @@ impl Decline for HostRamDecline {
                 ("available", available.to_string()),
             ],
             Self::Bound { inner } => inner.fields(),
+            Self::Window { inner } => inner.fields(),
         }
     }
 }
@@ -259,6 +271,17 @@ impl HostRamImports {
     /// Resolve `guest_ref` to a bindable range, importing its RAMBlock if this
     /// is the first reference into it.
     ///
+    /// `window` is the page-aligned window the registration ledger derived
+    /// beside this reference, carried on the run
+    /// ([`crate::runtime::guest_ram_map::GuestWindowRun::window`]). When it is
+    /// `Some` the bind reads that range rather than re-deriving it, and a
+    /// window that does not name exactly the reference's bound is refused by
+    /// name instead of bound — the fail-closed half of the coordinate split
+    /// `research/docs/20` §3.2 draws between an aligned window and the byte
+    /// precision [`GuestRef::head`] carries. `None` is the unregistered
+    /// reading (a packed alias, or a reference that beat the handshake), and
+    /// the bytes stay bindable exactly as before.
+    ///
     /// # Safety
     ///
     /// `ctx` must be the live device context, and the import's host base must
@@ -268,12 +291,24 @@ impl HostRamImports {
         &mut self,
         ctx: &super::context::DeviceContext,
         guest_ref: &GuestRef,
+        window: Option<&RegisteredWindow>,
     ) -> Result<BoundGuestRam, HostRamDecline> {
         // The bound first, so a reference that cannot name its own bytes never
         // reaches an import call.
         let range = guest_ref
             .bound()
             .map_err(|inner| HostRamDecline::Bound { inner })?;
+        // A run carrying the ledger's window binds that range — the same
+        // range, but taken from the derivation rather than recomputed here —
+        // and a window that disagrees with its reference fails closed before
+        // any import is asked for.
+        let range = match window {
+            Some(window) => {
+                crate::runtime::guest_ram_map::window_range(guest_ref.import(), range, window)
+                    .map_err(|inner| HostRamDecline::Window { inner })?
+            }
+            None => range,
+        };
         let (live, _) = unsafe { self.ensure(ctx, guest_ref.import()) }?;
         Ok(BoundGuestRam {
             buffer: live.buffer,
@@ -935,6 +970,27 @@ mod tests {
             import_len: 0x1000,
         };
         let outer = HostRamDecline::Bound { inner };
+        assert_eq!(outer.slug(), inner.slug());
+        assert_eq!(outer.fields(), inner.fields());
+    }
+
+    /// A window refusal forwards the ledger's name rather than being renamed
+    /// at the boundary. The two modules are one rail and a reader greps one
+    /// vocabulary — the same forwarding [`HostRamDecline::Bound`] does for the
+    /// reference's own bound.
+    #[test]
+    fn a_window_refusal_forwards_the_check_that_refused() {
+        let import = GuestRamImport::new_host_allocation(0x1000, 0x4000, 0x1000)
+            .expect("aligned synthetic import");
+        let inner = RegistrationLedgerRefusal::WindowMismatch {
+            import: import.id(),
+            window_import: import.id(),
+            window_base: 0x1000,
+            window_length: 0x1000,
+            bound_offset: 0x1000,
+            bound_len: 0x2000,
+        };
+        let outer = HostRamDecline::Window { inner };
         assert_eq!(outer.slug(), inner.slug());
         assert_eq!(outer.fields(), inner.fields());
     }

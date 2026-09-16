@@ -2242,6 +2242,12 @@ pub struct GuestRunSource {
 #[derive(Debug)]
 pub struct WindowStretch<'a> {
     pub guest: &'a crate::runtime::guest_ram::GuestRef,
+    /// The page-aligned provider window the run carries, when the
+    /// registration ledger holds its import. `None` is the unregistered
+    /// reading — the packed-alias shape and any reference that beat the
+    /// handshake — and the bytes stay bindable either way; the bind rail is
+    /// what turns a mismatched `Some` into a named refusal.
+    pub window: Option<crate::runtime::guest_ram_map::RegisteredWindow>,
     pub skip: u64,
     pub window_offset: u64,
     pub len: u64,
@@ -2276,6 +2282,7 @@ impl GuestRunSource {
         }
         Some(WindowStretch {
             guest: &only.guest,
+            window: only.window,
             skip: self.source_offset,
             window_offset: 0,
             len: self.total_len,
@@ -2297,6 +2304,7 @@ impl GuestRunSource {
             }
             Some(WindowStretch {
                 guest: &run.guest,
+                window: run.window,
                 skip: start - run.window_offset,
                 window_offset: start - self.source_offset,
                 len: end - start,

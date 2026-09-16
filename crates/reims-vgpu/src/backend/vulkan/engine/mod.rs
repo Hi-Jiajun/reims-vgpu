@@ -4052,7 +4052,7 @@ unsafe fn plan_guest_linear_copies(
     use host_ram::GuestWriteDecline;
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)> = Vec::new();
     for run in &dst.runs {
-        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
+        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest, run.window.as_ref()) }
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
         let copy = ash::vk::BufferCopy::default()
             // `head` is what the granularity rounding added in front of the
@@ -4143,7 +4143,7 @@ unsafe fn plan_guest_scatter_dispatches(
     };
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ScatterRun>)> = Vec::new();
     for run in &dst.runs {
-        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
+        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest, run.window.as_ref()) }
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
         group_by_buffer(
             &mut grouped,
@@ -4360,7 +4360,7 @@ unsafe fn plan_guest_copies(
     let geom = dst.geometry();
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)> = Vec::new();
     for run in &dst.runs {
-        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
+        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest, run.window.as_ref()) }
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
         // `head` is what the granularity rounding added in front of the byte the
         // caller asked for, so the run's first requested byte sits here.

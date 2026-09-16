@@ -49,8 +49,8 @@
 
 use crate::backend::Backend as _;
 use crate::runtime::guest_ram::{
-    granularity, import_budget, import_span_max, GuestRamError, GuestRamImport, GuestRamRegion,
-    GuestRef, ImportId,
+    granularity, import_budget, import_span_max, BoundRange, GuestRamError, GuestRamImport,
+    GuestRamRegion, GuestRef, ImportId,
 };
 use crate::runtime::host::{GuestRamRegionsError, HostOps};
 use std::collections::BTreeMap;
@@ -934,6 +934,22 @@ pub enum RegistrationLedgerRefusal {
         offset: u64,
         length: u64,
     },
+    /// A carried window and the reference it rides on name different ranges,
+    /// or the window names a different import.
+    ///
+    /// [`GuestRamRegistrations::window`] cuts a window from exactly the bound
+    /// it is derived beside, so the ledger itself cannot produce this — it is
+    /// a caller bug (the wrong window reached the wrong run) or a window
+    /// carried across a reset that moved the mapping. Refused rather than
+    /// bound blindly: proceeding would name bytes the caller never asked for.
+    WindowMismatch {
+        import: ImportId,
+        window_import: ImportId,
+        window_base: u64,
+        window_length: u64,
+        bound_offset: u64,
+        bound_len: u64,
+    },
 }
 
 impl crate::observe::Decline for RegistrationLedgerRefusal {
@@ -959,6 +975,7 @@ impl crate::observe::Decline for RegistrationLedgerRefusal {
                 "guest_ram_registration_window_past_registration"
             }
             Self::WindowOverflow { .. } => "guest_ram_registration_window_overflow",
+            Self::WindowMismatch { .. } => "guest_ram_registration_window_mismatch",
         }
     }
 
@@ -1033,6 +1050,21 @@ impl crate::observe::Decline for RegistrationLedgerRefusal {
                 ("import", import.to_string()),
                 ("offset", format!("{offset:#x}")),
                 ("length", length.to_string()),
+            ],
+            Self::WindowMismatch {
+                import,
+                window_import,
+                window_base,
+                window_length,
+                bound_offset,
+                bound_len,
+            } => vec![
+                ("import", import.to_string()),
+                ("window_import", window_import.to_string()),
+                ("window_base", format!("{window_base:#x}")),
+                ("window_length", window_length.to_string()),
+                ("bound_offset", format!("{bound_offset:#x}")),
+                ("bound_len", bound_len.to_string()),
             ],
         }
     }
@@ -1720,6 +1752,56 @@ fn run_window(ledger: &GuestRamRegistrations, guest: &GuestRef) -> Option<Regist
             debug_assert!(false, "a bound run lost its window: {refusal:?}");
             None
         }
+    }
+}
+
+/// The byte range a carried window names, checked against the reference it
+/// rides on.
+///
+/// [`references_for_runs`] derives a window beside each run and the bind rail
+/// consumes both; this is that consumption point, the fork half of
+/// `research/docs/20` §3.2's coordinate split. The ledger cuts a window from
+/// exactly the bound the run carries, so a matching window is the same range
+/// in two coordinate systems — the window's `base` is the import base plus the
+/// bound's `offset` — and the range returned here is taken from the window,
+/// not re-derived from the reference.
+///
+/// The refusal is fail-closed on purpose. A window that names a different
+/// import, a different offset or a different length is a wiring bug — a window
+/// paired with the wrong run, or one carried across a reset that moved the
+/// mapping — and binding it would name bytes the caller never asked for.
+/// There is deliberately no fallback to the reference's own bound: a window
+/// that disagrees with the bound it was cut from is exactly the state in
+/// which nothing can say which of the two is right.
+///
+/// # Errors
+///
+/// [`RegistrationLedgerRefusal::WindowMismatch`].
+pub fn window_range(
+    import: &GuestRamImport,
+    bound: BoundRange,
+    window: &RegisteredWindow,
+) -> Result<BoundRange, RegistrationLedgerRefusal> {
+    let host_base = import.host_base() as u64;
+    match window.base.checked_sub(host_base) {
+        Some(offset)
+            if window.import == import.id()
+                && offset == bound.offset
+                && window.length == bound.len =>
+        {
+            Ok(BoundRange {
+                offset,
+                len: window.length,
+            })
+        }
+        _ => Err(RegistrationLedgerRefusal::WindowMismatch {
+            import: import.id(),
+            window_import: window.import,
+            window_base: window.base,
+            window_length: window.length,
+            bound_offset: bound.offset,
+            bound_len: bound.len,
+        }),
     }
 }
 
@@ -3588,6 +3670,85 @@ mod tests {
                 "an alias import is not registered, so it derives no window"
             );
         });
+    }
+
+    /// The bind rail consumes the derived window rather than re-deriving the
+    /// range, and a window that disagrees with its reference is refused by
+    /// name.
+    ///
+    /// The ledger cuts a window from exactly the bound it is derived beside,
+    /// so a matching window *is* the run's range and the refusal is
+    /// unreachable through the real rail — which is what makes failing closed
+    /// on it the right rule: a disagreement can only mean the wrong window
+    /// reached the wrong run, or one crossed a reset, and either way binding
+    /// it would name bytes the caller never asked for.
+    #[test]
+    fn a_carried_window_binds_only_the_range_it_names() {
+        const PAGE: u64 = 4096;
+        const BASE: u64 = 0x7000_0000_0000;
+        let import = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(BASE as usize, 0x4000, PAGE)
+                .expect("an aligned host allocation"),
+        );
+        let guest = GuestRef::new(
+            std::sync::Arc::clone(&import),
+            import.slice(0x1000, 0x1000).expect("inside the allocation"),
+        )
+        .expect("its own import");
+        let bound = guest.bound().expect("bound");
+        let window = RegisteredWindow {
+            import: import.id(),
+            base: BASE + bound.offset,
+            length: bound.len,
+            epoch: 1,
+        };
+        assert_eq!(
+            window_range(&import, bound, &window).expect("the window names its run"),
+            bound,
+            "a matching window is the run's own range"
+        );
+
+        // Each disagreement is the same named refusal rather than a bind of
+        // whichever coordinate happened to look right.
+        let shifted = RegisteredWindow {
+            base: window.base + PAGE,
+            ..window
+        };
+        let longer = RegisteredWindow {
+            length: window.length + PAGE,
+            ..window
+        };
+        let other = GuestRamImport::new_host_allocation((BASE + 0x10_0000) as usize, 0x4000, PAGE)
+            .expect("a second allocation");
+        let foreign = RegisteredWindow {
+            import: other.id(),
+            ..window
+        };
+        for (name, wrong) in [("offset", shifted), ("length", longer), ("import", foreign)] {
+            assert_eq!(
+                window_range(&import, bound, &wrong),
+                Err(RegistrationLedgerRefusal::WindowMismatch {
+                    import: import.id(),
+                    window_import: wrong.import,
+                    window_base: wrong.base,
+                    window_length: wrong.length,
+                    bound_offset: bound.offset,
+                    bound_len: bound.len,
+                }),
+                "a {name} disagreement is refused rather than bound"
+            );
+        }
+
+        // A window whose base is before the import cannot even name an
+        // offset, and is the same refusal rather than a second name.
+        let before = RegisteredWindow {
+            base: BASE - PAGE,
+            ..window
+        };
+        assert!(matches!(
+            window_range(&import, bound, &before),
+            Err(RegistrationLedgerRefusal::WindowMismatch { .. })
+        ));
     }
 
     /// A window inside one stretch yields one run, so the widened path is not a

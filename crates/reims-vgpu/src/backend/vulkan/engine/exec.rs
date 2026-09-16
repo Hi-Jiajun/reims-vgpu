@@ -807,7 +807,7 @@ unsafe fn import_guest_buffer_window(
         return None;
     }
     let stretch = src.single_stretch()?;
-    let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
+    let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest, stretch.window.as_ref()) } {
         Ok(bound) => bound,
         Err(inner) => {
             crate::observe::Emit::decline("vk_buffer_import", &inner).fail_once(0);
@@ -919,13 +919,14 @@ unsafe fn gather_guest_buffer_window(
     let mut sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
     let mut covered = 0u64;
     for stretch in stretches {
-        let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
-            Ok(bound) => bound,
-            Err(inner) => {
-                crate::observe::Emit::decline("vk_buffer_gather", &inner).fail_once(0);
-                return Ok(None);
-            }
-        };
+        let bound =
+            match unsafe { pools.bind_guest_ram(ctx, stretch.guest, stretch.window.as_ref()) } {
+                Ok(bound) => bound,
+                Err(inner) => {
+                    crate::observe::Emit::decline("vk_buffer_gather", &inner).fail_once(0);
+                    return Ok(None);
+                }
+            };
         let copy = gather_region(&bound, &stretch);
         covered = covered.saturating_add(copy.size);
         super::group_by_buffer(&mut sources, bound.buffer, copy);
@@ -1281,13 +1282,14 @@ unsafe fn import_sampled_guest_window(
     // 322 303 windows and gathered none on the CPU. It is not a small rail; it
     // was a rail whose only zero-copy arm could not be taken.
     if let Some(stretch) = src.single_stretch() {
-        let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
-            Ok(bound) => bound,
-            Err(inner) => {
-                crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
-                return Ok(None);
-            }
-        };
+        let bound =
+            match unsafe { pools.bind_guest_ram(ctx, stretch.guest, stretch.window.as_ref()) } {
+                Ok(bound) => bound,
+                Err(inner) => {
+                    crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
+                    return Ok(None);
+                }
+            };
         // As on the buffer rail: the buffer spans the RAMBlock, so the first
         // texel sits at the bound range's start, plus the granularity widening,
         // plus the plane's own offset inside the allocation. A mapped sampled
@@ -1316,13 +1318,14 @@ unsafe fn import_sampled_guest_window(
     let mut sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
     let mut covered = 0u64;
     for stretch in stretches {
-        let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
-            Ok(bound) => bound,
-            Err(inner) => {
-                crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
-                return Ok(None);
-            }
-        };
+        let bound =
+            match unsafe { pools.bind_guest_ram(ctx, stretch.guest, stretch.window.as_ref()) } {
+                Ok(bound) => bound,
+                Err(inner) => {
+                    crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
+                    return Ok(None);
+                }
+            };
         let copy = gather_region(&bound, &stretch);
         covered = covered.saturating_add(copy.size);
         super::group_by_buffer(&mut sources, bound.buffer, copy);

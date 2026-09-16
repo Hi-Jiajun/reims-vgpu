@@ -236,8 +236,9 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
         guest_ref: &crate::runtime::guest_ram::GuestRef,
+        window: Option<&crate::runtime::guest_ram_map::RegisteredWindow>,
     ) -> Result<host_ram::BoundGuestRam, host_ram::HostRamDecline> {
-        unsafe { self.host_ram_imports.bind(ctx, guest_ref) }
+        unsafe { self.host_ram_imports.bind(ctx, guest_ref, window) }
     }
 
     /// Import a RAMBlock ahead of any reference into it.
