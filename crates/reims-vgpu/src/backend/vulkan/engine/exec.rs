@@ -5646,10 +5646,10 @@ pub(crate) unsafe fn execute_draw_inner(
         return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
     }
 
-    if !defer_submit {
+    let submit_token = if !defer_submit {
         let cbs = [cb];
         match ctx.submit_guest_work(&cbs, fence) {
-            Ok(()) => {}
+            Ok(token) => token,
             Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
                 return Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
                     op: DeviceLostOp::DrawSubmit,
@@ -5658,7 +5658,9 @@ pub(crate) unsafe fn execute_draw_inner(
             }
             Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ExecSubmit, e))),
         }
-    }
+    } else {
+        None
+    };
     // Submission ends here. Everything below is CPU-side publication and
     // retention work, and needs its own bar: charging it to `submit_us` makes
     // a slow registry or Store-footprint update look like driver queue cost.
@@ -5883,7 +5885,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // the slot drains it. A failed wait below leaves the slot pending, so no
     // path ever reuses an unretired fence.
     let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), sampled_retains);
-    pools.finish_entry_async(&ctx.device, sealed);
+    pools.finish_entry_async(&ctx.device, sealed, submit_token);
 
     // Dispose the ad-hoc per-draw framebuffers (MRT and/or depth) now that
     // `finish_entry_async` has marked this slot pending: the handles park in

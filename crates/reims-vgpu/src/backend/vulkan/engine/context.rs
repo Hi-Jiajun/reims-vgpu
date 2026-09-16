@@ -1592,11 +1592,17 @@ impl DeviceContext {
     /// the submission so every guest-memory access participates in the same
     /// completion timeline. A failed submit publishes nothing, and a later
     /// successful value may legally skip the unused reservation.
+    ///
+    /// The returned value is the reservation's completion token — the point
+    /// the guest-window bind rail keys its leases to, so the submission's
+    /// windows can be released when the same point completes. `None` on a host
+    /// whose stamp rail did not start (no timeline semaphore): such a
+    /// submission binds no window lease.
     pub(crate) unsafe fn submit_guest_work(
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<Option<u64>, vk::Result> {
         let timeline = self
             .stamp_completion
             .as_ref()
@@ -1614,7 +1620,7 @@ impl DeviceContext {
         &self,
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<Option<u64>, vk::Result> {
         let timeline = self
             .stamp_completion
             .as_ref()
@@ -1630,10 +1636,11 @@ impl DeviceContext {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
         timeline: Option<(vk::Semaphore, u64, super::stamp_completion::SubmissionNote)>,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<Option<u64>, vk::Result> {
         let plain = vk::SubmitInfo::default().command_buffers(command_buffers);
         let Some((semaphore, value, note)) = timeline else {
-            return unsafe { self.device.queue_submit(self.queue(), &[plain], fence) };
+            return unsafe { self.device.queue_submit(self.queue(), &[plain], fence) }
+                .map(|()| None);
         };
         let semaphores = [semaphore];
         let values = [value];
@@ -1645,7 +1652,7 @@ impl DeviceContext {
             .push_next(&mut timeline_info);
         unsafe { self.device.queue_submit(self.queue(), &[info], fence) }?;
         note.submitted(value);
-        Ok(())
+        Ok(Some(value))
     }
 
     pub(crate) fn queue_failure(&self) -> Option<vk::Result> {

@@ -238,7 +238,17 @@ impl ResourcePools {
         guest_ref: &crate::runtime::guest_ram::GuestRef,
         window: Option<&crate::runtime::guest_ram_map::RegisteredWindow>,
     ) -> Result<host_ram::BoundGuestRam, host_ram::HostRamDecline> {
-        unsafe { self.host_ram_imports.bind(ctx, guest_ref, window) }
+        let bound = unsafe { self.host_ram_imports.bind(ctx, guest_ref, window) }?;
+        // A bound window is a lease on its registration for as long as this
+        // entry's submission is in flight: remember the import so the seal can
+        // report it beside the submission's completion token, and deduplicate
+        // so a window bound by several runs of one entry counts once.
+        if let Some(window) = window {
+            if !self.current_entry_guest_imports.contains(&window.import) {
+                self.current_entry_guest_imports.push(window.import);
+            }
+        }
+        Ok(bound)
     }
 
     /// Import a RAMBlock ahead of any reference into it.
@@ -338,6 +348,7 @@ impl ResourcePools {
             slab: slab::SlabPool::new(),
             slabs: buffer_slab::BufferSlabs::new(),
             host_ram_imports: host_ram::HostRamImports::default(),
+            current_entry_guest_imports: Vec::new(),
             guest_reads_in_flight: false,
             guest_writes_in_flight: false,
             guest_write_pins_live: Vec::new(),
@@ -696,6 +707,7 @@ impl ResourcePools {
                         cmd_buf,
                         fence,
                         pending: None,
+                        token: None,
                         span: super::gpu_span::SlotSpan::Idle,
                         readback_span_armed: false,
                     });
@@ -1456,6 +1468,11 @@ impl ResourcePools {
         // Its fence has signalled, so this submission is no longer a candidate
         // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
         crate::runtime::gpu_hang_trail::note_retired(index);
+        // The fence is exactly the observation the window leases were bound
+        // against: release whatever this submission borrowed. Runs after the
+        // wait and after the pending take so a wedged wait leaves the token
+        // with the slot it belongs to.
+        crate::runtime::guest_ram_map::retire_submission(self.slots[index].token.take());
         self.drain_cleanup(&ctx.device, pending);
         self.release_graveyard(&ctx.device, 1 << index);
         Ok(())
@@ -1522,6 +1539,10 @@ impl ResourcePools {
         // and above the early exits below, because every claim of a slot ends
         // the echoed pass's recording session whether a batch was open or not.
         self.forget_pass_echo();
+        // A fresh entry: whatever windows it binds are its own submission's
+        // business, so the collected set starts empty. Any binds the flushed
+        // batch owed were already taken by its seal.
+        self.current_entry_guest_imports.clear();
         // Reap the oldest contiguous run of already-signaled slots before
         // claiming one, rather than only the slot about to be reused. The
         // readback path deliberately waits a fence without retiring (see
@@ -1599,6 +1620,7 @@ impl ResourcePools {
                 unpin_residents: std::mem::take(&mut self.guest_write_pins_live),
                 unpin_compute_residents: std::mem::take(&mut self.compute_write_pins_live),
             },
+            guest_window_imports: std::mem::take(&mut self.current_entry_guest_imports),
             admissions,
         }
     }
@@ -1634,15 +1656,28 @@ impl ResourcePools {
     /// # Safety
     ///
     /// `device` must be the device every parked handle belongs to.
-    pub(crate) unsafe fn finish_entry_async(&mut self, device: &ash::Device, sealed: SealedEntry) {
+    pub(crate) unsafe fn finish_entry_async(
+        &mut self,
+        device: &ash::Device,
+        sealed: SealedEntry,
+        token: Option<u64>,
+    ) {
         let SealedEntry {
             cleanup,
             admissions,
+            guest_window_imports,
         } = sealed;
         debug_assert!(
             self.slots[self.cur].pending.is_none(),
             "current slot already owes cleanup"
         );
+        // Bind the submission's windows against its completion token *after*
+        // the submit returned, and carry the token on the slot so the retire
+        // side needs to know nothing but it. A `None` here is the ordinary
+        // no-guard submission (no stamp, no windows, or a refused bind) and
+        // leaves nothing for `retire_slot` to release.
+        self.slots[self.cur].token =
+            crate::runtime::guest_ram_map::bind_for_submission(token, &guest_window_imports);
         self.slots[self.cur].pending = Some(cleanup);
         self.in_flight += 1;
         // The submission is now outstanding, and this is the one point both
@@ -1918,6 +1953,22 @@ impl ResourcePools {
         super::super::publish_batch_open(false);
     }
 
+    /// Fold one entry's bound window imports into the batch's accumulated set,
+    /// keeping the first occurrence of each import. A batch is one submission,
+    /// so a window bound by two of its draws is one lease charge, not two —
+    /// and the token rail's ledger side counts each import once per token
+    /// anyway, so a duplicated list would be noise rather than an extra guard.
+    fn fold_window_imports(
+        batch_imports: &mut Vec<crate::runtime::guest_ram::ImportId>,
+        entry_imports: Vec<crate::runtime::guest_ram::ImportId>,
+    ) {
+        for import in entry_imports {
+            if !batch_imports.contains(&import) {
+                batch_imports.push(import);
+            }
+        }
+    }
+
     /// Record a batch-deferred draw's completion: open the batch on its ring
     /// slot (opener) or extend it (joiner), accumulating the per-draw descriptor
     /// set for the single flush-time seal. The CB stays in recording state;
@@ -1959,11 +2010,16 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) {
         let (cb, fence) = slot;
+        // The draw recorded its binds into the current entry's set; the batch
+        // is about to own them, so fold them into its accumulated set — one
+        // submission is one window-lease charge, and a batch is one submission.
+        let entry_imports = std::mem::take(&mut self.current_entry_guest_imports);
         match self.open_batch.as_mut() {
             Some(b) => {
                 debug_assert!(b.cb == cb, "joiner recorded into a foreign CB");
                 b.draws += 1;
                 b.dsets.extend(dset);
+                Self::fold_window_imports(&mut b.guest_window_imports, entry_imports);
                 counters.batch_joins.fetch_add(1, Ordering::Relaxed);
             }
             None => {
@@ -1972,12 +2028,15 @@ impl ResourcePools {
                     self.slots[self.cur].pending.is_none(),
                     "batch opener's slot already owes cleanup"
                 );
+                let mut guest_window_imports = Vec::new();
+                Self::fold_window_imports(&mut guest_window_imports, entry_imports);
                 self.install_open_batch(OpenBatch {
                     cb,
                     fence,
                     target,
                     draws: 1,
                     dsets: dset.into_iter().collect(),
+                    guest_window_imports,
                 });
                 counters.batch_opens.fetch_add(1, Ordering::Relaxed);
             }
@@ -2027,7 +2086,7 @@ impl ResourcePools {
             close_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
         );
-        let submit = (|| -> Result<(), DrawError> {
+        let submit = (|| -> Result<Option<u64>, DrawError> {
             let end_started = std::time::Instant::now();
             let end_result = ctx.device.end_command_buffer(batch.cb);
             counters
@@ -2042,7 +2101,7 @@ impl ResourcePools {
                 Ordering::Relaxed,
             );
             match result {
-                Ok(()) => Ok(()),
+                Ok(token) => Ok(token),
                 Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
                     Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
                         op: DeviceLostOp::PoolsSubmitBatch,
@@ -2053,10 +2112,18 @@ impl ResourcePools {
             }
         })();
         match submit {
-            Ok(()) => {
+            Ok(token) => {
                 let finish_started = std::time::Instant::now();
-                let sealed = self.seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
-                self.finish_entry_async(&ctx.device, sealed);
+                let mut sealed = self.seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
+                // The batch's draw binds were folded in per draw by
+                // `batch_append`, while the seal above took the current
+                // entry's set — which is nonempty when a guest writeback
+                // appended its copy to the open batch, and empty otherwise.
+                // Fold rather than overwrite: a copy's window is part of the
+                // same submission and must be charged under the same token.
+                let batch_imports = std::mem::take(&mut batch.guest_window_imports);
+                Self::fold_window_imports(&mut sealed.guest_window_imports, batch_imports);
+                self.finish_entry_async(&ctx.device, sealed, token);
                 counters.batch_flush_finish_us.fetch_add(
                     finish_started.elapsed().as_micros() as u64,
                     Ordering::Relaxed,
@@ -6138,6 +6205,7 @@ mod recycle_tests {
                 unpin_residents: Vec::new(),
                 unpin_compute_residents: Vec::new(),
             }),
+            token: None,
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
         }
@@ -6148,6 +6216,7 @@ mod recycle_tests {
             cmd_buf: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             pending: None,
+            token: None,
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
         }
@@ -6636,11 +6705,63 @@ mod recycle_tests {
                 bgra: false,
             },
             draws: 1,
+            guest_window_imports: Vec::new(),
             dsets: Vec::new(),
         });
         assert!(crate::backend::vulkan::engine::BATCH_OPEN.load(Ordering::Acquire));
         assert!(pools.take_open_batch().is_some());
         assert!(!crate::backend::vulkan::engine::BATCH_OPEN.load(Ordering::Acquire));
+    }
+
+    /// A sealed entry carries exactly the registered windows its command
+    /// buffer bound, and taking them empties the current entry's set so the
+    /// next entry starts clean.
+    #[test]
+    fn a_seal_carries_the_windows_the_entry_bound() {
+        let mut pools = ResourcePools::new();
+        let first = guest_window_import(0x1000);
+        let second = guest_window_import(0x2000);
+        pools.current_entry_guest_imports.push(first);
+        pools.current_entry_guest_imports.push(second);
+
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        assert_eq!(sealed.guest_window_imports, vec![first, second]);
+        assert!(
+            pools.current_entry_guest_imports.is_empty(),
+            "sealing hands the set over; the next entry records fresh"
+        );
+    }
+
+    /// A batch is one submission, so its window-lease set is the union of its
+    /// draws' binds, deduplicated across the batch — a window bound by two
+    /// draws of one command buffer is one charge, not two. The fold is the
+    /// device-free half of `batch_append`, split out exactly so this relation
+    /// is testable without a device.
+    #[test]
+    fn a_batch_folds_each_draws_windows_into_one_deduplicated_set() {
+        let first = guest_window_import(0x1000);
+        let second = guest_window_import(0x2000);
+        let mut batch_imports = vec![first];
+        ResourcePools::fold_window_imports(&mut batch_imports, vec![first, second]);
+        assert_eq!(batch_imports, vec![first, second]);
+
+        // The second draw bound only the window the batch already held: the
+        // set does not grow, and the repeat does not double-count.
+        ResourcePools::fold_window_imports(&mut batch_imports, vec![first]);
+        assert_eq!(batch_imports, vec![first, second]);
+    }
+
+    /// A host-allocation import with a fresh identity, for the collection
+    /// plumbing tests — the ledger is deliberately not involved, because what
+    /// these tests assert is which imports travel, not what the ledger counts.
+    fn guest_window_import(host_base: usize) -> crate::runtime::guest_ram::ImportId {
+        std::sync::Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                host_base, 0x1000, 0x1000,
+            )
+            .expect("a host-allocation import"),
+        )
+        .id()
     }
 
     /// The slot mask and the tail publication describe the same owned batch,
@@ -6663,6 +6784,7 @@ mod recycle_tests {
                 bgra: false,
             },
             draws: 1,
+            guest_window_imports: Vec::new(),
             dsets: Vec::new(),
         });
         assert_eq!(pools.open_slot_mask(), 1 << 3, "the batch's own slot");
@@ -6697,6 +6819,7 @@ mod recycle_tests {
             fence: vk::Fence::null(),
             target: target(0),
             draws: 1,
+            guest_window_imports: Vec::new(),
             dsets: Vec::new(),
         });
         assert!(
@@ -7048,6 +7171,7 @@ mod scatter_descriptor_sets_do_not_alias {
             fence: vk::Fence::null(),
             target: target.clone(),
             draws: 3,
+            guest_window_imports: Vec::new(),
             dsets: Vec::new(),
         });
         assert!(matches!(

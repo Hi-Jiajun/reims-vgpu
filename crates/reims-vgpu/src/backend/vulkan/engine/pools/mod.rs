@@ -590,6 +590,14 @@ pub(crate) struct ResourcePools {
     /// Lives here rather than beside its one consumer so it is destroyed by the
     /// same teardown that destroys every other device object.
     host_ram_imports: host_ram::HostRamImports,
+    /// The registered guest-window imports the command buffer currently
+    /// recording has bound, deduplicated across the entry. Collected by
+    /// [`ResourcePools::bind_guest_ram`], cleared by
+    /// [`ResourcePools::begin_entry`], and taken by
+    /// [`ResourcePools::seal_entry`] for a lone submission or by
+    /// [`ResourcePools::batch_append`] into the open batch's accumulated set —
+    /// the two routes one entry's submission can take.
+    current_entry_guest_imports: Vec<crate::runtime::guest_ram::ImportId>,
     /// Whether any command buffer recorded or submitted since the last quiesce
     /// **reads** guest RAM when it executes.
     ///
@@ -1063,6 +1071,12 @@ pub(crate) struct OpenBatch {
     /// Only the narrowed arm reads this; see [`BatchFit::OtherTarget`].
     target: BatchTarget,
     draws: u64,
+    /// The registered guest-window imports every draw parked in this batch
+    /// bound, deduplicated across the batch. Reported with the batch's
+    /// completion token when [`ResourcePools::batch_flush`] submits it, so one
+    /// retirement releases them all — a submission is the unit a window lease
+    /// is charged per, and a batch is one submission.
+    guest_window_imports: Vec<crate::runtime::guest_ram::ImportId>,
     /// Per-draw descriptor sets paired with the arena block they were allocated
     /// from, so the flush-time free routes each set to its owning pool.
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
@@ -1079,6 +1093,14 @@ struct CmdSlot {
     cmd_buf: vk::CommandBuffer,
     fence: vk::Fence,
     pending: Option<PendingGpuCleanup>,
+    /// The completion token this slot's submission was bound under, when it
+    /// bound a registered guest window. Carried from
+    /// [`ResourcePools::finish_entry_async`] to
+    /// [`ResourcePools::retire_slot`], which is the one place both the fence
+    /// and the token exist at once: retirement is what releases the windows
+    /// the submission borrowed. `None` for every submission that bound
+    /// nothing, and for a bind the ledger refused.
+    token: Option<u64>,
     /// Whether this slot's GPU timestamp pair has been written, and how far.
     /// Read and cleared when the slot retires, which is the first moment the
     /// fence makes the queries readable. See [`super::gpu_span`].
@@ -1324,6 +1346,11 @@ pub(crate) struct SealedEntry {
     /// Each entry pairs the image the CB fills with what names it. Empty for
     /// every non-render entry (compute, present, sync helpers).
     admissions: Vec<(SampledSlot, SampledRetain)>,
+    /// The registered guest-window imports this entry bound, collected by
+    /// [`ResourcePools::bind_guest_ram`] while it recorded. `finish_entry_async`
+    /// reports them with the submission's completion token; a batch seal
+    /// instead carries the whole batch's accumulated set.
+    pub(crate) guest_window_imports: Vec<crate::runtime::guest_ram::ImportId>,
 }
 
 pub(crate) struct SampledSlot {

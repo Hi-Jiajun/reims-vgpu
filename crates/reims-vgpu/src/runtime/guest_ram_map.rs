@@ -1619,6 +1619,9 @@ static REGISTRATIONS: std::sync::Mutex<Option<GuestRamRegistrations>> = std::syn
 /// *registered*, not about why a reference refused, and the two are read by
 /// different questions.
 const REGISTRATION_EVENT: &str = "guest_ram_registration";
+/// The event the submission and completion seams emit under: a bind the
+/// ledger refused, or a retirement that arrived with no pending binding.
+const SUBMISSION_EVENT: &str = "guest_ram_submission";
 
 /// What one registration pass did, in the numbers the diagnostic line carries.
 ///
@@ -1947,6 +1950,56 @@ pub fn pending_tokens() -> usize {
         .as_ref()
         .map(GuestRamRegistrations::pending_tokens)
         .unwrap_or_default()
+}
+
+/// The submit rail's seam on [`bind_for_token`]: turn a submission's
+/// completion token and its bound window imports into the token its ring slot
+/// must carry, or `None` when the slot owes no retirement.
+///
+/// The two ordinary `None` answers are "nothing was bound": no token exists
+/// (a host whose stamp rail did not start, or a submission the queue accepted
+/// without a reservation), or the submission bound no registered import and
+/// has nothing to guard. The third is not ordinary — a nonempty bind the
+/// ledger refused. The submission is already on the queue, so there is
+/// nothing to roll back; the refusal is emitted as evidence, and the slot
+/// carries no token rather than pretending the guard was raised.
+///
+/// The returned token is what the slot must hand [`retire_submission`] when
+/// its fence signals. A caller that drops it would be a submission whose
+/// binding never releases, which is exactly how a reclaim is let through
+/// while work is still in flight.
+pub fn bind_for_submission(token: Option<u64>, imports: &[ImportId]) -> Option<u64> {
+    let token = token?;
+    if imports.is_empty() {
+        return None;
+    }
+    match bind_for_token(token, imports) {
+        Ok(()) => Some(token),
+        Err(refusal) => {
+            crate::observe::Emit::decline(SUBMISSION_EVENT, &refusal).fail_once(0);
+            None
+        }
+    }
+}
+
+/// The completion rail's seam on [`retire_token`]: release whatever the
+/// retiring ring slot carried under its token. A `None` slot is the ordinary
+/// no-op for a submission that bound nothing.
+///
+/// The refusals split on evidence, not on severity: an [`UnknownToken`] is
+/// emitted once — a double retirement is a wiring bug, and a retirement that
+/// arrived after a device recreate cleared the ledger is the recreate winding
+/// down, and a line for either costs one line for a whole boot. Every other
+/// refusal is a live ledger disagreeing with its own bind and is emitted the
+/// same way; the slot is retiring regardless, so there is no correct place to
+/// hand the error back to.
+///
+/// [`UnknownToken`]: RegistrationLedgerRefusal::UnknownToken
+pub fn retire_submission(token: Option<u64>) {
+    let Some(token) = token else { return };
+    if let Err(refusal) = retire_token(token) {
+        crate::observe::Emit::decline(SUBMISSION_EVENT, &refusal).fail_once(0);
+    }
 }
 
 /// [`window_of`] against a ledger the caller already holds, so a list of runs
@@ -5245,6 +5298,90 @@ mod tests {
             assert_eq!(
                 retire_token(4).err(),
                 Some(RegistrationLedgerRefusal::UnknownToken { token: 4 })
+            );
+        });
+    }
+
+    /// The submission seam hangs a slot token only when there is a live bind to
+    /// retire: no stamp, an empty import set, and a refused bind all leave the
+    /// slot empty — the first two are the ordinary no-guard submissions, and
+    /// the third is evidence, not a guard.
+    #[test]
+    fn the_submission_seam_hangs_a_slot_token_only_for_a_live_bind() {
+        with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            register_imports(&mut host).expect("a two-span host registers");
+            let imports: Vec<_> = registrations()
+                .iter()
+                .map(|registration| registration.import)
+                .collect();
+            assert_eq!(imports.len(), 2);
+
+            assert_eq!(
+                bind_for_submission(None, &imports),
+                None,
+                "no completion token means nothing a slot can retire"
+            );
+            assert_eq!(
+                bind_for_submission(Some(1), &[]),
+                None,
+                "a submission that bound no window owes no retirement"
+            );
+            assert_eq!(
+                bind_for_submission(Some(2), &imports),
+                Some(2),
+                "a live bind hangs exactly its token on the slot"
+            );
+            assert_eq!(pending_tokens(), 1);
+            retire_submission(Some(2));
+            assert_eq!(pending_tokens(), 0, "the seam released both bindings");
+        });
+    }
+
+    /// A bind the ledger refuses leaves the slot without a token and is
+    /// emitted rather than silently dropped: the submission is already on the
+    /// queue, so the caller cannot roll it back, and a silent `None` would
+    /// look like the ordinary no-guard answer.
+    #[test]
+    fn a_refused_bind_leaves_the_slot_without_a_token() {
+        with_granularity(Some(0x1000), || {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            let import = reference(&mut host, 0x2000, 8)
+                .expect("the import rail resolves")
+                .import()
+                .id();
+            assert!(registrations().is_empty(), "no pass has run");
+
+            assert_eq!(
+                bind_for_submission(Some(7), &[import]),
+                None,
+                "an unregistered import cannot hang a retirement"
+            );
+            assert_eq!(pending_tokens(), 0);
+            let line = capture.one(SUBMISSION_EVENT);
+            assert!(
+                line.contains("reason=guest_ram_registration_unregistered_import"),
+                "the refusal is emitted under the submission event: {line}"
+            );
+        });
+    }
+
+    /// The completion seam tolerates the one ordinary refusal: a slot retiring
+    /// after a device recreate cleared its ledger names a token that no longer
+    /// exists, and that is a wind-down, not a defect worth failing on.
+    #[test]
+    fn the_completion_seam_tolerates_a_token_the_ledger_no_longer_holds() {
+        with_granularity(Some(0x1000), || {
+            let capture = crate::observe::FailCapture::start();
+            retire_submission(None);
+            assert!(capture.lines().is_empty(), "a slot with no token is silent");
+
+            retire_submission(Some(9));
+            let line = capture.one(SUBMISSION_EVENT);
+            assert!(
+                line.contains("reason=guest_ram_registration_unknown_token"),
+                "a late retirement is emitted once: {line}"
             );
         });
     }

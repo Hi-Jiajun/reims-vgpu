@@ -2998,7 +2998,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(&ctx.device, sealed);
+        pools.finish_entry_async(&ctx.device, sealed, None);
     }
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
@@ -4499,10 +4499,11 @@ unsafe fn copy_image_level0_to_buffer(
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
         let cbs = [cb];
-        ctx.submit_guest_work(&cbs, fence)
+        let token = ctx
+            .submit_guest_work(&cbs, fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(&ctx.device, sealed);
+        pools.finish_entry_async(&ctx.device, sealed, token);
     }
     note_readback_phase(
         ReadbackPhase::Submit,

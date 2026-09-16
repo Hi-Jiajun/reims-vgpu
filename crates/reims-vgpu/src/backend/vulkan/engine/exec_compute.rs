@@ -1385,8 +1385,8 @@ pub(crate) unsafe fn execute_compute_inner(
     }
 
     let cbs = [cb];
-    match ctx.submit_guest_work(&cbs, fence) {
-        Ok(()) => {}
+    let submit_token = match ctx.submit_guest_work(&cbs, fence) {
+        Ok(token) => token,
         Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
             return Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
                 op: DeviceLostOp::ComputeSubmit,
@@ -1394,7 +1394,7 @@ pub(crate) unsafe fn execute_compute_inner(
             }));
         }
         Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ComputeExecSubmit, e))),
-    }
+    };
 
     // The copy into guest pages is on the queue now, so the debt is owed from
     // here — before any fallible step below, because a failure past the submit
@@ -1445,7 +1445,7 @@ pub(crate) unsafe fn execute_compute_inner(
     // unretired fence. The readback maps below stay valid: the BufferSlot
     // handles are held by value and nothing else runs under the engine lock.
     let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), Vec::new());
-    pools.finish_entry_async(&ctx.device, sealed);
+    pools.finish_entry_async(&ctx.device, sealed, submit_token);
 
     if all_writeback_deferred {
         counters

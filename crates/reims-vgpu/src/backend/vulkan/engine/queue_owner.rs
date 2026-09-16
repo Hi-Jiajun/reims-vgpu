@@ -19,6 +19,10 @@ type PresentReply = mpsc::SyncSender<Result<bool, vk::Result>>;
 #[derive(Clone, Copy, Debug)]
 enum QueueOutcome {
     Unit,
+    /// The completion token (the reservation's timeline value) the submission
+    /// was accepted under, carried back so the caller can bind its guest
+    /// windows against the same point the completion rail will observe.
+    Guest(u64),
 }
 
 struct OwnedSubmit {
@@ -171,7 +175,7 @@ impl QueueOwner {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
         timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<Option<u64>, vk::Result> {
         let submit = OwnedSubmit {
             command_buffers: command_buffers.to_vec(),
             wait_semaphores: Vec::new(),
@@ -185,7 +189,10 @@ impl QueueOwner {
             submit,
             reply: Some(reply),
         })
-        .map(|_| ())
+        .map(|outcome| match outcome {
+            QueueOutcome::Unit => None,
+            QueueOutcome::Guest(token) => Some(token),
+        })
     }
 
     pub(crate) fn submit_async(
@@ -193,13 +200,14 @@ impl QueueOwner {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
         timeline: Option<(vk::Semaphore, u64, SubmissionNote)>,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<Option<u64>, vk::Result> {
         if let Some(result) = self.failure.get() {
             return Err(result);
         }
         let queued_point = timeline
             .as_ref()
             .map(|(_, value, note)| (*value, note.clone()));
+        let queued_value = queued_point.as_ref().map(|(value, _)| *value);
         self.sender
             .send(Request::Submit {
                 submit: OwnedSubmit {
@@ -217,7 +225,7 @@ impl QueueOwner {
         if let Some((value, note)) = queued_point {
             note.queued(value);
         }
-        Ok(())
+        Ok(queued_value)
     }
 
     pub(crate) fn submit_sync_ordered(
@@ -361,7 +369,11 @@ fn run(
                     }
                 }
                 if let Some(reply) = reply {
-                    let _ = reply.send(result.map(|_| QueueOutcome::Unit));
+                    let _ =
+                        reply
+                            .send(result.map(|token| {
+                                token.map_or(QueueOutcome::Unit, QueueOutcome::Guest)
+                            }));
                 }
             }
             Request::PresentTransaction {
@@ -376,7 +388,7 @@ fn run(
                 let driver_started = std::time::Instant::now();
                 let result = complete_present_transaction(
                     failure,
-                    || unsafe { execute_submit(device, queue, submit) },
+                    || unsafe { execute_submit(device, queue, submit) }.map(|_| ()),
                     || {
                         let waits = [wait];
                         let swapchains = [swapchain];
@@ -450,7 +462,8 @@ unsafe fn execute_submit(
     device: &ash::Device,
     queue: vk::Queue,
     mut submit: OwnedSubmit,
-) -> Result<(), vk::Result> {
+) -> Result<Option<u64>, vk::Result> {
+    let token = submit.timeline.as_ref().map(|(_, value, _)| *value);
     let mut timeline_value = [0u64; 1];
     let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default();
     if let Some((semaphore, value, _)) = submit.timeline.as_ref() {
@@ -470,7 +483,7 @@ unsafe fn execute_submit(
     if let Some((_, value, note)) = submit.timeline {
         note.submitted(value);
     }
-    Ok(())
+    Ok(token)
 }
 
 #[cfg(test)]
