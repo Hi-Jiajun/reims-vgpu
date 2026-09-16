@@ -136,6 +136,20 @@ pub enum Channel {
     Staged,
 }
 
+impl Channel {
+    /// The word this channel is reported under.
+    ///
+    /// A method rather than a `Debug` formatting at each site: the two names
+    /// are read off a log line beside a lease id, and `Borrowed` against
+    /// `borrowed` is the kind of difference a grep for one of them misses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Borrowed => "borrowed",
+            Self::Staged => "staged",
+        }
+    }
+}
+
 /// The owner channel one binding takes, or the device-gated refusal.
 ///
 /// This is the whole capability gate, and the submission path calls it for
@@ -423,6 +437,17 @@ pub fn registered_regions() -> usize {
     lock().regions.len()
 }
 
+/// Every import this rail has retired, in identity order.
+///
+/// The reading half of [`State::retired`], which is otherwise only visible as
+/// the `owner_region_retired` refusal on the next submission: a regression test
+/// asserts that an address rule retiring a RAMBlock-shaped import never lands
+/// here (`research/docs/20` §3.4 step 4), and a census can say how many
+/// registrations have stopped deriving windows.
+pub fn retired_regions() -> Vec<u64> {
+    lock().retired.iter().copied().collect()
+}
+
 /// Forget every registration and drop every lease: the owner half of a device
 /// recreate, called from the same place that drops the imports.
 ///
@@ -497,11 +522,41 @@ pub fn last_device_loss_teardown() -> DeviceLossTeardown {
 
 /// The address rail announced that the mapping behind `import` is gone.
 ///
+/// Only an alias-shaped registration is announced here. The seam that
+/// announces it (`crate::runtime::guest_ram_map::reclaim_alias`) decides on the
+/// guest-RAM ledger's own `gpa_base` first, because an address rule never ends
+/// a RAMBlock registration (`research/docs/20` §3.4 step 4): the boot pass owns
+/// it for the VM's lifetime and every later narrow-class window is cut from it.
+///
 /// The registration stays — a late window or reclaim is then answered by name
-/// — but it derives no further window, and any window still registered under it
-/// is retired so a later reclaim can take it.
+/// — but it derives no further window. A window still active under it is left
+/// for its own completion to retire and reclaim (`research/docs/20` §3.4: a
+/// host range must not be handed back underneath work the GPU may still be
+/// doing); one whose lease observation already retired it is reclaimed here, so
+/// a settled window cannot outlive the registration that backed it.
 pub fn retire_region(import: u64) {
     let mut state = lock();
+    retire_region_in(&mut state, import);
+}
+
+/// [`retire_region`] against a state the caller already holds, so a unit test
+/// can drive the window/lease half without the process-global rail.
+fn retire_region_in(state: &mut State, import: u64) {
+    // The same answer `reclaim_alias` decided on, asked once more against the
+    // shape this rail holds. Taking an address retirement for a RAMBlock-shaped
+    // registration would refuse every later window over it
+    // (`owner_region_retired`) while the guest-RAM ledger still resolved — the
+    // double-ledger disagreement a boot measured while the narrow class was the
+    // first thing to cut a window from an imported block
+    // (`evidence/gate3-zerocopy-narrow-2026-09-17`, import=9). A release build
+    // must not carry it, so the skip is unconditional rather than an assertion.
+    if state
+        .regions
+        .get(&import)
+        .is_some_and(|record| record.region.gpa_base.is_some())
+    {
+        return;
+    }
     state.retired.insert(import);
     let lease_id = state.regions.get(&import).map(|record| record.lease_id);
     if let Some(lease_id) = lease_id {
@@ -695,6 +750,20 @@ impl Plan {
             }
             release_import(provider, hold)?;
             hold.released = true;
+            // The retirement chain, in the order it ran, once per lease. This
+            // is the `research/docs/20` §3.4 evidence a report about a
+            // completed no-copy submission is written from, and it was the
+            // half of the chain with no line at all.
+            crate::observe::off(format!(
+                "provider_owner_release lease={} channel={} reason=settled window={} import=released",
+                hold.lease.get(),
+                hold.channel.name(),
+                if hold.window.is_some() {
+                    "retired+reclaimed"
+                } else {
+                    "none"
+                },
+            ));
         }
         Ok(())
     }
@@ -732,6 +801,16 @@ fn release_abandoned_lease(state: &mut State, hold: &Hold) -> bool {
 /// Returns whether the hold is now given up.
 fn abandon_hold(state: &mut State, provider: &VulkanComputeProvider, hold: &mut Hold) -> bool {
     if !release_abandoned_lease(state, hold) {
+        // The kept half, named. A lease bound to a token that never retired has
+        // no release short of a device-loss teardown, and the window and the
+        // provider import stay with it; a line here is what says the rail chose
+        // that on purpose rather than leaking it.
+        crate::observe::off(format!(
+            "provider_owner_lease_kept lease={} channel={} reason=ledger_still_holds \
+             (the window and the provider import are kept with it)",
+            hold.lease.get(),
+            hold.channel.name(),
+        ));
         return false;
     }
     if let Some(window) = hold.window {
@@ -748,6 +827,16 @@ fn abandon_hold(state: &mut State, provider: &VulkanComputeProvider, hold: &mut 
         return false;
     }
     hold.released = true;
+    crate::observe::off(format!(
+        "provider_owner_release lease={} channel={} reason=abandoned window={} import=released",
+        hold.lease.get(),
+        hold.channel.name(),
+        if hold.window.is_some() {
+            "retired+reclaimed"
+        } else {
+            "none"
+        },
+    ));
     true
 }
 
@@ -955,6 +1044,25 @@ pub fn plan_with_epoch<'a>(
                 },
             ));
         }
+        // The success path, named. A refusal has always been emitted — by the
+        // caller of `plan` for the `Decline` this returns — and the import that
+        // *worked* was silent, which is the half a report about the no-copy
+        // rail actually needs: "which window, how big, and did it go in
+        // without a copy" cannot be answered from a log that only has the
+        // failures. Emitted once per lease, so a narrow-class dispatch adds a
+        // handful of lines and the copying path adds the same handful with
+        // `no_copy=0`.
+        crate::observe::off(format!(
+            "provider_owner_lease channel=borrowed no_copy=1 lease={} import={} binding={} \
+             window_offset={} window_length={} pages={} region_bytes={}",
+            lease.get(),
+            import,
+            binding,
+            offset,
+            end - offset,
+            (end - offset) / alignment.max(1),
+            region.length,
+        ));
         holds.push(Hold {
             channel: Channel::Borrowed,
             binding: *binding,
@@ -1067,6 +1175,12 @@ pub fn plan_with_epoch<'a>(
                 },
             ));
         }
+        crate::observe::off(format!(
+            "provider_owner_lease channel=staged no_copy=0 lease={} bytes={} binding={}",
+            lease.get(),
+            length,
+            binding,
+        ));
         holds.push(Hold {
             channel: Channel::Staged,
             binding,
@@ -1087,6 +1201,21 @@ pub fn plan_with_epoch<'a>(
     }
 
     views.sort_by_key(|view| view.binding);
+    // One line per plan, so a boot can be read for "how much of this
+    // submission went in without copying" without walking the lease lines
+    // above: a plan whose windows are all borrowed is the narrow class on a
+    // registered guest-RAM block, and one whose bindings are all staged is the
+    // same class with no window behind its bytes.
+    let borrowed = holds
+        .iter()
+        .filter(|hold| hold.channel == Channel::Borrowed)
+        .count();
+    crate::observe::off(format!(
+        "provider_owner_plan leases={} borrowed={} staged={}",
+        holds.len(),
+        borrowed,
+        holds.len() - borrowed,
+    ));
     Ok(Plan { holds, views })
 }
 
@@ -1135,6 +1264,109 @@ mod tests {
             offset: 0,
             length: 64,
         }
+    }
+
+    /// One registration projected into a local state with a window over it, so
+    /// a test can drive the retirement chain without the process-global rail.
+    /// Returns the lease the window carries.
+    fn registered_window(state: &mut State, import: u64, gpa_base: Option<u64>) -> LeaseId {
+        const PAGE: usize = 4096;
+        let lease_id = state.lease();
+        let region = Region {
+            import,
+            epoch: 1,
+            host_pointer: PAGE,
+            length: 2 * PAGE as u64,
+            page_size: PAGE as u64,
+            gpa_base,
+        };
+        let host = HostRegion {
+            lease_id: LeaseId::new(lease_id),
+            owner_epoch: DeviceEpoch::new(1),
+            host_pointer: region.host_pointer,
+            length: region.length,
+            page_size: region.page_size,
+        };
+        state.regions.insert(
+            import,
+            Record {
+                region,
+                lease_id,
+                host,
+            },
+        );
+        let allocation = state.allocate();
+        state
+            .register_window(GuestWindow {
+                lease: LeaseId::new(lease_id),
+                allocation_id: AllocationId::new(allocation),
+                offset: 0,
+                length: PAGE as u64,
+            })
+            .expect("a window inside its registration");
+        LeaseId::new(lease_id)
+    }
+
+    /// The window/lease half of `research/docs/20` §3.4 step 4, with no device:
+    /// an address retirement never ends a RAMBlock-shaped registration, and an
+    /// alias retirement leaves a still-active window to its own completion.
+    ///
+    /// An active window under a retired alias is deliberately not reclaimed
+    /// here: only the completion that retires its lease may hand the host range
+    /// back (the GPU may still be reading it). A window whose lease observation
+    /// already retired it has no such claim left, so the retirement takes it
+    /// rather than leaving it behind.
+    #[test]
+    fn an_address_retirement_skips_a_ramblock_shaped_registration() {
+        let mut state = State::new();
+        let _ramblock = registered_window(&mut state, 12, Some(0x1_0000_0000));
+        let _alias = registered_window(&mut state, 11, None);
+
+        retire_region_in(&mut state, 12);
+        assert!(
+            !state.retired.contains(&12),
+            "a RAMBlock-shaped registration keeps deriving windows"
+        );
+        assert!(
+            state.regions.contains_key(&12),
+            "and keeps its registration"
+        );
+        assert_eq!(state.windows.len(), 2, "and keeps the window it had");
+
+        retire_region_in(&mut state, 11);
+        assert!(
+            state.retired.contains(&11),
+            "the alias stops deriving windows"
+        );
+        assert!(
+            state.regions.contains_key(&11),
+            "its registration stays: a late window or reclaim is answered by name"
+        );
+        assert_eq!(
+            state.windows.len(),
+            2,
+            "an active window is retired by its own completion, not by a mapping change"
+        );
+
+        // The settled half: once the completion retired the window and no
+        // reclaim has taken it yet, the retirement reclaims it rather than
+        // leaving a host range the lease observation has already given back.
+        let mut state = State::new();
+        let alias = registered_window(&mut state, 11, None);
+        state
+            .windows
+            .retire(alias)
+            .expect("the window is registered");
+        retire_region_in(&mut state, 11);
+        assert!(state.retired.contains(&11));
+        assert!(
+            state.windows.is_empty(),
+            "the retired window is reclaimed with its registration"
+        );
+        assert!(
+            state.window_leases.is_empty(),
+            "and its lease is forgotten with it"
+        );
     }
 
     #[test]

@@ -2993,6 +2993,11 @@ fn guest_page_window<M: HostOps>(
                 MapRefusal::NoBackendImport => "zc_buf_no_import",
                 MapRefusal::HostRefused(_) => "zc_buf_host_refused",
                 MapRefusal::NoUsableRegion { .. } => "zc_buf_no_region",
+                // The narrowed boot's own band: the rail is on, the device
+                // could import, and what admitted nothing is the operator's
+                // `REIMS_VGPU_GUEST_IMPORT_ONLY`. Folding it into
+                // `zc_buf_no_import` would read as a host that cannot import.
+                MapRefusal::ImportScopeEmpty { .. } => "zc_buf_scope_empty",
                 // Its own band and not folded into `zc_buf_no_import`: this
                 // host has the extension and would import, and what refused is
                 // the size of the guest against the size of its heaps. A boot

@@ -46,6 +46,17 @@
 //! [`crate::config::GUEST_IMPORT`](crate::config::GUEST_IMPORT) off. That one is a
 //! statement about the host rather than a loss, so it is reported once on the
 //! off channel rather than as a failure per reference.
+//!
+//! # Narrowing one boot's import set
+//!
+//! [`crate::config::GUEST_IMPORT_ONLY`] takes a boot from "every span" to "the
+//! spans at these positions", which is the variable the 2026-09-17 zero-copy
+//! experiment used to import one RAMBlock out of ten: with every block imported
+//! the guest kernel panicked in under a minute, and a rail that can be narrowed
+//! to the block one workload touches is what separates "the import destroys the
+//! guest" from "one block does". Everything downstream is unchanged — a span
+//! that was not imported keeps its copying answer — and the numbering the value
+//! is stated in is the one `guest_ram_span n=<i>/<count>` prints.
 
 use crate::backend::Backend as _;
 use crate::runtime::guest_ram::{
@@ -71,6 +82,18 @@ pub enum MapRefusal {
     /// granule. Distinct from [`Self::HostRefused`] because the host answered
     /// fine and it is our own bound that rejected every span.
     NoUsableRegion { spans: usize },
+    /// The operator's import scope
+    /// ([`crate::config::GUEST_IMPORT_ONLY`]) admitted no span, so this boot is
+    /// on the copying rails by instruction rather than by capability.
+    ///
+    /// Distinct from [`Self::NoUsableRegion`], which says every span the shim
+    /// reported failed a bound of ours: this one says no span was offered to
+    /// that bound. The two have different repairs — a host to look at, against
+    /// an environment variable to unset — and one line for both would send a
+    /// reader hunting for a host defect this run did not have. `reported` is
+    /// how many spans the shim did answer with, so the line cannot read as a
+    /// machine that has no guest RAM.
+    ImportScopeEmpty { reported: usize },
     /// The spans are importable and this guest is larger than the roomiest heap
     /// on the host's GPU, so nothing may import any of them.
     ///
@@ -189,6 +212,7 @@ impl crate::observe::Decline for MapRefusal {
             Self::NoBackendImport => "guest_ram_map_no_backend_import",
             Self::HostRefused(_) => "guest_ram_map_host_refused",
             Self::NoUsableRegion { .. } => "guest_ram_map_no_usable_region",
+            Self::ImportScopeEmpty { .. } => "guest_ram_map_import_scope_empty",
             Self::ImportExceedsHeap { .. } => "guest_ram_map_import_exceeds_heap",
             Self::GpaNotInAnyImport { .. } => "guest_ram_map_gpa_not_in_any_import",
             Self::Scattered { .. } => "guest_ram_map_scattered",
@@ -207,6 +231,7 @@ impl crate::observe::Decline for MapRefusal {
                 f
             }
             Self::NoUsableRegion { spans } => vec![("spans", spans.to_string())],
+            Self::ImportScopeEmpty { reported } => vec![("reported", reported.to_string())],
             Self::ImportExceedsHeap { needed, budget } => vec![
                 ("needed_mb", (needed >> 20).to_string()),
                 ("budget_mb", (budget >> 20).to_string()),
@@ -236,11 +261,180 @@ const EVENT: &str = "guest_ram_map";
 /// `VkDeviceMemory` that no longer exists.
 static MAP: std::sync::Mutex<Option<Resolved>> = std::sync::Mutex::new(None);
 
+/// Which of the spans the shim reported this boot may import.
+///
+/// [`crate::config::GUEST_IMPORT_ONLY`], read once per resolution. [`Self::All`]
+/// is the production reading and the state of every boot nobody narrowed;
+/// [`Self::None`] and [`Self::Blocks`] are the narrowing the 2026-09-17
+/// zero-copy experiment needed — a way to import *one* RAMBlock out of ten, so
+/// that a guest panic could be attributed to a block rather than to the rail.
+///
+/// Positions are of the resolved list, which is what `guest_ram_span n=<i>/…`
+/// prints: a selector and a log line quote one index space, and neither is the
+/// shim's own region numbering (chunking makes the two different — four shim
+/// regions resolved to ten imports on the driven x86 guest).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ImportScope {
+    /// Every span that survives the bounds. Unset, or `all`.
+    All,
+    /// No span. The copying rails, reached from this variable rather than from
+    /// [`crate::config::GUEST_IMPORT`].
+    None,
+    /// Exactly the spans at these positions, ascending and deduplicated.
+    ///
+    /// A position past the end of the list is dropped in silence rather than
+    /// refused: a machine that reports four imports where another reported ten
+    /// is a different machine, not a typo, and the `guest_ram_import_scope`
+    /// line names the positions that were actually adopted.
+    Blocks(Vec<usize>),
+}
+
+impl ImportScope {
+    /// Parse the operator's text, or `None` when it is not usable.
+    ///
+    /// The two words are matched case-insensitively, like every other variable
+    /// in [`crate::config`]; the list is whitespace-tolerant; anything else —
+    /// including a negative index, which is not a `usize` — is refused.
+    fn parse(raw: &str) -> Option<Self> {
+        let text = raw.trim();
+        if text.eq_ignore_ascii_case("all") {
+            return Some(Self::All);
+        }
+        if text.eq_ignore_ascii_case("none") || text.eq_ignore_ascii_case("off") {
+            return Some(Self::None);
+        }
+        let mut blocks: Vec<usize> = Vec::new();
+        for part in text.split(',') {
+            let index: usize = part.trim().parse().ok()?;
+            if !blocks.contains(&index) {
+                blocks.push(index);
+            }
+        }
+        (!blocks.is_empty()).then_some(Self::Blocks(blocks))
+    }
+
+    /// The word this scope is reported under.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::None => "none",
+            Self::Blocks(_) => "blocks",
+        }
+    }
+
+    /// Whether the span at `index` of the resolved list may be imported.
+    fn admits(&self, index: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::Blocks(blocks) => blocks.contains(&index),
+        }
+    }
+}
+
+/// The scope this process was started with, and the one refusal it can make.
+///
+/// Read at the resolution rather than latched at the first call: the resolution
+/// happens once per boot (and once per device recreate), the variable cannot
+/// change inside a process, and a second reader would be the second copy of the
+/// parse that this module exists to keep from existing.
+///
+/// A value that does not parse is failed **and** answered with [`ImportScope::None`]:
+/// the boot runs the copying rails, which is the arm that is known good, and the
+/// line says why. The other direction — a typo silently importing every span —
+/// is the one that would read as "narrowing did not help".
+fn import_scope() -> ImportScope {
+    let Some(raw) = crate::config::read(crate::config::GUEST_IMPORT_ONLY).1 else {
+        return ImportScope::All;
+    };
+    import_scope_from(&raw)
+}
+
+/// [`import_scope`] for a value already in hand.
+///
+/// Split out so the refusal direction — the one that decides whether a typo
+/// imports nothing or imports everything — is answerable by a test without
+/// writing the process environment, which every other test in this module is
+/// reading through `resolve`.
+fn import_scope_from(raw: &str) -> ImportScope {
+    match ImportScope::parse(&raw) {
+        Some(scope) => scope,
+        None => {
+            crate::observe::fail(format!(
+                "guest_ram_import_scope_unrecognized var={} value={raw:?} \
+                 (expected all|none|<i>[,<i>...]; this boot imports no span and runs the copying rails)",
+                crate::config::GUEST_IMPORT_ONLY,
+            ));
+            ImportScope::None
+        }
+    }
+}
+
+/// One span the shim reported, as the *scope* numbers it.
+///
+/// The resolved imports are what the rail binds; this is the table the
+/// operator's selector is stated against, kept after the scope has filtered the
+/// import list so that a reference which misses can say "this address is in
+/// reported span 8, which this boot did not import" instead of only "not in any
+/// import". `imported` is the scope's answer for this position, not a property
+/// of the span itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReportedSpan {
+    gpa_base: u64,
+    len: u64,
+    imported: bool,
+}
+
+impl ReportedSpan {
+    fn contains(&self, gpa: u64) -> bool {
+        gpa >= self.gpa_base && gpa - self.gpa_base < self.len
+    }
+}
+
+/// Which reported-but-unimported spans have already been named, one bit per
+/// position.
+///
+/// A bitmap rather than a `HashSet` because the walk that asks runs on the
+/// draw-time reference path, thousands of times a second, and an atomic
+/// test-and-set is the cheapest thing that can answer "already said" there. The
+/// scope switch is the only producer of these lines, so the cost is paid only
+/// by a boot that narrowed; sixty-four bits is sixteen times the longest span
+/// list measured (four regions, ten imports after chunking), and a machine past
+/// it logs nothing rather than logging the same span every frame.
+static UNIMPORTED_REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Name one reported span this boot did not import, once.
+///
+/// The address is what makes the line useful after the fact: it says which
+/// *block* the workload was reaching for and where in it, which is the reading
+/// a selector for the next boot is chosen from.
+fn note_unimported_span(index: usize, span: ReportedSpan, gpa: u64) {
+    use std::sync::atomic::Ordering;
+    if index >= 64 {
+        return;
+    }
+    let bit = 1u64 << index;
+    if UNIMPORTED_REPORTED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    crate::observe::off(format!(
+        "guest_ram_span_unimported n={index} gpa={gpa:#x} span_gpa={:#x} span_mib={}",
+        span.gpa_base,
+        span.len >> 20,
+    ));
+}
+
 #[derive(Debug)]
 struct Resolved {
     /// One per usable RAMBlock span, in the order the shim reported them.
     /// Ordinary machines have one or two.
     imports: Vec<Arc<GuestRamImport>>,
+    /// Every span the shim reported *before* [`ImportScope`] filtered the list
+    /// above, in the same order, so a selector's position and a reader's count
+    /// are one numbering. Empty on every arm that refused before a table
+    /// existed — there is nothing to attribute a miss to when no span was ever
+    /// offered.
+    spans: Vec<ReportedSpan>,
     /// Set when the resolution refused, so the next reference does not re-ask
     /// the shim for an answer that will not change. A refusal here is about the
     /// host and the granularity, both of which are fixed for the device's life.
@@ -278,7 +472,10 @@ impl Resolved {
             .checked_sub(1)
             .map(|last| &self.imports[last])
             .filter(|i| i.contains_gpa(gpa))
-            .ok_or(MapRefusal::GpaNotInAnyImport { gpa })
+            .ok_or_else(|| {
+                self.note_unimported(gpa);
+                MapRefusal::GpaNotInAnyImport { gpa }
+            })
             .map_err(report_once)?;
         // `slice_for_gpa` emits its own named refusal on the fail channel, so
         // the wrapper forwards the reason rather than adding a second line.
@@ -304,6 +501,29 @@ impl Resolved {
             .filter(|i| i.contains_gpa(gpa))
             .and_then(|i| i.gpa_base().map(|base| base + i.len()))
     }
+
+    /// Name the reported span a miss fell in, when this boot did not import it.
+    ///
+    /// This is the one place the narrowing switch becomes visible after the
+    /// fact. A miss inside a span that *was* imported is a different finding
+    /// with its own name ([`MapRefusal::OutsideImport`] carries the bound's
+    /// reason), so only the spans the scope left out are reported here — and
+    /// each of them once per boot, because the reference path that asks is a
+    /// draw-time one.
+    fn note_unimported(&self, gpa: u64) {
+        let Some((index, span)) = self
+            .spans
+            .iter()
+            .enumerate()
+            .find(|(_, span)| span.contains(gpa))
+        else {
+            return;
+        };
+        if span.imported {
+            return;
+        }
+        note_unimported_span(index, *span, gpa);
+    }
 }
 
 /// Forget every import.
@@ -326,6 +546,11 @@ impl Resolved {
 /// old epoch and install a ledger under it.
 pub fn reset() {
     *MAP.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    // The spans this boot declined are a fact about the map that just died, and
+    // the next one must be free to name them again: a device recreate re-asks
+    // the shim, so a second epoch that imported a span the first one did not is
+    // not the same reading as the first epoch's silence.
+    UNIMPORTED_REPORTED.store(0, std::sync::atomic::Ordering::Relaxed);
     {
         let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
         EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2192,13 +2417,32 @@ pub fn retire_submission(token: Option<u64>) {
 /// address rail can offer every retired packed import without deciding which
 /// of the two shapes it was — the ledger's own `gpa_base` answers that.
 ///
+/// # The owner rail hears the same answer
+///
+/// The provider's owner rail is told about one retirement and only one: a
+/// registration this seam actually reclaimed. Announcing a RAMBlock-shaped
+/// import there would make the two ledgers disagree — the registration would
+/// stay in this ledger while the provider refused every later window over it
+/// (`owner_region_retired`), which is what a boot measured while the narrow
+/// class was the first thing to cut a window from an imported block
+/// (`evidence/gate3-zerocopy-narrow-2026-09-17`). A retirement that finds no
+/// ledger at all is a device recreate winding down: [`reset`] dropped the
+/// owner rail's records in the same step, so there is nothing left to stop
+/// and nothing may be announced into the next epoch.
+///
 /// A refusal that is not one of the three [`GuestRamRegistrations::reclaim`]
 /// answers is unreachable, and is emitted as evidence rather than swallowed.
 pub fn reclaim_alias(import: ImportId) {
     enum Step {
-        /// Reclaimed now, or the registration is gone and there is nothing to
-        /// guard — both end the address rail's business with this import.
-        Done,
+        /// An alias-shaped registration was reclaimed — now, or by the earlier
+        /// retirement this one is a replay of. The provider's owner rail must
+        /// stop deriving windows under this import.
+        AliasReclaimed,
+        /// Nothing ended: the ledger is gone (the recreate already reset the
+        /// owner rail beside it), the import holds no live registration, or it
+        /// is the VM-lifetime RAMBlock shape. The owner rail keeps whatever it
+        /// holds, so windows over a live registration keep resolving.
+        NothingEnded,
         /// The reclaim latch refused; retry at the next slot retirement.
         Defer,
         /// A refusal [`GuestRamRegistrations::reclaim`] cannot produce.
@@ -2208,7 +2452,7 @@ pub fn reclaim_alias(import: ImportId) {
     let step = {
         let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_mut() {
-            None => Step::Done,
+            None => Step::NothingEnded,
             Some(ledger) => {
                 // The RAMBlock shape check runs before the reclaim rather than
                 // being a refusal: an address rule retiring a VM-lifetime
@@ -2218,13 +2462,21 @@ pub fn reclaim_alias(import: ImportId) {
                     .registration(import)
                     .is_some_and(|registration| registration.gpa_base.is_none());
                 if !is_alias {
-                    Step::Done
+                    Step::NothingEnded
                 } else {
                     match ledger.reclaim(import) {
-                        Ok(()) => Step::Done,
+                        Ok(()) => Step::AliasReclaimed,
                         Err(RegistrationLedgerRefusal::WindowStillBound { .. }) => Step::Defer,
+                        // The only path that reclaims a registration is this
+                        // seam, and it announces the reclaim when it lands; a
+                        // second retirement of the same import has nothing to
+                        // add. Both arms are unreachable while the lock is held
+                        // — `registration` above hides a reclaimed entry — and
+                        // are answered rather than swallowed.
                         Err(RegistrationLedgerRefusal::UnregisteredImport { .. })
-                        | Err(RegistrationLedgerRefusal::ReclaimedImport { .. }) => Step::Done,
+                        | Err(RegistrationLedgerRefusal::ReclaimedImport { .. }) => {
+                            Step::NothingEnded
+                        }
                         Err(refusal) => Step::Refused(refusal),
                     }
                 }
@@ -2233,13 +2485,14 @@ pub fn reclaim_alias(import: ImportId) {
     };
 
     match step {
-        Step::Done => {
+        Step::AliasReclaimed => {
             // The provider's owner rail hears the same retirement: the
             // registration stops deriving windows, and any window still
             // registered under it is reclaimed.
             #[cfg(feature = "provider-compute")]
             crate::backend::provider_owner::retire_region(import.get());
         }
+        Step::NothingEnded => {}
         Step::Defer => {
             PENDING_RECLAIM
                 .lock()
@@ -2798,9 +3051,20 @@ fn chunk_span(span: GuestRamRegion, span_max: u64) -> Vec<GuestRamRegion> {
 }
 
 fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
+    resolve_with(host, import_scope())
+}
+
+/// [`resolve`] with the import scope stated by the caller.
+///
+/// Production passes [`import_scope`] — that is what [`resolve`] does — so the
+/// parameter exists for the one caller that must state a scope directly: the
+/// tests below, which would otherwise have to write the process environment
+/// that every other test in this module reads through `resolve`.
+fn resolve_with<H: HostOps + ?Sized>(host: &mut H, scope: ImportScope) -> Resolved {
     let Some(align) = granularity() else {
         return Resolved {
             imports: Vec::new(),
+            spans: Vec::new(),
             refusal: Some(MapRefusal::NoBackendImport),
         };
     };
@@ -2809,6 +3073,7 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
         Err(why) => {
             return Resolved {
                 imports: Vec::new(),
+                spans: Vec::new(),
                 refusal: Some(MapRefusal::HostRefused(why)),
             }
         }
@@ -2839,6 +3104,47 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     // the search would silently answer `GpaNotInAnyImport` for a live address if
     // a future shim ever reported them out of order.
     imports.sort_by_key(|i| i.gpa_base());
+    // The scope, applied before anything is sized, registered or handed to a
+    // backend, so what this boot is charged for is what it actually holds. The
+    // table it is stated against is built first and *kept*: it is what a later
+    // miss attributes itself to, and it is the list `guest_ram_span` prints.
+    let reported: Vec<ReportedSpan> = imports
+        .iter()
+        .enumerate()
+        .map(|(index, import)| ReportedSpan {
+            gpa_base: import.gpa_base().expect("RAMBlock imports have a GPA base"),
+            len: import.len(),
+            imported: scope.admits(index),
+        })
+        .collect();
+    // Zipped rather than filtered by predicate: the two lists are the same
+    // length and the same order by construction, and a `retain` over the table
+    // would be a second search that could disagree with the first.
+    let imports: Vec<Arc<GuestRamImport>> = imports
+        .into_iter()
+        .zip(&reported)
+        .filter(|(_, span)| span.imported)
+        .map(|(import, _)| import)
+        .collect();
+    if !matches!(scope, ImportScope::All) {
+        let blocks = reported
+            .iter()
+            .enumerate()
+            .filter(|(_, span)| span.imported)
+            .map(|(index, _)| index.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        // Once per resolution — once per boot, and again after a recreate —
+        // and only for a boot that narrowed: a default boot's log is the one
+        // sixteen other measurements are compared against, and a line added to
+        // every boot is a line every earlier boot lacks.
+        crate::observe::off(format!(
+            "guest_ram_import_scope mode={} reported={} imported={} blocks=[{blocks}]",
+            scope.name(),
+            reported.len(),
+            imports.len(),
+        ));
+    }
     // Every import is live for the VM's lifetime and any submission may name any
     // of them, so what has to fit is the sum and not the largest block. A guest
     // that does not fit takes the copying rails whole rather than in part — see
@@ -2849,12 +3155,22 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     if let Some(budget) = over_budget {
         return Resolved {
             imports: Vec::new(),
+            spans: Vec::new(),
             refusal: Some(MapRefusal::ImportExceedsHeap { needed, budget }),
         };
     }
-    let refusal = imports
-        .is_empty()
-        .then_some(MapRefusal::NoUsableRegion { spans: count });
+    // Two ways to hold nothing, and they are not the same finding: a host whose
+    // every span failed a bound of ours, against a scope that admitted none of
+    // the spans the host offered.
+    let refusal = if !imports.is_empty() {
+        None
+    } else if reported.is_empty() {
+        Some(MapRefusal::NoUsableRegion { spans: count })
+    } else {
+        Some(MapRefusal::ImportScopeEmpty {
+            reported: reported.len(),
+        })
+    };
     // Once per boot, because this is what makes `guest_import_levels`'s
     // denominator interpretable. That line reports `imported/reported` and a
     // reader seeing `1/4` cannot tell which three went untouched, or whether the
@@ -2866,15 +3182,20 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     //
     // `resolve` runs once per boot (and again only after a device teardown), so
     // this is a handful of lines, not a cadence.
-    for (n, import) in imports.iter().enumerate() {
+    for (n, span) in reported.iter().enumerate() {
         crate::observe::off(format!(
-            "guest_ram_span n={n}/{count} gpa={:#x} len={} mib={}",
-            import.gpa_base().expect("RAMBlock imports have a GPA base"),
-            import.len(),
-            import.len() / (1024 * 1024),
+            "guest_ram_span n={n}/{count} gpa={:#x} len={} mib={} imported={}",
+            span.gpa_base,
+            span.len,
+            span.len / (1024 * 1024),
+            u8::from(span.imported),
         ));
     }
-    Resolved { imports, refusal }
+    Resolved {
+        imports,
+        spans: reported,
+        refusal,
+    }
 }
 
 /// Emit `refusal` and hand it back.
@@ -4403,6 +4724,13 @@ mod tests {
     /// A RAMBlock import's registration is the VM-lifetime shape and an
     /// address rule must not end it: the seam sees the ledger's `gpa_base` and
     /// leaves the registration alone, whatever packed resolution retired it.
+    ///
+    /// Both halves are locked here. The ledger half alone is what let the bug
+    /// through: the provider's owner rail heard the same retirement and refused
+    /// every later window over the import (`owner_region_retired`) while the
+    /// registration this test asserts stayed in place — measured on a boot
+    /// whose narrow class was the first thing to cut a window from an imported
+    /// block (`evidence/gate3-zerocopy-narrow-2026-09-17`, import=9).
     #[test]
     fn an_address_rule_never_reclaims_a_ramblock_registration() {
         const PAGE: u64 = 4096;
@@ -4423,6 +4751,76 @@ mod tests {
                 "the VM-lifetime registration survives an address retirement"
             );
             assert_eq!(pending_alias_reclaims(), 0);
+            #[cfg(feature = "provider-compute")]
+            {
+                let retired = crate::backend::provider_owner::retired_regions();
+                assert!(
+                    !retired.contains(&ramblock.import.get()),
+                    "the owner rail must keep deriving windows under the RAMBlock: \
+                     retired={retired:?}"
+                );
+                assert!(
+                    crate::backend::provider_owner::registered(ramblock.import.get()).is_some(),
+                    "the owner rail keeps the registration itself, not only the \
+                     ledger's copy"
+                );
+            }
+        });
+    }
+
+    /// The other half of the same decision, so neither can pass alone: a packed
+    /// alias the address rail retires **is** reclaimed, and the registrations it
+    /// ends are that alias's own — the RAMBlock entries beside it keep their
+    /// ledger record and their owner-rail record, and stay able to derive
+    /// windows.
+    #[test]
+    fn a_packed_alias_retirement_ends_only_the_alias_registration() {
+        const PAGE: u64 = 4096;
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            let ramblocks: Vec<u64> = registrations()
+                .iter()
+                .filter(|registration| registration.gpa_base.is_some())
+                .map(|registration| registration.import.get())
+                .collect();
+            assert_eq!(ramblocks.len(), 2, "the boot pass registered both spans");
+
+            let alias = std::sync::Arc::new(
+                GuestRamImport::new_host_allocation(0x7000_0000_0000, 0x4000, PAGE)
+                    .expect("an aligned host allocation"),
+            );
+            register_alias(&alias).expect("an alias registers against the ledger");
+
+            reclaim_alias(alias.id());
+
+            assert!(
+                registrations()
+                    .iter()
+                    .all(|registration| registration.import != alias.id()),
+                "the retired alias leaves the ledger"
+            );
+            assert_eq!(pending_alias_reclaims(), 0, "nothing was parked");
+            #[cfg(feature = "provider-compute")]
+            {
+                let retired = crate::backend::provider_owner::retired_regions();
+                assert!(
+                    retired.contains(&alias.id().get()),
+                    "the owner rail stops deriving windows under the reclaimed \
+                     alias: retired={retired:?}"
+                );
+                for import in &ramblocks {
+                    assert!(
+                        !retired.contains(import),
+                        "the RAMBlock entries beside it are untouched: \
+                         retired={retired:?}"
+                    );
+                    assert!(
+                        crate::backend::provider_owner::registered(*import).is_some(),
+                        "import {import} keeps its owner-rail registration"
+                    );
+                }
+            }
         });
     }
 
@@ -5915,6 +6313,277 @@ mod tests {
                 line.contains("reason=guest_ram_registration_unknown_token"),
                 "a late retirement is emitted once: {line}"
             );
+        });
+    }
+
+    /// Run `body` with `scope` in force and a granularity latched, under the
+    /// module lock — the setup [`with_granularity`] gives every other test here,
+    /// plus the import scope this section is about.
+    ///
+    /// The scope is **passed** rather than exported into the environment. The
+    /// environment is the operator's half of the variable and it is exercised end
+    /// to end by the boot the evidence comes from; writing it here would be a
+    /// process-global mutation every other test in this module reads through
+    /// `resolve`, which is exactly the interference `SERIAL` exists to prevent
+    /// and which this section cannot ask thirty other tests to respect.
+    fn with_scope<R>(scope: ImportScope, body: impl FnOnce(&ImportScope) -> R) -> R {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        // The span latch is process-wide like the granularity one, and it is
+        // what makes "said once" observable inside a single test.
+        UNIMPORTED_REPORTED.store(0, std::sync::atomic::Ordering::Relaxed);
+        latch_granularity(0x1000);
+        let out = body(&scope);
+        forget_granularity();
+        out
+    }
+
+    /// The selector is parsed as exactly what it names, and nothing else.
+    ///
+    /// The refused spellings matter more than the accepted ones: a value that
+    /// parsed as "all" by accident would import the whole guest on a boot the
+    /// operator meant to narrow, which is the one direction this variable
+    /// exists to keep closed.
+    #[test]
+    fn the_import_scope_parses_only_the_text_it_names() {
+        assert_eq!(ImportScope::parse("all"), Some(ImportScope::All));
+        assert_eq!(ImportScope::parse(" ALL "), Some(ImportScope::All));
+        assert_eq!(ImportScope::parse("none"), Some(ImportScope::None));
+        assert_eq!(ImportScope::parse("off"), Some(ImportScope::None));
+        assert_eq!(ImportScope::parse("0"), Some(ImportScope::Blocks(vec![0])));
+        assert_eq!(
+            ImportScope::parse("1,2"),
+            Some(ImportScope::Blocks(vec![1, 2]))
+        );
+        assert_eq!(
+            ImportScope::parse(" 3 , 1 "),
+            Some(ImportScope::Blocks(vec![3, 1])),
+            "a list keeps the operator's order and tolerates spaces"
+        );
+        assert_eq!(
+            ImportScope::parse("2,2"),
+            Some(ImportScope::Blocks(vec![2])),
+            "a repeated position is one import, not two"
+        );
+        for refused in ["", "  ", "-1", "0x2", "one", "all,1", "1,,2", "1,", "1.0"] {
+            assert_eq!(
+                ImportScope::parse(refused),
+                None,
+                "{refused:?} is not a scope"
+            );
+        }
+        // `0` is a position here, never the switch-off spelling: this variable
+        // is read for its text, and the two index spaces are the same one.
+        assert_eq!(
+            ImportScope::parse("0"),
+            Some(ImportScope::Blocks(vec![0])),
+            "the off spelling is a position in this variable"
+        );
+    }
+
+    /// A scope admits the positions it names and only ever narrows.
+    #[test]
+    fn the_import_scope_admits_only_the_positions_it_names() {
+        assert!(ImportScope::All.admits(0));
+        assert!(ImportScope::All.admits(9));
+        assert!(!ImportScope::None.admits(0));
+        let blocks = ImportScope::Blocks(vec![1, 3]);
+        assert!(!blocks.admits(0));
+        assert!(blocks.admits(1));
+        assert!(!blocks.admits(2));
+        assert!(blocks.admits(3));
+        assert_eq!(ImportScope::All.name(), "all");
+        assert_eq!(ImportScope::None.name(), "none");
+        assert_eq!(blocks.name(), "blocks");
+    }
+
+    /// The off-channel lines of this section, in capture order.
+    fn off_lines(capture: &crate::observe::FailCapture, event: &str) -> Vec<String> {
+        let prefix = format!("OFF {event} ");
+        capture
+            .lines()
+            .into_iter()
+            .filter(|line| line.starts_with(&prefix))
+            .collect()
+    }
+
+    /// A narrowed boot imports exactly the positions the selector named, and
+    /// says so in the same numbering the span lines print.
+    ///
+    /// The numbering is the load-bearing half: the value an operator writes and
+    /// the `n=<i>/<count>` a reader sees come from the one list, so a report can
+    /// go from "block 1" in an environment variable to the span that block was,
+    /// without a second table anyone has to keep in step.
+    #[test]
+    fn a_narrowed_boot_imports_only_the_spans_the_selector_named() {
+        let fixture = two_spans().0;
+        assert_eq!(fixture.len(), 2, "the fixture is two spans");
+        with_scope(ImportScope::Blocks(vec![1]), |scope| {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            let resolved = resolve_with(&mut host, scope.clone());
+            assert_eq!(
+                resolved.refusal, None,
+                "a scope that admits a span is not a refusal"
+            );
+            assert_eq!(resolved.imports.len(), 1, "one position, one import");
+            assert_eq!(
+                resolved.imports[0].gpa_base(),
+                Some(fixture[1].gpa_base),
+                "position 1 is the second span of the resolved list"
+            );
+            assert_eq!(
+                resolved.spans,
+                vec![
+                    ReportedSpan {
+                        gpa_base: fixture[0].gpa_base,
+                        len: fixture[0].len,
+                        imported: false,
+                    },
+                    ReportedSpan {
+                        gpa_base: fixture[1].gpa_base,
+                        len: fixture[1].len,
+                        imported: true,
+                    },
+                ],
+                "the table keeps every reported span and the scope's answer for each"
+            );
+
+            let scope = off_lines(&capture, "guest_ram_import_scope");
+            assert_eq!(scope.len(), 1, "{scope:?}");
+            assert!(scope[0].contains("mode=blocks"), "{}", scope[0]);
+            assert!(scope[0].contains("reported=2"), "{}", scope[0]);
+            assert!(scope[0].contains("imported=1"), "{}", scope[0]);
+            assert!(scope[0].contains("blocks=[1]"), "{}", scope[0]);
+
+            let spans = off_lines(&capture, "guest_ram_span");
+            assert_eq!(spans.len(), 2, "every reported span is named: {spans:?}");
+            assert!(
+                spans[0].contains("n=0/2") && spans[0].contains("imported=0"),
+                "{}",
+                spans[0]
+            );
+            assert!(
+                spans[1].contains("n=1/2") && spans[1].contains("imported=1"),
+                "{}",
+                spans[1]
+            );
+        });
+    }
+
+    /// A scope that admits nothing runs the copying rails, and it says which of
+    /// the two ways to hold no import this was.
+    ///
+    /// `guest_ram_map_import_scope_empty` against
+    /// `guest_ram_map_no_usable_region`: the first is an environment variable to
+    /// unset, the second is a host whose every span failed a bound of ours.
+    #[test]
+    fn a_scope_that_admits_nothing_is_named_as_the_scope() {
+        with_scope(ImportScope::None, |scope| {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            let resolved = resolve_with(&mut host, scope.clone());
+            assert_eq!(
+                resolved.refusal,
+                Some(MapRefusal::ImportScopeEmpty { reported: 2 }),
+                "a scope that admits nothing is the scope's own refusal"
+            );
+            assert!(resolved.imports.is_empty(), "and it imports nothing");
+            assert!(
+                resolved.spans.iter().all(|span| !span.imported),
+                "while still reporting the spans it was offered"
+            );
+            let line = off_lines(&capture, "guest_ram_import_scope");
+            assert_eq!(line.len(), 1, "{line:?}");
+            assert!(line[0].contains("mode=none"), "{}", line[0]);
+            assert!(line[0].contains("imported=0"), "{}", line[0]);
+        });
+
+        // The unparsable arm has to answer `None` rather than `All`: the other
+        // direction imports the whole guest on a boot whose operator meant to
+        // narrow it, which is the failure mode that reads as "narrowing did not
+        // help" — the one direction this variable exists to keep closed.
+        with_scope(ImportScope::All, |_| {
+            let capture = crate::observe::FailCapture::start();
+            let refused = import_scope_from("bogus");
+            assert_eq!(refused, ImportScope::None);
+            let mut host = two_spans();
+            assert_eq!(
+                resolve_with(&mut host, refused).refusal,
+                Some(MapRefusal::ImportScopeEmpty { reported: 2 })
+            );
+            // A failure line rather than an `OFF` one: this is a value the
+            // device refused, so it goes to the fail view with its own token
+            // first and `one` is the assertion that reads it.
+            let line = capture.one("guest_ram_import_scope_unrecognized");
+            assert!(line.contains("value=\"bogus\""), "{line}");
+            assert!(line.contains("var=REIMS_VGPU_GUEST_IMPORT_ONLY"), "{line}");
+        });
+    }
+
+    /// A position past the end of the list is dropped, not refused.
+    ///
+    /// The same selector has to work on a machine that reports ten spans and on
+    /// one that reports four, which is the whole point of stating a *position*
+    /// rather than a GPA: the boot that reads a four-span list says
+    /// `imported=0` rather than failing, and the line carries the number that
+    /// explains why.
+    #[test]
+    fn a_position_past_the_end_of_the_list_is_dropped_rather_than_refused() {
+        with_scope(ImportScope::Blocks(vec![5]), |scope| {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            assert_eq!(
+                resolve_with(&mut host, scope.clone()).refusal,
+                Some(MapRefusal::ImportScopeEmpty { reported: 2 })
+            );
+            let scope = off_lines(&capture, "guest_ram_import_scope");
+            assert_eq!(scope.len(), 1, "{scope:?}");
+            assert!(scope[0].contains("imported=0"), "{}", scope[0]);
+            assert!(scope[0].contains("blocks=[]"), "{}", scope[0]);
+        });
+    }
+
+    /// A miss in a span this boot did not import names the span, once.
+    ///
+    /// This is the line the 2026-09-17 experiment was read from: with one block
+    /// imported, every address the workload reached for in the other nine would
+    /// otherwise shrink to a single `gpa_not_in_any_import` line, which says a
+    /// window fell back to the copying rail but not *where* it was.
+    #[test]
+    fn a_miss_in_an_unimported_span_names_the_span_once() {
+        let fixture = two_spans().0;
+        with_scope(ImportScope::Blocks(vec![1]), |scope| {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            let resolved = resolve_with(&mut host, scope.clone());
+            let wanted = fixture[0].gpa_base + 0x1000;
+            assert_eq!(
+                resolved.reference(wanted, 0x1000).err(),
+                Some(MapRefusal::GpaNotInAnyImport { gpa: wanted })
+            );
+            // A second miss in the same span is the same reading, and the draw
+            // rail asks thousands of times a second — so the line is emitted
+            // for the first one only, while the refusal is answered every time.
+            let _ = resolved.reference(wanted + 0x1000, 0x1000);
+            assert_eq!(
+                resolved.reference(wanted, 0x1000).err(),
+                Some(MapRefusal::GpaNotInAnyImport { gpa: wanted })
+            );
+            // A run off the end of the span that *was* imported is a different
+            // finding with its own name, and this table does not answer for it.
+            let inside = fixture[1].gpa_base + fixture[1].len - 0x800;
+            assert!(
+                matches!(
+                    resolved.reference(inside, 0x1000),
+                    Err(MapRefusal::OutsideImport(_))
+                ),
+                "a run off the end of an imported span keeps the bound's own refusal"
+            );
+            let line = off_lines(&capture, "guest_ram_span_unimported");
+            assert_eq!(line.len(), 1, "one span, one line: {line:?}");
+            assert!(line[0].contains("n=0"), "{}", line[0]);
+            assert!(line[0].contains(&format!("gpa={wanted:#x}")), "{}", line[0]);
+            assert!(line[0].contains("span_gpa=0x0"), "{}", line[0]);
         });
     }
 }

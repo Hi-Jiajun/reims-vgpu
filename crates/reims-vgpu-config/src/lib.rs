@@ -1241,6 +1241,40 @@ choices! {
 /// changed" ambiguous between "the build does not carry that rail" and "the
 /// device declined the ask".
 pub const RAIL: &str = "REIMS_VGPU_RAIL";
+
+/// Selects *which* guest RAM spans a boot is allowed to import, so an
+/// experiment can narrow the guest-memory rail to the blocks one workload
+/// actually uses without turning the rail off.
+///
+/// `unset` or `all` is the production reading: every span the shim reports and
+/// the backend can bound is imported. `none` is the copying rails with the
+/// switch still set — the posture [`GUEST_IMPORT`] `off` reaches from the other
+/// side. A comma-separated list of zero-based positions (`0`, `1,2`, `0,3,8`)
+/// imports exactly the spans at those positions of the resolved list, which is
+/// the numbering `guest_ram_span n=<i>/<count>` prints — one index space shared
+/// by the log line and the value, so a report can say which span a selector
+/// named.
+///
+/// **It lives in this registry rather than the switch one because its value is
+/// a list, not a state.** The boot line prints an operator's own text for every
+/// variable here, and running `8` through the switch parse would report
+/// `unrecognized(8)` — a line saying the device rejected the value it adopted.
+///
+/// Narrowing is the only thing it can do: a span it does not name keeps its
+/// copying answer (`reference_for_pages` refuses and the caller falls back), so
+/// the variable cannot invent an import the device could not make and cannot
+/// widen the set past what the shim reported.
+///
+/// Unset means every span, and that default is load-bearing: this is the
+/// variable a 2026-09-17 experiment used to attribute a guest panic to a
+/// block, and a build that narrowed by default would silently change every
+/// other boot's posture.
+///
+/// A value that does not parse is refused in the direction that keeps the guest
+/// healthy — nothing is imported, and the refusal is named once per boot —
+/// because the other direction (a typo silently importing everything) is the
+/// failure mode that reads as "narrowing did not help".
+pub const GUEST_IMPORT_ONLY: &str = "REIMS_VGPU_GUEST_IMPORT_ONLY";
 }
 
 /// What one variable says, including the two ways it says nothing usable.
