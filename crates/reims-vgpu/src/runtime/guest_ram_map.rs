@@ -326,17 +326,24 @@ impl Resolved {
 /// old epoch and install a ledger under it.
 pub fn reset() {
     *MAP.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
-    EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    *guard = None;
-    // Deferred reclaims name registrations that died with the ledger, so
-    // nothing may retry them against the next epoch. Cleared in the same
-    // step, for the same one-recreate reason the ledger is dropped rather
-    // than reset in place.
-    PENDING_RECLAIM
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clear();
+    {
+        let mut guard = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+        EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *guard = None;
+        // Deferred reclaims name registrations that died with the ledger, so
+        // nothing may retry them against the next epoch. Cleared in the same
+        // step, for the same one-recreate reason the ledger is dropped rather
+        // than reset in place.
+        PENDING_RECLAIM
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+    // Gate 2 owner rail: one recreate, one pair of lifetimes. The rail drops
+    // every registration and every lease with the imports they named, and the
+    // next pass registers fresh ranges under fresh identities.
+    #[cfg(feature = "provider-compute")]
+    crate::backend::provider_owner::reset();
 }
 
 /// How many RAMBlock spans the shim reported, and how many bytes they cover.
@@ -1831,6 +1838,12 @@ pub fn register_imports<H: HostOps + ?Sized>(
     report.registered = fresh.len();
     drop(guard);
 
+    // The provider's half of the same handshake: every live registration is
+    // handed over in the provider's own `HostRegion` shape, so the range a
+    // window will be cut from is registered before any submission names it.
+    #[cfg(feature = "provider-compute")]
+    register_owner_regions();
+
     // Once per epoch, and only for a boot that has a region to talk about: a
     // host without the extension registers nothing and should not read as a
     // device that registered an empty set. The latch is the epoch rather than a
@@ -1859,6 +1872,47 @@ pub fn registrations() -> Vec<GuestRamRegistration> {
         .as_ref()
         .map(|ledger| ledger.registrations().collect())
         .unwrap_or_default()
+}
+
+/// Hand every live registration to the provider's owner rail, so a window cut
+/// from one is a window the provider already knows the shape of.
+///
+/// This is the step `research/docs/20` §3.1 calls the *registration*: the
+/// provider's own `HostRegion` is built from the same projection this ledger
+/// holds and validated by the provider's own `validate()`, at the handshake,
+/// before any submission can name a window. It is idempotent — a replayed
+/// handshake offers identities the rail already holds, and that duplicate is
+/// the ordinary reading rather than a refusal to report.
+///
+/// A registration the rail refuses is emitted and skipped, exactly like every
+/// other step on this rail: the range keeps its existing (copying) answer, and
+/// the refusal names the provider check that refused it.
+#[cfg(feature = "provider-compute")]
+fn register_owner_regions() {
+    use crate::backend::provider_owner;
+    for registration in registrations() {
+        let Ok(host_pointer) = usize::try_from(registration.aligned_base) else {
+            crate::observe::fail(format!(
+                "guest_ram_registration owner rail: host address {} does not fit this process",
+                registration.aligned_base
+            ));
+            continue;
+        };
+        let answer = provider_owner::register(provider_owner::Region {
+            import: registration.import.get(),
+            epoch: registration.epoch,
+            host_pointer,
+            length: registration.aligned_len,
+            page_size: registration.page_size,
+            gpa_base: registration.gpa_base,
+        });
+        match answer {
+            Ok(()) | Err(provider_owner::Decline::DuplicateRegion { .. }) => {}
+            Err(decline) => {
+                crate::observe::Emit::decline(REGISTRATION_EVENT, &decline).fail_once(0);
+            }
+        }
+    }
 }
 
 /// The region index a packed-alias registration carries: no projection
@@ -1937,6 +1991,10 @@ pub fn register_alias(import: &GuestRamImport) -> Result<(), RegistrationLedgerR
     if let Err(refusal) = answer {
         crate::observe::Emit::decline(REGISTRATION_EVENT, &refusal).fail_once(0);
     }
+    // An alias is a registration like any other: hand it to the owner rail too,
+    // so a window over it is importable without copying as well.
+    #[cfg(feature = "provider-compute")]
+    register_owner_regions();
     answer
 }
 
@@ -2175,7 +2233,13 @@ pub fn reclaim_alias(import: ImportId) {
     };
 
     match step {
-        Step::Done => {}
+        Step::Done => {
+            // The provider's owner rail hears the same retirement: the
+            // registration stops deriving windows, and any window still
+            // registered under it is reclaimed.
+            #[cfg(feature = "provider-compute")]
+            crate::backend::provider_owner::retire_region(import.get());
+        }
         Step::Defer => {
             PENDING_RECLAIM
                 .lock()
@@ -5678,6 +5742,22 @@ mod tests {
                 2,
                 "the handshake registers both spans"
             );
+            // The provider's half of the same pass: every span this ledger
+            // registered is a `HostRegion` the owner rail built and validated
+            // with the provider's own type, field by field.
+            #[cfg(feature = "provider-compute")]
+            for registration in registrations() {
+                let host = crate::backend::provider_owner::registered(registration.import.get())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "import {} is registered with the ledger but not with the provider",
+                            registration.import
+                        )
+                    });
+                assert_eq!(host.host_pointer as u64, registration.aligned_base);
+                assert_eq!(host.length, registration.aligned_len);
+                assert_eq!(host.page_size, registration.page_size);
+            }
             let line = registration_line(&capture);
             assert!(line.contains("imports=2"), "{line}");
             assert!(line.contains("candidates=2"), "{line}");

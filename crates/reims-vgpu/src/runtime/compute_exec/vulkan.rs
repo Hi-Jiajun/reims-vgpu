@@ -481,6 +481,77 @@ pub(crate) fn resident_serve(
 ///
 /// Nested/ICB/stage-in stay Unsupported (engine surface is storage buffers +
 /// storage images only).
+#[cfg(feature = "provider-compute")]
+fn owner_window_for_staged<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &mut M,
+    task_id: u32,
+    staged: &StagedBuffer,
+) -> Option<crate::backend::provider_owner::Window> {
+    use crate::runtime::guest_ram_map;
+    let len = u64::try_from(staged.bytes.len()).ok()?;
+    if len == 0 || staged.gva == 0 {
+        return None;
+    }
+    let page_size = state.page_size();
+    let ordered = gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        staged.gva,
+        len,
+        state.page_shift,
+    );
+    // Every page of the span must resolve, and to a page no earlier one named:
+    // a dropped page is not a window over the bytes that were staged, and a
+    // repeated one is not a single contiguous range. (Contiguity itself is
+    // re-checked by `reference_for_pages`.)
+    let spanned = reims_vgpu_paging::span::pages_spanned(staged.gva, len, page_size);
+    if ordered.is_empty() || ordered.len() as u64 != spanned {
+        return None;
+    }
+    let in_page = staged.gva % page_size;
+    let guest = guest_ram_map::reference_for_pages(host, &ordered, page_size, in_page, len).ok()?;
+    let bound = guest.bound().ok()?;
+    let import = guest.import();
+    let host_base = u64::try_from(import.host_base()).ok()?;
+    if host_base == 0 {
+        return None;
+    }
+    // The window may only name a range the registration ledger holds for this
+    // very import: an unregistered range has no provider registration behind
+    // it, and that is exactly the case the staged channel is for.
+    let registration = guest_ram_map::registrations()
+        .into_iter()
+        .find(|registration| registration.import == import.id())?;
+    // A no-copy import names the *view's own* host pointer, so the range the
+    // kernel touches must begin on an import granule: the provider imports the
+    // pointer it is given and refuses one it cannot align
+    // (`lease_alignment_unsupported`). A staged range that begins inside a
+    // granule (`head != 0`, because the slice is widened to the import's
+    // granularity) therefore keeps its staged copy — the window stays unclaimed
+    // rather than being named and refused one layer down.
+    if guest.head() % registration.page_size != 0 {
+        return None;
+    }
+    let window_base = host_base.checked_add(bound.offset)?;
+    let offset = window_base.checked_sub(registration.aligned_base)?;
+    if offset % registration.page_size != 0 || bound.len % registration.page_size != 0 {
+        return None;
+    }
+    if offset.checked_add(bound.len)? > registration.aligned_len {
+        return None;
+    }
+    Some(crate::backend::provider_owner::Window {
+        binding: staged.bind.index,
+        import: import.id().get(),
+        host_va: window_base,
+        length: bound.len,
+        head: guest.head(),
+        bytes_len: len,
+    })
+}
+
 pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -916,6 +987,15 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     ));
 
     let mut storage_buffers = Vec::with_capacity(buffer_accesses.len());
+    // Gate 2 owner rail: the guest RAM window each staged binding's bytes came
+    // from, when they came from exactly one. The owner rail imports those
+    // windows without copying (after checking the device can); a binding that
+    // resolves to no single window keeps its staged copy and is imported as an
+    // owner-issued staged lease instead. Derived here, before the staged bytes
+    // are moved into the request, because the window's extent is the staged
+    // range's.
+    #[cfg(feature = "provider-compute")]
+    let mut owner_windows = Vec::new();
     for s in &mut staged_bufs {
         let Some((_, writable)) = buffer_accesses
             .iter()
@@ -923,6 +1003,10 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         else {
             continue;
         };
+        #[cfg(feature = "provider-compute")]
+        if let Some(window) = owner_window_for_staged(state, host, task_id, s) {
+            owner_windows.push(window);
+        }
         storage_buffers.push(ComputeBufferResource {
             binding: s.bind.index,
             bytes: std::mem::take(&mut s.bytes),
@@ -1299,7 +1383,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             .entry_point
             .as_deref()
             .unwrap_or(&req.entry);
-        match provider_compute::submit_compute(air, air_entry, &req) {
+        match provider_compute::submit_compute(air, air_entry, &req, &owner_windows) {
             ComputeRailOutcome::ProviderCompleted(out) => {
                 crate::runtime::drain::note_store_route("compute_provider_canonical");
                 crate::observe::off(format!(

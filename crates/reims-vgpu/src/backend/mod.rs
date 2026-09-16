@@ -121,6 +121,14 @@ pub mod vulkan;
 #[cfg(feature = "provider-compute")]
 pub mod provider_compute;
 
+/// The owner half of the canonical-provider compute rail, present under the
+/// same `feature = "provider-compute"`: guest RAM regions registered in the
+/// provider's own `HostRegion` shape and the lease lifecycle of the windows one
+/// submission borrows. It is the fork's half of `research/docs/20` step 5 —
+/// reims as the provider's owner rather than a bookkeeping mirror.
+#[cfg(feature = "provider-compute")]
+pub mod provider_owner;
+
 /// The encoder one rail holds open across a compute segment — the one type
 /// besides [`SelectedBackend`] whose shape is neutral and whose contents are a
 /// rail's.
