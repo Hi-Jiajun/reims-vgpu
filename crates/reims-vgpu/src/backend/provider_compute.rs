@@ -17,7 +17,11 @@
 //!   false);
 //! - every buffer binding the compiled canonical contract names must be
 //!   present in the reims-staged request, so `Unused`/`Absent` reflection
-//!   cases stay on the reims engine.
+//!   cases stay on the reims engine;
+//! - the mirror direction too: every binding the request stages must be named
+//!   by the canonical contract and agree with it on writability, so a
+//!   disagreement between the two pinned translators stays on the reims engine
+//!   instead of completing with a silently dropped binding.
 //!
 //! Anything outside the class returns [`ComputeRailOutcome::NotInNarrowClass`]
 //! and the caller runs the self-contained engine unchanged — the feature only
@@ -363,10 +367,24 @@ struct ProviderRail {
     /// The executor the provider was built from. Kept so the test-only driver
     /// loss injection can arm the very provider this rail submits through.
     executor: Arc<VulkanExecutor>,
-    /// AIR identity → compiled pipeline. Compiled pipelines are metadata
+    /// `(AIR, entry)` → compiled pipeline. Compiled pipelines are metadata
     /// handles into the provider's own registry, so the cache bounds pipeline
-    /// registrations by distinct kernel AIR rather than by dispatch count.
-    pipelines: Mutex<HashMap<Vec<u8>, CompiledComputePipeline>>,
+    /// registrations by distinct kernel AIR rather than by dispatch count. The
+    /// entry point is part of the key: one AIR can carry more than one entry,
+    /// and a compiled pipeline belongs to exactly one of them, so an AIR-only
+    /// key would hand a caller the other entry's pipeline on a hit.
+    pipelines: Mutex<HashMap<PipelineKey, CompiledComputePipeline>>,
+}
+
+/// Cache key of one compiled canonical pipeline: the kernel AIR bytes and the
+/// entry point compiled in them. `apv_cs` and any second entry of the same AIR
+/// are two keys, so a hit can never answer with another entry's pipeline
+/// (`S3`, `evidence/reviews/reims-gate2-increment23-review-2026-09-17.md` §3).
+type PipelineKey = (Vec<u8>, String);
+
+/// The cache key for one `(air, entry)` pair.
+fn pipeline_cache_key(air: &[u8], entry: &str) -> PipelineKey {
+    (air.to_vec(), entry.to_owned())
 }
 
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -604,7 +622,8 @@ fn submit_narrow(
                 .map_err(|_| ProviderComputeDecline::TraceAdmission {
                     detail: "pipeline cache poisoned".into(),
                 })?;
-        if let Some(pipeline) = cache.get(air) {
+        let key = pipeline_cache_key(air, entry);
+        if let Some(pipeline) = cache.get(&key) {
             pipeline.clone()
         } else {
             let digest = SemanticDigest::new("reims-provider-compute-v1", air.to_vec()).map_err(
@@ -625,7 +644,7 @@ fn submit_narrow(
             let compiled = provider
                 .compile_pipeline(&function, digest)
                 .map_err(|error| refusal_decline(&error, "pipeline_compile"))?;
-            cache.insert(air.to_vec(), compiled.clone());
+            cache.insert(key, compiled.clone());
             compiled
         }
     };
@@ -656,6 +675,34 @@ fn submit_narrow(
             binding.access,
             staged.bytes.as_slice(),
         ));
+    }
+
+    // The mirror direction of the class rule: every binding the request staged
+    // must be named by the canonical contract, and the two must agree on
+    // whether it is writable. A staged binding the contract does not name is
+    // the two pinned translators (`9e0e99a` on this side, `43c46ac` in the
+    // provider) describing different kernels — the binding's bytes would never
+    // reach the trace, and a writable one would come back as a readback-count
+    // mismatch only after the provider had already run. The shape therefore
+    // stays on the reims engine, exactly like the forward rule above; the
+    // seam's own count check remains the fail-closed backstop for anything
+    // this walk does not name. Checked before any lease is imported.
+    for staged in &req.storage_buffers {
+        let Some(named) = pipeline
+            .contract
+            .buffer_bindings
+            .iter()
+            .find(|binding| binding.metal_binding == staged.binding)
+        else {
+            return Ok(NarrowOutcome::Outside(
+                "the reims reflection staged a binding the canonical contract does not name",
+            ));
+        };
+        if named.access.is_writable() != staged.writable {
+            return Ok(NarrowOutcome::Outside(
+                "the two reflections disagree on whether a staged binding is writable",
+            ));
+        }
     }
 
     // Every binding leaves as an owner-issued lease: a binding whose bytes came
@@ -1092,6 +1139,37 @@ mod tests {
                 .expect_err("another allocation's writeback")
                 .slug(),
             "writeback_missing"
+        );
+    }
+
+    /// S3: the pipeline cache key carries the entry point. One AIR with two
+    /// entry names is two cache keys, so a lookup for the second entry can
+    /// never be answered by the first entry's compiled pipeline — which is
+    /// what an AIR-only key would do.
+    #[test]
+    fn the_pipeline_cache_key_carries_the_entry_point() {
+        let air = b"one AIR, two entries".as_slice();
+        assert_eq!(
+            pipeline_cache_key(air, "apv_cs"),
+            pipeline_cache_key(air, "apv_cs"),
+            "one (AIR, entry) pair is one key"
+        );
+        assert_ne!(
+            pipeline_cache_key(air, "apv_cs"),
+            pipeline_cache_key(air, "apv_cs_second"),
+            "the same AIR under another entry is another key"
+        );
+
+        // The key is the one the rail's own map uses, so two entries of one AIR
+        // occupy two slots instead of colliding.
+        let mut cache: HashMap<PipelineKey, &'static str> = HashMap::new();
+        cache.insert(pipeline_cache_key(air, "apv_cs"), "first");
+        cache.insert(pipeline_cache_key(air, "apv_cs_second"), "second");
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache.get(&pipeline_cache_key(air, "apv_cs_second")),
+            Some(&"second"),
+            "the second entry hits its own compiled pipeline"
         );
     }
 }

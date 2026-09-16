@@ -15,6 +15,7 @@
 
 #![cfg(feature = "provider-compute")]
 
+use metal_api_core::provider::{CompletionDisposition, CompletionToken, SubmissionId};
 use metal_api_vulkan::{VulkanComputeProvider, VulkanExecutor};
 use reims_vgpu::backend::provider_compute::{
     device_epoch, host_import_alignment, submit_compute, ComputeRailOutcome, ProviderComputeDecline,
@@ -116,6 +117,179 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
         submit_compute(&air, "apv_cs", &multi_region, &[]),
         ComputeRailOutcome::NotInNarrowClass(_)
     ));
+}
+
+/// S2, mirror direction: a request that stages a binding the canonical contract
+/// does not name is the two pinned translators describing different kernels.
+/// The shape keeps the reims engine — the same answer the forward rule gives —
+/// instead of completing with the binding's bytes silently dropped (which the
+/// seam could only notice after the provider had already run).
+#[test]
+fn a_staged_binding_the_canonical_contract_does_not_name_stays_on_the_engine() {
+    let air = fixture_air();
+
+    let mut extra = mul3add1_request();
+    extra.storage_buffers.push(ComputeBufferResource {
+        binding: 7,
+        bytes: vec![0u8; 16],
+        writable: true,
+    });
+    assert!(
+        matches!(
+            submit_compute(&air, "apv_cs", &extra, &[]),
+            ComputeRailOutcome::NotInNarrowClass(_)
+        ),
+        "a staged binding the canonical contract does not name must keep the reims engine"
+    );
+
+    // The access half of the same rule: the two reflections must agree on
+    // writability, or the readback set the seam counts would disagree with the
+    // one the provider returned.
+    let mut access = mul3add1_request();
+    access.storage_buffers[0].writable = false;
+    assert!(
+        matches!(
+            submit_compute(&air, "apv_cs", &access, &[]),
+            ComputeRailOutcome::NotInNarrowClass(_)
+        ),
+        "reflections that disagree on writability must keep the reims engine"
+    );
+}
+
+/// S2, fail-closed: an in-class shape the canonical provider itself refuses —
+/// here a staged span shorter than the kernel's reachable footprint — is a
+/// typed decline on reims' own vocabulary, never a silent re-run on the
+/// self-contained engine.
+#[test]
+fn an_in_class_shape_the_provider_refuses_is_a_typed_decline() {
+    let air = fixture_air();
+    let mut short = mul3add1_request();
+    // The kernel's four threads reach 4 × 4 bytes; staging one word makes the
+    // canonical footprint proof refuse the trace before anything runs.
+    short.storage_buffers[0].bytes.truncate(4);
+    match submit_compute(&air, "apv_cs", &short, &[]) {
+        ComputeRailOutcome::ProviderDeclined(decline) => {
+            assert_eq!(decline.slug(), "provider_capability");
+            let fields = decline.fields();
+            assert!(
+                fields
+                    .iter()
+                    .any(|(key, value)| *key == "step" && value == "trace_admission"),
+                "the refusal names the provider step that refused: {fields:?}"
+            );
+            assert!(
+                fields.iter().any(|(key, value)| *key == "detail"
+                    && value.contains("buffer_footprint_exceeds_view")),
+                "the provider's own slug rides along: {fields:?}"
+            );
+        }
+        ComputeRailOutcome::ProviderCompleted(_) => panic!(
+            "the provider completed a dispatch whose staged span is shorter than its footprint"
+        ),
+        ComputeRailOutcome::NotInNarrowClass(reason) => {
+            panic!("an in-class refusal must not fall back to the engine: {reason}")
+        }
+    }
+}
+
+/// S3 end to end: the pipeline cache is keyed by `(AIR, entry)`. The same AIR
+/// asked for a second entry must recompile (and here refuse), never be answered
+/// by the first entry's cached pipeline.
+#[test]
+fn a_second_entry_over_the_same_air_does_not_hit_the_cached_pipeline() {
+    let air = fixture_air();
+    let request = mul3add1_request();
+    assert!(
+        matches!(
+            submit_compute(&air, "apv_cs", &request, &[]),
+            ComputeRailOutcome::ProviderCompleted(_)
+        ),
+        "the reviewed entry compiles and completes, and is now cached"
+    );
+    match submit_compute(&air, "apv_cs_second", &request, &[]) {
+        ComputeRailOutcome::ProviderDeclined(decline) => {
+            assert_eq!(decline.slug(), "provider_compile");
+            let fields = decline.fields();
+            assert!(
+                fields
+                    .iter()
+                    .any(|(key, value)| *key == "step" && value == "pipeline_compile"),
+                "the refusal names the compile step: {fields:?}"
+            );
+            assert!(
+                fields
+                    .iter()
+                    .any(|(key, value)| *key == "detail" && value.contains("apv_cs_second")),
+                "the provider's own entry-mismatch text rides along: {fields:?}"
+            );
+        }
+        ComputeRailOutcome::ProviderCompleted(_) => {
+            panic!("an AIR-only cache would have answered with the first entry's pipeline")
+        }
+        ComputeRailOutcome::NotInNarrowClass(reason) => {
+            panic!("a compile refusal must be a typed decline, not an engine fallback: {reason}")
+        }
+    }
+}
+
+/// S1 end to end: an aborted settle cannot release a provider import the owner
+/// ledger still holds. The completion names a token but is not retirement
+/// evidence, so `settle` binds the lease and refuses; the abort that follows
+/// must leave the import in the provider's own registry instead of releasing it
+/// behind the ledger's back.
+#[test]
+fn an_aborted_settle_keeps_a_lease_the_owner_ledger_still_holds() {
+    let executor = VulkanExecutor::new().expect("a Vulkan executor");
+    let provider = VulkanComputeProvider::with_executor(executor).expect("provider");
+    let bytes = vec![0xA5u8; 64];
+    let plan = provider_owner::plan(
+        &provider,
+        &[Request::Staged(Staged {
+            binding: 0,
+            bytes: &bytes,
+        })],
+    )
+    .expect("a staged binding imports as an owner lease");
+    assert_eq!(
+        provider.lease_registry().len(),
+        1,
+        "the import landed in the provider's own staged registry"
+    );
+
+    // `TimedOut` carries a token but is not retirement evidence: `settle` binds
+    // the token to the lease, refuses the completion, and aborts.
+    let token = CompletionToken {
+        submission_id: SubmissionId::new(1),
+        device_epoch: provider.device_epoch(),
+    };
+    let decline = plan
+        .settle(&provider, CompletionDisposition::TimedOut { token })
+        .expect_err("a timeout is not retirement evidence");
+    assert_eq!(decline.slug(), "owner_completion_not_retiring");
+    assert_eq!(
+        provider.lease_registry().len(),
+        1,
+        "the lease is still bound in the owner ledger, so its import must still be imported"
+    );
+
+    // The paired direction on the same provider: a plan whose lease the ledger
+    // gives up releases its import in the same step.
+    let second = vec![0x5Au8; 64];
+    let plan = provider_owner::plan(
+        &provider,
+        &[Request::Staged(Staged {
+            binding: 0,
+            bytes: &second,
+        })],
+    )
+    .expect("a second staged import");
+    assert_eq!(provider.lease_registry().len(), 2);
+    plan.abort(&provider);
+    assert_eq!(
+        provider.lease_registry().len(),
+        1,
+        "an unbound lease's import is released with the lease itself"
+    );
 }
 
 /// Page-aligned owner memory for a `VK_EXT_external_memory_host` import: the

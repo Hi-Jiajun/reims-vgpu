@@ -610,6 +610,11 @@ impl Plan {
 
     /// Give up every lease the plan still holds. Called when the submission
     /// never reached a completion (a provider refusal, a writeback mismatch).
+    ///
+    /// The owner ledger decides each lease's fate first (`abandon_hold` in this
+    /// module): a lease the ledger still holds — bound to a token that never
+    /// retired — keeps its window and its provider import, so the two records
+    /// cannot disagree about who owns the backing.
     pub fn abort(mut self, provider: &VulkanComputeProvider) {
         self.abort_inner(provider);
     }
@@ -700,22 +705,50 @@ impl Plan {
             if hold.released {
                 continue;
             }
-            if let Some(window) = hold.window {
-                // A window that never reached a completion is retired by the
-                // owner's own decision, which is the only authority left once
-                // the submission is abandoned.
-                let _ = state.reclaim_window(window.lease);
-            }
-            let _ = state.ledger.release(hold.lease);
-            if release_import(provider, hold).is_err() {
-                // The import is still held by the provider; the line is emitted
-                // by the caller's own decline, and a second failure here would
-                // only overwrite it.
-                continue;
-            }
-            hold.released = true;
+            abandon_hold(&mut state, provider, hold);
         }
     }
+}
+
+/// The owner ledger's half of [`abandon_hold`]: release the lease and answer
+/// whether the provider import may follow.
+///
+/// `false` means the ledger still holds the lease — it is bound to a token
+/// that never retired, and the contract names no release for it short of a
+/// device-loss teardown (`research/docs/20` §3.4). The caller must then keep
+/// the import held as well, so the ledger and the provider cannot end up
+/// disagreeing about who owns the backing (`S1`,
+/// `evidence/reviews/reims-gate2-increment23-review-2026-09-17.md` §3).
+fn release_abandoned_lease(state: &mut State, hold: &Hold) -> bool {
+    state.ledger.release(hold.lease).is_some()
+}
+
+/// Give up one abandoned hold as an explicit pair: the owner ledger releases
+/// the lease first, the window it registered is retired and reclaimed second,
+/// and only then is the provider import dropped. The ledger is the gate: a
+/// lease it refuses to release keeps its window *and* its import, because the
+/// import is the provider's record of the same lease.
+///
+/// Returns whether the hold is now given up.
+fn abandon_hold(state: &mut State, provider: &VulkanComputeProvider, hold: &mut Hold) -> bool {
+    if !release_abandoned_lease(state, hold) {
+        return false;
+    }
+    if let Some(window) = hold.window {
+        // A window that never reached a completion is retired by the owner's
+        // own decision, which is the only authority left once the submission
+        // is abandoned. It is retired only after the ledger gave the lease up,
+        // in the same order `settle_inner` keeps.
+        let _ = state.reclaim_window(window.lease);
+    }
+    if release_import(provider, hold).is_err() {
+        // The import is still held by the provider; the line is emitted by the
+        // caller's own decline, and a second failure here would only overwrite
+        // it.
+        return false;
+    }
+    hold.released = true;
+    true
 }
 
 /// Drop one lease from the provider that imported it.
@@ -1070,13 +1103,7 @@ fn abort_with(
         views: Vec::new(),
     };
     for hold in &mut plan.holds {
-        if let Some(window) = hold.window {
-            let _ = state.reclaim_window(window.lease);
-        }
-        let _ = state.ledger.release(hold.lease);
-        if release_import(provider, hold).is_ok() {
-            hold.released = true;
-        }
+        abandon_hold(state, provider, hold);
     }
     decline
 }
@@ -1084,6 +1111,31 @@ fn abort_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metal_api_core::provider::{CompletionToken, SubmissionId};
+
+    /// A plan hold with no window: the shape a staged binding produces, and
+    /// everything [`release_abandoned_lease`] needs.
+    fn hold(lease: LeaseId) -> Hold {
+        Hold {
+            channel: Channel::Staged,
+            binding: 0,
+            lease,
+            window: None,
+            released: false,
+        }
+    }
+
+    fn reservation(lease: LeaseId, allocation: u64) -> LeaseReservation {
+        LeaseReservation {
+            lease: BufferLease {
+                lease_id: lease,
+                allocation_id: AllocationId::new(allocation),
+                owner_epoch: DeviceEpoch::new(1),
+            },
+            offset: 0,
+            length: 64,
+        }
+    }
 
     #[test]
     fn a_window_on_a_device_without_host_import_is_refused_by_name() {
@@ -1128,5 +1180,62 @@ mod tests {
             "the provider's own error must be visible: {refusal:?}"
         );
         reset();
+    }
+
+    /// S1: an abort releases a provider import only as the explicit pair of an
+    /// owner-ledger release. The unreachable arm — a lease bound to a token
+    /// that never retired — is locked here structurally: the ledger keeps the
+    /// lease, so its import stays held with it instead of the ledger claiming a
+    /// lease the provider has already released.
+    #[test]
+    fn an_abandoned_release_is_paired_with_the_owner_ledger() {
+        let mut state = State::new();
+        let lease = LeaseId::new(91);
+        state
+            .ledger
+            .register(reservation(lease, 9_001))
+            .expect("a legal reservation");
+
+        // Never bound: the ledger gives the lease up, so its provider import
+        // may be released with it.
+        assert!(
+            release_abandoned_lease(&mut state, &hold(lease)),
+            "the ledger releases an unbound lease"
+        );
+        assert!(
+            !state.ledger.contains(lease),
+            "and the lease leaves the ledger in the same step"
+        );
+
+        // Bound to a token that never retired: the ledger refuses, and the
+        // import must stay held — the contract names no release for a bound
+        // lease short of a device-loss teardown.
+        let bound = LeaseId::new(92);
+        state
+            .ledger
+            .register(reservation(bound, 9_002))
+            .expect("a legal reservation");
+        state
+            .ledger
+            .bind(
+                bound,
+                CompletionToken {
+                    submission_id: SubmissionId::new(4),
+                    device_epoch: DeviceEpoch::new(1),
+                },
+            )
+            .expect("a valid token binds the lease");
+        assert!(
+            !release_abandoned_lease(&mut state, &hold(bound)),
+            "a still-bound lease is not the abort's to release"
+        );
+        assert!(
+            state.ledger.contains(bound),
+            "the ledger still holds the lease, so the caller keeps its import"
+        );
+        assert!(
+            !state.ledger.release_ready(bound),
+            "and the lease is not release-ready until its token retires"
+        );
     }
 }
