@@ -2808,56 +2808,36 @@ fn the_engines_asymmetric_frame_is_the_metal_ndc_mapping() {
     );
 }
 
-/// The canonical rail's frame for the same draw is the engine's own frame with
-/// its rows reversed — the two rails' NDC-y conventions, side by side, byte for
-/// byte.
+/// The canonical rail's frame for an asymmetric draw is the engine's own frame,
+/// byte for byte.
 ///
-/// This is the disagreement every positive case in this file has avoided with
-/// y-symmetric geometry since R6, pinned as an expectation instead of a remark.
-/// The provider translates the request's own stages and executes them under a
-/// positive-height viewport built from the attachment
-/// (`crates/metal-api-vulkan/src/render.rs`), and nothing in the trace states a
-/// convention, so the guest's `+Y` — Metal's "up" — lands at the bottom of the
-/// attachment. The first assertion below says that in the engine half's own
-/// vocabulary: the provider's frame is the Metal mapping of the shape reflected
-/// in y, not an arbitrary corruption.
+/// This is the disagreement every positive case in this file had to avoid with
+/// y-symmetric geometry since R6 — pinned as an expectation instead of a remark.
+/// The provider now states Metal's convention where it translates a guest vertex
+/// stage: `y` is negated on every `BuiltIn Position` output on the way into
+/// SPIR-V (`metal-api-vulkan/src/lib.rs::negate_position_y`, merged as
+/// `ed60380`), so the same shape lands on the same rows under the provider's
+/// positive-height viewport as under the engine's negative-height one.
 ///
-/// Why this side of the seam cannot align the pair:
-///
-/// * the canonical pass carries `viewport: [u32; 4]` with the origin fixed at
-///   `(0, 0)` and the extents fixed to the attachment's own
-///   (`metal-api-core/src/provider.rs`, `ViewportOriginUnsupported` and
-///   `ViewportExtentMismatch`), so a negative height — the way the engine states
-///   the flip — is not a trace this rail can build;
-/// * the provider's translated-stage gate (`metal-api-vulkan/src/lib.rs`,
-///   `TranslatedRenderStage`) applies no convention of its own, and the v38
-///   alignment in the emulator lives in its *hand-written* reviewed modules
-///   (`crates/metal-api-vulkan/src/render_spv/*.vert.spvasm`, the `OpFNegate` on
-///   each vertex module's position), which no guest module goes through;
-/// * the one channel left inside this rail — flipping the provider's rows on the
-///   way back out — is not the same map: the provider's image, the scissor's own
-///   rectangle and every `[[position]]` a guest fragment stage reads would keep
-///   describing a mirrored framebuffer, so the class does not take it.
-///
-/// When the provider states Metal's convention for translated stages, this test
-/// becomes `assert_frames_equal(provider, engine)` — the two frames the seam
-/// hands back are then byte-identical, asymmetric geometry included.
-///
-/// `research/docs/26` §18 has the readings.
+/// `research/docs/26` §18 recorded the pair of readings *before* the provider's
+/// change (provider = engine's rows reversed); `research/docs/23` §80 has the
+/// provider-side reading. This test is the same fixture after it: the first
+/// assertion derives the Metal mapping from the guest's own vertices, and the
+/// last one compares the two rails directly.
 #[test]
-fn the_canonical_rails_asymmetric_frame_is_the_engines_own_frame_mirrored() {
+fn the_canonical_rails_asymmetric_frame_is_the_engines_own_frame() {
     let _guard = engine_test_session();
     let stages = reviewed_stages();
     let provider = provider_pixels("ndc-y fixture", &stages, &asymmetric_request());
-    let reflected = ASYMMETRIC_VERTICES.map(|(x, y)| (x, -y));
-    assert_frame_is_the_metal_mapping("ndc-y fixture (provider)", &provider, reflected);
+    assert_frame_is_the_metal_mapping("ndc-y fixture (provider)", &provider, ASYMMETRIC_VERTICES);
     let Some(engine) = engine_pixels("ndc-y fixture", &stages, asymmetric_request()) else {
         return;
     };
-    assert_frames_differ("ndc-y fixture", &provider, &engine);
-    assert_frames_equal(
-        "ndc-y fixture",
-        &provider,
-        &flip_rows(&engine, ASYMMETRIC_WIDTH, ASYMMETRIC_HEIGHT),
+    assert_frames_equal("ndc-y fixture", &provider, &engine);
+    assert_ne!(
+        engine,
+        flip_rows(&engine, ASYMMETRIC_WIDTH, ASYMMETRIC_HEIGHT),
+        "the fixture's own frame has to differ from its rows reversed: a shape whose two \
+         readings agree would make this pair's expectation vacuous"
     );
 }

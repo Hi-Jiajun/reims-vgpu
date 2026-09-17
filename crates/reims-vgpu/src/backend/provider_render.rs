@@ -122,7 +122,7 @@
 //! refuses returns [`RenderRailOutcome::ProviderDeclined`] and the caller
 //! declines the draw: fail-closed, never silently re-run on the engine.
 //!
-//! # The y convention, which the two rails do not share yet
+//! # The y convention, which both rails now state
 //!
 //! Metal's clip space is `+Y` up and its framebuffer rows count from the top, so
 //! a guest vertex at `y = +1` belongs in row 0. The engine states that mapping in
@@ -130,32 +130,24 @@
 //! bottom edge (`reims-vgpu-vulkan/src/raster.rs`) — and the comparison this rail
 //! makes is in *that* vocabulary, because the frame belongs to the guest.
 //!
-//! The canonical rail does not state it. Its pass carries `viewport: [u32; 4]`
-//! ([`RenderPassDescriptor::viewport`]), whose origin the contract fixes at
-//! `(0, 0)` and whose extents it fixes to the attachment's own
-//! (`ViewportOriginUnsupported` / `ViewportExtentMismatch`), and its translated
-//! stages carry no convention either: the provider builds a positive-height
-//! `VkViewport` from the attachment (`metal-api-vulkan/src/render.rs`) and
-//! translates the guest's `y` verbatim, so an admitted draw lands the guest's
-//! `+Y` at the *bottom* of its attachment — the two frames are vertical mirrors
-//! of each other. The emulator's own alignment of its two rails lives in its
-//! *hand-written* reviewed modules (`crates/metal-api-vulkan/src/render_spv/*.
-//! vert.spvasm`, one `OpFNegate` per vertex module), which no guest module goes
-//! through; `research/docs/23` §32 is that increment.
+//! The canonical rail states the same convention where it translates a guest
+//! vertex stage: the provider negates the `y` of every `BuiltIn Position` output
+//! on the way into SPIR-V (`metal-api-vulkan/src/lib.rs::negate_position_y`,
+//! merged as `ed60380`), so the guest's `+Y` lands in row 0 under the provider's
+//! positive-height viewport. The hand-written reviewed modules keep their own
+//! `OpFNegate` and are not translated, so the emulator's own fixtures are
+//! untouched.
 //!
-//! So every positive case in `tests/provider_render_rail.rs` draws a shape whose
-//! *frame* is the same under the mirror (a full-screen triangle, an x-only offset,
-//! an x-only scissor), and the y axis itself is pinned by the pair
+//! The y axis itself is pinned by the pair
 //! `the_engines_asymmetric_frame_is_the_metal_ndc_mapping` (the Metal mapping,
 //! derived from the guest's own vertices) and
-//! `the_canonical_rails_asymmetric_frame_is_the_engines_own_frame_mirrored` (the
-//! exact relation between the two rails today). Aligning them is a *provider*
-//! capability and not a trace this class can state: a negative-height viewport
-//! does not fit the contract's `[u32; 4]`, and flipping the provider's rows on the
-//! way out is a different map — the provider's image, the scissor's own rectangle
-//! and every `[[position]]` a guest fragment stage reads would keep describing a
-//! mirrored framebuffer. `research/docs/26` §18 records the readings and the
-//! provider-side change point.
+//! `the_canonical_rails_asymmetric_frame_is_the_engines_own_frame` (the two rails
+//! hand back byte-identical frames for the same asymmetric draw). Every other
+//! positive case in `tests/provider_render_rail.rs` still draws a shape whose
+//! *frame* is the same under the mirror (a full-screen triangle, an x-only
+//! offset, an x-only scissor), which keeps those cases about their own subject
+//! rather than about this axis. `research/docs/26` §18 and `research/docs/23` §80
+//! record the readings on both sides of the seam.
 //!
 //! # The frame comes back at the attachment's own width
 //!
