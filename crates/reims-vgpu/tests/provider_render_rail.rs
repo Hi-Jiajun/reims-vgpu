@@ -22,8 +22,9 @@
 #![cfg(feature = "provider-render")]
 
 use metal_api_core::provider::{
-    AttachmentFormat, ComputeProvider, FieldValue, RenderPipelineContract, RenderPipelineStage,
-    SemanticDigest, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep,
+    AttachmentFormat, BufferAccess, ComputeProvider, FieldValue, FootprintProof,
+    RenderPipelineContract, RenderPipelineStage, SemanticDigest, StageBufferBinding,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -5202,4 +5203,439 @@ fn the_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
         "and produces no frame at all"
     );
     provider_wire::capture_submission_frames(false);
+}
+
+/// R9m, the drop: a `[[buffer(N)]]` argument whose translated entry point never
+/// dereferences it is not a declaration this rail states.
+///
+/// The reflection answers `ResourceAccess::Unused` for such an argument — the
+/// metadata declares it and the emitted entry point never reaches it — and
+/// `pipeline_resolve` maps that answer onto the class's own vocabulary
+/// (`StageBufferAccess::Unused`). R9m's change is what the class does with it:
+/// the statement the seam builds carries only the arguments the entries reach,
+/// the dropped declaration is *counted* (`stage_buffer_skipped_unused_1`) so a
+/// census can size the population, and no submission frame is produced at all —
+/// a frame is what carries declarations, and this request states none.
+///
+/// The door still answers, and that is the other half of the reading: the
+/// provider's registration pairs a translation's reflected arguments with the
+/// contract's declarations one to one, so a slot with no declaration is refused
+/// by name there
+/// (`the_registration_has_no_pair_for_a_slot_the_entry_never_dereferences`), and
+/// a rail that had stated one anyway would be stating a declaration it cannot
+/// bind.
+#[test]
+fn a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement() {
+    let _guard = engine_test_session();
+    use reims_vgpu::backend::provider_wire;
+
+    // The measured fact: the fixture's own translation answers `Unused` for the
+    // one slot it declares, and states no byte range for it.
+    let stages =
+        buffer_declaring_stages("render_frag_buffer_unused.air", "reims_unused_buffer_frag");
+    assert_eq!(
+        stages.fragment_stage_buffer_declarations,
+        vec![StageBufferDeclaration {
+            index: 0,
+            access: StageBufferAccess::Unused,
+            footprint: StageBufferFootprint::Unstated,
+        }],
+        "the unused fixture declares one slot its entry never dereferences"
+    );
+
+    // The statement: the slot is not in it, and the drop is a count beside it.
+    let inputs = inputs(&stages, RenderChainRole::SoleOrTail);
+    let statement = inputs.stage_buffer_statement();
+    eprintln!(
+        "statement for the unused shape: declared={} dropped={} unstated={:?}",
+        statement.declared.len(),
+        statement.dropped(),
+        statement
+            .unstated
+            .iter()
+            .map(|(stage, declaration)| (
+                stage.name(),
+                declaration.index,
+                declaration.access.name()
+            ))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        statement.declared.is_empty(),
+        "no declaration is stated for a slot no entry reaches: {statement:?}"
+    );
+    assert_eq!(statement.dropped(), 1, "and the drop is counted");
+
+    let skipped = route_count("stage_buffer_skipped_unused_1");
+    let zeros = route_count("stage_buffer_skipped_unused_0");
+    let door = route_count("render_provider_out_of_class_stage_buffer_unused");
+    provider_wire::capture_submission_frames(true);
+    let frames_before = provider_wire::wire_counts().submit_frames;
+    match provider_render::submit_render(&inputs, &narrow_request(MTL_FORMAT_RGBA8_UNORM)) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("door for the dropped declaration: {reason}");
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_stage_buffer_unused"
+            );
+            assert!(
+                reason.detail().contains("[[buffer(0)]]"),
+                "the sentence names the slot: {reason}"
+            );
+            assert!(
+                reason.detail().contains("1 declaration(s)"),
+                "and the number of declarations the statement dropped: {reason}"
+            );
+        }
+        other => panic!("a slot no entry reaches stays on the engine: {other:?}"),
+    }
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    assert_eq!(
+        route_count("stage_buffer_skipped_unused_1"),
+        skipped + 1,
+        "the dropped declaration is counted in its own band"
+    );
+    assert_eq!(
+        route_count("stage_buffer_skipped_unused_0"),
+        zeros,
+        "and the band's zero arm is not charged for it"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_unused"),
+        door + 1,
+        "the door answers for the dropped slot exactly once"
+    );
+    assert!(
+        frames.is_empty(),
+        "no declaration reaches the wire for this request"
+    );
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        frames_before,
+        "and the seam produced no submission frame at all"
+    );
+}
+
+/// The same pass with the slot dereferenced: the statement carries exactly that
+/// one declaration, the drop band's zero arm is charged, the declaration crosses
+/// the wire with a view beside it, and the two rails land the same frame.
+///
+/// This is R9m's other half. The fixture is the same shape as
+/// `a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement`'s
+/// — one `[[buffer(0)]]` argument, one admitted draw — with the entry point
+/// actually reading it, so the pair of tests is a statement about the *access
+/// arm* rather than about the slot, the stage or the draw.
+#[test]
+fn the_statement_and_the_wire_carry_the_one_slot_the_entry_dereferences() {
+    let _guard = engine_test_session();
+    use reims_vgpu::backend::provider_wire;
+
+    let stages = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
+    assert_eq!(
+        stages.fragment_stage_buffer_declarations,
+        vec![StageBufferDeclaration {
+            index: 0,
+            access: StageBufferAccess::Read,
+            footprint: StageBufferFootprint::Static { max_bytes: 4 },
+        }],
+        "the read fixture declares one slot its entry dereferences"
+    );
+    // The fixture stores its bind's first `float32` in red: `1.0f` lands
+    // `ff 00 00 ff`, and a zeroed bind lands `00 00 00 ff`.
+    let mut bytes = vec![0u8; 16];
+    bytes[..4].copy_from_slice(&[0, 0, 0x80, 0x3f]);
+    let content = BufferContent::Bytes(std::sync::Arc::new(bytes));
+    let binds = [staged_bind(RenderPipelineStage::Fragment, 0, &content)];
+    let inputs = inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds);
+
+    let statement = inputs.stage_buffer_statement();
+    eprintln!(
+        "statement for the dereferenced shape: declared={:?} dropped={} unstated={}",
+        statement
+            .declared
+            .iter()
+            .map(|(stage, declaration, access)| (
+                stage.name(),
+                declaration.index,
+                declaration.access.name(),
+                *access
+            ))
+            .collect::<Vec<_>>(),
+        statement.dropped(),
+        statement.unstated.len(),
+    );
+    assert_eq!(
+        statement.declared.len(),
+        1,
+        "the one slot the entry reaches is stated"
+    );
+    assert_eq!(statement.declared[0].1.index, 0);
+    assert_eq!(
+        statement.declared[0].2,
+        BufferAccess::Read,
+        "under the access the contract states it with"
+    );
+    assert!(
+        statement.unstated.is_empty(),
+        "and nothing is withheld: {statement:?}"
+    );
+    assert_eq!(statement.dropped(), 0);
+
+    let zeros = route_count("stage_buffer_skipped_unused_0");
+    provider_wire::capture_submission_frames(true);
+    let frames_before = provider_wire::wire_counts().submit_frames;
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.storage_buffers.push(engine::StorageBufferResource {
+        binding: 0,
+        content: content.clone(),
+    });
+    match provider_render::submit_render(&inputs, &req) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("a dereferenced stage buffer is in class: {other:?}"),
+    }
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    assert_eq!(
+        route_count("stage_buffer_skipped_unused_0"),
+        zeros + 1,
+        "the drop band is charged for every request the gate is handed, zero arm and all"
+    );
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        frames_before + 1,
+        "the seam produced exactly one submission frame"
+    );
+    assert_eq!(frames.len(), 1, "and the capture holds it");
+
+    let (trace, _resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let declarations = trace
+        .pipelines
+        .iter()
+        .find_map(|pipeline| pipeline.render.as_ref())
+        .map(|render| render.stage_buffers.clone())
+        .unwrap_or_default();
+    let views = trace
+        .passes
+        .iter()
+        .find_map(|pass| pass.as_render())
+        .map(|pass| pass.stage_buffers.clone())
+        .unwrap_or_default();
+    eprintln!(
+        "wire frame for the dereferenced slot: {} bytes, declarations={:?}, views={}",
+        frames[0].len(),
+        declarations,
+        views.len(),
+    );
+    assert_eq!(
+        declarations,
+        vec![StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            access: BufferAccess::Read,
+            footprint: FootprintProof::Static { max_bytes: 4 },
+        }],
+        "the frame carries exactly the slot the entry dereferences"
+    );
+    assert_eq!(views.len(), 1, "and one view beside it");
+
+    // The other rail, for the same draw: the same bytes behind the same slot.
+    let provider = match provider_render::submit_render(&inputs, &req) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the dereferenced shape leaves for the provider: {other:?}"),
+    };
+    assert_eq!(
+        texel_at(&provider, 0, 0),
+        [255, 0, 0, 255],
+        "the provider reads the bytes behind the declaration"
+    );
+    let Some(engine) = engine_pixels("R9m dereferenced stage buffer", &stages, req) else {
+        return;
+    };
+    assert_frames_equal(
+        "R9m: the dereferenced slot on both rails",
+        &provider,
+        &engine,
+    );
+}
+
+/// R9m's measured boundary: the canonical registration has no pair for a slot a
+/// translated entry point never dereferences.
+///
+/// This is the fact the dropped declaration is answered with, measured on the
+/// provider's own registration entry point rather than inferred from this
+/// rail's code: the same fragment stage is handed to
+/// `register_translated_render_pipeline` under the three contracts this rail
+/// could state for it, and every one is refused by name — undeclared
+/// (`render_stage_unsupported_interface`), declared `unused`
+/// (`render_pipeline_contract_invalid`), declared `read`
+/// (`render_stage_reflection_mismatch`) — while the same stage with the slot
+/// dereferenced registers against the very declaration the rail states for it.
+///
+/// Which is why R9m drops the declaration and still keeps the draw on the
+/// engine: the increment that admits this population is the registration arm
+/// ("an argument the entry point never dereferences is not interface"), not a
+/// rail that states a declaration it cannot bind.
+#[test]
+fn the_registration_has_no_pair_for_a_slot_the_entry_never_dereferences() {
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let provider = VulkanComputeProvider::with_executor(std::sync::Arc::clone(&executor))
+        .expect("the canonical provider builds");
+    let device =
+        Device::new(std::sync::Arc::clone(&executor) as std::sync::Arc<dyn ComputeExecutor>);
+    let policy = provider.spirv_feature_policy();
+    let translate = |air: &[u8], stage: RenderStage, entry: &str| {
+        let function = device
+            .new_library_with_binary_air(air.to_vec())
+            .expect("the fixture is a binary AIR module")
+            .function(entry)
+            .expect("the fixture's entry exists");
+        TranslatedRenderStage::translate_with_policy(stage, &function, policy)
+            .expect("the fixture translates under this device's policy")
+    };
+    let vertex_air = fixture("reims_indexed_tri.air");
+    let unused_air = fixture("render_frag_buffer_unused.air");
+    let read_air = fixture("render_frag_buffer.air");
+    let unused_fragment = translate(
+        &unused_air,
+        RenderStage::Fragment,
+        "reims_unused_buffer_frag",
+    );
+    eprintln!(
+        "unused fragment reflection bindings: {:?}",
+        unused_fragment
+            .reflection()
+            .bindings
+            .iter()
+            .map(|binding| (
+                binding.metal_index,
+                binding.kind,
+                binding.access,
+                binding.descriptor,
+                binding.footprint.clone(),
+            ))
+            .collect::<Vec<_>>()
+    );
+    let contract = |entry: &str, stage_buffers: Vec<StageBufferBinding>| RenderPipelineContract {
+        vertex_entry: "reims_indexed_vertex".to_owned(),
+        fragment_entry: entry.to_owned(),
+        color_formats: vec![AttachmentFormat::Rgba8Unorm],
+        vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
+            stride: 8,
+            step: VertexStep::PerVertex,
+            attributes: vec![VertexAttribute {
+                location: 0,
+                offset: 0,
+                format: VertexFormat::Float32x2,
+            }],
+        }]),
+        stage_buffers,
+    };
+    let digest = |name: &str| {
+        SemanticDigest::new("reims-provider-render-rail-r9m", name.as_bytes().to_vec())
+            .expect("the digest names a case")
+    };
+    let declaration = |access: BufferAccess| StageBufferBinding {
+        stage: RenderPipelineStage::Fragment,
+        index: 0,
+        access,
+        footprint: FootprintProof::Static { max_bytes: 16 },
+    };
+
+    // Arm 1: no declaration at all — the shape R9m's statement produces.
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: contract("reims_unused_buffer_frag", Vec::new()),
+            vertex: translate(&vertex_air, RenderStage::Vertex, "reims_indexed_vertex"),
+            fragment: translate(
+                &unused_air,
+                RenderStage::Fragment,
+                "reims_unused_buffer_frag",
+            ),
+            logical_digest: digest("unused-undeclared"),
+        })
+        .expect_err("a reflected slot the contract does not declare has no view to fill it");
+    eprintln!(
+        "unused, undeclared: class={:?} slug={} fields={:?}",
+        refused.class, refused.slug, refused.fields
+    );
+    assert_eq!(refused.slug, "render_stage_unsupported_interface");
+    assert_eq!(
+        refused.fields.get("field"),
+        Some(&FieldValue::Text("bindings".to_owned()))
+    );
+    assert_eq!(
+        refused.fields.get("index"),
+        Some(&FieldValue::Unsigned(0)),
+        "the refusal names the slot the translation never reaches"
+    );
+
+    // Arm 2: declared with the access the reflection itself reports. The
+    // contract has no `Unused` declaration at all, so the refusal comes from
+    // the contract rather than from the pairing.
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: contract(
+                "reims_unused_buffer_frag",
+                vec![declaration(BufferAccess::Unused)],
+            ),
+            vertex: translate(&vertex_air, RenderStage::Vertex, "reims_indexed_vertex"),
+            fragment: translate(
+                &unused_air,
+                RenderStage::Fragment,
+                "reims_unused_buffer_frag",
+            ),
+            logical_digest: digest("unused-declared-unused"),
+        })
+        .expect_err("the contract states no Unused declaration");
+    eprintln!(
+        "unused, declared unused: class={:?} slug={} detail={:?}",
+        refused.class, refused.slug, refused.detail
+    );
+    assert_eq!(refused.slug, "render_pipeline_contract_invalid");
+
+    // Arm 3: declared as the read a rail could try to fabricate for the slot.
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: contract(
+                "reims_unused_buffer_frag",
+                vec![declaration(BufferAccess::Read)],
+            ),
+            vertex: translate(&vertex_air, RenderStage::Vertex, "reims_indexed_vertex"),
+            fragment: translate(
+                &unused_air,
+                RenderStage::Fragment,
+                "reims_unused_buffer_frag",
+            ),
+            logical_digest: digest("unused-declared-read"),
+        })
+        .expect_err("the reflection and the contract disagree about the access");
+    eprintln!(
+        "unused, declared read: class={:?} slug={} fields={:?}",
+        refused.class, refused.slug, refused.fields
+    );
+    assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+    assert_eq!(
+        refused.fields.get("declared_access"),
+        Some(&FieldValue::Text("read".to_owned()))
+    );
+    assert_eq!(
+        refused.fields.get("reflected_access"),
+        Some(&FieldValue::Text("unused".to_owned()))
+    );
+
+    // The control: the same stage with the slot dereferenced registers against
+    // the declaration this rail states for it.
+    let registered =
+        provider.register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: contract("reims_buffer_frag", vec![declaration(BufferAccess::Read)]),
+            vertex: translate(&vertex_air, RenderStage::Vertex, "reims_indexed_vertex"),
+            fragment: translate(&read_air, RenderStage::Fragment, "reims_buffer_frag"),
+            logical_digest: digest("read-declared-read"),
+        });
+    assert!(
+        registered.is_ok(),
+        "the dereferenced slot registers against its own declaration: {registered:?}"
+    );
 }
