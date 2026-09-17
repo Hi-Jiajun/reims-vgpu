@@ -1474,7 +1474,30 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             .entry_point
             .as_deref()
             .unwrap_or(&req.entry);
-        match provider_compute::submit_compute(air, air_entry, &req, &owner_windows) {
+        // The module's own sampler half (C1b): the AIR constexpr samplers this
+        // reflection named, which are the only sampler descriptors the canonical
+        // compute texture face can state. The request's `samplers` were built
+        // from this same value above — a guest `[[sampler(n)]]` binding or a
+        // neutral default carries no constexpr state and is not in this list, so
+        // the seam can tell the two apart instead of trusting a state.
+        let module_samplers: Vec<provider_compute::ModuleSampler> = reflected_samplers
+            .iter()
+            .filter_map(|descriptor| {
+                descriptor
+                    .static_state
+                    .map(|state| provider_compute::ModuleSampler {
+                        binding: descriptor.binding,
+                        state,
+                    })
+            })
+            .collect();
+        match provider_compute::submit_compute(
+            air,
+            air_entry,
+            &req,
+            &module_samplers,
+            &owner_windows,
+        ) {
             ComputeRailOutcome::ProviderCompleted(out) => {
                 crate::runtime::drain::note_store_route("compute_provider_canonical");
                 crate::observe::off(format!(

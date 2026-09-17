@@ -108,7 +108,7 @@ fn readback_words(out: &[u8]) -> Vec<u32> {
 }
 
 fn decline_for(air: &[u8], request: &ComputeRequest, windows: &[Window]) -> ProviderComputeDecline {
-    match submit_compute(air, "apv_cs", request, windows) {
+    match submit_compute(air, "apv_cs", request, &[], windows) {
         ComputeRailOutcome::ProviderDeclined(decline) => decline,
         ComputeRailOutcome::ProviderCompleted(_) => {
             panic!("the rail completed a submission the test expected to be refused")
@@ -159,7 +159,7 @@ fn a_driver_reported_device_loss_is_a_typed_refusal_with_an_executed_teardown() 
 
     // 1. The rail carries the reviewed fixture before the injection, so the
     //    loss below is the only difference between the two submissions.
-    match submit_compute(&air, "apv_cs", &request, &[window]) {
+    match submit_compute(&air, "apv_cs", &request, &[], &[window]) {
         ComputeRailOutcome::ProviderCompleted(out) => {
             assert_eq!(readback_words(&out.writebacks[0].bytes), vec![4, 7, 10, 13]);
         }
@@ -279,7 +279,7 @@ fn a_driver_reported_device_loss_is_a_typed_refusal_with_an_executed_teardown() 
         head: 0,
         bytes_len: input.len() as u64,
     };
-    match submit_compute(&air, "apv_cs", &request, &[window]) {
+    match submit_compute(&air, "apv_cs", &request, &[], &[window]) {
         ComputeRailOutcome::ProviderCompleted(out) => {
             assert_eq!(
                 readback_words(&out.writebacks[0].bytes),

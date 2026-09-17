@@ -1125,7 +1125,7 @@ fn a_tiled_launch_is_byte_identical_across_the_engine_and_the_canonical_provider
         // `apv_cs` is the AIR entry the canonical translator reports for this
         // fixture — the entry the production seam passes through, not the
         // reims SPIR-V entry `main`.
-        match provider_compute::submit_compute(&air, "apv_cs", &request, &[]) {
+        match provider_compute::submit_compute(&air, "apv_cs", &request, &[], &[]) {
             ComputeRailOutcome::ProviderCompleted(out) => {
                 assert_eq!(out.writebacks.len(), 1, "one writable binding readback");
                 assert_eq!(out.writebacks[0].binding, 0);

@@ -10,7 +10,37 @@
 //!
 //! The admitted class is deliberately the smallest falsifiable shape:
 //!
-//! - no sampled images, samplers, or storage images (pure storage buffers);
+//! - at most one sampled image, and only the shape the canonical compute
+//!   texture face executes (`research/docs/26` §21.3, C1/C1b): a D2,
+//!   single-sample, single-array-element texture carried as owned bytes, with
+//!   one mip level, a mapped `R32Uint`/`R32Float` format and a binding the
+//!   compiled module's own contract declares. Storage images stay on the
+//!   engine, and so does every shape those bounds do not name (an array slice,
+//!   a descriptor array, a mip chain, a resident or multisample source, a
+//!   format the contract's closed list does not carry);
+//! - the sampler half of that shape is the module's own: a request sampler is
+//!   admitted only when the caller's reflection names it as an AIR constexpr
+//!   sampler (`StaticSamplerState`, C1b) whose state is the state the request's
+//!   descriptor carries, and a module that carries a constexpr sampler must
+//!   pair it with exactly one sampled texture — the pairing the canonical
+//!   contract reviews. A guest-bound `[[sampler(n)]]`, a runtime sampler slot
+//!   the runtime filled with its neutral default, and every state outside the
+//!   reviewed `{nearest, linear} x {clamp-to-edge, repeat}` family keep the
+//!   engine;
+//! - the declaration the seam states is the module's own, and it is checked
+//!   twice: the request's sampler state must restate the module's constexpr
+//!   state ([`ModuleSampler`]), and the policy the canonical provider compiled
+//!   from the same AIR must restate it too. The two readings of one module
+//!   disagreeing is [`ProviderComputeDecline::ComputeTextureSamplerMismatch`],
+//!   fail-closed, exactly like the payload offset below;
+//! - a textured pass's trace crosses the owner→provider wire before anything is
+//!   admitted: [`super::provider_wire::submit_frame`] encodes it, the
+//!   provider's own decoder reads it back, and it is the *decoded* trace
+//!   admission sees. C1c's compute-texture tags carry the declaration
+//!   (`PIPELINE_KIND_COMPUTE_TEXTURES`, `SUBMIT_COMPUTE_TEXTURES_REQUEST`), and
+//!   the class gate reads the capability answer's own texture section
+//!   (`compute_texture_support`) rather than the in-process snapshot — a
+//!   device that does not declare the shape executes none of it;
 //! - a `ComputeDispatch::Regions` exact-thread launch — one region or the
 //!   several a partial threadgroup decomposes into — whose region list is
 //!   exactly the decomposition the translator derives for the launch it
@@ -92,7 +122,9 @@ use metal_api_core::provider::{
     AllocationId, AllocationRecord, BufferSource, BufferView, BufferWriteback,
     CompiledComputePipeline, CompletionDisposition, ComputePass, ComputeProvider, ComputeTrace,
     Dispatch, DispatchKind, DispatchType, NoCopyLeaseImporter, OperationId, ProviderError,
-    ProviderErrorClass, ProviderHealth, ResourceTableSnapshot, SemanticDigest, TracePass, ViewId,
+    ProviderErrorClass, ProviderHealth, ResourceTableSnapshot, SamplerAddressMode, SamplerFilter,
+    SamplerPolicy, SemanticDigest, TextureAccess, TextureFootprintProof, TextureFormat,
+    TextureSource, TextureType, TextureView, TracePass, ViewId, MAX_COMPUTE_TEXTURES,
     PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
@@ -101,9 +133,14 @@ use metal_api_vulkan::{VulkanComputeProvider, VulkanExecutor};
 use super::provider_owner::{
     self, DeviceLossTeardown, Request as OwnerRequest, Staged as OwnerStaged, Window,
 };
+use super::provider_wire;
 use super::vulkan::engine::types::ComputeImageResult;
-use super::vulkan::engine::{ComputeDispatch, ComputeRequest};
+use super::vulkan::engine::{
+    ComputeDispatch, ComputeRequest, ComputeSampledImageResource, ComputeSampledSource,
+    SamplerResource, StorageImageFormat,
+};
 use crate::observe::{decline_display, Decline};
+use crate::runtime::spirv_bind;
 
 /// Why one reims compute request did not leave this rail for the engine.
 #[derive(Debug)]
@@ -191,6 +228,198 @@ impl ProviderRefusalClass {
     }
 }
 
+/// One sampler the module itself carries: an AIR constexpr sampler the
+/// translated module's reflection names, with the descriptor binding it lands
+/// on and the decoded state the AIR was lowered against
+/// (`research/docs/26` §21.3, C1b's `StaticSampler`).
+///
+/// The seam needs both halves, and neither can be read off the request alone:
+/// whether a sampler descriptor the request carries is the module's own
+/// constexpr state rather than a guest-bound (`[[sampler(n)]]`) one, and what
+/// the module states for it. The caller reads them from the same
+/// `metal2vulkan` reflection it built `req.samplers` from
+/// (`runtime::spirv_bind::reflected_sampler_descriptors`); this rail does not
+/// run a second translation of its own to rediscover them, because a textured
+/// compute dispatch would then pay for two.
+#[derive(Clone, Copy, Debug)]
+pub struct ModuleSampler {
+    /// The descriptor binding the AIR constexpr sampler lands on, in the
+    /// numbering the request's sampler descriptors use.
+    pub binding: u32,
+    /// The state the module's AIR carries for it.
+    pub state: metal2vulkan::reflect::StaticSamplerState,
+}
+
+/// The reviewed compute sampler family, read off the module's own AIR state.
+///
+/// The window is exactly the one `metal-api-vulkan` reviews when it compiles a
+/// declaration (`static_sampler_policy`): one filter for minification and
+/// magnification, one address mode across the three axes, no mip filter,
+/// normalized coordinates, no comparison, weighted-average reduction and unit
+/// anisotropy. The reviewed textures carry one mip level, so the LOD clamps
+/// cannot select another level and are not part of the state the sampled bytes
+/// depend on; everything that can change which texels a sample returns is
+/// checked, and every other shape stays on the self-contained engine.
+fn policy_of_state(
+    state: &metal2vulkan::reflect::StaticSamplerState,
+) -> Result<SamplerPolicy, &'static str> {
+    use metal2vulkan::reflect::{
+        SamplerAddressMode as AirAddress, SamplerCompareFunction, SamplerCoordinates,
+        SamplerFilter as AirFilter, SamplerMipFilter, SamplerReduction,
+    };
+
+    let filter = match (state.min_filter, state.mag_filter) {
+        (AirFilter::Nearest, AirFilter::Nearest) => SamplerFilter::Nearest,
+        (AirFilter::Linear, AirFilter::Linear) => SamplerFilter::Linear,
+        _ => {
+            return Err(
+                "an AIR sampler whose minification and magnification filters are not the one \
+                 reviewed filter stays on the self-contained engine",
+            )
+        }
+    };
+    if state.address_mode_s != state.address_mode_t || state.address_mode_s != state.address_mode_r
+    {
+        return Err(
+            "an AIR sampler whose axes address differently stays on the self-contained engine \
+             (the reviewed family states one mode for all three)",
+        );
+    }
+    let address =
+        match state.address_mode_s {
+            AirAddress::ClampToEdge => SamplerAddressMode::ClampToEdge,
+            AirAddress::Repeat => SamplerAddressMode::Repeat,
+            _ => return Err(
+                "an AIR sampler whose address mode is not clamp-to-edge or repeat stays on the \
+                 self-contained engine",
+            ),
+        };
+    if state.mip_filter != SamplerMipFilter::None {
+        return Err(
+            "an AIR sampler with a mip filter stays on the self-contained engine (the reviewed \
+             texture carries one level)",
+        );
+    }
+    if state.coordinates != SamplerCoordinates::Normalized {
+        return Err(
+            "an AIR sampler with pixel coordinates stays on the self-contained engine (the \
+             reviewed family samples normalized coordinates)",
+        );
+    }
+    if state.compare_function != SamplerCompareFunction::Never {
+        return Err("an AIR sampler with a comparison function stays on the self-contained engine");
+    }
+    if state.reduction != SamplerReduction::WeightedAverage {
+        return Err(
+            "an AIR sampler whose reduction is not the weighted average stays on the \
+             self-contained engine",
+        );
+    }
+    if state.max_anisotropy != 1 {
+        return Err("an AIR sampler with anisotropy stays on the self-contained engine");
+    }
+    Ok(SamplerPolicy { filter, address })
+}
+
+/// The state one request sampler descriptor carries, in the contract's own
+/// vocabulary, or why the descriptor is not a state this rail can state.
+///
+/// The descriptor is the engine's own [`SamplerResource`] — the value the
+/// self-contained engine creates its `VkSampler` from — so this walk is what
+/// makes "the request states the module's own state" checkable field by field
+/// instead of assumed. The fields are the `MTLSampler*` ordinals both routes
+/// into `SamplerResource` carry (`runtime::draw::vulkan::reflected_static_sampler_resource`
+/// and the guest's own descriptor), which is why the family is written here in
+/// those ordinals rather than in the AIR enum's.
+fn policy_of_resource(resource: &SamplerResource) -> Result<SamplerPolicy, &'static str> {
+    use crate::backend::vulkan::engine::SamplerCompareFunction;
+    use reims_vgpu_core::sampler as mtl;
+
+    let filter = match (resource.min_filter, resource.mag_filter) {
+        (mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST, mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST) => {
+            SamplerFilter::Nearest
+        }
+        (mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR, mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR) => {
+            SamplerFilter::Linear
+        }
+        _ => {
+            return Err(
+                "a sampler descriptor whose filters are not one reviewed filter stays on the \
+                 self-contained engine",
+            )
+        }
+    };
+    if resource.address_mode_u != resource.address_mode_v
+        || resource.address_mode_u != resource.address_mode_w
+    {
+        return Err(
+            "a sampler descriptor whose axes address differently stays on the self-contained \
+             engine",
+        );
+    }
+    let address =
+        match resource.address_mode_u {
+            mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE => SamplerAddressMode::ClampToEdge,
+            mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT => SamplerAddressMode::Repeat,
+            _ => return Err(
+                "a sampler descriptor whose address mode is not clamp-to-edge or repeat stays on \
+                 the self-contained engine",
+            ),
+        };
+    if resource.mip_filter != mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED {
+        return Err(
+            "a sampler descriptor with a mip filter stays on the self-contained engine (the \
+             reviewed texture carries one level)",
+        );
+    }
+    if resource.unnormalized_coordinates {
+        return Err(
+            "a sampler descriptor with unnormalized coordinates stays on the self-contained \
+             engine",
+        );
+    }
+    if resource.compare_function != SamplerCompareFunction::Never {
+        return Err(
+            "a sampler descriptor with a comparison function stays on the self-contained engine",
+        );
+    }
+    if resource.max_anisotropy != 1 {
+        return Err("a sampler descriptor with anisotropy stays on the self-contained engine");
+    }
+    Ok(SamplerPolicy { filter, address })
+}
+
+/// The canonical format one staged sampled image's pixel format maps onto, or
+/// `None` for every format the compute texture face does not carry.
+///
+/// The list is the contract's own closed one (`TextureFormat`) narrowed to the
+/// two entries the canonical Vulkan rail executes compute-side: a `uint` texel
+/// read's `R32Uint` and, from C1b on, the `R32Float` a module's own constexpr
+/// sampler samples.
+fn mapped_texture_format(format: StorageImageFormat) -> Option<TextureFormat> {
+    match format {
+        StorageImageFormat::R32Uint => Some(TextureFormat::R32Uint),
+        StorageImageFormat::R32Float => Some(TextureFormat::R32Float),
+        _ => None,
+    }
+}
+
+/// The filter name one [`SamplerFilter`] travels under in a refusal.
+fn filter_name(filter: SamplerFilter) -> &'static str {
+    match filter {
+        SamplerFilter::Nearest => "Nearest",
+        SamplerFilter::Linear => "Linear",
+    }
+}
+
+/// The address name one [`SamplerAddressMode`] travels under in a refusal.
+fn address_name(address: SamplerAddressMode) -> &'static str {
+    match address {
+        SamplerAddressMode::ClampToEdge => "ClampToEdge",
+        SamplerAddressMode::Repeat => "Repeat",
+    }
+}
+
 /// One provider-reported writeback, mapped onto the staged binding it belongs
 /// to.
 ///
@@ -247,6 +476,29 @@ pub enum ProviderComputeDecline {
     /// dispatch one of them would execute as a different launch
     /// (`research/docs/26` §7, 2026-09-17).
     PushOffsetMismatch { request: u32, contract: u32 },
+    /// The sampler state this seam states for a compute texture binding is not
+    /// the state the canonical provider compiled from the same AIR
+    /// (`research/docs/26` §21.3, C1b). Both readings claim to be the module's
+    /// own `@__air_sampler_state`, and the texels a sample returns depend on
+    /// which one executes, so the disagreement is fail-closed — never a
+    /// dispatch executed with the other state, exactly as the payload offset
+    /// above is.
+    ComputeTextureSamplerMismatch {
+        binding: u32,
+        /// The state the module's own AIR constexpr sampler states, as this
+        /// seam read it.
+        request_filter: &'static str,
+        request_address: &'static str,
+        /// The state the compiled contract declares for the same binding.
+        contract_filter: &'static str,
+        contract_address: &'static str,
+    },
+    /// The compute texture declaration could not cross the owner→provider wire.
+    /// `step` names the codec call that answered and `detail` carries the
+    /// codec's own text (a shape the frame cannot carry is a fact about the
+    /// wire, and the provider's own decoder is the only thing that gets to say
+    /// so — the same rule R9j's stage-buffer frames keep).
+    ComputeTextureWire { step: &'static str, detail: String },
     /// The canonical provider refused, named by its normalized class: `step`
     /// names the provider call that answered, and `detail` carries the
     /// provider's own slug and detail text.
@@ -292,6 +544,8 @@ impl Decline for ProviderComputeDecline {
             Self::ProviderUnavailable { .. } => "provider_unavailable",
             Self::PipelineCompile { .. } => "pipeline_compile",
             Self::PushOffsetMismatch { .. } => "push_offset_mismatch",
+            Self::ComputeTextureSamplerMismatch { .. } => "compute_texture_sampler_mismatch",
+            Self::ComputeTextureWire { .. } => "compute_texture_wire",
             Self::ProviderRefused { class, .. } => class.slug(),
             Self::ProviderDeviceLost { .. } => ProviderRefusalClass::DeviceLost.slug(),
             Self::TraceAdmission { .. } => "trace_admission",
@@ -333,6 +587,22 @@ impl Decline for ProviderComputeDecline {
                 ("request", request.to_string()),
                 ("contract", contract.to_string()),
             ],
+            Self::ComputeTextureSamplerMismatch {
+                binding,
+                request_filter,
+                request_address,
+                contract_filter,
+                contract_address,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("request_filter", (*request_filter).to_string()),
+                ("request_address", (*request_address).to_string()),
+                ("contract_filter", (*contract_filter).to_string()),
+                ("contract_address", (*contract_address).to_string()),
+            ],
+            Self::ComputeTextureWire { step, detail } => {
+                vec![("step", (*step).to_string()), ("detail", detail.clone())]
+            }
             Self::ProviderRefused {
                 class,
                 step,
@@ -414,6 +684,28 @@ fn pipeline_cache_key(air: &[u8], entry: &str) -> PipelineKey {
     (air.to_vec(), entry.to_owned())
 }
 
+/// The canonical view identity of the one texture this rail stages.
+///
+/// The buffer views beside it are numbered `binding + 1`, so a fixed base above
+/// that namespace keeps the two kinds apart in a trace whose pass carries both
+/// — and the identity is a function of the binding, so the same staged texture
+/// keeps the same view across submissions exactly as the buffer views do.
+fn texture_view_id(binding: u32) -> u64 {
+    const TEXTURE_VIEW_BASE: u64 = 0x1000;
+    TEXTURE_VIEW_BASE + u64::from(binding)
+}
+
+/// The allocation identity of that view.
+///
+/// The source is [`TextureSource::OwnedBytes`], so no allocation record is
+/// needed for it (the canonical rail refuses a lease source compute-side); the
+/// identity only has to be nonzero and distinct from the buffers' lease
+/// allocations, which come from the provider's own namespace.
+fn texture_allocation_id(binding: u32) -> u64 {
+    const TEXTURE_ALLOCATION_BASE: u64 = 0x636f_6d70_7465_7874; // "comptext"
+    TEXTURE_ALLOCATION_BASE + u64::from(binding)
+}
+
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn rail() -> Result<&'static ProviderRail, ProviderComputeDecline> {
@@ -441,22 +733,25 @@ pub(crate) fn rail() -> Result<&'static ProviderRail, ProviderComputeDecline> {
 /// Route one reims compute request. `entry` is the AIR entry-point name the
 /// canonical translator reports for this kernel (`apv_cs` for the reviewed
 /// fixture), not the reims SPIR-V entry (`main`) — the canonical provider
-/// requires the two to agree. `windows` names, per canonical binding, the
-/// registered guest RAM window its staged bytes came from; a binding with no
-/// entry is imported as an owner-issued staged lease instead. See the module
-/// docs for the class rules and the owner rail's own docs for the lease
-/// lifecycle.
+/// requires the two to agree. `module_samplers` is the module's own sampler
+/// half, as the caller's reflection read it ([`ModuleSampler`]): the AIR
+/// constexpr samplers a request's own sampler descriptors must restate.
+/// `windows` names, per canonical binding, the registered guest RAM window its
+/// staged bytes came from; a binding with no entry is imported as an
+/// owner-issued staged lease instead. See the module docs for the class rules
+/// and the owner rail's own docs for the lease lifecycle.
 pub fn submit_compute(
     air: &[u8],
     entry: &str,
     req: &ComputeRequest,
+    module_samplers: &[ModuleSampler],
     windows: &[Window],
 ) -> ComputeRailOutcome {
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no device, no compile, no lease).
-    match narrow_class(req) {
+    match narrow_class(req, module_samplers) {
         Err(reason) => ComputeRailOutcome::NotInNarrowClass(reason),
-        Ok(launch) => match submit_narrow(air, entry, req, launch, windows) {
+        Ok(class) => match submit_narrow(air, entry, req, class, windows) {
             Ok(NarrowOutcome::Completed(output)) => ComputeRailOutcome::ProviderCompleted(output),
             Ok(NarrowOutcome::Outside(reason)) => ComputeRailOutcome::NotInNarrowClass(reason),
             Err(decline) => ComputeRailOutcome::ProviderDeclined(decline),
@@ -624,6 +919,119 @@ struct NarrowLaunch {
     push_offset: u32,
 }
 
+/// The one sampled texture binding a request stages, in the canonical
+/// vocabulary the pass view is built in.
+///
+/// Every field is a fact of the request's own [`ComputeSampledImageResource`]:
+/// the binding the view names, the canonical format its pixel format maps
+/// onto, the extent, and the tightly packed texels one mip level carries.
+#[derive(Clone, Copy, Debug)]
+struct StagedTexture<'a> {
+    binding: u32,
+    format: TextureFormat,
+    width: u64,
+    height: u64,
+    bytes: &'a [u8],
+}
+
+/// One request's texture half: the launch, the sampled image it stages (when it
+/// stages one) and the sampler descriptor that image is sampled through.
+///
+/// The sampler is carried as two readings of one fact — the request's own
+/// descriptor and the module's own AIR state the caller's reflection named —
+/// because the seam's rule is that they agree, and admission then requires the
+/// compiled contract to agree with both.
+#[derive(Debug)]
+struct NarrowClass<'a> {
+    launch: NarrowLaunch,
+    texture: Option<StagedTexture<'a>>,
+    /// The sampler descriptor the request carries, when it carries one.
+    sampler: Option<&'a SamplerResource>,
+    /// The module's own stated state for that descriptor.
+    module_sampler: Option<ModuleSampler>,
+}
+
+/// One staged sampled image as the canonical view this rail would state, or why
+/// the shape it carries keeps the engine.
+///
+/// The closed list is C1/C1b's reviewed window, and every entry is the *view*
+/// side of the canonical `TextureView`: single-layer, single-array-element,
+/// single-descriptor, one mip level, owned bytes, a format the compute texture
+/// face carries. The shapes that fall out — an array slice, a descriptor array,
+/// a mip chain, a resident storage image, a retained multisample target — have
+/// no canonical spelling, so they are named here rather than discovered by a
+/// provider that would refuse them later.
+fn staged_texture(image: &ComputeSampledImageResource) -> Result<StagedTexture<'_>, &'static str> {
+    if image.array_element != 0 {
+        return Err(
+            "a sampled image bound as one element of an array stays on the self-contained engine",
+        );
+    }
+    if image.descriptor_count != 1 {
+        return Err(
+            "a sampled image bound as an array of descriptors stays on the self-contained engine",
+        );
+    }
+    if image.mip_levels != 1 {
+        return Err(
+            "a sampled image carrying a mip chain stays on the self-contained engine (the \
+             canonical view is one level)",
+        );
+    }
+    let bytes =
+        match &image.source {
+            ComputeSampledSource::Bytes(bytes) => bytes.as_slice(),
+            ComputeSampledSource::ResidentCopy(_) => return Err(
+                "a sampled image served from a resident storage image stays on the self-contained \
+                 engine (the canonical texture source is the caller's own bytes)",
+            ),
+            ComputeSampledSource::MultisampleTarget(_) => {
+                return Err(
+                    "a sampled image served from a retained multisample target stays on the \
+                 self-contained engine (the canonical compute texture face samples single-sample \
+                 D2 images)",
+                )
+            }
+        };
+    let Some(format) = mapped_texture_format(image.format) else {
+        return Err(
+            "a sampled image whose format the canonical compute texture face does not carry stays \
+             on the self-contained engine",
+        );
+    };
+    // Two numbering systems meet here, and this is the one place both are
+    // known: the engine's request carries the translator's texture band
+    // (`TEXTURE_BINDING_BASE + Metal index`, `runtime::spirv_bind`), while the
+    // canonical contract names the Metal `[[texture(n)]]` index itself. The
+    // scalar shape above (`array_element == 0`, `descriptor_count == 1`) is
+    // exactly the case where the difference is the band base.
+    let Some(metal_binding) = image.binding.checked_sub(spirv_bind::TEXTURE_BINDING_BASE) else {
+        return Err(
+            "a sampled image whose descriptor binding is not in the translator's texture band \
+             stays on the self-contained engine",
+        );
+    };
+    if image.width == 0 || image.height == 0 {
+        return Err("a sampled image with no texels stays on the self-contained engine");
+    }
+    let expected = u64::from(image.width)
+        .saturating_mul(u64::from(image.height))
+        .saturating_mul(format.bytes_per_texel());
+    if expected != bytes.len() as u64 {
+        return Err(
+            "a sampled image whose bytes are not the tightly packed extent of its view stays on \
+             the self-contained engine",
+        );
+    }
+    Ok(StagedTexture {
+        binding: metal_binding,
+        format,
+        width: u64::from(image.width),
+        height: u64::from(image.height),
+        bytes,
+    })
+}
+
 /// The launch `req`'s dispatch decomposes, or why the request stays on the
 /// self-contained engine.
 ///
@@ -637,10 +1045,94 @@ struct NarrowLaunch {
 /// re-derived) keeps the engine rather than silently dispatching other threads.
 /// The whole check is pure — it runs before the rail is even created, so a
 /// refused shape costs the provider nothing.
-fn narrow_class(req: &ComputeRequest) -> Result<NarrowLaunch, &'static str> {
-    if !req.sampled_images.is_empty() || !req.samplers.is_empty() || !req.storage_images.is_empty()
-    {
-        return Err("compute images/samplers stay on the self-contained engine");
+fn narrow_class<'a>(
+    req: &'a ComputeRequest,
+    module_samplers: &[ModuleSampler],
+) -> Result<NarrowClass<'a>, &'static str> {
+    if !req.storage_images.is_empty() {
+        return Err("compute storage images stay on the self-contained engine");
+    }
+
+    // The texture half (`research/docs/26` §21.3). Every condition is a fact of
+    // the request or of the module's own reflection, so they all run before the
+    // rail exists: a shape the canonical view cannot carry keeps the engine
+    // without costing the provider a compile. A pass with no texture at all is
+    // the population this rail always had and skips the whole walk.
+    let texture = match req.sampled_images.as_slice() {
+        [] => None,
+        [image] => Some(staged_texture(image)?),
+        _ => {
+            return Err(
+                "a pass that stages more than one sampled image stays on the self-contained \
+                 engine (the canonical compute texture face reviews one binding, and the wire \
+                 bounds the declaration list at that same one)",
+            )
+        }
+    };
+
+    // The sampler half: the request's own descriptors have to be the module's
+    // own AIR constexpr samplers, state and all. A guest `[[sampler(n)]]`
+    // binding, a runtime sampler slot the runtime filled with its neutral
+    // default, and a state the reviewed family does not name all keep the
+    // engine, because the canonical contract has no separate sampler object to
+    // state them with (`research/docs/26` §21.3, C1b).
+    if module_samplers.len() > 1 {
+        return Err(
+            "a module that carries more than one AIR constexpr sampler stays on the \
+             self-contained engine (the canonical compute sampler face reviews one)",
+        );
+    }
+    let mut sampler = None;
+    let mut module_sampler = None;
+    match req.samplers.as_slice() {
+        [] => {}
+        [resource] => {
+            let Some(declared) = module_samplers
+                .iter()
+                .find(|declared| declared.binding == resource.binding)
+            else {
+                return Err(
+                    "a sampler the module does not carry as its own AIR constexpr state stays on \
+                     the self-contained engine",
+                );
+            };
+            let carried = policy_of_resource(resource)?;
+            let stated = policy_of_state(&declared.state)?;
+            if carried != stated {
+                return Err(
+                    "a sampler descriptor whose state is not the state the module's own AIR \
+                     constexpr sampler carries stays on the self-contained engine",
+                );
+            }
+            sampler = Some(resource);
+            module_sampler = Some(*declared);
+        }
+        _ => {
+            return Err(
+                "a pass that carries more than one sampler stays on the self-contained engine \
+                 (the canonical compute sampler face reviews one)",
+            )
+        }
+    }
+    match (module_sampler, texture) {
+        (Some(_), Some(_)) => {}
+        (Some(_), None) => {
+            return Err(
+                "a module whose AIR constexpr sampler the request does not restate stays on the \
+                 self-contained engine (the reviewed shape pairs one constexpr sampler with one \
+                 staged texture)",
+            )
+        }
+        // The mirror direction: a module that carries a constexpr sampler the
+        // request does not name at all has the same gap as the pair above — the
+        // declaration would travel without the descriptor that restates it.
+        (None, _) if module_samplers.is_empty() => {}
+        (None, _) => {
+            return Err(
+                "a module whose AIR constexpr sampler the request does not restate stays on the \
+                 self-contained engine (the request carries no sampler descriptor for it)",
+            )
+        }
     }
     let ComputeDispatch::Regions {
         push_offset,
@@ -721,10 +1213,15 @@ fn narrow_class(req: &ComputeRequest) -> Result<NarrowLaunch, &'static str> {
              stays on the self-contained engine",
         );
     }
-    Ok(NarrowLaunch {
-        grid,
-        threads_per_threadgroup: local,
-        push_offset: *push_offset,
+    Ok(NarrowClass {
+        launch: NarrowLaunch {
+            grid,
+            threads_per_threadgroup: local,
+            push_offset: *push_offset,
+        },
+        texture,
+        sampler,
+        module_sampler,
     })
 }
 
@@ -732,7 +1229,7 @@ fn submit_narrow(
     air: &[u8],
     entry: &str,
     req: &ComputeRequest,
-    launch: NarrowLaunch,
+    class: NarrowClass<'_>,
     windows: &[Window],
 ) -> Result<NarrowOutcome, ProviderComputeDecline> {
     let rail = rail()?;
@@ -742,6 +1239,42 @@ fn submit_narrow(
     // answer is a refusal, never a silent switch to the other rail.
     if let Some(decline) = refuse_unhealthy(provider, "admission") {
         return Err(decline);
+    }
+
+    // The one device answer the texture half needs (C1c's capability section):
+    // a provider that does not declare compute texture sampling executes none
+    // of these declarations, so the pass keeps the engine under the capability
+    // frame's own reading rather than being met later by the provider's
+    // `compute_texture_input_unsupported` refusal. The frame is read exactly as
+    // the stage-buffer half reads its own (`provider_wire`), and it is read
+    // before the compile because the answer is a property of the device and not
+    // of the module.
+    let NarrowClass {
+        launch,
+        texture,
+        sampler,
+        module_sampler,
+    } = class;
+    if let Some(staged) = &texture {
+        let support = provider_wire::compute_texture_support(
+            provider.device_epoch(),
+            &provider.capabilities(),
+        )
+        .map_err(|decline| ProviderComputeDecline::ComputeTextureWire {
+            step: decline.step,
+            detail: decline.detail,
+        })?;
+        if !support.supported
+            || support.maximum < MAX_COMPUTE_TEXTURES as u32
+            || !support.formats.contains(&staged.format)
+        {
+            return Ok(NarrowOutcome::Outside(
+                "a pass that stages a sampled image stays on the self-contained engine when the \
+                 provider's own capability answer does not carry the compute texture shape (no \
+                 compute texture sampling, a binding cap below one, or a format outside the \
+                 admitted list — each of which admission refuses by name)",
+            ));
+        }
     }
 
     // One canonical pass carries the whole launch in Metal units, and the
@@ -859,6 +1392,93 @@ fn submit_narrow(
         }
     }
 
+    // The texture half's own pair rule (`research/docs/26` §21.3, steps 1-3).
+    // The trace carries the module's compiled contract, so the request's staged
+    // view has to be the view that declaration names, field by field; a
+    // disagreement is the two readings of one module rather than a shape the
+    // provider refuses, and the engine keeps it exactly as the buffer face's
+    // mirror rule above does. The sampler half is the one place the two
+    // readings must agree or the dispatch is fail-closed: both claim to be the
+    // module's own `@__air_sampler_state`, and the texels a sample returns
+    // depend on which one executes.
+    let mut textures = Vec::new();
+    if let Some(staged) = &texture {
+        let declared =
+            match pipeline.contract.texture_bindings.as_slice() {
+                [declared] => declared,
+                [] => return Ok(NarrowOutcome::Outside(
+                    "the request staged a sampled image the canonical contract does not declare",
+                )),
+                _ => return Ok(NarrowOutcome::Outside(
+                    "a contract that declares more than one texture binding keeps the dispatch on \
+                     the self-contained engine (the reviewed compute texture face pairs one)",
+                )),
+            };
+        if declared.metal_binding != staged.binding {
+            return Ok(NarrowOutcome::Outside(
+                "the contract's texture binding is not the binding the request staged",
+            ));
+        }
+        if declared.access != TextureAccess::Sampled
+            || declared.texture_type != TextureType::D2
+            || declared.footprint != TextureFootprintProof::WholeView
+        {
+            return Ok(NarrowOutcome::Outside(
+                "a texture binding the canonical contract declares outside the reviewed D2 \
+                 sampled whole-view shape keeps the dispatch on the self-contained engine",
+            ));
+        }
+        if declared.format != staged.format {
+            return Ok(NarrowOutcome::Outside(
+                "the two readings of the same module disagree on the sampled texture's format",
+            ));
+        }
+        if let Some(module_sampler) = module_sampler {
+            let stated = policy_of_state(&module_sampler.state)
+                .expect("the class gate admitted the module's own state, so it is a nameable one");
+            let Some(contract_policy) = declared.sampler else {
+                return Ok(NarrowOutcome::Outside(
+                    "a sampled texture declaration that carries no sampler state keeps the \
+                     dispatch on the self-contained engine (the two rails cannot pair a state \
+                     nobody stated)",
+                ));
+            };
+            if contract_policy != stated {
+                return Err(ProviderComputeDecline::ComputeTextureSamplerMismatch {
+                    binding: declared.metal_binding,
+                    request_filter: filter_name(stated.filter),
+                    request_address: address_name(stated.address),
+                    contract_filter: filter_name(contract_policy.filter),
+                    contract_address: address_name(contract_policy.address),
+                });
+            }
+        }
+        textures.push(TextureView {
+            view_id: ViewId::new(texture_view_id(staged.binding)),
+            metal_binding: staged.binding,
+            allocation_id: AllocationId::new(texture_allocation_id(staged.binding)),
+            texture_type: TextureType::D2,
+            format: staged.format,
+            width: staged.width,
+            height: staged.height,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(staged.bytes.to_vec()),
+        });
+    }
+    // The sampler descriptor the request carried is consumed here: the
+    // canonical contract states its state on the texture binding instead, so
+    // nothing about it travels beside the view. Reading it keeps the walk's
+    // two sources visible in one place rather than leaving `sampler` an unused
+    // binding.
+    debug_assert_eq!(
+        sampler.is_some(),
+        module_sampler.is_some(),
+        "the class gate pairs the request's sampler with the module's own state"
+    );
+
     // Every binding leaves as an owner-issued lease: a binding whose bytes came
     // from a registered guest RAM window is imported without copying, and one
     // with no window behind it is imported as a staged lease. Both are imported
@@ -927,7 +1547,7 @@ fn submit_narrow(
         passes: vec![TracePass::Compute(ComputePass {
             pipeline: pipeline.pipeline_id,
             buffers,
-            textures: Vec::new(),
+            textures: textures.clone(),
             dispatch: Dispatch {
                 kind: DispatchKind::ThreadsExact,
                 grid,
@@ -937,6 +1557,40 @@ fn submit_narrow(
         completion_policy: metal_api_core::provider::CompletionPolicy::HostReadback,
         heap: None,
         indirect: None,
+    };
+    // C1c: a pass whose table carries compute texture declarations crosses the
+    // owner→provider wire before anything is admitted. The frame is the payload
+    // — the declaration the provider compiled beside the view this rail staged,
+    // source bytes and all — it is decoded again with the provider's own
+    // decoder, and it is what the admission below sees, so a field the frame
+    // cannot carry is a typed decline here at the seam rather than a difference
+    // discovered when the owner and the provider are two processes. A trace
+    // whose table declares no texture keeps the exact path (and bytes) it had
+    // before the texture half existed.
+    let (trace, resources) = if textures.is_empty() {
+        (trace, resources)
+    } else {
+        let frame = match provider_wire::submit_frame(&trace, &resources) {
+            Ok(frame) => frame,
+            Err(decline) => {
+                leases.abort(provider);
+                return Err(ProviderComputeDecline::ComputeTextureWire {
+                    step: decline.step,
+                    detail: decline.detail,
+                });
+            }
+        };
+        provider_wire::note_submit_frame();
+        match provider_wire::carried_submission(&frame) {
+            Ok(pair) => pair,
+            Err(decline) => {
+                leases.abort(provider);
+                return Err(ProviderComputeDecline::ComputeTextureWire {
+                    step: decline.step,
+                    detail: decline.detail,
+                });
+            }
+        }
     };
     let validated = match provider.capabilities().validate_trace(trace, resources) {
         Ok(validated) => validated,
@@ -1153,10 +1807,10 @@ mod tests {
     fn the_class_recovers_the_launch_a_region_list_decomposes() {
         // The single-region control: the old mapping and the recovered launch
         // are the same numbers.
-        let single = narrow_class(&request_of_launch([4, 1, 1], [4, 1, 1]))
-            .expect("one exact region is the class");
-        assert_eq!(single.grid, [4, 1, 1]);
-        assert_eq!(single.threads_per_threadgroup, [4, 1, 1]);
+        let single_request = request_of_launch([4, 1, 1], [4, 1, 1]);
+        let single = narrow_class(&single_request, &[]).expect("one exact region is the class");
+        assert_eq!(single.launch.grid, [4, 1, 1]);
+        assert_eq!(single.launch.threads_per_threadgroup, [4, 1, 1]);
 
         // A tail launch: 6 threads in 4-wide groups are two regions (the
         // interior 0..3 and the slab 4..5), and the launch they decompose is
@@ -1171,24 +1825,31 @@ mod tests {
             [4, 0, 0],
             "the slab's payload starts its threads at 4"
         );
-        let tail = narrow_class(&tail_request).expect("the translator's own tiling is the class");
-        assert_eq!(tail.grid, [6, 1, 1], "the launch is the tiling's cover");
-        assert_eq!(tail.threads_per_threadgroup, [4, 1, 1]);
+        let tail =
+            narrow_class(&tail_request, &[]).expect("the translator's own tiling is the class");
+        assert_eq!(
+            tail.launch.grid,
+            [6, 1, 1],
+            "the launch is the tiling's cover"
+        );
+        assert_eq!(tail.launch.threads_per_threadgroup, [4, 1, 1]);
 
         // Eight regions (a boundary on every axis): the cover is the whole
         // grid, not any one region's span.
-        let all_axes = narrow_class(&request_of_launch([130, 5, 3], [64, 2, 2]))
-            .expect("an eight-region tiling is the class");
-        assert_eq!(all_axes.grid, [130, 5, 3]);
-        assert_eq!(all_axes.threads_per_threadgroup, [64, 2, 2]);
+        let all_axes_request = request_of_launch([130, 5, 3], [64, 2, 2]);
+        let all_axes =
+            narrow_class(&all_axes_request, &[]).expect("an eight-region tiling is the class");
+        assert_eq!(all_axes.launch.grid, [130, 5, 3]);
+        assert_eq!(all_axes.launch.threads_per_threadgroup, [64, 2, 2]);
 
         // A grid smaller than one threadgroup is a single slab: the recovered
         // local size is the effective one, and re-planning it reproduces the
         // same single region.
-        let sub_group = narrow_class(&request_of_launch([3, 1, 1], [8, 1, 1]))
-            .expect("a sub-threadgroup grid is the class");
-        assert_eq!(sub_group.grid, [3, 1, 1]);
-        assert_eq!(sub_group.threads_per_threadgroup, [3, 1, 1]);
+        let sub_group_request = request_of_launch([3, 1, 1], [8, 1, 1]);
+        let sub_group =
+            narrow_class(&sub_group_request, &[]).expect("a sub-threadgroup grid is the class");
+        assert_eq!(sub_group.launch.grid, [3, 1, 1]);
+        assert_eq!(sub_group.launch.threads_per_threadgroup, [3, 1, 1]);
     }
 
     /// The class *carries* the request's stated payload offset rather than
@@ -1201,9 +1862,13 @@ mod tests {
     #[test]
     fn the_class_carries_the_requests_stated_payload_offset() {
         assert_eq!(
-            narrow_class(&request_of_launch([4, 1, 1], [4, 1, 1]))
-                .expect("the derived tiling is the class")
-                .push_offset,
+            {
+                let request = request_of_launch([4, 1, 1], [4, 1, 1]);
+                narrow_class(&request, &[])
+                    .expect("the derived tiling is the class")
+                    .launch
+                    .push_offset
+            },
             0,
             "the translator's own payload sits at the reflected offset"
         );
@@ -1213,8 +1878,9 @@ mod tests {
         };
         *push_offset = 16;
         assert_eq!(
-            narrow_class(&hacked)
+            narrow_class(&hacked, &[])
                 .expect("the class gate has no contract to compare an offset against")
+                .launch
                 .push_offset,
             16,
             "the class hands the request's claim to admission untouched"
@@ -1230,7 +1896,7 @@ mod tests {
             "a region list the translator would not derive from one exact-thread launch \
              stays on the self-contained engine";
         let reason_of = |request: &ComputeRequest| {
-            narrow_class(request).expect_err("this list is not a decomposition")
+            narrow_class(request, &[]).expect_err("this list is not a decomposition")
         };
 
         // A second copy of the interior region: no single launch tiles into the

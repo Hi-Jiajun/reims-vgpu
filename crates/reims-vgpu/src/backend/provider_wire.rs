@@ -36,7 +36,7 @@
 //! population and not a change to any other shape's route.
 
 use metal_api_core::provider::{
-    ComputeTrace, DeviceEpoch, ProviderCapabilities, ResourceTableSnapshot,
+    ComputeTrace, DeviceEpoch, ProviderCapabilities, ResourceTableSnapshot, TextureFormat,
 };
 
 use metal_api_ipc::codec::CodecError;
@@ -86,6 +86,59 @@ pub fn stage_buffer_support(
     epoch: DeviceEpoch,
     capabilities: &ProviderCapabilities,
 ) -> Result<StageBufferSupport, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(StageBufferSupport {
+        supported: decoded.supports_render_stage_buffers,
+        maximum: decoded.max_render_stage_buffers,
+    })
+}
+
+/// The compute-texture half of one provider capability snapshot, read back out
+/// of the response frame the provider would send (`research/docs/26` §21.3,
+/// C1c's `CAPABILITY_COMPUTE_TEXTURE_TAIL`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeTextureSupport {
+    /// Whether the provider declares it samples compute-side textures at all.
+    pub supported: bool,
+    /// The most compute textures one pass may carry, as the same frame
+    /// declares it.
+    pub maximum: u32,
+    /// The formats the same frame admits for a sampled compute texture.
+    pub formats: Vec<TextureFormat>,
+}
+
+/// Encode a capability answer, decode it again, and read the compute-texture
+/// bits out of the decoded value.
+///
+/// The same one-snapshot-two-readings rule [`stage_buffer_support`] states:
+/// the class gate asks what the wire carries — `supports_compute_texture_sampling`,
+/// `max_compute_textures` and `supported_compute_texture_formats`, which C1c
+/// gave a capability section of their own — rather than what the in-process
+/// snapshot happens to hold. A device whose frame cannot carry the bits is a
+/// device whose remote owner never sees them, and the textured pass keeps the
+/// engine under the class gate's own name for that.
+pub fn compute_texture_support(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<ComputeTextureSupport, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(ComputeTextureSupport {
+        supported: decoded.supports_compute_texture_sampling,
+        maximum: decoded.max_compute_textures,
+        formats: decoded.supported_compute_texture_formats,
+    })
+}
+
+/// The provider's own capability snapshot as it comes back out of the frame
+/// the owner would receive.
+///
+/// One encoder and one decoder for every capability question this rail asks,
+/// so the readings beside each other really are one frame's bytes rather than
+/// two spellings of them.
+fn capabilities_frame(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<ProviderCapabilities, WireDecline> {
     let frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
         epoch,
         capabilities: capabilities.clone(),
@@ -95,10 +148,7 @@ pub fn stage_buffer_support(
     match CommandCodec::decode_response(&frame)
         .map_err(|error| WireDecline::new("capabilities_decode", error))?
     {
-        CommandResponse::Capabilities { capabilities, .. } => Ok(StageBufferSupport {
-            supported: capabilities.supports_render_stage_buffers,
-            maximum: capabilities.max_render_stage_buffers,
-        }),
+        CommandResponse::Capabilities { capabilities, .. } => Ok(capabilities),
         other => Err(WireDecline {
             step: "capabilities_decode",
             detail: format!("the frame decoded as a {} response", other.kind()),
