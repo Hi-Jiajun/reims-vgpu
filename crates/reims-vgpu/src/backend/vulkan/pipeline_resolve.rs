@@ -282,6 +282,18 @@ pub struct ResolvedRenderPipeline {
     pub vertex_air: Arc<[u8]>,
     #[cfg(feature = "provider-render")]
     pub fragment_air: Arc<[u8]>,
+    /// The vertex stage's own attribute locations, as its reflection reports
+    /// them, retained for the same reasons as the AIR beside them.
+    ///
+    /// The canonical render rail's class gate compares the request's declared
+    /// attributes with this set, so a request that declares a stream the shader
+    /// does not read — or misses one it does — stays on the self-contained
+    /// engine instead of being answered by a provider that always refuses it.
+    /// Collected once per resolved pipeline rather than once per draw: the
+    /// reflection behind it is memoized with the translation, and the rail is
+    /// entered for every draw on this backend.
+    #[cfg(feature = "provider-render")]
+    pub vertex_attribute_locations: Arc<[u32]>,
 }
 
 #[cfg(test)]
@@ -338,6 +350,11 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
         vertex_air: Arc::from(Vec::new()),
         #[cfg(feature = "provider-render")]
         fragment_air: Arc::from(Vec::new()),
+        // The synthetic reflection declares no attribute, so the rail's
+        // interface check would refuse any request that declares one — which is
+        // what keeps this constructor from standing in for a real pipeline.
+        #[cfg(feature = "provider-render")]
+        vertex_attribute_locations: Arc::from(Vec::new()),
     })
 }
 
@@ -681,6 +698,16 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         PipelineState::Compiling,
     );
     let bind_plan = Arc::new(VertexBindPlan::build(&desc));
+    // The rail's own field, so a build without it pays neither the walk nor the
+    // allocation.
+    #[cfg(feature = "provider-render")]
+    let vertex_attribute_locations: Arc<[u32]> = vertex
+        .reflection
+        .vertex_attributes
+        .iter()
+        .map(|attribute| attribute.location)
+        .collect::<Vec<u32>>()
+        .into();
     Ok(ResolvedRenderPipeline {
         pipeline_object: None,
         desc: Arc::new(desc),
@@ -696,6 +723,8 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         vertex_air: Arc::from(v_air.to_vec()),
         #[cfg(feature = "provider-render")]
         fragment_air: Arc::from(f_air.to_vec()),
+        #[cfg(feature = "provider-render")]
+        vertex_attribute_locations,
     })
 }
 

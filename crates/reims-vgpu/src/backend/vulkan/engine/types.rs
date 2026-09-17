@@ -460,6 +460,30 @@ impl ColorAttachmentState {
     }
 }
 
+/// Why one request skips its CPU readback, beside [`DrawRequest::skip_readback`].
+///
+/// The two variants are the two rails that set the flag on this backend, and
+/// they are *not* interchangeable: an unpublished store has no resident and no
+/// reader (`store_action_publishes_single_sample` is false, so the guest never
+/// asked for the bytes), while a resident store is a frame the guest reads back
+/// through a mapping, a GVA or a surface cache — `draw_partial_load_from_target`
+/// counted 3943 such readers in one boot. Splitting them is what lets a census
+/// say which one a record took without re-deriving it from the assembler.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReadbackSkipReason {
+    /// The request does not skip its readback, or skipped it without naming a
+    /// reason (which no arm on this backend does).
+    #[default]
+    None,
+    /// The guest's own store action publishes nothing for this attachment, so
+    /// there is no frame to read back and no resident to hold one.
+    UnpublishedStore,
+    /// The frame landed in a resident target (the render-chain, GVA or
+    /// mapper-ref-texture rail), so the CPU copy is withheld and the bytes stay
+    /// on the GPU under that identity.
+    ResidentStore,
+}
+
 /// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
 #[derive(Debug, Default)]
 pub struct DrawRequest {
@@ -625,6 +649,21 @@ pub struct DrawRequest {
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
+    /// Why [`Self::skip_readback`] is set, when it is.
+    ///
+    /// The flag is one bit and the rails behind it are two: the 2026-09-17
+    /// `writeback`/`skip_readback` probe had to *re-derive* "the guest's store
+    /// action publishes nothing" from "the frame landed in a resident the guest
+    /// can read through a mapping" out of four call sites in a thousand-line
+    /// assembler, and one of the two is safely materializable while the other
+    /// has live readers (`draw_partial_load_from_target`). Recording the reason
+    /// where the flag is set costs one assignment per arm and makes the two
+    /// populations different names on the census rather than one number.
+    ///
+    /// [`ReadbackSkipReason::None`] beside a set `skip_readback` is a fact about
+    /// the caller, and the rail that reads this reports it as its own answer
+    /// rather than guessing which of the two it is.
+    pub readback_skip_reason: ReadbackSkipReason,
     /// Publish a Store into an admitted guest-backed primary attachment to the
     /// guest-write completion ledger in this draw's engine transaction.
     ///

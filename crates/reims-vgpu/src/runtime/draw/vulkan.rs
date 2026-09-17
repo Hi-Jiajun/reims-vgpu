@@ -248,6 +248,160 @@ pub(super) fn note_draw_shape(req: &DrawEncodeRequest) {
     }
 }
 
+/// The `slug × shape` row the 2026-09-17 render profile asked for, in one
+/// place.
+///
+/// The class gate answers with a bucket and a sentence, and the census can
+/// count the buckets — but nothing joined a bucket to the *shape* that met it.
+/// The profile had to re-derive "which shapes does `writeback` hold?" from four
+/// identities over 93 windows and could still state only an upper bound,
+/// because the gate is first-failure: every axis behind the first one that
+/// fires is invisible. This row is that join as a reading — one latched line
+/// per distinct `(slug, shape, pipeline)`, every field taken from the request
+/// that was refused — printed where the class answers.
+///
+/// Latched rather than counted for the reason `pass_color_shape` is: the
+/// population is a small closed set (the buckets the gate names × the shapes a
+/// boot states), and the counts are already the buckets' job.
+#[cfg(feature = "provider-render")]
+#[derive(Clone, Copy, Debug)]
+struct OutOfClassShape {
+    slug: &'static str,
+    format: u16,
+    width: u32,
+    height: u32,
+    slots: usize,
+    samples: u32,
+    load: u16,
+    /// Where the colour attachment's bytes live: `0` pooled, `1` a mapper
+    /// mapping, `2` a linear GVA — the same discriminant `pass_color_shape`
+    /// folds into its latch.
+    door: u8,
+    /// The request's *declared* vertex streams — the list the class gate reads.
+    attrs: usize,
+    /// The bound vertex streams, as `draw_vertex_streams_*` counts them.
+    streams: usize,
+    /// `0` no scissor, `1` one covering the attachment, `2` one that does not.
+    scissor: u8,
+    writeback_guest: bool,
+    skip: crate::backend::vulkan::engine::ReadbackSkipReason,
+    store: bool,
+    /// `0` no seed, `1` CPU bytes, `2` a resident chain.
+    seed: u8,
+    continues: bool,
+    pass_continues: bool,
+    pipeline_ref: u32,
+}
+
+#[cfg(feature = "provider-render")]
+impl OutOfClassShape {
+    /// The line, in the field order the profile's probe printed so the two can
+    /// be compared line for line.
+    fn line(&self) -> String {
+        format!(
+            "render_provider_out_of_class_shape slug={} fmt={:#x} {}x{} slots={} samples={} \
+             load={:#x} door={} attrs={} streams={} scissor={} wb={} skip={} store={} seed={} \
+             continues={} pass_cont={} pipe={}",
+            self.slug,
+            self.format,
+            self.width,
+            self.height,
+            self.slots,
+            self.samples,
+            self.load,
+            match self.door {
+                1 => "mapping",
+                2 => "gva",
+                _ => "pooled",
+            },
+            self.attrs,
+            self.streams,
+            match self.scissor {
+                1 => "full",
+                2 => "partial",
+                _ => "none",
+            },
+            self.writeback_guest as u8,
+            match self.skip {
+                crate::backend::vulkan::engine::ReadbackSkipReason::UnpublishedStore => {
+                    "unpublished"
+                }
+                crate::backend::vulkan::engine::ReadbackSkipReason::ResidentStore => "resident",
+                crate::backend::vulkan::engine::ReadbackSkipReason::None => "none",
+            },
+            self.store as u8,
+            match self.seed {
+                1 => "bytes",
+                2 => "chain",
+                _ => "none",
+            },
+            self.continues as u8,
+            self.pass_continues as u8,
+            self.pipeline_ref,
+        )
+    }
+
+    /// The latch key: every field the line prints, so two shapes that differ in
+    /// any of them are two lines rather than one line whose fields describe the
+    /// first sighting.
+    fn latch_key(&self) -> u64 {
+        let packed = u64::from(self.format) << 48
+            | (self.slots as u64 & 0xf) << 44
+            | (self.samples as u64 & 0xf) << 40
+            | u64::from(self.load) << 32
+            | (self.door as u64 & 0x3) << 30
+            | (self.attrs as u64 & 0xff) << 22
+            | (self.streams as u64 & 0xff) << 14
+            | (self.scissor as u64 & 0x3) << 12
+            | u64::from(self.writeback_guest) << 11
+            | (self.skip_code() as u64) << 9
+            | u64::from(self.store) << 8
+            | u64::from(self.seed) << 6
+            | u64::from(self.continues) << 5
+            | u64::from(self.pass_continues) << 4;
+        // The slug and the pipeline are folded in by their own values rather
+        // than by an index into a table: a bucket this file has not heard of
+        // still latches under its own name, and two pipelines that state one
+        // shape stay two rows for the reason `pipe` is on the line.
+        let shape = crate::backend::hash::hash_u64(
+            packed ^ slug_fold(self.slug),
+            (u64::from(self.width) << 32) | u64::from(self.height),
+        );
+        crate::backend::hash::hash_u64(shape, u64::from(self.pipeline_ref))
+    }
+
+    fn skip_code(&self) -> u8 {
+        match self.skip {
+            crate::backend::vulkan::engine::ReadbackSkipReason::None => 0,
+            crate::backend::vulkan::engine::ReadbackSkipReason::UnpublishedStore => 1,
+            crate::backend::vulkan::engine::ReadbackSkipReason::ResidentStore => 2,
+        }
+    }
+}
+
+/// FNV-1a over a slug's bytes, so the latch key separates buckets by name.
+///
+/// A census latch and not a checksum: the only property it needs is that two
+/// different spelling do not fold to one value, and the set it folds is the
+/// gate's own `&'static str` slugs.
+#[cfg(feature = "provider-render")]
+fn slug_fold(slug: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in slug.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Print the class boundary's `slug × shape` row, once per distinct tuple.
+#[cfg(feature = "provider-render")]
+fn note_out_of_class_shape(shape: &OutOfClassShape) {
+    if crate::observe::first_sight("render_provider_out_of_class_shape", shape.latch_key()) {
+        crate::observe::off(shape.line());
+    }
+}
+
 /// Linux / non-Apple product rail: metal2vulkan + Vulkan offscreen, then Store.
 ///
 /// `writeback_guest` is the archive multi-draw store plan (only the last record
@@ -9075,6 +9229,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // import is gone, so the only way a Store's pixels reach the guest is
         // the CPU writeback, and that needs them read back.
         resources.skip_readback = !store_is_store;
+        // Which of the two rails the flag belongs to, recorded where the flag is
+        // set: a store action that publishes nothing is a different shape from a
+        // frame that landed in a resident the guest reads back through, and the
+        // 2026-09-17 probe had to re-derive that split out of four call sites.
+        resources.readback_skip_reason = if store_is_store {
+            crate::backend::vulkan::engine::ReadbackSkipReason::None
+        } else {
+            crate::backend::vulkan::engine::ReadbackSkipReason::UnpublishedStore
+        };
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTarget);
         // Ephemeral resident render-pass rail: intermediate Store records render
         // into a protocol-keyed RGBA target on every Vulkan backend. This does
@@ -9096,6 +9259,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 resources.target_identity = Some(identity);
                 if store_is_store && !writeback_guest {
                     resources.skip_readback = true;
+                    resources.readback_skip_reason =
+                        crate::backend::vulkan::engine::ReadbackSkipReason::ResidentStore;
                     resident_render_chain = true;
                 }
             }
@@ -9109,6 +9274,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if gva_store_defer_eligible(req) {
                     resources.target_identity = Some(identity.clone());
                     resources.skip_readback = true;
+                    resources.readback_skip_reason =
+                        crate::backend::vulkan::engine::ReadbackSkipReason::ResidentStore;
                     gva_resident_store = Some(identity);
                 }
             }
@@ -9160,6 +9327,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // derived, because the derivation is a property of two other blocks.
         if renders_into_surface_identity && !resources.skip_readback {
             resources.skip_readback = true;
+            resources.readback_skip_reason =
+                crate::backend::vulkan::engine::ReadbackSkipReason::ResidentStore;
             // `resources.target_identity`, which the comparison just proved is
             // this same value, and which is what `registry_ensure` will be
             // handed. Taken from here rather than unwrapped from the `Option`
@@ -9805,6 +9974,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 vertex_entry: resolved.vertex.reflection.entry_point.as_deref(),
                 fragment_entry: resolved.fragment.reflection.entry_point.as_deref(),
                 writeback_guest,
+                // The stage's own attribute locations, so a request whose
+                // declared streams disagree with them stays on the engine
+                // instead of being answered by a provider that always refuses
+                // that shape.
+                vertex_attribute_locations: resolved.vertex_attribute_locations.as_ref(),
             };
             match provider_render::submit_render(&inputs, &resources) {
                 RenderRailOutcome::ProviderCompleted(out) => {
@@ -9840,6 +10014,68 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         req.pipeline_ref,
                         reason.detail()
                     ));
+                    // The join the profile could not read: the bucket this
+                    // answer landed in beside the shape that met it, taken from
+                    // the refused request itself.
+                    let c0 = req.colors.first();
+                    let (width, height) = c0.map(|c| (c.width, c.height)).unwrap_or((0, 0));
+                    note_out_of_class_shape(&OutOfClassShape {
+                        slug: reason.slug(),
+                        format: c0.map(|c| c.format).unwrap_or(0),
+                        width,
+                        height,
+                        slots: req.colors.len(),
+                        samples: c0.map(|c| c.sample_count).unwrap_or(1),
+                        load: c0.map(|c| c.load_action).unwrap_or(0),
+                        door: match c0 {
+                            Some(color) if color.mapping_id != 0 => 1,
+                            Some(color) if color.target_gva != 0 => 2,
+                            _ => 0,
+                        },
+                        attrs: resources.vertex_attributes.len(),
+                        streams: req
+                            .vertex_buffers
+                            .iter()
+                            .filter(|bind| bind.buffer_ref != 0)
+                            .count(),
+                        scissor: match resources.scissors.first() {
+                            None => 0,
+                            Some(scissor) => {
+                                let rect = ScissorRect {
+                                    x: scissor.x,
+                                    y: scissor.y,
+                                    width: scissor.width,
+                                    height: scissor.height,
+                                };
+                                if rect.covers(width, height) {
+                                    1
+                                } else {
+                                    2
+                                }
+                            }
+                        },
+                        writeback_guest,
+                        skip: resources.readback_skip_reason,
+                        store: c0
+                            .map(|c| {
+                                reims_vgpu_protocol::pass_action::store_action_publishes_single_sample(
+                                    c.store_action,
+                                )
+                            })
+                            .unwrap_or(true),
+                        seed: if req.chain_from_resident {
+                            2
+                        } else if resources.target_rgba8.is_some()
+                            || resources.target_guest_seed.is_some()
+                        {
+                            1
+                        } else {
+                            0
+                        },
+                        continues: resources.continues_render_pass,
+                        pass_continues: resources.render_pass_continues,
+                        pipeline_ref: req.pipeline_ref,
+                    });
                 }
                 RenderRailOutcome::ProviderDeclined(decline) => {
                     crate::observe::Emit::decline("render_provider", &decline)
@@ -15093,5 +15329,145 @@ mod memo_scratch_tests {
             3,
             "two causes share a tag and cannot be told apart"
         );
+    }
+}
+
+#[cfg(all(test, feature = "backend-vulkan", feature = "provider-render"))]
+mod out_of_class_shape_tests {
+    use super::*;
+
+    /// The class boundary's `slug × shape` row prints the fields the 2026-09-17
+    /// probe had to reconstruct by hand, in the probe's own vocabulary and
+    /// order.
+    ///
+    /// The assertion is on the whole line rather than on a field, because the
+    /// reading is a comparison: a reader holds the probe's sample line beside
+    /// this one and looks down it. A row that silently dropped an axis would
+    /// still latch — one line per shape — and the shape would be a lie.
+    #[test]
+    fn the_out_of_class_shape_row_prints_the_probes_vocabulary() {
+        let shape = OutOfClassShape {
+            slug: "render_provider_out_of_class_writeback",
+            format: 0x50,
+            width: 1920,
+            height: 1080,
+            slots: 1,
+            samples: 1,
+            load: 0x1,
+            door: 1,
+            attrs: 3,
+            streams: 3,
+            scissor: 2,
+            writeback_guest: false,
+            skip: crate::backend::vulkan::engine::ReadbackSkipReason::None,
+            store: true,
+            seed: 0,
+            continues: true,
+            pass_continues: false,
+            pipeline_ref: 42,
+        };
+        assert_eq!(
+            shape.line(),
+            "render_provider_out_of_class_shape slug=render_provider_out_of_class_writeback \
+             fmt=0x50 1920x1080 slots=1 samples=1 load=0x1 door=mapping attrs=3 streams=3 \
+             scissor=partial wb=0 skip=none store=1 seed=none continues=1 pass_cont=0 pipe=42"
+        );
+        // Both resident rails and both skip rails are named rather than folded
+        // into a bit, because the splits are the point of the row: the probe had
+        // to re-derive the first population and could not separate the second.
+        let resident = OutOfClassShape {
+            skip: crate::backend::vulkan::engine::ReadbackSkipReason::ResidentStore,
+            door: 2,
+            scissor: 0,
+            ..shape
+        };
+        assert!(
+            resident.line().contains("skip=resident")
+                && resident.line().contains("door=gva")
+                && resident.line().contains("scissor=none"),
+            "the row names which resident rail and which door: {}",
+            resident.line()
+        );
+        let unpublished = OutOfClassShape {
+            skip: crate::backend::vulkan::engine::ReadbackSkipReason::UnpublishedStore,
+            seed: 2,
+            ..shape
+        };
+        assert!(
+            unpublished.line().contains("skip=unpublished")
+                && unpublished.line().contains("seed=chain"),
+            "the row names the other skip rail and the seed's own source: {}",
+            unpublished.line()
+        );
+        // Every axis the line prints is in the latch key: two shapes that differ
+        // in one of them are two rows rather than one row describing the first
+        // sighting — the reason `pass_color_shape` folds its door into its
+        // discriminant.
+        for (name, other) in [
+            (
+                "scissor",
+                OutOfClassShape {
+                    scissor: 1,
+                    ..shape
+                },
+            ),
+            ("attrs", OutOfClassShape { attrs: 4, ..shape }),
+            (
+                "streams",
+                OutOfClassShape {
+                    streams: 2,
+                    ..shape
+                },
+            ),
+            (
+                "writeback",
+                OutOfClassShape {
+                    writeback_guest: true,
+                    ..shape
+                },
+            ),
+            (
+                "continues",
+                OutOfClassShape {
+                    continues: false,
+                    ..shape
+                },
+            ),
+            ("skip", resident),
+            (
+                "pipeline",
+                OutOfClassShape {
+                    pipeline_ref: 43,
+                    ..shape
+                },
+            ),
+            (
+                "extent",
+                OutOfClassShape {
+                    width: 1919,
+                    ..shape
+                },
+            ),
+        ] {
+            assert_ne!(
+                shape.latch_key(),
+                other.latch_key(),
+                "the {name} axis has to be part of the latch key"
+            );
+        }
+        // And the latch answers once per tuple, which is what makes the row a
+        // reading of the boundary rather than a second per-draw line.
+        assert!(crate::observe::first_sight(
+            "out_of_class_shape_row_test",
+            0xA
+        ));
+        assert!(!crate::observe::first_sight(
+            "out_of_class_shape_row_test",
+            0xA
+        ));
+        assert!(crate::observe::first_sight(
+            "out_of_class_shape_row_test",
+            0xB
+        ));
     }
 }

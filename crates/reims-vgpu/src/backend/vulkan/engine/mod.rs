@@ -76,12 +76,12 @@ pub use types::{
     ComputeStorageImageResource, ComputeStorageResidency, DepthState, DrawError, DrawOutput,
     DrawRequest, GuestRun, GuestRunSource, GuestSampledBacking, GuestTargetBacking,
     GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
-    PrimitiveTopology, SampledByteOrigin, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
-    SeedOrder, StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
-    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
-    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
-    COLOR_INPUT_BINDING,
+    PrimitiveTopology, ReadbackSkipReason, SampledByteOrigin, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource,
+    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, StorageImageFormat, TargetIdentity, TargetKeyDivergence,
+    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
+    VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]

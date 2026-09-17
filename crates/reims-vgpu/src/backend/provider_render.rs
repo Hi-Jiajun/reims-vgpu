@@ -23,19 +23,34 @@
 //!   instead of being compared at a tolerance;
 //! - **one indexed draw**, `instance_count == 1`, `base_vertex == 0`, triangle
 //!   list, single-sample;
-//! - **zero or one vertex stream** and exactly one index stream, each carried
-//!   into the trace as trace-owned bytes. The engine numbers one Vulkan binding
-//!   per attribute *location*, so the one-stream shape is one attribute at
-//!   location 0 — the shape the reviewed provider fixtures exercise;
+//! - **up to four vertex streams** and exactly one index stream, each carried
+//!   into the trace as trace-owned bytes, one canonical binding per stream. Four
+//!   is the canonical contract's `MAX_VERTEX_BUFFERS`, and it is the stream axis
+//!   the 2026-09-17 census measured as the one a real draw stream lives on
+//!   (`8327 / 8526` draws bind two to four streams, `199` bind more); a fifth
+//!   stays on the engine by name. The engine numbers one Vulkan binding per
+//!   attribute location, so a request's attribute list is a list of streams —
+//!   one attribute each — and the canonical binding index is the stream's
+//!   position in that list, which is why the class renumbers rather than
+//!   carrying the guest's binding numbers across;
+//! - **at most one scissor rectangle inside the attachment**, and no viewport
+//!   override: the canonical pass states the attachment-covering viewport and
+//!   carries the guest's own rectangle through the pass scissor
+//!   ([`RenderPassDescriptor::scissor`], the v29 channel both rails execute), so
+//!   the texels outside the rectangle keep the load op's bytes on both. A
+//!   rectangle that is empty, that reaches outside the attachment, or that is one
+//!   of several stays on the engine: the contract refuses such a rect by name
+//!   (`ScissorOutOfBounds`) while the engine *clamps* one that reaches past the
+//!   attachment, so a class that repaired it here would answer with a frame the
+//!   engine never drew;
 //! - the pipeline pair is the request's own translated stages: the two SPIR-V
 //!   modules reims' pipeline resolution produced, registered through the
 //!   canonical *translated* registration gate
 //!   (`register_translated_render_pipeline`), which checks each stage's
 //!   reflection against the contract field by field;
 //! - no depth, stencil, MSAA, MRT, resolve, present, blend, colour write mask,
-//!   viewport/scissor override, occlusion query, sampled image, sampler or
-//!   storage buffer — and every one of those is a *reason*, not a silent
-//!   downgrade;
+//!   occlusion query, sampled image, sampler or storage buffer — and every one
+//!   of those is a *reason*, not a silent downgrade;
 //! - no resident, deferred or chained target: the request is the pooled,
 //!   offscreen, CPU-readback shape (`target_identity == None`,
 //!   `skip_readback == false`, no seed and no mapper backing), which is what
@@ -91,17 +106,20 @@
 //!
 //! `research/docs/26` §3 planned to carry the vertex and index streams through
 //! the owner rail's lease channel (the one [`super::provider_owner`] gives the
-//! compute rail). The canonical render rail does **not** accept leases for
-//! render inputs yet: `render.rs::resolve_vertex_streams`, `decode_indices` and
-//! the encoder's `create_vertex_inputs` each admit `BufferSource::OwnedBytes`
-//! only, with "the first vertex-input increment executes trace-owned bytes
-//! only" as the refusal text. The streams therefore travel as trace-owned
-//! bytes here too — the same bytes reims would have staged — and the
-//! lease/window arm for render inputs is an emulator-side increment this
-//! module cannot make from here (the rail is not allowed to change
-//! `metal-api-emulator`). The report beside this increment names the exact
-//! call sites, and the owner rail stays where it is: shared with the compute
-//! rail, untouched by this one.
+//! compute rail). The canonical side has since opened that channel per binding:
+//! R3c's `resolve_render_input` resolves each stream's own
+//! `BufferSource::OwnedBytes` / `StagedLease` / `BorrowedNoCopy` arm under the
+//! input's binding index (`render.rs::resolve_vertex_streams` zips the pass's
+//! views with the pipeline layout, so N streams are N independent
+//! resolutions — nothing in it assumes one stream). What is still missing is on
+//! *this* side: this rail holds no lease for a guest-gathered stream, so every
+//! stream here travels as trace-owned bytes (the same bytes reims would have
+//! staged) and a stream the GPU would gather from guest RAM is refused by name
+//! (`render_provider_out_of_class_vertex_staging`) instead of being read
+//! through a lease this module cannot mint from the owner rail without the
+//! emulator's own lease channel. Multi-stream admission therefore changes the
+//! number of streams and not their source; the lease arm stays the named
+//! follow-up the report beside this increment records.
 //!
 //! # Error mapping
 //!
@@ -126,7 +144,7 @@ use metal_api_core::provider::{
     IndexFormat, LoadOp, OperationId, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp, TracePass,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
-    PROVIDER_SCHEMA_VERSION,
+    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::Device;
 use metal_api_vulkan::{RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage};
@@ -136,7 +154,8 @@ use super::provider_compute::{
 };
 use super::provider_owner::{self, DeviceLossTeardown};
 use super::vulkan::engine::types::{
-    BufferContent, ColorClearValue, DrawRequest, VertexStepFunction,
+    BufferContent, ColorClearValue, DrawRequest, ReadbackSkipReason, VertexAttributeResource,
+    VertexStepFunction,
 };
 use crate::observe::{decline_display, Decline};
 
@@ -181,20 +200,69 @@ fn window_admits(window: [u64; 2], width: u64, height: u64) -> Result<(), OutOfC
     if width <= window[0] && height <= window[1] {
         return Ok(());
     }
-    Err(OutOfClass {
-        // The window is one condition however many shapes meet it, so one
-        // bucket: the numbers that moved are in the sentence, and what a reader
-        // wants from the counter is how much of a boot's stream the window
-        // refuses.
-        route: "render_provider_out_of_class_attachment_window",
-        detail: Cow::Owned(format!(
+    // The window is one condition however many shapes meet it, so one bucket:
+    // the numbers that moved are in the sentence, and what a reader wants from
+    // the counter is how much of a boot's stream the window refuses.
+    Err(OutOfClass::owned(
+        "render_provider_out_of_class_attachment_window",
+        format!(
             "an attachment of {width}x{height} is outside the window this device's provider \
              declares ({}x{}, `max_attachment_dimension`): the canonical rail states the window, \
              admission refuses a wider attachment by name (`attachment_dimension_limit`), and a \
              shape the provider always refuses is not one this class executes",
             window[0], window[1],
-        )),
-    })
+        ),
+    ))
+}
+
+/// Whether one scissor rectangle is a shape the canonical pass can state.
+///
+/// The contract carries at most one rectangle per pass and refuses one that is
+/// empty or reaches outside the viewport (`ScissorOutOfBounds`), while the
+/// engine *clamps* a rectangle that reaches past the attachment and draws the
+/// intersection. The two rails therefore answer an out-of-bounds rect
+/// differently — one refuses, one draws a smaller rectangle — so such a request
+/// is a class exit and not a decline: the engine's own answer is the one the
+/// class has to leave it to.
+fn scissor_admits(
+    scissor: crate::backend::vulkan::engine::ScissorResource,
+    width: u32,
+    height: u32,
+) -> Result<[u32; 4], OutOfClass> {
+    let inside = u64::from(scissor.x)
+        .checked_add(u64::from(scissor.width))
+        .is_some_and(|end| end <= u64::from(width))
+        && u64::from(scissor.y)
+            .checked_add(u64::from(scissor.height))
+            .is_some_and(|end| end <= u64::from(height));
+    if scissor.width != 0 && scissor.height != 0 && inside {
+        return Ok([scissor.x, scissor.y, scissor.width, scissor.height]);
+    }
+    Err(OutOfClass::owned(
+        "render_provider_out_of_class_scissor",
+        format!(
+            "a scissor rectangle of {}x{} at ({}, {}) stays on the engine: the canonical pass \
+             refuses a rectangle that is empty or reaches outside the {width}x{height} \
+             attachment (`ScissorOutOfBounds`), while the engine clamps such a rectangle and \
+             draws the part inside it — so this is the engine's own answer to give",
+            scissor.width, scissor.height, scissor.x, scissor.y,
+        ),
+    ))
+}
+
+/// Whether a request's declared attributes name exactly the locations the
+/// vertex stage's own translation reports.
+///
+/// Both halves are small — the stream count is bounded by the contract's
+/// `max_vertex_buffers` and one stream carries one attribute — so the comparison
+/// is a linear walk of a list no longer than four rather than a set. A request
+/// with two attributes at one location cannot pass it: the reflected locations
+/// are distinct, so a duplicate leaves one of them uncovered.
+fn attribute_locations_match(attributes: &[VertexAttributeResource], reflected: &[u32]) -> bool {
+    attributes.len() == reflected.len()
+        && attributes
+            .iter()
+            .all(|attribute| reflected.contains(&attribute.location))
 }
 
 /// The allocation the colour attachment's declaring view lives in.
@@ -238,6 +306,21 @@ pub struct RenderRailInputs<'a> {
     /// its frame is a seed for the next record, which is a rail this increment
     /// does not execute.
     pub writeback_guest: bool,
+    /// The *vertex stage's own* attribute locations, as the translation that
+    /// produced `vertex_air` reflected them
+    /// (`CachedShader::reflection.vertex_attributes`), in the reflection's
+    /// order.
+    ///
+    /// The canonical registration gate compares the contract's vertex layout
+    /// with the reflection attribute by attribute and refuses a layout that
+    /// names an attribute the shader does not read, or one attribute fewer than
+    /// the shader reads. A request whose own declared attributes disagree with
+    /// that set is therefore a shape the provider *always* refuses — and a
+    /// refusal is a decline, not a fallback, so the class has to answer it
+    /// before the provider is asked. Carried as locations rather than as the
+    /// reflection type itself so this module keeps its provider-facing imports
+    /// and compares the one field the gate reads.
+    pub vertex_attribute_locations: &'a [u32],
 }
 
 /// What one completed narrow-class submission returns.
@@ -301,9 +384,34 @@ impl OutOfClass {
         }
     }
 
+    /// One class condition whose sentence names a number the gate *read* — the
+    /// device's declared window, the contract's stream ceiling — instead of one
+    /// this module states.
+    ///
+    /// Owned for the reason the window reason is: the number is part of the
+    /// answer, and a reader comparing two boots needs it beside the condition
+    /// rather than in a copy that can drift from the declaration it came from.
+    fn owned(slug: &'static str, detail: String) -> Self {
+        Self {
+            route: slug,
+            detail: Cow::Owned(detail),
+        }
+    }
+
     /// The sentence, for the caller to print.
     pub fn detail(&self) -> &str {
         &self.detail
+    }
+
+    /// The census bucket, for a caller that has to name the answer *and* the
+    /// shape it was asked about: the seam's latched `slug × shape` row prints
+    /// this beside the request's own fields, and the profile's probe could only
+    /// *re-derive* that join from a dozen counters while the slug was private.
+    /// Public for the same reason [`Self::detail`] is: the answer's two halves
+    /// belong to whoever prints the boundary, and neither may be re-spelled
+    /// here and there.
+    pub fn slug(&self) -> &'static str {
+        self.route
     }
 
     /// Count this answer into the census window.
@@ -554,6 +662,15 @@ fn contract_fingerprint(contract: &RenderPipelineContract) -> String {
 /// passes both is offered to the provider, and a refusal from there is a
 /// decline (never a fallback).
 pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> RenderRailOutcome {
+    // The band a widening order sizes the vertex axis on, charged for every
+    // request the gate is handed and before any condition answers — so a shape
+    // the gate refuses is still in the denominator, and the four arms sum to the
+    // band's population by construction. The list it counts is the one the
+    // vertex half of the class reads (`req.vertex_attributes`), which nothing
+    // else in this device measured: the 2026-09-17 census had the *bound* stream
+    // count (`draw_vertex_streams_*`) and no reading of the declared attributes
+    // the gate actually compares.
+    crate::runtime::drain::note_store_route(attribute_count_route(req.vertex_attributes.len()));
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(inputs, req) {
@@ -587,6 +704,21 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     match submit_narrow(inputs, &pass) {
         Ok(output) => RenderRailOutcome::ProviderCompleted(output),
         Err(decline) => RenderRailOutcome::ProviderDeclined(decline),
+    }
+}
+
+/// The census band of one request's declared vertex streams.
+///
+/// `MAX_VERTEX_BUFFERS` is the arm boundary as well as the class's ceiling: a
+/// build where the contract moved to five streams would have to rename the
+/// `_gt4` arm rather than silently count five as `2_4`, which is what the
+/// assertion in this module's tests pins.
+pub fn attribute_count_route(declared: usize) -> &'static str {
+    match declared {
+        0 => "draw_vertex_attrs_0",
+        1 => "draw_vertex_attrs_1",
+        2..=4 => "draw_vertex_attrs_2_4",
+        _ => "draw_vertex_attrs_gt4",
     }
 }
 
@@ -634,32 +766,48 @@ struct NarrowPass<'a> {
     height: u64,
     extent: u64,
     index_count: u32,
-    vertex_stream: Option<NarrowVertexStream<'a>>,
+    /// The admitted streams, in the request's own attribute order: entry `i`
+    /// becomes canonical binding `i`. One attribute per stream, because the
+    /// engine numbers one Vulkan binding per attribute location — an interleaved
+    /// stream is several attributes in the *guest's* pipeline, and each one
+    /// arrives here as its own attribute with its own bytes and stride.
+    vertex_streams: Vec<NarrowVertexStream<'a>>,
     index_stream: NarrowIndexStream<'a>,
+    /// The scissor rectangle the pass states, or `None` for the whole
+    /// attachment — the canonical pass's own default
+    /// ([`RenderPassDescriptor::scissor`]).
+    scissor: Option<[u32; 4]>,
 }
 
 impl NarrowPass<'_> {
     /// The contract's vertex layout for the admitted streams.
     ///
     /// One entry per stream, one attribute per entry: the engine numbers one
-    /// Vulkan binding per attribute *location*, so the class's one-stream shape
-    /// is one attribute at location 0 and the contract says exactly that.
+    /// Vulkan binding per attribute *location*, so a stream is one attribute
+    /// and the contract says exactly that — at the location the guest declared,
+    /// which is the location the shader reads and the one the canonical
+    /// pipeline's vertex input state is keyed on.
     /// Derived in one place because the registration gate and the pass
     /// descriptor have to agree about it — two spellings of one layout is how
     /// a registration ends up describing a pass that is never submitted.
     fn vertex_layout(&self) -> VertexLayout {
-        match &self.vertex_stream {
-            Some(stream) => VertexLayout::Buffers(vec![VertexBufferLayout {
-                stride: stream.stride,
-                step: VertexStep::PerVertex,
-                attributes: vec![VertexAttribute {
-                    location: stream.location,
-                    offset: stream.offset,
-                    format: stream.format,
-                }],
-            }]),
-            None => VertexLayout::None,
+        if self.vertex_streams.is_empty() {
+            return VertexLayout::None;
         }
+        VertexLayout::Buffers(
+            self.vertex_streams
+                .iter()
+                .map(|stream| VertexBufferLayout {
+                    stride: stream.stride,
+                    step: VertexStep::PerVertex,
+                    attributes: vec![VertexAttribute {
+                        location: stream.location,
+                        offset: stream.offset,
+                        format: stream.format,
+                    }],
+                })
+                .collect(),
+        )
     }
 }
 
@@ -678,10 +826,27 @@ fn narrow_class<'a>(
     req: &'a DrawRequest,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     if !inputs.writeback_guest {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_writeback",
-            "a record that does not own the guest writeback stays on the engine",
-        ));
+        // Two records answer this and they are different shapes: the *head* of a
+        // packet (the first record; `continues_render_pass == false`) hands its
+        // frame to the next record, and every record after it hands the chain
+        // on. Splitting the answer by name costs one branch and is what makes
+        // the next census read the 2653 chain heads and the 2065 middles apart
+        // instead of as one 4718-wide bucket; the class still refuses both,
+        // because a frame that has to reach the next record is a rail this
+        // increment does not execute.
+        return Err(if req.continues_render_pass {
+            OutOfClass::new(
+                "render_provider_out_of_class_chain_middle",
+                "a record in the middle of a multi-record packet stays on the engine: its frame \
+                 is a seed for the record after it, which is a rail this class does not execute",
+            )
+        } else {
+            OutOfClass::new(
+                "render_provider_out_of_class_chain_head",
+                "the first record of a multi-record packet stays on the engine: it hands its \
+                 frame to the next record rather than to guest memory",
+            )
+        });
     }
     if inputs.vertex_air.is_empty() || inputs.fragment_air.is_empty() {
         return Err(OutOfClass::new(
@@ -750,10 +915,35 @@ fn narrow_class<'a>(
         ));
     }
     if req.skip_readback {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_skip_readback",
-            "a record that skips its readback stays on the engine",
-        ));
+        // Which of the two rails set the flag decides the name, because they are
+        // not the same shape: a store that publishes nothing has no resident and
+        // no reader, while a resident store is a frame the guest reads back
+        // through a mapping or a GVA (`draw_partial_load_from_target`). The
+        // class refuses both here — the second until the provider can own a
+        // named resident, the first until its writeback route is reviewed — and
+        // the split is what lets the next census size them separately.
+        return Err(match req.readback_skip_reason {
+            ReadbackSkipReason::ResidentStore => OutOfClass::new(
+                "render_provider_out_of_class_resident_store",
+                "a record whose frame lands in an engine-resident target stays on the engine: the \
+                 resident is what the guest reads back through, and the canonical rail cannot \
+                 name it yet",
+            ),
+            ReadbackSkipReason::UnpublishedStore => OutOfClass::new(
+                "render_provider_out_of_class_unpublished_store",
+                "a record whose store action publishes nothing stays on the engine: the class \
+                 reads its frame back from the completion, and a store that lands nowhere is a \
+                 route this increment has not reviewed",
+            ),
+            // A skip with no recorded reason is a fact about the caller rather
+            // than a third rail, and guessing which of the two it is would name
+            // the wrong population.
+            ReadbackSkipReason::None => OutOfClass::new(
+                "render_provider_out_of_class_skip_readback",
+                "a record that skips its readback for a reason this rail cannot name stays on the \
+                 engine",
+            ),
+        });
     }
     if req.target_identity.is_some()
         || req.seed_from_target.is_some()
@@ -826,13 +1016,32 @@ fn narrow_class<'a>(
             "a draw with a blend constant stays on the engine",
         ));
     }
-    if !req.viewports.is_empty() || !req.scissors.is_empty() {
+    // The viewport the canonical pass states is the attachment-covering one and
+    // nothing else, so a request that binds a viewport of its own stays on the
+    // engine. The scissor is the other half of that pair and the contract does
+    // carry it: `RenderPassDescriptor::scissor` is the v29 channel both rails
+    // execute, and the pass states it verbatim — so a request that binds exactly
+    // one rectangle inside the attachment is in class, and its texels outside
+    // the rectangle keep the load op's bytes on both rails.
+    if !req.viewports.is_empty() {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_viewport",
-            "an explicit viewport or scissor stays on the engine: the canonical pass states the \
-             attachment-covering viewport and no scissor",
+            "a request that binds a viewport of its own stays on the engine: the canonical pass \
+             states the attachment-covering viewport, and another size or origin is not state the \
+             frozen pass descriptor can carry",
         ));
     }
+    let scissor = match req.scissors.as_slice() {
+        [] => None,
+        [scissor] => Some(scissor_admits(*scissor, req.width, req.height)?),
+        _ => {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_scissor_count",
+                "a draw that binds more than one scissor rectangle stays on the engine: the \
+                 canonical pass carries at most one, and one rectangle cannot state the others",
+            ))
+        }
+    };
     if req.raster.cull_mode != reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.cull_mode
         || req.raster.winding != reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.winding
         || req.raster.depth_clip_mode
@@ -902,64 +1111,82 @@ fn narrow_class<'a>(
         ));
     }
 
-    // The engine numbers one Vulkan binding per attribute location, so the
-    // one-stream class is one attribute at location 0. The same shape reaches
-    // the contract as one stream with one attribute.
-    let vertex_stream = match req.vertex_attributes.as_slice() {
-        [] => None,
-        [attribute] => {
-            if attribute.binding != 0 || attribute.location != 0 {
-                return Err(OutOfClass::new(
-                    "render_provider_out_of_class_vertex_location",
-                    "a vertex attribute that is not location 0 of binding 0 stays on the engine",
-                ));
-            }
-            if attribute.step_function != VertexStepFunction::PerVertex {
-                return Err(OutOfClass::new(
-                    "render_provider_out_of_class_vertex_step",
-                    "a per-instance vertex stream stays on the engine",
-                ));
-            }
-            let Some(format) = vertex_format(attribute.format) else {
-                return Err(OutOfClass::new(
-                    "render_provider_out_of_class_vertex_format",
-                    "a vertex attribute outside the canonical format set stays on the engine \
-                     (Float32x2, Float32x3, Float32x4, Uint32)",
-                ));
-            };
-            let stride = u64::from(attribute.stride);
-            if stride < u64::from(attribute.offset) + format.bytes() {
-                return Err(OutOfClass::new(
-                    "render_provider_out_of_class_vertex_stride",
-                    "a vertex layout whose attribute does not fit its stride stays on the engine",
-                ));
-            }
-            let bytes = staged_bytes(&attribute.content).ok_or(OutOfClass::new(
-                "render_provider_out_of_class_vertex_staging",
-                "a vertex stream the GPU gathers from guest RAM stays on the engine",
-            ))?;
-            if bytes.len() < usize::try_from(stride).unwrap_or(usize::MAX) {
-                return Err(OutOfClass::new(
-                    "render_provider_out_of_class_vertex_short",
-                    "a vertex stream shorter than one record stays on the engine",
-                ));
-            }
-            Some(NarrowVertexStream {
-                location: attribute.location,
-                offset: u64::from(attribute.offset),
-                stride,
-                format,
-                bytes,
-            })
-        }
-        _ => {
+    // One stream per declared attribute, because that is the shape both rails
+    // execute: the engine numbers one Vulkan binding per attribute *location*
+    // (`runtime/draw/vulkan.rs` builds `binding: a.location`), and the canonical
+    // layout this class states describes binding `i` with the request's `i`-th
+    // attribute and nothing else. Four is the canonical contract's
+    // `max_vertex_buffers` — the axis 97.7 % of the measured draw stream lives on
+    // — and a fifth is a layout the contract cannot state, so it stays on the
+    // engine rather than in a trace admission would refuse.
+    if req.vertex_attributes.len() > MAX_VERTEX_BUFFERS {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_vertex_stream_limit",
+            format!(
+                "a draw that binds more than {MAX_VERTEX_BUFFERS} vertex streams stays on the \
+                 engine: {} is the canonical contract's `max_vertex_buffers`, and a wider layout \
+                 is a shape admission refuses by name",
+                MAX_VERTEX_BUFFERS,
+            ),
+        ));
+    }
+    // The declared attributes and the vertex stage's *own* reflection have to
+    // name the same locations. The registration gate compares the two field by
+    // field and refuses a mismatch — a stream the shader never reads, or a
+    // location it reads that no stream covers — so a request that disagrees with
+    // its own translation is a shape the provider always refuses, and a refusal
+    // is a decline rather than a fallback. Answering it here is what keeps the
+    // class's one promise: everything it admits is a shape the provider executes.
+    if !attribute_locations_match(&req.vertex_attributes, inputs.vertex_attribute_locations) {
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_vertex_interface",
+            "a request whose declared vertex attributes do not name exactly the locations the \
+             vertex stage reads stays on the engine: the canonical registration gate compares \
+             the layout with the reflection field by field, so this is a shape the provider \
+             always refuses",
+        ));
+    }
+    let mut vertex_streams = Vec::with_capacity(req.vertex_attributes.len());
+    for attribute in &req.vertex_attributes {
+        if attribute.step_function != VertexStepFunction::PerVertex {
             return Err(OutOfClass::new(
-                "render_provider_out_of_class_vertex_count",
-                "a pass with more than one vertex attribute stays on the engine: the admitted \
-                 class is one attribute at location 0",
-            ))
+                "render_provider_out_of_class_vertex_step",
+                "a per-instance vertex stream stays on the engine: the canonical layout states \
+                 one step per stream and the class admits the per-vertex one",
+            ));
         }
-    };
+        let Some(format) = vertex_format(attribute.format) else {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_vertex_format",
+                "a vertex attribute outside the canonical format set stays on the engine \
+                 (Float32x2, Float32x3, Float32x4, Uint32)",
+            ));
+        };
+        let stride = u64::from(attribute.stride);
+        if stride < u64::from(attribute.offset) + format.bytes() {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_vertex_stride",
+                "a vertex layout whose attribute does not fit its stride stays on the engine",
+            ));
+        }
+        let bytes = staged_bytes(&attribute.content).ok_or(OutOfClass::new(
+            "render_provider_out_of_class_vertex_staging",
+            "a vertex stream the GPU gathers from guest RAM stays on the engine",
+        ))?;
+        if bytes.len() < usize::try_from(stride).unwrap_or(usize::MAX) {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_vertex_short",
+                "a vertex stream shorter than one record stays on the engine",
+            ));
+        }
+        vertex_streams.push(NarrowVertexStream {
+            location: attribute.location,
+            offset: u64::from(attribute.offset),
+            stride,
+            format,
+            bytes,
+        });
+    }
 
     Ok(NarrowPass {
         vertex_entry: vertex_entry.to_owned(),
@@ -971,11 +1198,12 @@ fn narrow_class<'a>(
         height: u64::from(req.height),
         extent,
         index_count: index.index_count,
-        vertex_stream,
+        vertex_streams,
         index_stream: NarrowIndexStream {
             format: index_format,
             bytes: index_bytes,
         },
+        scissor,
     })
 }
 
@@ -1080,10 +1308,17 @@ fn submit_narrow(
 
     let mut vertex_buffers = Vec::new();
     let mut next_view = FIRST_INPUT_VIEW;
-    if let Some(stream) = &pass.vertex_stream {
+    for (binding, stream) in pass.vertex_streams.iter().enumerate() {
+        // The canonical binding index is the stream's position in the request,
+        // not the guest's own binding number: the contract requires entry `i` to
+        // carry `metal_binding == i` (`VertexBufferBindingMismatch` otherwise),
+        // and the pipeline's vertex input state is keyed on attribute
+        // *locations*, which are the guest's and are carried unchanged. Two
+        // rails that agree on every location, format, offset and stride fetch
+        // the same bytes whatever the binding numbers are called.
         vertex_buffers.push(BufferView {
             view_id: ViewId::new(next_view),
-            metal_binding: stream.location,
+            metal_binding: u32::try_from(binding).unwrap_or(u32::MAX),
             allocation_id: input_allocation(next_view),
             offset: 0,
             length: u64::try_from(stream.bytes.len()).unwrap_or(u64::MAX),
@@ -1125,7 +1360,7 @@ fn submit_narrow(
             u32::try_from(pass.width).unwrap_or(u32::MAX),
             u32::try_from(pass.height).unwrap_or(u32::MAX),
         ],
-        scissor: None,
+        scissor: pass.scissor,
         vertices: pass.index_count,
         vertex_buffers,
         indices: Some(indices),
@@ -1210,9 +1445,9 @@ fn submit_narrow(
 /// stream and one for the index stream, with the view's own length as the
 /// extent.
 fn input_allocations(pass: &NarrowPass<'_>) -> Vec<(AllocationId, u64)> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(pass.vertex_streams.len() + 1);
     let mut next_view = FIRST_INPUT_VIEW;
-    if let Some(stream) = &pass.vertex_stream {
+    for stream in &pass.vertex_streams {
         out.push((
             input_allocation(next_view),
             u64::try_from(stream.bytes.len()).unwrap_or(u64::MAX),

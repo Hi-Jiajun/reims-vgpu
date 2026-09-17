@@ -28,8 +28,8 @@ use reims_vgpu::backend::provider_render::{
 };
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
-    IndexedDrawResource, PrimitiveTopology, SamplerResource, VertexAttributeFormat,
-    VertexAttributeResource, VertexStepFunction, ViewportResource,
+    IndexedDrawResource, PrimitiveTopology, ReadbackSkipReason, SamplerResource, ScissorResource,
+    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
 };
 use reims_vgpu::observe::Decline as _;
 use reims_vgpu::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
@@ -80,31 +80,76 @@ fn fixture(name: &str) -> Vec<u8> {
         .to_vec()
 }
 
-/// The vertex module and the fragment module of the admitted shape: the rail's
-/// own `float2`-per-vertex fixture and the reviewer's solid-colour fragment.
-fn stage_air() -> (Vec<u8>, Vec<u8>) {
-    (fixture("reims_indexed_tri.air"), fixture("render_frag.air"))
+/// One translated stage pair, beside the reflection facts the class gate reads
+/// from the vertex half.
+///
+/// The AIR travels to both arms of every test — the canonical provider
+/// translates it itself, the engine goes through this crate's translator — so
+/// the two must be the same bytes; the entry names and the reflected attribute
+/// locations are what the seam would take from `CachedShader::reflection` and
+/// hands the rail as inputs.
+struct Stages {
+    air: (Vec<u8>, Vec<u8>),
+    vertex_entry: &'static str,
+    fragment_entry: &'static str,
+    vertex_attribute_locations: Vec<u32>,
 }
 
-/// The entry names those two modules declare (`llvm-dis` shows them; the
-/// canonical gate checks the contract against the reflection, and the
-/// reflection carries the AIR function's name).
-const VERTEX_ENTRY: &str = "reims_indexed_vertex";
+/// The reviewer's solid-colour fragment, shared by every vertex fixture here.
 const FRAGMENT_ENTRY: &str = "fmain";
 
-/// Three vertices of `float2` clip positions covering the viewport — the same
-/// full-screen triangle the reviewed milestone uses, but read from a
-/// caller-held stream so the vertex-input half of the class is exercised.
-///
-/// `(-1, -3)`, `(-1, 1)`, `(3, 1)` as little-endian `f32` pairs.
-const VERTEX_BYTES: [u8; 24] = [
-    0x00, 0x00, 0x80, 0xbf, // -1.0
-    0x00, 0x00, 0x40, 0xc0, // -3.0
-    0x00, 0x00, 0x80, 0xbf, // -1.0
-    0x00, 0x00, 0x80, 0x3f, //  1.0
-    0x00, 0x00, 0x40, 0x40, //  3.0
-    0x00, 0x00, 0x80, 0x3f, //  1.0
-];
+fn stages(vertex_fixture: &str, vertex_entry: &'static str, locations: &[u32]) -> Stages {
+    Stages {
+        air: (fixture(vertex_fixture), fixture("render_frag.air")),
+        vertex_entry,
+        fragment_entry: FRAGMENT_ENTRY,
+        vertex_attribute_locations: locations.to_vec(),
+    }
+}
+
+/// The reviewed one-stream shape: `float2` per vertex at location 0, the
+/// fixture the rail shipped with.
+fn reviewed_stages() -> Stages {
+    stages("reims_indexed_tri.air", "reims_indexed_vertex", &[0])
+}
+
+/// The two-stream shape: position at location 0 and an offset at location 1,
+/// each its own stream and each read by the vertex stage.
+fn two_stream_stages() -> Stages {
+    stages(
+        "reims_indexed_tri_two_stream.air",
+        "reims_two_stream_vertex",
+        &[0, 1],
+    )
+}
+
+/// The four-stream shape — the widest interface the canonical contract can
+/// state (`max_vertex_buffers`): position at location 0 and three offsets after
+/// it, all read by the vertex stage.
+fn four_stream_stages() -> Stages {
+    stages(
+        "reims_indexed_tri_four_stream.air",
+        "reims_four_stream_vertex",
+        &[0, 1, 2, 3],
+    )
+}
+
+/// `float2` records in the order a stream carries them: little-endian pairs.
+fn f32x2(records: &[(f32, f32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(records.len() * 8);
+    for (x, y) in records {
+        out.extend_from_slice(&x.to_ne_bytes());
+        out.extend_from_slice(&y.to_ne_bytes());
+    }
+    out
+}
+
+/// The reviewed position stream: `(-1, -3)`, `(-1, 1)`, `(3, 1)` — the
+/// full-screen triangle the reviewed milestone uses, read from a caller-held
+/// stream so the vertex-input half of the class is exercised.
+fn position_records() -> Vec<u8> {
+    f32x2(&[(-1.0, -3.0), (-1.0, 1.0), (3.0, 1.0)])
+}
 
 /// `[0, 1, 2]` as `u32` little-endian: the reviewed indexed shape, whose index
 /// values select the three vertices in order.
@@ -163,10 +208,81 @@ fn attachment(format: u16) -> reims_vgpu::backend::vulkan::engine::ColorAttachme
         .with_clear(CLEAR)
 }
 
+/// One vertex stream of a test's draw, in the terms the production seam builds
+/// it: a `float2` attribute at its own location, one record per vertex, and the
+/// bytes of the whole window.
+///
+/// Separate from [`VertexAttributeResource`] because the two arms of a test —
+/// the rail and the engine — each need their own request, and the resource type
+/// owns its bytes.
+struct StreamSpec {
+    location: u32,
+    offset: u32,
+    stride: u32,
+    bytes: Vec<u8>,
+}
+
+fn streams(specs: &[StreamSpec]) -> Vec<VertexAttributeResource> {
+    specs
+        .iter()
+        .map(|spec| VertexAttributeResource {
+            location: spec.location,
+            // The engine numbers one Vulkan binding per attribute *location*
+            // (`runtime/draw/vulkan.rs` builds `binding: a.location`), which is
+            // why the seam's own requests spell it that way too.
+            binding: spec.location,
+            format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
+                .expect("Float2 is a vertex format"),
+            offset: spec.offset,
+            stride: spec.stride,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: BufferContent::Bytes(std::sync::Arc::new(spec.bytes.clone())),
+        })
+        .collect()
+}
+
+/// The reviewed position stream: the full-screen triangle at location 0.
+fn position_stream() -> StreamSpec {
+    StreamSpec {
+        location: 0,
+        offset: 0,
+        stride: 8,
+        bytes: position_records(),
+    }
+}
+
+fn position_streams() -> [StreamSpec; 1] {
+    [position_stream()]
+}
+
+/// One stream of the multi-stream shapes: `float2` records at `location`, stride
+/// eight.
+///
+/// The fixtures behind these streams assemble their clip position by extraction
+/// and insertion rather than by arithmetic — the canonical provider's translator
+/// revision asks for `FloatControls2` on every floating-point operation and its
+/// capability subset refuses it, so a shader with an `fadd` in it never reaches
+/// this rail at all (the increment's report records that finding).
+fn stream(location: u32, records: &[(f32, f32)]) -> StreamSpec {
+    StreamSpec {
+        location,
+        offset: 0,
+        stride: 8,
+        bytes: f32x2(records),
+    }
+}
+
 /// The admitted request, in the terms the production seam builds it: one colour
 /// attachment, one vertex stream (one `float2` attribute at location 0), one
 /// index stream, and the pooled offscreen target whose whole frame is read back.
 fn narrow_request(format: u16) -> DrawRequest {
+    request_with_streams(format, &position_streams())
+}
+
+/// The same shape with the streams a test hands it, so the multi-stream half of
+/// the class is exercised through the same request builder the rail sees.
+fn request_with_streams(format: u16, specs: &[StreamSpec]) -> DrawRequest {
     let (width, height) = extent();
     DrawRequest {
         width,
@@ -182,17 +298,7 @@ fn narrow_request(format: u16) -> DrawRequest {
             vertex_offset: 0,
             content: BufferContent::Bytes(std::sync::Arc::new(INDEX_BYTES.to_vec())),
         }),
-        vertex_attributes: vec![VertexAttributeResource {
-            location: 0,
-            binding: 0,
-            format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
-                .expect("Float2 is a vertex format"),
-            offset: 0,
-            stride: 8,
-            step_function: VertexStepFunction::PerVertex,
-            step_rate: 1,
-            content: BufferContent::Bytes(std::sync::Arc::new(VERTEX_BYTES.to_vec())),
-        }],
+        vertex_attributes: streams(specs),
         color_attachment: Some(attachment(format)),
         color0_declared: Some(reims_vgpu::protocol::pass_action::LoadAction::Clear),
         ..Default::default()
@@ -202,24 +308,31 @@ fn narrow_request(format: u16) -> DrawRequest {
 /// `MTLVertexFormat::Float2`.
 const MTL_FORMAT_VERTEX_FLOAT2: u32 = 29;
 
-fn inputs<'a>(air: &'a (Vec<u8>, Vec<u8>), writeback_guest: bool) -> RenderRailInputs<'a> {
+fn inputs<'a>(stages: &'a Stages, writeback_guest: bool) -> RenderRailInputs<'a> {
     RenderRailInputs {
-        vertex_air: &air.0,
-        fragment_air: &air.1,
-        vertex_entry: Some(VERTEX_ENTRY),
-        fragment_entry: Some(FRAGMENT_ENTRY),
+        vertex_air: &stages.air.0,
+        fragment_air: &stages.air.1,
+        vertex_entry: Some(stages.vertex_entry),
+        fragment_entry: Some(stages.fragment_entry),
         writeback_guest,
+        vertex_attribute_locations: &stages.vertex_attribute_locations,
     }
 }
 
 /// The engine arm: the same AIR, translated by this crate's own translator.
-fn engine_request(air: &(Vec<u8>, Vec<u8>), format: u16) -> DrawRequest {
-    let mut req = narrow_request(format);
+fn engine_request(stages: &Stages, format: u16, specs: &[StreamSpec]) -> DrawRequest {
+    translated(stages, request_with_streams(format, specs))
+}
+
+/// One request with this crate's own translation of the same AIR in it: what
+/// the self-contained engine needs, and the only difference between the two
+/// arms of a test.
+fn translated(stages: &Stages, mut req: DrawRequest) -> DrawRequest {
     let words = |stage| -> Vec<u32> {
         let shader = reims_vgpu::runtime::m2v_cache::translate_cached_reflected(
             match stage {
-                metal2vulkan::passes::Stage::Vertex => air.0.as_slice(),
-                metal2vulkan::passes::Stage::Fragment => air.1.as_slice(),
+                metal2vulkan::passes::Stage::Vertex => stages.air.0.as_slice(),
+                metal2vulkan::passes::Stage::Fragment => stages.air.1.as_slice(),
                 metal2vulkan::passes::Stage::Kernel => unreachable!("render stages only"),
             },
             stage,
@@ -231,6 +344,32 @@ fn engine_request(air: &(Vec<u8>, Vec<u8>), format: u16) -> DrawRequest {
     req.vert_spirv = std::sync::Arc::new(words(metal2vulkan::passes::Stage::Vertex));
     req.frag_spirv = std::sync::Arc::new(words(metal2vulkan::passes::Stage::Fragment));
     req
+}
+
+/// The canonical rail's own frame for one request, in semantic RGBA8.
+fn provider_pixels(label: &str, stages: &Stages, req: &DrawRequest) -> Vec<u8> {
+    match provider_render::submit_render(&inputs(stages, true), req) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("{label}: the canonical provider has to execute this shape: {other:?}"),
+    }
+}
+
+/// The self-contained engine's frame for the same request, in semantic RGBA8.
+///
+/// `None` when the acceptance environment has no Vulkan device at all, which is
+/// the one condition the reviewed cases treat as a skip.
+fn engine_pixels(label: &str, stages: &Stages, req: DrawRequest) -> Option<Vec<u8>> {
+    match engine::execute_draw_request(engine_device(), &translated(stages, req)) {
+        Ok(out) => Some(semantic_rgba(out.pixels, out.pixels_bgra)),
+        Err(error) => {
+            let text = error.to_string();
+            if skip_if_no_gpu(&text) {
+                eprintln!("SKIP {label} engine arm: no GPU ({text})");
+                return None;
+            }
+            panic!("{label} engine arm: {text}")
+        }
+    }
 }
 
 fn skip_if_no_gpu(error: &str) -> bool {
@@ -255,32 +394,68 @@ fn semantic_rgba(mut pixels: Vec<u8>, bgra: bool) -> Vec<u8> {
 }
 
 fn assert_solid(label: &str, pixels: &[u8]) {
+    assert_texel_count(label, pixels);
+    for (index, texel) in pixels.chunks_exact(4).enumerate() {
+        assert_texel_near(
+            &format!("{label}: texel {index}"),
+            [texel[0], texel[1], texel[2], texel[3]],
+            FRAGMENT_TEXEL,
+        );
+    }
+}
+
+/// The attachment's whole extent has to come back, whatever the frame is.
+fn assert_texel_count(label: &str, pixels: &[u8]) {
     let (width, height) = extent();
     assert_eq!(
         pixels.len(),
         (width * height * 4) as usize,
         "{label}: the attachment's whole extent has to come back"
     );
-    for (index, texel) in pixels.chunks_exact(4).enumerate() {
-        for channel in 0..4 {
-            let got = texel[channel];
-            let want = FRAGMENT_TEXEL[channel];
-            assert!(
-                (i32::from(got) - i32::from(want)).abs() <= 1,
-                "{label}: texel {index} channel {channel} is {got}, expected ~{want}; the \
-                 full-screen triangle has to cover every texel"
-            );
-        }
+}
+
+/// One texel of a readback, in the attachment's own physical order.
+fn texel_at(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
+    let (width, _) = extent();
+    let offset = ((y * width + x) * 4) as usize;
+    [
+        pixels[offset],
+        pixels[offset + 1],
+        pixels[offset + 2],
+        pixels[offset + 3],
+    ]
+}
+
+/// A texel the fragment stage covered: the fragment's own colour, within a
+/// rounding step, because the attachment rounds the `float32` output to eight
+/// bits on both rails.
+fn assert_texel_near(label: &str, got: [u8; 4], want: [u8; 4]) {
+    for channel in 0..4 {
+        assert!(
+            (i32::from(got[channel]) - i32::from(want[channel])).abs() <= 1,
+            "{label}: channel {channel} is {}, expected ~{} (whole texel {got:?}, want {want:?})",
+            got[channel],
+            want[channel],
+        );
     }
+}
+
+/// A texel the fragment stage did *not* cover: the clear, byte-exact.
+fn assert_clear_texel(label: &str, got: [u8; 4]) {
+    assert_eq!(
+        got,
+        [0, 0, 0, 255],
+        "{label}: a texel outside the scissor keeps the clear's own bytes"
+    );
 }
 
 #[test]
 fn the_production_seam_completes_the_reviewed_shape_and_agrees_with_the_engine() {
     let _guard = engine_test_session();
-    let air = stage_air();
+    let stages = reviewed_stages();
     let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
 
-    let provider = match provider_render::submit_render(&inputs(&air, true), &req) {
+    let provider = match provider_render::submit_render(&inputs(&stages, true), &req) {
         RenderRailOutcome::ProviderCompleted(out) => out,
         RenderRailOutcome::NotInNarrowClass(reason) => {
             panic!("the reviewed shape is in the narrow class; refused: {reason}")
@@ -296,7 +471,7 @@ fn the_production_seam_completes_the_reviewed_shape_and_agrees_with_the_engine()
     let provider_pixels = semantic_rgba(provider.bytes, provider.bgra);
     assert_solid("provider", &provider_pixels);
 
-    let engine_req = engine_request(&air, MTL_FORMAT_RGBA8_UNORM);
+    let engine_req = engine_request(&stages, MTL_FORMAT_RGBA8_UNORM, &position_streams());
     let engine_out = match engine::execute_draw_request(engine_device(), &engine_req) {
         Ok(out) => out,
         Err(error) => {
@@ -323,9 +498,9 @@ fn the_production_seam_completes_the_reviewed_shape_and_agrees_with_the_engine()
 #[test]
 fn a_bgra_attachment_reports_guest_scanout_order() {
     let _guard = engine_test_session();
-    let air = stage_air();
+    let stages = reviewed_stages();
     let req = narrow_request(MTL_FORMAT_BGRA8_UNORM);
-    match provider_render::submit_render(&inputs(&air, true), &req) {
+    match provider_render::submit_render(&inputs(&stages, true), &req) {
         RenderRailOutcome::ProviderCompleted(out) => {
             assert!(out.bgra, "a Bgra8Unorm attachment reads back in BGRA order");
             // The same colour, in the other physical order: the fragment
@@ -343,15 +518,16 @@ fn a_bgra_attachment_reports_guest_scanout_order() {
 #[test]
 fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     let _guard = engine_test_session();
-    let air = stage_air();
-    let class = |req: &DrawRequest| match provider_render::submit_render(&inputs(&air, true), req) {
-        RenderRailOutcome::NotInNarrowClass(_) => (),
-        other => panic!("expected an out-of-class answer, got {other:?}"),
-    };
+    let stages = reviewed_stages();
+    let class =
+        |req: &DrawRequest| match provider_render::submit_render(&inputs(&stages, true), req) {
+            RenderRailOutcome::NotInNarrowClass(_) => (),
+            other => panic!("expected an out-of-class answer, got {other:?}"),
+        };
 
     // A record that does not own the guest writeback is a chain intermediate.
     let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    match provider_render::submit_render(&inputs(&air, false), &req) {
+    match provider_render::submit_render(&inputs(&stages, false), &req) {
         RenderRailOutcome::NotInNarrowClass(_) => (),
         other => panic!("a chain intermediate is out of class: {other:?}"),
     }
@@ -361,21 +537,21 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     req.indexed = None;
     class(&req);
 
-    // Two vertex attributes: the admitted class is one location-0 attribute.
+    // A second stream the vertex stage does not read: several streams are in
+    // class now, but only the ones the shader's own reflection names — the
+    // canonical registration gate compares the two and refuses a stream nothing
+    // reads, which is a decline rather than a fallback.
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    let first = &req.vertex_attributes[0];
+    let format = req.vertex_attributes[0].format;
     req.vertex_attributes.push(VertexAttributeResource {
         location: 1,
         binding: 1,
-        format: first.format,
+        format,
         offset: 8,
         stride: 16,
         step_function: VertexStepFunction::PerVertex,
         step_rate: 1,
-        content: BufferContent::Bytes(std::sync::Arc::clone(match &first.content {
-            BufferContent::Bytes(bytes) => bytes,
-            BufferContent::GuestRuns(_) => panic!("the fixture is CPU-staged"),
-        })),
+        content: BufferContent::Bytes(std::sync::Arc::new(position_records())),
     });
     class(&req);
 
@@ -536,10 +712,10 @@ fn each_out_of_class_condition_is_counted_under_its_own_bucket() {
     use reims_vgpu::protocol::pass_action::LoadAction;
 
     let _guard = engine_test_session();
-    let air = stage_air();
+    let stages = reviewed_stages();
     let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
     let out_of_class =
-        |req: &DrawRequest| match provider_render::submit_render(&inputs(&air, true), req) {
+        |req: &DrawRequest| match provider_render::submit_render(&inputs(&stages, true), req) {
             RenderRailOutcome::NotInNarrowClass(reason) => {
                 assert!(
                     !reason.detail().is_empty(),
@@ -562,7 +738,7 @@ fn each_out_of_class_condition_is_counted_under_its_own_bucket() {
     // bucket: the counters are charged where the gate answers, not where a
     // render request arrives.
     let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    match provider_render::submit_render(&inputs(&air, true), &req) {
+    match provider_render::submit_render(&inputs(&stages, true), &req) {
         RenderRailOutcome::ProviderCompleted(_) => (),
         other => panic!("the reviewed shape is in class: {other:?}"),
     }
@@ -635,7 +811,7 @@ fn each_out_of_class_condition_is_counted_under_its_own_bucket() {
 #[test]
 fn the_class_window_is_the_providers_declaration() {
     let _guard = engine_test_session();
-    let air = stage_air();
+    let stages = reviewed_stages();
     let (window_width, window_height) = extent();
     eprintln!(
         "declared attachment window: {window_width}x{window_height} (read from a live provider \
@@ -646,7 +822,7 @@ fn the_class_window_is_the_providers_declaration() {
     // the untouched-counter assertion below is not vacuous).
     let delivered = provider_render::provider_submissions();
     let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    match provider_render::submit_render(&inputs(&air, true), &req) {
+    match provider_render::submit_render(&inputs(&stages, true), &req) {
         RenderRailOutcome::ProviderCompleted(out) => assert_solid(
             "at the declared window",
             &semantic_rgba(out.bytes, out.bgra),
@@ -671,7 +847,7 @@ fn the_class_window_is_the_providers_declaration() {
         req.height = height;
         let request_extent = format!("{width}x{height}");
         let declared = format!("{window_width}x{window_height}");
-        match provider_render::submit_render(&inputs(&air, true), &req) {
+        match provider_render::submit_render(&inputs(&stages, true), &req) {
             RenderRailOutcome::NotInNarrowClass(reason) => {
                 assert!(
                     reason.detail().contains(request_extent.as_str()),
@@ -698,11 +874,11 @@ fn the_class_window_is_the_providers_declaration() {
 #[test]
 fn an_in_class_shape_the_provider_refuses_is_a_typed_decline() {
     let _guard = engine_test_session();
-    let air = stage_air();
+    let stages = reviewed_stages();
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.indexed.as_mut().expect("indexed").content =
         BufferContent::Bytes(std::sync::Arc::new(INDEX_BYTES[..4].to_vec()));
-    match provider_render::submit_render(&inputs(&air, true), &req) {
+    match provider_render::submit_render(&inputs(&stages, true), &req) {
         RenderRailOutcome::ProviderDeclined(decline) => {
             assert_eq!(
                 decline.slug(),
@@ -737,10 +913,10 @@ fn an_in_class_shape_the_provider_refuses_is_a_typed_decline() {
 #[test]
 fn a_second_submission_reuses_the_registration() {
     let _guard = engine_test_session();
-    let air = stage_air();
+    let stages = reviewed_stages();
     let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     for round in 0..2 {
-        match provider_render::submit_render(&inputs(&air, true), &req) {
+        match provider_render::submit_render(&inputs(&stages, true), &req) {
             RenderRailOutcome::ProviderCompleted(out) => {
                 assert_solid(
                     &format!("round {round}"),
@@ -777,4 +953,524 @@ fn the_decline_slugs_name_the_provider_class() {
         );
     }
     assert!(VertexFormat::ADMITTED.contains(&VertexFormat::Float32x2));
+}
+
+/// The multi-stream half of the class, end to end.
+///
+/// Two streams, one attribute each: the vertex stage adds the second to the
+/// first, so a rail that dropped the second stream — or bound the first one
+/// twice — would draw the *reviewed* full-screen frame instead. The test
+/// separates those two outcomes rather than only asserting that the rails agree,
+/// because "both rails agree" is also what a rail that ignores its input says.
+///
+/// The offset is x-only on purpose. It leaves the shape symmetric under the NDC
+/// y convention the two rails have never agreed about (`metal-api-vulkan`'s own
+/// render fixture records the same split: Vulkan's y points down, Metal's points
+/// up), so the parity asserted here is about the stream plumbing and not about
+/// an axis this increment does not touch.
+#[test]
+fn a_two_stream_shape_draws_the_same_bytes_on_both_rails() {
+    let _guard = engine_test_session();
+    let stages = two_stream_stages();
+    let (width, height) = extent();
+
+    let reviewed_req = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[position_stream(), stream(1, &[(0.0, 0.0); 3])],
+    );
+    let reviewed = provider_pixels("two streams, zero offset", &stages, &reviewed_req);
+    assert_solid("two streams, zero offset (provider)", &reviewed);
+    let Some(engine_reviewed) = engine_pixels("two streams, zero offset", &stages, reviewed_req)
+    else {
+        return;
+    };
+    assert_eq!(
+        reviewed, engine_reviewed,
+        "the identity offset has to land the reviewed frame on both rails"
+    );
+
+    let shifted_req = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[position_stream(), stream(1, &[(0.25, 0.0); 3])],
+    );
+    let shifted = provider_pixels("two streams, shifted", &stages, &shifted_req);
+    assert_texel_count("two streams, shifted (provider)", &shifted);
+    assert_ne!(
+        shifted, reviewed,
+        "the second stream's bytes have to reach the vertex stage: with them zeroed the frame is \
+         the reviewed one, and with an offset on them it is not"
+    );
+    for row in [0, height / 2, height - 1] {
+        assert_clear_texel(
+            &format!("shifted: texel (0, {row})"),
+            texel_at(&shifted, 0, row),
+        );
+    }
+    assert_texel_near(
+        "shifted: texel (width - 1, 0)",
+        texel_at(&shifted, width - 1, 0),
+        FRAGMENT_TEXEL,
+    );
+    let Some(engine_shifted) = engine_pixels("two streams, shifted", &stages, shifted_req) else {
+        return;
+    };
+    assert_eq!(
+        shifted, engine_shifted,
+        "the same two streams, drawn by the canonical provider and by the self-contained engine, \
+         have to land the same bytes"
+    );
+}
+
+/// The widest interface the canonical contract can state, and the first one it
+/// cannot.
+///
+/// Three offsets add into one x-shift, so no stream is decorative: zeroing any
+/// one of them moves the boundary, which is what makes "four streams were
+/// fetched" falsifiable rather than asserted. The fifth stream is the contract's
+/// own ceiling (`max_vertex_buffers`), and the gate has to answer it by name
+/// *before* the provider is asked.
+#[test]
+fn four_vertex_streams_are_admitted_and_a_fifth_stays_on_the_engine() {
+    let _guard = engine_test_session();
+    let stages = four_stream_stages();
+    let (width, _) = extent();
+    let shifted = |a: f32, b: f32, c: f32| {
+        [
+            position_stream(),
+            stream(1, &[(a, 0.0); 3]),
+            stream(2, &[(b, 0.0); 3]),
+            stream(3, &[(c, 0.0); 3]),
+        ]
+    };
+
+    let reviewed_req =
+        request_with_streams(MTL_FORMAT_RGBA8_UNORM, &shifted(0.125, 0.0625, 0.0625));
+    let reviewed = provider_pixels("four streams", &stages, &reviewed_req);
+    assert_texel_count("four streams (provider)", &reviewed);
+    assert_clear_texel("four streams: texel (0, 0)", texel_at(&reviewed, 0, 0));
+    assert_texel_near(
+        "four streams: texel (width - 1, 0)",
+        texel_at(&reviewed, width - 1, 0),
+        FRAGMENT_TEXEL,
+    );
+    let Some(engine) = engine_pixels("four streams", &stages, reviewed_req) else {
+        return;
+    };
+    assert_eq!(
+        reviewed, engine,
+        "four streams, drawn by the canonical provider and by the self-contained engine"
+    );
+
+    // One move per offset stream: each of them has to be fetched, because each
+    // one changes where the triangle's edge lands.
+    for (label, streams) in [
+        ("the first offset zeroed", shifted(0.0, 0.0625, 0.0625)),
+        ("the second offset zeroed", shifted(0.125, 0.0, 0.0625)),
+        ("the third offset zeroed", shifted(0.125, 0.0625, 0.0)),
+    ] {
+        let moved = provider_pixels(
+            label,
+            &stages,
+            &request_with_streams(MTL_FORMAT_RGBA8_UNORM, &streams),
+        );
+        assert_ne!(
+            moved, reviewed,
+            "{label}: the stream's own bytes have to reach the vertex stage"
+        );
+    }
+
+    let delivered = provider_render::provider_submissions();
+    let five = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[
+            position_stream(),
+            stream(1, &[(0.125, 0.0); 3]),
+            stream(2, &[(0.0625, 0.0); 3]),
+            stream(3, &[(0.0625, 0.0); 3]),
+            stream(4, &[(0.0, 0.0); 3]),
+        ],
+    );
+    match provider_render::submit_render(&inputs(&stages, true), &five) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_vertex_stream_limit",
+                "a fifth stream is refused by name: {reason}"
+            );
+            assert!(
+                reason.detail().contains("4"),
+                "the sentence names the ceiling the draw crossed: {reason}"
+            );
+        }
+        other => panic!("the contract states four streams and no more: {other:?}"),
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a layout the contract cannot state stays on the engine without the provider seeing it"
+    );
+}
+
+/// The scissor half of the class, end to end.
+///
+/// A rectangle over half the attachment has to clip the canonical pass exactly
+/// where it clips the engine's, and the texels outside it keep the load op's
+/// bytes — the clear. An unscissored submission of the same shape lands a
+/// different frame, which is what separates "the scissor was carried" from "the
+/// scissor was ignored".
+#[test]
+fn a_scissor_clips_the_pass_the_same_way_on_both_rails() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let half = width / 2;
+
+    let mut scissored = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    scissored.scissors.push(ScissorResource {
+        x: 0,
+        y: 0,
+        width: half,
+        height,
+    });
+    let clipped = provider_pixels("scissored", &stages, &scissored);
+    assert_texel_count("scissored (provider)", &clipped);
+    assert_texel_near(
+        "scissored: the last texel inside the rectangle",
+        texel_at(&clipped, half - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    assert_clear_texel(
+        "scissored: the first texel outside the rectangle",
+        texel_at(&clipped, half, height / 2),
+    );
+    assert_clear_texel(
+        "scissored: the far corner",
+        texel_at(&clipped, width - 1, height - 1),
+    );
+
+    let unscissored = provider_pixels(
+        "unscissored",
+        &stages,
+        &narrow_request(MTL_FORMAT_RGBA8_UNORM),
+    );
+    assert_ne!(
+        clipped, unscissored,
+        "a rail that dropped the rectangle would draw the whole attachment"
+    );
+
+    let Some(engine) = engine_pixels("scissored", &stages, scissored) else {
+        return;
+    };
+    assert_eq!(
+        clipped, engine,
+        "one rectangle, clipped by the canonical provider and by the self-contained engine"
+    );
+}
+
+/// The scissor shapes the canonical pass cannot state stay on the engine, by
+/// name, without the provider being asked.
+///
+/// Every refusal here is a shape the *engine* still answers — it clamps a
+/// rectangle that reaches past the attachment and draws the intersection — so a
+/// class that admitted them would be handing the guest a different frame rather
+/// than a refusal.
+#[test]
+fn a_scissor_the_canonical_pass_cannot_state_stays_on_the_engine() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let delivered = provider_render::provider_submissions();
+    let refused = |req: &DrawRequest, slug: &str| match provider_render::submit_render(
+        &inputs(&stages, true),
+        req,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                slug,
+                "the refusal names the condition: {reason}"
+            );
+            assert!(
+                !reason.detail().is_empty(),
+                "an out-of-class answer still carries its sentence"
+            );
+        }
+        other => panic!("expected {slug} for this shape, got {other:?}"),
+    };
+
+    // One texel past the right edge: inside neither the contract's rule nor the
+    // class's, while the engine draws the clamped intersection.
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.scissors.push(ScissorResource {
+        x: 0,
+        y: 0,
+        width: width + 1,
+        height,
+    });
+    refused(&req, "render_provider_out_of_class_scissor");
+
+    // An origin at the right edge: the rectangle's own numbers are inside the
+    // attachment, and it still covers nothing.
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.scissors.push(ScissorResource {
+        x: width,
+        y: 0,
+        width: 1,
+        height,
+    });
+    refused(&req, "render_provider_out_of_class_scissor");
+
+    // A zero-area rectangle: "nothing landed" is a shape the contract refuses
+    // and the engine executes as a draw that writes nothing.
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.scissors.push(ScissorResource {
+        x: 0,
+        y: 0,
+        width: 0,
+        height,
+    });
+    refused(&req, "render_provider_out_of_class_scissor");
+
+    // Two rectangles: the canonical pass carries one, and one cannot state the
+    // other, so the engine draws this one.
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.scissors.push(ScissorResource {
+        x: 0,
+        y: 0,
+        width: half_of(width),
+        height,
+    });
+    req.scissors.push(ScissorResource {
+        x: half_of(width),
+        y: 0,
+        width: width - half_of(width),
+        height,
+    });
+    refused(&req, "render_provider_out_of_class_scissor_count");
+
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a rectangle the canonical pass cannot state stays on the engine without the provider \
+         seeing it"
+    );
+}
+
+fn half_of(width: u32) -> u32 {
+    width / 2
+}
+
+/// The vertex-interface half of the class: one stream per attribute the vertex
+/// stage *reads*, and nothing else.
+///
+/// Both directions are refused, because both are shapes the canonical
+/// registration gate refuses — and a refusal there is a decline, not a fallback,
+/// so the class has to answer them before the provider is asked.
+#[test]
+fn a_stream_the_vertex_stage_does_not_read_stays_on_the_engine() {
+    let _guard = engine_test_session();
+    let delivered = provider_render::provider_submissions();
+    let refused = |stages: &Stages, specs: &[StreamSpec]| {
+        let req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, specs);
+        match provider_render::submit_render(&inputs(stages, true), &req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_vertex_interface",
+                "the refusal names the interface and not the count: {reason}"
+            ),
+            other => panic!("a stream the stage does not read is out of class: {other:?}"),
+        }
+    };
+
+    // Declared, not read: the reviewed one-attribute stage with a second stream,
+    // which a real pipeline descriptor is free to state (the descriptor may
+    // declare more than the shader consumes).
+    refused(
+        &reviewed_stages(),
+        &[position_stream(), stream(1, &[(0.0, 0.0); 3])],
+    );
+    // Read, not declared: the two-stream stage with one stream bound, which
+    // would leave the location the shader reads undefined.
+    refused(&two_stream_stages(), &[position_stream()]);
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a request whose streams disagree with its own reflection stays on the engine"
+    );
+}
+
+/// The census names this increment's splits, and charges the band the vertex
+/// widening is sized on.
+#[test]
+fn the_widening_splits_are_counted_under_their_own_names() {
+    use reims_vgpu::backend::provider_render::attribute_count_route;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
+    let submit = |inputs: &RenderRailInputs<'_>, req: &DrawRequest| {
+        let _ = provider_render::submit_render(inputs, req);
+    };
+
+    // The band: charged by the gate it sizes, before any condition answers, so a
+    // request the interface check refuses is still in its arm.
+    let band_1 = count("draw_vertex_attrs_1");
+    let band_2_4 = count("draw_vertex_attrs_2_4");
+    let one = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    submit(&inputs(&stages, true), &one);
+    assert_eq!(
+        count("draw_vertex_attrs_1"),
+        band_1 + 1,
+        "the reviewed shape declares one stream"
+    );
+    let two = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[position_stream(), stream(1, &[(0.0, 0.0); 3])],
+    );
+    submit(&inputs(&stages, true), &two);
+    assert_eq!(
+        count("draw_vertex_attrs_2_4"),
+        band_2_4 + 1,
+        "a two-stream request is banded even when the vertex interface keeps it on the engine"
+    );
+    assert_eq!(attribute_count_route(0), "draw_vertex_attrs_0");
+    assert_eq!(attribute_count_route(1), "draw_vertex_attrs_1");
+    assert_eq!(attribute_count_route(4), "draw_vertex_attrs_2_4");
+    assert_eq!(attribute_count_route(5), "draw_vertex_attrs_gt4");
+    assert_eq!(
+        metal_api_core::provider::MAX_VERTEX_BUFFERS,
+        4,
+        "the band's `_gt4` arm and the class's ceiling are the contract's own number: a contract \
+         that moved has to rename both"
+    );
+
+    // The chain split: the head of a packet and every record after it are two
+    // populations, and the bucket they replaced no longer moves.
+    let head = count("render_provider_out_of_class_chain_head");
+    let middle = count("render_provider_out_of_class_chain_middle");
+    let retired = count("render_provider_out_of_class_writeback");
+    let first = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    submit(&inputs(&stages, false), &first);
+    assert_eq!(
+        count("render_provider_out_of_class_chain_head"),
+        head + 1,
+        "the packet's first record is a chain head"
+    );
+    let mut later = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    later.continues_render_pass = true;
+    submit(&inputs(&stages, false), &later);
+    assert_eq!(
+        count("render_provider_out_of_class_chain_middle"),
+        middle + 1,
+        "a record after the first is a chain middle"
+    );
+    assert_eq!(
+        count("render_provider_out_of_class_writeback"),
+        retired,
+        "the split retired the old bucket rather than charging it beside the two"
+    );
+
+    // The readback split: the two rails that skip a readback carry their own
+    // names, and a skip with no recorded reason keeps the old one.
+    let unpublished = count("render_provider_out_of_class_unpublished_store");
+    let resident = count("render_provider_out_of_class_resident_store");
+    let unnamed = count("render_provider_out_of_class_skip_readback");
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.skip_readback = true;
+    req.readback_skip_reason = ReadbackSkipReason::UnpublishedStore;
+    submit(&inputs(&stages, true), &req);
+    assert_eq!(
+        count("render_provider_out_of_class_unpublished_store"),
+        unpublished + 1,
+        "a store that publishes nothing is its own population"
+    );
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.skip_readback = true;
+    req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    submit(&inputs(&stages, true), &req);
+    assert_eq!(
+        count("render_provider_out_of_class_resident_store"),
+        resident + 1,
+        "a frame in a resident the guest reads back through is the other one"
+    );
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.skip_readback = true;
+    submit(&inputs(&stages, true), &req);
+    assert_eq!(
+        count("render_provider_out_of_class_skip_readback"),
+        unnamed + 1,
+        "a skip with no recorded reason is reported as such rather than guessed into one of the two"
+    );
+}
+
+/// A boundary this widening measured, pinned where it was found.
+///
+/// The rail's promise is that everything it admits is a shape the provider
+/// *executes*, and that a shape the provider refuses ends the draw rather than
+/// silently falling back. There is one class of shape the gate cannot answer
+/// before the provider does, because the condition is a property of the
+/// translation rather than of the request: a vertex stage whose floating-point
+/// operation *withholds* a fast-math permission is decorated `FPFastMathMode` by
+/// the translator revision the canonical provider pins, which demands
+/// `FloatControls2` + `SPV_KHR_float_controls2` — neither of which the provider's
+/// Phase-1 capability subset admits. The two-stream fixture beside this test
+/// carries the `fast` flag run a Metal module compiled with the default math mode
+/// carries and executes; this one, the same module without it, is refused.
+///
+/// The assertions below pin the *boundary's shape* and not the limitation as a
+/// requirement: `ProviderDeclined` is the fail-closed answer (the draw ends, the
+/// engine is not run behind the guest's back), the decline names the provider
+/// step that refused, and its detail carries the provider's own words. A
+/// translator pin or capability-gate change that admits this module will fail
+/// this test — which is the point of writing it down: the increment's report
+/// names the follow-up rather than leaving the boundary to be rediscovered.
+#[test]
+fn a_float_op_that_withholds_a_permission_is_a_typed_decline() {
+    let _guard = engine_test_session();
+    let stages = stages(
+        "reims_indexed_tri_two_stream_precise.air",
+        "reims_two_stream_vertex",
+        &[0, 1],
+    );
+    let req = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[position_stream(), stream(1, &[(0.25, 0.0); 3])],
+    );
+    match provider_render::submit_render(&inputs(&stages, true), &req) {
+        RenderRailOutcome::ProviderDeclined(decline) => {
+            // The reading, beside the assertions: the provider's own words are
+            // what a reader compares against the day this boundary moves.
+            eprintln!(
+                "withheld float permission: slug={} fields={:?}",
+                decline.slug(),
+                decline.fields()
+            );
+            assert_eq!(
+                decline.slug(),
+                "pipeline_compile",
+                "the refusal is the translation step's own class: {decline}"
+            );
+            let fields = decline.fields();
+            assert!(
+                fields
+                    .iter()
+                    .any(|(key, value)| *key == "step" && value == "vertex_stage"),
+                "the refusal names which stage refused: {fields:?}"
+            );
+            assert!(
+                fields
+                    .iter()
+                    .any(|(key, value)| *key == "detail" && value.contains("Phase 1 subset")),
+                "the provider's own words ride along: {fields:?}"
+            );
+        }
+        RenderRailOutcome::ProviderCompleted(_) => panic!(
+            "the canonical provider executed a module its capability subset refuses: the boundary \
+             this test pins has moved, and the fixtures' own comment says so"
+        ),
+        RenderRailOutcome::NotInNarrowClass(reason) => panic!(
+            "a withheld float permission is the translation's condition and not the gate's; a \
+             class answer here means the gate learned something this test does not know: {reason}"
+        ),
+    }
 }
