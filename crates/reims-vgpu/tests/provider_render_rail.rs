@@ -2668,3 +2668,196 @@ fn a_device_without_the_feature_still_refuses_the_withheld_permission_module() {
         ),
     }
 }
+
+/// The y-asymmetric fixture the convention pair draws: a triangle whose own top
+/// half is covered — `(-1, 0)`, `(1, 0)`, `(-1, 1)` in the guest's clip space —
+/// into an 8x4 attachment.
+///
+/// Every edge misses the pixel centres: the horizontal edge sits at `y = 0`
+/// between two centre rows, the vertical one at `x = -1` outside the first
+/// centre column, and the diagonal `y = (1 - x) / 2` lands on eighths and
+/// sixteenths no centre (a quarter in `y`, an eighth in `x`) shares. So the
+/// coverage of both rails is the rasterizer's own answer with no edge-tie rule
+/// in it — which is what makes the expectation below a statement about the y
+/// convention and about nothing else.
+const ASYMMETRIC_VERTICES: [(f32, f32); 3] = [(-1.0, 0.0), (1.0, 0.0), (-1.0, 1.0)];
+
+/// The fixture's attachment, small enough to read a frame row by row in a log.
+const ASYMMETRIC_WIDTH: u32 = 8;
+const ASYMMETRIC_HEIGHT: u32 = 4;
+
+/// Whether the pixel centre `point` is inside the triangle `vertices`, by the
+/// three signed edge functions a rasterizer evaluates for a centre.
+///
+/// The assertion in the middle is the fixture's own precondition: a centre *on*
+/// an edge would be decided by the rasterizer's tie rule rather than by this
+/// function, and the pair would be pinning a tie rule instead of a convention.
+fn point_in_triangle(vertices: [(f32, f32); 3], point: (f64, f64)) -> bool {
+    let edge = |a: (f32, f32), b: (f32, f32)| -> f64 {
+        let (ax, ay) = (f64::from(a.0), f64::from(a.1));
+        let (bx, by) = (f64::from(b.0), f64::from(b.1));
+        (bx - ax) * (point.1 - ay) - (by - ay) * (point.0 - ax)
+    };
+    let edges = [
+        edge(vertices[0], vertices[1]),
+        edge(vertices[1], vertices[2]),
+        edge(vertices[2], vertices[0]),
+    ];
+    for value in edges {
+        assert!(
+            value.abs() > 1.0e-6,
+            "the fixture's centre {point:?} sits on an edge ({value}): the tie rule, not the y \
+             convention, would decide this texel"
+        );
+    }
+    edges.iter().all(|value| *value > 0.0) || edges.iter().all(|value| *value < 0.0)
+}
+
+/// The same frame with its rows reversed: what the identical NDC vertices
+/// produce when the attachment is rasterized with `+Y` down (Vulkan's own clip
+/// space) instead of Metal's `+Y` up.
+fn flip_rows(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let row = (width * 4) as usize;
+    let mut out = Vec::with_capacity(pixels.len());
+    for index in (0..height).rev() {
+        let start = index as usize * row;
+        out.extend_from_slice(&pixels[start..start + row]);
+    }
+    out
+}
+
+/// The y-asymmetric draw: the reviewed request shape — one `float2` stream, one
+/// index stream, `Clear` plus writeback — at the fixture's own small extent,
+/// with the fixture's vertices in the stream the pass-through vertex stage
+/// forwards.
+fn asymmetric_request() -> DrawRequest {
+    let specs = [StreamSpec {
+        location: 0,
+        offset: 0,
+        stride: 8,
+        bytes: f32x2(&ASYMMETRIC_VERTICES),
+    }];
+    let mut request = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &specs);
+    request.width = ASYMMETRIC_WIDTH;
+    request.height = ASYMMETRIC_HEIGHT;
+    request
+}
+
+/// One frame against **Metal's own mapping**, derived from the guest's clip-space
+/// vertices instead of from either rail: `+Y` up (a vertex at `y = +1` is in row
+/// 0), fragment colour on a covered centre, the clear's own bytes elsewhere, and
+/// both populations present.
+///
+/// This is the adjudicating half of the pair: it reads neither the engine's
+/// viewport nor the provider's, so a frame that matches it is the Metal answer
+/// whatever the other rail does.
+fn assert_frame_is_the_metal_mapping(label: &str, frame: &[u8], vertices: [(f32, f32); 3]) {
+    assert_eq!(
+        frame.len(),
+        (ASYMMETRIC_WIDTH * ASYMMETRIC_HEIGHT * 4) as usize,
+        "{label}: the attachment's whole extent has to come back"
+    );
+    let mut covered = 0;
+    let mut cleared = 0;
+    for row in 0..ASYMMETRIC_HEIGHT {
+        // Metal's row 0 is the top of the attachment, where `y = +1` maps.
+        let y = 1.0 - (2.0 * f64::from(row) + 1.0) / f64::from(ASYMMETRIC_HEIGHT);
+        for column in 0..ASYMMETRIC_WIDTH {
+            let x = -1.0 + (2.0 * f64::from(column) + 1.0) / f64::from(ASYMMETRIC_WIDTH);
+            let texel = texel_of(frame, ASYMMETRIC_WIDTH, column, row, 4);
+            let texel = [texel[0], texel[1], texel[2], texel[3]];
+            let label = format!("{label}: texel ({column}, {row})");
+            if point_in_triangle(vertices, (x, y)) {
+                covered += 1;
+                assert_texel_near(&label, texel, FRAGMENT_TEXEL);
+            } else {
+                cleared += 1;
+                assert_clear_texel(&label, texel);
+            }
+        }
+    }
+    assert!(
+        covered > 0 && cleared > 0,
+        "{label}: the shape has to cover part of the attachment and leave part of it ({covered} \
+         covered, {cleared} cleared), or the frame says nothing about a y-asymmetric draw"
+    );
+}
+
+/// The self-contained engine draws the y-asymmetric fixture the way Metal's clip
+/// space describes it.
+///
+/// This half is the adjudication and never mentions the canonical rail: the
+/// expectation is Metal's mapping, so a frame that matches it is the Metal answer
+/// whatever produced it. The engine states that mapping in its viewport — a
+/// negative height with the origin on the bottom edge
+/// (`reims-vgpu-vulkan/src/raster.rs`) — which is the one place `raster.rs`'s
+/// module doc allows the flip to live.
+#[test]
+fn the_engines_asymmetric_frame_is_the_metal_ndc_mapping() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let Some(engine) = engine_pixels("ndc-y fixture", &stages, asymmetric_request()) else {
+        return;
+    };
+    assert_frame_is_the_metal_mapping("ndc-y fixture (engine)", &engine, ASYMMETRIC_VERTICES);
+    assert_ne!(
+        engine,
+        flip_rows(&engine, ASYMMETRIC_WIDTH, ASYMMETRIC_HEIGHT),
+        "the fixture's own frame has to differ from its rows reversed: a shape whose two \
+         readings agree would make this pair's expectation vacuous"
+    );
+}
+
+/// The canonical rail's frame for the same draw is the engine's own frame with
+/// its rows reversed — the two rails' NDC-y conventions, side by side, byte for
+/// byte.
+///
+/// This is the disagreement every positive case in this file has avoided with
+/// y-symmetric geometry since R6, pinned as an expectation instead of a remark.
+/// The provider translates the request's own stages and executes them under a
+/// positive-height viewport built from the attachment
+/// (`crates/metal-api-vulkan/src/render.rs`), and nothing in the trace states a
+/// convention, so the guest's `+Y` — Metal's "up" — lands at the bottom of the
+/// attachment. The first assertion below says that in the engine half's own
+/// vocabulary: the provider's frame is the Metal mapping of the shape reflected
+/// in y, not an arbitrary corruption.
+///
+/// Why this side of the seam cannot align the pair:
+///
+/// * the canonical pass carries `viewport: [u32; 4]` with the origin fixed at
+///   `(0, 0)` and the extents fixed to the attachment's own
+///   (`metal-api-core/src/provider.rs`, `ViewportOriginUnsupported` and
+///   `ViewportExtentMismatch`), so a negative height — the way the engine states
+///   the flip — is not a trace this rail can build;
+/// * the provider's translated-stage gate (`metal-api-vulkan/src/lib.rs`,
+///   `TranslatedRenderStage`) applies no convention of its own, and the v38
+///   alignment in the emulator lives in its *hand-written* reviewed modules
+///   (`crates/metal-api-vulkan/src/render_spv/*.vert.spvasm`, the `OpFNegate` on
+///   each vertex module's position), which no guest module goes through;
+/// * the one channel left inside this rail — flipping the provider's rows on the
+///   way back out — is not the same map: the provider's image, the scissor's own
+///   rectangle and every `[[position]]` a guest fragment stage reads would keep
+///   describing a mirrored framebuffer, so the class does not take it.
+///
+/// When the provider states Metal's convention for translated stages, this test
+/// becomes `assert_frames_equal(provider, engine)` — the two frames the seam
+/// hands back are then byte-identical, asymmetric geometry included.
+///
+/// `research/docs/26` §18 has the readings.
+#[test]
+fn the_canonical_rails_asymmetric_frame_is_the_engines_own_frame_mirrored() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let provider = provider_pixels("ndc-y fixture", &stages, &asymmetric_request());
+    let reflected = ASYMMETRIC_VERTICES.map(|(x, y)| (x, -y));
+    assert_frame_is_the_metal_mapping("ndc-y fixture (provider)", &provider, reflected);
+    let Some(engine) = engine_pixels("ndc-y fixture", &stages, asymmetric_request()) else {
+        return;
+    };
+    assert_frames_differ("ndc-y fixture", &provider, &engine);
+    assert_frames_equal(
+        "ndc-y fixture",
+        &provider,
+        &flip_rows(&engine, ASYMMETRIC_WIDTH, ASYMMETRIC_HEIGHT),
+    );
+}
