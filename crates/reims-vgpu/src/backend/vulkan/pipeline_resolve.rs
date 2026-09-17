@@ -411,9 +411,57 @@ fn stage_buffer_declarations(
     reflection: &metal2vulkan::reflect::ShaderReflection,
 ) -> Arc<[crate::backend::provider_render::StageBufferDeclaration]> {
     use crate::backend::provider_render::{
-        StageBufferDeclaration, StageBufferDeclarationClass, StageBufferFootprint,
+        StageBufferAccess, StageBufferDeclaration, StageBufferFootprint,
     };
-    use metal2vulkan::reflect::{ResourceAccess, ResourceKind};
+    use metal2vulkan::reflect::{BufferFootprint, ResourceAccess, ResourceKind};
+    use metal_api_core::provider::{AffineAccess, AffineTerm};
+
+    /// The reflected affine access set, in the contract's own terms
+    /// (`metal-api-vulkan`'s `reflected_affine_accesses`, R9f/v86).
+    ///
+    /// The two reflected shapes map onto the contract's two: a static range
+    /// becomes a term-less access, and a strided access becomes an
+    /// `AffineAccess` carrying the draw's own axes — the reflection's
+    /// `VertexIndex` is axis 0 and its `InstanceIndex` axis 1. `None` is a
+    /// reach this contract cannot state: an unbounded access, or a stride over
+    /// an invocation index a draw does not have. Both encodings read the same
+    /// translator pin over the same AIR, so this is one measurement restated
+    /// rather than a second opinion.
+    fn affine_accesses(footprint: &BufferFootprint) -> Option<Vec<AffineAccess>> {
+        use metal2vulkan::reflect::BufferIndexSource;
+        if footprint.has_unbounded_access {
+            return None;
+        }
+        let mut accesses =
+            Vec::with_capacity(footprint.static_ranges.len() + footprint.strided_accesses.len());
+        for range in &footprint.static_ranges {
+            accesses.push(AffineAccess {
+                base_offset: range.offset,
+                access_size: range.size,
+                terms: Vec::new(),
+            });
+        }
+        for access in &footprint.strided_accesses {
+            let mut terms = Vec::with_capacity(access.terms.len());
+            for term in &access.terms {
+                let axis = match term.source {
+                    BufferIndexSource::VertexIndex => 0,
+                    BufferIndexSource::InstanceIndex => 1,
+                    _ => return None,
+                };
+                terms.push(AffineTerm {
+                    axis,
+                    stride: term.stride,
+                });
+            }
+            accesses.push(AffineAccess {
+                base_offset: access.base_offset,
+                access_size: access.access_size,
+                terms,
+            });
+        }
+        Some(accesses)
+    }
 
     reflection
         .bindings
@@ -421,25 +469,24 @@ fn stage_buffer_declarations(
         .filter(|binding| binding.kind == ResourceKind::Buffer)
         .map(|binding| StageBufferDeclaration {
             index: binding.metal_index,
-            class: match binding.access {
-                Some(ResourceAccess::Unused) => StageBufferDeclarationClass::Unused,
-                Some(ResourceAccess::ReadOnly) => StageBufferDeclarationClass::ReadOnly,
-                Some(ResourceAccess::WriteOnly | ResourceAccess::ReadWrite) => {
-                    StageBufferDeclarationClass::Writable
-                }
+            access: match binding.access {
+                Some(ResourceAccess::Unused) => StageBufferAccess::Unused,
+                Some(ResourceAccess::ReadOnly) => StageBufferAccess::Read,
+                Some(ResourceAccess::WriteOnly) => StageBufferAccess::Write,
+                Some(ResourceAccess::ReadWrite) => StageBufferAccess::ReadWrite,
                 Some(ResourceAccess::Sampled | ResourceAccess::Storage) | None => {
-                    StageBufferDeclarationClass::Unknown
+                    StageBufferAccess::Unknown
                 }
             },
             // The reach the canonical registration will compare its own
             // translation against, computed the way that gate computes it
             // (`metal-api-vulkan`'s `validate_translated_stage_buffers`): the
             // largest exclusive byte offset over the declaration's static
-            // ranges, with affine (strided) and unbounded reaches stated as
-            // what they are — shapes the render contract cannot state — and a
-            // read binding that names no range at all treated the same way,
-            // because the canonical gate has no extent to prove a view
-            // against. Both sides read the same translator pin over the same
+            // ranges when every reach is static, the reflected affine access
+            // set when a stride is involved (R9f/v86), and `Unstated` for an
+            // unbounded reach or one that names no range at all — the shapes
+            // the contract refuses by name rather than a proof it could
+            // evaluate. Both sides read the same translator pin over the same
             // AIR, so this is one measurement and not two.
             footprint: match binding.footprint.as_ref() {
                 Some(footprint)
@@ -452,6 +499,12 @@ fn stage_buffer_declarations(
                         .max()
                     {
                         Some(max_bytes) => StageBufferFootprint::Static { max_bytes },
+                        None => StageBufferFootprint::Unstated,
+                    }
+                }
+                Some(footprint) if !footprint.has_unbounded_access => {
+                    match affine_accesses(footprint) {
+                        Some(accesses) => StageBufferFootprint::Affine { accesses },
                         None => StageBufferFootprint::Unstated,
                     }
                 }

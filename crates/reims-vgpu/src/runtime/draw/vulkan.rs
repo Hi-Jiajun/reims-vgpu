@@ -10109,7 +10109,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         {
             use crate::backend::provider_render::{
                 self, RenderChainRole, RenderRailInputs, RenderRailOutcome, StageBufferBind,
+                StageBufferLanding,
             };
+            use metal_api_core::provider::RenderPipelineStage;
             // R9d: the `[[buffer(N)]]` binds this draw carries, at the Metal
             // index of the stage that names them. The seam already resolved
             // both lists — `vtx_storage` for the vertex stage, `frag_storage`
@@ -10126,19 +10128,109 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // owner's staged lease — the arm the canonical rail calls
             // `BufferSource::StagedLease` — and a gather with no window keeps
             // the draw on the engine (`..._stage_buffer_gather`).
+            //
+            // R9j: a bind whose stage declares it *writable* is a landing
+            // (R9f), so it also states where those bytes go back to. The
+            // address is the bind's own — the one the bytes above were read
+            // from — and the pages are the ones it resolved to right now, i.e.
+            // before the submission that produces the new bytes; the write
+            // after the completion is bounded to that window
+            // (`runtime::gva_view`'s rule, the same one the compute rail's
+            // writeback keeps). A bind with no resolvable destination states
+            // none, and the class gate answers it by name rather than dropping
+            // a writeback.
+            let mut stage_buffer_destinations: Vec<(
+                RenderPipelineStage,
+                u32,
+                u64,
+                std::collections::HashSet<u64>,
+            )> = Vec::new();
+            for (stage, declarations, binds, resolved_binds) in [
+                (
+                    RenderPipelineStage::Vertex,
+                    resolved.vertex_stage_buffer_declarations.as_ref(),
+                    req.vertex_buffers.iter(),
+                    &vtx_storage,
+                ),
+                (
+                    RenderPipelineStage::Fragment,
+                    resolved.fragment_stage_buffer_declarations.as_ref(),
+                    req.fragment_buffers.iter(),
+                    &frag_storage,
+                ),
+            ] {
+                for declaration in declarations
+                    .iter()
+                    .filter(|declaration| declaration.access.is_writable())
+                {
+                    let Some(bind) = binds
+                        .clone()
+                        .find(|bind| bind.index == declaration.index && bind.buffer_ref != 0)
+                    else {
+                        continue;
+                    };
+                    let Some(length) = resolved_binds
+                        .iter()
+                        .find(|(index, _)| *index == declaration.index)
+                        .map(|(_, content)| u64::try_from(content.len()).unwrap_or(u64::MAX))
+                    else {
+                        continue;
+                    };
+                    let Some(backing) = super::resolve_buffer_backing(
+                        state,
+                        host,
+                        req.task_id,
+                        bind.buffer_ref,
+                        bind.resource.as_deref(),
+                    ) else {
+                        continue;
+                    };
+                    let Some(gva) = backing.gva.checked_add(bind.offset) else {
+                        continue;
+                    };
+                    let pages = crate::runtime::compute_exec::staged_span_pages(
+                        state,
+                        host,
+                        req.task_id,
+                        gva,
+                        length,
+                    );
+                    stage_buffer_destinations.push((stage, declaration.index, gva, pages));
+                }
+            }
             let stage_buffer_binds: Vec<StageBufferBind<'_>> = vtx_storage
                 .iter()
                 .map(|(index, content)| StageBufferBind {
-                    stage: metal_api_core::provider::RenderPipelineStage::Vertex,
+                    stage: RenderPipelineStage::Vertex,
                     index: *index,
                     content,
                     window: None,
+                    landing: stage_buffer_destinations
+                        .iter()
+                        .find(|(stage, i, _, _)| {
+                            *stage == RenderPipelineStage::Vertex && i == index
+                        })
+                        .map(|(_, _, gva, pages)| StageBufferLanding {
+                            gva: *gva,
+                            pages: Some(pages),
+                        }),
                 })
-                .chain(frag_storage.iter().map(|(index, content)| StageBufferBind {
-                    stage: metal_api_core::provider::RenderPipelineStage::Fragment,
-                    index: *index,
-                    content,
-                    window: None,
+                .chain(frag_storage.iter().map(|(index, content)| {
+                    StageBufferBind {
+                        stage: RenderPipelineStage::Fragment,
+                        index: *index,
+                        content,
+                        window: None,
+                        landing: stage_buffer_destinations
+                            .iter()
+                            .find(|(stage, i, _, _)| {
+                                *stage == RenderPipelineStage::Fragment && i == index
+                            })
+                            .map(|(_, _, gva, pages)| StageBufferLanding {
+                                gva: *gva,
+                                pages: Some(pages),
+                            }),
+                    }
                 }))
                 .collect();
             let inputs = RenderRailInputs {
@@ -10184,6 +10276,78 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 RenderRailOutcome::ProviderCompleted(out) => {
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
                     crate::runtime::drain::note_store_route("render_provider_canonical");
+                    // R9j: the writable stage buffers' bytes land in the guest
+                    // before the frame is handed on. The destination is the
+                    // bind's own address and the pages it resolved to *before*
+                    // this submission, so a range the guest re-pointed while
+                    // the GPU was running fails the window check and the write
+                    // is dropped by name rather than painted into whatever owns
+                    // those pages now — the same rule the compute rail's
+                    // writeback keeps (`runtime::gva_mem`'s
+                    // `write_task_gva_product_within`).
+                    for writeback in &out.stage_writebacks {
+                        let destination =
+                            stage_buffer_destinations
+                                .iter()
+                                .find(|(stage, index, _, _)| {
+                                    *stage == writeback.stage && *index == writeback.index
+                                });
+                        let Some((_, _, gva, pages)) = destination else {
+                            crate::runtime::drain::note_store_route(
+                                "render_provider_stage_writeback_unplaced",
+                            );
+                            crate::observe::fail(format!(
+                                "render_provider_stage_writeback_unplaced reason=no_destination \
+                                 task={} pipe={} stage={:?} index={} bytes={}",
+                                req.task_id,
+                                req.pipeline_ref,
+                                writeback.stage,
+                                writeback.index,
+                                writeback.bytes.len(),
+                            ));
+                            continue;
+                        };
+                        let Some(address) = gva.checked_add(writeback.offset) else {
+                            crate::runtime::drain::note_store_route(
+                                "render_provider_stage_writeback_unplaced",
+                            );
+                            crate::observe::fail(format!(
+                                "render_provider_stage_writeback_unplaced \
+                                 reason=task_gva_overflow task={} pipe={} stage={:?} index={} \
+                                 gva={gva:#x} off={:#x}",
+                                req.task_id,
+                                req.pipeline_ref,
+                                writeback.stage,
+                                writeback.index,
+                                writeback.offset,
+                            ));
+                            continue;
+                        };
+                        if let Err(error) = crate::runtime::gva_mem::write_task_gva_product_within(
+                            state,
+                            host,
+                            req.task_id,
+                            address,
+                            &writeback.bytes,
+                            Some(pages),
+                        ) {
+                            crate::runtime::drain::note_store_route(
+                                "render_provider_stage_writeback_failed",
+                            );
+                            crate::observe::fail(format!(
+                                "render_provider_stage_writeback_failed \
+                                 reason=task_gva_write task={} pipe={} stage={:?} index={} \
+                                 gva={address:#x} len={} err={error:?}",
+                                req.task_id,
+                                req.pipeline_ref,
+                                writeback.stage,
+                                writeback.index,
+                                writeback.bytes.len(),
+                            ));
+                            continue;
+                        }
+                        crate::runtime::drain::note_store_route("render_provider_stage_writeback");
+                    }
                     // Over a present-bearing submission the completion's bytes
                     // are the provider's *present target* readback rather than
                     // a pooled scratch image's, so the frame this span hands
@@ -15795,6 +15959,7 @@ mod provider_span_pixels_tests {
                     bytes: frame.clone(),
                     bgra,
                     present: None,
+                    stage_writebacks: Vec::new(),
                 },
             )
             .expect("an eight-bit frame is already what the span speaks");
@@ -15818,6 +15983,7 @@ mod provider_span_pixels_tests {
                 bytes: vec![0x04, 0x34, 0x04, 0x38, 0xfe, 0x39, 0x00, 0x3c],
                 bgra: false,
                 present: None,
+                stage_writebacks: Vec::new(),
             },
         )
         .expect("four half channels narrow to four bytes");
@@ -15857,6 +16023,7 @@ mod provider_span_pixels_tests {
                     bytes,
                     bgra: false,
                     present: None,
+                    stage_writebacks: Vec::new(),
                 },
             )
             .expect_err(label);

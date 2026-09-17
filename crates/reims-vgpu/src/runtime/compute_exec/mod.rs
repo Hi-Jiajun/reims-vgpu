@@ -1331,7 +1331,14 @@ fn staged_window_pages<M: HostMemory>(
 }
 
 /// [`staged_window_pages`] for a flat span — the buffer rail's shape.
-fn staged_span_pages<M: HostMemory>(
+///
+/// `pub(crate)` because the render rail's writable stage buffers state the same
+/// authority for the same reason (`provider_render::StageBufferLanding`,
+/// `research/docs/26` §R9j): the pages an address resolved to *before* the
+/// submission that produces the bytes are the window the later guest write is
+/// bounded to, and one walk answered by one function is what keeps the two
+/// rails from spelling that rule twice.
+pub(crate) fn staged_span_pages<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     task_id: u32,

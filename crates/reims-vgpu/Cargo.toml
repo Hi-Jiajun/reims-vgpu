@@ -48,7 +48,7 @@ provider-compute = ["backend-vulkan", "dep:metal-api-core", "dep:metal-api-vulka
 # class boundary is fail-closed on exactly the compute rail's terms: an
 # in-class draw the provider refuses is declined, never silently re-run on the
 # other rail.
-provider-render = ["provider-compute"]
+provider-render = ["provider-compute", "dep:metal-api-ipc"]
 # Host-owned presentation window (kb host-window): a Rust-owned winit window
 # that replaces QEMU's UI. Off by default so the QEMU staticlib link is
 # unchanged until the window is proven. Pulls the windowing stack and nothing
@@ -115,6 +115,11 @@ metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "
 # bind against that workspace, not this one.
 metal-api-core = { path = "../../../../metal-api-emulator/crates/metal-api-core", optional = true }
 metal-api-vulkan = { path = "../../../../metal-api-emulator/crates/metal-api-vulkan", optional = true }
+# The canonical command channel (`MCC1`), named beside the two crates above
+# because it is the same contract's wire: `backend::provider_wire` is this
+# device's owner half of it — the capability answer the class gate reads, and
+# the submission frame a stage-buffer-declaring pass crosses.
+metal-api-ipc = { path = "../../../../metal-api-emulator/crates/metal-api-ipc", optional = true }
 winit = { version = "0.30", optional = true }
 ash-window = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.6", optional = true }

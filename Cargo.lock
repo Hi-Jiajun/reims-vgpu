@@ -656,6 +656,14 @@ name = "metal-api-core"
 version = "0.1.0"
 
 [[package]]
+name = "metal-api-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "metal-api-core",
+]
+
+[[package]]
 name = "metal-api-vulkan"
 version = "0.1.0"
 dependencies = [
@@ -1156,6 +1164,7 @@ dependencies = [
  "libc",
  "metal",
  "metal-api-core",
+ "metal-api-ipc",
  "metal-api-vulkan",
  "metal2vulkan",
  "objc",

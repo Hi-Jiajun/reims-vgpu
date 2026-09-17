@@ -132,6 +132,13 @@ pub mod provider_compute;
 #[cfg(feature = "provider-render")]
 pub mod provider_render;
 
+/// The owner half of the canonical command channel (`MCC1`), present under the
+/// same `feature = "provider-render"`: the frames this rail produces from what
+/// it states, and the capability answer it reads back out of the wire before it
+/// declares a stage buffer.
+#[cfg(feature = "provider-render")]
+pub mod provider_wire;
+
 /// The owner half of the canonical-provider compute rail, present under the
 /// same `feature = "provider-compute"`: guest RAM regions registered in the
 /// provider's own `HostRegion` shape and the lease lifecycle of the windows one

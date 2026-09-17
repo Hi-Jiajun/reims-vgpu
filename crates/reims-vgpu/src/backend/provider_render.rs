@@ -297,11 +297,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use metal_api_core::provider::{
-    half_to_f32, AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess,
-    BufferSource, BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition,
-    CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind,
-    DispatchType, FootprintProof, IndexBufferBinding, IndexFormat, InitialState, LoadOp,
-    NoCopyLeaseImporter, OperationId, PresentDescriptor, PresentMode, PresentTarget,
+    half_to_f32, AcquirePolicy, AffineAccess, AllocationId, AllocationRecord, AttachmentFormat,
+    BufferAccess, BufferSource, BufferView, BufferWriteback, ClearColor, CompiledComputePipeline,
+    CompletionDisposition, CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch,
+    DispatchKind, DispatchType, FootprintProof, IndexBufferBinding, IndexFormat, InitialState,
+    LoadOp, NoCopyLeaseImporter, OperationId, PresentDescriptor, PresentMode, PresentTarget,
     RenderAttachment, RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage,
     ResourceTableSnapshot, SemanticDigest, StageBufferBinding, StageBufferView, StoreOp, TracePass,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
@@ -314,6 +314,7 @@ use super::provider_compute::{
     provider_error_detail, rail, refusal_decline, refuse_unhealthy, ProviderRefusalClass,
 };
 use super::provider_owner::{self, DeviceLossTeardown};
+use super::provider_wire;
 use super::vulkan::engine::types::{
     BufferContent, ColorClearValue, DrawRequest, GuestRunSource, ReadbackSkipReason,
     TargetIdentity, VertexAttributeResource, VertexStepFunction,
@@ -328,6 +329,16 @@ const RENDER_DECLARE_SOURCE: &str = include_str!("render_declare.ll");
 
 /// Entry point [`RENDER_DECLARE_SOURCE`] declares.
 const RENDER_DECLARE_ENTRY: &str = "reims_declare";
+
+/// The byte reach the declaring kernel's own reflection states for the buffer it
+/// reads (`render_declare.ll`'s `air.buffer_size`).
+///
+/// A writable stage buffer rides into the trace's pool as a view a declare pass
+/// binds (see `submit_narrow`), and that pass's view is proven against the
+/// declaring contract's own footprint — a shorter view is a shape admission
+/// refuses by name (`buffer_footprint_exceeds_view`), so the class gate answers
+/// it first.
+const RENDER_DECLARE_REACH: u64 = 4;
 
 /// The attachment window the canonical rail declares on this device, one
 /// number per axis.
@@ -552,8 +563,149 @@ fn gather_window(source: &GuestRunSource) -> Option<StageBufferWindow> {
 /// the whole condition; every other shape keeps the draw on the engine under
 /// the bucket its own fact names, which is what makes this a narrowing and not
 /// a second bind policy.
+fn declared_stage_buffer_support(
+) -> Result<provider_wire::StageBufferSupport, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    provider_wire::stage_buffer_support(rail.provider.device_epoch(), &rail.provider.capabilities())
+        .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        })
+}
+
+/// The two invocation counts one draw's affine stage-buffer footprint is
+/// bounded by (`research/docs/23` §3.3, v86).
+///
+/// The same two numbers the canonical contract reads out of the trace's own
+/// index bytes (`metal-api-core`'s `render_affine_axis_counts`): axis 0 counts
+/// the vertices the draw names — for this class's indexed draws
+/// `base_vertex + highest index + 1`, over the same bytes the pass binds — and
+/// axis 1 its instances, which the class fixes at one. `None` is a draw whose
+/// index bytes do not travel with the trace (a gather), which is a proof the
+/// contract refuses by name rather than a bound this rail invented.
+fn stage_buffer_affine_counts(req: &DrawRequest) -> Option<[u64; 2]> {
+    use crate::backend::vulkan::engine::IndexType;
+    let index = req.indexed.as_ref()?;
+    let bytes = staged_bytes(&index.content)?;
+    let width = match index.index_type {
+        IndexType::U16 => 2,
+        IndexType::U32 => 4,
+    };
+    let count = usize::try_from(index.index_count).ok()?;
+    let readable = count.checked_mul(width)?;
+    if bytes.len() < readable {
+        return None;
+    }
+    let mut highest = 0u64;
+    for chunk in bytes.chunks_exact(width).take(count) {
+        let value = match index.index_type {
+            IndexType::U16 => u64::from(u16::from_ne_bytes([chunk[0], chunk[1]])),
+            IndexType::U32 => {
+                u64::from(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            }
+        };
+        highest = highest.max(value);
+    }
+    let vertices = u64::try_from(index.vertex_offset)
+        .ok()?
+        .checked_add(highest)?
+        .checked_add(1)?;
+    Some([vertices, u64::from(req.instance_count.unwrap_or(1))])
+}
+
+/// The byte extent one affine proof reaches over a draw's own invocation counts
+/// (`metal-api-core`'s `render_affine_required_bytes`): each access reaches
+/// `base + size + (count - 1) * stride` per term, and the widest access is what
+/// the pass's view has to cover. `None` is an expression that overflows or
+/// names an axis the draw does not have — a proof the contract refuses by name
+/// rather than one this rail evaluates against a bound nothing states.
+fn stage_buffer_affine_required_bytes(accesses: &[AffineAccess], counts: [u64; 2]) -> Option<u64> {
+    let mut required = 0u64;
+    for access in accesses {
+        let mut end = access.base_offset.checked_add(access.access_size)?;
+        for term in &access.terms {
+            let count = counts.get(usize::from(term.axis))?;
+            end = end.checked_add(count.saturating_sub(1).checked_mul(term.stride)?)?;
+        }
+        required = required.max(end);
+    }
+    Some(required)
+}
+
+/// What one frame carries, printed from the *decoded* trace
+/// (`research/docs/26` §R9j).
+///
+/// One line per declared binding: the pipeline's own declaration (stage,
+/// index, access, footprint) beside the pass's view (access, offset, length,
+/// source arm) — read back out of the decoded value rather than out of the
+/// values this rail built, because it is the frame's reading that the
+/// provider's registration and admission pair. A declaration that decoded
+/// differently from the one stated is exactly what this line makes visible.
+fn note_wire_stage_buffers(trace: &ComputeTrace) {
+    let declarations = trace
+        .pipelines
+        .iter()
+        .find_map(|pipeline| pipeline.render.as_ref())
+        .map(|render| render.stage_buffers.as_slice())
+        .unwrap_or(&[]);
+    let views = trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .map(|pass| pass.stage_buffers.as_slice())
+        .unwrap_or(&[]);
+    for declaration in declarations {
+        let view = views.iter().find(|view| {
+            view.stage == declaration.stage && view.view.metal_binding == declaration.index
+        });
+        let source = match view.map(|view| &view.view.source) {
+            Some(BufferSource::OwnedBytes(bytes)) => format!("owned_bytes={}", bytes.len()),
+            Some(BufferSource::StagedLease(lease)) => format!("staged_lease={}", lease.get()),
+            Some(BufferSource::BorrowedNoCopy(lease)) => {
+                format!("borrowed_lease={}", lease.get())
+            }
+            None => "view=absent".to_owned(),
+        };
+        crate::observe::line(format!(
+            "render_provider_wire stage_buffer stage={} index={} access={} footprint={} {} \
+             view_access={} offset={} length={}",
+            declaration.stage.name(),
+            declaration.index,
+            buffer_access_name(declaration.access),
+            footprint_name(&declaration.footprint),
+            source,
+            view.map(|view| buffer_access_name(view.view.access))
+                .unwrap_or("none"),
+            view.map(|view| view.view.offset).unwrap_or(0),
+            view.map(|view| view.view.length).unwrap_or(0),
+        ));
+    }
+}
+
+/// The name one contract access is reported under, in the spelling the
+/// refusal's fields use (`metal-api-vulkan`'s own `buffer_access_name`).
+fn buffer_access_name(access: BufferAccess) -> &'static str {
+    match access {
+        BufferAccess::Read => "read",
+        BufferAccess::Write => "write",
+        BufferAccess::ReadWrite => "read_write",
+        BufferAccess::Unused => "unused",
+    }
+}
+
+/// The name one footprint proof is reported under, with the number that makes
+/// it checkable: a static ceiling in bytes, or an affine access set.
+fn footprint_name(proof: &FootprintProof) -> String {
+    match proof {
+        FootprintProof::Static { max_bytes } => format!("static bytes={max_bytes}"),
+        FootprintProof::Affine { accesses } => format!("affine accesses={}", accesses.len()),
+        FootprintProof::Unbounded => "unbounded".to_owned(),
+    }
+}
+
 fn stage_buffer_gate<'a>(
     inputs: &'a RenderRailInputs<'a>,
+    req: &DrawRequest,
     binds: usize,
     vertex_streams: usize,
 ) -> Result<Vec<NarrowStageBuffer<'a>>, OutOfClass> {
@@ -576,60 +728,47 @@ fn stage_buffer_gate<'a>(
         return Ok(Vec::new());
     }
     // One declaration anywhere in either stage is enough for the door to have
-    // something to answer about, and the three classes the canonical contract
-    // cannot state answer under their own bucket. The vertex half is asked
-    // first — the order the contract states its two buffers in — and inside a
-    // stage the reflection's own order, which is what `pipeline_resolve`
-    // collected.
-    let refused = |stage: &'static str, declaration: &StageBufferDeclaration| {
-        let (slug, access) = match declaration.class {
-            StageBufferDeclarationClass::Unused => {
-                ("render_provider_out_of_class_stage_buffer_unused", "unused")
-            }
-            StageBufferDeclarationClass::Writable => (
-                "render_provider_out_of_class_stage_buffer_write",
-                "writable",
-            ),
-            StageBufferDeclarationClass::Unknown => (
-                "render_provider_out_of_class_stage_buffer_unknown",
-                "of an unclassified access",
-            ),
-            // The read-only class is this increment's population, answered
-            // below one stateable fact at a time.
-            StageBufferDeclarationClass::ReadOnly => return None,
-        };
-        Some(OutOfClass::owned(
-            slug,
-            format!(
-                "a draw whose {stage} stage declares a [[buffer({})]] argument ({access}) stays \
-                 on the engine: the canonical contract states pipeline-level buffers (v83) and \
-                 executes a read-only declaration whose footprint the pass's own view covers, so \
-                 this class is a population the wire does not carry rather than a shape the \
-                 contract refuses. The request binds {binds} stage buffer(s)",
-                declaration.index,
-            ),
-        ))
-    };
-    for (_, stage, declarations) in declaring {
+    // something to answer about, and the two arms the canonical contract cannot
+    // state answer under their own bucket. The vertex half is asked first — the
+    // order the contract states its two buffers in — and inside a stage the
+    // reflection's own order, which is what `pipeline_resolve` collected.
+    // Every stated declaration is this increment's population: state the
+    // canonical pair, or name the fact that stands in the way. The list is
+    // built in the contract's own canonical order — vertex bindings first by
+    // index, then fragment bindings — rather than the reflection's order,
+    // because that order is a rule of the canonical list
+    // (`NonCanonicalBindingOrder`) and not a preference. The two arms the
+    // contract cannot state answer under their own bucket on the way in, in the
+    // order the contract states its two stages.
+    let mut ordered: Vec<(RenderPipelineStage, &StageBufferDeclaration, BufferAccess)> = Vec::new();
+    for (stage, stage_name, declarations) in declaring {
         for declaration in declarations {
-            if let Some(reason) = refused(stage, declaration) {
-                return Err(reason);
-            }
+            let Some(access) = declaration.access.contract_access() else {
+                let slug = match declaration.access {
+                    StageBufferAccess::Unknown => {
+                        "render_provider_out_of_class_stage_buffer_unknown"
+                    }
+                    _ => "render_provider_out_of_class_stage_buffer_unused",
+                };
+                return Err(OutOfClass::owned(
+                    slug,
+                    format!(
+                        "a draw whose {stage_name} stage declares a [[buffer({})]] argument \
+                         ({access}) stays on the engine: the canonical contract states \
+                         pipeline-level buffers (v83) and pairs a declaration with a translation \
+                         that reaches it, so a declaration the entry never dereferences — or one \
+                         whose access the translation does not classify — is a reflection \
+                         mismatch the provider refuses by name rather than a slot this rail could \
+                         declare and bind. The request binds {binds} stage buffer(s)",
+                        declaration.index,
+                        access = declaration.access.name(),
+                    ),
+                ));
+            };
+            ordered.push((stage, declaration, access));
         }
     }
-
-    // Every declaration is read-only: state the canonical pair, or name the
-    // fact that stands in the way. The list is built in the contract's own
-    // canonical order — vertex bindings first by index, then fragment bindings
-    // — rather than the reflection's order, because that order is a rule of
-    // the canonical list (`NonCanonicalBindingOrder`) and not a preference.
-    let mut ordered: Vec<(RenderPipelineStage, &StageBufferDeclaration)> = Vec::new();
-    for (stage, _, declarations) in declaring {
-        for declaration in declarations {
-            ordered.push((stage, declaration));
-        }
-    }
-    ordered.sort_by_key(|(stage, declaration)| (stage.code(), declaration.index));
+    ordered.sort_by_key(|(stage, declaration, _)| (stage.code(), declaration.index));
     if ordered.len() > MAX_RENDER_STAGE_BUFFERS {
         return Err(OutOfClass::owned(
             "render_provider_out_of_class_stage_buffer_shape",
@@ -642,7 +781,7 @@ fn stage_buffer_gate<'a>(
         ));
     }
     let mut out: Vec<NarrowStageBuffer<'a>> = Vec::with_capacity(ordered.len());
-    for (stage, declaration) in ordered {
+    for (stage, declaration, access) in ordered {
         // One slot, one declaration: a reflection that names the same stage
         // buffer twice describes two interfaces for one index, which the
         // canonical list refuses as a duplicate rather than reconciling.
@@ -678,17 +817,70 @@ fn stage_buffer_gate<'a>(
                 ),
             ));
         }
-        let max_bytes = match declaration.footprint {
-            StageBufferFootprint::Static { max_bytes } => max_bytes,
+        // The declaration's own proof, stated as the contract states it
+        // (`FootprintProof`), beside the number this rail proves the bind's
+        // bytes against. A static declaration is a ceiling; an affine one is
+        // the reflected access set itself, evaluated here over the draw's own
+        // invocation counts — the same arithmetic (`stage_buffer_affine_counts`
+        // → `stage_buffer_affine_required_bytes`) the canonical admission runs
+        // over the same bytes, because a proof this rail cannot evaluate is one
+        // the provider would refuse by name.
+        let (proof, max_bytes) = match &declaration.footprint {
+            StageBufferFootprint::Static { max_bytes } => (
+                FootprintProof::Static {
+                    max_bytes: *max_bytes,
+                },
+                *max_bytes,
+            ),
+            StageBufferFootprint::Affine { accesses } => {
+                let Some(counts) = stage_buffer_affine_counts(req) else {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_stage_buffer_footprint",
+                        format!(
+                            "a draw whose {} stage declares a [[buffer({})]] argument with an \
+                             affine footprint stays on the engine when the draw's own invocation \
+                             counts are not readable from the bytes the trace carries: the \
+                             canonical contract bounds the proof over the trace's own index bytes \
+                             and refuses a count nothing states (`buffer_footprint_axis_invalid` \
+                             / `StageBufferFootprintProofUnsupported`), so a lease-backed or \
+                             gathered index view is a shape this rail cannot state",
+                            stage.name(),
+                            declaration.index,
+                        ),
+                    ));
+                };
+                let Some(required) = stage_buffer_affine_required_bytes(accesses, counts) else {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_stage_buffer_footprint",
+                        format!(
+                            "a draw whose {} stage declares a [[buffer({})]] argument with an \
+                             affine footprint stays on the engine when the proof's bound cannot be \
+                             evaluated over this draw: {} access(es) over the draw's own \
+                             invocation counts either overflow the byte extent or name an axis a \
+                             draw does not have, and the contract refuses such a proof by name",
+                            stage.name(),
+                            declaration.index,
+                            accesses.len(),
+                        ),
+                    ));
+                };
+                (
+                    FootprintProof::Affine {
+                        accesses: accesses.clone(),
+                    },
+                    required,
+                )
+            }
             StageBufferFootprint::Unstated => {
                 return Err(OutOfClass::owned(
                     "render_provider_out_of_class_stage_buffer_footprint",
                     format!(
                         "a draw whose {} stage declares a [[buffer({})]] argument stays on the \
-                         engine when the translation's reach is not a static byte extent: the \
-                         canonical contract states stage buffer footprints as static extents \
-                         alone, so an affine, unbounded or unstated reach is a shape that \
-                         registration refuses by name",
+                         engine when the translation's reach is unbounded or states no byte range \
+                         at all: the canonical contract states stage buffer footprints as a \
+                         static ceiling or a bounded affine proof, and both registration and \
+                         admission refuse anything else by name rather than executing it against \
+                         a bound nothing states",
                         stage.name(),
                         declaration.index,
                     ),
@@ -721,6 +913,49 @@ fn stage_buffer_gate<'a>(
                      argument stays on the engine: the request binds {bind_bytes} byte(s) there, \
                      and the canonical contract proves the pass's view against the declared \
                      extent rather than the other way round",
+                    stage.name(),
+                    declaration.index,
+                ),
+            ));
+        }
+        // A writable declaration is a landing (R9f): the provider publishes one
+        // writeback per writable view, and this rail has to be able to place it
+        // where the guest reads. The bind's own guest address and the pages it
+        // resolved to when it was staged are that place; a bind with neither —
+        // the neutral bytes an index no stage reads is served, a bind whose
+        // destination the seam never resolved — would have its writeback
+        // dropped, so the draw keeps the engine by name.
+        if declaration.access.is_writable() && bind.landing.is_none() {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_stage_buffer_write",
+                format!(
+                    "a draw whose {} stage declares a writable [[buffer({})]] argument stays on \
+                     the engine when the request names no guest destination for it: the canonical \
+                     rail publishes one writeback per writable stage buffer, and a bind this rail \
+                     cannot land those bytes back into is a write the guest would never see. The \
+                     request binds {binds} stage buffer(s)",
+                    stage.name(),
+                    declaration.index,
+                ),
+            ));
+        }
+        // The landing's bytes also ride as a *pool* view: the trace's pool is
+        // the set of views a compute pass declares, and a writeback is keyed by
+        // the view the pool holds, so a writable stage buffer gets one declare
+        // pass of its own (`submit_narrow`). That pass binds the same bytes and
+        // is proven against the declaring kernel's own reach, so a shorter bind
+        // is a shape the provider always refuses — answered here rather than
+        // declined.
+        if declaration.access.is_writable() && bind_bytes < RENDER_DECLARE_REACH {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_stage_buffer_write",
+                format!(
+                    "a draw whose {} stage declares a writable [[buffer({})]] argument stays on \
+                     the engine when the request binds {bind_bytes} byte(s) there: a landing has \
+                     to name a view the trace's own pool declares, and the declaring kernel that \
+                     holds those entries reads {RENDER_DECLARE_REACH} byte(s) of each, so a \
+                     shorter bind is a view admission refuses by name. The request binds {binds} \
+                     stage buffer(s)",
                     stage.name(),
                     declaration.index,
                 ),
@@ -788,7 +1023,8 @@ fn stage_buffer_gate<'a>(
         out.push(NarrowStageBuffer {
             stage,
             index: declaration.index,
-            max_bytes,
+            access,
+            proof,
             bytes,
             window,
         });
@@ -1107,29 +1343,67 @@ impl RenderChainRole {
 }
 
 /// What one stage's own translation says about a `[[buffer(N)]]` argument it
-/// declares (`research/docs/23` §3.3, v83 / `research/docs/26` §R9b).
+/// declares (`research/docs/23` §3.3, v83/v86 / `research/docs/26` §R9b, §R9j).
 ///
-/// The classes are the render bind census's own
-/// (`runtime::bind_phase`'s `access_unused` / `access_dereferenced` /
-/// `access_undeclared` over the engine's `ReflectedBufferAccess`) minus the one
-/// class that is no declaration at all: a bind reflection does not mention is
-/// *absent*, and that is exactly the population this class admits.
+/// The three stated arms are the canonical contract's own access vocabulary
+/// ([`metal_api_core::provider::BufferAccess`]), so a declaration states the
+/// interface the provider pairs against its reflection rather than a class this
+/// rail would have to translate; the two remaining arms are the render bind
+/// census's (`runtime::bind_phase`'s `access_unused` / `access_undeclared` over
+/// the engine's `ReflectedBufferAccess`), minus the one class that is no
+/// declaration at all: a bind reflection does not mention is *absent*, and that
+/// is exactly the population this class admits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StageBufferDeclarationClass {
+pub enum StageBufferAccess {
     /// Declared, and the specialized entry point never dereferences it. The
     /// canonical registration pairs a *declaration* with a translation that
     /// reaches it, and a declaration the entry never reaches is a
-    /// `render_stage_reflection_mismatch` — so this class names a population
+    /// `render_stage_reflection_mismatch` — so this arm names a population
     /// rather than a cheaper admission.
     Unused,
-    /// Declared and read — `BufferAccess::Read`'s Metal spelling.
-    ReadOnly,
-    /// Declared and writable: the writeback landing neither rail carries for a
-    /// stage buffer yet.
-    Writable,
+    /// Declared and read: `BufferAccess::Read`'s Metal spelling.
+    Read,
+    /// Declared and written: the `BufferAccess::Write` arm R9f landed, whose
+    /// bytes leave through the completion's `BufferWriteback` channel.
+    Write,
+    /// Declared, read and written: `BufferAccess::ReadWrite`, stated the same
+    /// way and landed the same way.
+    ReadWrite,
     /// Declared without a usable access answer: fail closed, exactly as the
     /// engine's own bind path does.
     Unknown,
+}
+
+impl StageBufferAccess {
+    /// The access the canonical contract states for this declaration, or
+    /// `None` for the two arms the contract has no slot for — the arms this
+    /// rail's gate answers under their own bucket.
+    pub fn contract_access(self) -> Option<metal_api_core::provider::BufferAccess> {
+        use metal_api_core::provider::BufferAccess;
+        match self {
+            Self::Read => Some(BufferAccess::Read),
+            Self::Write => Some(BufferAccess::Write),
+            Self::ReadWrite => Some(BufferAccess::ReadWrite),
+            Self::Unused | Self::Unknown => None,
+        }
+    }
+
+    /// Whether this declaration is a landing (R9f): a writeback this rail has
+    /// to see placed, not just bytes to read.
+    pub fn is_writable(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
+
+    /// The spelling the class census and the refusal sentences use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unused => "unused",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::ReadWrite => "read_write",
+            Self::Unknown => "of an unclassified access",
+        }
+    }
 }
 
 /// The byte reach one `[[buffer(N)]]` declaration accounts for
@@ -1145,12 +1419,19 @@ pub enum StageBufferDeclarationClass {
 ///   declaration's static ranges names — the same number, computed the same
 ///   way, as the canonical rail's own `reflected_bytes`, from the same
 ///   translator pin over the same AIR;
-/// - a reach that is affine (strided) or unbounded, or that states no range at
-///   all: a shape the canonical contract cannot state, which keeps the draw on
-///   the engine under its own bucket.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// - an affine reach (`FootprintProof::Affine`, R9f/v86): the reflected
+///   `base + stride * index` accesses restated over the draw's own invocation
+///   axes. The canonical registration pairs an affine declaration with the
+///   reflection as *two measurements of one module* — the same access set,
+///   order- and duplicate-insensitively — so these are the translator's own
+///   numbers rather than a ceiling this rail chose;
+/// - an unbounded reach, or one that states no range at all: a proof the
+///   contract refuses by name, which keeps the draw on the engine under its own
+///   bucket.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StageBufferFootprint {
     Static { max_bytes: u64 },
+    Affine { accesses: Vec<AffineAccess> },
     Unstated,
 }
 
@@ -1161,13 +1442,49 @@ pub enum StageBufferFootprint {
 /// name, and the one the canonical contract's `StageBufferBinding::index`
 /// speaks — so a vertex declaration and a fragment declaration at one index are
 /// two different arguments.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StageBufferDeclaration {
     pub index: u32,
-    pub class: StageBufferDeclarationClass,
+    /// The access the contract states beside this slot, or the arm the
+    /// contract has no slot for.
+    pub access: StageBufferAccess,
     /// The byte extent the declaration's own reflection reaches, or the
     /// reason it cannot be stated as one.
     pub footprint: StageBufferFootprint,
+}
+
+/// Where a writable bind's bytes go back to the guest (`research/docs/26`
+/// §R9j).
+///
+/// A writable stage buffer is a landing (R9f): the provider publishes one
+/// `BufferWriteback` for it, and those bytes have to reach the address the
+/// guest reads. This is the bind's own guest address — the one this rail read
+/// the bytes from — beside the pages that address resolved to **when the bind
+/// was staged**. The pages are the write's authority rather than a second walk
+/// taken at completion time, for the reason
+/// `runtime::gva_view::write_span_within` states: between the two walks the
+/// guest can re-point the range, and the address a later walk answers is then
+/// not the one these bytes belong to.
+#[derive(Clone, Copy, Debug)]
+pub struct StageBufferLanding<'a> {
+    /// Guest address of the bind's first byte.
+    pub gva: u64,
+    /// Pages that address resolved to when the bind was staged.
+    pub pages: crate::runtime::gva_view::WindowPages<'a>,
+}
+
+/// One writable stage buffer's bytes, as the provider's completion published
+/// them (`BufferWriteback`), re-based onto the bind the pass stated.
+///
+/// `offset` is the writeback's first byte inside the bind's own bytes, so a
+/// caller holding the bind's guest destination writes exactly the interval the
+/// provider named — never "the whole buffer".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StageWriteback {
+    pub stage: RenderPipelineStage,
+    pub index: u32,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
 }
 
 /// The registered guest RAM window that covers one stage buffer's bytes
@@ -1215,6 +1532,11 @@ pub struct StageBufferBind<'a> {
     /// one. `None` is the staged arm: the owner copies, and no registration is
     /// named.
     pub window: Option<StageBufferWindow>,
+    /// Where this bind's bytes go back to, for the declarations whose access
+    /// is writable (`research/docs/26` §R9j). `None` is a bind this rail has no
+    /// guest destination for — a shape a writable declaration cannot land in,
+    /// which the gate answers by name rather than dropping a writeback.
+    pub landing: Option<StageBufferLanding<'a>>,
 }
 
 /// What one render submission needs to leave this rail: the two stage
@@ -1314,6 +1636,15 @@ pub struct RenderRailOutput {
     /// `Some`, which is what lets the caller say *which* frame the store route
     /// is about to land.
     pub present: Option<PresentCompletion>,
+    /// The bytes of every writable stage buffer the pass declared, in the
+    /// contract's canonical order (`research/docs/26` §R9j).
+    ///
+    /// One entry per writable declaration, re-based onto the bind's own bytes
+    /// and range-checked against the view the trace carried. Empty for every
+    /// pass whose stage buffers are read-only — which is every shape R9d/R9e
+    /// admitted — so a caller that lands these bytes has nothing to do for the
+    /// population that came before this increment.
+    pub stage_writebacks: Vec<StageWriteback>,
 }
 
 /// What one resident-class submission leaves behind.
@@ -1512,6 +1843,26 @@ pub enum ProviderRenderDecline {
         allocation: AllocationId,
         view: ViewId,
     },
+    /// The completion published no writeback for a writable stage buffer, so
+    /// the pass ran without landing the bytes the guest reads (R9f/R9j).
+    StageBufferWritebackMissing {
+        stage: RenderPipelineStage,
+        index: u32,
+    },
+    /// The completion's writeback for a writable stage buffer does not lie
+    /// inside the view the trace carried, so its bytes are not that bind's.
+    StageBufferWritebackShape {
+        stage: RenderPipelineStage,
+        index: u32,
+        offset: u64,
+        length: u64,
+        view_offset: u64,
+        view_length: u64,
+    },
+    /// The frame this rail states could not be produced or consumed by the
+    /// canonical command channel, so the shape is one the wire does not carry
+    /// (`research/docs/26` §R9j). `step` names the codec call that answered.
+    StageBufferWire { step: &'static str, detail: String },
     /// The owner rail refused a registration, an import, a retirement or a
     /// release. Not raised by this rail's own class (its inputs are
     /// trace-owned), but shared with the compute rail so one device-loss
@@ -1533,6 +1884,9 @@ impl Decline for ProviderRenderDecline {
             Self::AttachmentFrameNotNarrowable { .. } => "attachment_frame_not_narrowable",
             Self::PresentNotExecuted { .. } => "render_present_not_executed",
             Self::ResidentWritebackPublished { .. } => "resident_writeback_published",
+            Self::StageBufferWritebackMissing { .. } => "stage_buffer_writeback_missing",
+            Self::StageBufferWritebackShape { .. } => "stage_buffer_writeback_shape",
+            Self::StageBufferWire { .. } => "stage_buffer_wire",
             Self::Owner(inner) => inner.slug(),
         }
     }
@@ -1604,6 +1958,28 @@ impl Decline for ProviderRenderDecline {
                 ("allocation", format!("{:#x}", allocation.get())),
                 ("view", view.get().to_string()),
             ],
+            Self::StageBufferWritebackMissing { stage, index } => vec![
+                ("stage", stage.name().to_string()),
+                ("index", index.to_string()),
+            ],
+            Self::StageBufferWritebackShape {
+                stage,
+                index,
+                offset,
+                length,
+                view_offset,
+                view_length,
+            } => vec![
+                ("stage", stage.name().to_string()),
+                ("index", index.to_string()),
+                ("offset", offset.to_string()),
+                ("length", length.to_string()),
+                ("view_offset", view_offset.to_string()),
+                ("view_length", view_length.to_string()),
+            ],
+            Self::StageBufferWire { step, detail } => {
+                vec![("step", step.to_string()), ("detail", detail.clone())]
+            }
             Self::Owner(inner) => inner.fields(),
         }
     }
@@ -1794,6 +2170,35 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     // no-copy arm, which a device without host-pointer import refuses by name.
     // Read here rather than inside the pure gate, exactly as the window above,
     // so a shape the request alone already answers never reaches the provider.
+    //
+    // The capability answer comes first (R9j), and it is the *wire's* reading
+    // of it: a provider that does not declare the stage-buffer shape executes
+    // none of these declarations, so the draw keeps the engine under the
+    // capability's own bucket rather than being met by the provider's
+    // `render_stage_buffer_unsupported` refusal.
+    if !pass.stage_buffers.is_empty() {
+        let support = match declared_stage_buffer_support() {
+            Ok(support) => support,
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        };
+        let declared = pass.stage_buffers.len();
+        if !support.supported || declared > support.maximum as usize {
+            let reason = OutOfClass::owned(
+                "render_provider_out_of_class_stage_buffer_capability",
+                format!(
+                    "a draw whose stages declare {declared} stage buffer(s) stays on the engine \
+                     when the provider's own capability answer does not carry the shape: the \
+                     frame declares supports_render_stage_buffers={} and \
+                     max_render_stage_buffers={}, and a pass above either bound is one admission \
+                     refuses by name (`render_stage_buffer_unsupported` / \
+                     `render_stage_buffer_limit`) rather than a slot this rail could bind",
+                    support.supported, support.maximum,
+                ),
+            );
+            reason.note();
+            return RenderRailOutcome::NotInNarrowClass(reason);
+        }
+    }
     if pass
         .stage_buffers
         .iter()
@@ -1926,16 +2331,21 @@ struct NarrowIndexStream<'a> {
     bytes: &'a [u8],
 }
 
-/// One admitted stage buffer: a read-only `[[buffer(N)]]` argument a stage's
-/// own translation declares, with the bytes the canonical pass binds into it
-/// (`research/docs/26` §R9d).
+/// One admitted stage buffer: a `[[buffer(N)]]` argument a stage's own
+/// translation declares, with the bytes the canonical pass binds into it
+/// (`research/docs/26` §R9d, §R9j).
 struct NarrowStageBuffer<'a> {
     stage: RenderPipelineStage,
     /// The Metal index inside `stage`'s own buffer namespace.
     index: u32,
-    /// The static byte extent the stage's reflection reaches: the number the
-    /// contract declares and the pass's view is proven against.
-    max_bytes: u64,
+    /// The access the contract declares for this slot — the arm the stage's own
+    /// reflection reported, so the pass's view carries the same one
+    /// (`StageBufferAccessMismatch` is the contract's own pairing of the two).
+    access: BufferAccess,
+    /// The proof the contract declares: the static ceiling, or the affine
+    /// access set the reflection reported (R9f/v86). The bind's bytes are
+    /// proven to cover it before the view exists.
+    proof: FootprintProof,
     /// The owner's staged bytes, when the bind's content is a copy the owner
     /// holds. `None` is a bind whose bytes exist only behind its window.
     bytes: Option<&'a [u8]>,
@@ -2396,6 +2806,7 @@ fn narrow_class<'a>(
     // with.
     let stage_buffers = stage_buffer_gate(
         inputs,
+        req,
         req.storage_buffers.len(),
         req.vertex_attributes.len(),
     )?;
@@ -2909,6 +3320,14 @@ fn submit_narrow(
         },
         format: pass.index_stream.format,
     };
+    // The index view has an identity of its own: the two namespaces are the
+    // same one (`ViewId`), and R9j made the collision visible — a stage
+    // buffer's pool entry is keyed by this identity, and an index view that
+    // reused it was answered as "the same view changed its allocation, range
+    // or source bytes" (`SerialBufferRebinding`). Harmless while every stage
+    // buffer lived only in the render pass and nothing declared these views in
+    // the pool; a landing declares them.
+    next_view += 1;
     // The v83 stage-buffer half, filled (R9d). One lease per admitted stage
     // buffer, imported through the owner rail before the trace exists, and one
     // view per declaration, at the view offset and length the owner's own
@@ -2916,12 +3335,26 @@ fn submit_narrow(
     // registration to execute it.
     let mut leases = plan_stage_buffers(provider, pass, &mut resources)?;
     let mut stage_buffers = Vec::with_capacity(pass.stage_buffers.len());
+    // The view identities the completion's writebacks are paired with, kept
+    // beside the views for the same reason the compute rail keeps its binding
+    // table: the writeback names `(view, allocation)`, and only the trace's own
+    // construction knows which bind that is.
+    let mut stage_buffer_slots: Vec<StageBufferSlot> = Vec::with_capacity(pass.stage_buffers.len());
     for buffer in &pass.stage_buffers {
         let binding = stage_buffer_owner_binding(buffer.stage, buffer.index);
         let view = leases
             .as_ref()
             .and_then(|plan| plan.view(binding))
             .expect("the owner plan covers every admitted stage buffer");
+        stage_buffer_slots.push(StageBufferSlot {
+            stage: buffer.stage,
+            index: buffer.index,
+            view: ViewId::new(next_view),
+            allocation: view.allocation,
+            view_offset: view.view_offset,
+            view_length: view.view_length,
+            access: buffer.access,
+        });
         stage_buffers.push(StageBufferView {
             stage: buffer.stage,
             view: BufferView {
@@ -2930,7 +3363,11 @@ fn submit_narrow(
                 allocation_id: view.allocation,
                 offset: view.view_offset,
                 length: view.view_length,
-                access: BufferAccess::Read,
+                // The access the pipeline declares for this slot (R9j): the
+                // contract pairs the two field by field
+                // (`StageBufferAccessMismatch`), so a writable declaration is
+                // what makes this view a landing rather than a read.
+                access: buffer.access,
                 attribute_stride: None,
                 source: match view.channel {
                     provider_owner::Channel::Borrowed => BufferSource::BorrowedNoCopy(view.lease),
@@ -3010,7 +3447,11 @@ fn submit_narrow(
         // request whose stages declare no `[[buffer(N)]]` argument — the R9b
         // population, whose binds fill indices no descriptor can be needed for
         // and which therefore needs no declaration either.
-        stage_buffers,
+        // Cloned for the declaring half below, which states one pool entry per
+        // *writable* view from this same list, so the render pass's views and
+        // the pool entries they land through are one set of bytes rather than
+        // two spellings of them.
+        stage_buffers: stage_buffers.clone(),
     };
     let trace = ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
@@ -3018,22 +3459,49 @@ fn submit_narrow(
         operation_id: OperationId::new(NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed)),
         pipelines: vec![declaring.clone(), render_pipeline.clone()],
         encoder_dispatch_type: DispatchType::Serial,
-        passes: vec![
-            TracePass::Compute(ComputePass {
-                pipeline: declaring.pipeline_id,
-                buffers: vec![declaration],
-                textures: Vec::new(),
-                dispatch: Dispatch {
-                    kind: DispatchKind::ThreadsExact,
-                    grid: [1, 1, 1],
-                    threads_per_threadgroup: [1, 1, 1],
-                },
-            }),
-            TracePass::Render(pass_descriptor),
-        ],
+        passes: {
+            let mut passes =
+                declaring_passes_with(declaring.pipeline_id, declaration, &stage_buffers);
+            passes.push(TracePass::Render(pass_descriptor));
+            passes
+        },
         completion_policy: CompletionPolicy::HostReadback,
         heap: None,
         indirect: None,
+    };
+    // R9j: a pass that declares a stage buffer crosses the owner→provider wire
+    // before anything is admitted. The frame is the payload (every declaration,
+    // view and source this rail stated), it is decoded again with the
+    // provider's own decoder, and it is what the admission below sees — so a
+    // field the wire cannot carry is a typed decline here at the seam rather
+    // than a difference discovered when the owner and the provider are two
+    // processes. A trace whose stages declare no buffer keeps the exact path
+    // (and bytes) it had before the declaration half existed; the frames of the
+    // shapes this increment does not touch are R9h's 7/7 regression.
+    let (trace, resources) = if pass.stage_buffers.is_empty() {
+        (trace, resources)
+    } else {
+        let frame = provider_wire::submit_frame(&trace, &resources).map_err(|decline| {
+            abort_stage_buffer_leases(&mut leases, provider);
+            ProviderRenderDecline::StageBufferWire {
+                step: decline.step,
+                detail: decline.detail,
+            }
+        })?;
+        provider_wire::note_submit_frame();
+        match provider_wire::carried_submission(&frame) {
+            Ok((trace, resources)) => {
+                note_wire_stage_buffers(&trace);
+                (trace, resources)
+            }
+            Err(decline) => {
+                abort_stage_buffer_leases(&mut leases, provider);
+                return Err(ProviderRenderDecline::StageBufferWire {
+                    step: decline.step,
+                    detail: decline.detail,
+                });
+            }
+        }
     };
     let validated = match provider.capabilities().validate_trace(trace, resources) {
         Ok(validated) => validated,
@@ -3099,13 +3567,19 @@ fn submit_narrow(
     // the completion retires it, retire and reclaim each window, release the
     // provider's import. It runs before this rail reads the completion's
     // writebacks, exactly as the compute rail's does, so no provider-visible
-    // byte reaches the caller while a lease that covers it is still held. The
-    // stage buffers are read-only, so there is nothing of theirs to write back
-    // and no writeback check waits for them.
+    // byte reaches the caller while a lease that covers it is still held.
     if let Some(plan) = leases.take() {
         plan.settle(provider, result.completion)
             .map_err(ProviderRenderDecline::Owner)?;
     }
+    // R9j: the writable stage buffers' bytes, on the same `BufferWriteback`
+    // channel the stored attachment lands through (R9f). One writeback per
+    // writable view, in the contract's canonical order, re-based onto the bind
+    // the pass stated with the range checked against the view the trace
+    // carried — a provider-reported interval the view cannot hold is never
+    // truncated into place. The bytes leave here for the caller, which owns the
+    // guest destination (`StageBufferLanding`).
+    let stage_writebacks = stage_buffer_writebacks(&stage_buffer_slots, &result.writebacks)?;
     // The resident arm's whole claim is that the frame stayed in the provider's
     // image. The one fact that would make that claim unreadable is a published
     // writeback for the same attachment, so it is checked rather than assumed —
@@ -3171,7 +3645,118 @@ fn submit_narrow(
         bytes: writeback.bytes.clone(),
         bgra: pass.bgra,
         present,
+        stage_writebacks,
     }))
+}
+
+/// The trace's compute half: the pass that declares the attachment's bytes,
+/// plus one declare pass per *writable* stage buffer (R9f/R9j).
+///
+/// A landing has to name a view the trace declares, and the views a trace
+/// declares are the ones a compute pass binds — the trace's pool
+/// ([`ComputeTrace::serial_resources`]). So each writable stage buffer rides in
+/// a declare pass of its own, carrying the *same* bytes, source and identity as
+/// the render pass's view of the same slot (`SerialBufferRebinding` holds the
+/// two to each other field by field), at the read access the declaring kernel's
+/// own reflection states. One pass per view rather than one pass with several
+/// bound views, because a compute pass's bound set has to be exactly what its
+/// pipeline declares (`UnknownBinding` / `MissingBinding`), and the declaring
+/// kernel declares one buffer.
+///
+/// The render half follows, in the same order the render pass always had.
+fn declaring_passes_with(
+    pipeline: metal_api_core::provider::PipelineId,
+    attachment: BufferView,
+    stage_buffers: &[StageBufferView],
+) -> Vec<TracePass> {
+    let declare_pass = |buffers: Vec<BufferView>| {
+        TracePass::Compute(ComputePass {
+            pipeline,
+            buffers,
+            textures: Vec::new(),
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+        })
+    };
+    let mut passes = vec![declare_pass(vec![attachment])];
+    for buffer in stage_buffers
+        .iter()
+        .filter(|buffer| buffer.view.access.is_writable())
+    {
+        let mut pool = buffer.view.clone();
+        // The declaring kernel's own interface: one buffer, read.
+        pool.metal_binding = 0;
+        pool.access = BufferAccess::Read;
+        passes.push(declare_pass(vec![pool]));
+    }
+    passes
+}
+
+/// One admitted stage buffer's view identity, kept from the trace construction
+/// so the completion's writebacks can be paired with the bind they belong to
+/// (`research/docs/26` §R9j).
+struct StageBufferSlot {
+    stage: RenderPipelineStage,
+    index: u32,
+    view: ViewId,
+    allocation: AllocationId,
+    view_offset: u64,
+    view_length: u64,
+    access: BufferAccess,
+}
+
+/// The provider's writebacks for this submission's writable stage buffers, in
+/// the contract's canonical order.
+///
+/// The pairing is the same `(view, allocation)` identity the compute rail's
+/// `staged_writebacks` uses, and so are the two refusals: a writable view the
+/// completion named no writeback for is a landing that did not happen, and one
+/// whose interval leaves the view is a range the staged bytes cannot hold —
+/// neither is truncated into place, and both are typed because an in-class
+/// shape is never re-run somewhere else.
+fn stage_buffer_writebacks(
+    slots: &[StageBufferSlot],
+    writebacks: &[BufferWriteback],
+) -> Result<Vec<StageWriteback>, ProviderRenderDecline> {
+    let mut out = Vec::new();
+    for slot in slots.iter().filter(|slot| slot.access.is_writable()) {
+        let Some(writeback) = writebacks.iter().find(|writeback| {
+            writeback.view_id == slot.view && writeback.allocation_id == slot.allocation
+        }) else {
+            return Err(ProviderRenderDecline::StageBufferWritebackMissing {
+                stage: slot.stage,
+                index: slot.index,
+            });
+        };
+        let length = u64::try_from(writeback.bytes.len()).unwrap_or(u64::MAX);
+        let inside = slot
+            .view_offset
+            .checked_add(slot.view_length)
+            .zip(writeback.offset.checked_add(length))
+            .is_some_and(|(view_end, writeback_end)| {
+                writeback.offset >= slot.view_offset && writeback_end <= view_end
+            });
+        if !inside {
+            return Err(ProviderRenderDecline::StageBufferWritebackShape {
+                stage: slot.stage,
+                index: slot.index,
+                offset: writeback.offset,
+                length,
+                view_offset: slot.view_offset,
+                view_length: slot.view_length,
+            });
+        }
+        out.push(StageWriteback {
+            stage: slot.stage,
+            index: slot.index,
+            offset: writeback.offset - slot.view_offset,
+            bytes: writeback.bytes.clone(),
+        });
+    }
+    Ok(out)
 }
 
 /// Every input allocation the trace's render half carries: one per vertex
@@ -3357,24 +3942,23 @@ fn register_render_pipeline(
         fragment_entry: pass.fragment_entry.clone(),
         color_formats: vec![pass.format],
         vertex_layout: pass.vertex_layout(),
-        // The v83 half, stated (R9d): one declaration per read-only
-        // `[[buffer(N)]]` argument the two stages' own translations reported,
-        // in the contract's canonical order and with the static extent the
-        // reflection reaches. The gate admitted this request by pairing each of
+        // The v83 half, stated (R9d/R9j): one declaration per `[[buffer(N)]]`
+        // argument the two stages' own translations reported, in the
+        // contract's canonical order, with the access the reflection reported
+        // and the footprint it reaches (a static ceiling, or the affine access
+        // set R9f landed). The gate admitted this request by pairing each of
         // these declarations with a bind, so the pass below states exactly one
-        // view per entry and core holds the two lists to each other
-        // (`validate_against`). An empty list is the pre-R9d shape where
-        // neither stage declares a buffer at all.
+        // view per entry — carrying the same access — and core holds the two
+        // lists to each other (`validate_against`). An empty list is the
+        // pre-R9d shape where neither stage declares a buffer at all.
         stage_buffers: pass
             .stage_buffers
             .iter()
             .map(|buffer| StageBufferBinding {
                 stage: buffer.stage,
                 index: buffer.index,
-                access: BufferAccess::Read,
-                footprint: FootprintProof::Static {
-                    max_bytes: buffer.max_bytes,
-                },
+                access: buffer.access,
+                footprint: buffer.proof.clone(),
             })
             .collect(),
     };
