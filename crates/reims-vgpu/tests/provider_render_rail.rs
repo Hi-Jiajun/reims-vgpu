@@ -35,7 +35,9 @@ use reims_vgpu::backend::vulkan::engine::{
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
 };
 use reims_vgpu::observe::Decline as _;
-use reims_vgpu::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
+use reims_vgpu::protocol::pixel_format::{
+    MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM,
+};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -205,10 +207,20 @@ const FRAGMENT_TEXEL: [u8; 4] = [64, 128, 191, 255];
 const CLEAR: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
 
 fn attachment(format: u16) -> reims_vgpu::backend::vulkan::engine::ColorAttachmentState {
+    attachment_with_clear(format, CLEAR)
+}
+
+/// [`attachment`] with a test's own clear, because the wide arm's whole point is
+/// that the clear is stated in the attachment's *own* format: 0.5 is a half and
+/// is not a multiple of `1/255`, so the two arms admit different clears.
+fn attachment_with_clear(
+    format: u16,
+    clear: [f64; 4],
+) -> reims_vgpu::backend::vulkan::engine::ColorAttachmentState {
     reims_vgpu::backend::vulkan::translate::pixel::color_attachment(format)
         .expect("the fixture's attachment format is renderable")
         .0
-        .with_clear(CLEAR)
+        .with_clear(clear)
 }
 
 /// One vertex stream of a test's draw, in the terms the production seam builds
@@ -355,10 +367,44 @@ fn translated(stages: &Stages, mut req: DrawRequest) -> DrawRequest {
 
 /// The canonical rail's own frame for one request, in semantic RGBA8.
 fn provider_pixels(label: &str, stages: &Stages, req: &DrawRequest) -> Vec<u8> {
+    let out = provider_frame(label, stages, req);
+    semantic_rgba(out.bytes, out.bgra)
+}
+
+/// The canonical rail's frame for one request **as the provider published it**:
+/// the attachment's whole packed extent at the attachment's own texel width.
+///
+/// Separate from [`provider_pixels`] because a wide attachment's frame is not
+/// eight-bit colour until the seam narrows it, and that narrowing is exactly
+/// what the wide-texel test has to be able to see past.
+fn provider_frame(
+    label: &str,
+    stages: &Stages,
+    req: &DrawRequest,
+) -> provider_render::RenderRailOutput {
     match provider_render::submit_render(&inputs(stages, RenderChainRole::SoleOrTail), req) {
-        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        RenderRailOutcome::ProviderCompleted(out) => out,
         other => panic!("{label}: the canonical provider has to execute this shape: {other:?}"),
     }
+}
+
+/// One eight-byte attachment frame narrowed to the eight-bit colour the span's
+/// consumers speak, by the protocol rule the seam itself applies
+/// (`runtime/draw/vulkan`'s `provider_span_pixels`, counted as
+/// `target_read_narrowed`) — so the provider's raw bytes can be compared with
+/// the engine's own readback without the test re-deriving the quantization.
+fn narrow_wide_frame(label: &str, frame: &[u8], texels: u32) -> Vec<u8> {
+    let mut narrowed = vec![0u8; texels as usize * 4];
+    assert!(
+        reims_vgpu::protocol::pixel_format::narrow_texel_to_rgba8(
+            reims_vgpu::protocol::pixel_format::TexelLayout::Rgba16Float,
+            frame,
+            texels,
+            &mut narrowed,
+        ),
+        "{label}: a 16F frame narrows to the span's colour"
+    );
+    narrowed
 }
 
 /// The self-contained engine's frame for the same request, in semantic RGBA8.
@@ -431,6 +477,45 @@ fn texel_at(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
         pixels[offset + 2],
         pixels[offset + 3],
     ]
+}
+
+/// One texel of a readback at whatever width the attachment published it, so a
+/// wide frame's eight bytes can be read as directly as a narrow frame's four.
+fn texel_of(pixels: &[u8], width: u32, x: u32, y: u32, bytes_per_texel: usize) -> Vec<u8> {
+    let offset = (usize::try_from(y * width + x).expect("the extent fits usize")) * bytes_per_texel;
+    pixels[offset..offset + bytes_per_texel].to_vec()
+}
+
+/// Two frames compared byte for byte, reporting the *first* byte that differs
+/// rather than printing two whole attachments (which is 16 KiB of hex at the
+/// declared window and buries the reading).
+fn assert_frames_equal(label: &str, got: &[u8], want: &[u8]) {
+    assert_eq!(got.len(), want.len(), "{label}: the frames' extents");
+    if let Some((index, (got, want))) = got
+        .iter()
+        .zip(want)
+        .enumerate()
+        .find(|(_, (got, want))| got != want)
+    {
+        let texel = index / 4;
+        panic!(
+            "{label}: byte {index} (texel {texel}, channel {}) is {got:#04x}, expected \
+             {want:#04x}",
+            index % 4,
+        );
+    }
+}
+
+/// Two frames asserted to be *different* frames, at the first byte that differs
+/// (a `assert_ne!` on two attachments would print both whole, which is the same
+/// 16 KiB of hex the equality helper avoids).
+fn assert_frames_differ(label: &str, got: &[u8], want: &[u8]) {
+    if got.len() == want.len() && got == want {
+        panic!(
+            "{label}: the frames are the same frame ({} bytes)",
+            got.len()
+        );
+    }
 }
 
 /// A texel the fragment stage covered: the fragment's own colour, within a
@@ -1457,6 +1542,253 @@ fn a_scissor_clips_the_pass_the_same_way_on_both_rails() {
     );
 }
 
+/// The wide-texel half of the class, end to end.
+///
+/// An `Rgba16Float` attachment is one **eight-byte** texel — four little-endian
+/// halves, `research/docs/23` §78 — and the canonical provider publishes it as
+/// such. That is what makes the half rounding falsifiable rather than asserted:
+/// the bytes pinned below are the driver's own rounding of the fragment stage's
+/// `float32` output, and of a clear the guest stated as a float, into the
+/// attachment's format — so a rail that read the attachment as four bytes, or
+/// spelled its clear as four, cannot produce them.
+///
+/// The shape is the resident chain of
+/// `a_resident_store_keeps_the_frame_a_later_record_loads`, at 16F: a record
+/// that clears a green frame into the provider's own image and keeps it there,
+/// then a record that loads that image, covers half the attachment with the
+/// fragment's texel and *publishes* the mixed frame. The second record is the
+/// wide shape this class reads back at its own width, and it is also one the
+/// engine's own wide rail draws — a *resident* image is created at the
+/// attachment's format, unlike the pooled one
+/// (`a_pooled_wide_attachment_stays_on_the_engine_by_name`) — which is what
+/// makes the byte comparison a statement about the two rails and not about one
+/// rail twice.
+#[test]
+fn a_rgba16float_attachment_travels_at_its_own_width_and_agrees_with_the_engine() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let half = half_of(width);
+    let texels = width * height;
+    let identity = wide_surface_identity(0x7a_16_00_01);
+
+    // The seed: a clear every component of which a half holds exactly, kept in
+    // the provider's own image under the request's own identity. The outcome
+    // carries no bytes — that *is* the resident-store arm.
+    let seed = wide_resident_seed_request(&identity);
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &seed) {
+        RenderRailOutcome::ProviderCompletedResident(frame) => assert!(
+            !frame.loaded,
+            "a record that clears cannot have loaded the image it keeps"
+        ),
+        other => panic!("a 16F resident seed is in class: {other:?}"),
+    }
+
+    // The record that composites onto it and publishes what it drew.
+    let delivered = provider_render::provider_submissions();
+    let chained = wide_resident_load_request(&identity, true);
+    let frame = provider_frame("rgba16float", &stages, &chained);
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered + 1,
+        "the wide shape reached the canonical provider rather than staying on the engine"
+    );
+    assert!(
+        !frame.bgra,
+        "the wide arm is RGBA in its own halves; only the 8-bit orders carry a scanout order"
+    );
+    assert_eq!(
+        frame.bytes.len(),
+        texels as usize * 8,
+        "the frame is the attachment's whole packed extent at eight bytes per texel"
+    );
+
+    // A texel the second record never covered: the *seed's* own halves, green as
+    // `0x0000, 0x3c00, 0x0000, 0x3c00`. A rail that read the resident's bytes as
+    // four-byte texels cannot produce this, and neither can one that wrote a
+    // four-byte clear into it.
+    assert_eq!(
+        texel_of(&frame.bytes, width, width - 1, height / 2, 8),
+        [0x00, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x3c],
+        "a texel outside the rectangle keeps the resident's own halves"
+    );
+    // A texel the second record covered: the half rounding of the fragment's own
+    // output. The fixture writes `float4(0.25, 0.5, 0.75, 1)` — four values a
+    // half holds exactly, so these bytes are that colour with no step between,
+    // and they are *halves* rather than the four bytes of an 8-bit order.
+    assert_eq!(
+        texel_of(&frame.bytes, width, half - 1, height / 2, 8),
+        [0x00, 0x34, 0x00, 0x38, 0x00, 0x3a, 0x00, 0x3c],
+        "a covered texel is the fragment's float4(0.25, 0.5, 0.75, 1) as four little-endian \
+         halves (0x3400, 0x3800, 0x3a00, 0x3c00)"
+    );
+
+    // Narrowed to the eight-bit colour the span's consumers read, the frame is
+    // exactly the engine's own readback of the same two-record chain: the
+    // engine's resident is created at the attachment's own format, and its
+    // readback quantizes a wide resident with the same protocol rule.
+    let narrowed = narrow_wide_frame("rgba16float", &frame.bytes, texels);
+    assert_texel_count("rgba16float narrowed", &narrowed);
+    for x in half..width {
+        assert_eq!(
+            texel_at(&narrowed, x, height / 2),
+            RESIDENT_SEED_TEXEL,
+            "texel ({x}, {}) is the seed's green narrowed: a rail that cleared instead of \
+             loading, or that loaded a stale image, lands another colour here",
+            height / 2,
+        );
+    }
+    assert_texel_near(
+        "rgba16float narrowed: the last texel inside the rectangle",
+        texel_at(&narrowed, half - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    let Some(engine_seed) = engine_pixels(
+        "wide resident seed",
+        &stages,
+        wide_resident_seed_request(&identity),
+    ) else {
+        return;
+    };
+    assert!(
+        engine_seed.is_empty(),
+        "a resident store's readback is withheld on the engine too"
+    );
+    let Some(engine) = engine_pixels(
+        "wide resident chain",
+        &stages,
+        wide_resident_load_request(&identity, true),
+    ) else {
+        return;
+    };
+    assert_frames_equal(
+        "rgba16float narrowed against the engine",
+        &narrowed,
+        &engine,
+    );
+
+    // The narrow order is untouched by all of this: the same shape at eight bits
+    // still publishes four-byte texels, and those bytes are still the engine's.
+    let narrow_req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    let narrow = provider_frame("rgba8", &stages, &narrow_req);
+    assert!(
+        !narrow.bgra,
+        "the reviewed attachment is the RGBA order of the two 8-bit ones"
+    );
+    assert_eq!(
+        narrow.bytes.len(),
+        texels as usize * 4,
+        "the 8-bit arm's frame is still four bytes per texel"
+    );
+    let Some(narrow_engine) = engine_pixels("rgba8", &stages, narrow_req) else {
+        return;
+    };
+    assert_frames_equal("rgba8 against the engine", &narrow.bytes, &narrow_engine);
+
+    // Neither arm of the clear rule is the other's relaxation, and both answer
+    // before the provider is asked.
+    let delivered = provider_render::provider_submissions();
+    let mut half_only_clear_on_eight_bits = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    half_only_clear_on_eight_bits.color_attachment = Some(attachment_with_clear(
+        MTL_FORMAT_RGBA8_UNORM,
+        [0.0, 0.0, 0.0, 0.5],
+    ));
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &half_only_clear_on_eight_bits,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_clear_bytes",
+            "0.5 is exact in half and not a multiple of 1/255: {reason}"
+        ),
+        other => panic!("a half-only clear on a narrow attachment is out of class: {other:?}"),
+    }
+    let mut eight_bit_only_clear_on_wide =
+        request_with_streams(MTL_FORMAT_RGBA16_FLOAT, &position_streams());
+    eight_bit_only_clear_on_wide.target_identity = Some(identity.clone());
+    eight_bit_only_clear_on_wide.skip_readback = true;
+    eight_bit_only_clear_on_wide.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    eight_bit_only_clear_on_wide.color_attachment = Some(attachment_with_clear(
+        MTL_FORMAT_RGBA16_FLOAT,
+        [64.0 / 255.0, 128.0 / 255.0, 191.0 / 255.0, 1.0],
+    ));
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &eight_bit_only_clear_on_wide,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_clear_bytes",
+            "an eight-bit-exact texel is not a half-exact one: {reason}"
+        ),
+        other => panic!("a clear the half cannot hold is out of class: {other:?}"),
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "both clear-rule refusals stay on the engine without the provider seeing them"
+    );
+}
+
+/// The pooled wide attachment: a shape the *engine* cannot draw.
+///
+/// The engine's pooled offscreen target is one image at
+/// `translate::pixel::RESIDENT_RGBA_FORMAT` — its `TargetKey` carries no format
+/// — while the render pass is keyed on the attachment's own. At eight bytes per
+/// texel the pass therefore lands nothing, which this test measures rather than
+/// assumes. A class that admitted the shape would hand the guest a frame the
+/// engine never drew, so it stays on the engine by name; the day the pooled arm
+/// follows the attachment's format, the last assertion here fails and the guard
+/// can be deleted.
+#[test]
+fn a_pooled_wide_attachment_stays_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+
+    let delivered = provider_render::provider_submissions();
+    let pooled = request_with_streams(MTL_FORMAT_RGBA16_FLOAT, &position_streams());
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &pooled) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_wide_pooled",
+            "a pooled wide attachment is a shape the engine does not draw: {reason}"
+        ),
+        other => panic!("a pooled wide attachment stays on the engine: {other:?}"),
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "the refusal answers before the provider is asked"
+    );
+
+    // The frame the *resident* arm lands for the same draw, on the provider's
+    // side of this file: the previous test pins that arm's byte parity with the
+    // engine. What the engine answers for the *pooled* shape is a different
+    // frame — the measurement the guard rests on.
+    let identity = wide_surface_identity(0x7a_16_00_02);
+    let seed = wide_resident_seed_request(&identity);
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &seed) {
+        RenderRailOutcome::ProviderCompletedResident(_) => (),
+        other => panic!("the 16F seed is in class: {other:?}"),
+    }
+    let resident = provider_frame(
+        "wide resident",
+        &stages,
+        &wide_resident_load_request(&identity, true),
+    );
+    let resident_narrowed =
+        narrow_wide_frame("wide resident", &resident.bytes, extent().0 * extent().1);
+    let Some(pooled_engine) = engine_pixels("pooled wide", &stages, pooled) else {
+        return;
+    };
+    assert_frames_differ(
+        "the pooled wide frame against the resident one",
+        &pooled_engine,
+        &resident_narrowed,
+    );
+}
+
 /// The scissor shapes the canonical pass cannot state stay on the engine, by
 /// name, without the provider being asked.
 ///
@@ -1569,6 +1901,22 @@ fn surface_identity(id: u32) -> engine::TargetIdentity {
     }
 }
 
+/// The same identity at the **wide** attachment's format.
+///
+/// The engine's resident image is created from the request's attachment, while
+/// the identity is what both rails key that image on — so a 16F resident has to
+/// name 16F here, exactly as a guest's own `TargetIdentity` would.
+fn wide_surface_identity(id: u32) -> engine::TargetIdentity {
+    let (width, height) = extent();
+    engine::TargetIdentity::Surface {
+        id,
+        width,
+        height,
+        generation: 1,
+        format: ash::vk::Format::R16G16B16A16_SFLOAT,
+    }
+}
+
 /// The frame a resident seed leaves behind: a colour that is neither the
 /// fragment stage's texel nor the *second* record's own clear value
 /// ([`CLEAR`]), so "the resident load was skipped and the pass cleared instead"
@@ -1615,6 +1963,41 @@ fn resident_seed_request(identity: &engine::TargetIdentity) -> DrawRequest {
 fn resident_load_request(identity: &engine::TargetIdentity, publishes: bool) -> DrawRequest {
     let (width, height) = extent();
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.target_identity = Some(identity.clone());
+    req.load_from_target = true;
+    req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+    req.scissors.push(ScissorResource {
+        x: 0,
+        y: 0,
+        width: half_of(width),
+        height,
+    });
+    if !publishes {
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    }
+    req
+}
+
+/// [`resident_seed_request`] at the wide attachment's own format: the same
+/// degenerate stream, the same resident-store pair, and a clear every component
+/// of which a half holds exactly ([`RESIDENT_SEED_CLEAR`]).
+fn wide_resident_seed_request(identity: &engine::TargetIdentity) -> DrawRequest {
+    let mut req = request_with_streams(MTL_FORMAT_RGBA16_FLOAT, &[degenerate_stream()]);
+    req.target_identity = Some(identity.clone());
+    req.skip_readback = true;
+    req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    req.color_attachment = Some(attachment_with_clear(
+        MTL_FORMAT_RGBA16_FLOAT,
+        RESIDENT_SEED_CLEAR,
+    ));
+    req
+}
+
+/// [`resident_load_request`] at the wide attachment's own format.
+fn wide_resident_load_request(identity: &engine::TargetIdentity, publishes: bool) -> DrawRequest {
+    let (width, height) = extent();
+    let mut req = request_with_streams(MTL_FORMAT_RGBA16_FLOAT, &position_streams());
     req.target_identity = Some(identity.clone());
     req.load_from_target = true;
     req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);

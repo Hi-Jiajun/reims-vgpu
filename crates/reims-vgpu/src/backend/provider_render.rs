@@ -14,13 +14,19 @@
 //! `research/docs/26` §3 against the increments the canonical render rail
 //! already executes:
 //!
-//! - **one colour attachment** at an admitted 8-bit format (`Rgba8Unorm` /
-//!   `Bgra8Unorm`), loaded by a `Clear` whose four components are byte-exact in
-//!   the attachment's own 8-bit encoding, and stored. A clear that is not
-//!   byte-exact is a *different* colour on the two rails — the engine hands
-//!   Vulkan a `float32` clear and the driver rounds it to UNORM, while the
-//!   canonical pass states the byte value — so such a request keeps the engine
-//!   instead of being compared at a tolerance;
+//! - **one colour attachment** at an admitted format — the two 8-bit colour
+//!   orders (`Rgba8Unorm` / `Bgra8Unorm`) and the wide `Rgba16Float` (eight
+//!   bytes per texel, `research/docs/23` §78) — loaded by a `Clear` whose
+//!   components are byte-exact in that format's own texel, and stored. A clear
+//!   that is not byte-exact is a *different* colour on the two rails — the
+//!   engine hands Vulkan a `float32` clear and the driver rounds it to the
+//!   attachment's texel, while the canonical pass states the texel bytes — so
+//!   such a request keeps the engine instead of being compared at a tolerance;
+//!   a **wide** attachment is in class only where the frame is the provider's
+//!   own image (the resident arms below), because the engine's pooled offscreen
+//!   target is its own four-byte image: a pooled wide attachment is a shape the
+//!   engine does not draw at all, and this class cannot answer for one
+//!   (`render_provider_out_of_class_wide_pooled`);
 //! - **one indexed draw**, `instance_count == 1`, `base_vertex == 0`, triangle
 //!   list, single-sample;
 //! - **the record that opens the packet** when the draw is one record of a
@@ -116,6 +122,24 @@
 //! refuses returns [`RenderRailOutcome::ProviderDeclined`] and the caller
 //! declines the draw: fail-closed, never silently re-run on the engine.
 //!
+//! # The frame comes back at the attachment's own width
+//!
+//! A completion publishes the attachment's whole packed extent **at its own
+//! texel width**: four bytes per texel for the two 8-bit orders, eight for
+//! `Rgba16Float`, whose four little-endian halves are the format's own bytes and
+//! not a rounding of four bytes (`research/docs/23` §78). `bgra` below names the
+//! physical order of the 8-bit orders alone.
+//!
+//! The span the production seam returns (`M2vDrawSpan::Pixels`,
+//! `runtime::draw::vulkan`) speaks eight-bit colour, so *that* boundary is where
+//! a wider frame is narrowed — through the protocol's own rule, under the
+//! engine's own census name for the loss (`target_read_narrowed`), exactly where
+//! the engine's draw tail narrows its own wide readback
+//! (`engine::narrow_readback_to_rgba8`). This rail states the bytes the canonical
+//! provider published: a quantization performed here as well would be a second
+//! answer to a question the span already answers, and the raw halves are what
+//! make the format's own rounding observable instead of asserted.
+//!
 //! # The declaring pass, and why the class carries one
 //!
 //! The frozen render contract resolves every colour attachment against a
@@ -191,10 +215,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use metal_api_core::provider::{
-    AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource, BufferView,
-    ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass,
-    ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, IndexBufferBinding,
-    IndexFormat, LoadOp, OperationId, RenderAttachment, RenderPassDescriptor,
+    half_to_f32, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
+    BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
+    ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType,
+    IndexBufferBinding, IndexFormat, LoadOp, OperationId, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp, TracePass,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
     MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
@@ -410,8 +434,13 @@ pub fn resident_attachment(target: &TargetIdentity) -> ResidentAttachment {
 /// How one admitted pass establishes the attachment's previous contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NarrowLoad {
-    /// Fill every texel with the guest's byte-exact clear.
-    Clear([u8; 4]),
+    /// Fill every texel with the guest's byte-exact clear, carried as **one
+    /// texel of the attachment's own format** ([`ClearColor`]): four bytes for
+    /// the two 8-bit orders, four little-endian halves for `Rgba16Float`.
+    /// Widening the payload with the attachment is what keeps the contract's
+    /// `clear.len() == format.bytes_per_texel()` rule satisfied rather than
+    /// re-derived here.
+    Clear(ClearColor),
     /// Keep the bytes the provider already holds under the attachment's own
     /// identity (`LoadOp::Resident`).
     Resident(ResidentAttachment),
@@ -518,11 +547,19 @@ pub struct RenderRailInputs<'a> {
 /// What one completed narrow-class submission returns.
 #[derive(Debug)]
 pub struct RenderRailOutput {
-    /// The attachment's whole packed extent, in the attachment's own physical
-    /// order — the order `bgra` names.
+    /// The attachment's whole packed extent, at the attachment's **own texel
+    /// width**: four bytes per texel in the order `bgra` names for the two
+    /// 8-bit orders, eight bytes of four little-endian halves in RGBA for
+    /// `Rgba16Float` (`research/docs/23` §78).
+    ///
+    /// The span the seam returns speaks eight-bit colour, so a wider frame is
+    /// narrowed there and not here — the module docs say why, and
+    /// [`ProviderRenderDecline::AttachmentFrameNotNarrowable`] is the name for
+    /// a frame that cannot make that trip.
     pub bytes: Vec<u8>,
     /// Whether those bytes are guest scanout order (BGRA), which is what the
-    /// store route needs to know before it can land them.
+    /// store route needs to know before it can land them. The wide arm is RGBA,
+    /// so this is `false` for it by construction.
     pub bgra: bool,
 }
 
@@ -691,6 +728,16 @@ pub enum ProviderRenderDecline {
         length: u64,
         expected: u64,
     },
+    /// The completion's frame carries a texel the seam's span cannot speak: the
+    /// attachment's format is wider than four bytes per texel and the engine's
+    /// own widening rule has no four-byte meaning for it.
+    ///
+    /// Raised at the seam's span conversion (`runtime::draw::vulkan`), not inside
+    /// this rail, which publishes the provider's bytes exactly as it received
+    /// them. Named rather than guessed: a frame read as the wrong texel width is
+    /// a wrong picture, not a quantized one. The format is carried because it is
+    /// the whole answer — the frame above it was well formed.
+    AttachmentFrameNotNarrowable { format: ash::vk::Format },
     /// A resident store's completion published a writeback for the attachment.
     ///
     /// `StoreOp::Resident` is defined by *not* publishing one — the frame stays
@@ -720,6 +767,7 @@ impl Decline for ProviderRenderDecline {
             Self::CompletionNotVisible => "completion_not_visible",
             Self::AttachmentWritebackMissing => "attachment_writeback_missing",
             Self::AttachmentWritebackShape { .. } => "attachment_writeback_shape",
+            Self::AttachmentFrameNotNarrowable { .. } => "attachment_frame_not_narrowable",
             Self::ResidentWritebackPublished { .. } => "resident_writeback_published",
             Self::Owner(inner) => inner.slug(),
         }
@@ -781,6 +829,9 @@ impl Decline for ProviderRenderDecline {
                 ("length", length.to_string()),
                 ("expected", expected.to_string()),
             ],
+            Self::AttachmentFrameNotNarrowable { format } => {
+                vec![("format", format!("{format:?}"))]
+            }
             Self::ResidentWritebackPublished { allocation, view } => vec![
                 ("allocation", format!("{:#x}", allocation.get())),
                 ("view", view.get().to_string()),
@@ -1115,11 +1166,14 @@ fn narrow_class<'a>(
     let format = match attachment.format() {
         ash::vk::Format::R8G8B8A8_UNORM => AttachmentFormat::Rgba8Unorm,
         ash::vk::Format::B8G8R8A8_UNORM => AttachmentFormat::Bgra8Unorm,
+        ash::vk::Format::R16G16B16A16_SFLOAT => AttachmentFormat::Rgba16Float,
         _ => {
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_format",
-                "only the admitted 8-bit colour formats leave for the canonical rail \
-                 (Rgba8Unorm, Bgra8Unorm)",
+                "only the admitted colour formats leave for the canonical rail \
+                 (Rgba8Unorm, Bgra8Unorm, Rgba16Float): the format is the attachment's own \
+                 fact, and a pass the canonical contract cannot state is one this class \
+                 hands back to the engine",
             ))
         }
     };
@@ -1129,12 +1183,13 @@ fn narrow_class<'a>(
             "a non-float clear stays on the engine",
         ));
     };
-    let Some(clear) = clear_bytes(clear) else {
+    let Some(clear) = clear_bytes(format, clear) else {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_clear_bytes",
-            "a clear that is not byte-exact in the attachment's 8-bit encoding stays on the \
-             engine: the canonical pass states bytes, the engine states floats, and the two \
-             rounds must be the same value for the rails to agree",
+            "a clear that is not byte-exact in the attachment's own texel stays on the engine: \
+             the canonical pass states one texel of bytes, the engine states floats, and the \
+             two rounds must be the same value for the rails to agree (eight bits per channel \
+             for the 8-bit orders, one half per channel for Rgba16Float)",
         ));
     };
     if req.width == 0 || req.height == 0 {
@@ -1145,7 +1200,7 @@ fn narrow_class<'a>(
     }
     let extent = u64::from(req.width)
         .checked_mul(u64::from(req.height))
-        .and_then(|texels| texels.checked_mul(4))
+        .and_then(|texels| texels.checked_mul(format.bytes_per_texel()))
         .ok_or(OutOfClass::new(
             "render_provider_out_of_class_extent_overflow",
             "an attachment extent that overflows u64 stays on the engine",
@@ -1276,6 +1331,32 @@ fn narrow_class<'a>(
             "render_provider_out_of_class_seed",
             "a record that seeds itself from another resident stays on the engine: the copy \
              between two images is not an attachment load the canonical pass can state",
+        ));
+    }
+    // A texel wider than four bytes is a shape the *frame's* two rails answer
+    // for differently unless the frame stays in an image the provider owns.
+    // `Rgba16Float` is eight bytes per texel, and the engine's pooled offscreen
+    // target is its own four-byte image (`translate::pixel::RESIDENT_RGBA_FORMAT`;
+    // `TargetKey` carries no format at all), so a pooled wide attachment is one
+    // the engine cannot draw — measured, not assumed: the pass lands nothing and
+    // the readback comes back empty. This class only narrows *which submissions
+    // change rail*; it may not answer for a shape the engine has no answer to,
+    // so such a record keeps the engine under its own name. The two resident
+    // arms are the other side of that line: there the frame is the provider's
+    // own image, created at the attachment's own format, and whether it is kept
+    // (`StoreOp::Resident`) or read back (a published store on a loaded
+    // resident) it is the frame both rails would land.
+    if format.bytes_per_texel() > ClearColor::BYTES as u64
+        && !matches!(load, NarrowLoad::Resident(_))
+        && !matches!(store, NarrowStore::Resident(_))
+    {
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_wide_pooled",
+            "a colour attachment wider than four bytes per texel whose frame comes back through \
+             this class's pooled readback stays on the engine: the pooled offscreen target is \
+             the engine's own four-byte image, so this is a shape the engine does not draw, and \
+             the class may not answer for it. A wide attachment is in class where the frame \
+             comes from the provider's own image — the resident load and store arms",
         ));
     }
     // A guest-backed attachment's home is the guest's own pages. The class
@@ -1547,28 +1628,116 @@ fn narrow_class<'a>(
     })
 }
 
-/// A clear value that survives the round trip through the 8-bit encoding.
+/// A clear that survives the round trip through the attachment's own texel.
 ///
-/// The engine hands Vulkan `float32` components and the driver rounds them to
-/// UNORM; the canonical pass states bytes. `Some` only when the rounding is the
-/// identity, so "the two rails drew the same colour" is a byte comparison
-/// rather than a tolerance.
-fn clear_bytes(clear: [f32; 4]) -> Option<[u8; 4]> {
-    let mut out = [0u8; 4];
-    for (index, component) in clear.iter().enumerate() {
-        if !component.is_finite() || *component < 0.0 || *component > 1.0 {
-            return None;
+/// The engine hands Vulkan `float32` components and the driver rounds them *to
+/// the attachment's format*; the canonical pass states the texel's bytes. `Some`
+/// only when that rounding is the identity — an exact multiple of `1/255` for
+/// the two 8-bit orders, a value a half holds exactly for `Rgba16Float` — so
+/// "the two rails drew the same colour" is a byte comparison rather than a
+/// tolerance.
+///
+/// The payload is one texel wide, which is what the contract checks against the
+/// carrying attachment (`RenderAttachment::validate_shape` →
+/// `AttachmentClearLengthMismatch`); the width here is the format's own
+/// [`AttachmentFormat::bytes_per_texel`] and never a constant of this module.
+fn clear_bytes(format: AttachmentFormat, clear: [f32; 4]) -> Option<ClearColor> {
+    match format {
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => {
+            let mut out = [0u8; ClearColor::BYTES];
+            for (index, component) in clear.iter().enumerate() {
+                if !component.is_finite() || *component < 0.0 || *component > 1.0 {
+                    return None;
+                }
+                let byte = (component * 255.0).round();
+                if !byte.is_finite() || byte < 0.0 || byte > 255.0 {
+                    return None;
+                }
+                if (byte / 255.0 - component).abs() > 1e-6 {
+                    return None;
+                }
+                out[index] = byte as u8;
+            }
+            Some(ClearColor::new(out))
         }
-        let byte = (component * 255.0).round();
-        if !byte.is_finite() || byte < 0.0 || byte > 255.0 {
-            return None;
+        AttachmentFormat::Rgba16Float => {
+            // The contract's eight bytes are four little-endian halves in
+            // memory order (`research/docs/23` §78), which is the order both
+            // rails decode them in.
+            let mut out = [0u8; 8];
+            for (index, component) in clear.iter().enumerate() {
+                let half = f32_to_half_bits(*component);
+                // The widening back is the whole rule: an encoding that does not
+                // reproduce the component bit for bit is one the driver's own
+                // rounding could have chosen differently, and a clear the two
+                // rails round differently is a different colour on each. NaN
+                // fails here for free (`NaN != NaN`), which is right — a NaN
+                // clear's payload is not a value either rail could agree on.
+                if half_to_f32(half) != *component {
+                    return None;
+                }
+                out[index * 2..index * 2 + 2].copy_from_slice(&half.to_le_bytes());
+            }
+            ClearColor::from_bytes(&out)
         }
-        if (byte / 255.0 - component).abs() > 1e-6 {
-            return None;
-        }
-        out[index] = byte as u8;
+        // Unreachable through `narrow_class`, which answers
+        // `render_provider_out_of_class_format` for every format this class does
+        // not admit; spelled out so a format added to that gate has to answer
+        // here as well rather than inherit an arm by accident.
+        AttachmentFormat::R32Float | AttachmentFormat::R32Uint => None,
     }
-    Some(out)
+}
+
+/// The IEEE-754 binary16 encoding of one `f32`: round to nearest, ties to even.
+///
+/// This is the rounding a driver performs when it writes a `float32` clear or a
+/// fragment output into a half attachment, and it is what makes the canonical
+/// pass's bytes and the engine's `float32` clear the same colour. Only values
+/// this function encodes *exactly* are admitted ([`clear_bytes`] widens the
+/// result back), so its rounding never decides a value — it decides which values
+/// are values at all, and a truncating encoder would admit a different set
+/// (0.5 + 2⁻¹² encodes to `0x3801` here and to `0x3800` under truncation).
+fn f32_to_half_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let biased = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x007f_ffff;
+    // Infinities and every NaN keep the exponent's meaning; a NaN's payload has
+    // no half spelling of its own, so it becomes quiet.
+    if biased == 0xff {
+        return sign | 0x7c00 | if mantissa != 0 { 0x0200 } else { 0 };
+    }
+    let exponent = biased - 127 + 15;
+    // Larger than the widest half: rounds to an infinity. The tie at 65520 is
+    // settled below with the rest of the mantissa rounding.
+    if exponent >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if exponent <= 0 {
+        // Zero, and everything below the smallest normal half, shares one
+        // encoding: the mantissa's implicit one is shifted down to the
+        // subnormal scale of `2^-24`.
+        if exponent < -10 {
+            return sign;
+        }
+        let shift = (14 - exponent) as u32;
+        let widened = mantissa | 0x0080_0000;
+        let mut half = (widened >> shift) as u16;
+        let remainder = widened & ((1 << shift) - 1);
+        let halfway = 1 << (shift - 1);
+        if remainder > halfway || (remainder == halfway && half & 1 == 1) {
+            half += 1;
+        }
+        return sign | half;
+    }
+    let mut half = (((exponent as u32) << 10) | (mantissa >> 13)) as u16;
+    let remainder = mantissa & 0x1fff;
+    // A carry out of the mantissa lands in the exponent field, which is what
+    // rounding up to the next binade (and, at the top, to an infinity) means.
+    if remainder > 0x1000 || (remainder == 0x1000 && half & 1 == 1) {
+        half += 1;
+    }
+    sign | half
 }
 
 /// The CPU-staged bytes of one render input, or `None` when the content is the
@@ -1723,7 +1892,7 @@ fn submit_narrow(
             width: pass.width,
             height: pass.height,
             load: match pass.load {
-                NarrowLoad::Clear(clear) => LoadOp::Clear(ClearColor::new(clear)),
+                NarrowLoad::Clear(clear) => LoadOp::Clear(clear),
                 NarrowLoad::Resident(_) => LoadOp::Resident,
             },
             store: match pass.store {
@@ -2085,5 +2254,118 @@ impl IntoRender for super::provider_compute::ProviderComputeDecline {
                 detail: format!("unmapped compute-rail refusal: {other:?}"),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod clear_payload_tests {
+    use super::*;
+
+    /// The two 8-bit orders keep the four-byte payload every pre-v78 trace
+    /// carries, byte for byte — widening the *rule* did not widen these bytes.
+    #[test]
+    fn the_narrow_orders_keep_their_four_byte_payload() {
+        // The reviewed texel: the fixture fragment's own `64/255, 128/255,
+        // 191/255, 1`, every component an exact multiple of `1/255`.
+        let reviewed = [64.0 / 255.0, 128.0 / 255.0, 191.0 / 255.0, 1.0];
+        for format in [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Bgra8Unorm] {
+            let clear = clear_bytes(format, reviewed).expect("a multiple of 1/255");
+            assert_eq!(clear.as_bytes(), [64, 128, 191, 255]);
+            assert_eq!(clear.len(), ClearColor::BYTES);
+        }
+        // 0.5 is *not* one of them: it is 127.5/255, so the driver's rounding
+        // and the byte would be two different colours — the whole reason this
+        // arm compares instead of quantizing.
+        assert!(clear_bytes(AttachmentFormat::Rgba8Unorm, [0.0, 0.5, 0.0, 1.0]).is_none());
+    }
+
+    /// The wide format's clear is **its own texel**: four little-endian halves
+    /// in memory order, and a payload that is not four bytes.
+    #[test]
+    fn the_wide_format_carries_four_little_endian_halves() {
+        let clear = clear_bytes(AttachmentFormat::Rgba16Float, [0.0, 0.5, -2.0, 1.0])
+            .expect("0.5 and -2 are halves");
+        assert_eq!(
+            clear.as_bytes(),
+            [0x00, 0x00, 0x00, 0x38, 0x00, 0xc0, 0x00, 0x3c]
+        );
+        assert_eq!(clear.len(), 8);
+        // The very same colour is *not* a clear on an 8-bit attachment: 0.5 is
+        // 127.5/255, which no byte holds. The rule is the carrying format's, so
+        // widening the payload could not have relaxed the 8-bit half of it.
+        assert!(clear_bytes(AttachmentFormat::Rgba8Unorm, [0.0, 0.5, 0.0, 1.0]).is_none());
+        // And it holds in the other direction too: the reviewed `64/255` texel
+        // the narrow arm admits is *not* a half (`0x3404` widens to
+        // 0.2509765625), so the wide arm refuses it. Neither arm is a relaxation
+        // of the other; both are the format's own round trip.
+        assert_eq!(
+            clear_bytes(AttachmentFormat::Rgba16Float, [0.25, 0.5, 0.75, 1.0])
+                .expect("quarters are halves")
+                .as_bytes(),
+            [0x00, 0x34, 0x00, 0x38, 0x00, 0x3a, 0x00, 0x3c]
+        );
+        assert!(clear_bytes(
+            AttachmentFormat::Rgba16Float,
+            [64.0 / 255.0, 128.0 / 255.0, 191.0 / 255.0, 1.0]
+        )
+        .is_none());
+    }
+
+    /// The rule is a *round trip*, so what the half cannot hold is not a clear:
+    /// a component the driver would round elsewhere is a different colour on the
+    /// two rails, and one no equality can pin (NaN) is refused for the same
+    /// reason.
+    #[test]
+    fn a_component_the_half_cannot_hold_is_not_a_clear() {
+        for component in [0.1, 1e-9, 1.0e30, 65_520.0, f32::NAN] {
+            assert!(
+                clear_bytes(AttachmentFormat::Rgba16Float, [component, 0.0, 0.0, 1.0]).is_none(),
+                "{component} must not be a half-exact clear"
+            );
+        }
+        // The edges a half *does* hold, subnormal through infinity, plus the
+        // signed zero whose sign the payload keeps.
+        for component in [0.0, -0.0, 2f32.powi(-24), 65_504.0, f32::INFINITY] {
+            assert!(
+                clear_bytes(AttachmentFormat::Rgba16Float, [component, 0.0, 0.0, 1.0]).is_some(),
+                "{component} is a half"
+            );
+        }
+        assert_eq!(
+            clear_bytes(AttachmentFormat::Rgba16Float, [-0.0, 0.0, 0.0, 1.0])
+                .expect("a signed zero is a half")
+                .as_bytes()[..2],
+            [0x00, 0x80]
+        );
+    }
+
+    /// The encoder's own rounding, pinned where it is observable: the classic
+    /// `half(0.1)` bit pattern, the tie that lands on an infinity, both edges of
+    /// the subnormal range, and a zero that keeps its sign.
+    #[test]
+    fn the_half_encoder_rounds_to_nearest_even() {
+        assert_eq!(f32_to_half_bits(0.1), 0x2e66);
+        assert_eq!(f32_to_half_bits(65_520.0), 0x7c00);
+        assert_eq!(f32_to_half_bits(2f32.powi(-24)), 0x0001);
+        assert_eq!(f32_to_half_bits(2f32.powi(-25)), 0x0000);
+        assert_eq!(f32_to_half_bits(-0.0), 0x8000);
+        assert_eq!(f32_to_half_bits(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half_bits(f32::NAN), 0x7e00);
+    }
+
+    /// Every half that is a *value* survives the round trip this module's rule
+    /// is stated in, across the whole format: 65536 patterns minus the two
+    /// signs' 1023 NaN payloads each.
+    #[test]
+    fn every_half_value_widens_and_encodes_back_to_itself() {
+        let mut checked = 0_u32;
+        for bits in 0..=u16::MAX {
+            if bits & 0x7c00 == 0x7c00 && bits & 0x03ff != 0 {
+                continue;
+            }
+            assert_eq!(f32_to_half_bits(half_to_f32(bits)), bits, "{bits:#06x}");
+            checked += 1;
+        }
+        assert_eq!(checked, 65_536 - 2 * 1023);
     }
 }

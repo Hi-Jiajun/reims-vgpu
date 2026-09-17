@@ -7271,6 +7271,70 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
     }
 }
 
+/// The eight-bit frame [`M2vDrawSpan::Pixels`] speaks, out of a canonical
+/// provider render pass's completion.
+///
+/// The canonical rail publishes its attachment at the **attachment's own texel
+/// width** — four bytes per texel for the two 8-bit orders, eight for
+/// `Rgba16Float`, whose four little-endian halves are the format's own bytes
+/// (`research/docs/23` §78) — while every consumer of this span reads eight-bit
+/// colour: the chain seed is declared `SeedOrder::Rgba8`, the mapping rail
+/// writes rows of `width * 4`, and the GVA rail converts *from* RGBA8. So a
+/// wider frame is narrowed here, by the protocol's own rule, and the loss is
+/// counted under the engine's own name for it (`target_read_narrowed`) — the
+/// same quantization, at the same boundary, that
+/// `engine::execute_draw_request`'s tail performs on its own wide readback
+/// (`narrow_readback_to_rgba8`). One rule, one owner.
+///
+/// The attachment's format decides the arm rather than the frame's length: a
+/// wide attachment whose frame arrived short is a shape the narrowing itself
+/// refuses, and reading it as eight-bit colour because it happens to be
+/// four-times-texture long is exactly the wrong picture this function exists to
+/// prevent.
+#[cfg(feature = "provider-render")]
+fn provider_span_pixels(
+    req: &crate::backend::vulkan::engine::DrawRequest,
+    out: crate::backend::provider_render::RenderRailOutput,
+) -> Result<(Vec<u8>, bool), DrawError> {
+    let format = req.color_attachment.map(|attachment| attachment.format());
+    let refuse = |format: Option<ash::vk::Format>| {
+        DrawError::ProviderRender(Box::new(
+            crate::backend::provider_render::ProviderRenderDecline::AttachmentFrameNotNarrowable {
+                format: format.unwrap_or(ash::vk::Format::UNDEFINED),
+            },
+        ))
+    };
+    let Some(layout) = format.and_then(crate::backend::vulkan::translate::pixel::texel_layout_of)
+    else {
+        return Err(refuse(format));
+    };
+    // The narrow orders are already the span's own shape, and travel untouched:
+    // the two rails' byte parity for them is a statement about the provider's
+    // frame and not about a conversion on the way out.
+    if layout.is_four_byte_color() {
+        return Ok((out.bytes, out.bgra));
+    }
+    let pixels = req.width.saturating_mul(req.height);
+    let mut narrowed = vec![
+        0u8;
+        (u64::from(pixels) * u64::from(crate::protocol::pixel_format::RGBA8_BPP))
+            as usize
+    ];
+    if !crate::protocol::pixel_format::narrow_texel_to_rgba8(
+        layout,
+        &out.bytes,
+        pixels,
+        &mut narrowed,
+    ) {
+        return Err(refuse(format));
+    }
+    crate::runtime::drain::note_store_route("target_read_narrowed");
+    // The narrowed frame is semantically RGBA in every arm the protocol
+    // narrows (`Rgba16Float`'s own memory order is RGBA, `Bgra8` is the only
+    // order the eight-bit arm exchanges, and that arm never reaches here).
+    Ok((narrowed, false))
+}
+
 fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -9992,6 +10056,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 RenderRailOutcome::ProviderCompleted(out) => {
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
                     crate::runtime::drain::note_store_route("render_provider_canonical");
+                    // The completion lands at the attachment's own texel width;
+                    // the span's consumers read eight-bit colour, so a wide
+                    // frame is narrowed here (`provider_span_pixels`) rather
+                    // than carried out mis-shaped. The narrow orders take the
+                    // pass-through arm and keep their bytes exactly.
+                    let (bytes, bgra) = provider_span_pixels(&resources, out)?;
                     crate::observe::line(format!(
                         "linux_render_provider ok pipe={} {}x{} idx={} bgra={}",
                         req.pipeline_ref,
@@ -10002,12 +10072,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             .as_ref()
                             .map(|index| index.index_count)
                             .unwrap_or(0),
-                        out.bgra as u8,
+                        bgra as u8,
                     ));
-                    return Ok(M2vDrawSpan::Pixels {
-                        bytes: out.bytes,
-                        bgra: out.bgra,
-                    });
+                    return Ok(M2vDrawSpan::Pixels { bytes, bgra });
                 }
                 RenderRailOutcome::ProviderCompletedResident(frame) => {
                     // The frame stayed in the provider's image under this
@@ -15523,5 +15590,129 @@ mod out_of_class_shape_tests {
             "out_of_class_shape_row_test",
             0xB
         ));
+    }
+}
+
+#[cfg(all(test, feature = "provider-render"))]
+mod provider_span_pixels_tests {
+    use super::*;
+    use crate::backend::provider_render::RenderRailOutput;
+    use crate::protocol::pixel_format::{
+        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM,
+    };
+
+    /// A request whose attachment is `mtl`'s own renderable format, which is
+    /// all this conversion reads.
+    fn request(mtl: u16, width: u32, height: u32) -> crate::backend::vulkan::engine::DrawRequest {
+        crate::backend::vulkan::engine::DrawRequest {
+            width,
+            height,
+            color_attachment: Some(
+                translate::pixel::color_attachment(mtl)
+                    .expect("the fixture's attachment format is renderable")
+                    .0
+                    .with_clear([0.0, 0.0, 0.0, 1.0]),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// A request whose attachment names a format this class does not admit, so
+    /// the frame's texel has no eight-bit reading at all — the arm a format the
+    /// span has never heard of would land in.
+    fn unreadable_texel_request() -> crate::backend::vulkan::engine::DrawRequest {
+        crate::backend::vulkan::engine::DrawRequest {
+            width: 1,
+            height: 1,
+            color_attachment: Some(
+                crate::backend::vulkan::engine::types::ColorAttachmentState::new(
+                    ash::vk::Format::R32_SFLOAT,
+                    crate::backend::vulkan::engine::types::ColorClearValue::Float([0.0; 4]),
+                ),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// The narrow orders are the span's own shape: they travel through this
+    /// conversion byte for byte, whatever their order flag says.
+    #[test]
+    fn the_eight_bit_orders_travel_untouched() {
+        for (mtl, bgra) in [
+            (MTL_FORMAT_RGBA8_UNORM, false),
+            (MTL_FORMAT_BGRA8_UNORM, true),
+        ] {
+            let frame: Vec<u8> = (0..16u8).collect();
+            let (bytes, order) = provider_span_pixels(
+                &request(mtl, 2, 2),
+                RenderRailOutput {
+                    bytes: frame.clone(),
+                    bgra,
+                },
+            )
+            .expect("an eight-bit frame is already what the span speaks");
+            assert_eq!(bytes, frame, "{mtl:#x}: the bytes are untouched");
+            assert_eq!(order, bgra, "{mtl:#x}: the order is the frame's own");
+        }
+    }
+
+    /// A wide attachment arrives as its own texels — four little-endian halves
+    /// — and leaves as the eight-bit colour the span speaks, quantized by the
+    /// protocol's rule and counted under the engine's own name for the loss.
+    #[test]
+    fn a_wide_frame_is_narrowed_under_the_engines_own_name() {
+        let before = crate::runtime::drain::store_route_count_for_test("target_read_narrowed");
+        // 0.2509765625, 0.501953125, 0.7490234375, 1.0 — the halves of the
+        // fixture fragment's `64/255, 128/255, 191/255, 1` outputs as Lavapipe
+        // rounds them (`research/docs/23` §78's own reading).
+        let (bytes, order) = provider_span_pixels(
+            &request(MTL_FORMAT_RGBA16_FLOAT, 1, 1),
+            RenderRailOutput {
+                bytes: vec![0x04, 0x34, 0x04, 0x38, 0xfe, 0x39, 0x00, 0x3c],
+                bgra: false,
+            },
+        )
+        .expect("four half channels narrow to four bytes");
+        assert_eq!(bytes, [64, 128, 191, 255]);
+        assert!(
+            !order,
+            "the narrowed frame is RGBA in every arm the protocol narrows"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count_for_test("target_read_narrowed"),
+            before + 1,
+            "the frame's loss of resolution is a census reading, as it is on the engine's rail"
+        );
+    }
+
+    /// Fail-closed: a frame whose texel the protocol has no eight-bit reading
+    /// for — an `R32Float` attachment, and a wide frame that arrived short — is
+    /// refused by name rather than reinterpreted, because a frame read as the
+    /// wrong texel width is a wrong picture.
+    #[test]
+    fn a_frame_the_span_cannot_speak_is_refused_by_name() {
+        for (label, req, bytes) in [
+            (
+                "an r32float texel has no eight-bit reading",
+                unreadable_texel_request(),
+                vec![0x00, 0x34, 0x04, 0x38],
+            ),
+            (
+                "a wide frame that arrived short",
+                request(MTL_FORMAT_RGBA16_FLOAT, 2, 1),
+                vec![0x04, 0x34, 0x04, 0x38],
+            ),
+        ] {
+            let error = provider_span_pixels(&req, RenderRailOutput { bytes, bgra: false })
+                .expect_err(label);
+            let DrawError::ProviderRender(decline) = error else {
+                panic!("{label}: the refusal is the rail's own vocabulary: {error:?}");
+            };
+            assert_eq!(
+                decline.slug(),
+                "attachment_frame_not_narrowable",
+                "{label}: {decline}"
+            );
+        }
     }
 }
