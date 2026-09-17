@@ -636,6 +636,73 @@ fn a_chain_head_hands_its_frame_to_the_next_record() {
     }
 }
 
+/// The chain in the order the census's shapes mostly carry: BGRA8.
+///
+/// The rail reports a readback's physical order instead of converting it, and
+/// `encode_draw_chain` is what turns a `!writeback_guest` readback into the
+/// `SeedOrder::Rgba8` image the next record loads. This test drives that
+/// conversion the way the encode side does — the head's frame is read in guest
+/// scanout order and reordered — and asserts the packet still lands the head's
+/// own colour: the fragment's channels are not symmetric under an R/B exchange
+/// (`64` against `191`), so a chain that seeded the *raw* readback would put
+/// `191` in the red slot, and the half the second record does not draw would
+/// say so. The assertion is therefore about the order the chain carries, not
+/// only about the two rails agreeing.
+#[test]
+fn a_scanout_order_chain_head_seeds_the_next_record() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let half = width / 2;
+
+    // The head, on the format the census's shapes mostly state.
+    let mut head = narrow_request(MTL_FORMAT_BGRA8_UNORM);
+    head.render_pass_continues = true;
+    let head_provider =
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::Head), &head) {
+            RenderRailOutcome::ProviderCompleted(out) => {
+                assert!(out.bgra, "a Bgra8Unorm attachment reads back in BGRA order");
+                // The seed's own order, which is what `encode_draw_chain` builds
+                // for a chain image before it hands it back.
+                semantic_rgba(out.bytes, out.bgra)
+            }
+            other => panic!("a Bgra8Unorm chain head is in the class: {other:?}"),
+        };
+    let Some(head_engine) = engine_pixels("scanout-order chain head", &stages, head) else {
+        return;
+    };
+    assert_eq!(
+        head_provider, head_engine,
+        "the head's frame is the same colour on both rails, whatever order it was read in"
+    );
+
+    // The record after it, on the same format: the packet's records share one
+    // attachment template, so the seed crosses the order boundary in the one
+    // place the engine already handles it (`DrawRequest::target_seed_order`).
+    let mut second = request_with_streams(MTL_FORMAT_BGRA8_UNORM, &position_streams());
+    second.scissors.push(ScissorResource {
+        x: 0,
+        y: 0,
+        width: half,
+        height,
+    });
+    second.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+    second.target_rgba8 = Some(std::sync::Arc::new(head_provider));
+    let Some(chained) = engine_pixels("scanout-order chain", &stages, second) else {
+        return;
+    };
+    assert_texel_near(
+        "scanout-order chain: the half the second record drew",
+        texel_at(&chained, half / 2, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    assert_texel_near(
+        "scanout-order chain: the half the head filled",
+        texel_at(&chained, width - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+}
+
 /// The guest-visible write order is the other half of the pairing: a BGRA
 /// attachment is what a mapper-ref-texture target reads back in, and the rail
 /// reports the order rather than converting, exactly as the engine does.
