@@ -47,10 +47,11 @@
 //!   the 2026-09-17 census measured as the one a real draw stream lives on
 //!   (`8327 / 8526` draws bind two to four streams, `199` bind more); a fifth
 //!   stays on the engine by name. The engine numbers one Vulkan binding per
-//!   attribute location, so a request's attribute list is a list of streams —
-//!   one attribute each — and the canonical binding index is the stream's
-//!   position in that list, which is why the class renumbers rather than
-//!   carrying the guest's binding numbers across;
+//!   attribute location, so a request's attribute list is one entry per
+//!   location; the canonical layout states one entry per *fetch table* with the
+//!   attributes that read it (`research/docs/26` §31), and the canonical binding
+//!   index is the table's position in that list, which is why the class
+//!   renumbers rather than carrying the guest's binding numbers across;
 //! - **at most one scissor rectangle inside the attachment**, and no viewport
 //!   override: the canonical pass states the attachment-covering viewport and
 //!   carries the guest's own rectangle through the pass scissor
@@ -455,16 +456,68 @@ fn scissor_admits(
 /// Whether a request's declared attributes name exactly the locations the
 /// vertex stage's own translation reports.
 ///
-/// Both halves are small — the stream count is bounded by the contract's
-/// `max_vertex_buffers` and one stream carries one attribute — so the comparison
-/// is a linear walk of a list no longer than four rather than a set. A request
-/// with two attributes at one location cannot pass it: the reflected locations
-/// are distinct, so a duplicate leaves one of them uncovered.
+/// The request's attribute list is the engine's own shape — one entry per
+/// attribute *location* — and the reflection lists one input per location, so
+/// the comparison is a linear walk of one list against the other rather than a
+/// set. A request with two attributes at one location cannot pass it: the
+/// reflected locations are distinct, so a duplicate leaves one of them
+/// uncovered.
 fn attribute_locations_match(attributes: &[VertexAttributeResource], reflected: &[u32]) -> bool {
     attributes.len() == reflected.len()
         && attributes
             .iter()
             .all(|attribute| reflected.contains(&attribute.location))
+}
+
+/// Whether two of a request's attributes read one vertex stream.
+///
+/// Three facts decide it, and all three are the request's own. The staged bytes
+/// the two were resolved from: the runtime resolves every attribute that names
+/// one guest vertex buffer through that buffer's single bind, and
+/// [`BufferContent::Bytes`]'s own contract is that the allocation behind it is
+/// *shared* — "several attributes on one interleaved stream, or a stage-in
+/// buffer doubling as a storage bind, reference the same allocation instead of
+/// cloning it" — so two attributes off one interleaved guest stream carry the
+/// same `Arc`. The stride the descriptor declared for that buffer, and the step
+/// beside it: two attributes of one table advance by one stride at one rate.
+///
+/// Two attributes that agree on all three read one table at two offsets, which
+/// is one canonical vertex stream. Nothing else in the request can join them:
+/// bytes that merely *compare* equal are two allocations and stay two streams,
+/// which is the conservative reading — the layout then states more streams than
+/// the guest's own descriptor had, and the gate's vertex-layout rule answers
+/// the same draws it would have answered had this grouping never landed.
+///
+/// A zero-copy gather is not staged bytes and is answered by name before any
+/// layout is stated from it ([`narrow_class`]'s `vertex_staging` arm), so two
+/// gathers are never *proved* to be one table here: grouping them would move
+/// the stream count the gate reads without a byte this rail could compare.
+fn one_vertex_stream(a: &VertexAttributeResource, b: &VertexAttributeResource) -> bool {
+    a.stride == b.stride
+        && a.step_function == b.step_function
+        && a.step_rate == b.step_rate
+        && match (&a.content, &b.content) {
+            (BufferContent::Bytes(left), BufferContent::Bytes(right)) => {
+                std::sync::Arc::ptr_eq(left, right)
+            }
+            _ => false,
+        }
+}
+
+/// How many canonical vertex streams a request's attributes form.
+///
+/// The count [`stage_buffer_gate`]'s vertex-layout rule reads, and the one the
+/// canonical layout is built with: both come from this walk, so the number a
+/// refusal names and the number a registration states are one measurement
+/// rather than two spellings of it.
+fn canonical_vertex_stream_count(attributes: &[VertexAttributeResource]) -> usize {
+    let mut heads: Vec<&VertexAttributeResource> = Vec::new();
+    for attribute in attributes {
+        if !heads.iter().any(|head| one_vertex_stream(head, attribute)) {
+            heads.push(attribute);
+        }
+    }
+    heads.len()
 }
 
 /// The registered window one zero-copy gather was cut from (`R9e`).
@@ -716,6 +769,14 @@ fn footprint_name(proof: &FootprintProof) -> String {
     }
 }
 
+/// The request's two stages' `[[buffer(N)]]` statement, every rule the class
+/// answers it under, in the order the census reads them.
+///
+/// `vertex_streams` is the number of canonical vertex streams the request's
+/// attributes form — its fetch tables, not its attributes
+/// ([`canonical_vertex_stream_count`]) — because that is the number of
+/// bindings the canonical layout will occupy and the number the contract's own
+/// vertex-layout rule is written against (`research/docs/26` §31).
 fn stage_buffer_gate<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &DrawRequest,
@@ -811,9 +872,17 @@ fn stage_buffer_gate<'a>(
         }
         // A vertex stage buffer may not occupy an index the pipeline's vertex
         // layout already describes: this class states the request's streams as
-        // canonical bindings `0..vertex_streams`, and one Metal binding
-        // described twice is what the contract refuses by name
+        // canonical bindings `0..vertex_streams`, and one binding described
+        // twice is what the contract refuses by name
         // (`StageBufferVertexLayoutConflict`).
+        //
+        // `vertex_streams` is the number of the request's own *fetch tables*
+        // (`canonical_vertex_stream_count`), not its attribute count, and the
+        // canonical layout is built from that same walk — so the rule reads the
+        // same number the registration will (`research/docs/26` §31). It is the
+        // contract's own rule mirrored here rather than a second opinion: a
+        // shape whose declaration lands inside the block is one the provider's
+        // admission refuses, and a refusal is a decline, not a fallback.
         if stage == RenderPipelineStage::Vertex && (declaration.index as usize) < vertex_streams {
             // The layout-collision rule's own route (R9o), beside the
             // unchanged slug.
@@ -2392,12 +2461,17 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     }
 }
 
-/// The census band of one request's declared vertex streams.
+/// The census band of one request's declared vertex *attributes* — the engine's
+/// own list, one entry per location.
 ///
-/// `MAX_VERTEX_BUFFERS` is the arm boundary as well as the class's ceiling: a
-/// build where the contract moved to five streams would have to rename the
-/// `_gt4` arm rather than silently count five as `2_4`, which is what the
-/// assertion in this module's tests pins.
+/// The band is charged from `req.vertex_attributes.len()` and keeps the
+/// contract's own `MAX_VERTEX_BUFFERS` breakpoints, because a build where the
+/// contract moved to five would have to rename the `_gt4` arm rather than
+/// silently count five as `2_4` (the assertion in this module's tests pins the
+/// four names). The class's ceiling is on the canonical *streams*, which are the
+/// request's fetch tables and can be fewer than its attributes
+/// (`research/docs/26` §31), so an admitted draw may be banded here past the
+/// number of streams the layout it registered with states.
 pub fn attribute_count_route(declared: usize) -> &'static str {
     match declared {
         0 => "draw_vertex_attrs_0",
@@ -2487,7 +2561,8 @@ pub enum StageBufferShapeRoute {
     /// One `(stage, index)` is declared twice.
     Duplicate,
     /// A vertex-stage declaration occupies an index the pipeline's own vertex
-    /// layout already describes (`0..vertex_streams`).
+    /// layout already describes (`0..vertex_streams`, where the count is the
+    /// request's own fetch tables — `research/docs/26` §31).
     VertexLayout,
 }
 
@@ -2512,13 +2587,40 @@ pub(crate) fn on_device_rebuilt() {
     }
 }
 
-/// One admitted vertex stream: the single attribute its binding carries.
+/// One admitted vertex stream: one fetch table, and the attributes read out of
+/// it at their own offsets.
+///
+/// One entry per *table* rather than one per attribute, because that is the
+/// shape the canonical contract states: a [`VertexBufferLayout`] carries one
+/// stride and a list of attributes, which is Metal's own
+/// `MTLVertexBufferLayoutDescriptor`, and the entry's position in
+/// [`VertexLayout::Buffers`] is the binding both rails resolve it under. The
+/// request the seam hands this rail holds one entry per *attribute* (the engine
+/// numbers one Vulkan binding per attribute *location*), so the attributes that
+/// read one table — the runtime shares one staged allocation per guest vertex
+/// buffer, [`BufferContent::Bytes`]'s own contract — collapse into one entry
+/// here (`research/docs/26` §31).
 struct NarrowVertexStream<'a> {
+    /// Bytes between consecutive vertices of this table.
+    stride: u64,
+    /// The request attribute whose staged bytes this table holds: the group's
+    /// identity, which the next attribute of the table is matched against
+    /// ([`one_vertex_stream`]), and the bytes below are its own.
+    head: usize,
+    bytes: &'a [u8],
+    /// Every attribute this table carries, in the request's own order.
+    attributes: Vec<NarrowVertexAttribute>,
+}
+
+/// One attribute read out of one canonical vertex stream.
+///
+/// The location is the guest's and is carried unchanged, because that is what
+/// the pipeline's vertex input state and the translated shader's own inputs are
+/// keyed on; the offset is inside the stream's records.
+struct NarrowVertexAttribute {
     location: u32,
     offset: u64,
-    stride: u64,
     format: VertexFormat,
-    bytes: &'a [u8],
 }
 
 /// The admitted index stream.
@@ -2568,10 +2670,11 @@ struct NarrowPass<'a> {
     extent: u64,
     index_count: u32,
     /// The admitted streams, in the request's own attribute order: entry `i`
-    /// becomes canonical binding `i`. One attribute per stream, because the
-    /// engine numbers one Vulkan binding per attribute location — an interleaved
-    /// stream is several attributes in the *guest's* pipeline, and each one
-    /// arrives here as its own attribute with its own bytes and stride.
+    /// becomes canonical binding `i`. One entry per fetch table, and one
+    /// attribute per *location* inside it: the engine's request numbers one
+    /// Vulkan binding per attribute location, while a guest's interleaved
+    /// stream is several attributes off one table — which is the table entry `i`
+    /// states here, with each attribute at its own offset.
     vertex_streams: Vec<NarrowVertexStream<'a>>,
     index_stream: NarrowIndexStream<'a>,
     /// The read-only stage buffers the request binds, in the contract's own
@@ -2592,11 +2695,15 @@ struct NarrowPass<'a> {
 impl NarrowPass<'_> {
     /// The contract's vertex layout for the admitted streams.
     ///
-    /// One entry per stream, one attribute per entry: the engine numbers one
-    /// Vulkan binding per attribute *location*, so a stream is one attribute
-    /// and the contract says exactly that — at the location the guest declared,
-    /// which is the location the shader reads and the one the canonical
-    /// pipeline's vertex input state is keyed on.
+    /// One entry per admitted fetch table, with the attributes that read it at
+    /// their own offsets — the shape a `MTLVertexBufferLayoutDescriptor` has,
+    /// and the one the canonical pipeline's vertex input state is built from.
+    /// The locations are the guest's, unchanged: they are what the shader reads
+    /// and what the vertex input state is keyed on. The entry's *position* is
+    /// the binding both rails resolve the stream under
+    /// (`provider.rs::validate_vertex_buffer_binding`), which is this class's
+    /// own numbering and not the guest's binding number
+    /// (`research/docs/26` §31).
     /// Derived in one place because the registration gate and the pass
     /// descriptor have to agree about it — two spellings of one layout is how
     /// a registration ends up describing a pass that is never submitted.
@@ -2610,11 +2717,15 @@ impl NarrowPass<'_> {
                 .map(|stream| VertexBufferLayout {
                     stride: stream.stride,
                     step: VertexStep::PerVertex,
-                    attributes: vec![VertexAttribute {
-                        location: stream.location,
-                        offset: stream.offset,
-                        format: stream.format,
-                    }],
+                    attributes: stream
+                        .attributes
+                        .iter()
+                        .map(|attribute| VertexAttribute {
+                            location: attribute.location,
+                            offset: attribute.offset,
+                            format: attribute.format,
+                        })
+                        .collect(),
                 })
                 .collect(),
         )
@@ -2996,15 +3107,16 @@ fn narrow_class<'a>(
     // translation *declares* a `[[buffer(N)]]` argument, and — once one does —
     // whether the canonical pair (declaration beside view) can be stated from
     // what this request carries. Both answers live in `stage_buffer_gate`. The
-    // stream count is the request's own declared attribute count: the class
-    // states one canonical binding per admitted stream, and the gate's
-    // vertex-layout rule is about the layout this request will be registered
-    // with.
+    // stream count the gate's vertex-layout rule reads is the number of the
+    // request's own *fetch tables* — one canonical binding per admitted stream,
+    // which is the layout this request will be registered with — rather than
+    // its attribute list, because an attribute list is one entry per location
+    // and a layout is one entry per stream (`research/docs/26` §31).
     let stage_buffers = stage_buffer_gate(
         inputs,
         req,
         req.storage_buffers.len(),
-        req.vertex_attributes.len(),
+        canonical_vertex_stream_count(&req.vertex_attributes),
     )?;
     if !req.sampled_images.is_empty() || !req.samplers.is_empty() || req.color_input {
         return Err(OutOfClass::new(
@@ -3126,21 +3238,27 @@ fn narrow_class<'a>(
         ));
     }
 
-    // One stream per declared attribute, because that is the shape both rails
-    // execute: the engine numbers one Vulkan binding per attribute *location*
-    // (`runtime/draw/vulkan.rs` builds `binding: a.location`), and the canonical
-    // layout this class states describes binding `i` with the request's `i`-th
-    // attribute and nothing else. Four is the canonical contract's
-    // `max_vertex_buffers` — the axis 97.7 % of the measured draw stream lives on
-    // — and a fifth is a layout the contract cannot state, so it stays on the
-    // engine rather than in a trace admission would refuse.
-    if req.vertex_attributes.len() > MAX_VERTEX_BUFFERS {
+    // One canonical stream per *fetch table* the request's attributes read, and
+    // one attribute per location inside it: the engine numbers one Vulkan
+    // binding per attribute *location* (`runtime/draw/vulkan.rs` builds
+    // `binding: a.location`), while the canonical layout this class states has
+    // one entry per stream with the attributes that read it at their own
+    // offsets (`research/docs/26` §31). Both rails fetch the same bytes — the
+    // entry's stride and each attribute's offset are the descriptor's own — and
+    // the canonical shape is Metal's, which is what makes a draw whose vertex
+    // stage *also* declares a `[[buffer(N)]]` argument statable: the streams it
+    // occupies are the tables it has, not the attributes it reads. Four is the
+    // canonical contract's `max_vertex_buffers` — the axis 97.7 % of the
+    // measured draw stream lives on — and a fifth table is a layout the
+    // contract cannot state, so it stays on the engine rather than in a trace
+    // admission would refuse.
+    if canonical_vertex_stream_count(&req.vertex_attributes) > MAX_VERTEX_BUFFERS {
         return Err(OutOfClass::owned(
             "render_provider_out_of_class_vertex_stream_limit",
             format!(
-                "a draw that binds more than {MAX_VERTEX_BUFFERS} vertex streams stays on the \
-                 engine: {} is the canonical contract's `max_vertex_buffers`, and a wider layout \
-                 is a shape admission refuses by name",
+                "a draw whose attributes read more than {MAX_VERTEX_BUFFERS} vertex streams stays \
+                 on the engine: {} is the canonical contract's `max_vertex_buffers`, and a wider \
+                 layout is a shape admission refuses by name",
                 MAX_VERTEX_BUFFERS,
             ),
         ));
@@ -3161,8 +3279,9 @@ fn narrow_class<'a>(
              always refuses",
         ));
     }
-    let mut vertex_streams = Vec::with_capacity(req.vertex_attributes.len());
-    for attribute in &req.vertex_attributes {
+    let mut vertex_streams: Vec<NarrowVertexStream<'_>> =
+        Vec::with_capacity(req.vertex_attributes.len());
+    for (head, attribute) in req.vertex_attributes.iter().enumerate() {
         if attribute.step_function != VertexStepFunction::PerVertex {
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_vertex_step",
@@ -3194,13 +3313,27 @@ fn narrow_class<'a>(
                 "a vertex stream shorter than one record stays on the engine",
             ));
         }
-        vertex_streams.push(NarrowVertexStream {
+        // The table this attribute reads, or a new one: the walk that decides
+        // that is [`one_vertex_stream`], which the gate's own stream count is
+        // built from, so the layout stated here and the number the gate read are
+        // one measurement.
+        let stated = NarrowVertexAttribute {
             location: attribute.location,
             offset: u64::from(attribute.offset),
-            stride,
             format,
-            bytes,
-        });
+        };
+        match vertex_streams
+            .iter_mut()
+            .find(|stream| one_vertex_stream(&req.vertex_attributes[stream.head], attribute))
+        {
+            Some(stream) => stream.attributes.push(stated),
+            None => vertex_streams.push(NarrowVertexStream {
+                stride,
+                head,
+                bytes,
+                attributes: vec![stated],
+            }),
+        }
     }
 
     Ok(NarrowPass {
@@ -3489,7 +3622,9 @@ fn submit_narrow(
         // and the pipeline's vertex input state is keyed on attribute
         // *locations*, which are the guest's and are carried unchanged. Two
         // rails that agree on every location, format, offset and stride fetch
-        // the same bytes whatever the binding numbers are called.
+        // the same bytes whatever the binding numbers are called — which is why
+        // the canonical block is the request's own fetch tables and can be
+        // shorter than the attribute list (`research/docs/26` §31).
         vertex_buffers.push(BufferView {
             view_id: ViewId::new(next_view),
             metal_binding: u32::try_from(binding).unwrap_or(u32::MAX),
@@ -3957,7 +4092,9 @@ fn stage_buffer_writebacks(
 
 /// Every input allocation the trace's render half carries: one per vertex
 /// stream and one for the index stream, with the view's own length as the
-/// extent.
+/// extent. One per *stream*, so a table several attributes read travels once —
+/// the bytes are the same allocation the request already holds
+/// ([`one_vertex_stream`]).
 fn input_allocations(pass: &NarrowPass<'_>) -> Vec<(AllocationId, u64)> {
     let mut out = Vec::with_capacity(pass.vertex_streams.len() + 1);
     let mut next_view = FIRST_INPUT_VIEW;
@@ -4442,5 +4579,98 @@ mod clear_payload_tests {
             routes.len(),
             "one name per rule: {routes:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod vertex_stream_tests {
+    use super::*;
+
+    /// One request attribute off one staged table.
+    fn attribute(
+        location: u32,
+        offset: u32,
+        stride: u32,
+        table: &std::sync::Arc<Vec<u8>>,
+    ) -> VertexAttributeResource {
+        VertexAttributeResource {
+            location,
+            binding: location,
+            format: crate::backend::vulkan::engine::VertexAttributeFormat::parse(29)
+                .expect("Float2 is a vertex format"),
+            offset,
+            stride,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: BufferContent::Bytes(std::sync::Arc::clone(table)),
+        }
+    }
+
+    /// The census v6 door's own shape, in the terms the seam hands this rail:
+    /// four attributes at locations 0..3 and *two* staged tables — locations 0
+    /// and 1 off the first, 2 and 3 off the second, which is what an
+    /// interleaved pair of guest vertex buffers looks like once the runtime has
+    /// resolved each attribute through its own buffer's bind.
+    ///
+    /// Two canonical streams, not four: the count the stage-buffer gate's
+    /// vertex-layout rule reads is the request's own fetch tables, so a vertex
+    /// stage argument at Metal index 2 is clear of them — where the attribute
+    /// count the rule used to read (4) put it inside. The second half of the
+    /// test is that control: the same four attributes with four allocations are
+    /// four streams, which is the number the same draw had before this
+    /// increment and the reason the door held 77103 of them (R9p).
+    #[test]
+    fn attributes_of_one_staged_table_are_one_canonical_stream() {
+        let first = std::sync::Arc::new(vec![0u8; 48]);
+        let second = std::sync::Arc::new(vec![0u8; 48]);
+        let interleaved = vec![
+            attribute(0, 0, 16, &first),
+            attribute(1, 8, 16, &first),
+            attribute(2, 0, 16, &second),
+            attribute(3, 8, 16, &second),
+        ];
+        assert_eq!(
+            canonical_vertex_stream_count(&interleaved),
+            2,
+            "two tables, four attributes"
+        );
+
+        let separate = vec![
+            attribute(0, 0, 8, &first),
+            attribute(1, 0, 8, &second),
+            attribute(2, 0, 8, &std::sync::Arc::new(vec![0u8; 24])),
+            attribute(3, 0, 8, &std::sync::Arc::new(vec![0u8; 24])),
+        ];
+        assert_eq!(
+            canonical_vertex_stream_count(&separate),
+            4,
+            "one table per attribute is the attribute count"
+        );
+    }
+
+    /// Sharing the staged allocation is not enough: a stream is the *fetch
+    /// table*, so the stride is the other half of the identity. Two attributes
+    /// that read one allocation at two strides are two tables, and a rail that
+    /// folded them would fetch one of them at the wrong stride.
+    #[test]
+    fn one_allocation_at_two_strides_is_two_streams() {
+        let table = std::sync::Arc::new(vec![0u8; 64]);
+        let attributes = vec![attribute(0, 0, 16, &table), attribute(1, 0, 32, &table)];
+        assert_eq!(canonical_vertex_stream_count(&attributes), 2);
+    }
+
+    /// Two attributes of one table *are* one stream even when the caller built
+    /// them separately: only the staged allocation's identity joins them, which
+    /// is the runtime's own sharing contract — a request that resolves one
+    /// buffer twice hands this rail two allocations, and it then states two
+    /// streams (which the gate answers, conservatively, as it always did).
+    #[test]
+    fn equal_bytes_from_two_allocations_stay_two_streams() {
+        let bytes = vec![0u8; 32];
+        let attributes = vec![
+            attribute(0, 0, 16, &std::sync::Arc::new(bytes.clone())),
+            attribute(1, 8, 16, &std::sync::Arc::new(bytes)),
+        ];
+        assert_eq!(canonical_vertex_stream_count(&attributes), 2);
     }
 }

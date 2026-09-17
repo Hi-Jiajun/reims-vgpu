@@ -5982,3 +5982,375 @@ fn the_registration_leaves_a_slot_the_entry_never_dereferences_out_of_the_pairin
         "the dereferenced slot registers against its own declaration: {registered:?}"
     );
 }
+
+/// The fixture of the R9p shape: four `[[stage_in]]` attributes at locations
+/// 0..3 beside a vertex-stage `[[buffer(2)]]` argument the entry reads.
+///
+/// The vertex half is the census v6 door's own shape — the pair 77094 of the
+/// 77103 `stage_buffer_shape_vertex_layout` rows answered with — and the
+/// fragment half is the reviewed solid colour, so a frame is a function of the
+/// bytes both stages read.
+fn shared_table_stages() -> Stages {
+    let mut stages = Stages {
+        air: (
+            fixture("reims_indexed_tri_two_stream_buffer2.air"),
+            fixture("render_frag.air"),
+        ),
+        vertex_entry: "reims_two_stream_buffer2_vertex",
+        fragment_entry: FRAGMENT_ENTRY,
+        vertex_attribute_locations: vec![0, 1, 2, 3],
+        vertex_stage_buffer_declarations: Vec::new(),
+        fragment_stage_buffer_declarations: Vec::new(),
+    };
+    stages.vertex_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.0, RenderStage::Vertex, stages.vertex_entry);
+    stages.fragment_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.1, RenderStage::Fragment, stages.fragment_entry);
+    eprintln!(
+        "R9p fixture declarations: attributes={:?} vertex={:?} fragment={:?}",
+        stages.vertex_attribute_locations,
+        stages.vertex_stage_buffer_declarations,
+        stages.fragment_stage_buffer_declarations,
+    );
+    stages
+}
+
+/// One attribute of one already-resolved fetch table.
+///
+/// The staged allocation is passed in rather than built here, because that
+/// identity *is* the table: two attributes that hand this helper the same
+/// `Arc` read one interleaved guest stream, which is the shape the runtime
+/// builds (`runtime/draw/vulkan` resolves each attribute through its own
+/// buffer index's single bind, and one bind is one `BufferContent::Bytes`
+/// allocation).
+fn attribute_of(
+    location: u32,
+    offset: u32,
+    stride: u32,
+    table: &std::sync::Arc<Vec<u8>>,
+) -> VertexAttributeResource {
+    VertexAttributeResource {
+        location,
+        binding: location,
+        format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
+            .expect("Float2 is a vertex format"),
+        offset,
+        stride,
+        step_function: VertexStepFunction::PerVertex,
+        step_rate: 1,
+        content: BufferContent::Bytes(std::sync::Arc::clone(table)),
+    }
+}
+
+/// One interleaved table: three records of two `float2`s, the first at offset 0
+/// and the second at offset 8 of a sixteen-byte record.
+fn interleaved(heads: [(f32, f32); 3], tails: [(f32, f32); 3]) -> std::sync::Arc<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(48);
+    for index in 0..3 {
+        bytes.extend_from_slice(&f32x2(&[heads[index], tails[index]]));
+    }
+    std::sync::Arc::new(bytes)
+}
+
+/// R9p: a vertex stage that declares a `[[buffer(N)]]` argument beside its
+/// `[[stage_in]]` attributes leaves for the provider exactly when the argument's
+/// Metal index is clear of the draw's own *streams* — and one canonical stream
+/// is one fetch table, not one attribute.
+///
+/// The census v6 measured this population as the stage-buffer door's whole
+/// first failure: `stage_buffer_shape_vertex_layout` = 77103 of the 77700
+/// `stage_buffer_shape` rows, and 77094 of those answered with one and the same
+/// pair — a `[[buffer(2)]]` argument beside four attributes. The request the
+/// seam builds carries one entry per attribute *location* (the engine numbers
+/// one Vulkan binding per location), so a rail that numbers one canonical
+/// stream per attribute occupies bindings 0..3 and the argument at Metal index 2
+/// lands inside them. The descriptor behind those four attributes reads two
+/// interleaved tables — locations 0/1 out of the first, 2/3 out of the second —
+/// and the request still states that: one staged allocation per guest vertex
+/// buffer, shared by every attribute that reads it.
+///
+/// Two halves, one per side of the pair:
+///
+/// * the canonical registration itself refuses the statement the old numbering
+///   produced (one layout entry per attribute beside the declaration:
+///   `StageBufferVertexLayoutConflict`, slug `trace_contract_invalid`) and mints
+///   the one this increment states, which is what makes this rail's rule the
+///   contract's own rule mirrored rather than a policy of this rail;
+/// * both rails draw the shape and land the same bytes, and the refusal beside
+///   them is the rule that is *still* the door: a request that really does read
+///   three tables while declaring a `[[buffer(2)]]` argument states three
+///   canonical streams, so index 2 lands inside them and the draw keeps the
+///   engine by name.
+///
+/// Falsifiability: the argument's `float2` is added into the clip position and so
+/// is every one of the four attributes, so each move below — the argument's own
+/// bytes, and one attribute of either table — has to change the frame.
+#[test]
+fn a_vertex_stream_shared_by_two_attributes_leaves_room_for_its_stage_buffer() {
+    let _guard = engine_test_session();
+    let stages = shared_table_stages();
+    assert_eq!(stages.vertex_attribute_locations, vec![0, 1, 2, 3]);
+    assert_eq!(
+        stages.vertex_stage_buffer_declarations,
+        vec![StageBufferDeclaration {
+            index: 2,
+            access: StageBufferAccess::Read,
+            // The entry loads one `float2` at a constant address: two four-byte
+            // reaches at one stride of zero, which is the contract's static
+            // ceiling and the number the registration compares its own
+            // translation's footprint against.
+            footprint: StageBufferFootprint::Static { max_bytes: 8 },
+        }],
+        "the fixture's own translation declares one read-only buffer at Metal index 2"
+    );
+    assert!(
+        stages.fragment_stage_buffer_declarations.is_empty(),
+        "the reviewed fragment half declares no buffer: {:#?}",
+        stages.fragment_stage_buffer_declarations
+    );
+
+    // The provider's own half, read through its public registration entry point
+    // rather than inferred from this rail's code: the statement one layout entry
+    // per attribute would build is refused by the contract that consumes it, and
+    // the statement one entry per table builds registers.
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let provider = VulkanComputeProvider::with_executor(std::sync::Arc::clone(&executor))
+        .expect("the canonical provider builds");
+    let device =
+        Device::new(std::sync::Arc::clone(&executor) as std::sync::Arc<dyn ComputeExecutor>);
+    let policy = provider.spirv_feature_policy();
+    let translate = |air: &[u8], stage: RenderStage, entry: &str| {
+        let function = device
+            .new_library_with_binary_air(air.to_vec())
+            .expect("the fixture is a binary AIR module")
+            .function(entry)
+            .expect("the fixture's entry exists");
+        TranslatedRenderStage::translate_with_policy(stage, &function, policy)
+            .expect("the fixture translates under this device's policy")
+    };
+    let attribute = |location: u32, offset: u64| VertexAttribute {
+        location,
+        offset,
+        format: VertexFormat::Float32x2,
+    };
+    let one_entry_per_attribute = VertexLayout::Buffers(
+        (0..4)
+            .map(|location| VertexBufferLayout {
+                stride: 16,
+                step: VertexStep::PerVertex,
+                attributes: vec![attribute(location, 0)],
+            })
+            .collect(),
+    );
+    let one_entry_per_table = VertexLayout::Buffers(vec![
+        VertexBufferLayout {
+            stride: 16,
+            step: VertexStep::PerVertex,
+            attributes: vec![attribute(0, 0), attribute(1, 8)],
+        },
+        VertexBufferLayout {
+            stride: 16,
+            step: VertexStep::PerVertex,
+            attributes: vec![attribute(2, 0), attribute(3, 8)],
+        },
+    ]);
+    let declaration = StageBufferBinding {
+        stage: RenderPipelineStage::Vertex,
+        index: 2,
+        access: BufferAccess::Read,
+        footprint: FootprintProof::Static { max_bytes: 8 },
+    };
+    let register = |label: &str, layout: VertexLayout| {
+        provider.register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: stages.vertex_entry.to_owned(),
+                fragment_entry: stages.fragment_entry.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: layout,
+                stage_buffers: vec![declaration.clone()],
+            },
+            vertex: translate(&stages.air.0, RenderStage::Vertex, stages.vertex_entry),
+            fragment: translate(&stages.air.1, RenderStage::Fragment, stages.fragment_entry),
+            logical_digest: SemanticDigest::new(
+                "reims-provider-render-rail-r9p",
+                label.as_bytes().to_vec(),
+            )
+            .expect("the digest names a case"),
+        })
+    };
+    let refused = register("one-entry-per-attribute", one_entry_per_attribute)
+        .expect_err("the contract refuses an argument inside its own stream block");
+    eprintln!(
+        "registration, one entry per attribute: class={:?} slug={} fields={:?} refusal={refused:?}",
+        refused.class, refused.slug, refused.fields,
+    );
+    assert_eq!(refused.slug, "render_pipeline_contract_invalid");
+    assert!(
+        format!("{refused:?}").contains("vertex stage buffer 2 shares its binding with a vertex"),
+        "the refusal is the contract's own vertex-layout conflict: {refused:?}"
+    );
+    let registered = register("one-entry-per-table", one_entry_per_table)
+        .expect("two streams leave the argument at Metal index 2 clear of them");
+    eprintln!(
+        "registration, one entry per table: pipeline={:?}",
+        registered.pipeline_id
+    );
+
+    // The four attributes the census pair had, as two interleaved tables: the
+    // positions with the first offset in the first, the second and third offsets
+    // in the second. One request builder feeds both rails — the attributes and
+    // the `[[buffer(2)]]` bind are the same allocations for the engine's own
+    // bind rail and for the seam's list beside it — so the byte comparison below
+    // is about the rails' plumbing and nothing else.
+    let positions = [(-1.0_f32, -3.0_f32), (-1.0, 1.0), (3.0, 1.0)];
+    let offsets = |x: f32| [(x, 0.0_f32); 3];
+    let request = |first: &std::sync::Arc<Vec<u8>>,
+                   second: &std::sync::Arc<Vec<u8>>,
+                   tail: &std::sync::Arc<Vec<u8>>| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.vertex_attributes = vec![
+            attribute_of(0, 0, 16, first),
+            attribute_of(1, 8, 16, first),
+            attribute_of(2, 0, 16, second),
+            attribute_of(3, 8, 16, second),
+        ];
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 2,
+            content: BufferContent::Bytes(std::sync::Arc::clone(tail)),
+        });
+        req
+    };
+    let first = interleaved(positions, offsets(0.125));
+    let second = interleaved(offsets(0.0625), offsets(0.0625));
+    let still = std::sync::Arc::new(f32x2(&[(0.0, 0.0)]));
+    let moved = std::sync::Arc::new(f32x2(&[(-0.25, 0.0)]));
+    let (width, _) = extent();
+
+    let frame = |label: &str,
+                 first: &std::sync::Arc<Vec<u8>>,
+                 second: &std::sync::Arc<Vec<u8>>,
+                 tail: &std::sync::Arc<Vec<u8>>| {
+        let req = request(first, second, tail);
+        let content = BufferContent::Bytes(std::sync::Arc::clone(tail));
+        let binds = [staged_bind(RenderPipelineStage::Vertex, 2, &content)];
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &req,
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: a draw whose argument is clear of its streams leaves for the provider: \
+                 {other:?}"
+            ),
+        }
+    };
+
+    let delivered = provider_render::provider_submissions();
+    let reviewed = frame("two tables", &first, &second, &still);
+    eprintln!(
+        "two-table draw: provider submissions {delivered} -> {}, texel (0, 0) {:?}, \
+         texel (width - 1, 0) {:?}",
+        provider_render::provider_submissions(),
+        texel_at(&reviewed, 0, 0),
+        texel_at(&reviewed, width - 1, 0),
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census pair reaches the canonical provider instead of the engine"
+    );
+    assert_clear_texel("two tables: texel (0, 0)", texel_at(&reviewed, 0, 0));
+    assert_texel_near(
+        "two tables: texel (width - 1, 0)",
+        texel_at(&reviewed, width - 1, 0),
+        FRAGMENT_TEXEL,
+    );
+
+    // The engine's own frame for the same request: the shape is one both rails
+    // execute, which is what the class gate promises and what this comparison
+    // reads.
+    let Some(engine) = engine_pixels("two tables", &stages, request(&first, &second, &still))
+    else {
+        return;
+    };
+    assert_frames_equal("two tables, both rails", &reviewed, &engine);
+
+    // Every input of the shape has to reach the frame: the argument's own bytes,
+    // and one attribute out of each table.
+    for (label, first, second, tail) in [
+        ("the argument's own bytes moved", &first, &second, &moved),
+        (
+            "the first table's second attribute zeroed",
+            &interleaved(positions, offsets(0.0)),
+            &second,
+            &still,
+        ),
+        (
+            "the second table's second attribute zeroed",
+            &first,
+            &interleaved(offsets(0.0625), offsets(0.0)),
+            &still,
+        ),
+    ] {
+        let moved_frame = frame(label, first, second, tail);
+        assert_ne!(
+            moved_frame, reviewed,
+            "{label}: the bytes behind this input have to reach the vertex stage"
+        );
+    }
+
+    // The rule the census read as the door is still the door: a request whose
+    // attributes really do read three tables states three canonical streams, and
+    // the same `[[buffer(2)]]` argument then occupies one of them.
+    let third = interleaved(offsets(0.0625), offsets(0.0625));
+    let mut three_tables = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    three_tables.vertex_attributes = vec![
+        attribute_of(0, 0, 16, &first),
+        attribute_of(1, 8, 16, &first),
+        attribute_of(2, 0, 16, &second),
+        attribute_of(3, 0, 16, &third),
+    ];
+    three_tables
+        .storage_buffers
+        .push(engine::StorageBufferResource {
+            binding: 2,
+            content: BufferContent::Bytes(std::sync::Arc::clone(&still)),
+        });
+    let content = BufferContent::Bytes(std::sync::Arc::clone(&still));
+    let binds = [staged_bind(RenderPipelineStage::Vertex, 2, &content)];
+    let band = route_count("stage_buffer_shape_vertex_layout");
+    let delivered = provider_render::provider_submissions();
+    match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &three_tables,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!(
+                "three tables, [[buffer(2)]]: slug={} detail={} route {} -> {}",
+                reason.slug(),
+                reason.detail(),
+                band,
+                route_count("stage_buffer_shape_vertex_layout"),
+            );
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_stage_buffer_shape"
+            );
+            assert!(
+                reason.detail().contains("[[buffer(2)]]")
+                    && reason.detail().contains("3 vertex stream(s)"),
+                "the sentence names the slot and the streams it lands inside: {reason}"
+            );
+        }
+        other => panic!("a declaration inside the stream block stays on the engine: {other:?}"),
+    }
+    assert_eq!(
+        route_count("stage_buffer_shape_vertex_layout"),
+        band + 1,
+        "the arm the census reads is the one this refusal charged"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "and the draw never reaches the provider"
+    );
+}
