@@ -121,6 +121,17 @@ pub mod vulkan;
 #[cfg(feature = "provider-compute")]
 pub mod provider_compute;
 
+/// The canonical-provider render rail, present only when
+/// `feature = "provider-render"`. It is the render sibling of
+/// [`provider_compute`]: the narrow offscreen class (one colour attachment
+/// loaded by a byte-exact `Clear`, one indexed draw over owner-lease
+/// vertex/index streams) is submitted through `metal-api-core` /
+/// `metal-api-vulkan` instead of the self-contained [`vulkan::engine`];
+/// everything outside the class stays on the engine exactly as a build
+/// without the feature would run it.
+#[cfg(feature = "provider-render")]
+pub mod provider_render;
+
 /// The owner half of the canonical-provider compute rail, present under the
 /// same `feature = "provider-compute"`: guest RAM regions registered in the
 /// provider's own `HostRegion` shape and the lease lifecycle of the windows one

@@ -38,6 +38,17 @@ backend-vulkan = [
 # on. The class boundary is fail-closed: an in-class dispatch the provider
 # refuses is declined, never silently re-run on the other rail.
 provider-compute = ["backend-vulkan", "dep:metal-api-core", "dep:metal-api-vulkan"]
+# Gate 2 narrow production render rail: under this flag a reviewed offscreen
+# render class (one colour attachment with a byte-exact `Clear` load and a
+# `Store` store, one indexed draw over owner-lease vertex/index streams, and a
+# translated pipeline pair the canonical registration gate accounts for) is
+# submitted through the canonical provider instead of the self-contained
+# engine. Off by default; it implies `provider-compute` because both rails
+# share one provider context, one device epoch and one pipeline registry. The
+# class boundary is fail-closed on exactly the compute rail's terms: an
+# in-class draw the provider refuses is declined, never silently re-run on the
+# other rail.
+provider-render = ["provider-compute"]
 # Host-owned presentation window (kb host-window): a Rust-owned winit window
 # that replaces QEMU's UI. Off by default so the QEMU staticlib link is
 # unchanged until the window is proven. Pulls the windowing stack and nothing

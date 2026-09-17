@@ -357,7 +357,7 @@ decline_display!(ProviderComputeDecline);
 /// Render a [`ProviderError`] without a `Display` impl: its slug plus the
 /// optional detail, which is where the canonical provider names the refusing
 /// check. Class and phase are recoverable from the slug family in the log.
-fn provider_error_detail(error: &ProviderError) -> String {
+pub(crate) fn provider_error_detail(error: &ProviderError) -> String {
     match &error.detail {
         Some(detail) => format!("{}: {detail}", error.slug),
         None => error.slug.clone(),
@@ -367,9 +367,9 @@ fn provider_error_detail(error: &ProviderError) -> String {
 /// One process-global canonical rail: the provider, the neutral `Device` used
 /// to compile AIR, and a per-AIR pipeline cache. The provider keeps its own
 /// Vulkan instance/device, so it never shares the self-contained engine's.
-struct ProviderRail {
-    provider: VulkanComputeProvider,
-    device: Device,
+pub(crate) struct ProviderRail {
+    pub(crate) provider: VulkanComputeProvider,
+    pub(crate) device: Device,
     /// The executor the provider was built from. Kept so the test-only driver
     /// loss injection can arm the very provider this rail submits through.
     executor: Arc<VulkanExecutor>,
@@ -395,7 +395,7 @@ fn pipeline_cache_key(air: &[u8], entry: &str) -> PipelineKey {
 
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
-fn rail() -> Result<&'static ProviderRail, ProviderComputeDecline> {
+pub(crate) fn rail() -> Result<&'static ProviderRail, ProviderComputeDecline> {
     static RAIL: OnceLock<Result<ProviderRail, String>> = OnceLock::new();
     RAIL.get_or_init(|| {
         let executor = VulkanExecutor::new().map_err(|error| error.to_string())?;
@@ -484,6 +484,12 @@ pub fn recover_after_device_loss() -> Result<(), ProviderComputeDecline> {
             detail: "pipeline cache poisoned".into(),
         })?
         .clear();
+    // The render rail's registrations are children of the same dead device
+    // (`provider_render`'s module docs): its declaring kernel and every
+    // registered pipeline pair are dropped here, under the same rebuild, so
+    // no handle survives the incarnation it was minted under.
+    #[cfg(feature = "provider-render")]
+    super::provider_render::on_device_rebuilt();
     Ok(())
 }
 
@@ -519,7 +525,7 @@ fn health_name(health: ProviderHealth) -> &'static str {
 /// run the contract's device-loss teardown over the owner ledger first when the
 /// terminal state is `DeviceLost`, so no lease stays imported against the dead
 /// incarnation. Returns `None` while the provider is `Usable`.
-fn refuse_unhealthy(
+pub(crate) fn refuse_unhealthy(
     provider: &VulkanComputeProvider,
     step: &'static str,
 ) -> Option<ProviderComputeDecline> {
@@ -545,7 +551,7 @@ fn refuse_unhealthy(
 /// detail text. `DeviceLost` is the one class whose mapping is more than a
 /// name: the contract treats it as a teardown guarantee, so the owner ledger is
 /// released here and the refusal carries the census of what that released.
-fn refusal_decline(error: &ProviderError, step: &'static str) -> ProviderComputeDecline {
+pub(crate) fn refusal_decline(error: &ProviderError, step: &'static str) -> ProviderComputeDecline {
     let class = ProviderRefusalClass::from_provider(error.class);
     let detail = provider_error_detail(error);
     match class {

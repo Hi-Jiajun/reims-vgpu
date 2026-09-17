@@ -52,6 +52,17 @@ pub enum DrawError {
     FenceTimeout,
     /// Device lost and recreate budget exhausted (or mid-draw loss).
     DeviceLost(super::device_lost::DeviceLostDecline),
+    /// The canonical render rail refused an in-class draw
+    /// (`feature = "provider-render"`).
+    ///
+    /// Fail-closed and named: the class gate admitted the request, so the
+    /// refusal is the canonical provider's own answer and the draw is declined
+    /// rather than re-run on the self-contained engine, exactly as the compute
+    /// rail's declines work. The slug and every field come from
+    /// [`crate::backend::provider_render::ProviderRenderDecline`], so one event
+    /// has one name at every layer.
+    #[cfg(feature = "provider-render")]
+    ProviderRender(Box<crate::backend::provider_render::ProviderRenderDecline>),
 }
 
 impl DrawError {
@@ -110,6 +121,8 @@ impl std::fmt::Display for DrawError {
             Self::Slab(d) => write!(f, "vk_engine_slab: {d}"),
             Self::FenceTimeout => write!(f, "vk_engine_fence_timeout"),
             Self::DeviceLost(d) => write!(f, "vk_engine_device_lost: {d}"),
+            #[cfg(feature = "provider-render")]
+            Self::ProviderRender(d) => write!(f, "vk_engine_provider_render: {d}"),
         }
     }
 }
@@ -137,6 +150,8 @@ impl crate::observe::Decline for DrawError {
             Self::ComputeValidation(d) => d.slug(),
             Self::ComputeExecution(d) => d.slug(),
             Self::DeviceLost(d) => d.slug(),
+            #[cfg(feature = "provider-render")]
+            Self::ProviderRender(d) => d.slug(),
         }
     }
 
@@ -163,6 +178,8 @@ impl crate::observe::Decline for DrawError {
             Self::ComputeValidation(d) => d.owner(),
             Self::ComputeExecution(d) => d.owner(),
             Self::DeviceLost(d) => d.owner(),
+            #[cfg(feature = "provider-render")]
+            Self::ProviderRender(d) => d.owner(),
         }
     }
 
@@ -182,6 +199,8 @@ impl crate::observe::Decline for DrawError {
             Self::FenceTimeout => Vec::new(),
             Self::Facade(d) => d.fields(),
             Self::DrawPreparation(d) => d.fields(),
+            #[cfg(feature = "provider-render")]
+            Self::ProviderRender(d) => d.fields(),
         }
     }
 }

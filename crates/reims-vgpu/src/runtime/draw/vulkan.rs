@@ -9561,6 +9561,63 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
+        // Gate 2 production seam, render half: while `provider-render` is on,
+        // the narrow offscreen class (one colour attachment cleared to a
+        // byte-exact value, one indexed draw over trace-owned streams, no
+        // resident/seed/chained target) is submitted through the canonical
+        // provider instead of the self-contained engine. The gate is pure and
+        // runs first, so an out-of-class shape falls through to the engine
+        // unchanged; an in-class shape the provider refuses is a typed decline
+        // that ends this draw rather than a silent switch back to the engine.
+        #[cfg(feature = "provider-render")]
+        {
+            use crate::backend::provider_render::{self, RenderRailInputs, RenderRailOutcome};
+            let inputs = RenderRailInputs {
+                vertex_air: resolved.vertex_air.as_ref(),
+                fragment_air: resolved.fragment_air.as_ref(),
+                // The canonical translation reports the AIR function's own
+                // name; the rail's contract names that entry, exactly as the
+                // compute rail's `air_entry` does.
+                vertex_entry: resolved.vertex.reflection.entry_point.as_deref(),
+                fragment_entry: resolved.fragment.reflection.entry_point.as_deref(),
+                writeback_guest,
+            };
+            match provider_render::submit_render(&inputs, &resources) {
+                RenderRailOutcome::ProviderCompleted(out) => {
+                    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
+                    crate::runtime::drain::note_store_route("render_provider_canonical");
+                    crate::observe::line(format!(
+                        "linux_render_provider ok pipe={} {}x{} idx={} bgra={}",
+                        req.pipeline_ref,
+                        w,
+                        h,
+                        resources
+                            .indexed
+                            .as_ref()
+                            .map(|index| index.index_count)
+                            .unwrap_or(0),
+                        out.bgra as u8,
+                    ));
+                    return Ok(M2vDrawSpan::Pixels {
+                        bytes: out.bytes,
+                        bgra: out.bgra,
+                    });
+                }
+                RenderRailOutcome::NotInNarrowClass(reason) => {
+                    crate::runtime::drain::note_store_route("render_provider_out_of_class");
+                    crate::observe::off(format!(
+                        "linux_render_provider out_of_class pipe={} reason={reason}",
+                        req.pipeline_ref
+                    ));
+                }
+                RenderRailOutcome::ProviderDeclined(decline) => {
+                    crate::observe::Emit::decline("render_provider", &decline)
+                        .field("pipe", req.pipeline_ref)
+                        .fail_once(u64::from(req.pipeline_ref));
+                    return Err(DrawError::ProviderRender(Box::new(decline)));
+                }
+            }
+        }
         let out = crate::backend::vulkan::engine::execute_draw_request(&resources)?;
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a

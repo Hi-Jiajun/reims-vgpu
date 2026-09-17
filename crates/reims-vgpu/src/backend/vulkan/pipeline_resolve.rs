@@ -212,6 +212,20 @@ pub struct ResolvedRenderPipeline {
     pub fragment: Arc<CachedShader>,
     /// Derived from `desc` and memoized with it — see [`VertexBindPlan`].
     pub bind_plan: Arc<VertexBindPlan>,
+    /// The AIR each stage was translated from, retained only for the canonical
+    /// render rail (`feature = "provider-render"`).
+    ///
+    /// The canonical provider's translated-registration gate takes an AIR
+    /// module and runs its *own* translator over it, so the render rail needs
+    /// the carve this resolution already made and would otherwise drop on the
+    /// floor: `resolve_uncached` carves it, translates it, and keeps only the
+    /// translation. Carried beside the translation so the two describe one
+    /// read of one MTLB, and gated on the feature so a build without the rail
+    /// pays neither the copy nor the field.
+    #[cfg(feature = "provider-render")]
+    pub vertex_air: Arc<[u8]>,
+    #[cfg(feature = "provider-render")]
+    pub fragment_air: Arc<[u8]>,
 }
 
 #[cfg(test)]
@@ -261,6 +275,13 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
             Vec::new(),
             reflection(ShaderStage::Fragment),
         )),
+        // A synthetic pipeline is never the provider rail's input, and the rail
+        // refuses a request without both modules anyway: the empty carve keeps
+        // this constructor honest about that instead of inventing bytes.
+        #[cfg(feature = "provider-render")]
+        vertex_air: Arc::from(Vec::new()),
+        #[cfg(feature = "provider-render")]
+        fragment_air: Arc::from(Vec::new()),
     })
 }
 
@@ -465,6 +486,15 @@ fn resolve_uncached<M: HostMemory + HostOps>(
         vertex,
         fragment,
         bind_plan,
+        // The two carves this resolution just translated, kept so the
+        // canonical render rail can hand the *same* AIR to the provider's
+        // translated-registration gate. `v_air`/`f_air` borrow from the MTLB
+        // reads above, so this is one copy each, under the feature that asks
+        // for them.
+        #[cfg(feature = "provider-render")]
+        vertex_air: Arc::from(v_air.to_vec()),
+        #[cfg(feature = "provider-render")]
+        fragment_air: Arc::from(f_air.to_vec()),
     })
 }
 
