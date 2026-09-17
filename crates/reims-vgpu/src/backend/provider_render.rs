@@ -5153,6 +5153,12 @@ fn submit_narrow(
 
     let pass_descriptor = RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
+        // The runtime `[[sampler(n)]]` bindings the fragment stage executes
+        // with stay empty until the seam states them (`research/docs/23`
+        // §102, E-RS2): the canonical pass admits them, and a declaration
+        // this seam has not made is refused by the pairing rule rather
+        // than invented here.
+        samplers: Vec::new(),
         color_attachments: vec![RenderAttachment {
             view_id: attachment.view,
             allocation_id: attachment.allocation,
