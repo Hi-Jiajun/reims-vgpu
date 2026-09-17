@@ -56,24 +56,48 @@
 //!   canonical binding index is the table's position in that list, which is why
 //!   the class renumbers rather than carrying the guest's binding numbers
 //!   across;
-//! - **at most one scissor rectangle inside the attachment**, and no viewport
-//!   override: the canonical pass states the attachment-covering viewport and
+//! - **at most one scissor rectangle inside the attachment, and at most one
+//!   viewport of its own** (R10, `research/docs/23` §100): the canonical pass
 //!   carries the guest's own rectangle through the pass scissor
-//!   ([`RenderPassDescriptor::scissor`], the v29 channel both rails execute), so
-//!   the texels outside the rectangle keep the load op's bytes on both. A
-//!   rectangle that is empty, that reaches outside the attachment, or that is one
-//!   of several stays on the engine: the contract refuses such a rect by name
-//!   (`ScissorOutOfBounds`) while the engine *clamps* one that reaches past the
-//!   attachment, so a class that repaired it here would answer with a frame the
-//!   engine never drew;
+//!   ([`RenderPassDescriptor::scissor`], the v29 channel both rails execute) and
+//!   *states the guest's viewport rect* in its own body
+//!   ([`RenderPassDescriptor::viewport`], the v100 channel), so the texels
+//!   outside either rectangle keep the load op's bytes on both. A scissor that
+//!   is empty, that reaches outside the attachment, or that is one of several
+//!   stays on the engine (the contract refuses such a rect by name,
+//!   `ScissorOutOfBounds`, while the engine *clamps* one that reaches past the
+//!   attachment), and so does a viewport the contract has no spelling for — a
+//!   negative or fractional origin, an empty or out-of-bounds rect, a depth
+//!   range of its own, or more than one rect ([`viewport_admits`], one bucket
+//!   per shape);
+//! - **one sampled texture per fragment-stage `[[texture(i)]]`, declared beside
+//!   its bind** (R10, `research/docs/23` §101): the canonical pass's texture
+//!   list *is* the fragment stage's texture argument space, so the class states
+//!   one declaration per reflected `[[texture(i)]]` — the module's own AIR
+//!   sampler state, the positional index, and the one shape the render sampler
+//!   uploads (a single-sample, non-arrayed, read-only 2D surface of
+//!   `rgba8_unorm` texels at the render area's own extent) — beside the draw's
+//!   own bind, and requires the bind's sampler state to repeat the module's.
+//!   Every other shape is a named exit ([`sampled_textures`]): a resource
+//!   family the translated rail does not execute, a texture that is not its own
+//!   position, a reflected shape or state outside the family, an unbound
+//!   declaration, a bind whose texels are a guest gather or a resident image, a
+//!   texture of another extent, and a draw whose sampler says another state;
+//! - **the attachment's own blend state** (R10, `research/docs/23` §100): a
+//!   blend the canonical pass can state *and* the command channel's v40 section
+//!   carries (blending enabled, one operation for both channel pairs, every
+//!   channel written) leaves for the provider as the pass's blend entry, while
+//!   a write mask, an alpha operation of its own and the three factor families
+//!   the provider refuses by name keep the engine under their own buckets
+//!   ([`declared_blend`]);
 //! - the pipeline pair is the request's own translated stages: the two SPIR-V
 //!   modules reims' pipeline resolution produced, registered through the
 //!   canonical *translated* registration gate
 //!   (`register_translated_render_pipeline`), which checks each stage's
 //!   reflection against the contract field by field;
-//! - no depth, stencil, MSAA, MRT, resolve, blend, colour write mask,
-//!   occlusion query, sampled image or sampler — and every one of those is a
-//!   *reason*, not a silent downgrade;
+//! - no depth, stencil, MSAA, MRT, resolve, colour write mask a wire section
+//!   cannot carry, occlusion query or framebuffer fetch — and every one of those
+//!   is a *reason*, not a silent downgrade;
 //! - **stage buffers by the stage's own interface** (R9b/R9d/R9j): a request
 //!   whose stages bind buffers directly is the v2 census's 99.3% door, and the
 //!   door answers by what each stage's *translation* declares rather than by
@@ -328,18 +352,21 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use metal_api_core::provider::{
     half_to_f32, AcquirePolicy, AffineAccess, AllocationId, AllocationRecord, AttachmentFormat,
-    BufferAccess, BufferSource, BufferView, BufferWriteback, ClearColor, CompiledComputePipeline,
+    BlendAttachment, BlendFactor, BlendFactorSlot, BlendOperation, BufferAccess, BufferSource,
+    BufferView, BufferWriteback, ClearColor, ColorWriteMask, CompiledComputePipeline,
     CompletionDisposition, CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch,
     DispatchKind, DispatchType, FootprintProof, IndexBufferBinding, IndexFormat, InitialState,
     LoadOp, NoCopyLeaseImporter, OperationId, PresentDescriptor, PresentMode, PresentTarget,
-    RenderAttachment, RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage,
-    ResourceTableSnapshot, SemanticDigest, StageBufferBinding, StageBufferView, StoreOp, TracePass,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
-    MAX_RENDER_STAGE_BUFFERS, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    RenderAttachment, RenderPassBlend, RenderPassDescriptor, RenderPipelineContract,
+    RenderPipelineStage, ResourceTableSnapshot, SamplerPolicy, SemanticDigest, StageBufferBinding,
+    StageBufferView, StoreOp, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
+    TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexLayout, VertexStep, ViewId, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
+    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::Device;
 use metal_api_vulkan::{RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage};
@@ -565,6 +592,979 @@ fn scissor_admits(
             scissor.width, scissor.height, scissor.x, scissor.y,
         ),
     ))
+}
+
+/// The shape one fragment-stage `[[texture(i)]]` argument was reflected with,
+/// reduced to the question the render sampler's class gate asks (R10,
+/// `research/docs/23` §101).
+///
+/// The canonical translated arm executes exactly one texture family: a
+/// single-sample, non-arrayed, read-only `D2` surface whose component is a
+/// float, one descriptor in set 0. The reflection is asked about the shape
+/// *before* the request is, because a module that declares another family is a
+/// shape the provider refuses by name (`render_texture_shape_unsupported` /
+/// `render_texture_format_unsupported` / `render_texture_layout_unsupported`)
+/// whatever the draw bound — and a refusal is a decline, not a fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderTextureShape {
+    /// The one family both sampler arms upload and sample.
+    Sampled2D,
+    /// Everything else, named for the class gate's bucket.
+    Unsupported(RenderTextureShapeRefusal),
+}
+
+/// Which reflected fact put a texture outside the executable family.
+///
+/// A value rather than a string for the reason every other route in this module
+/// is one: two arms that answer with different census names are two facts, and
+/// a typo'd literal would file both under one name with nothing failing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderTextureShapeRefusal {
+    /// A dimension that is not `D2` (1D, 3D, cube, …).
+    Dimension,
+    /// An arrayed (or array-reference) texture.
+    Arrayed,
+    /// A multisampled texture.
+    Multisampled,
+    /// A writable (storage) texture.
+    Writable,
+    /// A component that is not the float family (uint/int samples).
+    Component,
+    /// A descriptor outside set 0 / count 1, or one the reflection does not
+    /// carry at all.
+    Descriptor,
+}
+
+impl RenderTextureShapeRefusal {
+    /// The shape, as the refusal's sentence names it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Dimension => "a texture whose dimension is not D2",
+            Self::Arrayed => "an arrayed texture",
+            Self::Multisampled => "a multisampled texture",
+            Self::Writable => "a writable (storage) texture",
+            Self::Component => "a texture whose component is not a float",
+            Self::Descriptor => "a texture whose descriptor is not one binding in set 0",
+        }
+    }
+}
+
+/// The state one fragment-stage `[[texture(i)]]` argument's samples were
+/// lowered against, as the module's own AIR carries it (R10,
+/// `research/docs/23` §101).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderSamplerState {
+    /// The state the canonical rail creates a `VkSampler` from.
+    Policy(SamplerPolicy),
+    /// The module names no AIR static sampler for this texture — the other
+    /// Metal sampler family is a runtime `[[sampler(n)]]` object, which the
+    /// canonical translated rail refuses by name
+    /// (`render_stage_unsupported_interface`).
+    Runtime,
+    /// The AIR state is outside the family the canonical rail creates: a
+    /// differing min/mag filter, a mip filter, non-normalized coordinates, a
+    /// compare function, anisotropy, or a reduction.
+    Unsupported,
+}
+
+/// One `[[texture(i)]]` argument the fragment stage's own translation declares
+/// (R10, `research/docs/23` §101).
+///
+/// The three facts the class gate needs, and the one place each comes from:
+/// the Metal index and the sampler state are the *module's* (the declaration
+/// has to repeat the state the module was lowered against, or the provider
+/// refuses the pair by name), the two device bindings are the slots the
+/// *request's* binds were resolved at — the runtime applies the same fragment
+/// sampled-band relocation to both lists, so declaration `i` and the draw's
+/// own bind pair by number here exactly as they do inside the engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderTextureDeclaration {
+    /// The Metal `[[texture(n)]]` argument index. The canonical contract is
+    /// positional (`entry i` is `[[texture(i)]]`), so a declaration whose index
+    /// is not its position is a shape the class keeps on the engine by name.
+    pub index: u32,
+    /// The device binding the request resolves this texture's view at.
+    pub binding: u32,
+    /// The device binding of the AIR static sampler the samples go through.
+    pub sampler_binding: u32,
+    /// The module's own state for that sampler.
+    pub sampler: RenderSamplerState,
+    /// The reflected texture shape.
+    pub shape: RenderTextureShape,
+}
+
+/// One Metal resource argument outside the family the canonical *translated*
+/// render rail executes, with the stage and kind that answer for it (R10).
+///
+/// The translated rail binds `[[buffer(n)]]` arguments, one sampled
+/// `[[texture(i)]]` per AIR static sampler, and nothing else: a runtime
+/// `[[sampler(n)]]`, a storage image, a texture array, a framebuffer-fetch
+/// `[[color(n)]]` or a vertex-stage image is refused by the provider's own name
+/// (`render_stage_unsupported_interface`), so a draw whose module declares one
+/// is a shape this class has to answer for before the provider is asked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderInterfaceRefusal {
+    /// The stage whose reflection declares it.
+    pub stage: RenderPipelineStage,
+    /// The Metal resource kind, as `metal2vulkan`'s reflection names it.
+    pub kind: &'static str,
+    /// The argument's Metal index.
+    pub index: u32,
+}
+
+/// The `[[texture(i)]]` arguments one fragment stage's reflection declares, with
+/// the AIR sampler state its samples were lowered against (R10,
+/// `research/docs/23` §101).
+///
+/// The canonical render sampler pairs the *i*-th reflected sampled texture with
+/// the *i*-th AIR static sampler (`metal-api-vulkan`'s
+/// `translated_texture_slots`), so this walk makes the same pairing over the
+/// same reflection — one list of textures, one list of static samplers, paired
+/// by position — instead of a second rule that could disagree about which state
+/// belongs to which texture.
+///
+/// The state is mapped into the canonical policy family here, once per resolved
+/// pipeline, because that is the question the class gate asks on every draw:
+/// `Some` exactly for the states the canonical rail creates a `VkSampler` from
+/// — nearest or linear min/mag filtering, identical on all three axes, one mip
+/// level, normalized coordinates, no comparison, no anisotropy, weighted-average
+/// reduction — and the two refusals the gate answers with otherwise. The
+/// refusals' *names* live in the rail (`RenderSamplerState`), the facts live
+/// here.
+#[cfg(feature = "provider-render")]
+pub fn texture_declarations(
+    reflection: &metal2vulkan::reflect::ShaderReflection,
+) -> Arc<[RenderTextureDeclaration]> {
+    use metal2vulkan::meta::{TextureComponent, TextureDimension, TextureShape};
+    use metal2vulkan::reflect::{
+        ResourceKind, SamplerAddressMode as AirAddress, SamplerCompareFunction, SamplerCoordinates,
+        SamplerFilter as AirFilter, SamplerMipFilter, SamplerReduction,
+    };
+    use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
+
+    /// The module's AIR state in the canonical policy's two fields, or `None`
+    /// when the state is outside the family the canonical rail creates.
+    ///
+    /// This is the same rule `metal-api-vulkan`'s `static_sampler_policy`
+    /// applies to the very same reflection — the two rails translate one AIR
+    /// with one translator, so this is one measurement restated, not a second
+    /// opinion.
+    fn air_sampler_policy(
+        state: &metal2vulkan::reflect::StaticSamplerState,
+    ) -> Option<SamplerPolicy> {
+        if state.min_filter != state.mag_filter
+            || state.address_mode_s != state.address_mode_t
+            || state.address_mode_s != state.address_mode_r
+            || state.mip_filter != SamplerMipFilter::None
+            || state.coordinates != SamplerCoordinates::Normalized
+            || state.compare_function != SamplerCompareFunction::Never
+            || state.reduction != SamplerReduction::WeightedAverage
+            || state.max_anisotropy != 1
+        {
+            return None;
+        }
+        let filter = match state.min_filter {
+            AirFilter::Nearest => SamplerFilter::Nearest,
+            AirFilter::Linear => SamplerFilter::Linear,
+            AirFilter::Bicubic => return None,
+        };
+        let address = match state.address_mode_s {
+            AirAddress::ClampToEdge => SamplerAddressMode::ClampToEdge,
+            AirAddress::Repeat => SamplerAddressMode::Repeat,
+            _ => return None,
+        };
+        Some(SamplerPolicy { filter, address })
+    }
+
+    /// The reflected shape, reduced to the one family the canonical render
+    /// sampler executes and the named refusal otherwise.
+    fn sampled_shape(binding: &metal2vulkan::reflect::ResourceBinding) -> RenderTextureShape {
+        let Some(shape): Option<&TextureShape> = binding.texture_shape.as_ref() else {
+            return RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Descriptor);
+        };
+        if shape.dimension != TextureDimension::D2 {
+            return RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Dimension);
+        }
+        if shape.arrayed || shape.array_ref || shape.array_length.is_some() {
+            return RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Arrayed);
+        }
+        if shape.multisampled {
+            return RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Multisampled);
+        }
+        if shape.writable {
+            return RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Writable);
+        }
+        if shape.component != TextureComponent::Float {
+            return RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Component);
+        }
+        let Some(descriptor) = binding.descriptor else {
+            return RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Descriptor);
+        };
+        if descriptor.set != 0 || descriptor.count != 1 {
+            return RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Descriptor);
+        }
+        RenderTextureShape::Sampled2D
+    }
+
+    // The AIR static samplers first: the canonical rail pairs them with the
+    // sampled textures by position, and so does the loop below.
+    let samplers = reflection
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::StaticSampler)
+        .collect::<Vec<_>>();
+    reflection
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::Texture)
+        .enumerate()
+        .map(|(position, texture)| {
+            let paired = samplers.get(position);
+            RenderTextureDeclaration {
+                index: texture.metal_index,
+                binding: texture
+                    .descriptor
+                    .map_or(0, |descriptor| descriptor.binding),
+                // The device binding the runtime resolves this draw's own
+                // sampler bind at: the translator's sampler band is widened
+                // into the device's before any shader is cached
+                // (`runtime::spirv_bind::widen_sampled_bands`), and the
+                // fragment sampled-band relocation is added per draw on top of
+                // that (see [`RenderTextureDeclaration::sampler_binding`]).
+                // The one helper that states the pair is the runtime's own.
+                sampler_binding: paired
+                    .and_then(|sampler| {
+                        crate::runtime::spirv_bind::reflected_sampler_binding(sampler, false)
+                    })
+                    .unwrap_or(0),
+                sampler: match paired.and_then(|sampler| sampler.static_sampler.as_ref()) {
+                    Some(state) => match air_sampler_policy(state) {
+                        Some(policy) => RenderSamplerState::Policy(policy),
+                        None => RenderSamplerState::Unsupported,
+                    },
+                    // No AIR static sampler pairs with this texture: the other
+                    // Metal sampler family is a runtime `[[sampler(n)]]`
+                    // object, which the translated rail does not execute.
+                    None => RenderSamplerState::Runtime,
+                },
+                shape: sampled_shape(texture),
+            }
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// The Metal arguments outside the family the canonical *translated* render rail
+/// executes, across both stages (R10).
+///
+/// The translated rail binds `[[buffer(n)]]` arguments, one sampled
+/// `[[texture(i)]]` per AIR static sampler, and nothing else: every other kind
+/// (a runtime `[[sampler(n)]]`, a storage image, a texture array, a
+/// framebuffer-fetch `[[color(n)]]`) is refused by the provider by name
+/// (`render_stage_unsupported_interface`), so the class gate answers them here
+/// rather than letting the provider decline a draw the engine could run.
+#[cfg(feature = "provider-render")]
+pub fn texture_interface_refusals(
+    vertex: &metal2vulkan::reflect::ShaderReflection,
+    fragment: &metal2vulkan::reflect::ShaderReflection,
+) -> Arc<[RenderInterfaceRefusal]> {
+    use metal2vulkan::reflect::ResourceKind;
+
+    /// One reflected kind, as the refusal's sentence names it. The three kinds
+    /// the translated rail executes have arms too so the match is total — a
+    /// kind the translator gains later is a compile error here rather than a
+    /// silent reclassification of a refusal the census already counts.
+    fn kind_name(kind: ResourceKind) -> &'static str {
+        match kind {
+            ResourceKind::Buffer => "buffer",
+            ResourceKind::Texture => "sampled texture",
+            ResourceKind::StaticSampler => "AIR static sampler",
+            ResourceKind::ThreadgroupBuffer => "threadgroup buffer",
+            ResourceKind::KernelStageInput => "kernel stage input",
+            ResourceKind::TextureArray => "texture array",
+            ResourceKind::StorageImage => "storage image",
+            ResourceKind::Sampler => "runtime sampler",
+            ResourceKind::ColorInput => "framebuffer-fetch colour input",
+            ResourceKind::AccelerationStructureShadow => "acceleration-structure shadow",
+            ResourceKind::PrimitiveAccelerationStructure => "acceleration structure",
+            ResourceKind::VisibleFunctionTable => "visible-function table",
+            ResourceKind::IntersectionFunctionTable => "intersection-function table",
+            ResourceKind::EmbeddedArgBufferTexture => "argument-buffer texture",
+            ResourceKind::EmbeddedArgBufferBuffer => "argument-buffer buffer",
+            ResourceKind::BufferAddressTable => "buffer address table",
+            ResourceKind::SynthesizedNullTexture => "synthesized null texture",
+            ResourceKind::SynthesizedReadSampler => "synthesized read sampler",
+        }
+    }
+
+    fn refused(
+        stage: metal_api_core::provider::RenderPipelineStage,
+        reflection: &metal2vulkan::reflect::ShaderReflection,
+    ) -> Vec<RenderInterfaceRefusal> {
+        reflection
+            .bindings
+            .iter()
+            .filter(|binding| {
+                !matches!(
+                    binding.kind,
+                    ResourceKind::Buffer | ResourceKind::Texture | ResourceKind::StaticSampler
+                )
+            })
+            .map(|binding| RenderInterfaceRefusal {
+                stage,
+                kind: kind_name(binding.kind),
+                index: binding.metal_index,
+            })
+            .collect()
+    }
+    let mut out = refused(
+        metal_api_core::provider::RenderPipelineStage::Vertex,
+        vertex,
+    );
+    out.extend(refused(
+        metal_api_core::provider::RenderPipelineStage::Fragment,
+        fragment,
+    ));
+    out.into()
+}
+/// One `MTLBlendFactor` ordinal in the canonical contract's own vocabulary
+/// (`research/docs/23` §100, E-RV1/v100).
+///
+/// The two enumerations are both Metal's list, but their *codes* are not the
+/// same: the contract keeps `2`/`3` for `SourceAlpha`/`OneMinusSourceAlpha`
+/// (the values v40 published) and gives the rest Metal's ordinals, so a
+/// translation by ordinal number would put the source colour and source alpha
+/// families on each other's factors. The mapping is therefore by *name*, one
+/// arm per `MTLRenderPipeline.h` value, and an ordinal outside the list is
+/// `None` — the runtime's pipeline gate parses the same list, so a value here
+/// that is not a factor is a shape the engine would have refused at build time
+/// rather than one this class has to execute.
+fn blend_factor(ordinal: u32) -> Option<BlendFactor> {
+    Some(match ordinal {
+        0 => BlendFactor::Zero,
+        1 => BlendFactor::One,
+        2 => BlendFactor::SourceColor,
+        3 => BlendFactor::OneMinusSourceColor,
+        4 => BlendFactor::SourceAlpha,
+        5 => BlendFactor::OneMinusSourceAlpha,
+        6 => BlendFactor::DestinationColor,
+        7 => BlendFactor::OneMinusDestinationColor,
+        8 => BlendFactor::DestinationAlpha,
+        9 => BlendFactor::OneMinusDestinationAlpha,
+        10 => BlendFactor::SourceAlphaSaturated,
+        11 => BlendFactor::BlendColor,
+        12 => BlendFactor::OneMinusBlendColor,
+        13 => BlendFactor::BlendAlpha,
+        14 => BlendFactor::OneMinusBlendAlpha,
+        15 => BlendFactor::Source1Color,
+        16 => BlendFactor::OneMinusSource1Color,
+        17 => BlendFactor::Source1Alpha,
+        18 => BlendFactor::OneMinusSource1Alpha,
+        _ => return None,
+    })
+}
+
+/// One `MTLBlendOperation` ordinal, in the contract's own vocabulary.
+///
+/// Metal's order and the contract's are the same five values, and the arm is
+/// written out rather than cast so a sixth value is a `None` here instead of
+/// becoming one by accident.
+fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
+    Some(match ordinal {
+        0 => BlendOperation::Add,
+        1 => BlendOperation::Subtract,
+        2 => BlendOperation::ReverseSubtract,
+        3 => BlendOperation::Min,
+        4 => BlendOperation::Max,
+        _ => return None,
+    })
+}
+
+/// The sampled textures one request's fragment stage declares, weighed against
+/// the module's own declarations (R10, `research/docs/23` §101).
+///
+/// Every rule below is one of the three questions the canonical render
+/// sampler's contract answers, and each keeps the draw on the engine under its
+/// own name rather than narrowing anything:
+///
+/// 1. **What the module declares.** A fragment stage whose reflection names a
+///    resource family the translated rail does not execute — a runtime
+///    `[[sampler(n)]]`, a storage image, an arrayed texture, a vertex-stage
+///    image — is refused by the provider by name, so the class answers it here
+///    (`render_provider_out_of_class_texture_interface`). A `[[texture(n)]]`
+///    that is not its own position has no positional list the contract can
+///    state (`..._texture_binding`), a reflected shape outside the executable
+///    family is `..._texture_shape`, and a missing or unsupported AIR static
+///    sampler is `..._texture_sampler` — the state comes from the *module*, not
+///    from the draw, which is exactly the rule E-RS1 landed on the canonical
+///    side.
+/// 2. **What the draw bound.** Declaration `i` pairs with the request's own
+///    bind at the device binding the runtime resolved it at; a declaration
+///    without one is `..._texture_unbound`, a bind whose shape the pass cannot
+///    state (dimensionality, layers, descriptor count, a non-RGBA8 texel, a
+///    view swizzle) is `..._texture_bind`, and a bind whose texels are a guest
+///    gather or a resident image rather than the request's own copy is
+///    `..._texture_source` — this increment carries text-owned bytes the way
+///    the vertex streams' staged arm does.
+/// 3. **What the sampler state is.** The draw's bound sampler at the
+///    declaration's slot has to repeat the state the module's AIR carries
+///    (`..._texture_state`), field by field in the two fields the policy has:
+///    a bind that says another filtering or address mode is the drift the
+///    declaration exists to stop — the engine would sample through the bind
+///    while the canonical rail creates its sampler from the declaration, and
+///    the two frames would differ with nothing named.
+///
+/// Binds the module does not declare (a vertex stage's texture, or a fragment
+/// texture no reflected slot names) are **not** an error: neither rail's module
+/// reads them, so the pass states nothing for them and both frames are the
+/// same — the same rule the stage-buffer door states for a bind no stage
+/// declares.
+fn sampled_textures<'a>(
+    inputs: &RenderRailInputs<'_>,
+    req: &'a DrawRequest,
+) -> Result<Vec<NarrowTexture<'a>>, OutOfClass> {
+    if req.color_input {
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_color_input",
+            "a fragment stage that fetches the attachment it renders into stays on the engine: \
+             the fetch is a subpass input, not a sampled texture, and the canonical pass carries \
+             no input attachment",
+        ));
+    }
+    // The canonical contract states one render texture (`MAX_RENDER_TEXTURES`),
+    // and both the registration and the pass refuse a longer list by name
+    // (`RenderTextureLimitExceeded`), so a wider statement is a shape this
+    // class answers before the provider is asked.
+    if inputs.fragment_texture_declarations.len() > MAX_RENDER_TEXTURES {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_texture_count",
+            format!(
+                "a fragment stage that declares {} sampled textures stays on the engine: the \
+                 canonical contract states {MAX_RENDER_TEXTURES} (`MAX_RENDER_TEXTURES`), and a \
+                 longer list is refused by name (`render_texture_limit`) rather than executed \
+                 with the rest dropped",
+                inputs.fragment_texture_declarations.len(),
+            ),
+        ));
+    }
+    if let Some(refused) = inputs.texture_interface_refusals.first() {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_texture_interface",
+            format!(
+                "a draw whose {} stage declares a {} at Metal index {} stays on the engine: the \
+                 canonical translated rail executes `[[buffer(n)]]` arguments, one sampled \
+                 `[[texture(i)]]` per AIR static sampler and nothing else, and every other \
+                 resource kind is refused by the provider's own name \
+                 (`render_stage_unsupported_interface`) rather than executed with the binding \
+                 dropped",
+                match refused.stage {
+                    RenderPipelineStage::Vertex => "vertex",
+                    RenderPipelineStage::Fragment => "fragment",
+                },
+                refused.kind,
+                refused.index,
+            ),
+        ));
+    }
+    let mut textures = Vec::with_capacity(inputs.fragment_texture_declarations.len());
+    for (position, declaration) in inputs.fragment_texture_declarations.iter().enumerate() {
+        let position = u32::try_from(position).unwrap_or(u32::MAX);
+        if declaration.index != position {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_binding",
+                format!(
+                    "a fragment stage whose sampled texture {} is `[[texture({})]]` stays on the \
+                     engine: the canonical contract's texture list is positional — entry `i` is \
+                     the fragment stage's `[[texture(i)]]` and pairs with `pass.textures[i]` — so \
+                     a list that would have to skip an index is not one this class can state",
+                    position, declaration.index,
+                ),
+            ));
+        }
+        let sampler = match declaration.sampler {
+            RenderSamplerState::Policy(policy) => policy,
+            RenderSamplerState::Runtime => {
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_texture_sampler",
+                    format!(
+                        "a fragment stage whose `[[texture({})]]` samples through a runtime \
+                         `[[sampler(n)]]` object stays on the engine: the canonical render sampler \
+                         is the AIR static sampler the module was lowered against \
+                         (`constexpr sampler`), and a runtime sampler object is a resource kind \
+                         the translated rail refuses by name \
+                         (`render_stage_unsupported_interface`)",
+                        declaration.index,
+                    ),
+                ))
+            }
+            RenderSamplerState::Unsupported => {
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_texture_sampler",
+                    format!(
+                        "a fragment stage whose `[[texture({})]]` carries an AIR sampler state \
+                         outside the family the canonical rail creates stays on the engine: the \
+                         declaration has to repeat the module's own state, and the rail's \
+                         sampler family is nearest or linear filtering with clamped or repeating \
+                         addressing, one mip level, normalized coordinates and no comparison",
+                        declaration.index,
+                    ),
+                ))
+            }
+        };
+        if let RenderTextureShape::Unsupported(reason) = declaration.shape {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_shape",
+                format!(
+                    "a fragment stage whose `[[texture({})]]` is {} stays on the engine: the \
+                     canonical render sampler uploads and samples one single-sample, non-arrayed, \
+                     read-only 2D surface with a float component, and the provider refuses every \
+                     other reflected shape by name",
+                    declaration.index,
+                    reason.name(),
+                ),
+            ));
+        }
+        let Some(image) = req
+            .sampled_images
+            .iter()
+            .find(|image| image.binding == declaration.binding)
+        else {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_unbound",
+                format!(
+                    "a draw that samples `[[texture({})]]` without binding a texture there stays \
+                     on the engine: the canonical pass pairs declaration {} with \
+                     `pass.textures[{}]`, and a declaration without a view would leave the \
+                     descriptor the module reads undefined",
+                    declaration.index, position, position,
+                ),
+            ));
+        };
+        let bindable = image.array_element == 0
+            && image.descriptor_count == 1
+            && image.layers == 1
+            && image.kind == reims_vgpu_core::texture_shape::TextureKind::D2
+            && !image.multisampled
+            && image.width != 0
+            && image.height != 0
+            && image.format == ash::vk::Format::R8G8B8A8_UNORM
+            && crate::protocol::pixel_format::swizzle_is_identity(&image.swizzle);
+        if !bindable {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_bind",
+                format!(
+                    "a draw that binds a texture of its own shape at `[[texture({})]]` stays on \
+                     the engine: the canonical pass states one single-sample, non-arrayed 2D view \
+                     with one descriptor, `rgba8_unorm` texels and an identity channel mapping, \
+                     and the bind is {}x{} {:?} (kind {:?}, layers {}, descriptors {}, element \
+                     {}, multisampled {})",
+                    declaration.index,
+                    image.width,
+                    image.height,
+                    image.format,
+                    image.kind,
+                    image.layers,
+                    image.descriptor_count,
+                    image.array_element,
+                    image.multisampled,
+                ),
+            ));
+        }
+        let crate::backend::vulkan::engine::SampledSource::Bytes(bytes) = &image.source else {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_source",
+                format!(
+                    "a draw whose `[[texture({})]]` texels come from the GPU rather than the \
+                     request's own copy stays on the engine: this class carries a sampled \
+                     texture as trace-owned bytes, the way the vertex streams' staged arm does, \
+                     and the guest-gather and resident arms are the increments after it",
+                    declaration.index,
+                ),
+            ));
+        };
+        let expected = u64::from(image.width)
+            .checked_mul(u64::from(image.height))
+            .and_then(|texels| texels.checked_mul(4));
+        if expected != u64::try_from(bytes.len()).ok() {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_bind",
+                format!(
+                    "a draw whose `[[texture({})]]` view carries {} byte(s) for a {}x{} rgba8 \
+                     surface stays on the engine: the canonical view's byte source has to be the \
+                     whole tightly packed extent ({} byte(s))",
+                    declaration.index,
+                    bytes.len(),
+                    image.width,
+                    image.height,
+                    u64::from(image.width) * u64::from(image.height) * 4,
+                ),
+            ));
+        }
+        // The canonical render sampler executes one texture *extent*: the
+        // render area's own, so every fragment's sample stands on a texel
+        // centre of the surface it reads (the rail's
+        // `render_texture_extent_unsupported`). A texture of another extent is
+        // a shape the provider always refuses, so the class answers it here.
+        if image.width != req.width || image.height != req.height {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_extent",
+                format!(
+                    "a draw whose `[[texture({})]]` is {}x{} in a {}x{} pass stays on the engine: \
+                     the canonical render sampler samples a texture of the render area's own \
+                     extent (the provider refuses another extent by name, \
+                     `render_texture_extent_unsupported`), and a shape the provider always \
+                     refuses is not one this class executes",
+                    declaration.index, image.width, image.height, req.width, req.height,
+                ),
+            ));
+        }
+        let Some(bound) = req
+            .samplers
+            .iter()
+            .find(|sampler| sampler.binding == declaration.sampler_binding)
+        else {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_unbound",
+                format!(
+                    "a draw that samples `[[texture({})]]` without binding a sampler for the \
+                     module's own AIR state stays on the engine: the declaration states the state \
+                     the module was lowered against, and the engine samples through the bind — a \
+                     missing bind is a state the two rails would resolve differently",
+                    declaration.index,
+                ),
+            ));
+        };
+        let bound = request_sampler_policy(bound).ok_or_else(|| {
+            OutOfClass::owned(
+                "render_provider_out_of_class_texture_state",
+                format!(
+                    "a draw whose sampler at `[[texture({})]]`'s slot is outside the family the \
+                     canonical rail creates stays on the engine: the bind states a state the \
+                     declaration could not repeat (nearest or linear filtering, clamped or \
+                     repeating addressing, one mip level, normalized coordinates, no comparison, \
+                     no anisotropy)",
+                    declaration.index,
+                ),
+            )
+        })?;
+        if bound != sampler {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_state",
+                format!(
+                    "a draw whose sampler at `[[texture({})]]`'s slot does not repeat the \
+                     module's own AIR state stays on the engine: the module's samples were \
+                     lowered against {sampler:?} and the engine would execute the bind's {bound:?} \
+                     while \
+                     the canonical rail creates its sampler from the declaration — the two rails \
+                     would sample differently with nothing named",
+                    declaration.index,
+                ),
+            ));
+        }
+        textures.push(NarrowTexture {
+            index: declaration.index,
+            width: u64::from(image.width),
+            height: u64::from(image.height),
+            sampler,
+            bytes,
+        });
+    }
+    Ok(textures)
+}
+
+/// One bound sampler resource in the canonical policy's own two fields, or
+/// `None` when the state is outside the family the canonical rail creates.
+///
+/// This is the request-side half of the rule E-RS1 landed on the canonical
+/// side (`static_sampler_policy`): the two enumerations are the same family —
+/// `MTLSamplerMinMagFilter`, `MTLSamplerMipFilter` and `MTLSamplerAddressMode`
+/// as the runtime resolved them — and a state the canonical rail cannot create
+/// is answered here rather than executed under another state.
+fn request_sampler_policy(
+    sampler: &crate::backend::vulkan::engine::SamplerResource,
+) -> Option<SamplerPolicy> {
+    use crate::protocol::sampler::{
+        MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+        MTL_SAMPLER_MIN_MAG_FILTER_LINEAR, MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+        MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+    };
+    if sampler.min_filter != sampler.mag_filter {
+        return None;
+    }
+    if sampler.address_mode_u != sampler.address_mode_v
+        || sampler.address_mode_u != sampler.address_mode_w
+    {
+        return None;
+    }
+    if sampler.mip_filter != MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED {
+        return None;
+    }
+    if sampler.unnormalized_coordinates
+        || sampler.compare_function != crate::backend::vulkan::engine::SamplerCompareFunction::Never
+        || sampler.max_anisotropy != 1
+    {
+        return None;
+    }
+    let filter = match sampler.min_filter {
+        MTL_SAMPLER_MIN_MAG_FILTER_NEAREST => metal_api_core::provider::SamplerFilter::Nearest,
+        MTL_SAMPLER_MIN_MAG_FILTER_LINEAR => metal_api_core::provider::SamplerFilter::Linear,
+        _ => return None,
+    };
+    let address = match sampler.address_mode_u {
+        MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE => {
+            metal_api_core::provider::SamplerAddressMode::ClampToEdge
+        }
+        MTL_SAMPLER_ADDRESS_MODE_REPEAT => metal_api_core::provider::SamplerAddressMode::Repeat,
+        _ => return None,
+    };
+    Some(SamplerPolicy { filter, address })
+}
+
+/// The blend state one request states as the canonical pass's own
+/// (`research/docs/23` §100, E-RV1/v100), or the name of the shape that keeps
+/// it on the engine.
+///
+/// `None` from this function is "the request declares no blend state at all",
+/// which the canonical pass spells by leaving its `blend` list absent — the
+/// no-blend, all-writes entry both rails ran before v40.
+///
+/// Everything else is stated **or refused by name**, never narrowed:
+///
+/// - a write mask other than `ALL` is a shape the wire's v40 blend section
+///   cannot carry (five bytes per entry: four factors and one operation, every
+///   channel written), so it keeps the engine here rather than being framed as
+///   the all-writes shape it is not;
+/// - an alpha operation of its own is the same wire question, one field over;
+/// - the three factor families the canonical contract refuses by name — the
+///   blend constant (`blend_constant_unsupported`: the pass carries no blend
+///   constant), the second colour output (`blend_dual_source_unsupported`), and
+///   `SourceAlphaSaturated` in a destination slot
+///   (`blend_factor_slot_unsupported`) — are shapes the provider *always*
+///   refuses, so the class answers them before the provider is asked, exactly
+///   as it answers the attachment window.
+///
+/// The two halves above are the reason this gate exists: the wire question is
+/// this rail's (`provider_wire` encodes the trace this function helped build),
+/// and the execution question is the contract's. Neither is answered by
+/// rounding one state into another.
+fn declared_blend(req: &DrawRequest) -> Result<Option<RenderPassBlend>, OutOfClass> {
+    if req.color_write_mask != crate::protocol::blend::ColorWriteMask::ALL {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_blend_mask",
+            format!(
+                "an attachment whose colour write mask is {:#x} stays on the engine: the \
+                 canonical pass can state a mask, but the command channel's v40 blend section \
+                 carries four factors and one operation per entry and every channel written, so \
+                 a masked entry is a shape this rail's wire refuses by name \
+                 (`RenderBlendStateUnsupported`) rather than framing as the all-writes shape it \
+                 is not",
+                req.color_write_mask.bits(),
+            ),
+        ));
+    }
+    let Some(state) = req.blend else {
+        return Ok(None);
+    };
+    let factor = |field: &'static str, ordinal: u32| {
+        blend_factor(ordinal).ok_or_else(|| {
+            OutOfClass::owned(
+                "render_provider_out_of_class_blend_ordinal",
+                format!(
+                    "a blend whose {field} factor is the ordinal {ordinal} stays on the engine: \
+                     {ordinal} is not an `MTLBlendFactor`, so the canonical pass has no factor to \
+                     state there",
+                ),
+            )
+        })
+    };
+    let source_rgb = factor("source rgb", state.src_rgb)?;
+    let destination_rgb = factor("destination rgb", state.dst_rgb)?;
+    let source_alpha = factor("source alpha", state.src_alpha)?;
+    let destination_alpha = factor("destination alpha", state.dst_alpha)?;
+    let operation = blend_operation(state.op_rgb).ok_or_else(|| {
+        OutOfClass::owned(
+            "render_provider_out_of_class_blend_ordinal",
+            format!(
+                "a blend whose rgb operation is the ordinal {} stays on the engine: it is not an \
+                 `MTLBlendOperation`, so the canonical pass has no operation to state there",
+                state.op_rgb,
+            ),
+        )
+    })?;
+    let alpha_operation = blend_operation(state.op_alpha).ok_or_else(|| {
+        OutOfClass::owned(
+            "render_provider_out_of_class_blend_ordinal",
+            format!(
+                "a blend whose alpha operation is the ordinal {} stays on the engine: it is not \
+                 an `MTLBlendOperation`, so the canonical pass has no operation to state there",
+                state.op_alpha,
+            ),
+        )
+    })?;
+    // The v40 section is one operation per entry, shared by the colour and
+    // alpha equations. Both APIs state two, and this class states both — the
+    // wire is the half that cannot carry the second one.
+    if alpha_operation != operation {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_blend_alpha_operation",
+            format!(
+                "a blend whose alpha operation ({}) differs from its colour operation ({}) stays \
+                 on the engine: the canonical pass states both, but the command channel's v40 \
+                 section carries one operation per entry, so the difference is a shape this \
+                 rail's wire refuses by name (`RenderBlendStateUnsupported`) rather than \
+                 dropping",
+                state.op_alpha, state.op_rgb,
+            ),
+        ));
+    }
+    for (slot, factor_value) in [
+        (BlendFactorSlot::SourceRgb, source_rgb),
+        (BlendFactorSlot::DestinationRgb, destination_rgb),
+        (BlendFactorSlot::SourceAlpha, source_alpha),
+        (BlendFactorSlot::DestinationAlpha, destination_alpha),
+    ] {
+        if factor_value.needs_blend_constant() {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_blend_constant",
+                format!(
+                    "a blend whose {} factor is {factor_value:?} stays on the engine: it reads \
+                     the encoder's blend colour, the canonical pass carries no blend constant, \
+                     and a shape the provider always refuses (`blend_constant_unsupported`) is \
+                     not one this class executes",
+                    slot.name(),
+                ),
+            ));
+        }
+        if factor_value.is_dual_source() {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_blend_dual_source",
+                format!(
+                    "a blend whose {} factor is {factor_value:?} stays on the engine: it \
+                     reads the fragment shader's second colour output, which the reviewed stages \
+                     do not declare, and a shape the provider always refuses \
+                     (`blend_dual_source_unsupported`) is not one this class executes",
+                    slot.name(),
+                ),
+            ));
+        }
+        if slot.is_destination() && factor_value == BlendFactor::SourceAlphaSaturated {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_blend_factor_slot",
+                format!(
+                    "a blend whose {} factor is SourceAlphaSaturated stays on the engine: both \
+                     APIs define that factor for a source slot only, and a shape the provider \
+                     always refuses (`blend_factor_slot_unsupported`) is not one this class \
+                     executes",
+                    slot.name(),
+                ),
+            ));
+        }
+    }
+    Ok(Some(RenderPassBlend {
+        attachments: vec![BlendAttachment {
+            enabled: true,
+            source_rgb,
+            destination_rgb,
+            source_alpha,
+            destination_alpha,
+            operation,
+            alpha_operation,
+            write_mask: ColorWriteMask::ALL,
+        }],
+    }))
+}
+
+/// Whether one viewport rectangle is a shape the canonical pass can state
+/// (`research/docs/23` §100, E-RV1/v100).
+///
+/// The contract's `viewport` is a *rect* in framebuffer coordinates —
+/// `[origin_x, origin_y, width, height]`, the rectangle NDC maps onto — and it
+/// is stated in the pass body, so this face needs no wire section. What it
+/// cannot state is a rect outside the attachment (the contract refuses it by
+/// name, `viewport_extent_unsupported`, rather than clipping), a rect whose
+/// origin or extent has no `u32` spelling (Metal states the four numbers as
+/// `f64`; a negative or fractional one is a shape the engine draws and the
+/// contract cannot name), a rect whose depth range is not `0..1`, and more than
+/// one rect (the canonical pass carries one). Every one of those is the
+/// engine's own answer to give, so each keeps the draw on the engine under its
+/// own name instead of being clamped or truncated here.
+fn viewport_admits(
+    viewport: crate::backend::vulkan::engine::ViewportResource,
+    width: u32,
+    height: u32,
+) -> Result<[u32; 4], OutOfClass> {
+    // The engine states the four numbers as `f32`; the contract as `u32`. The
+    // conversions below are total in the order they are written: `f64` widens
+    // the `f32` exactly, so `fract` and the comparison read the value the
+    // engine will rasterize with, and the cast is only reached for an integral
+    // value inside the `u32` range.
+    let spelling = |value: f32| -> Option<u32> {
+        let wide = f64::from(value);
+        if !wide.is_finite() || wide < 0.0 || wide.fract() != 0.0 || wide > f64::from(u32::MAX) {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some(wide as u32)
+    };
+    let (Some(x), Some(y), Some(width_u32), Some(height_u32)) = (
+        spelling(viewport.x),
+        spelling(viewport.y),
+        spelling(viewport.width),
+        spelling(viewport.height),
+    ) else {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_viewport_spelling",
+            format!(
+                "a viewport of {}x{} at ({}, {}) stays on the engine: the canonical pass states \
+                 the rect as four integers in framebuffer coordinates ([origin_x, origin_y, \
+                 width, height]), and a negative, fractional or over-wide number is a rect the \
+                 frozen pass descriptor has no spelling for — truncating it here would draw a \
+                 rect the engine never drew",
+                viewport.width, viewport.height, viewport.x, viewport.y,
+            ),
+        ));
+    };
+    if width_u32 == 0 || height_u32 == 0 {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_viewport_empty",
+            format!(
+                "a {width_u32}x{height_u32} viewport stays on the engine: the canonical pass \
+                 refuses a rect with an empty extent by name, while the engine rasterizes through \
+                 it — a draw that covers no texel is the engine's own answer to give, not a shape \
+                 this class repairs",
+            ),
+        ));
+    }
+    if viewport.min_depth != 0.0 || viewport.max_depth != 1.0 {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_viewport_depth",
+            format!(
+                "a viewport with depth range {}..{} stays on the engine: the canonical pass \
+                 states the rect alone and both rails rasterize with the 0..1 range, so a \
+                 different range is state the frozen pass descriptor cannot carry",
+                viewport.min_depth, viewport.max_depth,
+            ),
+        ));
+    }
+    let inside = u64::from(x)
+        .checked_add(u64::from(width_u32))
+        .is_some_and(|end| end <= u64::from(width))
+        && u64::from(y)
+            .checked_add(u64::from(height_u32))
+            .is_some_and(|end| end <= u64::from(height));
+    if !inside {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_viewport_extent",
+            format!(
+                "a viewport of {width_u32}x{height_u32} at ({x}, {y}) stays on the engine: it \
+                 reaches outside the {width}x{height} attachment, the canonical pass refuses a \
+                 rect outside the raster by name (`viewport_extent_unsupported`) rather than \
+                 clipping it, and the engine clamps such a rect — so this is the engine's own \
+                 answer to give",
+            ),
+        ));
+    }
+    Ok([x, y, width_u32, height_u32])
 }
 
 /// Whether a request's declared attributes name exactly the locations the
@@ -1893,6 +2893,24 @@ pub struct RenderRailInputs<'a> {
     /// class has always admitted.
     pub vertex_stage_buffer_declarations: &'a [StageBufferDeclaration],
     pub fragment_stage_buffer_declarations: &'a [StageBufferDeclaration],
+    /// The `[[texture(i)]]` arguments the fragment stage's own translation
+    /// declares, with the module's AIR sampler state and the device bindings
+    /// this draw's binds were resolved at (R10, `research/docs/23` §101).
+    ///
+    /// Carried for the reason the two stage-buffer lists are: the canonical
+    /// render sampler's declaration has to repeat the state the module was
+    /// lowered against, and the class gate has to answer the shapes the
+    /// provider always refuses (`render_texture_sampler_unsupported`,
+    /// `render_texture_shape_unsupported`, …) before the provider is asked.
+    /// The runtime applies the fragment sampled-band relocation to both this
+    /// list and the request's own binds, so entry `i` and the draw's bind at
+    /// the same number are one binding on both sides of this seam.
+    pub fragment_texture_declarations: &'a [RenderTextureDeclaration],
+    /// The Metal arguments outside the family the canonical translated rail
+    /// executes, across both stages (R10). A draw whose module declares one
+    /// keeps the engine under the class's own name; empty is every shape whose
+    /// interface the provider accounts for.
+    pub texture_interface_refusals: &'a [RenderInterfaceRefusal],
     /// The stage's own `[[buffer(N)]]` binds this request's draw carries, at
     /// the Metal indices of the stage that named them (R9d).
     ///
@@ -2794,6 +3812,22 @@ struct NarrowIndexStream<'a> {
     bytes: &'a [u8],
 }
 
+/// One admitted sampled texture: the canonical binding (its position), the
+/// bytes the fragment stage samples, and the state the module's own AIR says
+/// its samples were lowered against (R10).
+struct NarrowTexture<'a> {
+    /// The Metal `[[texture(n)]]` index, which the contract requires to equal
+    /// the entry's position.
+    index: u32,
+    width: u64,
+    height: u64,
+    /// The state the declaration states and the canonical rail creates its
+    /// `VkSampler` from.
+    sampler: SamplerPolicy,
+    /// The texels, as the request's own tightly packed `rgba8_unorm` copy.
+    bytes: &'a [u8],
+}
+
 /// One admitted stage buffer: a `[[buffer(N)]]` argument a stage's own
 /// translation declares, with the bytes the canonical pass binds into it
 /// (`research/docs/26` §R9d, §R9j).
@@ -2846,10 +3880,25 @@ struct NarrowPass<'a> {
     /// canonical order (vertex bindings first by index, then fragment), empty
     /// for every request whose stages declare no `[[buffer(N)]]` argument.
     stage_buffers: Vec<NarrowStageBuffer<'a>>,
+    /// The sampled textures the pass binds, in the contract's own positional
+    /// order (R10): entry `i` is declaration `i`, which pairs with the
+    /// fragment stage's `[[texture(i)]]`. Empty for every request whose
+    /// fragment stage declares no sampled texture.
+    textures: Vec<NarrowTexture<'a>>,
     /// The scissor rectangle the pass states, or `None` for the whole
     /// attachment — the canonical pass's own default
     /// ([`RenderPassDescriptor::scissor`]).
     scissor: Option<[u32; 4]>,
+    /// The viewport rect the pass states (`research/docs/23` §100), or `None`
+    /// for the attachment-covering default the contract published before v100
+    /// — the same default a request that binds no viewport keeps.
+    viewport: Option<[u32; 4]>,
+    /// The attachment's own blend state the pass states (`research/docs/23`
+    /// §100), or `None` for the no-blend, all-writes entry the contract
+    /// published before v40 — the same shape a request with
+    /// `MTLRenderPipelineColorAttachmentDescriptor.blendingEnabled` clear
+    /// keeps.
+    blend: Option<RenderPassBlend>,
     /// The present target this pass hands on, or `None` for the pooled/resident
     /// arms (R4b). Present whenever the caller stated a present tail; the class
     /// conditions above are what make that the *only* shape a presenting record
@@ -2909,6 +3958,28 @@ impl NarrowPass<'_> {
                 })
                 .collect(),
         )
+    }
+
+    /// The render texture declarations this pass's pipeline is registered with
+    /// (R10, `research/docs/23` §101).
+    ///
+    /// One entry per admitted texture, in the same positional order the pass
+    /// states its views: the contract pairs declaration `i` with
+    /// `pass.textures[i]`, and the sampler state each entry carries is the
+    /// module's own AIR state — the state the canonical rail creates its
+    /// `VkSampler` from and the state the translated arm compares against its
+    /// own translation of the same module.
+    fn texture_declarations(&self) -> Vec<TextureBindingContract> {
+        self.textures
+            .iter()
+            .map(|texture| {
+                TextureBindingContract::sampled(
+                    texture.index,
+                    TextureFormat::Rgba8Unorm,
+                    texture.sampler,
+                )
+            })
+            .collect()
     }
 }
 
@@ -3298,46 +4369,49 @@ fn narrow_class<'a>(
         req.storage_buffers.len(),
         canonical_vertex_stream_count(&req.vertex_attributes),
     )?;
-    if !req.sampled_images.is_empty() || !req.samplers.is_empty() || req.color_input {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_sampling",
-            "a pass that samples stays on the engine: the canonical render pass carries no \
-             texture or sampler binding",
-        ));
-    }
+    // The sampled textures the fragment stage reads (v101, `research/docs/23`
+    // §101): the class states the module's own declarations beside the draw's
+    // binds — the canonical pass carries both, and the wire carries the pass's
+    // texture list like any other view — and every shape the provider or the
+    // module refuses keeps the engine under its own name ([`sampled_textures`]).
+    let textures = sampled_textures(inputs, req)?;
     if req.occlusion_query.is_some() {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_visibility",
             "a visibility-armed draw stays on the engine",
         ));
     }
-    if req.blend.is_some() || req.color_write_mask != crate::protocol::blend::ColorWriteMask::ALL {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_blend",
-            "a blending or write-masked attachment stays on the engine",
-        ));
-    }
+    // The attachment's own blend state (v100, `research/docs/23` §100): a
+    // request that blends is in class exactly when the shape can be stated
+    // *and* carried — the canonical pass states the entry, the v40 wire
+    // section carries it — and every other shape keeps the engine under its
+    // own name ([`declared_blend`], which also answers the three factor
+    // families the provider always refuses).
+    let blend = declared_blend(req)?;
     if req.blend_color != [0.0; 4] {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_blend_color",
             "a draw with a blend constant stays on the engine",
         ));
     }
-    // The viewport the canonical pass states is the attachment-covering one and
-    // nothing else, so a request that binds a viewport of its own stays on the
-    // engine. The scissor is the other half of that pair and the contract does
-    // carry it: `RenderPassDescriptor::scissor` is the v29 channel both rails
-    // execute, and the pass states it verbatim — so a request that binds exactly
-    // one rectangle inside the attachment is in class, and its texels outside
-    // the rectangle keep the load op's bytes on both rails.
-    if !req.viewports.is_empty() {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_viewport",
-            "a request that binds a viewport of its own stays on the engine: the canonical pass \
-             states the attachment-covering viewport, and another size or origin is not state the \
-             frozen pass descriptor can carry",
-        ));
-    }
+    // The viewport the canonical pass states is a rect of its own since v100
+    // (`research/docs/23` §100, E-RV1): the pass body carries
+    // `[origin_x, origin_y, width, height]` in framebuffer coordinates, so a
+    // request that binds *one* rect the contract can name — integer, non-empty,
+    // inside the attachment, 0..1 depth — is in class and the pass states it
+    // verbatim. Everything else is the engine's own answer to give, one bucket
+    // per shape ([`viewport_admits`]).
+    let viewport = match req.viewports.as_slice() {
+        [] => None,
+        [viewport] => Some(viewport_admits(*viewport, req.width, req.height)?),
+        _ => {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_viewport_count",
+                "a draw that binds more than one viewport stays on the engine: the canonical \
+                 pass carries at most one rect, and one rect cannot state the others",
+            ))
+        }
+    };
     let scissor = match req.scissors.as_slice() {
         [] => None,
         [scissor] => Some(scissor_admits(*scissor, req.width, req.height)?),
@@ -3536,7 +4610,10 @@ fn narrow_class<'a>(
             bytes: index_bytes,
         },
         stage_buffers,
+        textures,
         scissor,
+        viewport,
+        blend,
         present,
     })
 }
@@ -3921,6 +4998,31 @@ fn submit_narrow(
         next_view += 1;
     }
 
+    // The v101 sampled-texture half (R10): one view per admitted declaration,
+    // in the contract's positional order, each carrying the request's own
+    // tightly packed `rgba8_unorm` copy as a trace-owned source. The sampler
+    // state is *not* a view field: the declaration states it, and the canonical
+    // rail creates its `VkSampler` from that state — which is why the class gate
+    // requires the draw's bind to repeat it rather than trusting either half.
+    let mut textures = Vec::with_capacity(pass.textures.len());
+    for texture in &pass.textures {
+        textures.push(TextureView {
+            view_id: ViewId::new(next_view),
+            metal_binding: texture.index,
+            allocation_id: input_allocation(next_view),
+            texture_type: TextureType::D2,
+            format: TextureFormat::Rgba8Unorm,
+            width: texture.width,
+            height: texture.height,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(texture.bytes.to_vec()),
+        });
+        next_view += 1;
+    }
+
     let pass_descriptor = RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
         color_attachments: vec![RenderAttachment {
@@ -3938,19 +5040,27 @@ fn submit_narrow(
                 NarrowStore::Resident(_) => StoreOp::Resident,
             },
         }],
-        viewport: [
+        // The pass's own rect when the request bound one the contract can name
+        // (`research/docs/23` §100), and the attachment-covering default the
+        // pre-v100 contract published for a request that bound none — the same
+        // default both rails rasterized with before this face existed.
+        viewport: pass.viewport.unwrap_or([
             0,
             0,
             u32::try_from(pass.width).unwrap_or(u32::MAX),
             u32::try_from(pass.height).unwrap_or(u32::MAX),
-        ],
+        ]),
         scissor: pass.scissor,
         vertices: pass.index_count,
         vertex_buffers,
         indices: Some(indices),
         base_vertex: 0,
         cull: None,
-        blend: None,
+        // The attachment's own blend state, stated since v100: `Some` exactly
+        // when the request declares `blendingEnabled` and the shape travels
+        // ([`declared_blend`]), `None` for the no-blend, all-writes entry every
+        // earlier increment stated.
+        blend: pass.blend.clone(),
         multisample: None,
         depth_resolve: None,
         depth: None,
@@ -3980,9 +5090,12 @@ fn submit_narrow(
             mode: PresentMode::Fifo,
             acquire: AcquirePolicy::Blocking,
         }),
-        // The v70 sampler channel: this class refuses sampled images, samplers
-        // and color input before it ever gets here, so the pass binds none.
-        textures: Vec::new(),
+        // The v70 sampler channel, filled since v101 (R10): one view per
+        // admitted declaration, in the contract's positional order, paired
+        // with the declaration of the same position by
+        // `validate_against` — and the fragment stage's `[[texture(i)]]` by the
+        // contract's own rule.
+        textures,
         // The v83 stage-buffer half (R9d): one view per declaration the
         // pipeline's own contract carries, in the same canonical order
         // (`stage_buffer_gate` built both from the same declarations), each
@@ -4026,6 +5139,17 @@ fn submit_narrow(
     // declaration list, because the plan is exactly the set of bindings that
     // travel as leases — a vertex window without a declaration crosses the wire
     // on the same rule (R9q).
+    //
+    // R10 adds two faces to the *trace* and none to this gate: a sampled
+    // texture's view travels in the pass's own texture list (the v70 channel)
+    // and a v40-shaped blend entry travels in the pass's blend block, so both
+    // cross with every frame that crosses at all — while the *registration's*
+    // own frame does not carry the render texture declarations yet
+    // (`research/docs/23` §101.5: the provider's `get_render_pipeline_contract`
+    // still decodes an empty list), so this rail's sampled passes are the
+    // in-process arm the class gate's declarations make exact. The two shapes
+    // the v40 blend section cannot carry are answered by the class gate before
+    // this point (`declared_blend`), not framed as another state here.
     let (trace, resources) = if leases.is_none() {
         (trace, resources)
     } else {
@@ -4319,7 +5443,7 @@ fn stage_buffer_writebacks(
 /// this rail's own. The view *identities* below still advance once per stream,
 /// so a stream's identity never depends on which arm it took.
 fn input_allocations(pass: &NarrowPass<'_>) -> Vec<(AllocationId, u64)> {
-    let mut out = Vec::with_capacity(pass.vertex_streams.len() + 1);
+    let mut out = Vec::with_capacity(pass.vertex_streams.len() + 1 + pass.textures.len());
     let mut next_view = FIRST_INPUT_VIEW;
     for stream in &pass.vertex_streams {
         if let VertexStreamSource::Staged(bytes) = &stream.source {
@@ -4334,6 +5458,19 @@ fn input_allocations(pass: &NarrowPass<'_>) -> Vec<(AllocationId, u64)> {
         input_allocation(next_view),
         u64::try_from(pass.index_stream.bytes.len()).unwrap_or(u64::MAX),
     ));
+    // The sampled textures' views are stated after the index view and the
+    // stage buffers' (which claim a view number each but mint their allocation
+    // through the owner rail), so their own allocations start one past the
+    // index and every declared stage buffer — the same walk `submit_narrow`
+    // makes, one number at a time.
+    let texture_base = next_view + 1 + u64::try_from(pass.stage_buffers.len()).unwrap_or(u64::MAX);
+    for (index, texture) in pass.textures.iter().enumerate() {
+        let view_number = texture_base + u64::try_from(index).unwrap_or(u64::MAX);
+        out.push((
+            input_allocation(view_number),
+            u64::try_from(texture.bytes.len()).unwrap_or(u64::MAX),
+        ));
+    }
     out
 }
 
@@ -4560,6 +5697,11 @@ fn register_render_pipeline(
                 footprint: buffer.proof.clone(),
             })
             .collect(),
+        // The render texture declarations (E-RS1, `research/docs/23` §101):
+        // one entry per admitted sampled texture, each restating the module's
+        // own AIR sampler state, in the positional order the pass's own views
+        // are stated in.
+        textures: pass.texture_declarations(),
     };
     let fingerprint = contract_fingerprint(&contract);
     let key = RenderPipelineKey {

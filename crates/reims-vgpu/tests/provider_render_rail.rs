@@ -33,15 +33,17 @@ use metal_api_vulkan::{
 };
 use reims_vgpu::backend::provider_owner::{self, Region};
 use reims_vgpu::backend::provider_render::{
-    self, PresentSurfaceKey, ProviderRenderDecline, RenderChainRole, RenderPresentRequest,
-    RenderRailInputs, RenderRailOutcome, StageBufferAccess, StageBufferBind,
-    StageBufferDeclaration, StageBufferFootprint, StageBufferLanding, StageBufferWindow,
-    StageWriteback,
+    self, PresentSurfaceKey, ProviderRenderDecline, RenderChainRole, RenderInterfaceRefusal,
+    RenderPresentRequest, RenderRailInputs, RenderRailOutcome, RenderSamplerState,
+    RenderTextureDeclaration, RenderTextureShape, RenderTextureShapeRefusal, StageBufferAccess,
+    StageBufferBind, StageBufferDeclaration, StageBufferFootprint, StageBufferLanding,
+    StageBufferWindow, StageWriteback,
 };
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
-    IndexedDrawResource, PrimitiveTopology, ReadbackSkipReason, SamplerResource, ScissorResource,
-    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
+    IndexedDrawResource, PrimitiveTopology, ReadbackSkipReason, SampledImageResource,
+    SampledSource, SamplerResource, ScissorResource, VertexAttributeFormat,
+    VertexAttributeResource, VertexStepFunction, ViewportResource,
 };
 use reims_vgpu::observe::Decline as _;
 use reims_vgpu::protocol::pixel_format::{
@@ -114,6 +116,14 @@ struct Stages {
     /// below fill them from the translation itself, never by hand.
     vertex_stage_buffer_declarations: Vec<StageBufferDeclaration>,
     fragment_stage_buffer_declarations: Vec<StageBufferDeclaration>,
+    /// The `[[texture(i)]]` arguments the fragment stage's reflection
+    /// declares, with the AIR sampler state each was lowered against and the
+    /// device bindings this crate's runtime resolves the request's own binds
+    /// at (R10). Empty for every fixture whose fragment stage samples nothing.
+    fragment_texture_declarations: Vec<RenderTextureDeclaration>,
+    /// The Metal arguments outside the family the canonical translated render
+    /// rail executes, across both stages (R10).
+    texture_interface_refusals: Vec<RenderInterfaceRefusal>,
 }
 
 /// The reviewer's solid-colour fragment, shared by every vertex fixture here.
@@ -127,6 +137,8 @@ fn stages(vertex_fixture: &str, vertex_entry: &'static str, locations: &[u32]) -
         vertex_attribute_locations: locations.to_vec(),
         vertex_stage_buffer_declarations: Vec::new(),
         fragment_stage_buffer_declarations: Vec::new(),
+        fragment_texture_declarations: Vec::new(),
+        texture_interface_refusals: Vec::new(),
     }
 }
 
@@ -155,6 +167,127 @@ fn four_stream_stages() -> Stages {
         "reims_four_stream_vertex",
         &[0, 1, 2, 3],
     )
+}
+
+/// The sampled shape (R10): the reviewed vertex stage beside a fragment stage
+/// that reads one `[[texture(0)]]` through the AIR `constexpr sampler` its own
+/// module carries.
+///
+/// The declarations are the *production* walk over the fixture's own
+/// translation (`provider_render::texture_declarations`), which is the fact the
+/// runtime hands the rail; the expectations the sampling tests compare those
+/// declarations with are written by hand in `sampled_stages_are_what_the_module_says`,
+/// so a fixture whose reflection moves fails an assertion instead of quietly
+/// changing what the seam is asked about.
+fn sampled_stages() -> Stages {
+    let fragment_entry = "reims_sampled_frag";
+    let mut stages = Stages {
+        air: (
+            fixture("reims_indexed_tri.air"),
+            fixture("render_frag_sampled_2d.air"),
+        ),
+        vertex_entry: "reims_indexed_vertex",
+        fragment_entry,
+        vertex_attribute_locations: vec![0],
+        vertex_stage_buffer_declarations: Vec::new(),
+        fragment_stage_buffer_declarations: Vec::new(),
+        fragment_texture_declarations: Vec::new(),
+        texture_interface_refusals: Vec::new(),
+    };
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let device =
+        Device::new(std::sync::Arc::clone(&executor) as std::sync::Arc<dyn ComputeExecutor>);
+    let function = device
+        .new_library_with_binary_air(stages.air.1.clone())
+        .expect("the fixture is a binary AIR module")
+        .function(stages.fragment_entry)
+        .expect("the fixture's entry exists");
+    let translated = TranslatedRenderStage::translate(RenderStage::Fragment, &function)
+        .expect("the fixture translates");
+    stages.fragment_texture_declarations =
+        reims_vgpu::backend::provider_render::texture_declarations(translated.reflection())
+            .to_vec();
+    stages.texture_interface_refusals = Vec::new();
+    stages
+}
+
+/// The one texel the sampled fixture reads: texel `(6, 3)` of the 8x4 surface
+/// the tests draw at, whose centre is the fixed coordinate the fragment half
+/// samples.
+const SAMPLED_TEXEL: (usize, usize) = (6, 3);
+
+/// The sampler resource the fixture's own AIR state derives, spelled from the
+/// `MTL*` ordinals the runtime's `reflected_static_sampler_resource` maps that
+/// state onto: nearest filtering, clamped addressing, one mip level, normalized
+/// coordinates, no comparison and no anisotropy.
+fn sampled_sampler_resource(binding: u32) -> SamplerResource {
+    use reims_vgpu::protocol::sampler as mtl;
+    SamplerResource {
+        binding,
+        min_filter: mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+        mag_filter: mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+        mip_filter: mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        address_mode_u: mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        address_mode_v: mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        address_mode_w: mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        border_color: mtl::MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK,
+        compare_function: reims_vgpu::backend::vulkan::engine::SamplerCompareFunction::Never,
+        lod_min: 0.0f32.to_bits(),
+        lod_max: f32::MAX.to_bits(),
+        max_anisotropy: 1,
+        unnormalized_coordinates: false,
+    }
+}
+
+/// The attachment-covering draw with the sampled pair bound (R10): the
+/// reviewed position stream and index stream beside one 2x2 `rgba8_unorm`
+/// texture at the device binding the fragment stage's declaration names, and
+/// the AIR static sampler resource that state derives.
+fn sampled_request(stages: &Stages, texels: Vec<Vec<u8>>, extent: (u32, u32)) -> DrawRequest {
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = extent.0;
+    req.height = extent.1;
+    let declaration = stages.fragment_texture_declarations[0];
+    let mut bytes = Vec::with_capacity(texels.len() * 4);
+    for texel in texels {
+        bytes.extend_from_slice(&texel);
+    }
+    req.sampled_images.push(SampledImageResource {
+        binding: declaration.binding,
+        array_element: 0,
+        descriptor_count: 1,
+        width: extent.0,
+        height: extent.1,
+        layers: 1,
+        kind: reims_vgpu_core::texture_shape::TextureKind::D2,
+        multisampled: false,
+        source: SampledSource::Bytes(std::sync::Arc::new(bytes)),
+        byte_origin: Default::default(),
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    req.samplers
+        .push(sampled_sampler_resource(declaration.sampler_binding));
+    req
+}
+
+/// One 8x4 texture whose texels are all distinct, and the colour of the texel
+/// the fragment fixture reads. The value is a function of the position, so
+/// "changed the read texel" and "changed another texel" name different bytes.
+fn sampled_texels(width: u32, height: u32) -> Vec<Vec<u8>> {
+    (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| {
+                vec![
+                    (x * 16).min(255) as u8,
+                    (y * 64).min(255) as u8,
+                    ((x + y) * 8).min(255) as u8,
+                    255,
+                ]
+            })
+        })
+        .collect()
 }
 
 /// `float2` records in the order a stream carries them: little-endian pairs.
@@ -355,6 +488,12 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         vertex_attribute_locations: &stages.vertex_attribute_locations,
         vertex_stage_buffer_declarations: &stages.vertex_stage_buffer_declarations,
         fragment_stage_buffer_declarations: &stages.fragment_stage_buffer_declarations,
+        // The R10 half: the fragment stage's own declarations, which are empty
+        // for every fixture whose fragment samples nothing — the shape every
+        // pre-R10 test in this file is about, and one whose requests answer
+        // exactly as they did before the sampled-texture face existed.
+        fragment_texture_declarations: &stages.fragment_texture_declarations,
+        texture_interface_refusals: &stages.texture_interface_refusals,
         // The R9d half: no stage buffer of this draw is stated, which is the
         // shape every pre-R9d test in this file is about — a request whose
         // stages declare nothing answers exactly as it did before.
@@ -916,6 +1055,18 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
         RenderRailOutcome::NotInNarrowClass(_) => (),
         other => panic!("expected an out-of-class answer, got {other:?}"),
     };
+    // The R10 doors below print the way the dedicated refusal tests do, so the
+    // viewport face's own names are evidence rather than only assertions.
+    let door = |label: &str, expected: &str, req: &DrawRequest| match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        req,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("door ({label}): {}\n  {}", reason.slug(), reason.detail());
+            assert_eq!(reason.slug(), expected, "{label}: the refusal's own name");
+        }
+        other => panic!("{label}: expected an out-of-class answer, got {other:?}"),
+    };
 
     // The chain positions whose frame this class cannot name stay on the
     // engine: the packet's middle (a predecessor and a successor) when it
@@ -1016,14 +1167,62 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     class(&req);
 
     // Blend state, a write mask, an explicit viewport and a target identity no
-    // record here loads from or keeps all leave their rails to the engine.
+    // record here loads from or keeps all leave their rails to the engine —
+    // except the two faces R10 moved (the viewport above, and the blend entry
+    // below): a blend the canonical pass can state *and* the v40 wire section
+    // carries is in class, while a write mask, an alpha operation of its own
+    // and the three factor families the provider refuses by name stay on the
+    // engine under their own buckets.
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.blend = Some(BlendStateResource {
         src_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_SOURCE_ALPHA,
         dst_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
         op_rgb: reims_vgpu_core::blend::MTL_BLEND_OPERATION_ADD,
         src_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ONE,
-        dst_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+        dst_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ZERO,
+        op_alpha: reims_vgpu_core::blend::MTL_BLEND_OPERATION_ADD,
+    });
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("a v40-shaped blend is in the class: {other:?}"),
+    }
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.blend = Some(BlendStateResource {
+        src_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_SOURCE_ALPHA,
+        dst_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+        op_rgb: reims_vgpu_core::blend::MTL_BLEND_OPERATION_ADD,
+        src_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ONE,
+        dst_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ZERO,
+        op_alpha: reims_vgpu_core::blend::MTL_BLEND_OPERATION_MAX,
+    });
+    class(&req);
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.blend = Some(BlendStateResource {
+        src_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_BLEND_COLOR,
+        dst_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ZERO,
+        op_rgb: reims_vgpu_core::blend::MTL_BLEND_OPERATION_ADD,
+        src_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ONE,
+        dst_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ZERO,
+        op_alpha: reims_vgpu_core::blend::MTL_BLEND_OPERATION_ADD,
+    });
+    class(&req);
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.blend = Some(BlendStateResource {
+        src_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_SOURCE_1_ALPHA,
+        dst_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ZERO,
+        op_rgb: reims_vgpu_core::blend::MTL_BLEND_OPERATION_ADD,
+        src_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ONE,
+        dst_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ZERO,
+        op_alpha: reims_vgpu_core::blend::MTL_BLEND_OPERATION_ADD,
+    });
+    class(&req);
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.blend = Some(BlendStateResource {
+        src_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_SOURCE_ALPHA_SATURATED,
+        dst_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_SOURCE_ALPHA_SATURATED,
+        op_rgb: reims_vgpu_core::blend::MTL_BLEND_OPERATION_ADD,
+        src_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ONE,
+        dst_alpha: reims_vgpu_core::blend::MTL_BLEND_FACTOR_ZERO,
         op_alpha: reims_vgpu_core::blend::MTL_BLEND_OPERATION_ADD,
     });
     class(&req);
@@ -1040,7 +1239,108 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
         min_depth: 0.0,
         max_depth: 1.0,
     });
-    class(&req);
+    // R10: a viewport the contract can name left this door. The covering
+    // rect is byte for byte the default the class stated before the face
+    // existed, so it is admitted; the shapes the contract has no spelling
+    // for — a fractional or negative origin, an empty or out-of-bounds
+    // rect, a depth range of its own, and more than one rect — keep the
+    // engine under their own names below.
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("a covering viewport is in the class: {other:?}"),
+    }
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.viewports.push(ViewportResource {
+        x: 0.5,
+        y: 0.0,
+        width: 2.0,
+        height: 2.0,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    });
+    door(
+        "fractional origin",
+        "render_provider_out_of_class_viewport_spelling",
+        &req,
+    );
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.viewports.push(ViewportResource {
+        x: -1.0,
+        y: 0.0,
+        width: 2.0,
+        height: 2.0,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    });
+    door(
+        "negative origin",
+        "render_provider_out_of_class_viewport_spelling",
+        &req,
+    );
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.viewports.push(ViewportResource {
+        x: 0.0,
+        y: 0.0,
+        width: width as f32 + 1.0,
+        height: height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    });
+    door(
+        "out-of-bounds rect",
+        "render_provider_out_of_class_viewport_extent",
+        &req,
+    );
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.viewports.push(ViewportResource {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    });
+    door(
+        "empty rect",
+        "render_provider_out_of_class_viewport_empty",
+        &req,
+    );
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.viewports.push(ViewportResource {
+        x: 0.0,
+        y: 0.0,
+        width: 2.0,
+        height: 2.0,
+        min_depth: 0.25,
+        max_depth: 0.75,
+    });
+    door(
+        "depth range",
+        "render_provider_out_of_class_viewport_depth",
+        &req,
+    );
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.viewports.push(ViewportResource {
+        x: 0.0,
+        y: 0.0,
+        width: 2.0,
+        height: 2.0,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    });
+    req.viewports.push(ViewportResource {
+        x: 1.0,
+        y: 1.0,
+        width: 2.0,
+        height: 2.0,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    });
+    door(
+        "two rects",
+        "render_provider_out_of_class_viewport_count",
+        &req,
+    );
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.skip_readback = true;
     class(&req);
@@ -1083,7 +1383,15 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     }
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.samplers.push(SamplerResource::normalized_default(0));
-    class(&req);
+    // R10: a sampler bind the fragment stage never declares left this door.
+    // The module reads nothing at that slot, so neither rail's frame can move
+    // — the same rule the stage-buffer door states for a bind no stage declares
+    // (`stage_buffers_no_stage_declares_leave_for_the_provider_and_agree_with_the_engine`),
+    // and the pass states nothing for it.
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("a sampler bind no stage declares is in class: {other:?}"),
+    }
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.occlusion_query = Some(engine::VisibilityResultMode::Boolean);
     class(&req);
@@ -2882,6 +3190,704 @@ fn assert_frame_is_the_metal_mapping(label: &str, frame: &[u8], vertices: [(f32,
     );
 }
 
+/// One frame against the rect a pass *declares*: the fragment colour inside the
+/// rect and the clear's own bytes outside it.
+///
+/// The rect is the expectation rather than either rail's binding — the
+/// attachment-covering default is the rect that covers everything — so a frame
+/// that matches it answers "which texels did NDC rasterize into" without
+/// reading either rail's viewport.
+fn assert_frame_is_viewport(
+    label: &str,
+    frame: &[u8],
+    width: u32,
+    height: u32,
+    rect: [u32; 4],
+) -> (u32, u32) {
+    assert_eq!(
+        frame.len(),
+        (width * height * 4) as usize,
+        "{label}: the attachment's whole extent has to come back"
+    );
+    let [rect_x, rect_y, rect_width, rect_height] = rect;
+    let mut covered = 0;
+    let mut cleared = 0;
+    for row in 0..height {
+        for column in 0..width {
+            let texel = texel_of(frame, width, column, row, 4);
+            let texel = [texel[0], texel[1], texel[2], texel[3]];
+            let inside = column >= rect_x
+                && column < rect_x + rect_width
+                && row >= rect_y
+                && row < rect_y + rect_height;
+            let label = format!("{label}: texel ({column}, {row})");
+            if inside {
+                covered += 1;
+                assert_texel_near(&label, texel, FRAGMENT_TEXEL);
+            } else {
+                cleared += 1;
+                assert_clear_texel(&label, texel);
+            }
+        }
+    }
+    (covered, cleared)
+}
+
+/// R10: the guest's own viewport rect (`research/docs/23` §100, E-RV1/v100).
+///
+/// The canonical pass states the rect in its own body, so this face needs no
+/// wire section and the draw leaves for the provider. The reading is
+/// falsifiable in both directions: the *rect's* texels carry the fragment
+/// colour and every other texel keeps the clear (a rail that ignored the rect
+/// would fill the attachment), the covering control is the same draw with no
+/// viewport of its own (a rail that lost it would land the same frame either
+/// way), and the two rails have to be byte-identical — the engine rasterizes
+/// through a negative-height viewport while the canonical rail states the rect
+/// as-is, and the pass's own vertex module carries the matching y alignment.
+#[test]
+fn a_declared_viewport_lands_its_own_rect_and_agrees_with_the_engine() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let rect = [1u32, 1, 3, 2];
+    let request = |viewport: Option<[u32; 4]>| {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+        req.width = width;
+        req.height = height;
+        if let Some([x, y, rect_width, rect_height]) = viewport {
+            req.viewports.push(ViewportResource {
+                x: x as f32,
+                y: y as f32,
+                width: rect_width as f32,
+                height: rect_height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            });
+        }
+        req
+    };
+
+    let provider = provider_pixels("declared viewport", &stages, &request(Some(rect)));
+    let (covered, cleared) = assert_frame_is_viewport(
+        "declared viewport (provider)",
+        &provider,
+        width,
+        height,
+        rect,
+    );
+    assert!(
+        covered > 0 && cleared > 0,
+        "the declared rect has to cover part of the attachment and leave part of it ({covered} \
+         covered, {cleared} cleared), or the frame says nothing about a declared viewport"
+    );
+    let Some(engine) = engine_pixels("declared viewport", &stages, request(Some(rect))) else {
+        return;
+    };
+    assert_frames_equal("declared viewport", &provider, &engine);
+
+    let covering = provider_pixels("covering viewport", &stages, &request(None));
+    let (all_covered, all_cleared) = assert_frame_is_viewport(
+        "covering viewport (provider)",
+        &covering,
+        width,
+        height,
+        [0, 0, width, height],
+    );
+    assert_eq!(
+        (all_covered, all_cleared),
+        (width * height, 0),
+        "a request that binds no viewport keeps the attachment-covering default"
+    );
+    assert_frames_differ(
+        "the declared rect is what moved the frame",
+        &provider,
+        &covering,
+    );
+    eprintln!(
+        "R10 viewport: 8x4 attachment, declared rect {rect:?} covers {covered} texel(s) of the \
+         fragment's own colour and leaves {cleared} at the clear; the attachment-covering default \
+         covers all {}; provider and engine frames are byte-identical",
+        width * height,
+    );
+}
+
+/// One frame whose every texel is `want`, byte for byte.
+///
+/// The blend fixtures below cover the whole attachment (the reviewed triangle
+/// covers the whole NDC square) and blend the *same* value into every texel, so
+/// a uniform frame is the expectation and a per-texel walk would only repeat
+/// it.
+fn assert_uniform_frame(label: &str, frame: &[u8], width: u32, height: u32, want: [u8; 4]) {
+    assert_eq!(
+        frame.len(),
+        (width * height * 4) as usize,
+        "{label}: the attachment's whole extent has to come back"
+    );
+    for (index, texel) in frame.chunks_exact(4).enumerate() {
+        assert_texel_near(
+            &format!("{label}: texel {index}"),
+            [texel[0], texel[1], texel[2], texel[3]],
+            want,
+        );
+    }
+}
+
+/// R10: the attachment's own blend state (`research/docs/23` §100, E-RV1/v100).
+///
+/// The draw's fragment colour is `64, 128, 191, 255` and the attachment clears
+/// to green (`0, 255, 0, 255`), so the three equations a v40-shaped entry can
+/// state land three different frames by hand:
+///
+/// - no blend at all (`blendingEnabled` clear): the fragment replaces the clear;
+/// - `One`/`One` with `Add`: `source + destination` per channel, clamped;
+/// - `Zero`/`One` with `Add`: the destination survives untouched.
+///
+/// Every one of them is byte-exact in the attachment's own texel, and the two
+/// rails have to land the same frame — the engine bakes the blend into its
+/// pipeline from the same six ordinals, the canonical rail states the entry in
+/// the pass's own blend list.
+#[test]
+fn a_declared_blend_state_lands_the_blended_frame_and_agrees_with_the_engine() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    // Green, every component exact in eight bits — the class's clear rule
+    // requires that, and it keeps the blend arithmetic's expectations exact.
+    let green = [0.0, 1.0, 0.0, 1.0];
+    let request = |blend: Option<BlendStateResource>| {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+        req.width = width;
+        req.height = height;
+        req.color_attachment = Some(attachment_with_clear(MTL_FORMAT_RGBA8_UNORM, green));
+        req.blend = blend;
+        req
+    };
+    use reims_vgpu_core::blend::{
+        MTL_BLEND_FACTOR_ONE, MTL_BLEND_FACTOR_SOURCE_ALPHA, MTL_BLEND_FACTOR_ZERO,
+        MTL_BLEND_OPERATION_ADD,
+    };
+    let source_plus_destination = BlendStateResource {
+        src_rgb: MTL_BLEND_FACTOR_ONE,
+        dst_rgb: MTL_BLEND_FACTOR_ONE,
+        op_rgb: MTL_BLEND_OPERATION_ADD,
+        src_alpha: MTL_BLEND_FACTOR_ONE,
+        dst_alpha: MTL_BLEND_FACTOR_ONE,
+        op_alpha: MTL_BLEND_OPERATION_ADD,
+    };
+    let destination_only = BlendStateResource {
+        src_rgb: MTL_BLEND_FACTOR_ZERO,
+        dst_rgb: MTL_BLEND_FACTOR_ONE,
+        op_rgb: MTL_BLEND_OPERATION_ADD,
+        src_alpha: MTL_BLEND_FACTOR_SOURCE_ALPHA,
+        dst_alpha: MTL_BLEND_FACTOR_ZERO,
+        op_alpha: MTL_BLEND_OPERATION_ADD,
+    };
+    let cases: [(&str, Option<BlendStateResource>, [u8; 4]); 3] = [
+        ("no blend", None, [64, 128, 191, 255]),
+        (
+            "source plus destination",
+            Some(source_plus_destination),
+            [64, 255, 191, 255],
+        ),
+        ("destination only", Some(destination_only), [0, 255, 0, 255]),
+    ];
+    let mut frames = Vec::new();
+    for (label, blend, want) in cases {
+        let provider = provider_pixels(label, &stages, &request(blend));
+        assert_uniform_frame(label, &provider, width, height, want);
+        let Some(engine) = engine_pixels(label, &stages, request(blend)) else {
+            return;
+        };
+        assert_uniform_frame(&format!("{label} (engine)"), &engine, width, height, want);
+        assert_frames_equal(label, &provider, &engine);
+        frames.push((label, provider));
+    }
+    // The three equations are three frames: a rail that dropped the blend (or
+    // executed the wrong one) would repeat one of the others.
+    for (index, (label, frame)) in frames.iter().enumerate() {
+        for (other_label, other) in frames.iter().skip(index + 1) {
+            assert_frames_differ(&format!("{label} vs {other_label}"), frame, other);
+        }
+    }
+    eprintln!(
+        "R10 blend: green clear 0,255,0,255 + fragment 64,128,191,255 -> no blend=64,128,191,255; \
+         One/One Add=64,255,191,255; Zero/One Add=0,255,0,255; each provider frame is \
+         8x4={} byte(s) and byte-identical to the engine's",
+        width * height * 4,
+    );
+}
+
+/// R10: the blend and write-mask shapes beside the admitted entry, each under
+/// its own name (`research/docs/23` §100).
+///
+/// The write-mask half is the wire's boundary rather than the contract's: the
+/// canonical pass can state a mask (E-RV1 executes it), but the command
+/// channel's v40 blend section carries four factors and one operation per entry
+/// with every channel written, so a masked attachment is a shape this rail's
+/// wire refuses by name. The *engine's* own reading of the same shape is beside
+/// it — that is the rail the draw keeps, so the reading is what makes "kept on
+/// the engine" a claim about a frame rather than about a string.
+#[test]
+fn the_blend_shapes_beside_the_entry_stay_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let green = [0.0, 1.0, 0.0, 1.0];
+    let request = |blend: Option<BlendStateResource>, mask| {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+        req.width = width;
+        req.height = height;
+        req.color_attachment = Some(attachment_with_clear(MTL_FORMAT_RGBA8_UNORM, green));
+        req.blend = blend;
+        req.color_write_mask = mask;
+        req
+    };
+    let answer = |label: &str, req: &DrawRequest| -> (String, String) {
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the shape is out of class: {other:?}"),
+        }
+    };
+    use reims_vgpu::protocol::blend::ColorWriteMask;
+    use reims_vgpu_core::blend::{
+        MTL_BLEND_FACTOR_BLEND_COLOR, MTL_BLEND_FACTOR_ONE, MTL_BLEND_FACTOR_SOURCE_1_ALPHA,
+        MTL_BLEND_FACTOR_SOURCE_ALPHA, MTL_BLEND_FACTOR_SOURCE_ALPHA_SATURATED,
+        MTL_BLEND_FACTOR_ZERO, MTL_BLEND_OPERATION_ADD, MTL_BLEND_OPERATION_MAX,
+    };
+    let entry = |src_rgb, dst_rgb, op_rgb, src_alpha, dst_alpha, op_alpha| BlendStateResource {
+        src_rgb,
+        dst_rgb,
+        op_rgb,
+        src_alpha,
+        dst_alpha,
+        op_alpha,
+    };
+
+    // The write mask: the engine writes red and alpha and leaves green and blue
+    // at the clear, which is exactly what "kept on the engine" means here.
+    let masked = request(
+        None,
+        ColorWriteMask::new(
+            reims_vgpu::protocol::blend::MTL_COLOR_WRITE_MASK_RED
+                | reims_vgpu::protocol::blend::MTL_COLOR_WRITE_MASK_ALPHA,
+        )
+        .expect("red and alpha are a mask"),
+    );
+    let (slug, detail) = answer("write mask", &masked);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_blend_mask");
+    assert!(
+        detail.contains("0x9") && detail.contains("v40"),
+        "the sentence names the mask and the wire section: {detail}"
+    );
+    let Some(engine) = engine_pixels("masked attachment (engine)", &stages, masked) else {
+        return;
+    };
+    assert_uniform_frame(
+        "masked attachment (engine)",
+        &engine,
+        width,
+        height,
+        [64, 255, 0, 255],
+    );
+    let unmasked = engine_pixels(
+        "unmasked attachment (engine)",
+        &stages,
+        request(None, ColorWriteMask::ALL),
+    );
+    if let Some(unmasked) = unmasked {
+        assert_frames_differ(
+            "the write mask is what moved the engine's frame",
+            &engine,
+            &unmasked,
+        );
+    }
+
+    // An alpha operation of its own: the canonical pass states two, the v40
+    // section carries one.
+    let two_operations = request(
+        Some(entry(
+            MTL_BLEND_FACTOR_SOURCE_ALPHA,
+            MTL_BLEND_FACTOR_ONE,
+            MTL_BLEND_OPERATION_ADD,
+            MTL_BLEND_FACTOR_ONE,
+            MTL_BLEND_FACTOR_ZERO,
+            MTL_BLEND_OPERATION_MAX,
+        )),
+        ColorWriteMask::ALL,
+    );
+    let (slug, detail) = answer("alpha operation", &two_operations);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_blend_alpha_operation");
+
+    // The three factor families the provider refuses by name.
+    let constant = request(
+        Some(entry(
+            MTL_BLEND_FACTOR_BLEND_COLOR,
+            MTL_BLEND_FACTOR_ZERO,
+            MTL_BLEND_OPERATION_ADD,
+            MTL_BLEND_FACTOR_ONE,
+            MTL_BLEND_FACTOR_ZERO,
+            MTL_BLEND_OPERATION_ADD,
+        )),
+        ColorWriteMask::ALL,
+    );
+    let (slug, detail) = answer("blend constant", &constant);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_blend_constant");
+    assert!(
+        detail.contains("BlendColor") && detail.contains("blend_constant_unsupported"),
+        "the sentence names the factor and the provider's own refusal: {detail}"
+    );
+    let dual_source = request(
+        Some(entry(
+            MTL_BLEND_FACTOR_SOURCE_1_ALPHA,
+            MTL_BLEND_FACTOR_ZERO,
+            MTL_BLEND_OPERATION_ADD,
+            MTL_BLEND_FACTOR_ONE,
+            MTL_BLEND_FACTOR_ZERO,
+            MTL_BLEND_OPERATION_ADD,
+        )),
+        ColorWriteMask::ALL,
+    );
+    let (slug, detail) = answer("dual source", &dual_source);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_blend_dual_source");
+    let saturated_destination = request(
+        Some(entry(
+            MTL_BLEND_FACTOR_SOURCE_ALPHA,
+            MTL_BLEND_FACTOR_SOURCE_ALPHA_SATURATED,
+            MTL_BLEND_OPERATION_ADD,
+            MTL_BLEND_FACTOR_ONE,
+            MTL_BLEND_FACTOR_ZERO,
+            MTL_BLEND_OPERATION_ADD,
+        )),
+        ColorWriteMask::ALL,
+    );
+    let (slug, detail) = answer("saturated destination", &saturated_destination);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_blend_factor_slot");
+    assert!(
+        detail.contains("destination rgb") && detail.contains("SourceAlphaSaturated"),
+        "the sentence names the slot and the factor: {detail}"
+    );
+}
+
+/// R10: the declarations are what the module says.
+///
+/// The expectation is written by hand — one `[[texture(0)]]`, its view at the
+/// translator's texture band base, its AIR static sampler at the device's
+/// widened sampler band base, the state the module carries, and the one shape
+/// the canonical render sampler executes — so a fixture or reflection that
+/// moves fails here rather than silently changing what the seam is asked.
+#[test]
+fn the_sampled_declarations_are_what_the_module_says() {
+    let stages = sampled_stages();
+    assert_eq!(
+        stages.fragment_texture_declarations,
+        vec![RenderTextureDeclaration {
+            index: 0,
+            binding: 32,
+            sampler_binding: 160,
+            sampler: RenderSamplerState::Policy(metal_api_core::provider::SamplerPolicy {
+                filter: metal_api_core::provider::SamplerFilter::Nearest,
+                address: metal_api_core::provider::SamplerAddressMode::ClampToEdge,
+            }),
+            shape: RenderTextureShape::Sampled2D,
+        }],
+        "the fragment fixture declares one sampled 2D texture read through one \
+         nearest/clamped AIR static sampler"
+    );
+    assert!(
+        stages.texture_interface_refusals.is_empty(),
+        "the fixture's interface is inside the translated family: {:?}",
+        stages.texture_interface_refusals
+    );
+    eprintln!(
+        "R10 fixture declarations: {:?} interface={:?}",
+        stages.fragment_texture_declarations, stages.texture_interface_refusals,
+    );
+}
+
+/// R10: the sampled-texture reading, and the frame it lands.
+///
+/// The fragment half samples one fixed coordinate — the centre of the 8x4
+/// texture's texel `(6, 3)` — so the whole attachment is that texel's colour on
+/// both rails. Three falsifiable halves:
+///
+/// - the frame *is* the texel the fixture reads, not the texture's first one
+///   (every texel is distinct, so any other texel would be another frame);
+/// - changing the texel the fragment reads changes the frame, while changing a
+///   texel it does not read leaves it alone — the bytes reach the shader
+///   through the binding the request and the declaration agree on;
+/// - the engine and the canonical provider land the same frame byte for byte.
+#[test]
+fn a_declared_sampled_texture_lands_the_texel_it_reads_and_agrees_with_the_engine() {
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let read_texel = |texels: &[Vec<u8>]| {
+        let (x, y) = SAMPLED_TEXEL;
+        let texel = &texels[y * width as usize + x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    let request = |texels: Vec<Vec<u8>>| sampled_request(&stages, texels, (width, height));
+
+    let wanted = read_texel(&texels);
+    let provider = provider_pixels("sampled texture", &stages, &request(texels.clone()));
+    assert_uniform_frame(
+        "sampled texture (provider)",
+        &provider,
+        width,
+        height,
+        wanted,
+    );
+    let Some(engine) = engine_pixels("sampled texture", &stages, request(texels.clone())) else {
+        return;
+    };
+    assert_uniform_frame("sampled texture (engine)", &engine, width, height, wanted);
+    assert_frames_equal("sampled texture", &provider, &engine);
+
+    // The read texel's own bytes: another colour there is another frame.
+    let mut other = texels.clone();
+    let (read_x, read_y) = SAMPLED_TEXEL;
+    other[read_y * width as usize + read_x] = vec![255, 0, 128, 255];
+    let moved = provider_pixels("other sampled texel", &stages, &request(other.clone()));
+    assert_uniform_frame(
+        "other sampled texel (provider)",
+        &moved,
+        width,
+        height,
+        read_texel(&other),
+    );
+    assert_frames_differ("the read texel's bytes moved the frame", &provider, &moved);
+
+    // A texel the fragment never reads: the same bytes land in the texture,
+    // and neither rail's frame may move. This is the control that keeps the
+    // reading above a statement about *this* binding rather than about "some
+    // texture was uploaded".
+    let mut unread = texels.clone();
+    unread[0] = vec![7, 7, 7, 255];
+    let untouched = provider_pixels("unread texel", &stages, &request(unread.clone()));
+    assert_frames_equal(
+        "a texel the fragment does not read does not reach the frame",
+        &provider,
+        &untouched,
+    );
+    if let Some(engine_other) = engine_pixels("unread texel", &stages, request(unread)) {
+        assert_frames_equal("unread texel (engine)", &engine, &engine_other);
+    }
+    eprintln!(
+        "R10 sampled texture: attachment {width}x{height} ({} texels), sampled texel {SAMPLED_TEXEL:?} \
+         = {wanted:?}; provider frame = every texel is that colour, engine equal; read-texel change \
+         moved the frame, unread-texel change did not",
+        width * height,
+    );
+}
+
+/// R10: the sampled-texture shapes beside the admitted entry, each under its
+/// own name.
+///
+/// One door per rule the canonical render sampler's contract states: the
+/// module's interface (a resource family the translated rail does not execute),
+/// the module's list (a texture that is not its own position, a reflected shape
+/// outside the family, a sampler state the rail cannot create), the draw's bind
+/// (a declaration with no view, a view the pass cannot state, texels that are
+/// not the request's own copy), and the draw's sampler state (a bind that does
+/// not repeat the module's own AIR state). Every one of them keeps the draw on
+/// the engine, which is the rail that can run it.
+#[test]
+fn the_sampled_texture_shapes_beside_the_entry_stay_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let answer = |label: &str, stages: &Stages, req: &DrawRequest| -> (String, String) {
+        match provider_render::submit_render(&inputs(stages, RenderChainRole::SoleOrTail), req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the shape is out of class: {other:?}"),
+        }
+    };
+    let in_class =
+        |label: &str, stages: &Stages, req: &DrawRequest| match provider_render::submit_render(
+            &inputs(stages, RenderChainRole::SoleOrTail),
+            req,
+        ) {
+            RenderRailOutcome::ProviderCompleted(_) => (),
+            other => panic!("{label}: the shape is in the class: {other:?}"),
+        };
+    let sampled = || sampled_request(&stages, texels.clone(), (width, height));
+
+    // The positive control: the fixture's own shape is in the class.
+    in_class("the sampled fixture", &stages, &sampled());
+
+    // 1. The module's interface: an argument family the translated rail does
+    //    not execute, named with its stage, kind and index.
+    let mut refused_stages = sampled_stages();
+    refused_stages.texture_interface_refusals = vec![RenderInterfaceRefusal {
+        stage: RenderPipelineStage::Fragment,
+        kind: "runtime sampler",
+        index: 0,
+    }];
+    let (slug, detail) = answer("runtime sampler", &refused_stages, &sampled());
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_interface");
+    assert!(
+        detail.contains("fragment") && detail.contains("runtime sampler") && detail.contains('0'),
+        "the sentence names the stage, the kind and the index: {detail}"
+    );
+
+    // 2. The framebuffer-fetch arm: a subpass input, not a sampled texture.
+    let mut color_input = sampled();
+    color_input.color_input = true;
+    let (slug, detail) = answer("framebuffer fetch", &stages, &color_input);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_color_input");
+
+    // 3. The module's positional list: `[[texture(1)]]` with no `[[texture(0)]]`
+    //    before it has no entry the contract can state.
+    let mut shifted = sampled_stages();
+    shifted.fragment_texture_declarations = vec![RenderTextureDeclaration {
+        index: 1,
+        ..shifted.fragment_texture_declarations[0]
+    }];
+    let (slug, detail) = answer("shifted texture index", &shifted, &sampled());
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_binding");
+    assert!(
+        detail.contains("[[texture(1)]]") || detail.contains("texture 1"),
+        "the sentence names the argument and the position: {detail}"
+    );
+    //    Two sampled textures: the contract states one, and a longer list is
+    //    refused by the provider's own name.
+    let mut two_textures = sampled_stages();
+    let first = two_textures.fragment_texture_declarations[0];
+    two_textures.fragment_texture_declarations = vec![
+        first,
+        RenderTextureDeclaration {
+            index: 1,
+            binding: first.binding + 1,
+            sampler_binding: first.sampler_binding + 1,
+            ..first
+        },
+    ];
+    let (slug, detail) = answer("two sampled textures", &two_textures, &sampled());
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_count");
+
+    // 4. The module's reflected shape and sampler family.
+    let mut arrayed = sampled_stages();
+    arrayed.fragment_texture_declarations = vec![RenderTextureDeclaration {
+        shape: RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Arrayed),
+        ..arrayed.fragment_texture_declarations[0]
+    }];
+    let (slug, detail) = answer("arrayed texture", &arrayed, &sampled());
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_shape");
+    assert!(
+        detail.contains("arrayed texture"),
+        "the sentence names the reflected shape: {detail}"
+    );
+    let mut runtime_sampler = sampled_stages();
+    runtime_sampler.fragment_texture_declarations = vec![RenderTextureDeclaration {
+        sampler: RenderSamplerState::Runtime,
+        ..runtime_sampler.fragment_texture_declarations[0]
+    }];
+    let (slug, detail) = answer("runtime sampler state", &runtime_sampler, &sampled());
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_sampler");
+    let mut unsupported_state = sampled_stages();
+    unsupported_state.fragment_texture_declarations = vec![RenderTextureDeclaration {
+        sampler: RenderSamplerState::Unsupported,
+        ..unsupported_state.fragment_texture_declarations[0]
+    }];
+    let (slug, detail) = answer("unsupported sampler state", &unsupported_state, &sampled());
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_sampler");
+
+    // 5. The draw's bind: a declaration with no view, a view the pass cannot
+    //    state, and texels that are not the request's own copy.
+    let mut unbound = sampled();
+    unbound.sampled_images.clear();
+    let (slug, detail) = answer("unbound texture", &stages, &unbound);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_unbound");
+
+    let mut wrong_shape = sampled();
+    wrong_shape.sampled_images[0].descriptor_count = 2;
+    let (slug, detail) = answer("arrayed bind", &stages, &wrong_shape);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_bind");
+    assert!(
+        detail.contains("descriptors 2"),
+        "the sentence names the bind's own shape: {detail}"
+    );
+    let mut wrong_format = sampled();
+    wrong_format.sampled_images[0].format = ash::vk::Format::B8G8R8A8_UNORM;
+    let (slug, _) = answer("bgra bind", &stages, &wrong_format);
+    assert_eq!(slug, "render_provider_out_of_class_texture_bind");
+
+    let mut wrong_extent = sampled();
+    wrong_extent.sampled_images[0].width = width / 2;
+    wrong_extent.sampled_images[0].source = SampledSource::Bytes(std::sync::Arc::new(vec![
+        0u8;
+        (width / 2 * height * 4) as usize
+    ]));
+    let (slug, detail) = answer("other extent", &stages, &wrong_extent);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_extent");
+    assert!(
+        detail.contains("4x4") && detail.contains("8x4"),
+        "the sentence names both extents: {detail}"
+    );
+
+    let mut resident = sampled();
+    resident.sampled_images[0].source = SampledSource::Target(engine::TargetIdentity::Surface {
+        id: 0x10_10,
+        width: 2,
+        height: 2,
+        generation: 1,
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+    });
+    let (slug, detail) = answer("resident texture", &stages, &resident);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_source");
+
+    // 6. The draw's sampler state: the bind has to repeat the module's own AIR
+    //    state, and a state outside the family is answered under the same name.
+    let mut other_state = sampled();
+    other_state.samplers[0].min_filter =
+        reims_vgpu::protocol::sampler::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR;
+    other_state.samplers[0].mag_filter =
+        reims_vgpu::protocol::sampler::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR;
+    let (slug, detail) = answer("linear bind", &stages, &other_state);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_state");
+    assert!(
+        detail.contains("Nearest") && detail.contains("Linear"),
+        "the sentence names both states: {detail}"
+    );
+    let mut repeat = sampled();
+    repeat.samplers[0].address_mode_u =
+        reims_vgpu::protocol::sampler::MTL_SAMPLER_ADDRESS_MODE_REPEAT;
+    repeat.samplers[0].address_mode_v =
+        reims_vgpu::protocol::sampler::MTL_SAMPLER_ADDRESS_MODE_REPEAT;
+    repeat.samplers[0].address_mode_w =
+        reims_vgpu::protocol::sampler::MTL_SAMPLER_ADDRESS_MODE_REPEAT;
+    let (slug, detail) = answer("repeating bind", &stages, &repeat);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_state");
+    let mut anisotropic = sampled();
+    anisotropic.samplers[0].max_anisotropy = 4;
+    let (slug, _) = answer("anisotropic bind", &stages, &anisotropic);
+    assert_eq!(slug, "render_provider_out_of_class_texture_state");
+}
+
 /// The self-contained engine draws the y-asymmetric fixture the way Metal's clip
 /// space describes it.
 ///
@@ -3384,6 +4390,8 @@ fn buffer_declaring_stages(fragment_fixture: &str, fragment_entry: &'static str)
         vertex_attribute_locations: vec![0],
         vertex_stage_buffer_declarations: Vec::new(),
         fragment_stage_buffer_declarations: Vec::new(),
+        fragment_texture_declarations: Vec::new(),
+        texture_interface_refusals: Vec::new(),
     };
     stages.vertex_stage_buffer_declarations =
         declared_stage_buffers(&stages.air.0, RenderStage::Vertex, stages.vertex_entry);
@@ -3711,6 +4719,7 @@ fn a_read_only_stage_buffer_leaves_for_the_provider_and_agrees_with_the_engine()
                 // The declaration-less contract: the slot the stage reads is
                 // the one the pair below has no view for.
                 stage_buffers: Vec::new(),
+                textures: Vec::new(),
             },
             vertex: translate(&stages.air.0, RenderStage::Vertex, stages.vertex_entry),
             fragment: translate(&stages.air.1, RenderStage::Fragment, stages.fragment_entry),
@@ -5512,6 +6521,8 @@ fn an_affine_stage_buffer_footprint_is_bounded_by_the_draw() {
         vertex_attribute_locations: Vec::new(),
         vertex_stage_buffer_declarations: Vec::new(),
         fragment_stage_buffer_declarations: Vec::new(),
+        fragment_texture_declarations: Vec::new(),
+        texture_interface_refusals: Vec::new(),
     };
     stages.vertex_stage_buffer_declarations =
         declared_stage_buffers(&stages.air.0, RenderStage::Vertex, stages.vertex_entry);
@@ -6408,6 +7419,7 @@ fn the_registration_leaves_a_slot_the_entry_never_dereferences_out_of_the_pairin
             }],
         }]),
         stage_buffers,
+        textures: Vec::new(),
     };
     let digest = |name: &str| {
         SemanticDigest::new("reims-provider-render-rail-r9m", name.as_bytes().to_vec())
@@ -6527,6 +7539,8 @@ fn shared_table_stages() -> Stages {
         vertex_attribute_locations: vec![0, 1, 2, 3],
         vertex_stage_buffer_declarations: Vec::new(),
         fragment_stage_buffer_declarations: Vec::new(),
+        fragment_texture_declarations: Vec::new(),
+        texture_interface_refusals: Vec::new(),
     };
     stages.vertex_stage_buffer_declarations =
         declared_stage_buffers(&stages.air.0, RenderStage::Vertex, stages.vertex_entry);
@@ -6694,6 +7708,7 @@ fn a_vertex_stream_shared_by_two_attributes_leaves_room_for_its_stage_buffer() {
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: layout,
                 stage_buffers: vec![declaration.clone()],
+                textures: Vec::new(),
             },
             vertex: translate(&stages.air.0, RenderStage::Vertex, stages.vertex_entry),
             fragment: translate(&stages.air.1, RenderStage::Fragment, stages.fragment_entry),

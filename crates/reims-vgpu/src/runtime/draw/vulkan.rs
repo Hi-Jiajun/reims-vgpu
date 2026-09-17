@@ -10233,6 +10233,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }
                 }))
                 .collect();
+            // The fragment stage's `[[texture(i)]]` declarations, moved into
+            // the same device numbering the request's own binds were resolved
+            // in (R10): the fragment sampled-band relocation is applied to the
+            // images, the samplers and these two bindings by the same flag, so
+            // declaration `i` and the draw's bind at the same number name one
+            // binding on both sides of the seam. The module's AIR sampler state
+            // travels unchanged — it is a property of the module, not of the
+            // band the descriptors landed in.
+            let fragment_texture_declarations = {
+                use crate::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET;
+                let base_off = if separate_sampled {
+                    FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+                } else {
+                    0
+                };
+                resolved
+                    .fragment_texture_declarations
+                    .iter()
+                    .map(|declaration| provider_render::RenderTextureDeclaration {
+                        binding: declaration.binding + base_off,
+                        sampler_binding: declaration.sampler_binding + base_off,
+                        ..*declaration
+                    })
+                    .collect::<Vec<_>>()
+            };
             let inputs = RenderRailInputs {
                 vertex_air: resolved.vertex_air.as_ref(),
                 fragment_air: resolved.fragment_air.as_ref(),
@@ -10266,6 +10291,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 fragment_stage_buffer_declarations: resolved
                     .fragment_stage_buffer_declarations
                     .as_ref(),
+                // R10: the fragment stage's sampled-texture declarations, in
+                // the device numbering this draw's own bind list uses, beside
+                // the arguments outside the family the translated rail
+                // executes (a runtime sampler, a storage image, a vertex-stage
+                // image). The class gate states the declarations in the
+                // canonical contract and answers the rest by name.
+                fragment_texture_declarations: &fragment_texture_declarations,
+                texture_interface_refusals: resolved.texture_interface_refusals.as_ref(),
                 stage_buffer_binds: &stage_buffer_binds,
                 // R4b, probe-gated: the present tail a record states when it is
                 // the one whose frame the guest displays and that frame lands in

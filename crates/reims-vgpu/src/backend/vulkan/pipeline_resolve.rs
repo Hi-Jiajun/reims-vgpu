@@ -315,6 +315,24 @@ pub struct ResolvedRenderPipeline {
     pub vertex_stage_buffer_declarations: Arc<[StageBufferDeclaration]>,
     #[cfg(feature = "provider-render")]
     pub fragment_stage_buffer_declarations: Arc<[StageBufferDeclaration]>,
+    /// The `[[texture(i)]]` arguments the fragment stage's reflection declares,
+    /// with the AIR sampler state each was lowered against and the two device
+    /// bindings the runtime resolves the draw's own binds at (R10,
+    /// `research/docs/23` §101).
+    ///
+    /// A *stage-level* fact like the stage-buffer lists beside it, collected
+    /// once per resolved pipeline because the reflection is memoized with the
+    /// translation and the class gate runs on every draw. The canonical
+    /// render sampler's contract is positional and its declaration has to
+    /// repeat the module's own state, so this is the half of the pair the
+    /// provider cannot read out of the request.
+    #[cfg(feature = "provider-render")]
+    pub fragment_texture_declarations:
+        Arc<[crate::backend::provider_render::RenderTextureDeclaration]>,
+    /// The Metal arguments outside the family the canonical translated render
+    /// rail executes, across both stages (R10).
+    #[cfg(feature = "provider-render")]
+    pub texture_interface_refusals: Arc<[crate::backend::provider_render::RenderInterfaceRefusal]>,
 }
 
 #[cfg(test)]
@@ -383,6 +401,13 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
         vertex_stage_buffer_declarations: Arc::from(Vec::new()),
         #[cfg(feature = "provider-render")]
         fragment_stage_buffer_declarations: Arc::from(Vec::new()),
+        // The synthetic reflection declares no texture and no sampler either,
+        // so the rail's gate reads this constructor as "the stages name no
+        // sampled texture" — the same shape the two lists above give it.
+        #[cfg(feature = "provider-render")]
+        fragment_texture_declarations: Arc::from(Vec::new()),
+        #[cfg(feature = "provider-render")]
+        texture_interface_refusals: Arc::from(Vec::new()),
     })
 }
 
@@ -867,6 +892,17 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
     let vertex_stage_buffer_declarations = stage_buffer_declarations(&vertex.reflection);
     #[cfg(feature = "provider-render")]
     let fragment_stage_buffer_declarations = stage_buffer_declarations(&fragment.reflection);
+    // The sampled-texture half (R10): the fragment stage's `[[texture(i)]]`
+    // arguments beside the AIR sampler state each was lowered against, and the
+    // arguments outside the family the translated rail executes.
+    #[cfg(feature = "provider-render")]
+    let fragment_texture_declarations =
+        crate::backend::provider_render::texture_declarations(&fragment.reflection);
+    #[cfg(feature = "provider-render")]
+    let texture_interface_refusals = crate::backend::provider_render::texture_interface_refusals(
+        &vertex.reflection,
+        &fragment.reflection,
+    );
     Ok(ResolvedRenderPipeline {
         pipeline_object: None,
         desc: Arc::new(desc),
@@ -888,6 +924,10 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         vertex_stage_buffer_declarations,
         #[cfg(feature = "provider-render")]
         fragment_stage_buffer_declarations,
+        #[cfg(feature = "provider-render")]
+        fragment_texture_declarations,
+        #[cfg(feature = "provider-render")]
+        texture_interface_refusals,
     })
 }
 
