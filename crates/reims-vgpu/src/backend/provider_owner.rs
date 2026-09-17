@@ -195,6 +195,9 @@ pub enum Decline {
         region_length: u64,
         detail: String,
     },
+    /// A window carried no bytes to copy (`R18`): the staged arm it would
+    /// become has nothing to hold, so it is refused rather than imported empty.
+    WindowEmpty { binding: u32 },
     /// The device reports no host-pointer import, so a window-backed binding
     /// cannot leave this rail: device-gated, fail-closed, no staged fallback.
     HostImportUnavailable { binding: u32 },
@@ -224,6 +227,7 @@ impl ObserveDecline for Decline {
             Self::UnregisteredRegion { .. } => "owner_unregistered_region",
             Self::RegionRetired { .. } => "owner_region_retired",
             Self::WindowOutsideRegion { .. } => "owner_window_outside_region",
+            Self::WindowEmpty { .. } => "owner_window_empty",
             Self::HostImportUnavailable { .. } => "owner_host_import_unavailable",
             Self::LeaseImport { .. } => "owner_lease_import",
             Self::LeaseRelease { .. } => "owner_lease_release",
@@ -268,6 +272,7 @@ impl ObserveDecline for Decline {
             Self::HostImportUnavailable { binding } => {
                 vec![("binding", binding.to_string())]
             }
+            Self::WindowEmpty { binding } => vec![("binding", binding.to_string())],
             Self::LeaseImport { binding, detail } => {
                 vec![("binding", binding.to_string()), ("detail", detail.clone())]
             }
@@ -446,6 +451,96 @@ pub fn registered_regions() -> usize {
 /// registrations have stopped deriving windows.
 pub fn retired_regions() -> Vec<u64> {
     lock().retired.iter().copied().collect()
+}
+
+/// One window's own bytes, read out of the registration that names it (`R18`).
+///
+/// The owner rail's *copy* answer for a window its device cannot import: the
+/// render rail states a window-backed bind as the borrowed no-copy arm when the
+/// view's own host pointer is a whole number of the device's import granules,
+/// and as an owner-issued staged lease over these bytes when it is not. The
+/// bytes are the ones the borrowed arm would have bound — `host_va + head` for
+/// `bytes_len` bytes — so the two arms differ in *how* the provider gets them
+/// and not in which bytes the declaration reads.
+///
+/// Every check the read needs comes from this rail's own state, in one critical
+/// section with the read itself: the import has to be registered here, its
+/// address rail must not have retired it, the window has to cover exactly the
+/// bind's bytes, and the window has to be a range inside the registration. The
+/// registration is what bounds the read — it was built by [`register`] from
+/// this process's own mapping of the import and validated by the provider's
+/// `HostRegion::validate` — so no window a caller invents can point this at
+/// bytes outside it.
+///
+/// `Err` is a typed refusal (`owner_unregistered_region`,
+/// `owner_region_retired`, `owner_window_outside_region`, `owner_window_empty`)
+/// rather than an empty answer, so the caller can name the fact that stopped
+/// the copy instead of inventing one.
+pub fn window_bytes(window: Window) -> Result<Vec<u8>, Decline> {
+    let state = lock();
+    let record = state
+        .regions
+        .get(&window.import)
+        .ok_or(Decline::UnregisteredRegion {
+            import: window.import,
+            binding: window.binding,
+        })?;
+    if state.retired.contains(&window.import) {
+        return Err(Decline::RegionRetired {
+            import: window.import,
+            binding: window.binding,
+        });
+    }
+    if window.bytes_len == 0 {
+        return Err(Decline::WindowEmpty {
+            binding: window.binding,
+        });
+    }
+    let region = record.region;
+    let region_start = u64::try_from(region.host_pointer).unwrap_or(u64::MAX);
+    let region_end = region_start.checked_add(region.length);
+    // The window has to be inside the registration *and* its `head` has to leave
+    // the bind's own bytes inside the window: the view is what the declaration
+    // reads, so the two coordinates are one condition.
+    let window_inside = region_end.is_some_and(|end| {
+        window.host_va >= region_start
+            && window
+                .host_va
+                .checked_add(window.length)
+                .is_some_and(|window_end| window_end <= end)
+    });
+    let bind_inside = window
+        .head
+        .checked_add(window.bytes_len)
+        .is_some_and(|touched| touched <= window.length);
+    if !window_inside || !bind_inside {
+        return Err(Decline::WindowOutsideRegion {
+            import: window.import,
+            binding: window.binding,
+            offset: window.host_va.saturating_sub(region_start),
+            length: window.length,
+            region_length: region.length,
+            detail: format!(
+                "head={} bytes_len={} region_start={region_start}",
+                window.head, window.bytes_len
+            ),
+        });
+    }
+    let start = window
+        .host_va
+        .checked_add(window.head)
+        .expect("the window covers the bind's bytes, so the view pointer is addressable");
+    let len = usize::try_from(window.bytes_len).expect("the window is inside a host mapping");
+    // SAFETY: `register` was handed this process's own mapping of the import
+    // (`runtime::guest_ram_map`'s `register_owner_regions` projects
+    // `GuestRamImport::host_base`), the checks above put the whole read inside
+    // that registration, and an import the address rail retired was answered
+    // above rather than read — a retired mapping is the one way these bytes
+    // stop being this process's to read (`retire_region`). The mapping is held
+    // for the import's lifetime, which is longer than this call: the copy is
+    // made before the submission that names it.
+    let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+    Ok(bytes.to_vec())
 }
 
 /// Forget every registration and drop every lease: the owner half of a device

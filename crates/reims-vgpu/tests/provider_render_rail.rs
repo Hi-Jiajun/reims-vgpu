@@ -7470,16 +7470,415 @@ fn a_stage_buffer_the_seam_derives_from_its_gather_leaves_without_a_copy() {
     );
 }
 
+/// R18: a window-backed stage buffer whose view pointer misses the device's
+/// import granules is *copied* into the owner's staged arm instead of keeping
+/// the draw on the engine.
+///
+/// Census v13 read this shape as `render_provider_out_of_class_stage_buffer_alignment`
+/// — 2772 of one boot's 10696 seam rows, 25.92 %,
+/// `evidence/gate3-census-v13-2026-09-17` §0.4 — with the sentence "the view's
+/// own host pointer is not a whole number of the device's import granules".
+/// The window *does* cover the bind's bytes; the bind simply starts inside the
+/// granule (a packed resource's own `source_offset`), and the canonical rail
+/// refuses a no-copy import at that pointer by name
+/// (`lease_alignment_unsupported`). The answer this increment states is the
+/// arm the class already has for a bind with no window behind it: the bytes the
+/// borrowed arm would have bound are read out of the registration
+/// ([`reims_vgpu::backend::provider_owner::window_bytes`]) and imported as an
+/// owner-issued staged lease.
+///
+/// Every fact is checkable at once: the draw reaches the provider, the wire
+/// carries the view as `StagedLease`, the frame is byte-identical to the
+/// engine's for the same request and the same bytes, the lease row names the
+/// staged channel, and moving the owner's own mapping between submissions moves
+/// the frame.
+#[test]
+fn an_unaligned_stage_buffer_window_is_copied_into_the_owner_staged_arm() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    /// The bind's own offset inside the granule: not a whole number of the
+    /// device's import granules, and a whole number of the four-byte storage the
+    /// fragment stage reads.
+    const HEAD: u64 = 4;
+    /// Bytes the declaration's own reach covers at this bind.
+    const BIND_BYTES: u64 = 16;
+
+    let _guard = engine_test_session();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "the staged arm is still gated on the device importing host pointers"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let head = usize::try_from(HEAD).expect("the head fits usize");
+    // The fragment's red, written at the bind's own unaligned offset: the bytes
+    // the copied range has to carry.
+    owner.as_mut_slice()[head..head + 4].copy_from_slice(&[0, 0, 0x80, 0x3f]);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let guest = || {
+        let anchor = import
+            .slice(0, page as u64)
+            .expect("the first granule is inside the import");
+        GuestRef::new(std::sync::Arc::clone(&import), anchor)
+            .expect("the slice came from this import")
+    };
+    let import_id = import.id().get();
+    // The provider-shaped window the registration ledger derives: the whole
+    // granule, which does cover the bind's bytes.
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // The bind as the draw path builds it: one host run over the owner's
+    // mapping, the window's first byte `HEAD` into it, and the window the
+    // ledger derived on the run.
+    let gather = || {
+        BufferContent::GuestRuns(engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                owner.pointer as usize,
+                2 * page as u64,
+                0,
+                HEAD + BIND_BYTES,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset: HEAD,
+            total_len: BIND_BYTES,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+                window_offset: 0,
+                guest: guest(),
+                window: Some(registered),
+            }])),
+            direct_image: None,
+        })
+    };
+    let stages = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
+    let request = |content: &BufferContent| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: content.clone(),
+        });
+        req
+    };
+    // The engine's own frame for the same request and the same bytes, taken
+    // before anything is registered on the owner rail: the engine's device
+    // context is created lazily on its first draw, and that creation resets the
+    // owner rail.
+    let Some(engine_frame) =
+        engine_pixels("unaligned stage-buffer window", &stages, request(&gather()))
+    else {
+        return;
+    };
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let log_before = std::fs::read_to_string(reims_vgpu_observe::fail_log_path())
+        .unwrap_or_default()
+        .len();
+    let content = gather();
+    let binds = [StageBufferBind {
+        stage: RenderPipelineStage::Fragment,
+        index: 0,
+        content: &content,
+        // The seam states no window: everything the copy needs is derived.
+        window: None,
+        landing: None,
+    }];
+
+    use reims_vgpu::backend::provider_wire;
+
+    provider_wire::capture_submission_frames(true);
+    let frames_before = provider_wire::wire_counts();
+    let delivered = provider_render::provider_submissions();
+    let red = match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &request(&content),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!(
+            "an unaligned window inside the device's granules is staged, not refused: {other:?}"
+        ),
+    };
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    eprintln!(
+        "unaligned stage-buffer window: device host-import alignment = {alignment}; the bind's \
+         bytes start {HEAD} byte(s) into a {page} byte granule; provider submissions {delivered} \
+         -> {}, texel (0, 0) {:?}",
+        provider_render::provider_submissions(),
+        texel_at(&red, 0, 0),
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census shape reaches the canonical provider instead of the engine"
+    );
+    assert_eq!(
+        texel_at(&red, 0, 0),
+        [255, 0, 0, 255],
+        "the fragment read the bind's own bytes at the unaligned offset"
+    );
+    assert_frames_equal(
+        "unaligned stage-buffer window, both rails",
+        &red,
+        &engine_frame,
+    );
+
+    // The wire's own reading: the copy is what crossed as the bind's source,
+    // under this binding's label, at the bind's own length.
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        frames_before.submit_frames + 1,
+        "the seam produced exactly one submission frame for the staged draw"
+    );
+    assert_eq!(frames.len(), 1, "and the capture holds it");
+    let (wire_trace, _wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let wire_pass = wire_trace
+        .passes
+        .iter()
+        .find_map(|pass| pass.as_render())
+        .expect("the frame carries the render pass");
+    let view = wire_pass
+        .stage_buffers
+        .first()
+        .expect("the frame carries the declared stage buffer");
+    let source = match &view.view.source {
+        BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
+        BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
+        BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+    };
+    eprintln!(
+        "wire stage-buffer view: stage={:?} offset={} length={} source={source}",
+        view.stage, view.view.offset, view.view.length,
+    );
+    assert!(
+        matches!(view.view.source, BufferSource::StagedLease(_)),
+        "the copied bind crosses the wire as the owner's staged lease"
+    );
+    assert_eq!(
+        view.view.length, BIND_BYTES,
+        "the staged view is the bind's own bytes, not the whole granule"
+    );
+
+    // The lease row, verbatim: the arm this bind left through, and the label
+    // the plan found its view by (`stage_buffer_owner_binding(Fragment, 0)`).
+    let log = std::fs::read_to_string(reims_vgpu_observe::fail_log_path()).expect("fail log");
+    let fresh = &log[log_before.min(log.len())..];
+    let lease = fresh
+        .lines()
+        .find(|line| line.contains("provider_owner_lease") && line.contains("no_copy=0"))
+        .unwrap_or_else(|| panic!("the staged lease row was emitted: {fresh}"));
+    eprintln!("lease row: {lease}");
+    assert!(
+        lease.contains("channel=staged") && lease.contains("binding=65536"),
+        "the row names the staged arm under the fragment stage buffer's own label: {lease}"
+    );
+    assert!(
+        !fresh
+            .lines()
+            .any(|line| line.contains("provider_owner_lease") && line.contains("no_copy=1")),
+        "nothing about this bind was imported: the copy replaced the borrowed arm wholesale"
+    );
+    assert!(route_count("render_provider_unaligned_window_staged") >= 1);
+    assert!(
+        route_count("render_provider_unaligned_window_bytes") >= BIND_BYTES,
+        "the byte census carries the bytes the copy moved"
+    );
+
+    // The falsifiable half: move the owner's own bytes and the next submission
+    // follows. A rail that had cached one copy would be unmoved by this.
+    owner.as_mut_slice()[head..head + 4].copy_from_slice(&[0, 0, 0, 0]);
+    let black = match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &request(&content),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the same shape stays in class after the mapping moved: {other:?}"),
+    };
+    eprintln!(
+        "provider texel after moving the mapping's unaligned float: {:?}",
+        texel_at(&black, 0, 0),
+    );
+    assert_eq!(
+        texel_at(&black, 0, 0),
+        [0, 0, 0, 255],
+        "the same bind now carries the moved bytes"
+    );
+    assert_frames_differ(
+        "the owner's own bytes reach the provider's frame through the copy",
+        &red,
+        &black,
+    );
+}
+
+/// R18's read is bounded by the registration that names it, and every way it
+/// can fail is a named refusal rather than a shorter answer.
+///
+/// The class gate cannot reach these shapes — `gather_window` refuses a window
+/// that does not cover the bind's bytes before the copy is asked for one — so
+/// they are driven here, against the owner rail's own API, which is where the
+/// read happens: an unregistered import, a bind whose `head` leaves the window,
+/// a window that reaches past the registration, an empty bind, and an import
+/// the address rail retired. A copy that read any of them would be reading
+/// bytes outside the range the caller named, which is the one thing this
+/// function must never do.
+#[test]
+fn a_window_copy_reads_only_bytes_its_own_registration_covers() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    let _guard = engine_test_session();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(alignment > 0, "the copy needs the import gate open");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    owner.as_mut_slice()[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let import =
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation");
+    let import_id = import.id().get();
+    let base = owner.pointer as u64;
+    let window = |import: u64, host_va: u64, length: u64, head: u64, bytes_len: u64| {
+        provider_owner::Window {
+            binding: 65536,
+            import,
+            host_va,
+            length,
+            head,
+            bytes_len,
+        }
+    };
+    let slug = |refusal: provider_owner::Decline| refusal.slug().to_owned();
+
+    // An import the rail was never handed: nothing to bound the read with.
+    assert_eq!(
+        slug(
+            provider_owner::window_bytes(window(import_id, base, page as u64, 4, 8))
+                .expect_err("an unregistered import has no window")
+        ),
+        "owner_unregistered_region",
+    );
+
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+
+    // The bind's own bytes, at an unaligned head: exactly the range the
+    // borrowed arm would have bound.
+    assert_eq!(
+        provider_owner::window_bytes(window(import_id, base, page as u64, 4, 4))
+            .expect("a window inside its registration reads"),
+        vec![5, 6, 7, 8],
+    );
+
+    // A `head` that leaves the bind's bytes outside the window.
+    assert_eq!(
+        slug(
+            provider_owner::window_bytes(window(
+                import_id,
+                base,
+                page as u64,
+                (page - 4) as u64,
+                8,
+            ))
+            .expect_err("a bind reaching past its window")
+        ),
+        "owner_window_outside_region",
+    );
+
+    // A window that reaches past the registration, even with the bind inside
+    // the window.
+    assert_eq!(
+        slug(
+            provider_owner::window_bytes(window(
+                import_id,
+                base + page as u64,
+                (2 * page) as u64,
+                0,
+                8,
+            ))
+            .expect_err("a window reaching past its registration")
+        ),
+        "owner_window_outside_region",
+    );
+
+    // A window that starts before the registration.
+    assert_eq!(
+        slug(
+            provider_owner::window_bytes(window(import_id, base - 8, page as u64, 0, 8,))
+                .expect_err("a window starting before its registration")
+        ),
+        "owner_window_outside_region",
+    );
+
+    // An empty bind: the staged arm it would become has nothing to hold.
+    assert_eq!(
+        slug(
+            provider_owner::window_bytes(window(import_id, base, page as u64, 4, 0))
+                .expect_err("an empty bind")
+        ),
+        "owner_window_empty",
+    );
+
+    // The address rail announced the mapping moved. An alias-shaped
+    // registration is the one a retirement ends (a RAMBlock registration never
+    // is), so the copy has to stop with it.
+    let alias_id = 0x18_a11a5_u64;
+    provider_owner::register(Region {
+        import: alias_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: page as u64,
+        page_size: alignment,
+        gpa_base: None,
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    provider_owner::retire_region(alias_id);
+    assert_eq!(
+        slug(
+            provider_owner::window_bytes(window(alias_id, base, page as u64, 4, 8))
+                .expect_err("a retired registration derives no window")
+        ),
+        "owner_region_retired",
+    );
+}
+
 /// R9e's refusal half: a gather the seam cannot cut one window from stays on
 /// the engine, each under the bucket its own fact names.
 ///
 /// Three shapes, none of them a looser door: bytes scattered over more than one
 /// run, a run whose import the registration ledger never registered, and a
 /// packed bind whose `source_offset` leaves the view's own host pointer off the
-/// device's import granule. The first two answer `..._stage_buffer_gather` (the
-/// rail mints no copy for them either), and the third answers
-/// `..._stage_buffer_alignment` — a class answer, because the canonical rail
-/// refuses an unaligned import by name and a declined draw is not a fallback.
+/// device's import granule *and* whose import the owner rail was never handed,
+/// so there is no registration to copy the bytes out of. The first two answer
+/// `..._stage_buffer_gather` (the rail mints no copy for them either), and the
+/// third answers `..._stage_buffer_alignment` — since R18 that bucket is the
+/// *unreadable* window's, not every off-granule one: a window the rail can read
+/// is copied into the staged arm
+/// (`an_unaligned_stage_buffer_window_is_copied_into_the_owner_staged_arm`),
+/// and only a window it cannot read keeps the draw on the engine, because a
+/// declined draw is not a fallback.
 #[test]
 fn a_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     use reims_vgpu::backend::provider_compute::host_import_alignment;
@@ -7589,7 +7988,9 @@ fn a_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
 
     // Off-granule: the bind starts inside the window, so the view's own host
-    // pointer is not a whole number of the device's import granules.
+    // pointer is not a whole number of the device's import granules — and this
+    // import was never handed to the owner rail, so there is no registration
+    // the bytes could be copied out of (R18).
     let off_granule = gather(
         4,
         vec![GuestWindowRun {
@@ -7604,6 +8005,10 @@ fn a_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     assert!(
         detail.contains(&format!("{alignment} byte alignment")),
         "the sentence names the alignment it crossed: {detail}"
+    );
+    assert!(
+        detail.contains("owner_unregistered_region"),
+        "the sentence names the fact that stopped the copy: {detail}"
     );
 
     // Both buckets are counters, not latches.
@@ -8203,6 +8608,215 @@ fn an_index_stream_in_a_registered_window_leaves_without_a_copy() {
     );
 }
 
+/// R18: the index half of the same answer — a dust-sized stream, read once, and
+/// the arm where the extra copy costs least.
+///
+/// The bind's three `u32` indices start four bytes into the granule, so the
+/// view's own host pointer misses the device's import granules while the window
+/// covers the bytes; the class copies them out of the registration and imports
+/// them as the owner's staged lease instead of keeping the draw on the engine
+/// (`render_provider_out_of_class_index_alignment` is the bucket this shape
+/// answered with before this increment). The index stream is the smallest bind
+/// this class carries, so the copy is also the cheapest place to read what the
+/// new arm costs: twelve bytes, one lease, and a view that is the bind's own
+/// length rather than the granule's.
+#[test]
+fn an_unaligned_index_stream_window_is_copied_into_the_owner_staged_arm() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    /// The index bind's own offset inside its granule.
+    const HEAD: u64 = 4;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "the staged arm is still gated on the device importing host pointers"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let head = usize::try_from(HEAD).expect("the head fits usize");
+    // The reviewed shape's own indices, at the bind's unaligned offset.
+    owner.as_mut_slice()[head..head + INDEX_BYTES.len()].copy_from_slice(&INDEX_BYTES);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let guest = || {
+        let anchor = import
+            .slice(0, page as u64)
+            .expect("the first granule is inside the import");
+        GuestRef::new(std::sync::Arc::clone(&import), anchor)
+            .expect("the slice came from this import")
+    };
+    let import_id = import.id().get();
+    let base = owner.pointer as usize;
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: base as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    let indices = || engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            base,
+            2 * page as u64,
+            0,
+            HEAD + INDEX_BYTES.len() as u64,
+        )
+        .expect("the bind's own bytes are inside the mapping")]),
+        source_offset: HEAD,
+        total_len: INDEX_BYTES.len() as u64,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+            window_offset: 0,
+            guest: guest(),
+            window: Some(registered),
+        }])),
+        direct_image: None,
+    };
+    let request = |source: &engine::GuestRunSource| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.indexed = Some(IndexedDrawResource {
+            index_type: IndexType::U32,
+            index_count: 3,
+            vertex_offset: 0,
+            content: BufferContent::GuestRuns(source.clone()),
+        });
+        req
+    };
+    let Some(engine_frame) = engine_pixels("unaligned index stream", &stages, request(&indices()))
+    else {
+        return;
+    };
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: base,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let log_before = std::fs::read_to_string(reims_vgpu_observe::fail_log_path())
+        .unwrap_or_default()
+        .len();
+    let frame = |label: &str| -> Vec<u8> {
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(&indices()),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: an unaligned index window inside the device's granules is staged, not \
+                 refused: {other:?}"
+            ),
+        }
+    };
+
+    use reims_vgpu::backend::provider_wire;
+
+    provider_wire::capture_submission_frames(true);
+    let delivered = provider_render::provider_submissions();
+    let reviewed = frame("unaligned index stream");
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    eprintln!(
+        "unaligned index stream: device host-import alignment = {alignment}; the three indices \
+         start {HEAD} byte(s) into a {page} byte granule; provider submissions {delivered} -> {}, \
+         texel (0, 0) {:?}",
+        provider_render::provider_submissions(),
+        texel_at(&reviewed, 0, 0),
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census shape reaches the canonical provider instead of the engine"
+    );
+    assert_solid("unaligned index stream", &reviewed);
+    assert_frames_equal(
+        "unaligned index stream, both rails",
+        &reviewed,
+        &engine_frame,
+    );
+
+    // The wire's own reading: the index view crosses as the copy, at the bind's
+    // own length, not the whole granule.
+    assert_eq!(frames.len(), 1, "the capture holds the submission frame");
+    let (wire_trace, _wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let wire_pass = wire_trace
+        .passes
+        .iter()
+        .find_map(|pass| pass.as_render())
+        .expect("the frame carries the render pass");
+    let index_view = wire_pass
+        .indices
+        .as_ref()
+        .expect("the frame carries the index binding");
+    let source = match &index_view.view.source {
+        BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
+        BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
+        BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+    };
+    eprintln!(
+        "wire index view: offset={} length={} source={source}",
+        index_view.view.offset, index_view.view.length,
+    );
+    assert!(
+        matches!(index_view.view.source, BufferSource::StagedLease(_)),
+        "the copied index bind crosses the wire as the owner's staged lease"
+    );
+    assert_eq!(
+        index_view.view.length,
+        INDEX_BYTES.len() as u64,
+        "the staged view is the bind's own three indices"
+    );
+
+    // The lease row, verbatim: the staged arm under the index stream's own
+    // label (`0x30000`).
+    let log = std::fs::read_to_string(reims_vgpu_observe::fail_log_path()).expect("fail log");
+    let fresh = &log[log_before.min(log.len())..];
+    let lease = fresh
+        .lines()
+        .find(|line| line.contains("provider_owner_lease") && line.contains("no_copy=0"))
+        .unwrap_or_else(|| panic!("the staged lease row was emitted: {fresh}"));
+    eprintln!("lease row: {lease}");
+    assert!(
+        lease.contains("channel=staged")
+            && lease.contains(&format!("bytes={}", INDEX_BYTES.len()))
+            && lease.contains("binding=196608"),
+        "the row names the staged arm, the bind's own length and the index stream's label: {lease}"
+    );
+    assert!(route_count("render_provider_unaligned_window_staged") >= 1);
+
+    // The falsifiable half: rewrite the owner's own index bytes, with nothing
+    // else touched. Every index becomes zero, both triangles degenerate and the
+    // attachment keeps the clear's bytes wherever the quad would have covered.
+    owner.as_mut_slice()[head..head + INDEX_BYTES.len()].fill(0);
+    let degenerated = frame("unaligned index stream, indices rewritten to zero");
+    let (width, _) = extent();
+    eprintln!(
+        "provider texel after the owner's index bytes became zeros: {:?}",
+        texel_at(&degenerated, 0, 0),
+    );
+    assert_clear_texel(
+        "degenerated unaligned indices: texel (0, 0)",
+        texel_at(&degenerated, 0, 0),
+    );
+    assert_clear_texel(
+        "degenerated unaligned indices: texel (width - 1, 0)",
+        texel_at(&degenerated, width - 1, 0),
+    );
+    assert_frames_differ(
+        "the owner's own index bytes reach the provider's frame through the copy",
+        &reviewed,
+        &degenerated,
+    );
+}
+
 /// R11's refusal half: an index gather the seam cannot cut one registered
 /// window from stays on the engine, each under the bucket its own fact names.
 ///
@@ -8210,14 +8824,16 @@ fn an_index_stream_in_a_registered_window_leaves_without_a_copy() {
 /// arm this increment moved: bytes scattered over more than one run, a run
 /// whose import the registration ledger never registered, and a bind whose
 /// `source_offset` leaves the view's own host pointer off the device's import
-/// granule. The first two answer
-/// `render_provider_out_of_class_index_staging` — the bucket every index
+/// granule beside an import the owner rail was never handed. The first two
+/// answer `render_provider_out_of_class_index_staging` — the bucket every index
 /// gather answered with before this increment — and the third answers
-/// `render_provider_out_of_class_index_alignment`, because the canonical rail
-/// refuses an unaligned import by name and a declined draw is not a fallback.
+/// `render_provider_out_of_class_index_alignment`, the *unreadable* window's
+/// bucket since R18: an off-granule window the rail can read is copied into the
+/// staged arm (`an_unaligned_index_stream_window_is_copied_into_the_owner_staged_arm`),
+/// and only one with no registration to read from keeps the draw on the engine.
 #[test]
 fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
-    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
     use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
 
@@ -8242,15 +8858,10 @@ fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
             .expect("the slice came from this import")
     };
     let import_id = import.id().get();
-    provider_owner::register(Region {
-        import: import_id,
-        epoch: device_epoch().expect("the rail's provider epoch"),
-        host_pointer: owner.pointer as usize,
-        length: 2 * page as u64,
-        page_size: alignment,
-        gpa_base: Some(0x40_0000),
-    })
-    .expect("a page-aligned registration is a legal provider region");
+    // The import is deliberately *not* handed to the owner rail: the
+    // off-granule window below is the shape whose copy needs a registration to
+    // read the bytes out of, so this is what the alignment bucket still
+    // answers (R18).
     let registered = RegisteredWindow {
         import: import.id(),
         base: owner.pointer as u64,
@@ -8338,7 +8949,9 @@ fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     assert_eq!(slug, "render_provider_out_of_class_index_staging");
 
     // Off-granule: the bind starts inside the window, so the view's own host
-    // pointer is not a whole number of the device's import granules.
+    // pointer is not a whole number of the device's import granules — and this
+    // import was never handed to the owner rail, so there is no registration
+    // the bytes could be copied out of (R18).
     let off_granule = gather(
         4,
         vec![GuestWindowRun {
@@ -8354,6 +8967,10 @@ fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
         detail.contains(&format!("{alignment} byte alignment")),
         "the sentence names the alignment it crossed: {detail}"
     );
+    assert!(
+        detail.contains("owner_unregistered_region"),
+        "the sentence names the fact that stopped the copy: {detail}"
+    );
 
     // Both buckets are counters, not latches, and no refused shape reaches the
     // provider.
@@ -8367,6 +8984,273 @@ fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     assert_eq!(registered.import.get(), import_id);
 }
 
+/// R18: the same staged answer for a **vertex stream** the device cannot import
+/// in place.
+///
+/// Census v13 read 131 rows of this shape as
+/// `render_provider_out_of_class_vertex_alignment` — the vertex half of the
+/// same sentence (`evidence/gate3-census-v13-2026-09-17` §0.4) — and here the
+/// copy has to reach the *vertex stage*'s own fetches: the bind's bytes start
+/// four bytes into the granule, the window still covers them, and the class
+/// states the copied bytes as an owner-issued staged lease instead of keeping
+/// the draw on the engine. The two-stream shape is the reviewed one: the
+/// second table is aligned and keeps the borrowed arm in the same submission,
+/// which is what makes the two arms distinguishable in one lease set.
+#[test]
+fn an_unaligned_vertex_stream_window_is_copied_into_the_owner_staged_arm() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    /// The first stream's own offset inside its granule.
+    const HEAD: u64 = 4;
+    /// The stream's own bytes (`interleaved`'s three vertices).
+    const TABLE_BYTES: u64 = 48;
+
+    let _guard = engine_test_session();
+    let stages = shared_table_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "the staged arm is still gated on the device importing host pointers"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let guest = |granule: usize| {
+        let anchor = import
+            .slice((granule * page) as u64, page as u64)
+            .expect("one granule is inside the import");
+        GuestRef::new(std::sync::Arc::clone(&import), anchor)
+            .expect("the slice came from this import")
+    };
+    let import_id = import.id().get();
+    let base = owner.pointer as usize;
+    let head = usize::try_from(HEAD).expect("the head fits usize");
+
+    let positions = [(-1.0_f32, -3.0_f32), (-1.0, 1.0), (3.0, 1.0)];
+    let offsets = |x: f32| [(x, 0.0_f32); 3];
+    let first_bytes = interleaved(positions, offsets(0.125));
+    let second_bytes = interleaved(offsets(0.0625), offsets(0.0625));
+    // The first table's bytes live at the bind's own unaligned offset; the
+    // second table is the aligned control beside it.
+    owner.as_mut_slice()[head..head + TABLE_BYTES as usize].copy_from_slice(&first_bytes);
+    owner.as_mut_slice()[page..page + TABLE_BYTES as usize].copy_from_slice(&second_bytes);
+
+    let window = |granule: usize| RegisteredWindow {
+        import: import.id(),
+        base: base as u64 + (granule * page) as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    let table = |granule: usize, source_offset: u64, bytes: &[u8]| -> engine::GuestRunSource {
+        let granule_base = (granule * page) as u64;
+        engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                base,
+                2 * page as u64,
+                granule_base,
+                source_offset + bytes.len() as u64,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset,
+            total_len: bytes.len() as u64,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+                window_offset: 0,
+                guest: guest(granule),
+                window: Some(window(granule)),
+            }])),
+            direct_image: None,
+        }
+    };
+    let first = table(0, HEAD, &first_bytes);
+    let second = table(1, 0, &second_bytes);
+    let guest_attribute =
+        |location: u32, offset: u32, source: &engine::GuestRunSource| -> VertexAttributeResource {
+            VertexAttributeResource {
+                location,
+                binding: location,
+                format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
+                    .expect("Float2 is a vertex format"),
+                offset,
+                stride: 16,
+                step_function: VertexStepFunction::PerVertex,
+                step_rate: 1,
+                content: BufferContent::GuestRuns(source.clone()),
+            }
+        };
+    let request = |first: &engine::GuestRunSource,
+                   second: &engine::GuestRunSource,
+                   tail: &std::sync::Arc<Vec<u8>>| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.vertex_attributes = vec![
+            guest_attribute(0, 0, first),
+            guest_attribute(1, 8, first),
+            guest_attribute(2, 0, second),
+            guest_attribute(3, 8, second),
+        ];
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 2,
+            content: BufferContent::Bytes(std::sync::Arc::clone(tail)),
+        });
+        req
+    };
+    let still = std::sync::Arc::new(f32x2(&[(0.0, 0.0)]));
+    let (width, _) = extent();
+
+    // The engine's own frame for the same request and the same bytes, before
+    // anything is registered: the engine's device creation resets the owner
+    // rail.
+    let Some(engine_frame) = engine_pixels(
+        "unaligned vertex stream",
+        &stages,
+        request(&first, &second, &still),
+    ) else {
+        return;
+    };
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: base,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let log_before = std::fs::read_to_string(reims_vgpu_observe::fail_log_path())
+        .unwrap_or_default()
+        .len();
+    let frame = |label: &str, tail: &std::sync::Arc<Vec<u8>>| -> Vec<u8> {
+        let content = BufferContent::Bytes(std::sync::Arc::clone(tail));
+        let binds = [staged_bind(RenderPipelineStage::Vertex, 2, &content)];
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &request(&first, &second, tail),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: an unaligned vertex window inside the device's granules is staged, not \
+                 refused: {other:?}"
+            ),
+        }
+    };
+
+    use reims_vgpu::backend::provider_wire;
+
+    provider_wire::capture_submission_frames(true);
+    let delivered = provider_render::provider_submissions();
+    let reviewed = frame("unaligned vertex stream", &still);
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    eprintln!(
+        "unaligned vertex stream: device host-import alignment = {alignment}; the first table's \
+         bytes start {HEAD} byte(s) into its granule; provider submissions {delivered} -> {}, \
+         texel (0, 0) {:?}, texel (width - 1, 0) {:?}",
+        provider_render::provider_submissions(),
+        texel_at(&reviewed, 0, 0),
+        texel_at(&reviewed, width - 1, 0),
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census shape reaches the canonical provider instead of the engine"
+    );
+    assert_clear_texel(
+        "unaligned vertex stream: texel (0, 0)",
+        texel_at(&reviewed, 0, 0),
+    );
+    assert_texel_near(
+        "unaligned vertex stream: texel (width - 1, 0)",
+        texel_at(&reviewed, width - 1, 0),
+        FRAGMENT_TEXEL,
+    );
+    assert_frames_equal(
+        "unaligned vertex stream, both rails",
+        &reviewed,
+        &engine_frame,
+    );
+
+    // The wire's own reading: the two streams cross under their own arms, and
+    // the staged one carries the copied bytes at the bind's own length.
+    assert_eq!(frames.len(), 1, "the capture holds the submission frame");
+    let (wire_trace, _wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let wire_pass = wire_trace
+        .passes
+        .iter()
+        .find_map(|pass| pass.as_render())
+        .expect("the frame carries the render pass");
+    let arms: Vec<String> = wire_pass
+        .vertex_buffers
+        .iter()
+        .map(|view| match &view.source {
+            BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
+            BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
+            BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+        })
+        .collect();
+    eprintln!("wire vertex views: {arms:?}");
+    assert_eq!(
+        arms.len(),
+        2,
+        "two fetch tables crossed, not four attributes"
+    );
+    assert!(
+        arms[0].starts_with("staged_lease"),
+        "the unaligned table crosses as the owner's staged lease: {}",
+        arms[0]
+    );
+    assert!(
+        arms[1].starts_with("borrowed_no_copy"),
+        "the aligned table beside it keeps the no-copy arm: {}",
+        arms[1]
+    );
+
+    // The lease rows, verbatim: the copy under the first stream's own label
+    // (`vertex_stream_owner_binding(0)`), the import under the second's, and
+    // the request's own `[[buffer(2)]]` argument staged beside them — the arm
+    // a request with no window behind it takes, which this shape's copies have
+    // to be distinguishable from.
+    let log = std::fs::read_to_string(reims_vgpu_observe::fail_log_path()).expect("fail log");
+    let fresh = &log[log_before.min(log.len())..];
+    let staged = fresh
+        .lines()
+        .find(|line| {
+            line.contains("provider_owner_lease")
+                && line.contains("no_copy=0")
+                && line.contains("binding=131072")
+        })
+        .unwrap_or_else(|| panic!("the stream's own staged lease row was emitted: {fresh}"));
+    let borrowed = fresh
+        .lines()
+        .find(|line| line.contains("provider_owner_lease") && line.contains("no_copy=1"))
+        .unwrap_or_else(|| panic!("the borrowed lease row was emitted: {fresh}"));
+    eprintln!("staged lease row: {staged}\nborrowed lease row: {borrowed}");
+    assert!(
+        staged.contains("channel=staged") && staged.contains(&format!("bytes={TABLE_BYTES}")),
+        "the copy is stated under the first stream's own label, at the bind's own length: {staged}"
+    );
+    assert!(
+        borrowed.contains("channel=borrowed") && borrowed.contains(&format!("import={import_id}")),
+        "the aligned table's window is imported under the second stream's label: {borrowed}"
+    );
+    assert!(route_count("render_provider_unaligned_window_staged") >= 1);
+
+    // The falsifiable half: move the unaligned table's own bytes and the next
+    // submission follows them.
+    owner.as_mut_slice()[head..head + TABLE_BYTES as usize]
+        .copy_from_slice(&interleaved(offsets(0.125), offsets(0.0)));
+    let moved = frame("unaligned vertex stream, first table moved", &still);
+    assert_frames_differ(
+        "the owner's own vertex bytes reach the provider's frame through the copy",
+        &reviewed,
+        &moved,
+    );
+}
+
 /// R9q's refusal half: a vertex gather the seam cannot cut one registered
 /// window from stays on the engine, each under the bucket its own fact names.
 ///
@@ -8374,14 +9258,16 @@ fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
 /// arm this increment moved: bytes scattered over more than one run, a run
 /// whose import the registration ledger never registered, and a bind whose
 /// `source_offset` leaves the view's own host pointer off the device's import
-/// granule. The first two answer `render_provider_out_of_class_vertex_staging`
-/// — the bucket every gather answered with before this increment — and the
-/// third answers `render_provider_out_of_class_vertex_alignment`, because the
-/// canonical rail refuses an unaligned import by name and a declined draw is
-/// not a fallback.
+/// granule beside an import the owner rail was never handed. The first two
+/// answer `render_provider_out_of_class_vertex_staging` — the bucket every
+/// gather answered with before this increment — and the third answers
+/// `render_provider_out_of_class_vertex_alignment`, the *unreadable* window's
+/// bucket since R18: an off-granule window the rail can read is copied into the
+/// staged arm (`an_unaligned_vertex_stream_window_is_copied_into_the_owner_staged_arm`),
+/// and only one with no registration to read from keeps the draw on the engine.
 #[test]
 fn a_vertex_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
-    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
     use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
 
@@ -8405,15 +9291,10 @@ fn a_vertex_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
             .expect("the slice came from this import")
     };
     let import_id = import.id().get();
-    provider_owner::register(Region {
-        import: import_id,
-        epoch: device_epoch().expect("the rail's provider epoch"),
-        host_pointer: owner.pointer as usize,
-        length: 2 * page as u64,
-        page_size: alignment,
-        gpa_base: Some(0x40_0000),
-    })
-    .expect("a page-aligned registration is a legal provider region");
+    // The import is deliberately *not* handed to the owner rail: the
+    // off-granule window below is the shape whose copy needs a registration to
+    // read the bytes out of, so this is what the alignment bucket still
+    // answers (R18).
     let registered = RegisteredWindow {
         import: import.id(),
         base: owner.pointer as u64,
@@ -8507,7 +9388,9 @@ fn a_vertex_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     assert_eq!(slug, "render_provider_out_of_class_vertex_staging");
 
     // Off-granule: the bind starts inside the window, so the view's own host
-    // pointer is not a whole number of the device's import granules.
+    // pointer is not a whole number of the device's import granules — and this
+    // import was never handed to the owner rail, so there is no registration
+    // the bytes could be copied out of (R18).
     let off_granule = gather(
         4,
         vec![GuestWindowRun {
@@ -8522,6 +9405,10 @@ fn a_vertex_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     assert!(
         detail.contains(&format!("{alignment} byte alignment")),
         "the sentence names the alignment it crossed: {detail}"
+    );
+    assert!(
+        detail.contains("owner_unregistered_region"),
+        "the sentence names the fact that stopped the copy: {detail}"
     );
 
     // Both buckets are counters, not latches, and no refused shape reaches the

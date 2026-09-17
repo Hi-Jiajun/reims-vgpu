@@ -314,10 +314,20 @@
 //! - a gather this rail cannot cut a window from — scattered across stretches,
 //!   unregistered, or with a `source_offset` reaching past its stretch's window
 //!   — keeps the engine by name
-//!   (`render_provider_out_of_class_stage_buffer_gather`), and one whose view
-//!   pointer is not a whole number of the device's import granules keeps it
-//!   under `render_provider_out_of_class_stage_buffer_alignment` rather than
-//!   being declined a layer down.
+//!   (`render_provider_out_of_class_stage_buffer_gather`);
+//! - R18 gives the window-backed arm its third answer, and it is the one the
+//!   device decides: a window that *does* cover the bind's bytes still cannot be
+//!   imported in place when the view's own host pointer is not a whole number of
+//!   the device's import granules (the registration aligns the window's base,
+//!   but a bind at a packed resource's own offset moves the view off the
+//!   granule). The bytes the borrowed arm would have bound are copied out of the
+//!   registration's own mapping ([`provider_owner::window_bytes`]) and travel as
+//!   an owner-issued **staged lease**, exactly as a bind with no window does —
+//!   so the draw reaches the provider instead of keeping the engine
+//!   (`render_provider_out_of_class_stage_buffer_alignment` was that population
+//!   before this increment). Only a window this rail cannot read — its import
+//!   unregistered, its address rail retired, or its coordinates outside the
+//!   registration — still keeps the draw on the engine under that same name.
 //!
 //! R9q wires the *vertex* half of the same channel. A vertex stream is the same
 //! kind of bind as a stage buffer — the guest's own buffer, resolved by the
@@ -329,10 +339,15 @@
 //!   **borrowed no-copy** ([`StreamSource::Window`], derived by the same
 //!   [`gather_window`], imported by the same plan): the frame follows the
 //!   owner's own mapping, and moving that mapping moves the vertex bytes;
+//! - R18's third answer applies here unchanged: a stream whose view pointer
+//!   misses the device's granules is copied into an owner-issued staged lease
+//!   rather than keeping the engine, and the view this rail states for it names
+//!   that lease (`BufferSource::StagedLease`) exactly as a declared stage
+//!   buffer's staged arm does;
 //! - a gather the seam cannot cut one window from still keeps the engine under
 //!   `render_provider_out_of_class_vertex_staging` — the bucket every gather
-//!   answered with before this increment — and one whose view pointer misses the
-//!   device's import granules keeps it under
+//!   answered with before this increment — and one whose granules miss it *and*
+//!   whose window cannot be read keeps it under
 //!   `render_provider_out_of_class_vertex_alignment`; a device without
 //!   host-pointer import answers `render_provider_out_of_class_vertex_import`.
 //!
@@ -349,9 +364,12 @@
 //!   follows the owner's own mapping, and moving that mapping moves the index
 //!   bytes — which is what the census read as `index_staging` on every draw
 //!   whose index bind the draw path had already imported;
+//! - R18's staged copy is the third arm here too, and an index bind is where it
+//!   costs least: the stream is small, read once, and the canonical pass states
+//!   it as one lease-backed view like any other staged bind;
 //! - a gather the seam cannot cut one window from still keeps the engine under
-//!   `render_provider_out_of_class_index_staging`, one whose view pointer misses
-//!   the device's import granules keeps it under
+//!   `render_provider_out_of_class_index_staging`, one whose granules miss the
+//!   bind *and* whose window cannot be read keeps it under
 //!   `render_provider_out_of_class_index_alignment`, and a device without
 //!   host-pointer import answers `render_provider_out_of_class_index_import`.
 //!
@@ -504,19 +522,27 @@ const INDEX_STREAM_WINDOW: WindowShape = WindowShape {
     alignment_slug: "render_provider_out_of_class_index_alignment",
 };
 
-/// The device answers one window-backed binding needs (`R9e`, `R9q`).
+/// The view's own host pointer of one window-backed binding: the window's base
+/// plus the bind's own head, when the two are addressable together.
 ///
-/// Two questions, both about the device rather than the request, which is why
-/// they are asked here beside [`declared_host_import`] and not inside the pure
-/// gate: the device has to import host pointers at all, and the *view's own*
-/// host pointer — the window's base plus the bind's own head — has to be a
-/// whole number of the device's import granules. The registration ledger aligns
-/// the window's base and the window covers the bind's bytes, but a
-/// `source_offset` a packed resource binds at can still leave the view
-/// unaligned; the canonical rail refuses that import by name
-/// (`lease_alignment_*`), and a declined draw where the engine would have
-/// gathered is the wrong answer for a class that only narrows which submissions
-/// change rail — so the shape stays on the engine, under its own bucket.
+/// `None` is a coordinate pair whose sum leaves the address space — a malformed
+/// window rather than a slow one, answered by [`window_binding_admits`]'s own
+/// refusal.
+fn window_view_pointer(window: StageBufferWindow) -> Option<u64> {
+    window.host_va.checked_add(window.head)
+}
+
+/// The device answer one window-backed binding has to pass before this class
+/// states it at all (`R9e`, `R9q`, `R11`).
+///
+/// One question, about the device rather than the request: a device that cannot
+/// import host pointers has no window arm at all — the owner rail refuses a
+/// window-backed bind on it rather than turning it into a copy
+/// ([`provider_owner::channel`]'s `HostImportUnavailable`), and a declined draw
+/// where the engine would have gathered is the wrong answer for a class that
+/// only narrows which submissions change rail. The *second* device answer — the
+/// view pointer's alignment — is not a refusal any more: since R18 it decides
+/// between the borrowed arm and the staged copy, and [`window_arm`] asks it.
 ///
 /// `shape` carries the binding's own spelling in the sentence and the two slugs
 /// it answers under, because the bucket is the census's own reading of *which*
@@ -544,7 +570,7 @@ fn window_binding_admits(
             ),
         ));
     }
-    let Some(pointer) = window.host_va.checked_add(window.head) else {
+    if window_view_pointer(window).is_none() {
         return Err(OutOfClass::owned(
             alignment_slug,
             format!(
@@ -553,20 +579,94 @@ fn window_binding_admits(
                  plus the bind's own head overflows the address space",
             ),
         ));
-    };
-    if !pointer.is_multiple_of(alignment) {
-        return Err(OutOfClass::owned(
+    }
+    Ok(())
+}
+
+/// The arm one window-backed binding takes on this device (`R9e`, `R9q`, `R11`,
+/// `R18`).
+///
+/// `Ok(None)` is the borrowed arm: the view's own host pointer is a whole
+/// number of the device's import granules, so the plan imports the window and
+/// nothing is copied. `Ok(Some(bytes))` is the staged arm: the registration
+/// aligns the window's base, but a bind at a packed resource's own
+/// `source_offset` moves the view off the granule, the canonical rail refuses an
+/// import at that pointer by name (`lease_alignment_unsupported`), and a
+/// declined draw where the engine would have gathered is not an answer this
+/// class may give — so the bind's own bytes are copied out of the registration
+/// ([`provider_owner::window_bytes`]) and travel as the owner's staged lease,
+/// which is the arm a bind with no window behind it already takes. What the copy
+/// costs is the device's own constraint; what it preserves is *which bytes* the
+/// declaration reads, because the copied range is exactly the range the
+/// borrowed arm would have bound.
+///
+/// A window this rail cannot read at all — an import the owner rail does not
+/// hold, one its address rail retired, coordinates outside the registration, or
+/// an empty bind — keeps the draw on the engine under the shape's own alignment
+/// bucket, because there is no copy to state and a decline is not a fallback.
+fn window_arm(
+    shape: WindowShape,
+    binding: u32,
+    window: StageBufferWindow,
+    alignment: u64,
+) -> Result<Option<Vec<u8>>, OutOfClass> {
+    window_binding_admits(shape, window, alignment)?;
+    let WindowShape {
+        name,
+        alignment_slug,
+        ..
+    } = shape;
+    // The refusal above answers the unaddressable pair, so the sum exists here.
+    let pointer =
+        window_view_pointer(window).expect("an admitted window's view pointer is addressable");
+    if pointer.is_multiple_of(alignment) {
+        return Ok(None);
+    }
+    match provider_owner::window_bytes(owner_window(binding, window)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(decline) => Err(OutOfClass::owned(
             alignment_slug,
             format!(
                 "a draw whose {name} is covered by a registered guest RAM window stays on the \
                  engine when the view's own host pointer is not a whole number of the device's \
-                 import granules: the pointer is {pointer}, the device imports host pointers at \
-                 {alignment} byte alignment, and the canonical rail refuses an unaligned import \
-                 by name rather than copying the bind",
+                 import granules and the window's bytes cannot be copied out of the \
+                 registration that names it: the pointer is {pointer}, the device imports host \
+                 pointers at {alignment} byte alignment, and the copy this class states in \
+                 place of the no-copy import was refused by the owner rail (`{}`)",
+                decline.slug(),
             ),
-        ));
+        )),
     }
-    Ok(())
+}
+
+/// The bytes one pass copies out of its window-backed binds (`R18`), under the
+/// owner binding label the plan looks each view up by.
+///
+/// The copy itself is made by the class gate, where the device's import
+/// alignment is read — before the pass is submitted and before any lease exists
+/// — and this is what carries it to [`plan_owner_leases`], which states those
+/// binds through the owner's staged arm instead of the borrowed one. Keyed by
+/// the owner label rather than by position because the three shapes' namespaces
+/// overlap (`stage_buffer_owner_binding`'s two stages, a stream's index, the
+/// index stream's constant), and a copy read back under another namespace's
+/// label would be a wrong frame rather than a refusal.
+#[derive(Default)]
+struct WindowCopies {
+    entries: Vec<(u32, Vec<u8>)>,
+}
+
+impl WindowCopies {
+    fn insert(&mut self, binding: u32, bytes: Vec<u8>) {
+        self.entries.push((binding, bytes));
+    }
+
+    /// The copied bytes for one window-backed bind, when this pass stages it.
+    fn bytes(&self, binding: u32) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .find(|(label, _)| *label == binding)
+            .map(|(_, bytes)| bytes.as_slice())
+    }
 }
 
 /// Whether one attachment extent is inside the declared window, and the class
@@ -4139,40 +4239,77 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             return RenderRailOutcome::NotInNarrowClass(reason);
         }
     }
-    // The third device answer (R9e/R9q/R11): every window-backed binding this
-    // pass states — a stage buffer's window, a vertex stream's since R9q, and
-    // the index stream's since R11 — is imported by the owner rail, and a device
-    // that cannot import host pointers refuses that arm by name rather than
-    // turning it into a copy. The answer is asked once for the pass, in the
-    // order the binds are stated (the stage buffers, then the vertex streams,
-    // then the index stream), so the bucket a refusal lands in is the one its
-    // own shape owns.
+    // The third device answer (R9e/R9q/R11/R18): every window-backed binding
+    // this pass states — a stage buffer's window, a vertex stream's since R9q,
+    // and the index stream's since R11 — is imported by the owner rail unless
+    // this device cannot take the view's own pointer, in which case the gate
+    // copies the window's bytes and the plan states the staged arm instead
+    // (`window_arm`); a device that cannot import host pointers at all refuses
+    // that arm by name rather than turning it into a copy. The answer is asked
+    // once for the pass, in the order the binds are stated (the stage buffers,
+    // then the vertex streams, then the index stream), so the bucket a refusal
+    // lands in is the one its own shape owns — and so the copies the plan reads
+    // back are keyed the same way the plan states them.
     let window_backed = || {
         pass.stage_buffers
             .iter()
-            .filter_map(|buffer| buffer.window.map(|window| (STAGE_BUFFER_WINDOW, window)))
-            .chain(
-                pass.vertex_windows()
-                    .map(|(_, window)| (VERTEX_STREAM_WINDOW, window)),
-            )
+            .filter_map(|buffer| {
+                buffer.window.map(|window| {
+                    (
+                        STAGE_BUFFER_WINDOW,
+                        stage_buffer_owner_binding(buffer.stage, buffer.index),
+                        window,
+                    )
+                })
+            })
+            .chain(pass.vertex_windows().map(|(binding, window)| {
+                (
+                    VERTEX_STREAM_WINDOW,
+                    vertex_stream_owner_binding(binding),
+                    window,
+                )
+            }))
             .chain(
                 pass.index_window()
-                    .map(|window| (INDEX_STREAM_WINDOW, window)),
+                    .map(|window| (INDEX_STREAM_WINDOW, index_stream_owner_binding(), window)),
             )
     };
+    // R18: the binds the device's granules turn away from the borrowed arm. The
+    // copy is made here rather than inside the plan because this is where the
+    // device answer lives, and because a window this rail cannot read has to
+    // keep the draw on the engine *by name* — an answer only the class gate can
+    // give (`plan`'s refusals are declines, and a decline is not a fallback).
+    let mut copies = WindowCopies::default();
     if window_backed().next().is_some() {
         let alignment = match declared_host_import() {
             Ok(alignment) => alignment,
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         };
-        for (shape, window) in window_backed() {
-            if let Err(reason) = window_binding_admits(shape, window, alignment) {
-                reason.note();
-                return RenderRailOutcome::NotInNarrowClass(reason);
+        for (shape, binding, window) in window_backed() {
+            match window_arm(shape, binding, window, alignment) {
+                Ok(Some(bytes)) => {
+                    // The extra copy this class pays, counted where it happens:
+                    // one route per staged window and one byte total beside it,
+                    // so a boot can say how much of the class's traffic the
+                    // device's granules moved onto the staging arm.
+                    crate::runtime::drain::note_store_route(
+                        "render_provider_unaligned_window_staged",
+                    );
+                    crate::runtime::drain::note_store_route_n(
+                        "render_provider_unaligned_window_bytes",
+                        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    );
+                    copies.insert(binding, bytes);
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    reason.note();
+                    return RenderRailOutcome::NotInNarrowClass(reason);
+                }
             }
         }
     }
-    match submit_narrow(inputs, &pass) {
+    match submit_narrow(inputs, &pass, &copies) {
         Ok(RenderCompletion::Writeback(output)) => RenderRailOutcome::ProviderCompleted(output),
         Ok(RenderCompletion::Resident(frame)) => {
             RenderRailOutcome::ProviderCompletedResident(frame)
@@ -5574,6 +5711,7 @@ fn attachment_identity(pass: &NarrowPass<'_>) -> AttachmentIdentity {
 fn submit_narrow(
     inputs: &RenderRailInputs<'_>,
     pass: &NarrowPass<'_>,
+    copies: &WindowCopies,
 ) -> Result<RenderCompletion, ProviderRenderDecline> {
     let rail = rail().map_err(IntoRender::into_render)?;
     let provider = &rail.provider;
@@ -5632,7 +5770,7 @@ fn submit_narrow(
     // imported here, and the trace's views below name the allocation and lease
     // the plan minted for each. Importing before the trace exists is the same
     // order the compute rail keeps: a refused import never reaches admission.
-    let mut leases = plan_owner_leases(provider, pass, &mut resources)?;
+    let mut leases = plan_owner_leases(provider, pass, &mut resources, copies)?;
     let mut vertex_buffers = Vec::new();
     let mut next_view = FIRST_INPUT_VIEW;
     for (binding, stream) in pass.vertex_streams.iter().enumerate() {
@@ -5660,7 +5798,12 @@ fn submit_narrow(
             // for this submission under the label the plan cut for this
             // stream. The view is the pair the owner's reservation covers —
             // the window's own offset and the bind's own length — and the
-            // access is the read the class admitted.
+            // access is the read the class admitted. R18 adds the second arm
+            // here: a stream whose view pointer the device's granules turn away
+            // is *copied* by the gate, so the plan minted a staged lease over
+            // those bytes and the view names it — the channel the plan took is
+            // the fact that decides which source this view states, so the two
+            // arms cannot drift apart.
             StreamSource::Window(_) => {
                 let owner = leases
                     .as_ref()
@@ -5674,7 +5817,12 @@ fn submit_narrow(
                     length: owner.view_length,
                     access: BufferAccess::Read,
                     attribute_stride: None,
-                    source: BufferSource::BorrowedNoCopy(owner.lease),
+                    source: match owner.channel {
+                        provider_owner::Channel::Borrowed => {
+                            BufferSource::BorrowedNoCopy(owner.lease)
+                        }
+                        provider_owner::Channel::Staged => BufferSource::StagedLease(owner.lease),
+                    },
                 }
             }
         };
@@ -5684,30 +5832,36 @@ fn submit_narrow(
     let index_view = ViewId::new(next_view);
     // R11: the index stream's own arm decides the view. Staged bytes stay
     // trace-owned, exactly as before; a window-backed index bind names the
-    // lease the owner plan imported for it — the same
-    // `BufferSource::BorrowedNoCopy` arm a vertex window takes — with the view
-    // offset and length the owner's own reservation covers.
-    let (index_allocation, index_offset, index_length, index_source) =
-        match &pass.index_stream.source {
-            StreamSource::Staged(bytes) => (
-                input_allocation(next_view),
-                0,
-                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                BufferSource::OwnedBytes(bytes.to_vec()),
-            ),
-            StreamSource::Window(_) => {
-                let owner = leases
-                    .as_ref()
-                    .and_then(|plan| plan.view(index_stream_owner_binding()))
-                    .expect("the owner plan covers every admitted index window");
-                (
-                    owner.allocation,
-                    owner.view_offset,
-                    owner.view_length,
-                    BufferSource::BorrowedNoCopy(owner.lease),
-                )
-            }
-        };
+    // lease the owner plan imported for it — the borrowed arm, or since R18 the
+    // staged lease over the copy the gate made — with the view offset and
+    // length the owner's own reservation covers. The same channel switch the
+    // vertex stream above keeps, for the same reason.
+    let (index_allocation, index_offset, index_length, index_source) = match &pass
+        .index_stream
+        .source
+    {
+        StreamSource::Staged(bytes) => (
+            input_allocation(next_view),
+            0,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            BufferSource::OwnedBytes(bytes.to_vec()),
+        ),
+        StreamSource::Window(_) => {
+            let owner = leases
+                .as_ref()
+                .and_then(|plan| plan.view(index_stream_owner_binding()))
+                .expect("the owner plan covers every admitted index window");
+            (
+                owner.allocation,
+                owner.view_offset,
+                owner.view_length,
+                match owner.channel {
+                    provider_owner::Channel::Borrowed => BufferSource::BorrowedNoCopy(owner.lease),
+                    provider_owner::Channel::Staged => BufferSource::StagedLease(owner.lease),
+                },
+            )
+        }
+    };
     let indices = IndexBufferBinding {
         view: BufferView {
             view_id: index_view,
@@ -6326,24 +6480,50 @@ fn index_stream_owner_binding() -> u32 {
     0x0003 << 16
 }
 
-/// One window-backed binding's owner request: the window's own coordinates
-/// under the label the plan looks its view up by.
+/// One window-backed binding's coordinates in the owner rail's own shape, under
+/// the label the plan looks its view up by.
 ///
 /// The three shapes that state windows — a stage buffer, a vertex stream and
 /// the index stream — differ only in the label, which is why it is a parameter
-/// and the coordinates are built in one place.
-fn window_request(binding: u32, window: StageBufferWindow) -> provider_owner::Request<'static> {
-    provider_owner::Request::Window(provider_owner::Window {
+/// and the coordinates are built in one place. The borrowed *request* and the
+/// staged *copy* ([`provider_owner::window_bytes`], R18) are the two readers of
+/// this one spelling of the coordinates.
+fn owner_window(binding: u32, window: StageBufferWindow) -> provider_owner::Window {
+    provider_owner::Window {
         binding,
         import: window.import,
         host_va: window.host_va,
         length: window.length,
         head: window.head,
         bytes_len: window.bytes_len,
-    })
+    }
 }
 
-/// Import the owner's leases for one submission (`R9d`, `R9q`, `R11`).
+/// One window-backed binding's owner request: the borrowed arm, at the window's
+/// own coordinates.
+fn window_request(binding: u32, window: StageBufferWindow) -> provider_owner::Request<'static> {
+    provider_owner::Request::Window(owner_window(binding, window))
+}
+
+/// The arm one window-backed binding's owner request states (`R18`): the
+/// borrowed window, or the owner-issued staged lease over the copy this pass
+/// made of it.
+///
+/// `copies` decides alone, because it is filled only for the binds whose view
+/// pointer the device's granules turned away — and a bind that has a copy is by
+/// construction one the borrowed arm cannot state.
+fn window_arm_request<'a>(
+    binding: u32,
+    window: StageBufferWindow,
+    copies: &'a WindowCopies,
+) -> provider_owner::Request<'a> {
+    match copies.bytes(binding) {
+        Some(bytes) => provider_owner::Request::Staged(provider_owner::Staged { binding, bytes }),
+        None => window_request(binding, window),
+    }
+}
+
+/// Import the owner's leases for one submission (`R9d`, `R9q`, `R11`, `R18`).
 ///
 /// The three arms `research/docs/26` §13.7 left open are decided here, one
 /// binding at a time, exactly as the compute rail decides them
@@ -6367,6 +6547,14 @@ fn window_request(binding: u32, window: StageBufferWindow) -> provider_owner::Re
 /// it is not a bind of the guest's buffer, it is the bytes the runtime already
 /// read, and it stays trace-owned exactly as before.
 ///
+/// R18 gives a window-backed bind a *second* owner arm. The gate copies the
+/// bytes of any window whose view pointer the device's granules turn away
+/// ([`window_arm`], [`WindowCopies`]), and this plan states those binds as
+/// `StagedLease` over the copy — the same arm a bind with no window behind it
+/// takes, and the arm the copy is *for*. The window's own coordinates are then
+/// not part of the plan at all: nothing about this binding is imported, so
+/// nothing can be read through a pointer the device will not take.
+///
 /// Every lease is imported before the trace exists, so a refused import never
 /// reaches admission, and the allocation table is extended with what the plan
 /// minted before the trace is validated against it — the same order the compute
@@ -6376,6 +6564,7 @@ fn plan_owner_leases(
     provider: &metal_api_vulkan::VulkanComputeProvider,
     pass: &NarrowPass<'_>,
     resources: &mut ResourceTableSnapshot,
+    copies: &WindowCopies,
 ) -> Result<Option<provider_owner::Plan>, ProviderRenderDecline> {
     if pass.stage_buffers.is_empty()
         && pass.vertex_windows().next().is_none()
@@ -6389,7 +6578,7 @@ fn plan_owner_leases(
         .map(|buffer| {
             let binding = stage_buffer_owner_binding(buffer.stage, buffer.index);
             match buffer.window {
-                Some(window) => window_request(binding, window),
+                Some(window) => window_arm_request(binding, window, copies),
                 None => provider_owner::Request::Staged(provider_owner::Staged {
                     binding,
                     // The gate admits a bind with neither a window nor staged
@@ -6401,13 +6590,12 @@ fn plan_owner_leases(
             }
         })
         .collect();
-    requests.extend(
-        pass.vertex_windows()
-            .map(|(binding, window)| window_request(vertex_stream_owner_binding(binding), window)),
-    );
+    requests.extend(pass.vertex_windows().map(|(binding, window)| {
+        window_arm_request(vertex_stream_owner_binding(binding), window, copies)
+    }));
     requests.extend(
         pass.index_window()
-            .map(|window| window_request(index_stream_owner_binding(), window)),
+            .map(|window| window_arm_request(index_stream_owner_binding(), window, copies)),
     );
     let plan = provider_owner::plan(provider, &requests).map_err(ProviderRenderDecline::Owner)?;
     for (allocation, size, reservation) in plan.leases() {
