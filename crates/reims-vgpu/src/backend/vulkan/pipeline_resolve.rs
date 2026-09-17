@@ -410,7 +410,9 @@ pub(crate) fn retained_pipeline_for_test() -> Arc<ResolvedRenderPipeline> {
 fn stage_buffer_declarations(
     reflection: &metal2vulkan::reflect::ShaderReflection,
 ) -> Arc<[crate::backend::provider_render::StageBufferDeclaration]> {
-    use crate::backend::provider_render::{StageBufferDeclaration, StageBufferDeclarationClass};
+    use crate::backend::provider_render::{
+        StageBufferDeclaration, StageBufferDeclarationClass, StageBufferFootprint,
+    };
     use metal2vulkan::reflect::{ResourceAccess, ResourceKind};
 
     reflection
@@ -428,6 +430,32 @@ fn stage_buffer_declarations(
                 Some(ResourceAccess::Sampled | ResourceAccess::Storage) | None => {
                     StageBufferDeclarationClass::Unknown
                 }
+            },
+            // The reach the canonical registration will compare its own
+            // translation against, computed the way that gate computes it
+            // (`metal-api-vulkan`'s `validate_translated_stage_buffers`): the
+            // largest exclusive byte offset over the declaration's static
+            // ranges, with affine (strided) and unbounded reaches stated as
+            // what they are — shapes the render contract cannot state — and a
+            // read binding that names no range at all treated the same way,
+            // because the canonical gate has no extent to prove a view
+            // against. Both sides read the same translator pin over the same
+            // AIR, so this is one measurement and not two.
+            footprint: match binding.footprint.as_ref() {
+                Some(footprint)
+                    if !footprint.has_unbounded_access && footprint.strided_accesses.is_empty() =>
+                {
+                    match footprint
+                        .static_ranges
+                        .iter()
+                        .map(|range| range.offset.saturating_add(range.size))
+                        .max()
+                    {
+                        Some(max_bytes) => StageBufferFootprint::Static { max_bytes },
+                        None => StageBufferFootprint::Unstated,
+                    }
+                }
+                _ => StageBufferFootprint::Unstated,
             },
         })
         .collect::<Vec<_>>()

@@ -10108,8 +10108,39 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         #[cfg(feature = "provider-render")]
         {
             use crate::backend::provider_render::{
-                self, RenderChainRole, RenderRailInputs, RenderRailOutcome,
+                self, RenderChainRole, RenderRailInputs, RenderRailOutcome, StageBufferBind,
             };
+            // R9d: the `[[buffer(N)]]` binds this draw carries, at the Metal
+            // index of the stage that names them. The seam already resolved
+            // both lists — `vtx_storage` for the vertex stage, `frag_storage`
+            // for the fragment one — so the bytes here are the same ones the
+            // engine's own bind rail reads, and the *fragment* half keeps the
+            // Metal index the engine's single-namespace relocation would
+            // otherwise hide (`frag_storage` is keyed on it, not on the
+            // relocated binding the descriptor table uses).
+            //
+            // The owner *window* is not stated here yet: the draw path stages
+            // its binds as CPU copies (or gathers them as `GuestRuns`), and the
+            // one window a bind could be cut from is what a later increment
+            // derives from those runs. A bind with no window travels as the
+            // owner's staged lease — the arm the canonical rail calls
+            // `BufferSource::StagedLease` — and a gather with no window keeps
+            // the draw on the engine (`..._stage_buffer_gather`).
+            let stage_buffer_binds: Vec<StageBufferBind<'_>> = vtx_storage
+                .iter()
+                .map(|(index, content)| StageBufferBind {
+                    stage: metal_api_core::provider::RenderPipelineStage::Vertex,
+                    index: *index,
+                    content,
+                    window: None,
+                })
+                .chain(frag_storage.iter().map(|(index, content)| StageBufferBind {
+                    stage: metal_api_core::provider::RenderPipelineStage::Fragment,
+                    index: *index,
+                    content,
+                    window: None,
+                }))
+                .collect();
             let inputs = RenderRailInputs {
                 vertex_air: resolved.vertex_air.as_ref(),
                 fragment_air: resolved.fragment_air.as_ref(),
@@ -10143,6 +10174,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 fragment_stage_buffer_declarations: resolved
                     .fragment_stage_buffer_declarations
                     .as_ref(),
+                stage_buffer_binds: &stage_buffer_binds,
                 // R4b, probe-gated: the present tail a record states when it is
                 // the one whose frame the guest displays and that frame lands in
                 // a named mapping. `None` is the pre-R4b device.
