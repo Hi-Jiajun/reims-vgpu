@@ -3946,6 +3946,19 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     // count (`draw_vertex_streams_*`) and no reading of the declared attributes
     // the gate actually compares.
     crate::runtime::drain::note_store_route(attribute_count_route(req.vertex_attributes.len()));
+    // R-VF1: the same population, keyed by the *storage* each declared attribute
+    // was declared in, because the census's `vertex_format` gate (`26233` of one
+    // boot's `93259` seam rows, `evidence/gate3-census-v10-2026-09-17` §4) refuses
+    // 28.1% of the class exits with one sentence that names no format at all —
+    // the sentence lists the canonical set, not the declared value. One count per
+    // attribute, named from the protocol's own `VertexFormat::name`, is the whole
+    // reading: which storages the surviving draws declare, and in what mix, is
+    // what a widening order has to be sized on. Charged at the same place and for
+    // the same reason as the band above, so a request the gate refuses for some
+    // *other* face is still in the denominator and the two readings line up.
+    for attribute in &req.vertex_attributes {
+        crate::runtime::drain::note_store_route(vertex_format_route(attribute.format));
+    }
     // The bound stage-buffer axis (R9b), charged for the same reason and at the
     // same place: the door's four buckets answer *why* a draw stayed on the
     // engine, and this answers *how many* buffers were behind it — the split
@@ -4086,6 +4099,91 @@ pub fn attribute_count_route(declared: usize) -> &'static str {
         1 => "draw_vertex_attrs_1",
         2..=4 => "draw_vertex_attrs_2_4",
         _ => "draw_vertex_attrs_gt4",
+    }
+}
+
+/// The census route of one *declared* vertex format, named after the Metal
+/// storage it was declared in (R-VF1).
+///
+/// Why a route per format rather than a latched line. The gate's own sentence
+/// (`render_provider_out_of_class_vertex_format`) states the canonical set and
+/// not the value that met it, and the failure log has no other field that
+/// carries one: a draw refused at that gate is visible as a count and as a
+/// `(slug, shape)` row, and the question a widening order has to answer — *which
+/// storage do these draws declare, and in what mix* — is exactly the field the
+/// log loses. One counter per attribute, keyed by the protocol's own
+/// [`VertexAttributeFormat::name`], makes the reading a subtraction over a
+/// window's `store_routes` line.
+///
+/// The spelling is `vertex_format_<name>` rather than the bare name so the keys
+/// cannot be confused with another route family that happens to use the same
+/// word (`float`, `half`, … are ordinary English). The match is exhaustive over
+/// the protocol's closed list on purpose: a format added there has to name its
+/// route here, and the compiler is what says so.
+///
+/// Charged for every attribute of every request the class gate is handed, at the
+/// same place [`attribute_count_route`] is charged: the counters are the
+/// *declaration* population, so the formats of draws that stayed on the engine
+/// for some other face are in the reading too, and a widening order reads the
+/// admitted and refused halves as one distribution rather than as a remainder.
+pub fn vertex_format_route(
+    format: crate::backend::vulkan::engine::VertexAttributeFormat,
+) -> &'static str {
+    use crate::backend::vulkan::engine::VertexAttributeFormat as Format;
+    match format {
+        Format::UChar2 => "vertex_format_uchar2",
+        Format::UChar3 => "vertex_format_uchar3",
+        Format::UChar4 => "vertex_format_uchar4",
+        Format::Char2 => "vertex_format_char2",
+        Format::Char3 => "vertex_format_char3",
+        Format::Char4 => "vertex_format_char4",
+        Format::UChar2Normalized => "vertex_format_uchar2_normalized",
+        Format::UChar3Normalized => "vertex_format_uchar3_normalized",
+        Format::UChar4Normalized => "vertex_format_uchar4_normalized",
+        Format::Char2Normalized => "vertex_format_char2_normalized",
+        Format::Char3Normalized => "vertex_format_char3_normalized",
+        Format::Char4Normalized => "vertex_format_char4_normalized",
+        Format::UShort2 => "vertex_format_ushort2",
+        Format::UShort3 => "vertex_format_ushort3",
+        Format::UShort4 => "vertex_format_ushort4",
+        Format::Short2 => "vertex_format_short2",
+        Format::Short3 => "vertex_format_short3",
+        Format::Short4 => "vertex_format_short4",
+        Format::UShort2Normalized => "vertex_format_ushort2_normalized",
+        Format::UShort3Normalized => "vertex_format_ushort3_normalized",
+        Format::UShort4Normalized => "vertex_format_ushort4_normalized",
+        Format::Short2Normalized => "vertex_format_short2_normalized",
+        Format::Short3Normalized => "vertex_format_short3_normalized",
+        Format::Short4Normalized => "vertex_format_short4_normalized",
+        Format::Half2 => "vertex_format_half2",
+        Format::Half3 => "vertex_format_half3",
+        Format::Half4 => "vertex_format_half4",
+        Format::Float => "vertex_format_float",
+        Format::Float2 => "vertex_format_float2",
+        Format::Float3 => "vertex_format_float3",
+        Format::Float4 => "vertex_format_float4",
+        Format::Int => "vertex_format_int",
+        Format::Int2 => "vertex_format_int2",
+        Format::Int3 => "vertex_format_int3",
+        Format::Int4 => "vertex_format_int4",
+        Format::UInt => "vertex_format_uint",
+        Format::UInt2 => "vertex_format_uint2",
+        Format::UInt3 => "vertex_format_uint3",
+        Format::UInt4 => "vertex_format_uint4",
+        Format::Int1010102Normalized => "vertex_format_int1010102_normalized",
+        Format::UInt1010102Normalized => "vertex_format_uint1010102_normalized",
+        Format::UChar4NormalizedBgra => "vertex_format_uchar4_normalized_bgra",
+        Format::UChar => "vertex_format_uchar",
+        Format::Char => "vertex_format_char",
+        Format::UCharNormalized => "vertex_format_uchar_normalized",
+        Format::CharNormalized => "vertex_format_char_normalized",
+        Format::UShort => "vertex_format_ushort",
+        Format::Short => "vertex_format_short",
+        Format::UShortNormalized => "vertex_format_ushort_normalized",
+        Format::ShortNormalized => "vertex_format_short_normalized",
+        Format::Half => "vertex_format_half",
+        Format::FloatRg11B10 => "vertex_format_float_rg11b10",
+        Format::FloatRgb9E5 => "vertex_format_float_rgb9e5",
     }
 }
 

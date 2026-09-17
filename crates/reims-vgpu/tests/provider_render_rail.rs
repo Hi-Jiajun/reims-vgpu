@@ -3062,6 +3062,98 @@ fn the_widening_splits_are_counted_under_their_own_names() {
     );
 }
 
+/// The census reads *which storage* a draw declared, by name (R-VF1).
+///
+/// The gate's own sentence names the canonical set and not the value that met
+/// it, and the v10 failure log carries no other field that would: 26233 of
+/// 93259 seam rows are one sentence, one slug and one `(slug, shape)` row. So
+/// the reading is a route per declared format, and this test pins the three
+/// halves that make it a reading rather than a counter somebody wired:
+///
+/// * every format the protocol names has its own route, spelled
+///   `vertex_format_<name>` — two storages sharing a key would collapse the
+///   distribution the widening order is sized on;
+/// * the archetypal refused storage (`UChar4Normalized`, the format the class's
+///   own tests use as "outside the canonical set") is charged for a request the
+///   format gate refuses, because the counters are the *declaration*
+///   population: charged before any condition answers, at the same place the
+///   attribute-count band is;
+/// * an admitted storage (`float2`, the reviewed stream) is charged for the same
+///   reason, so the admitted and refused halves of the distribution line up.
+#[test]
+fn the_declared_vertex_formats_are_counted_under_their_own_names() {
+    use reims_vgpu::backend::provider_render::vertex_format_route;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
+    let submit = |inputs: &RenderRailInputs<'_>, req: &DrawRequest| {
+        let _ = provider_render::submit_render(inputs, req);
+    };
+
+    let mut routes: Vec<&'static str> = Vec::new();
+    for format in VertexAttributeFormat::ALL {
+        let route = vertex_format_route(format);
+        assert_eq!(
+            route,
+            format!("vertex_format_{}", format.name()),
+            "{} is named after the protocol's own spelling",
+            format.ordinal()
+        );
+        assert!(
+            !routes.contains(&route),
+            "two formats share the route {route}"
+        );
+        routes.push(route);
+    }
+    assert_eq!(
+        routes.len(),
+        VertexAttributeFormat::ALL.len(),
+        "every format the protocol names gets exactly one route"
+    );
+    // The four storages the canonical class admits name their own routes, and
+    // so does the storage its own tests use as the archetypal refusal.
+    assert_eq!(
+        vertex_format_route(VertexAttributeFormat::parse(29).expect("Float2 is a vertex format")),
+        "vertex_format_float2"
+    );
+    assert_eq!(
+        vertex_format_route(VertexAttributeFormat::parse(27).expect("Half4 is a vertex format")),
+        "vertex_format_half4"
+    );
+    assert_eq!(
+        vertex_format_route(
+            VertexAttributeFormat::parse(9).expect("UChar4Normalized is a vertex format")
+        ),
+        "vertex_format_uchar4_normalized"
+    );
+
+    // A request the format gate refuses is still in the reading: the sentence
+    // says "a vertex attribute outside the canonical format set", and the route
+    // is what says which one.
+    let refused_before = count("vertex_format_uchar4_normalized");
+    let mut refused = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    refused.vertex_attributes[0].format =
+        VertexAttributeFormat::parse(9).expect("UChar4Normalized is a vertex format");
+    submit(&inputs(&stages, RenderChainRole::SoleOrTail), &refused);
+    assert_eq!(
+        count("vertex_format_uchar4_normalized"),
+        refused_before + 1,
+        "the refused storage is counted by name"
+    );
+
+    // And an admitted one is counted beside it, so the two halves of the
+    // distribution are the same measurement.
+    let admitted_before = count("vertex_format_float2");
+    let admitted = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    submit(&inputs(&stages, RenderChainRole::SoleOrTail), &admitted);
+    assert_eq!(
+        count("vertex_format_float2"),
+        admitted_before + 1,
+        "the admitted storage is counted in the same population"
+    );
+}
+
 /// The boundary R6 measured, now closed on this seam by adopting the device's
 /// own capability answer (R8b).
 ///
