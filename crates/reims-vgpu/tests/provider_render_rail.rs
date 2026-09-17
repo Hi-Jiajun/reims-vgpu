@@ -21,14 +21,18 @@
 
 #![cfg(feature = "provider-render")]
 
-use metal_api_core::provider::{AttachmentFormat, ComputeProvider, VertexFormat};
+use metal_api_core::provider::{
+    AttachmentFormat, ComputeProvider, FieldValue, RenderPipelineContract, SemanticDigest,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep,
+};
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
-    RenderStage, SpirvFeaturePolicy, TranslatedRenderStage, VulkanComputeProvider, VulkanExecutor,
+    RenderStage, SpirvFeaturePolicy, TranslatedRenderPipelineRequest, TranslatedRenderStage,
+    VulkanComputeProvider, VulkanExecutor,
 };
 use reims_vgpu::backend::provider_render::{
     self, PresentSurfaceKey, ProviderRenderDecline, RenderChainRole, RenderPresentRequest,
-    RenderRailInputs, RenderRailOutcome,
+    RenderRailInputs, RenderRailOutcome, StageBufferDeclaration, StageBufferDeclarationClass,
 };
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
@@ -94,11 +98,18 @@ fn fixture(name: &str) -> Vec<u8> {
 /// the two must be the same bytes; the entry names and the reflected attribute
 /// locations are what the seam would take from `CachedShader::reflection` and
 /// hands the rail as inputs.
+#[derive(Clone)]
 struct Stages {
     air: (Vec<u8>, Vec<u8>),
     vertex_entry: &'static str,
     fragment_entry: &'static str,
     vertex_attribute_locations: Vec<u32>,
+    /// The `[[buffer(N)]]` arguments each stage's reflection declares (R9b),
+    /// the other reflected fact the class gate reads. Empty for every fixture
+    /// whose stages are the reviewed `[[stage_in]]` shapes; the buffer fixtures
+    /// below fill them from the translation itself, never by hand.
+    vertex_stage_buffer_declarations: Vec<StageBufferDeclaration>,
+    fragment_stage_buffer_declarations: Vec<StageBufferDeclaration>,
 }
 
 /// The reviewer's solid-colour fragment, shared by every vertex fixture here.
@@ -110,6 +121,8 @@ fn stages(vertex_fixture: &str, vertex_entry: &'static str, locations: &[u32]) -
         vertex_entry,
         fragment_entry: FRAGMENT_ENTRY,
         vertex_attribute_locations: locations.to_vec(),
+        vertex_stage_buffer_declarations: Vec::new(),
+        fragment_stage_buffer_declarations: Vec::new(),
     }
 }
 
@@ -336,6 +349,8 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         fragment_entry: Some(stages.fragment_entry),
         role,
         vertex_attribute_locations: &stages.vertex_attribute_locations,
+        vertex_stage_buffer_declarations: &stages.vertex_stage_buffer_declarations,
+        fragment_stage_buffer_declarations: &stages.fragment_stage_buffer_declarations,
         present: None,
     }
 }
@@ -977,13 +992,31 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     });
     class(&req);
 
-    // A storage buffer, a sampled image and an occlusion query.
+    // A storage buffer, a sampled image and an occlusion query. The buffer arm
+    // moved in R9b: a *bind* no stage declares is admitted (its bytes cannot
+    // reach either rail's frame — see
+    // `stage_buffers_no_stage_declares_leave_for_the_provider_and_agree_with_the_engine`),
+    // and what stays on the engine is a stage whose own translation declares a
+    // `[[buffer(N)]]` argument. Both halves are pinned here so the pair cannot
+    // drift into "buffers are out of class" again.
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.storage_buffers.push(engine::StorageBufferResource {
         binding: 0,
         content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16])),
     });
-    class(&req);
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("a bind no stage declares is in class: {other:?}"),
+    }
+    let declared = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
+    match provider_render::submit_render(&inputs(&declared, RenderChainRole::SoleOrTail), &req) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_stage_buffer_read",
+            "a stage that declares a buffer argument stays on the engine: {reason}"
+        ),
+        other => panic!("a declared stage buffer is out of class: {other:?}"),
+    }
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.samplers.push(SamplerResource::normalized_default(0));
     class(&req);
@@ -3268,4 +3301,523 @@ fn the_canonical_rails_asymmetric_frame_is_the_engines_own_frame() {
         "the fixture's own frame has to differ from its rows reversed: a shape whose two \
          readings agree would make this pair's expectation vacuous"
     );
+}
+/// A stage pair whose fragment half declares a `[[buffer(0)]]` argument, with
+/// the class gate's declaration list taken from the fixture's *own* translation
+/// (R9b).
+///
+/// `provider_render_rail`'s other fixtures are the `[[stage_in]]` shapes, whose
+/// reflections declare no buffer at all; this one is the fixture that does, so
+/// the gate's input here is the fact the runtime would hand it rather than a
+/// second spelling of it. The vertex half stays the reviewed one — the draw is
+/// otherwise an admitted shape, which is what makes the answer about the
+/// fragment declaration alone.
+fn buffer_declaring_stages(fragment_fixture: &str, fragment_entry: &'static str) -> Stages {
+    let mut stages = Stages {
+        air: (fixture("reims_indexed_tri.air"), fixture(fragment_fixture)),
+        vertex_entry: "reims_indexed_vertex",
+        fragment_entry,
+        vertex_attribute_locations: vec![0],
+        vertex_stage_buffer_declarations: Vec::new(),
+        fragment_stage_buffer_declarations: Vec::new(),
+    };
+    stages.vertex_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.0, RenderStage::Vertex, stages.vertex_entry);
+    stages.fragment_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.1, RenderStage::Fragment, stages.fragment_entry);
+    stages
+}
+
+/// The `[[buffer(N)]]` arguments one fixture's stage really declares, read back
+/// from the canonical translation the provider will run.
+///
+/// The mapping from `metal2vulkan`'s access answer to the seam's class
+/// vocabulary is the one `backend/vulkan/pipeline_resolve.rs::
+/// stage_buffer_declarations` applies in production; it is re-stated here only
+/// so a test can hand the gate the *measured* fact of a fixture, and the
+/// expectation it is compared against in each test below is written by hand —
+/// so a fixture whose reflection moves fails the assertion instead of quietly
+/// changing what the seam is asked about.
+fn declared_stage_buffers(
+    air: &[u8],
+    stage: RenderStage,
+    entry: &str,
+) -> Vec<StageBufferDeclaration> {
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let device =
+        Device::new(std::sync::Arc::clone(&executor) as std::sync::Arc<dyn ComputeExecutor>);
+    let function = device
+        .new_library_with_binary_air(air.to_vec())
+        .expect("the fixture is a binary AIR module")
+        .function(entry)
+        .expect("the fixture's entry exists");
+    let translated =
+        TranslatedRenderStage::translate(stage, &function).expect("the fixture translates");
+    translated
+        .reflection()
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == metal2vulkan::reflect::ResourceKind::Buffer)
+        .map(|binding| StageBufferDeclaration {
+            index: binding.metal_index,
+            class: match binding.access {
+                Some(metal2vulkan::reflect::ResourceAccess::Unused) => {
+                    StageBufferDeclarationClass::Unused
+                }
+                Some(metal2vulkan::reflect::ResourceAccess::ReadOnly) => {
+                    StageBufferDeclarationClass::ReadOnly
+                }
+                Some(
+                    metal2vulkan::reflect::ResourceAccess::WriteOnly
+                    | metal2vulkan::reflect::ResourceAccess::ReadWrite,
+                ) => StageBufferDeclarationClass::Writable,
+                Some(
+                    metal2vulkan::reflect::ResourceAccess::Sampled
+                    | metal2vulkan::reflect::ResourceAccess::Storage,
+                )
+                | None => StageBufferDeclarationClass::Unknown,
+            },
+        })
+        .collect()
+}
+
+/// R9b, first half: a draw whose stages bind buffers that neither stage's
+/// translation declares leaves for the provider — and the two rails land the
+/// same bytes, because the bytes that differ are the bytes no stage reads.
+///
+/// This is the population the v2 census's 99.3% door held. The door was
+/// `!req.storage_buffers.is_empty()` with the sentence "the canonical render
+/// contract has no buffer bindings for a pipeline"; the contract states them now
+/// (v83), but a *translated* stage that names a buffer is still refused by the
+/// provider's registration, and a request whose binds fill indices neither stage
+/// names needs no declaration at all — the pipeline-level buffer face is about
+/// the shader's interface, and these binds are not in it. The engine's own bind
+/// path already serves exactly this population without reading it: an index the
+/// reflection does not mention is `ReflectedBufferAccess::Absent`, and the
+/// engine either stages those bytes or hands the bind the neutral page, while
+/// nothing in the module dereferences it.
+///
+/// Falsifiability, both directions, so the equality cannot be the equality of
+/// two frames nobody drew:
+///
+/// - the bound bytes move and the frame does *not* — on both rails, which is
+///   the statement that these binds carry no semantics for either one;
+/// - the position stream beside them moves and the frame *does*.
+#[test]
+fn stage_buffers_no_stage_declares_leave_for_the_provider_and_agree_with_the_engine() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let binds = |word: u8| {
+        vec![
+            // A vertex bind at 5 and a fragment bind at 7: indices no
+            // `[[buffer(N)]]` argument of this pair names. The two stages'
+            // index spaces are independent in Metal, so the pair is stated with
+            // one bind in each — the shape the census's `buffers` door was
+            // counting without being able to split it.
+            engine::StorageBufferResource {
+                binding: 5,
+                content: BufferContent::Bytes(std::sync::Arc::new(vec![word; 64])),
+            },
+            engine::StorageBufferResource {
+                binding: 7,
+                content: BufferContent::Bytes(std::sync::Arc::new(vec![!word; 64])),
+            },
+        ]
+    };
+    let request = |word: u8, specs: &[StreamSpec]| {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, specs);
+        req.storage_buffers = binds(word);
+        req
+    };
+
+    let before = route_count("draw_stage_buffers_2_4");
+    let provider = provider_pixels(
+        "binds no stage declares",
+        &stages,
+        &request(0x00, &position_streams()),
+    );
+    assert_solid("binds no stage declares", &provider);
+    assert_eq!(
+        route_count("draw_stage_buffers_2_4"),
+        before + 1,
+        "the bound-buffer band is charged once per request the gate is handed"
+    );
+    let Some(engine) = engine_pixels(
+        "binds no stage declares",
+        &stages,
+        request(0x00, &position_streams()),
+    ) else {
+        return;
+    };
+    // The engine's own frame for the same shape: the binds are the only
+    // difference from the reviewed request this suite already compares.
+    assert_solid("binds no stage declares (engine)", &engine);
+    assert_frames_equal(
+        "canonical provider vs engine, two undeclared stage buffers",
+        &provider,
+        &engine,
+    );
+
+    // The same shape with other bytes behind those binds: neither rail may
+    // move. This is also the negative control for the two binds' *indices*
+    // mattering: a rail that bound them into the descriptors its module does
+    // declare would land a different frame here.
+    let provider_other = provider_pixels(
+        "binds no stage declares, other bytes",
+        &stages,
+        &request(0xa5, &position_streams()),
+    );
+    assert_frames_equal(
+        "the undeclared binds' bytes do not reach the frame (provider)",
+        &provider_other,
+        &provider,
+    );
+    let Some(engine_other) = engine_pixels(
+        "binds no stage declares, other bytes",
+        &stages,
+        request(0xa5, &position_streams()),
+    ) else {
+        return;
+    };
+    assert_frames_equal(
+        "the undeclared binds' bytes do not reach the frame (engine)",
+        &engine_other,
+        &engine,
+    );
+
+    // The positive control: the *declared* interface beside the binds still
+    // decides the frame, so the equality above is a statement about these binds
+    // and not about a draw whose inputs stopped arriving.
+    let moved = provider_pixels(
+        "declared interface beside the binds",
+        &stages,
+        &request(0x00, &[stream(0, &[(0.25, 0.0); 3])]),
+    );
+    assert_frames_differ(
+        "the declared stream still reaches the frame",
+        &moved,
+        &provider,
+    );
+}
+/// R9b, other half: a stage whose own translation *declares* a `[[buffer(N)]]`
+/// argument keeps the draw on the engine, under the bucket its access names —
+/// and the reason is measured on this machine rather than asserted here, by
+/// handing the very same pair to the canonical provider's *translated*
+/// registration and reading the refusal it answers with.
+///
+/// Two facts make this the honest answer rather than a narrowing:
+///
+/// 1. the provider refuses a translated stage whose reflection names a buffer
+///    (`render_stage_unsupported_interface`, field `bindings`) whatever the
+///    access — the stage-level gate, before any descriptor exists;
+/// 2. its execution gate serves the pipeline-level buffer face through the
+///    *reviewed* `stage_buffer_positions` / `stage_buffer_tint` pair alone
+///    (`render_stage_buffer_stage_unsupported` otherwise), and this rail's
+///    stages are the request's translated ones by construction.
+///
+/// A refusal at the provider is a *decline* in this rail, not a fallback, so a
+/// class that admitted this shape would turn a draw the engine executes into
+/// one that fails. It stays on the engine by name instead, and the name is the
+/// access class, so the next census can read which increment lifts it.
+#[test]
+fn a_stage_that_declares_a_buffer_argument_stays_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
+    assert!(
+        stages.vertex_stage_buffer_declarations.is_empty(),
+        "the reviewed vertex fixture declares no buffer: {:#?}",
+        stages.vertex_stage_buffer_declarations
+    );
+    assert_eq!(
+        stages.fragment_stage_buffer_declarations,
+        vec![StageBufferDeclaration {
+            index: 0,
+            class: StageBufferDeclarationClass::ReadOnly,
+        }],
+        "the buffer fixture's own translation declares one read-only buffer at index 0"
+    );
+
+    // The request binds what the stage declares — the shape the census counted,
+    // and the shape the class has to answer before the provider is asked.
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.storage_buffers.push(engine::StorageBufferResource {
+        binding: 0,
+        content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16])),
+    });
+    let before = route_count("render_provider_out_of_class_stage_buffer_read");
+    let reason =
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => reason,
+            other => panic!("a declared stage buffer keeps the draw on the engine: {other:?}"),
+        };
+    assert_eq!(
+        reason.slug(),
+        "render_provider_out_of_class_stage_buffer_read",
+        "the bucket is the access class the stage's reflection reported"
+    );
+    eprintln!("declared stage buffer: {}", reason.detail());
+    assert!(
+        reason.detail().contains("[[buffer(0)]]") && reason.detail().contains("1 stage buffer"),
+        "the sentence names the declaration and the request's bind count: {}",
+        reason.detail()
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_read"),
+        before + 1,
+        "the four buckets are counters, not latches"
+    );
+
+    // The two provider-side facts the bucket stands on, measured on the same
+    // pair through the canonical provider's public registration entry point.
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let provider = VulkanComputeProvider::with_executor(std::sync::Arc::clone(&executor))
+        .expect("the canonical provider builds");
+    let device =
+        Device::new(std::sync::Arc::clone(&executor) as std::sync::Arc<dyn ComputeExecutor>);
+    let policy = provider.spirv_feature_policy();
+    let translate = |air: &[u8], stage: RenderStage, entry: &str| {
+        let function = device
+            .new_library_with_binary_air(air.to_vec())
+            .expect("the fixture is a binary AIR module")
+            .function(entry)
+            .expect("the fixture's entry exists");
+        TranslatedRenderStage::translate_with_policy(stage, &function, policy)
+            .expect("the fixture translates under this device's policy")
+    };
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: stages.vertex_entry.to_owned(),
+                fragment_entry: stages.fragment_entry.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
+                    stride: 8,
+                    step: VertexStep::PerVertex,
+                    attributes: vec![VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                }]),
+                // The contract half is *not* what refuses this pair: the E-side
+                // registration refuses the translated stage itself, which is
+                // why the class cannot answer by stating a declaration.
+                stage_buffers: Vec::new(),
+            },
+            vertex: translate(&stages.air.0, RenderStage::Vertex, stages.vertex_entry),
+            fragment: translate(&stages.air.1, RenderStage::Fragment, stages.fragment_entry),
+            logical_digest: SemanticDigest::new(
+                "reims-provider-render-rail-v1",
+                b"declared-stage-buffer-interface".to_vec(),
+            )
+            .expect("the digest names a case"),
+        })
+        .expect_err("a translated stage that declares a buffer is outside this rail's interface");
+    eprintln!("provider answer for the declared-buffer pair: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_unsupported_interface");
+    assert_eq!(
+        refused.fields.get("stage"),
+        Some(&FieldValue::Text("fragment".to_owned())),
+        "the refusal names the stage whose interface it is about: {refused:?}"
+    );
+    assert_eq!(
+        refused.fields.get("field"),
+        Some(&FieldValue::Text("bindings".to_owned())),
+        "and the reflected field that is not carried yet: {refused:?}"
+    );
+
+    // The shape this class keeps on the engine is a shape the engine *draws*:
+    // the declared binding's own bytes reach its frame, which is what makes the
+    // answer above a fallback rather than a dead end. The fixture's fragment
+    // stores the buffer's first `float32` in red, so a zeroed bind lands
+    // `00 00 00 ff` and `1.0f` lands `ff 00 00 ff`.
+    let framed = |word: [u8; 4]| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        let mut bytes = vec![0u8; 16];
+        bytes[..4].copy_from_slice(&word);
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: BufferContent::Bytes(std::sync::Arc::new(bytes)),
+        });
+        req
+    };
+    let Some(zeroed) = engine_pixels(
+        "declared stage buffer, zeroed",
+        &stages,
+        framed([0, 0, 0, 0]),
+    ) else {
+        return;
+    };
+    let Some(one) = engine_pixels(
+        "declared stage buffer, 1.0f",
+        &stages,
+        framed([0, 0, 0x80, 0x3f]),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        texel_at(&zeroed, 0, 0),
+        [0, 0, 0, 255],
+        "the engine draws the fragment the declared binding names"
+    );
+    assert_eq!(
+        texel_at(&one, 0, 0),
+        [255, 0, 0, 255],
+        "and the bytes behind that declaration are the fragment's own source"
+    );
+    assert_frames_differ(
+        "the declared buffer's bytes reach the engine's frame",
+        &one,
+        &zeroed,
+    );
+}
+
+/// The door's four buckets, each its own counter: the access the declaring
+/// stage's reflection reports decides which increment lifts the population, so
+/// the census has to be able to read them apart (`research/docs/26` §R9b).
+///
+/// Three arms are driven by a real fixture whose `[[buffer(0)]]` metadata states
+/// that access, so the split is measured against modules rather than against the
+/// seam's own vocabulary: an unread declaration must not be counted as a read
+/// one, and a writable one — the arm the canonical contract refuses before
+/// admission — must not hide inside the read population.
+///
+/// The fourth arm, `Unknown`, is the one no fixture here can state: a shader
+/// body that reads its buffer makes `metal2vulkan` reflect `ReadOnly` from the
+/// emitted module's own decoration whatever the metadata omitted, so the arm is
+/// handed to the gate directly. It is still a separate bucket, which is the
+/// property this test is about — an unclassified declaration must not be counted
+/// as a read one.
+#[test]
+fn the_stage_buffer_door_splits_its_population_four_ways() {
+    let _guard = engine_test_session();
+    let bases = reviewed_stages();
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.storage_buffers.push(engine::StorageBufferResource {
+        binding: 0,
+        content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16])),
+    });
+    let slug = |class| match class {
+        StageBufferDeclarationClass::Unused => (
+            "render_provider_out_of_class_stage_buffer_unused",
+            Some(("render_frag_buffer_unused.air", "reims_unused_buffer_frag")),
+        ),
+        StageBufferDeclarationClass::ReadOnly => (
+            "render_provider_out_of_class_stage_buffer_read",
+            Some(("render_frag_buffer.air", "reims_buffer_frag")),
+        ),
+        StageBufferDeclarationClass::Writable => (
+            "render_provider_out_of_class_stage_buffer_write",
+            Some(("render_frag_buffer_write.air", "reims_write_buffer_frag")),
+        ),
+        StageBufferDeclarationClass::Unknown => {
+            ("render_provider_out_of_class_stage_buffer_unknown", None)
+        }
+    };
+
+    for class in [
+        StageBufferDeclarationClass::Unused,
+        StageBufferDeclarationClass::ReadOnly,
+        StageBufferDeclarationClass::Writable,
+        StageBufferDeclarationClass::Unknown,
+    ] {
+        let (bucket, module) = slug(class);
+        let mut stages = bases.clone();
+        match module {
+            Some((fixture_name, entry)) => {
+                stages.air.1 = fixture(fixture_name);
+                stages.fragment_entry = entry;
+                stages.fragment_stage_buffer_declarations =
+                    declared_stage_buffers(&stages.air.1, RenderStage::Fragment, entry);
+                assert_eq!(
+                    stages.fragment_stage_buffer_declarations,
+                    vec![StageBufferDeclaration { index: 0, class }],
+                    "{fixture_name} declares one buffer of its own access class at index 0"
+                );
+            }
+            None => {
+                stages.fragment_stage_buffer_declarations =
+                    vec![StageBufferDeclaration { index: 0, class }];
+            }
+        }
+        let before = route_count(bucket);
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(
+                    reason.slug(),
+                    bucket,
+                    "{class:?} is its own bucket: {reason}"
+                );
+                assert!(
+                    reason.detail().contains("[[buffer(0)]]"),
+                    "the sentence names the declaration: {reason}"
+                );
+            }
+            other => panic!("{class:?} is out of class: {other:?}"),
+        }
+        assert_eq!(
+            route_count(bucket),
+            before + 1,
+            "{class:?} charges its own bucket exactly once"
+        );
+    }
+
+    // The vertex stage's declarations are the same four buckets, and a
+    // declaration there is answered before the fragment's: one request, both
+    // stages declaring, and the vertex bucket is the one that moves.
+    let mut stages = bases.clone();
+    stages.vertex_stage_buffer_declarations = vec![StageBufferDeclaration {
+        index: 2,
+        class: StageBufferDeclarationClass::ReadOnly,
+    }];
+    stages.fragment_stage_buffer_declarations = vec![StageBufferDeclaration {
+        index: 3,
+        class: StageBufferDeclarationClass::Writable,
+    }];
+    let vertex_bucket = route_count("render_provider_out_of_class_stage_buffer_read");
+    let fragment_bucket = route_count("render_provider_out_of_class_stage_buffer_write");
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_stage_buffer_read",
+            "the vertex half answers first: {reason}"
+        ),
+        other => panic!("a declared vertex buffer keeps the draw on the engine: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_read"),
+        vertex_bucket + 1
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_write"),
+        fragment_bucket,
+        "the stage that did not answer does not charge a bucket"
+    );
+
+    // And the admitted arm charges none of them: the buckets are the door's
+    // refusals, not the population it lets through.
+    let clean = reviewed_stages();
+    let before: Vec<u64> = [
+        StageBufferDeclarationClass::Unused,
+        StageBufferDeclarationClass::ReadOnly,
+        StageBufferDeclarationClass::Writable,
+        StageBufferDeclarationClass::Unknown,
+    ]
+    .iter()
+    .map(|class| route_count(slug(*class).0))
+    .collect();
+    match provider_render::submit_render(&inputs(&clean, RenderChainRole::SoleOrTail), &req) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("the undeclared binds are in class: {other:?}"),
+    }
+    let after: Vec<u64> = [
+        StageBufferDeclarationClass::Unused,
+        StageBufferDeclarationClass::ReadOnly,
+        StageBufferDeclarationClass::Writable,
+        StageBufferDeclarationClass::Unknown,
+    ]
+    .iter()
+    .map(|class| route_count(slug(*class).0))
+    .collect();
+    assert_eq!(before, after, "an admitted draw charges no door bucket");
 }

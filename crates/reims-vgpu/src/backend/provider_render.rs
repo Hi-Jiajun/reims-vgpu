@@ -67,8 +67,18 @@
 //!   (`register_translated_render_pipeline`), which checks each stage's
 //!   reflection against the contract field by field;
 //! - no depth, stencil, MSAA, MRT, resolve, blend, colour write mask,
-//!   occlusion query, sampled image, sampler or storage buffer — and every one
-//!   of those is a *reason*, not a silent downgrade;
+//!   occlusion query, sampled image or sampler — and every one of those is a
+//!   *reason*, not a silent downgrade;
+//! - **stage buffers by the stage's own interface** (R9b): a request whose
+//!   stages bind buffers directly is the v2 census's 99.3% door, and the door
+//!   now answers by what each stage's *translation* declares rather than by
+//!   the presence of the binds. Neither stage declaring a `[[buffer(N)]]`
+//!   argument means the binds fill indices no descriptor can be needed for, so
+//!   the canonical pass declares and binds nothing for them and the draw is
+//!   admitted; a stage that declares one keeps the draw on the engine under
+//!   the bucket its own access names (`StageBufferDeclaration`,
+//!   `stage_buffer_gate`), because the canonical rail executes its
+//!   pipeline-level buffer face through the reviewed fixture pair alone;
 //! - **a present tail, when the caller states one** (R4b): the record owns the
 //!   packet's frame and hands it to the display rail, so the canonical pass
 //!   *presents* the provider's own target for the guest surface the frame lands
@@ -383,6 +393,96 @@ fn attribute_locations_match(attributes: &[VertexAttributeResource], reflected: 
             .all(|attribute| reflected.contains(&attribute.location))
 }
 
+/// The stage-buffer gate: the v2 census's 99.3% door, answered by what each
+/// stage's own translation declares (`research/docs/23` §3.3, v83 /
+/// `research/docs/26` §R9b).
+///
+/// The door used to be one condition — `!req.storage_buffers.is_empty()` — and
+/// it kept every draw whose stages bind buffers on the engine, with the
+/// sentence "the canonical render contract has no buffer bindings for a
+/// pipeline". The contract has that face now (the E side's
+/// `RenderPipelineContract::stage_buffers` / `RenderPassDescriptor::
+/// stage_buffers`), but this rail registers through the *translated* gate, and
+/// two refusals stand between a translated stage and that face. Both are
+/// properties of the *stage*, not of the request:
+///
+/// 1. **registration** refuses a translated stage whose reflection names a
+///    buffer at all — `render_stage_unsupported_interface`, field `bindings`,
+///    whatever the access and whether or not the entry point dereferences it
+///    (`metal-api-vulkan`'s `unsupported_interface_field`). The
+///    translated-stage-buffer interface is the increment that lifts this;
+/// 2. **execution** accepts a pass's stage buffers only when its vertex stage
+///    *is* the reviewed `stage_buffer_positions` module and its fragment stage
+///    the reviewed tint module — `render_stage_buffer_stage_unsupported`
+///    otherwise — so a pass whose stages are translated could not be executed
+///    even if the registration let it through.
+///
+/// So the fact this gate answers on is whether either stage declares a
+/// `[[buffer(N)]]` argument, and the split is by the declaring stage's own
+/// access class, in the vocabulary the engine's bind census already counts
+/// (`access_unused` / `access_dereferenced` / `access_undeclared`) and the
+/// canonical contract already states (`BufferAccess`):
+///
+/// - **neither stage declares one**: every bound stage buffer fills an index no
+///   descriptor can be needed for, so the canonical pass declares and binds
+///   none of them and the draw leaves for the provider. Both rails land the
+///   same bytes for it, because the bytes that differ are the bytes no stage
+///   reads — which is the falsifiable half of this population (`provider_
+///   render_rail.rs`: the sentinel bind moves nothing, the stream bytes beside
+///   it move the frame);
+/// - **a stage declares one**: the draw stays on the engine under the bucket
+///   its declaration's access names, so the census says which increment lifts
+///   it instead of counting one 99.3% door.
+///
+/// The count of binds rides in the sentence rather than in the slug: the slug
+/// is the census bucket and has to stay a property of the *shape*, while the
+/// count is a property of this request.
+fn stage_buffer_gate(inputs: &RenderRailInputs<'_>, binds: usize) -> Result<(), OutOfClass> {
+    for (stage, declarations) in [
+        ("vertex", inputs.vertex_stage_buffer_declarations),
+        ("fragment", inputs.fragment_stage_buffer_declarations),
+    ] {
+        // One declaration anywhere in either stage is enough to keep the draw
+        // on the engine, and the vertex half is asked first: that is the order
+        // the contract states its two buffers in, and the order a reader of the
+        // sentence expects to see the stage named in.
+        let Some(declaration) = declarations.first() else {
+            continue;
+        };
+        let (slug, access) = match declaration.class {
+            StageBufferDeclarationClass::Unused => {
+                ("render_provider_out_of_class_stage_buffer_unused", "unused")
+            }
+            StageBufferDeclarationClass::ReadOnly => (
+                "render_provider_out_of_class_stage_buffer_read",
+                "read-only",
+            ),
+            StageBufferDeclarationClass::Writable => (
+                "render_provider_out_of_class_stage_buffer_write",
+                "writable",
+            ),
+            StageBufferDeclarationClass::Unknown => (
+                "render_provider_out_of_class_stage_buffer_unknown",
+                "of an unclassified access",
+            ),
+        };
+        return Err(OutOfClass::owned(
+            slug,
+            format!(
+                "a draw whose {stage} stage declares a [[buffer({})]] argument ({access}) stays \
+                 on the engine: the canonical contract states pipeline-level buffers (v83) but \
+                 its Vulkan rail executes that face through the reviewed stage-buffer pair \
+                 alone, and a translated stage that names a buffer is refused by name at \
+                 registration (`render_stage_unsupported_interface`, field `bindings`) before \
+                 any descriptor exists. The request binds {binds} stage buffer(s); the \
+                 translated-stage-buffer interface is the increment that lifts this population",
+                declaration.index,
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The allocation the colour attachment's declaring view lives in.
 ///
 /// Chosen far above the provider's own allocation counter so a render
@@ -693,6 +793,44 @@ impl RenderChainRole {
     }
 }
 
+/// What one stage's own translation says about a `[[buffer(N)]]` argument it
+/// declares (`research/docs/23` §3.3, v83 / `research/docs/26` §R9b).
+///
+/// The classes are the render bind census's own
+/// (`runtime::bind_phase`'s `access_unused` / `access_dereferenced` /
+/// `access_undeclared` over the engine's `ReflectedBufferAccess`) minus the one
+/// class that is no declaration at all: a bind reflection does not mention is
+/// *absent*, and that is exactly the population this class admits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StageBufferDeclarationClass {
+    /// Declared, and the specialized entry point never dereferences it. The
+    /// canonical registration still refuses the stage on the declaration's own
+    /// presence (`render_stage_unsupported_interface`, field `bindings`), so
+    /// this class names a population rather than a cheaper admission.
+    Unused,
+    /// Declared and read — `BufferAccess::Read`'s Metal spelling.
+    ReadOnly,
+    /// Declared and writable: the writeback landing neither rail carries for a
+    /// stage buffer yet.
+    Writable,
+    /// Declared without a usable access answer: fail closed, exactly as the
+    /// engine's own bind path does.
+    Unknown,
+}
+
+/// One `[[buffer(N)]]` argument one stage's translation declares.
+///
+/// The index is the stage's *own* Metal buffer index space — the one
+/// `setVertexBuffer(_:offset:index:)` and `setFragmentBuffer(_:offset:index:)`
+/// name, and the one the canonical contract's `StageBufferBinding::index`
+/// speaks — so a vertex declaration and a fragment declaration at one index are
+/// two different arguments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StageBufferDeclaration {
+    pub index: u32,
+    pub class: StageBufferDeclarationClass,
+}
+
 /// What one render submission needs to leave this rail: the two stage
 /// modules' AIR, the entries the translation reports for them, and this
 /// record's place in the chain it belongs to.
@@ -741,6 +879,19 @@ pub struct RenderRailInputs<'a> {
     /// — and every position or store this class cannot present keeps the engine
     /// by name.
     pub present: Option<RenderPresentRequest>,
+    /// The `[[buffer(N)]]` arguments each stage's own translation declares
+    /// (`CachedShader::reflection.bindings`, filtered to Metal's buffer kind),
+    /// with the access that reflection reports for each.
+    ///
+    /// Carried for the reason [`Self::vertex_attribute_locations`] is: the
+    /// canonical provider refuses a *translated* stage whose reflection names a
+    /// buffer (`render_stage_unsupported_interface`, field `bindings`, before
+    /// any descriptor exists) and executes stage buffers only through its
+    /// reviewed fixture pair — so a request whose stage declares one is a shape
+    /// this class does not execute, while a request whose stages declare none
+    /// leaves for the provider with its binds carried by nothing at all.
+    pub vertex_stage_buffer_declarations: &'a [StageBufferDeclaration],
+    pub fragment_stage_buffer_declarations: &'a [StageBufferDeclaration],
 }
 
 /// What one completed narrow-class submission returns.
@@ -1193,6 +1344,11 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     // count (`draw_vertex_streams_*`) and no reading of the declared attributes
     // the gate actually compares.
     crate::runtime::drain::note_store_route(attribute_count_route(req.vertex_attributes.len()));
+    // The bound stage-buffer axis (R9b), charged for the same reason and at the
+    // same place: the door's four buckets answer *why* a draw stayed on the
+    // engine, and this answers *how many* buffers were behind it — the split
+    // the v2 census could not make (its §7.3).
+    crate::runtime::drain::note_store_route(stage_buffer_count_route(req.storage_buffers.len()));
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(inputs, req) {
@@ -1244,6 +1400,26 @@ pub fn attribute_count_route(declared: usize) -> &'static str {
         1 => "draw_vertex_attrs_1",
         2..=4 => "draw_vertex_attrs_2_4",
         _ => "draw_vertex_attrs_gt4",
+    }
+}
+
+/// The census band of one request's *bound* stage buffers (`research/docs/26`
+/// §R9b).
+///
+/// The census could say that 99.3% of a boot's draws hit the buffer door and
+/// nothing about the binds behind it — "`buffers` 不拆分 stage", its own §7.3 —
+/// because the seam had one boolean for the whole population. This is the
+/// reading that replaces the boolean: charged for every request the gate is
+/// handed, exactly as [`attribute_count_route`] is, so the band's population
+/// and the door's four buckets are the same draws. The bands break at the
+/// canonical contract's own `MAX_RENDER_STAGE_BUFFERS` (4), which is what makes
+/// "two to four" one arm rather than an arbitrary split.
+pub fn stage_buffer_count_route(binds: usize) -> &'static str {
+    match binds {
+        0 => "draw_stage_buffers_0",
+        1 => "draw_stage_buffers_1",
+        2..=4 => "draw_stage_buffers_2_4",
+        _ => "draw_stage_buffers_gt4",
     }
 }
 
@@ -1714,13 +1890,11 @@ fn narrow_class<'a>(
             "a depth or stencil state stays on the engine",
         ));
     }
-    if !req.storage_buffers.is_empty() {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_buffers",
-            "a pass whose stages bind buffers stays on the engine: the canonical render contract \
-             has no buffer bindings for a pipeline",
-        ));
-    }
+    // R9b: whether the request *binds* buffers is no longer the condition. What
+    // decides which rail executes the draw is whether either stage's own
+    // translation *declares* a `[[buffer(N)]]` argument, and both answers live
+    // in `stage_buffer_gate`.
+    stage_buffer_gate(inputs, req.storage_buffers.len())?;
     if !req.sampled_images.is_empty() || !req.samplers.is_empty() || req.color_input {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_sampling",
@@ -2293,6 +2467,15 @@ fn submit_narrow(
         // The v70 sampler channel: this class refuses sampled images, samplers
         // and color input before it ever gets here, so the pass binds none.
         textures: Vec::new(),
+        // The v83 stage-buffer half, empty by construction: the class admits a
+        // request whose binds fill indices neither stage declares
+        // (`stage_buffer_gate`), which is exactly the shape no stage buffer
+        // binding has to be stated for. A pass that *did* bind one would be
+        // refused here rather than executed: the canonical rail's execution
+        // gate serves the reviewed stage-buffer pair alone
+        // (`render_stage_buffer_stage_unsupported`), and this pass's stages are
+        // the request's translated ones.
+        stage_buffers: Vec::new(),
     };
     let trace = ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
@@ -2516,6 +2699,15 @@ fn register_render_pipeline(
         fragment_entry: pass.fragment_entry.clone(),
         color_formats: vec![pass.format],
         vertex_layout: pass.vertex_layout(),
+        // The v83 half this class does not state yet (R9b): a stage buffer
+        // declaration is a *shader interface*, and the class admits only the
+        // requests whose stages declare none, so an empty list is the whole
+        // truth about every contract it registers. Stating a declaration here
+        // would be inventing an interface: core pairs it with the pass's own
+        // list (`validate_against`), and the provider's translated
+        // registration refuses the stage that would have to read it
+        // (`render_stage_unsupported_interface`).
+        stage_buffers: Vec::new(),
     };
     let fingerprint = contract_fingerprint(&contract);
     let key = RenderPipelineKey {

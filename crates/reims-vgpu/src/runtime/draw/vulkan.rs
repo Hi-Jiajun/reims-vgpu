@@ -10130,6 +10130,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // instead of being answered by a provider that always refuses
                 // that shape.
                 vertex_attribute_locations: resolved.vertex_attribute_locations.as_ref(),
+                // R9b: the `[[buffer(N)]]` arguments each stage's own
+                // translation declares. The canonical provider refuses a
+                // *translated* stage whose reflection names a buffer at all, so
+                // this is the fact that decides whether a draw whose stages
+                // bind buffers can leave for it — and, when neither stage
+                // declares one, that the request's binds fill indices no
+                // descriptor is needed for.
+                vertex_stage_buffer_declarations: resolved
+                    .vertex_stage_buffer_declarations
+                    .as_ref(),
+                fragment_stage_buffer_declarations: resolved
+                    .fragment_stage_buffer_declarations
+                    .as_ref(),
                 // R4b, probe-gated: the present tail a record states when it is
                 // the one whose frame the guest displays and that frame lands in
                 // a named mapping. `None` is the pre-R4b device.

@@ -38,6 +38,13 @@
 use reims_vgpu_core::pipeline::{PipelineState, RefusalReason};
 use std::sync::{Arc, OnceLock};
 
+// The class gate's own vocabulary for one stage's declared `[[buffer(N)]]`
+// arguments (R9b). Imported rather than re-spelled: the seam that answers the
+// gate owns the type, and a second copy here would be a second answer to "what
+// does this stage declare".
+#[cfg(feature = "provider-render")]
+use crate::backend::provider_render::StageBufferDeclaration;
+
 use crate::backend::vulkan::engine::DrawPreparationDecline;
 use crate::model::{DeviceState, RailDeviceState, TaskReferenceStates};
 use crate::runtime::decode::resource::RenderPipelineDescriptor;
@@ -294,6 +301,20 @@ pub struct ResolvedRenderPipeline {
     /// entered for every draw on this backend.
     #[cfg(feature = "provider-render")]
     pub vertex_attribute_locations: Arc<[u32]>,
+    /// The `[[buffer(N)]]` arguments each stage's reflection declares, retained
+    /// and gated exactly as the attribute locations above (R9b).
+    ///
+    /// This is a *stage-level* fact and not a per-bind one: the canonical
+    /// provider refuses a translated stage whose reflection names a buffer at
+    /// all (`render_stage_unsupported_interface`, field `bindings`, whatever
+    /// the access), so one declaration anywhere in either stage decides that
+    /// the draw cannot leave for the provider — and the absence of all of them
+    /// is what lets a request whose stages bind buffers go there. Collected
+    /// once per resolved pipeline, like the locations beside it.
+    #[cfg(feature = "provider-render")]
+    pub vertex_stage_buffer_declarations: Arc<[StageBufferDeclaration]>,
+    #[cfg(feature = "provider-render")]
+    pub fragment_stage_buffer_declarations: Arc<[StageBufferDeclaration]>,
 }
 
 #[cfg(test)]
@@ -355,12 +376,62 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
         // what keeps this constructor from standing in for a real pipeline.
         #[cfg(feature = "provider-render")]
         vertex_attribute_locations: Arc::from(Vec::new()),
+        // Same shape for the stage-buffer declarations (R9b): the synthetic
+        // reflection declares no `[[buffer(N)]]` argument, so the rail's gate
+        // reads this constructor as "the stages name no buffer".
+        #[cfg(feature = "provider-render")]
+        vertex_stage_buffer_declarations: Arc::from(Vec::new()),
+        #[cfg(feature = "provider-render")]
+        fragment_stage_buffer_declarations: Arc::from(Vec::new()),
     })
 }
 
 #[cfg(test)]
 pub(crate) fn retained_pipeline_for_test() -> Arc<ResolvedRenderPipeline> {
     retained_pipeline_with_desc_for_test(RenderPipelineDescriptor::default())
+}
+
+/// The `[[buffer(N)]]` arguments one stage's reflection declares (`R9b`),
+/// carried to the canonical render rail's class gate.
+///
+/// Filtered to Metal's buffer kind at the one boundary that reads the
+/// translator's reflection, for the reason
+/// `runtime::spirv_bind::reflected_buffer_access` filters its own: a
+/// `metal_index` is unique only *within* a kind, so a texture at index 0 is not
+/// a buffer at index 0, and a gate that did not filter would keep every
+/// texture-binding stage on the engine under a buffer's name.
+///
+/// The access answer is mapped total, one arm per `ResourceAccess`, so a
+/// variant the translator gains later is a compile error here rather than a
+/// silently different class: the rail's gate answers a population per arm, and
+/// two arms collapsed into one would make the census say "unclassified" about a
+/// shape it *can* classify.
+#[cfg(feature = "provider-render")]
+fn stage_buffer_declarations(
+    reflection: &metal2vulkan::reflect::ShaderReflection,
+) -> Arc<[crate::backend::provider_render::StageBufferDeclaration]> {
+    use crate::backend::provider_render::{StageBufferDeclaration, StageBufferDeclarationClass};
+    use metal2vulkan::reflect::{ResourceAccess, ResourceKind};
+
+    reflection
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::Buffer)
+        .map(|binding| StageBufferDeclaration {
+            index: binding.metal_index,
+            class: match binding.access {
+                Some(ResourceAccess::Unused) => StageBufferDeclarationClass::Unused,
+                Some(ResourceAccess::ReadOnly) => StageBufferDeclarationClass::ReadOnly,
+                Some(ResourceAccess::WriteOnly | ResourceAccess::ReadWrite) => {
+                    StageBufferDeclarationClass::Writable
+                }
+                Some(ResourceAccess::Sampled | ResourceAccess::Storage) | None => {
+                    StageBufferDeclarationClass::Unknown
+                }
+            },
+        })
+        .collect::<Vec<_>>()
+        .into()
 }
 
 /// Whether retained pipeline states are on. See [`crate::config::PIPELINE_MEMO`].
@@ -708,6 +779,13 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         .map(|attribute| attribute.location)
         .collect::<Vec<u32>>()
         .into();
+    // The other reflection fact the canonical render rail's class gate reads
+    // (R9b), collected at the same place for the same reason: the reflection is
+    // memoized with the translation, and the gate runs on every draw.
+    #[cfg(feature = "provider-render")]
+    let vertex_stage_buffer_declarations = stage_buffer_declarations(&vertex.reflection);
+    #[cfg(feature = "provider-render")]
+    let fragment_stage_buffer_declarations = stage_buffer_declarations(&fragment.reflection);
     Ok(ResolvedRenderPipeline {
         pipeline_object: None,
         desc: Arc::new(desc),
@@ -725,6 +803,10 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         fragment_air: Arc::from(f_air.to_vec()),
         #[cfg(feature = "provider-render")]
         vertex_attribute_locations,
+        #[cfg(feature = "provider-render")]
+        vertex_stage_buffer_declarations,
+        #[cfg(feature = "provider-render")]
+        fragment_stage_buffer_declarations,
     })
 }
 
