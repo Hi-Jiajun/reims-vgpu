@@ -9964,7 +9964,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // a silent switch back to the engine.
         #[cfg(feature = "provider-render")]
         {
-            use crate::backend::provider_render::{self, RenderRailInputs, RenderRailOutcome};
+            use crate::backend::provider_render::{
+                self, RenderChainRole, RenderRailInputs, RenderRailOutcome,
+            };
             let inputs = RenderRailInputs {
                 vertex_air: resolved.vertex_air.as_ref(),
                 fragment_air: resolved.fragment_air.as_ref(),
@@ -9973,7 +9975,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // compute rail's `air_entry` does.
                 vertex_entry: resolved.vertex.reflection.entry_point.as_deref(),
                 fragment_entry: resolved.fragment.reflection.entry_point.as_deref(),
-                writeback_guest,
+                // This record's place in the packet the exec loop is walking:
+                // the store plan's `do_writeback` says where the frame goes,
+                // and `continues_render_pass` says whether a record precedes
+                // it. Both are the walk's own facts rather than this seam's —
+                // `writeback_guest` is the plan's answer, and the request
+                // carries the chain position (`render_pass_chain_position`).
+                role: RenderChainRole::of(writeback_guest, resources.continues_render_pass),
                 // The stage's own attribute locations, so a request whose
                 // declared streams disagree with them stays on the engine
                 // instead of being answered by a provider that always refuses

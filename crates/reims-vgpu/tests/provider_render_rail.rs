@@ -24,7 +24,7 @@
 use metal_api_core::provider::{AttachmentFormat, ComputeProvider, VertexFormat};
 use metal_api_vulkan::{VulkanComputeProvider, VulkanExecutor};
 use reims_vgpu::backend::provider_render::{
-    self, ProviderRenderDecline, RenderRailInputs, RenderRailOutcome,
+    self, ProviderRenderDecline, RenderChainRole, RenderRailInputs, RenderRailOutcome,
 };
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
@@ -308,13 +308,13 @@ fn request_with_streams(format: u16, specs: &[StreamSpec]) -> DrawRequest {
 /// `MTLVertexFormat::Float2`.
 const MTL_FORMAT_VERTEX_FLOAT2: u32 = 29;
 
-fn inputs<'a>(stages: &'a Stages, writeback_guest: bool) -> RenderRailInputs<'a> {
+fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a> {
     RenderRailInputs {
         vertex_air: &stages.air.0,
         fragment_air: &stages.air.1,
         vertex_entry: Some(stages.vertex_entry),
         fragment_entry: Some(stages.fragment_entry),
-        writeback_guest,
+        role,
         vertex_attribute_locations: &stages.vertex_attribute_locations,
     }
 }
@@ -348,7 +348,7 @@ fn translated(stages: &Stages, mut req: DrawRequest) -> DrawRequest {
 
 /// The canonical rail's own frame for one request, in semantic RGBA8.
 fn provider_pixels(label: &str, stages: &Stages, req: &DrawRequest) -> Vec<u8> {
-    match provider_render::submit_render(&inputs(stages, true), req) {
+    match provider_render::submit_render(&inputs(stages, RenderChainRole::SoleOrTail), req) {
         RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
         other => panic!("{label}: the canonical provider has to execute this shape: {other:?}"),
     }
@@ -455,15 +455,16 @@ fn the_production_seam_completes_the_reviewed_shape_and_agrees_with_the_engine()
     let stages = reviewed_stages();
     let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
 
-    let provider = match provider_render::submit_render(&inputs(&stages, true), &req) {
-        RenderRailOutcome::ProviderCompleted(out) => out,
-        RenderRailOutcome::NotInNarrowClass(reason) => {
-            panic!("the reviewed shape is in the narrow class; refused: {reason}")
-        }
-        RenderRailOutcome::ProviderDeclined(decline) => {
-            panic!("the canonical provider declined the reviewed shape: {decline}")
-        }
-    };
+    let provider =
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+            RenderRailOutcome::ProviderCompleted(out) => out,
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                panic!("the reviewed shape is in the narrow class; refused: {reason}")
+            }
+            RenderRailOutcome::ProviderDeclined(decline) => {
+                panic!("the canonical provider declined the reviewed shape: {decline}")
+            }
+        };
     assert!(
         !provider.bgra,
         "an Rgba8Unorm attachment reads back in RGBA order"
@@ -492,6 +493,149 @@ fn the_production_seam_completes_the_reviewed_shape_and_agrees_with_the_engine()
     );
 }
 
+/// The chain half of the class: a packet's *first* record hands its frame on.
+///
+/// The exec loop's store plan grants the guest writeback to a packet's last
+/// record only (`runtime::exec::multi_draw_store_plan`), so every record before
+/// it produces a frame that belongs to the chain rather than to guest memory —
+/// and the record that *opens* the pass is the one that needs no frame from
+/// anywhere. That is the position this class executes: the pass's own beginning
+/// (`Clear`, which the class already admits) plus the frame's way back to the
+/// caller, which the encode side already has (`runtime/draw/vulkan.rs` returns
+/// the pixels for every `writeback_guest == false` encode instead of storing
+/// them, and `runtime::exec` hands them to the next record as its seed).
+///
+/// The handback is driven here the way the exec loop drives it: the head's
+/// frame, in the seed's own order (`SeedOrder::Rgba8`, the order
+/// `encode_draw_chain` reorders a readback into before returning it), becomes
+/// the second record's `Load` seed, and the packet's final attachment has to be
+/// the bytes the engine's own chain produces from the engine's own head frame.
+/// The control is what keeps that claim falsifiable: the same second record
+/// begun from its own `Clear` — the head's frame dropped, which is what a chain
+/// whose first record never landed looks like — has to land different bytes, so
+/// a rail that lost the frame cannot pass by drawing the same thing either way.
+#[test]
+fn a_chain_head_hands_its_frame_to_the_next_record() {
+    use reims_vgpu::protocol::pass_action::LoadAction;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let half = width / 2;
+
+    // The packet's first record: it opens the pass, a record follows it, and it
+    // owns no guest writeback.
+    let mut head = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    head.render_pass_continues = true;
+
+    let head_provider =
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::Head), &head) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                panic!(
+                    "the record that opens the pass is in the class: it needs no frame from \
+                     anywhere, and its frame goes back to the caller; refused: {reason}"
+                )
+            }
+            RenderRailOutcome::ProviderDeclined(decline) => {
+                panic!("the canonical provider declined the chain head: {decline}")
+            }
+        };
+    assert_solid("chain head (provider)", &head_provider);
+
+    // The same record on the engine rail: the frame a build without the
+    // provider would carry through the chain.
+    let Some(head_engine) = engine_pixels("chain head", &stages, head) else {
+        return;
+    };
+    assert_eq!(
+        head_provider, head_engine,
+        "the head's frame is the frame the chain carries, so both rails have to produce it"
+    );
+    assert_eq!(
+        head_provider.len(),
+        (width * height * 4) as usize,
+        "the frame handed back is the whole attachment"
+    );
+
+    // The record after it: a record with a predecessor LOADs the chain's frame
+    // and draws the left half of it.
+    let second_record = |seed: Option<Vec<u8>>| {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        if seed.is_some() {
+            req.color0_declared = Some(LoadAction::Load);
+        }
+        req.target_rgba8 = seed.map(std::sync::Arc::new);
+        engine_pixels("the record after the head", &stages, req)
+    };
+
+    let Some(chained) = second_record(Some(head_provider)) else {
+        return;
+    };
+    let Some(from_engine_head) = second_record(Some(head_engine)) else {
+        return;
+    };
+    assert_eq!(
+        chained, from_engine_head,
+        "the packet's final attachment is the same whether its first record ran on the canonical \
+         rail or on the engine: the handback is the only thing W1 moved"
+    );
+    // The half the second record did not draw carries the head's frame rather
+    // than the clear, which is the whole reading this test exists for.
+    assert_texel_near(
+        "the second record: the half it drew",
+        texel_at(&chained, half / 2, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    assert_texel_near(
+        "the second record: the half the head filled",
+        texel_at(&chained, width - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+
+    // The control: the same second record with the head's frame dropped, where
+    // the pass begins from the clear the guest declared.
+    let Some(dropped) = second_record(None) else {
+        return;
+    };
+    assert_ne!(
+        chained, dropped,
+        "the head's frame has to reach the record after it: with the frame dropped, the half the \
+         second record does not draw is the clear"
+    );
+    assert_texel_near(
+        "the dropped chain: the half the second record drew",
+        texel_at(&dropped, half / 2, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    assert_clear_texel(
+        "the dropped chain: the half the head would have filled",
+        texel_at(&dropped, width - 1, height / 2),
+    );
+
+    // What the class does *not* read: whether the guest has a record after this
+    // one. The frame comes back to the caller either way, so the successor fact
+    // is the caller's business rather than a class condition — the exec walk
+    // never produces a record without one (every `!do_writeback` record is
+    // followed by another), and this states the answer if one arrived.
+    let uncontinued = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::Head), &uncontinued) {
+        RenderRailOutcome::ProviderCompleted(out) => assert_solid(
+            "a head with no record after it",
+            &semantic_rgba(out.bytes, out.bgra),
+        ),
+        other => {
+            panic!("the successor fact belongs to the caller rather than to the class: {other:?}")
+        }
+    }
+}
+
 /// The guest-visible write order is the other half of the pairing: a BGRA
 /// attachment is what a mapper-ref-texture target reads back in, and the rail
 /// reports the order rather than converting, exactly as the engine does.
@@ -500,7 +644,7 @@ fn a_bgra_attachment_reports_guest_scanout_order() {
     let _guard = engine_test_session();
     let stages = reviewed_stages();
     let req = narrow_request(MTL_FORMAT_BGRA8_UNORM);
-    match provider_render::submit_render(&inputs(&stages, true), &req) {
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
         RenderRailOutcome::ProviderCompleted(out) => {
             assert!(out.bgra, "a Bgra8Unorm attachment reads back in BGRA order");
             // The same colour, in the other physical order: the fragment
@@ -519,17 +663,40 @@ fn a_bgra_attachment_reports_guest_scanout_order() {
 fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     let _guard = engine_test_session();
     let stages = reviewed_stages();
-    let class =
-        |req: &DrawRequest| match provider_render::submit_render(&inputs(&stages, true), req) {
-            RenderRailOutcome::NotInNarrowClass(_) => (),
-            other => panic!("expected an out-of-class answer, got {other:?}"),
-        };
-
-    // A record that does not own the guest writeback is a chain intermediate.
-    let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    match provider_render::submit_render(&inputs(&stages, false), &req) {
+    let class = |req: &DrawRequest| match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        req,
+    ) {
         RenderRailOutcome::NotInNarrowClass(_) => (),
-        other => panic!("a chain intermediate is out of class: {other:?}"),
+        other => panic!("expected an out-of-class answer, got {other:?}"),
+    };
+
+    // The two chain positions the class leaves to the engine, because both of
+    // them begin from a frame this class cannot name: the packet's middle (a
+    // predecessor and a successor) and the packet's last record, which begins
+    // from the frame before it as well even though it owns the guest
+    // writeback. The record that *opens* the pass is the third position and the
+    // one W1 admits — see `a_chain_head_hands_its_frame_to_the_next_record`.
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.continues_render_pass = true;
+    req.render_pass_continues = true;
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::Middle), &req) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_chain_middle",
+            "a record with a predecessor and a successor stays on the engine: {reason}"
+        ),
+        other => panic!("a chain middle is out of class: {other:?}"),
+    }
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.continues_render_pass = true;
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_encoder",
+            "the record that continues an encoder stays on the engine: {reason}"
+        ),
+        other => panic!("a continued record is out of class: {other:?}"),
     }
 
     // A non-indexed draw.
@@ -714,16 +881,18 @@ fn each_out_of_class_condition_is_counted_under_its_own_bucket() {
     let _guard = engine_test_session();
     let stages = reviewed_stages();
     let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
-    let out_of_class =
-        |req: &DrawRequest| match provider_render::submit_render(&inputs(&stages, true), req) {
-            RenderRailOutcome::NotInNarrowClass(reason) => {
-                assert!(
-                    !reason.detail().is_empty(),
-                    "an out-of-class answer still carries its sentence"
-                );
-            }
-            other => panic!("expected an out-of-class answer, got {other:?}"),
-        };
+    let out_of_class = |req: &DrawRequest| match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        req,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert!(
+                !reason.detail().is_empty(),
+                "an out-of-class answer still carries its sentence"
+            );
+        }
+        other => panic!("expected an out-of-class answer, got {other:?}"),
+    };
 
     let instanced = count("render_provider_out_of_class_instanced");
     let load_action = count("render_provider_out_of_class_load_action");
@@ -738,7 +907,7 @@ fn each_out_of_class_condition_is_counted_under_its_own_bucket() {
     // bucket: the counters are charged where the gate answers, not where a
     // render request arrives.
     let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    match provider_render::submit_render(&inputs(&stages, true), &req) {
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
         RenderRailOutcome::ProviderCompleted(_) => (),
         other => panic!("the reviewed shape is in class: {other:?}"),
     }
@@ -822,7 +991,7 @@ fn the_class_window_is_the_providers_declaration() {
     // the untouched-counter assertion below is not vacuous).
     let delivered = provider_render::provider_submissions();
     let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    match provider_render::submit_render(&inputs(&stages, true), &req) {
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
         RenderRailOutcome::ProviderCompleted(out) => assert_solid(
             "at the declared window",
             &semantic_rgba(out.bytes, out.bgra),
@@ -847,7 +1016,7 @@ fn the_class_window_is_the_providers_declaration() {
         req.height = height;
         let request_extent = format!("{width}x{height}");
         let declared = format!("{window_width}x{window_height}");
-        match provider_render::submit_render(&inputs(&stages, true), &req) {
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
             RenderRailOutcome::NotInNarrowClass(reason) => {
                 assert!(
                     reason.detail().contains(request_extent.as_str()),
@@ -878,7 +1047,7 @@ fn an_in_class_shape_the_provider_refuses_is_a_typed_decline() {
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.indexed.as_mut().expect("indexed").content =
         BufferContent::Bytes(std::sync::Arc::new(INDEX_BYTES[..4].to_vec()));
-    match provider_render::submit_render(&inputs(&stages, true), &req) {
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
         RenderRailOutcome::ProviderDeclined(decline) => {
             assert_eq!(
                 decline.slug(),
@@ -907,6 +1076,36 @@ fn an_in_class_shape_the_provider_refuses_is_a_typed_decline() {
     }
 }
 
+/// Fail-closed, chain half: an admitted chain head the provider itself refuses
+/// ends the draw as a typed decline, exactly as the reviewed record does — the
+/// engine does not quietly draw the head the class took.
+///
+/// The position matters rather than the shape: the head is the record whose
+/// frame the chain's later records build on, so a fallback here would hand the
+/// packet a frame from a rail the class did not choose.
+#[test]
+fn an_in_class_chain_head_the_provider_refuses_is_a_typed_decline() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.render_pass_continues = true;
+    req.indexed.as_mut().expect("indexed").content =
+        BufferContent::Bytes(std::sync::Arc::new(INDEX_BYTES[..4].to_vec()));
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::Head), &req) {
+        RenderRailOutcome::ProviderDeclined(decline) => assert_eq!(
+            decline.slug(),
+            "provider_capability",
+            "the head's refusal is the provider's own class, under this rail's name: {decline}"
+        ),
+        RenderRailOutcome::ProviderCompleted(_) => {
+            panic!("the provider completed a head whose index view is too short")
+        }
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            panic!("an in-class chain head's refusal must not fall back to the engine: {reason}")
+        }
+    }
+}
+
 /// The class gate is pure: a request whose *pipeline* has no translated stages
 /// is out of class before anything provider-side is touched, and the translated
 /// registration gate is what a reused submission hits next.
@@ -916,7 +1115,7 @@ fn a_second_submission_reuses_the_registration() {
     let stages = reviewed_stages();
     let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     for round in 0..2 {
-        match provider_render::submit_render(&inputs(&stages, true), &req) {
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
             RenderRailOutcome::ProviderCompleted(out) => {
                 assert_solid(
                     &format!("round {round}"),
@@ -1090,7 +1289,7 @@ fn four_vertex_streams_are_admitted_and_a_fifth_stays_on_the_engine() {
             stream(4, &[(0.0, 0.0); 3]),
         ],
     );
-    match provider_render::submit_render(&inputs(&stages, true), &five) {
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &five) {
         RenderRailOutcome::NotInNarrowClass(reason) => {
             assert_eq!(
                 reason.slug(),
@@ -1181,7 +1380,7 @@ fn a_scissor_the_canonical_pass_cannot_state_stays_on_the_engine() {
     let (width, height) = extent();
     let delivered = provider_render::provider_submissions();
     let refused = |req: &DrawRequest, slug: &str| match provider_render::submit_render(
-        &inputs(&stages, true),
+        &inputs(&stages, RenderChainRole::SoleOrTail),
         req,
     ) {
         RenderRailOutcome::NotInNarrowClass(reason) => {
@@ -1272,7 +1471,7 @@ fn a_stream_the_vertex_stage_does_not_read_stays_on_the_engine() {
     let delivered = provider_render::provider_submissions();
     let refused = |stages: &Stages, specs: &[StreamSpec]| {
         let req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, specs);
-        match provider_render::submit_render(&inputs(stages, true), &req) {
+        match provider_render::submit_render(&inputs(stages, RenderChainRole::SoleOrTail), &req) {
             RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
                 reason.slug(),
                 "render_provider_out_of_class_vertex_interface",
@@ -1317,7 +1516,7 @@ fn the_widening_splits_are_counted_under_their_own_names() {
     let band_1 = count("draw_vertex_attrs_1");
     let band_2_4 = count("draw_vertex_attrs_2_4");
     let one = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    submit(&inputs(&stages, true), &one);
+    submit(&inputs(&stages, RenderChainRole::SoleOrTail), &one);
     assert_eq!(
         count("draw_vertex_attrs_1"),
         band_1 + 1,
@@ -1327,7 +1526,7 @@ fn the_widening_splits_are_counted_under_their_own_names() {
         MTL_FORMAT_RGBA8_UNORM,
         &[position_stream(), stream(1, &[(0.0, 0.0); 3])],
     );
-    submit(&inputs(&stages, true), &two);
+    submit(&inputs(&stages, RenderChainRole::SoleOrTail), &two);
     assert_eq!(
         count("draw_vertex_attrs_2_4"),
         band_2_4 + 1,
@@ -1344,21 +1543,32 @@ fn the_widening_splits_are_counted_under_their_own_names() {
          that moved has to rename both"
     );
 
-    // The chain split: the head of a packet and every record after it are two
-    // populations, and the bucket they replaced no longer moves.
+    // The chain split: the record that opens a packet is in the class (W1), so
+    // the bucket it used to answer under stops charging for it while a record
+    // with a predecessor keeps its own name. The bucket the split replaced no
+    // longer moves either.
     let head = count("render_provider_out_of_class_chain_head");
     let middle = count("render_provider_out_of_class_chain_middle");
     let retired = count("render_provider_out_of_class_writeback");
-    let first = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    submit(&inputs(&stages, false), &first);
+    let delivered = provider_render::provider_submissions();
+    let mut first = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    first.render_pass_continues = true;
+    submit(&inputs(&stages, RenderChainRole::Head), &first);
     assert_eq!(
         count("render_provider_out_of_class_chain_head"),
-        head + 1,
-        "the packet's first record is a chain head"
+        head,
+        "the packet's first record is in the class, so the bucket it used to answer under does \
+         not move for it"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered + 1,
+        "the packet's first record reached the provider rather than the engine"
     );
     let mut later = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    later.render_pass_continues = true;
     later.continues_render_pass = true;
-    submit(&inputs(&stages, false), &later);
+    submit(&inputs(&stages, RenderChainRole::Middle), &later);
     assert_eq!(
         count("render_provider_out_of_class_chain_middle"),
         middle + 1,
@@ -1378,7 +1588,7 @@ fn the_widening_splits_are_counted_under_their_own_names() {
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.skip_readback = true;
     req.readback_skip_reason = ReadbackSkipReason::UnpublishedStore;
-    submit(&inputs(&stages, true), &req);
+    submit(&inputs(&stages, RenderChainRole::SoleOrTail), &req);
     assert_eq!(
         count("render_provider_out_of_class_unpublished_store"),
         unpublished + 1,
@@ -1387,7 +1597,7 @@ fn the_widening_splits_are_counted_under_their_own_names() {
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.skip_readback = true;
     req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
-    submit(&inputs(&stages, true), &req);
+    submit(&inputs(&stages, RenderChainRole::SoleOrTail), &req);
     assert_eq!(
         count("render_provider_out_of_class_resident_store"),
         resident + 1,
@@ -1395,7 +1605,7 @@ fn the_widening_splits_are_counted_under_their_own_names() {
     );
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.skip_readback = true;
-    submit(&inputs(&stages, true), &req);
+    submit(&inputs(&stages, RenderChainRole::SoleOrTail), &req);
     assert_eq!(
         count("render_provider_out_of_class_skip_readback"),
         unnamed + 1,
@@ -1436,7 +1646,7 @@ fn a_float_op_that_withholds_a_permission_is_a_typed_decline() {
         MTL_FORMAT_RGBA8_UNORM,
         &[position_stream(), stream(1, &[(0.25, 0.0); 3])],
     );
-    match provider_render::submit_render(&inputs(&stages, true), &req) {
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
         RenderRailOutcome::ProviderDeclined(decline) => {
             // The reading, beside the assertions: the provider's own words are
             // what a reader compares against the day this boundary moves.

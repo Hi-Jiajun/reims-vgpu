@@ -23,6 +23,18 @@
 //!   instead of being compared at a tolerance;
 //! - **one indexed draw**, `instance_count == 1`, `base_vertex == 0`, triangle
 //!   list, single-sample;
+//! - **the record that opens the packet** when the draw is one record of a
+//!   multi-record `exec` packet (W1). The packet's store plan grants the guest
+//!   writeback to its last record alone
+//!   (`runtime::exec::multi_draw_store_plan`), so a record before it produces a
+//!   frame that belongs to the chain — and the *first* one needs no frame from
+//!   anywhere, because the class's own `Clear` is the pass's beginning. That
+//!   record is in class ([`RenderChainRole::Head`]) and its frame goes back to
+//!   the caller, which is the route the encode side already takes for every
+//!   `writeback_guest == false` record (`runtime/draw/vulkan.rs` returns those
+//!   pixels and `runtime::exec` hands them to the next record as its seed). A
+//!   record *with* a predecessor — the packet's middle, and its last record —
+//!   begins from a frame the class cannot name yet and keeps the engine;
 //! - **up to four vertex streams** and exactly one index stream, each carried
 //!   into the trace as trace-owned bytes, one canonical binding per stream. Four
 //!   is the canonical contract's `MAX_VERTEX_BUFFERS`, and it is the stream axis
@@ -55,7 +67,8 @@
 //!   offscreen, CPU-readback shape (`target_identity == None`,
 //!   `skip_readback == false`, no seed and no mapper backing), which is what
 //!   makes the provider's whole-attachment readback the frame the store route
-//!   then lands in guest memory.
+//!   then lands in guest memory — or, for a chain head, the frame `exec` hands
+//!   to the record after it.
 //!
 //! Anything outside the class returns [`RenderRailOutcome::NotInNarrowClass`]
 //! and the caller runs the self-contained engine unchanged — the feature only
@@ -281,9 +294,54 @@ const ATTACHMENT_VIEW: ViewId = ViewId::new(1);
 /// stream (when the class carries one) then the index stream.
 const FIRST_INPUT_VIEW: u64 = 2;
 
+/// Where one record sits in the packet the exec loop walks.
+///
+/// The 2026-09-17 probe (`evidence/reviews/writeback-class-probe-2026-09-17.md`)
+/// read the class's old `writeback` condition as a *position* rather than a
+/// shape: `writeback_guest` is `multi_draw_store_plan`'s `do_writeback`, true
+/// for a packet's last record alone, so the records the class refused under
+/// that one name were the packet's heads (2653) and its middles (2065). Naming
+/// the position once, here, is what lets the gate answer about a record's place
+/// in its chain rather than about a boolean whose meaning has to be looked up —
+/// and it is what retires the census's `chain_head` bucket (those records are
+/// admitted now) while leaving `chain_middle` in place beside it.
+///
+/// The successor fact (`render_pass_continues`) is deliberately not part of the
+/// role: the class's question is where a record's *frame* goes — to guest
+/// memory ([`Self::SoleOrTail`]) or back to the caller ([`Self::Head`] and
+/// [`Self::Middle`]) — and whether the guest has a record after this one is the
+/// caller's business, because the frame comes back either way. The census row
+/// still prints that fact beside the role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderChainRole {
+    /// The record owns the guest writeback: the packet's only record, or its
+    /// last one. Whether it may begin from a frame produced before it is the
+    /// encoder gate's question and not the role's.
+    SoleOrTail,
+    /// The record opens the packet: no frame has to be seeded into it, and its
+    /// own frame goes to the record after it.
+    Head,
+    /// A record with a predecessor: it begins from a frame the record before it
+    /// produced.
+    Middle,
+}
+
+impl RenderChainRole {
+    /// One record's role, from the two facts the exec packet walk sets for it:
+    /// `do_writeback` (`runtime::exec::multi_draw_store_plan`) and
+    /// `continues_render_pass` (`runtime::exec::render_pass_chain_position`).
+    pub fn of(writeback_guest: bool, continues_render_pass: bool) -> Self {
+        match (writeback_guest, continues_render_pass) {
+            (true, _) => Self::SoleOrTail,
+            (false, false) => Self::Head,
+            (false, true) => Self::Middle,
+        }
+    }
+}
+
 /// What one render submission needs to leave this rail: the two stage
-/// modules' AIR, the entries the translation reports for them, and whether this
-/// record is the one that owes the guest writeback.
+/// modules' AIR, the entries the translation reports for them, and this
+/// record's place in the chain it belongs to.
 ///
 /// The AIR travels, rather than the SPIR-V, because the canonical registration
 /// this rail uses is its *translated* one: the emulator translates the module
@@ -301,11 +359,11 @@ pub struct RenderRailInputs<'a> {
     /// keeps it on the engine.
     pub vertex_entry: Option<&'a str>,
     pub fragment_entry: Option<&'a str>,
-    /// Whether the record this request belongs to owns the guest writeback.
-    /// A record that does not (a chain intermediate) is outside the class:
-    /// its frame is a seed for the next record, which is a rail this increment
-    /// does not execute.
-    pub writeback_guest: bool,
+    /// This record's place in the packet its encode belongs to
+    /// ([`RenderChainRole`]). The position decides whether the class executes
+    /// it, because what the class has to be able to name is where the frame
+    /// goes: to guest memory, or back to the caller that owns the chain.
+    pub role: RenderChainRole,
     /// The *vertex stage's own* attribute locations, as the translation that
     /// produced `vertex_air` reflected them
     /// (`CachedShader::reflection.vertex_attributes`), in the reflection's
@@ -825,28 +883,28 @@ fn narrow_class<'a>(
     inputs: &RenderRailInputs<'_>,
     req: &'a DrawRequest,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
-    if !inputs.writeback_guest {
-        // Two records answer this and they are different shapes: the *head* of a
-        // packet (the first record; `continues_render_pass == false`) hands its
-        // frame to the next record, and every record after it hands the chain
-        // on. Splitting the answer by name costs one branch and is what makes
-        // the next census read the 2653 chain heads and the 2065 middles apart
-        // instead of as one 4718-wide bucket; the class still refuses both,
-        // because a frame that has to reach the next record is a rail this
-        // increment does not execute.
-        return Err(if req.continues_render_pass {
-            OutOfClass::new(
+    match inputs.role {
+        // W1. The packet's first record owns the pass's own beginning — the
+        // class's `Clear` — so no frame has to be seeded into it, and its frame
+        // goes back to the caller that owns the chain, which is the route the
+        // encode side already takes for every `writeback_guest == false`
+        // encode. Admitting it is also what turns the probe's 4718-wide
+        // "unknown" into a distribution: a head that fails any other condition
+        // of this class now answers with *that* condition's name.
+        RenderChainRole::Head => {}
+        // A record with a predecessor begins from a frame this class cannot
+        // name. The middle is the one position that both takes and hands on a
+        // frame, so it has no route here at all; the packet's last record takes
+        // one too, and answers for that at the encoder gate below.
+        RenderChainRole::Middle => {
+            return Err(OutOfClass::new(
                 "render_provider_out_of_class_chain_middle",
-                "a record in the middle of a multi-record packet stays on the engine: its frame \
-                 is a seed for the record after it, which is a rail this class does not execute",
-            )
-        } else {
-            OutOfClass::new(
-                "render_provider_out_of_class_chain_head",
-                "the first record of a multi-record packet stays on the engine: it hands its \
-                 frame to the next record rather than to guest memory",
-            )
-        });
+                "a record in the middle of a multi-record packet stays on the engine: it begins \
+                 from the frame the record before it produced, which is a rail this class does \
+                 not execute",
+            ))
+        }
+        RenderChainRole::SoleOrTail => {}
     }
     if inputs.vertex_air.is_empty() || inputs.fragment_air.is_empty() {
         return Err(OutOfClass::new(
@@ -960,10 +1018,15 @@ fn narrow_class<'a>(
              is the pooled offscreen target whose whole frame comes back through the completion",
         ));
     }
-    if req.continues_render_pass || req.render_pass_continues {
+    // The class executes the record that opens the pass. A record that begins
+    // from a frame produced before it — a packet's last record, which the exec
+    // loop hands a forced `Load` — is a begin-from-the-chain the class cannot
+    // name yet: W1 named the frame's *destination*, and this is its source.
+    if req.continues_render_pass {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_encoder",
-            "a record inside a multi-record encoder stays on the engine",
+            "a record that continues a multi-record encoder stays on the engine: it begins from \
+             the frame the record before it produced",
         ));
     }
     if !req.secondary_targets.is_empty() {
