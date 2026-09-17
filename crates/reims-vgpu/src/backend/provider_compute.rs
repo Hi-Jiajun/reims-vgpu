@@ -21,6 +21,15 @@
 //!   translator reproduces its regions — same order, shapes, bases and
 //!   per-region payload — from the recovered launch. Whole-workgroup launches
 //!   keep the engine (`supports_threadgroups` is false);
+//! - the offset the request states for its region payload
+//!   (`ComputeDispatch::Regions::push_offset`) is the offset the canonical
+//!   provider's own reflection of the same AIR derives. One exact-thread
+//!   dispatch has one payload offset — every region's payload is written at
+//!   the same place — and the two rails read that number from different
+//!   translators, so a request whose offset disagrees is refused by name
+//!   instead of being run with the payload where no shader reads it. The
+//!   check needs the compiled contract and therefore runs at admission
+//!   (before any lease is imported), not in the pure class gate;
 //! - every buffer binding the compiled canonical contract names must be
 //!   present in the reims-staged request, so `Unused`/`Absent` reflection
 //!   cases stay on the reims engine;
@@ -231,6 +240,13 @@ pub enum ProviderComputeDecline {
     },
     /// Compiling the reviewed AIR in the canonical translator failed.
     PipelineCompile { detail: String },
+    /// The request's stated payload offset is not the offset the canonical
+    /// provider derives from the same AIR, so the region payload would land
+    /// where the kernel does not read it. The two rails read the number from
+    /// two pinned translators, so a disagreement is a refusal rather than a
+    /// dispatch one of them would execute as a different launch
+    /// (`research/docs/26` §7, 2026-09-17).
+    PushOffsetMismatch { request: u32, contract: u32 },
     /// The canonical provider refused, named by its normalized class: `step`
     /// names the provider call that answered, and `detail` carries the
     /// provider's own slug and detail text.
@@ -275,6 +291,7 @@ impl Decline for ProviderComputeDecline {
         match self {
             Self::ProviderUnavailable { .. } => "provider_unavailable",
             Self::PipelineCompile { .. } => "pipeline_compile",
+            Self::PushOffsetMismatch { .. } => "push_offset_mismatch",
             Self::ProviderRefused { class, .. } => class.slug(),
             Self::ProviderDeviceLost { .. } => ProviderRefusalClass::DeviceLost.slug(),
             Self::TraceAdmission { .. } => "trace_admission",
@@ -312,6 +329,10 @@ impl Decline for ProviderComputeDecline {
             Self::PipelineCompile { detail } | Self::TraceAdmission { detail } => {
                 vec![("detail", detail.clone())]
             }
+            Self::PushOffsetMismatch { request, contract } => vec![
+                ("request", request.to_string()),
+                ("contract", contract.to_string()),
+            ],
             Self::ProviderRefused {
                 class,
                 step,
@@ -594,6 +615,13 @@ struct NarrowLaunch {
     /// The launch's threadgroup shape, the nominal local size the regions were
     /// tiled at.
     threads_per_threadgroup: [u64; 3],
+    /// The offset the request states for every region's payload, read out of
+    /// the dispatch (`ComputeDispatch::Regions::push_offset`). The class gate
+    /// is pure and has no contract to compare this against, so the agreement
+    /// with the canonical provider's own reflected offset is checked at
+    /// admission, before the first lease
+    /// ([`ProviderComputeDecline::PushOffsetMismatch`]).
+    push_offset: u32,
 }
 
 /// The launch `req`'s dispatch decomposes, or why the request stays on the
@@ -615,9 +643,9 @@ fn narrow_class(req: &ComputeRequest) -> Result<NarrowLaunch, &'static str> {
         return Err("compute images/samplers stay on the self-contained engine");
     }
     let ComputeDispatch::Regions {
+        push_offset,
         threadgroups_per_grid,
         regions,
-        ..
     } = &req.dispatch
     else {
         return Err(
@@ -696,6 +724,7 @@ fn narrow_class(req: &ComputeRequest) -> Result<NarrowLaunch, &'static str> {
     Ok(NarrowLaunch {
         grid,
         threads_per_threadgroup: local,
+        push_offset: *push_offset,
     })
 }
 
@@ -721,6 +750,7 @@ fn submit_narrow(
     let NarrowLaunch {
         grid,
         threads_per_threadgroup,
+        push_offset: request_push_offset,
     } = launch;
 
     let pipeline = {
@@ -756,6 +786,22 @@ fn submit_narrow(
             compiled
         }
     };
+
+    // The payload offset is the one number the class gate cannot verify: one
+    // exact-thread dispatch has one payload offset — every region's payload is
+    // written at it — and the request states it from the reims-pinned
+    // translator while the provider re-derives its own from the same AIR. A
+    // disagreement means the payload would land where the kernel does not read
+    // it on whichever rail acted on the other number, so the dispatch is
+    // refused by name instead (`research/docs/26` §7). This runs before the
+    // first lease is imported, so a mismatched request costs the device
+    // nothing.
+    if pipeline.contract.push_constant_offset != request_push_offset {
+        return Err(ProviderComputeDecline::PushOffsetMismatch {
+            request: request_push_offset,
+            contract: pipeline.contract.push_constant_offset,
+        });
+    }
 
     // Reims stages only used bindings; a canonical binding it did not stage (an
     // `Unused` / `Absent` reflection case) keeps the shape on the reims engine
@@ -1143,6 +1189,36 @@ mod tests {
             .expect("a sub-threadgroup grid is the class");
         assert_eq!(sub_group.grid, [3, 1, 1]);
         assert_eq!(sub_group.threads_per_threadgroup, [3, 1, 1]);
+    }
+
+    /// The class *carries* the request's stated payload offset rather than
+    /// judging it: the agreement with the canonical contract needs the
+    /// compiled reflection, so it is an admission check, and the pure gate
+    /// admits a launch whatever offset the request names
+    /// (`ProviderComputeDecline::PushOffsetMismatch`). This is the boundary the
+    /// module docs draw, and the integration rail test is what proves the
+    /// refusal itself.
+    #[test]
+    fn the_class_carries_the_requests_stated_payload_offset() {
+        assert_eq!(
+            narrow_class(&request_of_launch([4, 1, 1], [4, 1, 1]))
+                .expect("the derived tiling is the class")
+                .push_offset,
+            0,
+            "the translator's own payload sits at the reflected offset"
+        );
+        let mut hacked = request_of_launch([4, 1, 1], [4, 1, 1]);
+        let ComputeDispatch::Regions { push_offset, .. } = &mut hacked.dispatch else {
+            panic!("a launch is a regions dispatch");
+        };
+        *push_offset = 16;
+        assert_eq!(
+            narrow_class(&hacked)
+                .expect("the class gate has no contract to compare an offset against")
+                .push_offset,
+            16,
+            "the class hands the request's claim to admission untouched"
+        );
     }
 
     /// Every way a region list can fail to be the translator's decomposition is
