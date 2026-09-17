@@ -9563,12 +9563,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         // Gate 2 production seam, render half: while `provider-render` is on,
         // the narrow offscreen class (one colour attachment cleared to a
-        // byte-exact value, one indexed draw over trace-owned streams, no
+        // byte-exact value and no wider than the window this device's provider
+        // declares, one indexed draw over trace-owned streams, no
         // resident/seed/chained target) is submitted through the canonical
-        // provider instead of the self-contained engine. The gate is pure and
-        // runs first, so an out-of-class shape falls through to the engine
-        // unchanged; an in-class shape the provider refuses is a typed decline
-        // that ends this draw rather than a silent switch back to the engine.
+        // provider instead of the self-contained engine. The gate runs first —
+        // pure over the request, and reading only that declared window out of
+        // the provider's own capability snapshot — so an out-of-class shape
+        // falls through to the engine unchanged; an in-class shape the
+        // provider refuses is a typed decline that ends this draw rather than
+        // a silent switch back to the engine.
         #[cfg(feature = "provider-render")]
         {
             use crate::backend::provider_render::{self, RenderRailInputs, RenderRailOutcome};

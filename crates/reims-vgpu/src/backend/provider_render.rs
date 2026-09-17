@@ -62,18 +62,30 @@
 //! over the same bytes (core admission refuses a compute pass that *writes* a
 //! view an attachment stores into).
 //!
-//! # What this costs, and the bound that pays for it
+//! # The window, and where its number comes from
+//!
+//! The class admits an attachment only inside the window the canonical rail
+//! *declares* on this device. R1b made that declaration a device fact:
+//! `ProviderCapabilities::max_attachment_dimension` is the smaller, per axis,
+//! of the rail's reviewed ceiling and the selected device's own framebuffer
+//! limit, and core admission refuses a wider attachment by name
+//! (`attachment_dimension_limit`, carrying the maximum it crossed). This rail
+//! reads that number out of the provider's own snapshot
+//! ([`declared_attachment_window`]) instead of stating a copy: the copy it
+//! shipped first (4×4) was one increment's reviewing window, and a gate that
+//! outran the declaration would hand the provider a shape it always refuses —
+//! a declined draw where the engine would have drawn it, which is the wrong
+//! answer for a rail that only narrows which submissions change rail.
 //!
 //! The declaring view has to be backed by bytes the trace states, so the rail
 //! hands it `BufferSource::OwnedBytes` of the attachment's own packed extent —
 //! zeros, since a `Clear` load reads none of it. That is a real per-submission
 //! copy, and it is the one cost this rail cannot avoid while the contract only
-//! lets an attachment land through a byte-carrying view. It is why the class
-//! states a bound ([`MAX_DECLARED_ATTACHMENT_BYTES`]) instead of admitting any
-//! extent: a class that copies a whole 1080p frame per draw to declare an
-//! attachment would be a pessimization wearing a feature flag. An attachment
-//! above the bound keeps the engine, and the byte-less declaration the bound
-//! stands in for is the named follow-up on the emulator side.
+//! lets an attachment land through a byte-carrying view. At the declared
+//! window the copy is at most 64×64 texels, the size the canonical rail's own
+//! reviewed fixtures execute, so the declaration cannot be a pessimization
+//! wearing a feature flag; the byte-less declaration that would lift the bound
+//! entirely is the named follow-up on the emulator side.
 //!
 //! # The lease channel, and the gap this increment reports
 //!
@@ -102,6 +114,7 @@
 //! released. A rail whose provider is not usable refuses in-class work
 //! fail-closed rather than re-running it on the engine.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -136,27 +149,46 @@ const RENDER_DECLARE_SOURCE: &str = include_str!("render_declare.ll");
 /// Entry point [`RENDER_DECLARE_SOURCE`] declares.
 const RENDER_DECLARE_ENTRY: &str = "reims_declare";
 
-/// The attachment window this rail admits, one number per axis.
+/// The attachment window the canonical rail declares on this device, one
+/// number per axis.
 ///
-/// Two facts set it, and both are the canonical rail's rather than this one's:
+/// Read from the provider's own capability snapshot rather than stated here
+/// (see the module docs): `max_attachment_dimension` is `min(reviewed ceiling,
+/// device framebuffer limit)` per axis when the snapshot is built, so the
+/// number this gate compares against is the number admission itself enforces
+/// (`attachment_dimension_limit`). A second copy in this crate would drift the
+/// moment either half moves — and this rail shipped exactly such a copy once
+/// (4×4, the reviewing window of the increment that opened the rail), which is
+/// why the class gate asks the provider instead.
 ///
-/// * the canonical render rail *declares* this window — `metal-api-vulkan`'s
-///   `MAX_ATTACHMENT_DIMENSION`, the size its reviewed fixtures prove — and
-///   refuses a larger attachment at admission
-///   (`attachment_dimension_limit`). A class gate that did not know the window
-///   would hand the provider a shape it always refuses, which is a declined
-///   draw where the engine would have drawn it: the wrong answer, since the
-///   rail never claimed to execute that size;
-/// * the declaring pass has to hand the attachment view trace-owned bytes (see
-///   the module docs), which are copied once per submission. At this window
-///   that copy is at most 4×4 texels, so the declaration cannot be a
-///   pessimization on the small offscreen targets the increment is reviewed
-///   against.
+/// Reading it is what puts the rail's provider in place the first time a shape
+/// passes every other class condition; a shape the pure gate already refused
+/// never gets this far. The read itself is a snapshot read, not provider work:
+/// nothing is translated, registered, admitted or submitted for a request this
+/// check keeps on the engine.
+fn declared_attachment_window() -> Result<[u64; 2], ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    Ok(rail.provider.capabilities().max_attachment_dimension)
+}
+
+/// Whether one attachment extent is inside the declared window, and the class
+/// reason that keeps it on the engine when it is not.
 ///
-/// Widening the window is the emulator's change to make first; this constant
-/// and the rail's own case move with it, and admission's typed refusal stays
-/// the backstop for the interval where the two disagree.
-pub const MAX_ATTACHMENT_DIMENSION: u32 = 4;
+/// Pure over its inputs, so the boundary is the provider's declaration and
+/// nothing else — the reason names both numbers, because that string is what
+/// the observer reports when the boundary moves.
+fn window_admits(window: [u64; 2], width: u64, height: u64) -> Result<(), Cow<'static, str>> {
+    if width <= window[0] && height <= window[1] {
+        return Ok(());
+    }
+    Err(Cow::Owned(format!(
+        "an attachment of {width}x{height} is outside the window this device's provider declares \
+         ({}x{}, `max_attachment_dimension`): the canonical rail states the window, admission \
+         refuses a wider attachment by name (`attachment_dimension_limit`), and a shape the \
+         provider always refuses is not one this class executes",
+        window[0], window[1],
+    )))
+}
 
 /// The allocation the colour attachment's declaring view lives in.
 ///
@@ -219,7 +251,11 @@ pub enum RenderRailOutcome {
     ProviderCompleted(RenderRailOutput),
     /// Outside the narrow admitted class. The caller must run the
     /// self-contained engine, exactly as a build without the feature would.
-    NotInNarrowClass(&'static str),
+    ///
+    /// Borrowed for the class conditions a request answers by itself; owned
+    /// for the one that is a property of the device — the declared attachment
+    /// window — because that answer names the numbers it compared.
+    NotInNarrowClass(Cow<'static, str>),
     /// In-class, but the canonical provider refused. The caller must decline
     /// the draw rather than fall back to another rail.
     ProviderDeclined(ProviderRenderDecline),
@@ -388,6 +424,22 @@ struct RenderPipelineKey {
 static RENDER_RAIL: OnceLock<RenderRail> = OnceLock::new();
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// How many traces this rail has handed to the canonical provider, one per
+/// submission that reached it.
+static PROVIDER_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The number of render submissions this rail has handed to the canonical
+/// provider.
+///
+/// Test observation; production callers do not read it. The class gate decides
+/// before this number moves, so a shape the gate keeps on the engine — the
+/// attachment-window boundary included — leaves it untouched, which is how the
+/// rail's own test asserts a fallback never reached the provider rather than
+/// only that the answer looked like a fallback.
+pub fn provider_submissions() -> u64 {
+    PROVIDER_SUBMISSIONS.load(Ordering::Relaxed)
+}
+
 fn render_rail() -> &'static RenderRail {
     RENDER_RAIL.get_or_init(RenderRail::default)
 }
@@ -429,13 +481,40 @@ fn contract_fingerprint(contract: &RenderPipelineContract) -> String {
 
 /// Route one reims draw request: the class gate first, and the canonical
 /// provider only if the whole shape is in the class.
+///
+/// Two stages, in this order: the pure gate, which answers everything the
+/// request states about itself, and the declared-window check, which is the one
+/// condition that belongs to the device. A shape that fails either is out of
+/// class and the caller runs the self-contained engine; only a shape that
+/// passes both is offered to the provider, and a refusal from there is a
+/// decline (never a fallback).
 pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> RenderRailOutcome {
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(inputs, req) {
-        Err(reason) => return RenderRailOutcome::NotInNarrowClass(reason),
+        Err(reason) => return RenderRailOutcome::NotInNarrowClass(reason.into()),
         Ok(pass) => pass,
     };
+    // The window is the one class condition a request cannot answer by itself:
+    // it is the canonical rail's declaration on this device (R1b), read from
+    // the provider's capability snapshot — before this submission is
+    // translated, registered, admitted or submitted, so a request wider than
+    // the window the provider declares is a *class* answer and not a decline.
+    // The read is what puts the rail's provider in place the first time a
+    // candidate shape arrives; the pure gate above has already answered for
+    // every shape that is out of class for any other reason.
+    let window = match declared_attachment_window() {
+        Ok(window) => window,
+        // A provider that cannot be reached cannot answer the one question the
+        // gate still has to ask, and an unclassifiable candidate is an
+        // in-class candidate: fail closed, exactly as `submit_narrow` does for
+        // the shapes it refuses, rather than silently re-running the draw
+        // somewhere the class never named.
+        Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+    };
+    if let Err(reason) = window_admits(window, pass.width, pass.height) {
+        return RenderRailOutcome::NotInNarrowClass(reason);
+    }
     match submit_narrow(inputs, &pass) {
         Ok(output) => RenderRailOutcome::ProviderCompleted(output),
         Err(decline) => RenderRailOutcome::ProviderDeclined(decline),
@@ -521,7 +600,10 @@ impl NarrowPass<'_> {
 /// Pure, and ordered cheapest-first so a refused shape costs nothing: no
 /// provider call, no translation, no registration. Every refusal names the
 /// condition that kept the shape on the engine, because that string is what the
-/// observer reports when a class boundary moves.
+/// observer reports when a class boundary moves. The one condition that is not
+/// a property of the request — the attachment window, which belongs to the
+/// device's provider — is [`declared_attachment_window`]'s, asked by
+/// [`submit_render`] after this gate has accepted the shape.
 fn narrow_class<'a>(
     inputs: &RenderRailInputs<'_>,
     req: &'a DrawRequest,
@@ -570,13 +652,6 @@ fn narrow_class<'a>(
         .checked_mul(u64::from(req.height))
         .and_then(|texels| texels.checked_mul(4))
         .ok_or("an attachment extent that overflows u64 stays on the engine")?;
-    if req.width > MAX_ATTACHMENT_DIMENSION || req.height > MAX_ATTACHMENT_DIMENSION {
-        return Err(
-            "an attachment outside the canonical rail's declared window stays on the engine: the \
-             canonical render rail refuses a larger attachment at admission, and a shape the \
-             provider always refuses is not one this class executes",
-        );
-    }
     if req.color0_declared != Some(crate::protocol::pass_action::LoadAction::Clear) {
         return Err(
             "the canonical class loads by `Clear` only; a Load or DontCare record stays on the \
@@ -908,6 +983,9 @@ fn submit_narrow(
         stencil_test: None,
         instance_count: 1,
         present: None,
+        // The v70 sampler channel: this class refuses sampled images, samplers
+        // and color input before it ever gets here, so the pass binds none.
+        textures: Vec::new(),
     };
     let trace = ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
@@ -938,6 +1016,10 @@ fn submit_narrow(
         .map_err(|error| ProviderRenderDecline::TraceAdmission {
             detail: provider_error_detail(&error),
         })?;
+    // Counted here, at the boundary: this is the point past which the draw is
+    // the provider's work, so a request that stays on the engine must leave
+    // the counter where it was.
+    PROVIDER_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
     let result = provider
         .submit(validated)
         .map_err(|error| refusal_decline(&error, "submission").into_render())?;

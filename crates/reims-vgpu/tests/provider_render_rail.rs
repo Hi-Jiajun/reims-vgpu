@@ -21,9 +21,10 @@
 
 #![cfg(feature = "provider-render")]
 
-use metal_api_core::provider::{AttachmentFormat, VertexFormat};
+use metal_api_core::provider::{AttachmentFormat, ComputeProvider, VertexFormat};
+use metal_api_vulkan::{VulkanComputeProvider, VulkanExecutor};
 use reims_vgpu::backend::provider_render::{
-    self, ProviderRenderDecline, RenderRailInputs, RenderRailOutcome, MAX_ATTACHMENT_DIMENSION,
+    self, ProviderRenderDecline, RenderRailInputs, RenderRailOutcome,
 };
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
@@ -100,10 +101,39 @@ const INDEX_BYTES: [u8; 12] = [
     0x02, 0x00, 0x00, 0x00, //
 ];
 
-/// The canonical render rail's own window (`MAX_ATTACHMENT_DIMENSION`), which
-/// is what the class gate states.
-const WIDTH: u32 = MAX_ATTACHMENT_DIMENSION;
-const HEIGHT: u32 = MAX_ATTACHMENT_DIMENSION;
+/// The attachment window the canonical rail declares on this device.
+///
+/// Read from a live provider's capability snapshot rather than stated here:
+/// R1b made the number `min(reviewed ceiling, device framebuffer limit)` per
+/// axis, so a copy in this file would go stale on a device that declares less
+/// than the ceiling — exactly the drift the class gate no longer carries. The
+/// one provider built here is a second, independent snapshot: the rail's gate
+/// has to answer with the same numbers.
+fn declared_window() -> [u64; 2] {
+    static WINDOW: OnceLock<[u64; 2]> = OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let executor =
+            VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+        let provider =
+            VulkanComputeProvider::with_executor(executor).expect("the canonical provider builds");
+        let window = provider.capabilities().max_attachment_dimension;
+        assert!(
+            window[0] > 0 && window[1] > 0,
+            "the acceptance environment's provider declares a render window: {window:?}"
+        );
+        window
+    })
+}
+
+/// The attachment extent the reviewed shape draws: the declared window's own
+/// size, so the fixture sits on the class gate's inclusive boundary.
+fn extent() -> (u32, u32) {
+    let window = declared_window();
+    (
+        u32::try_from(window[0]).expect("the declared width fits a u32"),
+        u32::try_from(window[1]).expect("the declared height fits a u32"),
+    )
+}
 
 /// `float4(0.25, 0.5, 0.75, 1)` in the 8-bit encoding both rails round to.
 const FRAGMENT_TEXEL: [u8; 4] = [64, 128, 191, 255];
@@ -124,9 +154,10 @@ fn attachment(format: u16) -> reims_vgpu::backend::vulkan::engine::ColorAttachme
 /// attachment, one vertex stream (one `float2` attribute at location 0), one
 /// index stream, and the pooled offscreen target whose whole frame is read back.
 fn narrow_request(format: u16) -> DrawRequest {
+    let (width, height) = extent();
     DrawRequest {
-        width: WIDTH,
-        height: HEIGHT,
+        width,
+        height,
         vertex_count: 3,
         instance_count: Some(1),
         primitive_topology: PrimitiveTopology(reims_vgpu_core::topology::PrimitiveType::Triangle),
@@ -211,9 +242,10 @@ fn semantic_rgba(mut pixels: Vec<u8>, bgra: bool) -> Vec<u8> {
 }
 
 fn assert_solid(label: &str, pixels: &[u8]) {
+    let (width, height) = extent();
     assert_eq!(
         pixels.len(),
-        (WIDTH * HEIGHT * 4) as usize,
+        (width * height * 4) as usize,
         "{label}: the attachment's whole extent has to come back"
     );
     for (index, texel) in pixels.chunks_exact(4).enumerate() {
@@ -394,11 +426,12 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     req.color_write_mask = reims_vgpu::protocol::blend::ColorWriteMask::NONE;
     class(&req);
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    let (width, height) = extent();
     req.viewports.push(ViewportResource {
         x: 0.0,
         y: 0.0,
-        width: WIDTH as f32,
-        height: HEIGHT as f32,
+        width: width as f32,
+        height: height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
     });
@@ -409,8 +442,8 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.target_identity = Some(engine::TargetIdentity::Surface {
         id: 1,
-        width: WIDTH,
-        height: HEIGHT,
+        width,
+        height,
         generation: 1,
         format: reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
     });
@@ -454,17 +487,87 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     req.instance_count = Some(2);
     class(&req);
 
-    // An attachment outside the canonical rail's declared window: the provider
-    // would refuse it at admission, and a shape the provider always refuses is
-    // not one this class executes.
+    // An attachment outside the window this device's provider declares (R1b):
+    // the provider would refuse it at admission, and a shape the provider
+    // always refuses is not one this class executes.
+    let (window_width, window_height) = extent();
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    req.width = MAX_ATTACHMENT_DIMENSION + 1;
-    req.height = MAX_ATTACHMENT_DIMENSION;
+    req.width = window_width + 1;
+    req.height = window_height;
     class(&req);
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    req.width = 512;
-    req.height = 512;
+    req.width = window_width * 8;
+    req.height = window_height * 8;
     class(&req);
+}
+
+/// The class window is the number the canonical rail declares on this device,
+/// not a copy inside this crate: a shape at the declared window still reaches
+/// the provider, and one texel beyond it stays on the engine *before* the
+/// provider is asked.
+///
+/// The boundary is read from a live provider snapshot here, so a device whose
+/// framebuffer limit is below the reviewed ceiling moves the check with it: a
+/// gate that lagged that declaration fails the one-texel case instead of
+/// passing on this machine's declared window.
+#[test]
+fn the_class_window_is_the_providers_declaration() {
+    let _guard = engine_test_session();
+    let air = stage_air();
+    let (window_width, window_height) = extent();
+    eprintln!(
+        "declared attachment window: {window_width}x{window_height} (read from a live provider \
+         snapshot, not stated in this file)"
+    );
+
+    // At the window: in class, and the shape really reaches the provider (so
+    // the untouched-counter assertion below is not vacuous).
+    let delivered = provider_render::provider_submissions();
+    let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    match provider_render::submit_render(&inputs(&air, true), &req) {
+        RenderRailOutcome::ProviderCompleted(out) => assert_solid(
+            "at the declared window",
+            &semantic_rgba(out.bytes, out.bgra),
+        ),
+        other => panic!("an attachment at the declared window is in class: {other:?}"),
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered + 1,
+        "the at-window shape reached the provider"
+    );
+
+    // One texel beyond it on either axis: out of class, the engine's to draw,
+    // and the provider is not called for it.
+    let delivered = provider_render::provider_submissions();
+    for (width, height) in [
+        (window_width + 1, window_height),
+        (window_width, window_height + 1),
+    ] {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        let request_extent = format!("{width}x{height}");
+        let declared = format!("{window_width}x{window_height}");
+        match provider_render::submit_render(&inputs(&air, true), &req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert!(
+                    reason.contains(request_extent.as_str()),
+                    "the reason names the request's own extent: {reason}"
+                );
+                assert!(
+                    reason.contains(declared.as_str()),
+                    "the reason names the window the provider declared: {reason}"
+                );
+            }
+            other => panic!("{request_extent} is outside the declared window: {other:?}"),
+        }
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a shape outside the declared window stays on the engine without the provider seeing it"
+    );
 }
 
 /// Fail-closed: an in-class shape the canonical provider itself refuses — here
