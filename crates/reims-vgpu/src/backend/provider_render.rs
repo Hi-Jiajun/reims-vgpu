@@ -89,11 +89,13 @@
 //!   not classify (`unknown`) keeps the draw on the engine under its own
 //!   bucket, and the one whose entry never dereferences the slot (`unused`) is
 //!   not declared at all (R9m,
-//!   [`RenderRailInputs::stage_buffer_statement`]) — the statement carries only
-//!   the arguments the entry reaches, and the draw keeps the engine because the
-//!   provider's registration pairs a stage's reflected arguments with the
-//!   contract's declarations one to one (measured three ways in
-//!   `provider_render_rail.rs`);
+//!   [`RenderRailInputs::stage_buffer_statement`]) **and no longer keeps the
+//!   draw on the engine** (R9n): the statement carries only the arguments the
+//!   entries reach, the canonical registration leaves a reflected `Unused`
+//!   slot out of the pairing when the contract does not declare it
+//!   (`research/docs/23` §95), and the draw proceeds with that slot neither
+//!   declared nor bound — while a contract that states the slot is refused by
+//!   name (measured in `provider_render_rail.rs`);
 //! - **a present tail, when the caller states one** (R4b): the record owns the
 //!   packet's frame and hands it to the display rail, so the canonical pass
 //!   *presents* the provider's own target for the guest surface the frame lands
@@ -722,50 +724,25 @@ fn stage_buffer_gate<'a>(
 ) -> Result<Vec<NarrowStageBuffer<'a>>, OutOfClass> {
     // The one statement this request's two stages make (R9m): `declared` is
     // what the contract, the pass's own views and the wire frame are built
-    // from, and `unstated` is what the class has to answer for, one bucket per
-    // arm.
+    // from, and `unstated` is the class's own account of what the statement
+    // left out — the slots it now lets through (R9n) and the one arm that still
+    // answers.
     let statement = inputs.stage_buffer_statement();
-    if statement.declared.is_empty() && statement.unstated.is_empty() {
-        return Ok(Vec::new());
-    }
-    // One declaration anywhere in either stage is enough for the door to have
-    // something to answer about, and the arms the canonical contract cannot
-    // state answer under their own bucket. The vertex half is asked first — the
-    // order the contract states its two buffers in — and inside a stage the
-    // reflection's own order, which is what `pipeline_resolve` collected — so
-    // the first declaration the statement did not carry is the one that
-    // answers, exactly as the walk this replaced answered it on the way in.
-    //
-    // The arm whose entry never dereferences the slot is the R9m fact: no
-    // declaration is stated for it, and the draw stays on the engine because
-    // the provider's registration pairs a stage's reflected arguments with the
-    // contract's declarations one to one — a reflected slot the contract does
-    // not declare is refused by name, a declaration stating `unused` is refused
-    // by the contract itself, and one stating `read` is a reflection mismatch,
-    // so the dropped slot has no pair the provider would execute.
-    if let Some((stage, declaration)) = statement.unstated.first() {
+    // The arm whose entry never dereferences the slot is *ignored* (R9n): the
+    // statement drops it, and the canonical registration leaves a reflected
+    // `Unused` slot out of the pairing when the contract does not declare it
+    // (`research/docs/23` §95) — nothing reads the slot, so it needs no
+    // declaration and carries no view. The arm the translation does not
+    // classify is still fail-closed, and still answers in the statement's own
+    // order: the vertex half first — the order the contract states its two
+    // buffers in — and inside a stage the reflection's own order, which is what
+    // `pipeline_resolve` collected.
+    if let Some((stage, declaration)) = statement
+        .unstated
+        .iter()
+        .find(|(_, declaration)| declaration.access != StageBufferAccess::Unused)
+    {
         let stage_name = stage.name();
-        if declaration.access == StageBufferAccess::Unused {
-            return Err(OutOfClass::owned(
-                "render_provider_out_of_class_stage_buffer_unused",
-                format!(
-                    "a draw whose {stage_name} stage declares a [[buffer({})]] argument the \
-                     translated entry point never dereferences stays on the engine: this rail \
-                     states no declaration for such a slot — the statement carries only the \
-                     arguments the entry reaches, and a view no use covers is not a canonical \
-                     pair — while the canonical registration pairs a stage's reflected arguments \
-                     with the contract's declarations one to one, so the dropped slot has no \
-                     pair the provider would execute: a reflected slot the contract does not \
-                     declare is refused by name (`render_stage_unsupported_interface`), a \
-                     declaration stating `unused` is refused by the contract \
-                     (`render_pipeline_contract_invalid`), and one stating `read` is a \
-                     `render_stage_reflection_mismatch`. {} declaration(s) of this request are \
-                     dropped; the request binds {binds} stage buffer(s)",
-                    declaration.index,
-                    statement.dropped(),
-                ),
-            ));
-        }
         return Err(OutOfClass::owned(
             "render_provider_out_of_class_stage_buffer_unknown",
             format!(
@@ -779,6 +756,15 @@ fn stage_buffer_gate<'a>(
                 access = declaration.access.name(),
             ),
         ));
+    }
+    // Nothing to state: a request whose stages declare no `[[buffer(N)]]`
+    // argument at all keeps the path it always had (R9b), and since R9n the
+    // same holds for a request whose declarations are all slots the entries
+    // never dereference — the dropped slot crosses into the provider neither
+    // declared nor bound, exactly as the binds of an argument no stage declares
+    // already did.
+    if statement.declared.is_empty() {
+        return Ok(Vec::new());
     }
     // The stated half is built in the contract's own canonical order — vertex
     // bindings first by index, then fragment bindings — rather than the
@@ -1373,8 +1359,9 @@ impl RenderChainRole {
 /// is exactly the population this class admits. Of those two, `Unused` is not
 /// stated to the provider at all (R9m): the statement this rail builds carries
 /// only the arguments the translated entries reach
-/// ([`RenderRailInputs::stage_buffer_statement`]), and the class answers for
-/// the dropped slot beside it.
+/// ([`RenderRailInputs::stage_buffer_statement`]) and the class no longer
+/// answers for the dropped slot beside it (R9n): it is counted and ignored,
+/// and the draw proceeds with the slot neither declared nor bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StageBufferAccess {
     /// Declared, and the specialized entry point never dereferences it.
@@ -1383,14 +1370,14 @@ pub enum StageBufferAccess {
     /// no entry reaches is not interface a canonical pair — a declaration
     /// beside the view that fills it — could describe, so the statement drops
     /// it and the count of dropped declarations is a reading of its own. The
-    /// draw still keeps the engine, because the provider's registration pairs
-    /// a translation's reflected arguments with the contract's declarations
-    /// one to one and refuses the slot either way: a reflected slot the
-    /// contract does not declare is a `render_stage_unsupported_interface`,
-    /// a declaration stating `unused` is refused by the contract itself
-    /// (`render_pipeline_contract_invalid`), and one stating `read` is a
-    /// `render_stage_reflection_mismatch` — all three measured in
-    /// `provider_render_rail.rs`.
+    /// drop does not keep the draw on the engine either (R9n): the canonical
+    /// registration leaves a reflected `Unused` slot out of the pairing when
+    /// the contract does not declare it (`research/docs/23` §95), so the
+    /// request proceeds with that slot declared nowhere and bound nowhere.
+    /// What is still refused by name is the opposite declaration, a contract
+    /// that states the slot: `render_pipeline_contract_invalid` for one
+    /// stating `unused`, `render_stage_reflection_mismatch` for one stating
+    /// `read`. Measured in `provider_render_rail.rs`.
     Unused,
     /// Declared and read: `BufferAccess::Read`'s Metal spelling.
     Read,
@@ -1649,8 +1636,8 @@ pub struct RenderRailInputs<'a> {
     pub stage_buffer_binds: &'a [StageBufferBind<'a>],
 }
 
-/// The statement one request's two stages make, and the declarations the class
-/// answers for instead (`research/docs/26` §R9m).
+/// The statement one request's two stages make, and the declarations it leaves
+/// out (`research/docs/26` §R9m, §R9n).
 ///
 /// Built by [`RenderRailInputs::stage_buffer_statement`], which is the one
 /// place the two stages' reflection lists become a canonical statement: the
@@ -1671,19 +1658,21 @@ pub struct StageBufferStatement<'a> {
     )>,
     /// Every declaration this class does **not** state, in the same order.
     ///
-    /// Two arms end up here, and the class answers each under its own bucket:
-    /// a slot the entry never dereferences (`Unused` — dropped from the
-    /// statement, counted, and answered for because the provider's
-    /// registration pairs a translation's reflected arguments with the
-    /// contract's declarations one to one) and an access the translation does
-    /// not classify (`Unknown` — fail closed, exactly as it always was).
+    /// Two arms end up here, and R9n splits what happens to each: a slot the
+    /// entry never dereferences (`Unused`) is *ignored* — dropped from the
+    /// statement, counted ([`Self::dropped`]), and passed through to the
+    /// canonical pairing, which leaves a reflected `Unused` slot out of it when
+    /// the contract does not declare it (`research/docs/23` §95) — and an
+    /// access the translation does not classify (`Unknown`) is fail-closed,
+    /// exactly as it always was.
     pub unstated: Vec<(RenderPipelineStage, &'a StageBufferDeclaration)>,
 }
 
 impl StageBufferStatement<'_> {
     /// How many declarations were dropped because the slot's entry never
     /// dereferences it — the `Unused` arm of [`Self::unstated`], which is what
-    /// the census band counts.
+    /// the census band counts and what the class answered for before R9n
+    /// stopped answering for it.
     pub fn dropped(&self) -> usize {
         self.unstated
             .iter()
@@ -1697,12 +1686,11 @@ impl<'a> RenderRailInputs<'a> {
     ///
     /// A `[[buffer(N)]]` argument the translated entry point never reaches is
     /// not part of it: there is no view the canonical pair could fill for a
-    /// slot no use covers, and the provider's registration refuses the slot
-    /// whether or not a declaration is stated for it (see
-    /// [`StageBufferAccess::Unused`]), so stating one would be a declaration
-    /// this rail cannot bind. The slot is reported in
-    /// [`StageBufferStatement::unstated`] instead, where the class answers for
-    /// it and the census counts it.
+    /// slot no use covers, so stating one would be a declaration this rail
+    /// cannot bind. The slot is reported in
+    /// [`StageBufferStatement::unstated`] instead, where the census counts it
+    /// and the class ignores it (R9n): the canonical pairing admits exactly the
+    /// shape the statement then carries (see [`StageBufferAccess::Unused`]).
     pub fn stage_buffer_statement(&self) -> StageBufferStatement<'a> {
         let mut statement = StageBufferStatement {
             declared: Vec::new(),
@@ -2252,13 +2240,15 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     // engine, and this answers *how many* buffers were behind it — the split
     // the v2 census could not make (its §7.3).
     crate::runtime::drain::note_store_route(stage_buffer_count_route(req.storage_buffers.len()));
-    // R9m: the declarations the same request's translations state and its
+    // R9m/R9n: the declarations the same request's translations state and its
     // statement does not carry, charged for the same population and for the
-    // same reason — the door's buckets say *why* a draw stayed on the engine,
-    // and this says how many declarations were dropped on the way in. The
-    // statement is the seam's one spelling of the partition
-    // ([`RenderRailInputs::stage_buffer_statement`]), so the band and the gate
-    // cannot disagree about what was dropped.
+    // same reason — this says how many declarations a request left behind on
+    // the way in. R9n is the increment the band now sizes: the drop no longer
+    // keeps the draw on the engine (the door has no bucket for it any more), so
+    // the band reads the population the class hands to the canonical pairing
+    // with a slot it never states. The statement is the seam's one spelling of
+    // the partition ([`RenderRailInputs::stage_buffer_statement`]), so the band
+    // and the gate cannot disagree about what was dropped.
     crate::runtime::drain::note_store_route(stage_buffer_unused_skip_route(
         inputs.stage_buffer_statement().dropped(),
     ));
@@ -2429,19 +2419,20 @@ pub fn stage_buffer_count_route(binds: usize) -> &'static str {
 }
 
 /// The census band of the stage-buffer declarations a request's translations
-/// state and the statement does not carry (`research/docs/26` §R9m).
+/// state and the statement does not carry (`research/docs/26` §R9m, §R9n).
 ///
 /// The reflection reports a `[[buffer(N)]]` argument whose specialized entry
 /// point never dereferences it as `ResourceAccess::Unused`, and this rail
 /// states no declaration for such a slot: there is no view the canonical pair
-/// could fill, and the provider's registration refuses the slot with or
-/// without a declaration ([`StageBufferAccess::Unused`]). The band sizes that
+/// could fill, and since R9n the canonical pairing admits exactly that shape —
+/// a reflected `Unused` slot the contract does not declare takes no part in the
+/// pairing (`research/docs/23` §95, [`StageBufferAccess::Unused`]) — so the
+/// draw proceeds with the slot neither declared nor bound. The band sizes that
 /// population. It is charged for every request the gate is handed, beside
 /// [`stage_buffer_count_route`] and with the same breakpoints, so one census
 /// can read both how many binds sat behind a draw and how many declarations
 /// were dropped — and so the arms sum to the same denominator the bound band's
-/// arms share. *Which* declarations were dropped (stage, index, reach) is the
-/// door's own sentence, not this count.
+/// arms share.
 pub fn stage_buffer_unused_skip_route(skipped: usize) -> &'static str {
     match skipped {
         0 => "stage_buffer_skipped_unused_0",

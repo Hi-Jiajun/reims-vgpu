@@ -3856,17 +3856,17 @@ fn a_read_only_stage_buffer_leaves_for_the_provider_and_agrees_with_the_engine()
     );
 }
 
-/// The door's buckets after R9d, each its own counter: the three classes the
-/// canonical contract cannot state keep the draw on the engine under the name
-/// their own access gives them, and the read-only class — the one this
-/// increment lifts — is answered by the *fact* that stands between the
-/// declaration and a stated pair (`research/docs/26` §R9b, §R9d).
+/// The door's buckets after R9n, each its own counter: the two facts that still
+/// keep a declared draw on the engine, and the two arms the increments lifted —
+/// the read-only class R9d admits once its bind is stated, and the slot whose
+/// entry never dereferences it, which R9n stops answering for altogether.
 ///
-/// Two arms are driven by a real fixture whose `[[buffer(0)]]` metadata states
-/// that access, so the split is measured against modules rather than against
-/// the seam's own vocabulary: an unread declaration must not be counted as a
-/// read one, and a writable one — the arm the canonical contract refuses
-/// before admission — must not hide inside the read population.
+/// The fixture-driven arms come from real modules whose `[[buffer(0)]]`
+/// metadata states that access, so the split is measured against translations
+/// rather than against the seam's own vocabulary: an unread declaration must
+/// not be counted as a writable one, and the writable arm — the one the
+/// canonical contract refuses before admission — must not hide inside the read
+/// population beside it.
 ///
 /// The `Unknown` arm is the one no fixture here can state: a shader body that
 /// reads its buffer makes `metal2vulkan` reflect `ReadOnly` from the emitted
@@ -3883,101 +3883,117 @@ fn the_stage_buffer_door_names_what_keeps_a_declared_draw_on_the_engine() {
         binding: 0,
         content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16])),
     });
-    // The refusals: one bucket per arm the canonical contract cannot state —
-    // unchanged by R9d — plus the writable arm R9j states and can only admit
-    // when the request names a destination for it.
-    let slug = |access| match access {
-        StageBufferAccess::Unused => (
-            "render_provider_out_of_class_stage_buffer_unused",
-            Some(("render_frag_buffer_unused.air", "reims_unused_buffer_frag")),
-        ),
-        // A writable declaration with no landing: this request's bind states
-        // no guest destination for it, which is the one fact R9j could not
-        // land.
-        StageBufferAccess::Write | StageBufferAccess::ReadWrite => (
-            "render_provider_out_of_class_stage_buffer_write",
-            Some(("render_frag_buffer_write.air", "reims_write_buffer_frag")),
-        ),
-        // The read-only arm is admitted, so it has no refusal bucket of its
-        // own any more: it is asserted below, against the request that states
-        // the bind and the one that does not.
-        StageBufferAccess::Read => (
-            "render_provider_out_of_class_stage_buffer_unbound",
-            Some(("render_frag_buffer.air", "reims_buffer_frag")),
-        ),
-        StageBufferAccess::Unknown => ("render_provider_out_of_class_stage_buffer_unknown", None),
-    };
-
-    for access in [
-        StageBufferAccess::Unused,
-        StageBufferAccess::Read,
-        // The writable fixture stores the word it loaded, so its reflection
-        // states both uses — `ReadWrite`, the arm R9f landed — while the
-        // request states no destination for it: the pair the gate has to
-        // answer as a write it cannot land.
-        StageBufferAccess::ReadWrite,
-        StageBufferAccess::Unknown,
-    ] {
-        let (bucket, module) = slug(access);
+    // One fixture-driven declaration, asserted to carry the access this test
+    // means: the arms come from the fixtures' own translations, and the reach
+    // beside them (R9d) is read rather than restated.
+    let with_fragment = |fixture_name: &str, entry: &'static str, access: StageBufferAccess| {
         let mut stages = bases.clone();
-        match module {
-            Some((fixture_name, entry)) => {
-                stages.air.1 = fixture(fixture_name);
-                stages.fragment_entry = entry;
-                stages.fragment_stage_buffer_declarations =
-                    declared_stage_buffers(&stages.air.1, RenderStage::Fragment, entry);
-                // The access and the index are the two facts this test is
-                // about; the reach beside them is whatever the fixture's own
-                // translation reports (R9d), so it is read and not restated.
-                let declarations = &stages.fragment_stage_buffer_declarations;
-                assert_eq!(declarations.len(), 1, "{fixture_name}: one declaration");
-                assert_eq!(
-                    (declarations[0].index, declarations[0].access),
-                    (0, access),
-                    "{fixture_name} declares one buffer of its own access at index 0"
-                );
-            }
-            None => {
-                stages.fragment_stage_buffer_declarations = vec![StageBufferDeclaration {
-                    index: 0,
-                    access,
-                    footprint: StageBufferFootprint::Static { max_bytes: 4 },
-                }];
-            }
-        }
-        let before = route_count(bucket);
-        // The writable arm needs a bind to reach its own fact: with the slot
-        // empty the gate answers `_unbound` first, which is the *other* arm's
-        // bucket. Its bind states no destination, so the write it cannot land
-        // is what the gate answers.
-        let content = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16]));
-        let writable_binds = [staged_bind(RenderPipelineStage::Fragment, 0, &content)];
-        let inputs = match access {
-            StageBufferAccess::Write | StageBufferAccess::ReadWrite => {
-                inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &writable_binds)
-            }
-            _ => inputs(&stages, RenderChainRole::SoleOrTail),
-        };
-        match provider_render::submit_render(&inputs, &req) {
-            RenderRailOutcome::NotInNarrowClass(reason) => {
-                assert_eq!(
-                    reason.slug(),
-                    bucket,
-                    "{access:?} is its own bucket: {reason}"
-                );
-                assert!(
-                    reason.detail().contains("[[buffer(0)]]"),
-                    "the sentence names the declaration: {reason}"
-                );
-            }
-            other => panic!("{access:?} is out of class: {other:?}"),
-        }
+        stages.air.1 = fixture(fixture_name);
+        stages.fragment_entry = entry;
+        stages.fragment_stage_buffer_declarations =
+            declared_stage_buffers(&stages.air.1, RenderStage::Fragment, entry);
+        let declarations = &stages.fragment_stage_buffer_declarations;
+        assert_eq!(declarations.len(), 1, "{fixture_name}: one declaration");
         assert_eq!(
-            route_count(bucket),
-            before + 1,
-            "{access:?} charges its own bucket exactly once"
+            (declarations[0].index, declarations[0].access),
+            (0, access),
+            "{fixture_name} declares one buffer of its own access at index 0"
         );
+        stages
+    };
+    let content = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16]));
+    let binds = [staged_bind(RenderPipelineStage::Fragment, 0, &content)];
+
+    // The writable arm: the fixture stores the word it loaded, so its
+    // reflection states both uses — `ReadWrite`, the arm R9f landed — while the
+    // request states no destination for it: the pair the gate has to answer as
+    // a write it cannot land. The bind is what reaches that fact at all; with
+    // the slot empty the `_unbound` arm would answer first.
+    let writable = with_fragment(
+        "render_frag_buffer_write.air",
+        "reims_write_buffer_frag",
+        StageBufferAccess::ReadWrite,
+    );
+    let write_bucket = route_count("render_provider_out_of_class_stage_buffer_write");
+    match provider_render::submit_render(
+        &inputs_with_binds(&writable, RenderChainRole::SoleOrTail, &binds),
+        &req,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_stage_buffer_write",
+                "a writable declaration with no landing is its own bucket: {reason}"
+            );
+            assert!(
+                reason.detail().contains("[[buffer(0)]]"),
+                "the sentence names the declaration: {reason}"
+            );
+        }
+        other => panic!("a writable declaration with no landing stays on the engine: {other:?}"),
     }
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_write"),
+        write_bucket + 1,
+        "the writable fact charges its own bucket exactly once"
+    );
+
+    // The unclassified arm, handed to the gate directly: no fixture here can
+    // state it (the module's own decoration answers whatever the metadata
+    // omitted), and it is still its own bucket.
+    let mut unknown = bases.clone();
+    unknown.fragment_stage_buffer_declarations = vec![StageBufferDeclaration {
+        index: 0,
+        access: StageBufferAccess::Unknown,
+        footprint: StageBufferFootprint::Static { max_bytes: 4 },
+    }];
+    let unknown_bucket = route_count("render_provider_out_of_class_stage_buffer_unknown");
+    match provider_render::submit_render(&inputs(&unknown, RenderChainRole::SoleOrTail), &req) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_stage_buffer_unknown",
+                "an access the translation does not classify is its own bucket: {reason}"
+            );
+            assert!(
+                reason.detail().contains("[[buffer(0)]]"),
+                "the sentence names the declaration: {reason}"
+            );
+        }
+        other => panic!("an unclassified declaration stays on the engine: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_unknown"),
+        unknown_bucket + 1,
+        "the unclassified fact charges its own bucket exactly once"
+    );
+
+    // The refusals this file still reads on the stage-buffer door, named once:
+    // the two arms above and the fact that stands between a read-only
+    // declaration and its stated pair.
+    let refusals = [
+        "render_provider_out_of_class_stage_buffer_write",
+        "render_provider_out_of_class_stage_buffer_unknown",
+        "render_provider_out_of_class_stage_buffer_unbound",
+    ];
+    let unread = with_fragment(
+        "render_frag_buffer_unused.air",
+        "reims_unused_buffer_frag",
+        StageBufferAccess::Unused,
+    );
+    let before: Vec<u64> = refusals.iter().map(|slug| route_count(slug)).collect();
+    match provider_render::submit_render(
+        &inputs_with_binds(&unread, RenderChainRole::SoleOrTail, &binds),
+        &req,
+    ) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("a slot no entry dereferences is admitted since R9n: {other:?}"),
+    }
+    let after: Vec<u64> = refusals.iter().map(|slug| route_count(slug)).collect();
+    assert_eq!(
+        before, after,
+        "an unread declaration charges none of the door's buckets: its own is gone (R9n)"
+    );
 
     // The read-only class, both ways: with no bind stated the pair cannot be
     // completed and the draw stays on the engine under the fact that is
@@ -3998,8 +4014,6 @@ fn the_stage_buffer_door_names_what_keeps_a_declared_draw_on_the_engine() {
         unbound + 1,
         "and that fact is its own counter"
     );
-    let content = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16]));
-    let binds = [staged_bind(RenderPipelineStage::Fragment, 0, &content)];
     assert_eq!(
         route_count("render_provider_out_of_class_stage_buffer_unbound"),
         unbound + 1,
@@ -4013,13 +4027,12 @@ fn the_stage_buffer_door_names_what_keeps_a_declared_draw_on_the_engine() {
         other => panic!("a declared read-only stage buffer leaves for the provider: {other:?}"),
     }
 
-    // The vertex stage's declarations answer first: one request, both stages
-    // declaring a class the contract cannot state, and the vertex bucket is the
-    // one that moves.
+    // The vertex half answers first: one request, both stages declaring a fact
+    // the class answers for, and the vertex bucket is the one that moves.
     let mut stages = bases.clone();
     stages.vertex_stage_buffer_declarations = vec![StageBufferDeclaration {
         index: 2,
-        access: StageBufferAccess::Unused,
+        access: StageBufferAccess::Unknown,
         footprint: StageBufferFootprint::Static { max_bytes: 16 },
     }];
     stages.fragment_stage_buffer_declarations = vec![StageBufferDeclaration {
@@ -4027,18 +4040,18 @@ fn the_stage_buffer_door_names_what_keeps_a_declared_draw_on_the_engine() {
         access: StageBufferAccess::Write,
         footprint: StageBufferFootprint::Static { max_bytes: 16 },
     }];
-    let vertex_bucket = route_count("render_provider_out_of_class_stage_buffer_unused");
+    let vertex_bucket = route_count("render_provider_out_of_class_stage_buffer_unknown");
     let fragment_bucket = route_count("render_provider_out_of_class_stage_buffer_write");
     match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
         RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
             reason.slug(),
-            "render_provider_out_of_class_stage_buffer_unused",
+            "render_provider_out_of_class_stage_buffer_unknown",
             "the vertex half answers first: {reason}"
         ),
         other => panic!("a declared vertex buffer keeps the draw on the engine: {other:?}"),
     }
     assert_eq!(
-        route_count("render_provider_out_of_class_stage_buffer_unused"),
+        route_count("render_provider_out_of_class_stage_buffer_unknown"),
         vertex_bucket + 1
     );
     assert_eq!(
@@ -4047,29 +4060,15 @@ fn the_stage_buffer_door_names_what_keeps_a_declared_draw_on_the_engine() {
         "the stage that did not answer does not charge a bucket"
     );
 
-    // And the admitted arm charges none of them: the buckets are the door's
-    // refusals, not the population it lets through.
+    // And an admitted draw charges none of the refusals' buckets: the buckets
+    // are the door's refusals, not the population it lets through.
     let clean = reviewed_stages();
-    let before: Vec<u64> = [
-        StageBufferAccess::Unused,
-        StageBufferAccess::Write,
-        StageBufferAccess::Unknown,
-    ]
-    .iter()
-    .map(|access| route_count(slug(*access).0))
-    .collect();
+    let before: Vec<u64> = refusals.iter().map(|slug| route_count(slug)).collect();
     match provider_render::submit_render(&inputs(&clean, RenderChainRole::SoleOrTail), &req) {
         RenderRailOutcome::ProviderCompleted(_) => (),
         other => panic!("the undeclared binds are in class: {other:?}"),
     }
-    let after: Vec<u64> = [
-        StageBufferAccess::Unused,
-        StageBufferAccess::Write,
-        StageBufferAccess::Unknown,
-    ]
-    .iter()
-    .map(|access| route_count(slug(*access).0))
-    .collect();
+    let after: Vec<u64> = refusals.iter().map(|slug| route_count(slug)).collect();
     assert_eq!(before, after, "an admitted draw charges no door bucket");
 }
 
@@ -5205,8 +5204,9 @@ fn the_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
     provider_wire::capture_submission_frames(false);
 }
 
-/// R9m, the drop: a `[[buffer(N)]]` argument whose translated entry point never
-/// dereferences it is not a declaration this rail states.
+/// R9m's drop and R9n's admission: a `[[buffer(N)]]` argument whose translated
+/// entry point never dereferences it is not a declaration this rail states, and
+/// since R9n it does not keep the draw on the engine either.
 ///
 /// The reflection answers `ResourceAccess::Unused` for such an argument — the
 /// metadata declares it and the emitted entry point never reaches it — and
@@ -5217,15 +5217,16 @@ fn the_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
 /// census can size the population, and no submission frame is produced at all —
 /// a frame is what carries declarations, and this request states none.
 ///
-/// The door still answers, and that is the other half of the reading: the
-/// provider's registration pairs a translation's reflected arguments with the
-/// contract's declarations one to one, so a slot with no declaration is refused
-/// by name there
-/// (`the_registration_has_no_pair_for_a_slot_the_entry_never_dereferences`), and
-/// a rail that had stated one anyway would be stating a declaration it cannot
-/// bind.
+/// R9n is the other half: the drop is not an answer any more. The canonical
+/// registration leaves a reflected `Unused` slot out of the pairing when the
+/// contract does not declare it (`research/docs/23` §95), so the request leaves
+/// for the provider with the slot neither declared nor bound — the R9b path a
+/// bind no stage declares already takes — and the two rails land the fixture's
+/// own frame byte for byte. The door's old bucket is charged by nothing any
+/// more, and the declaration that would state the slot is still refused by name
+/// (`the_registration_leaves_a_slot_the_entry_never_dereferences_out_of_the_pairing`).
 #[test]
-fn a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement() {
+fn a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement_and_admitted() {
     let _guard = engine_test_session();
     use reims_vgpu::backend::provider_wire;
 
@@ -5244,7 +5245,12 @@ fn a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement() {
     );
 
     // The statement: the slot is not in it, and the drop is a count beside it.
-    let inputs = inputs(&stages, RenderChainRole::SoleOrTail);
+    // The request states the bind the slot would have had on the engine, so the
+    // shape is the production one: the guest set the buffer and the entry never
+    // reached it.
+    let content = BufferContent::Bytes(std::sync::Arc::new(vec![0xa5u8; 16]));
+    let binds = [staged_bind(RenderPipelineStage::Fragment, 0, &content)];
+    let inputs = inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds);
     let statement = inputs.stage_buffer_statement();
     eprintln!(
         "statement for the unused shape: declared={} dropped={} unstated={:?}",
@@ -5271,26 +5277,23 @@ fn a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement() {
     let door = route_count("render_provider_out_of_class_stage_buffer_unused");
     provider_wire::capture_submission_frames(true);
     let frames_before = provider_wire::wire_counts().submit_frames;
-    match provider_render::submit_render(&inputs, &narrow_request(MTL_FORMAT_RGBA8_UNORM)) {
-        RenderRailOutcome::NotInNarrowClass(reason) => {
-            eprintln!("door for the dropped declaration: {reason}");
-            assert_eq!(
-                reason.slug(),
-                "render_provider_out_of_class_stage_buffer_unused"
-            );
-            assert!(
-                reason.detail().contains("[[buffer(0)]]"),
-                "the sentence names the slot: {reason}"
-            );
-            assert!(
-                reason.detail().contains("1 declaration(s)"),
-                "and the number of declarations the statement dropped: {reason}"
-            );
-        }
-        other => panic!("a slot no entry reaches stays on the engine: {other:?}"),
-    }
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.storage_buffers.push(engine::StorageBufferResource {
+        binding: 0,
+        content: content.clone(),
+    });
+    let provider = match provider_render::submit_render(&inputs, &req) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("a slot no entry reaches leaves for the provider since R9n: {other:?}"),
+    };
     let frames = provider_wire::captured_submission_frames();
     provider_wire::capture_submission_frames(false);
+    eprintln!(
+        "gate for the dropped declaration: the request left for the provider, {} byte(s), \
+         texel={:?}",
+        provider.len(),
+        texel_at(&provider, 0, 0),
+    );
     assert_eq!(
         route_count("stage_buffer_skipped_unused_1"),
         skipped + 1,
@@ -5303,8 +5306,15 @@ fn a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement() {
     );
     assert_eq!(
         route_count("render_provider_out_of_class_stage_buffer_unused"),
-        door + 1,
-        "the door answers for the dropped slot exactly once"
+        door,
+        "the bucket the drop used to answer under is charged by nothing any more"
+    );
+    eprintln!(
+        "skip band for the dropped declaration: stage_buffer_skipped_unused_1={}, \
+         stage_buffer_skipped_unused_0={}; the old door bucket reads {}",
+        route_count("stage_buffer_skipped_unused_1"),
+        route_count("stage_buffer_skipped_unused_0"),
+        route_count("render_provider_out_of_class_stage_buffer_unused"),
     );
     assert!(
         frames.is_empty(),
@@ -5315,6 +5325,42 @@ fn a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement() {
         frames_before,
         "and the seam produced no submission frame at all"
     );
+
+    // The dropped slot's bytes are not the frame's source: other bytes behind
+    // the same slot land the same frame, which is what "the entry never
+    // dereferences it" means on this rail.
+    let other_content = BufferContent::Bytes(std::sync::Arc::new(vec![0x5au8; 16]));
+    let other_binds = [staged_bind(
+        RenderPipelineStage::Fragment,
+        0,
+        &other_content,
+    )];
+    let other = match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &other_binds),
+        &req,
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the same shape with other bytes is in class: {other:?}"),
+    };
+    assert_frames_equal(
+        "the dropped slot's bytes do not reach the frame",
+        &other,
+        &provider,
+    );
+
+    // The engine's own frame for the same draw, byte for byte: the fixture's
+    // fragment never reads the slot on the engine either.
+    assert_solid("R9n: the dropped slot on the provider rail", &provider);
+    let Some(engine) = engine_pixels("R9n dropped stage buffer", &stages, req) else {
+        return;
+    };
+    assert_solid("R9n: the dropped slot on the engine rail", &engine);
+    assert_frames_equal("R9n: the dropped slot on both rails", &provider, &engine);
+    eprintln!(
+        "provider vs engine, dropped stage buffer: {} bytes equal; texel={:?}",
+        provider.len(),
+        texel_at(&provider, 0, 0),
+    );
 }
 
 /// The same pass with the slot dereferenced: the statement carries exactly that
@@ -5322,7 +5368,7 @@ fn a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement() {
 /// the wire with a view beside it, and the two rails land the same frame.
 ///
 /// This is R9m's other half. The fixture is the same shape as
-/// `a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement`'s
+/// `a_stage_buffer_the_entry_never_dereferences_is_dropped_from_the_statement_and_admitted`'s
 /// — one `[[buffer(0)]]` argument, one admitted draw — with the entry point
 /// actually reading it, so the pair of tests is a statement about the *access
 /// arm* rather than about the slot, the stage or the draw.
@@ -5460,25 +5506,186 @@ fn the_statement_and_the_wire_carry_the_one_slot_the_entry_dereferences() {
     );
 }
 
-/// R9m's measured boundary: the canonical registration has no pair for a slot a
-/// translated entry point never dereferences.
+/// R9n's mixed shape: one stage that reaches one slot and never reaches
+/// another.
 ///
-/// This is the fact the dropped declaration is answered with, measured on the
-/// provider's own registration entry point rather than inferred from this
-/// rail's code: the same fragment stage is handed to
-/// `register_translated_render_pipeline` under the three contracts this rail
-/// could state for it, and every one is refused by name — undeclared
-/// (`render_stage_unsupported_interface`), declared `unused`
-/// (`render_pipeline_contract_invalid`), declared `read`
-/// (`render_stage_reflection_mismatch`) — while the same stage with the slot
-/// dereferenced registers against the very declaration the rail states for it.
-///
-/// Which is why R9m drops the declaration and still keeps the draw on the
-/// engine: the increment that admits this population is the registration arm
-/// ("an argument the entry point never dereferences is not interface"), not a
-/// rail that states a declaration it cannot bind.
+/// The population the door was counting is not draws whose *only* declaration
+/// is unread — it is draws whose translations state several buffers, only some
+/// of which the entries reach. Dropping the unread slot must not drop the rest:
+/// the statement carries the read slot with its own view beside it, the frame
+/// crosses the wire with exactly that one declaration (the drop is a partition,
+/// not a silence), and the provider registers and executes the pair while
+/// leaving the unread slot out of the pairing (`research/docs/23` §95). Both
+/// rails land the same frame, and the unread slot's bytes reach neither.
 #[test]
-fn the_registration_has_no_pair_for_a_slot_the_entry_never_dereferences() {
+fn the_statement_drops_the_unread_slot_beside_the_one_the_entry_reaches() {
+    let _guard = engine_test_session();
+    use reims_vgpu::backend::provider_wire;
+
+    // The measured fact: the two-slot fixture's own translation states the
+    // reached slot as a read and the other as `Unused`, with no reach at all
+    // behind it.
+    let stages = buffer_declaring_stages(
+        "render_frag_buffer_read_and_unused.air",
+        "reims_read_and_unused_buffer_frag",
+    );
+    assert_eq!(
+        stages.fragment_stage_buffer_declarations,
+        vec![
+            StageBufferDeclaration {
+                index: 0,
+                access: StageBufferAccess::Read,
+                footprint: StageBufferFootprint::Static { max_bytes: 4 },
+            },
+            StageBufferDeclaration {
+                index: 1,
+                access: StageBufferAccess::Unused,
+                footprint: StageBufferFootprint::Unstated,
+            },
+        ],
+        "the two-slot fixture declares a read slot beside an unread one"
+    );
+
+    // The statement: the slot the entry reaches is stated, the other is dropped
+    // and counted.
+    let mut bytes = vec![0u8; 16];
+    bytes[..4].copy_from_slice(&[0, 0, 0x80, 0x3f]);
+    let content = BufferContent::Bytes(std::sync::Arc::new(bytes));
+    let binds = [staged_bind(RenderPipelineStage::Fragment, 0, &content)];
+    let inputs = inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds);
+    let statement = inputs.stage_buffer_statement();
+    eprintln!(
+        "statement for the mixed shape: declared={:?} dropped={} unstated={:?}",
+        statement
+            .declared
+            .iter()
+            .map(|(stage, declaration, access)| (
+                stage.name(),
+                declaration.index,
+                declaration.access.name(),
+                *access
+            ))
+            .collect::<Vec<_>>(),
+        statement.dropped(),
+        statement
+            .unstated
+            .iter()
+            .map(|(stage, declaration)| (
+                stage.name(),
+                declaration.index,
+                declaration.access.name()
+            ))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(statement.declared.len(), 1, "the reached slot is stated");
+    assert_eq!(statement.declared[0].1.index, 0);
+    assert_eq!(
+        statement.declared[0].2,
+        BufferAccess::Read,
+        "under the access the contract states it with"
+    );
+    assert_eq!(statement.dropped(), 1, "the unread slot is dropped");
+    assert_eq!(
+        statement.unstated.len(),
+        1,
+        "and the unread slot is the only thing withheld"
+    );
+
+    // The frame carries exactly the stated declaration, with one view beside
+    // it: the unread slot crosses neither half of the canonical pair.
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.storage_buffers.push(engine::StorageBufferResource {
+        binding: 0,
+        content: content.clone(),
+    });
+    let skipped = route_count("stage_buffer_skipped_unused_1");
+    provider_wire::capture_submission_frames(true);
+    let frames_before = provider_wire::wire_counts().submit_frames;
+    let provider = match provider_render::submit_render(&inputs, &req) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the mixed shape leaves for the provider: {other:?}"),
+    };
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    assert_eq!(
+        route_count("stage_buffer_skipped_unused_1"),
+        skipped + 1,
+        "the drop is counted for a request that states something"
+    );
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        frames_before + 1,
+        "the stated half produces exactly one submission frame"
+    );
+    assert_eq!(frames.len(), 1, "and the capture holds it");
+    let (trace, _resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let declarations = trace
+        .pipelines
+        .iter()
+        .find_map(|pipeline| pipeline.render.as_ref())
+        .map(|render| render.stage_buffers.clone())
+        .unwrap_or_default();
+    let views = trace
+        .passes
+        .iter()
+        .find_map(|pass| pass.as_render())
+        .map(|pass| pass.stage_buffers.clone())
+        .unwrap_or_default();
+    eprintln!(
+        "wire frame for the mixed shape: {} bytes, declarations={:?}, views={}",
+        frames[0].len(),
+        declarations,
+        views.len(),
+    );
+    assert_eq!(
+        declarations,
+        vec![StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            access: BufferAccess::Read,
+            footprint: FootprintProof::Static { max_bytes: 4 },
+        }],
+        "the frame carries the reached slot alone"
+    );
+    assert_eq!(views.len(), 1, "with its own view beside it");
+
+    // Both rails, for the same draw: the reached slot still decides the frame,
+    // and the unread slot's bytes reach neither rail.
+    assert_eq!(
+        texel_at(&provider, 0, 0),
+        [255, 0, 0, 255],
+        "the provider reads the bytes behind the stated declaration"
+    );
+    let Some(engine) = engine_pixels("R9n mixed stage buffers", &stages, req) else {
+        return;
+    };
+    assert_frames_equal("R9n: the mixed shape on both rails", &provider, &engine);
+    eprintln!(
+        "provider vs engine, mixed stage buffers: {} bytes equal; texel={:?}",
+        provider.len(),
+        texel_at(&provider, 0, 0),
+    );
+}
+
+/// R9n's measured boundary: the canonical registration leaves a slot a
+/// translated entry point never dereferences out of the pairing, and still
+/// refuses every declaration that states it by name.
+///
+/// This is the fact the R9m drop is answered with, measured on the provider's
+/// own registration entry point rather than inferred from this rail's code: the
+/// same fragment stage is handed to `register_translated_render_pipeline` under
+/// the contracts this rail could state for it. Undeclared — the shape R9m's
+/// statement produces — registers (`research/docs/23` §95: the translation
+/// classifies the argument `Unused`, the module reads nothing there, so the
+/// slot needs no declaration and takes no part in the pairing), while a
+/// declaration stating `unused` is refused by the contract itself
+/// (`render_pipeline_contract_invalid`) and one stating `read` is a reflection
+/// mismatch (`render_stage_reflection_mismatch`) — so the drop is not a
+/// silence, and the same stage with the slot dereferenced registers against the
+/// very declaration the rail states for it.
+#[test]
+fn the_registration_leaves_a_slot_the_entry_never_dereferences_out_of_the_pairing() {
     let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
     let provider = VulkanComputeProvider::with_executor(std::sync::Arc::clone(&executor))
         .expect("the canonical provider builds");
@@ -5543,8 +5750,10 @@ fn the_registration_has_no_pair_for_a_slot_the_entry_never_dereferences() {
         footprint: FootprintProof::Static { max_bytes: 16 },
     };
 
-    // Arm 1: no declaration at all — the shape R9m's statement produces.
-    let refused = provider
+    // Arm 1: no declaration at all — the shape R9m's statement produces and
+    // R9n admits. The registration leaves the reflected `Unused` slot out of
+    // the pairing, so the stage registers with no stage-buffer declaration.
+    let registered = provider
         .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
             contract: contract("reims_unused_buffer_frag", Vec::new()),
             vertex: translate(&vertex_air, RenderStage::Vertex, "reims_indexed_vertex"),
@@ -5555,20 +5764,10 @@ fn the_registration_has_no_pair_for_a_slot_the_entry_never_dereferences() {
             ),
             logical_digest: digest("unused-undeclared"),
         })
-        .expect_err("a reflected slot the contract does not declare has no view to fill it");
+        .expect("an unread slot the contract does not declare takes no part in the pairing");
     eprintln!(
-        "unused, undeclared: class={:?} slug={} fields={:?}",
-        refused.class, refused.slug, refused.fields
-    );
-    assert_eq!(refused.slug, "render_stage_unsupported_interface");
-    assert_eq!(
-        refused.fields.get("field"),
-        Some(&FieldValue::Text("bindings".to_owned()))
-    );
-    assert_eq!(
-        refused.fields.get("index"),
-        Some(&FieldValue::Unsigned(0)),
-        "the refusal names the slot the translation never reaches"
+        "unused, undeclared: registered pipeline_id={:?}",
+        registered.pipeline_id
     );
 
     // Arm 2: declared with the access the reflection itself reports. The
