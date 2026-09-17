@@ -465,6 +465,11 @@ fn the_production_seam_completes_the_reviewed_shape_and_agrees_with_the_engine()
     let provider =
         match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
             RenderRailOutcome::ProviderCompleted(out) => out,
+            // The pooled shape names no resident, so the resident arm cannot
+            // answer for it.
+            RenderRailOutcome::ProviderCompletedResident(frame) => {
+                panic!("the pooled class published no frame and kept one instead: {frame:?}")
+            }
             RenderRailOutcome::NotInNarrowClass(reason) => {
                 panic!("the reviewed shape is in the narrow class; refused: {reason}")
             }
@@ -538,6 +543,9 @@ fn a_chain_head_hands_its_frame_to_the_next_record() {
     let head_provider =
         match provider_render::submit_render(&inputs(&stages, RenderChainRole::Head), &head) {
             RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            RenderRailOutcome::ProviderCompletedResident(frame) => {
+                panic!("the chain head reads no resident and keeps none: {frame:?}")
+            }
             RenderRailOutcome::NotInNarrowClass(reason) => {
                 panic!(
                     "the record that opens the pass is in the class: it needs no frame from \
@@ -745,12 +753,13 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
         other => panic!("expected an out-of-class answer, got {other:?}"),
     };
 
-    // The two chain positions the class leaves to the engine, because both of
-    // them begin from a frame this class cannot name: the packet's middle (a
-    // predecessor and a successor) and the packet's last record, which begins
-    // from the frame before it as well even though it owns the guest
-    // writeback. The record that *opens* the pass is the third position and the
-    // one W1 admits — see `a_chain_head_hands_its_frame_to_the_next_record`.
+    // The chain positions whose frame this class cannot name stay on the
+    // engine: the packet's middle (a predecessor and a successor) when it
+    // carries no resident source, and the packet's last record when it begins
+    // from guest bytes rather than the provider's image. The positions R7b and
+    // W1 admit are exercised in `a_resident_middle_record_is_admitted_and_a_
+    // source_less_one_is_not` and `a_chain_head_hands_its_frame_to_the_next_
+    // record`.
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.continues_render_pass = true;
     req.render_pass_continues = true;
@@ -815,7 +824,9 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     class(&no_bytes);
     let _ = req;
 
-    // A declared Load keeps the engine: the class clears.
+    // A declared Load whose previous contents this rail cannot name keeps the
+    // engine: the class states the provider's own image or a clear, and the
+    // guest-bytes arm is the increment after this one.
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
     class(&req);
@@ -840,8 +851,8 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     ));
     class(&req);
 
-    // Blend state, a write mask, an explicit viewport and a resident target all
-    // leave their rails to the engine.
+    // Blend state, a write mask, an explicit viewport and a target identity no
+    // record here loads from or keeps all leave their rails to the engine.
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.blend = Some(BlendStateResource {
         src_rgb: reims_vgpu_core::blend::MTL_BLEND_FACTOR_SOURCE_ALPHA,
@@ -1144,6 +1155,9 @@ fn an_in_class_shape_the_provider_refuses_is_a_typed_decline() {
         RenderRailOutcome::ProviderCompleted(_) => {
             panic!("the provider completed a draw whose index view is too short")
         }
+        RenderRailOutcome::ProviderCompletedResident(_) => {
+            panic!("a draw with no target identity cannot keep a resident frame")
+        }
         RenderRailOutcome::NotInNarrowClass(reason) => {
             panic!("an in-class refusal must not fall back to the engine: {reason}")
         }
@@ -1173,6 +1187,9 @@ fn an_in_class_chain_head_the_provider_refuses_is_a_typed_decline() {
         ),
         RenderRailOutcome::ProviderCompleted(_) => {
             panic!("the provider completed a head whose index view is too short")
+        }
+        RenderRailOutcome::ProviderCompletedResident(_) => {
+            panic!("a head with no target identity cannot keep a resident frame")
         }
         RenderRailOutcome::NotInNarrowClass(reason) => {
             panic!("an in-class chain head's refusal must not fall back to the engine: {reason}")
@@ -1533,6 +1550,409 @@ fn half_of(width: u32) -> u32 {
     width / 2
 }
 
+/// The identity a resident test's target names, in the namespace the
+/// mapper-ref-texture rail mints: a mapping id, the attachment's own geometry,
+/// and the format the attachment renders in.
+///
+/// `TargetIdentity` is the *engine's* key, and it is also what the provider-side
+/// pair is minted from (`provider_render::resident_attachment`) — so a test that
+/// drives both rails through their own identities is driving the same guest
+/// target through both.
+fn surface_identity(id: u32) -> engine::TargetIdentity {
+    let (width, height) = extent();
+    engine::TargetIdentity::Surface {
+        id,
+        width,
+        height,
+        generation: 1,
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+    }
+}
+
+/// The frame a resident seed leaves behind: a colour that is neither the
+/// fragment stage's texel nor the *second* record's own clear value
+/// ([`CLEAR`]), so "the resident load was skipped and the pass cleared instead"
+/// cannot pass as "the frame stayed where it was".
+const RESIDENT_SEED_CLEAR: [f64; 4] = [0.0, 1.0, 0.0, 1.0];
+const RESIDENT_SEED_TEXEL: [u8; 4] = [0, 255, 0, 255];
+
+/// The degenerate stream a resident seed draws with: three coincident vertices,
+/// so the pass's `Clear` is what stays in the image.
+///
+/// The seed has to *not* draw over its own clear, or the chain's comparison
+/// would be between two drawn frames: the reviewed full-screen triangle paints
+/// the fragment's texel across the whole attachment, and the bytes the second
+/// record fails to cover would then be that texel rather than the frame the
+/// seed left. A zero-area triangle rasterizes nothing on both rails.
+fn degenerate_stream() -> StreamSpec {
+    stream(0, &[(0.5, 0.5), (0.5, 0.5), (0.5, 0.5)])
+}
+
+/// The seeding record of a resident chain, in the terms the GVA and
+/// mapper-ref-texture rails build it: a byte-exact `Clear` whose draw covers
+/// nothing, the request's own target identity, and the resident-store pair
+/// (`skip_readback` with the reason recorded where the flag is set).
+fn resident_seed_request(identity: &engine::TargetIdentity) -> DrawRequest {
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &[degenerate_stream()]);
+    req.target_identity = Some(identity.clone());
+    req.skip_readback = true;
+    req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    req.color_attachment = Some(
+        reims_vgpu::backend::vulkan::translate::pixel::color_attachment(MTL_FORMAT_RGBA8_UNORM)
+            .expect("renderable")
+            .0
+            .with_clear(RESIDENT_SEED_CLEAR),
+    );
+    req
+}
+
+/// The record that composites onto a resident frame: `load_from_target` is the
+/// engine's own spelling of "the previous contents are the live GPU image", and
+/// the scissor covers half the attachment. `publishes` chooses between the
+/// record that keeps its own frame (a chain intermediate) and the record whose
+/// frame comes back through the completion (the shape a chain's last record
+/// takes when its target is not one of the two deferring rails).
+fn resident_load_request(identity: &engine::TargetIdentity, publishes: bool) -> DrawRequest {
+    let (width, height) = extent();
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.target_identity = Some(identity.clone());
+    req.load_from_target = true;
+    req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+    req.scissors.push(ScissorResource {
+        x: 0,
+        y: 0,
+        width: half_of(width),
+        height,
+    });
+    if !publishes {
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    }
+    req
+}
+
+fn route_count(route: &str) -> u64 {
+    reims_vgpu::runtime::drain::store_route_count_for_test(route)
+}
+
+/// The rail's answer for one resident-shaped request the class admitted.
+fn declined(label: &str, stages: &Stages, req: &DrawRequest) -> ProviderRenderDecline {
+    match provider_render::submit_render(&inputs(stages, RenderChainRole::SoleOrTail), req) {
+        RenderRailOutcome::ProviderDeclined(decline) => decline,
+        other => panic!("{label}: expected a typed decline, got {other:?}"),
+    }
+}
+
+/// The provider's own slug and detail for a refusal, as the rail reports them.
+fn refused_slug(label: &str, stages: &Stages, req: &DrawRequest) -> (String, String) {
+    let decline = declined(label, stages, req);
+    let fields = reims_vgpu::observe::Decline::fields(&decline);
+    let field = |key: &str| {
+        fields
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default()
+    };
+    (decline.slug().to_owned(), field("detail"))
+}
+
+/// R7b: the frame a resident store keeps, and the record that composites onto
+/// it.
+///
+/// The seeding record declares `StoreOp::Resident` under the request's own
+/// target identity, so it publishes nothing — the outcome carries no bytes at
+/// all, and a provider that published a writeback for the attachment anyway
+/// would be declined by name (`resident_writeback_published`). The second
+/// record loads that image (`LoadOp::Resident`), covers half the attachment
+/// with its scissor, and publishes the mixed frame. The comparison is the
+/// engine's own two-record chain driven by the same requests: same AIR, same
+/// geometry, the engine's resident in place of the provider's image.
+#[test]
+fn a_resident_store_keeps_the_frame_a_later_record_loads() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let identity = surface_identity(0x7b_00_01);
+    let attachment = provider_render::resident_attachment(&identity);
+    let stores_before = route_count("render_provider_resident_store");
+    let loads_before = route_count("render_provider_resident_load");
+
+    // 1. The seeding record. `ProviderCompletedResident` *is* the assertion
+    //    that nothing was published: there is no byte-carrying arm of it.
+    let seed = resident_seed_request(&identity);
+    let frame = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &seed,
+    ) {
+        RenderRailOutcome::ProviderCompletedResident(frame) => frame,
+        other => panic!("the resident seed is in class: {other:?}"),
+    };
+    assert_eq!(
+        frame.attachment, attachment,
+        "the frame stayed under the request's own identity"
+    );
+    assert!(
+        !frame.loaded,
+        "a record that clears cannot have loaded the image it keeps"
+    );
+
+    // 2. The record that composites onto it: the half outside the rectangle
+    //    keeps the resident's own bytes, the half inside is the fragment's.
+    let chained = resident_load_request(&identity, true);
+    let provider = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &chained,
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("a resident load with a published store is in class: {other:?}"),
+    };
+    assert_texel_count("resident chain (provider)", &provider);
+    assert_texel_near(
+        "resident chain: the last texel inside the rectangle",
+        texel_at(&provider, half_of(width) - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    for x in half_of(width)..width {
+        assert_eq!(
+            texel_at(&provider, x, height / 2),
+            RESIDENT_SEED_TEXEL,
+            "texel ({x}, {}) keeps the resident's own bytes: a rail that cleared instead of \
+             loading, or that loaded a stale image, lands another colour here",
+            height / 2,
+        );
+    }
+
+    // 3. The engine's chain, from the same two requests. Its second record
+    //    loads the engine's own resident, which is what makes the comparison a
+    //    statement about the two rails and not about one rail twice.
+    let Some(engine_seed_pixels) =
+        engine_pixels("resident seed", &stages, resident_seed_request(&identity))
+    else {
+        return;
+    };
+    assert!(
+        engine_seed_pixels.is_empty(),
+        "a resident store's readback is withheld on the engine too"
+    );
+    let Some(engine_chained) = engine_pixels(
+        "resident chain",
+        &stages,
+        resident_load_request(&identity, true),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        provider, engine_chained,
+        "the provider's resident chain and the engine's own resident chain land the same frame"
+    );
+
+    assert_eq!(
+        route_count("render_provider_resident_store") - stores_before,
+        1,
+        "one submission kept its frame in the provider's image"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_load") - loads_before,
+        1,
+        "one submission began from the provider's image"
+    );
+}
+
+/// R7b's chain position: the packet's *middle* record — a predecessor and a
+/// successor — is now executed by the class when it both begins from and keeps
+/// the provider's image, and the same record with no resident source keeps the
+/// engine under the same name as before.
+#[test]
+fn a_resident_middle_record_is_admitted_and_a_source_less_one_is_not() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let identity = surface_identity(0x7b_00_02);
+
+    // The seed first, so the image the middle loads exists.
+    let seed = resident_seed_request(&identity);
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &seed) {
+        RenderRailOutcome::ProviderCompletedResident(_) => (),
+        other => panic!("the resident seed is in class: {other:?}"),
+    }
+
+    // A middle record that takes the frame from the provider's image and hands
+    // its own frame on: nothing about it touches guest memory.
+    let mut middle = resident_load_request(&identity, false);
+    middle.continues_render_pass = true;
+    middle.render_pass_continues = true;
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::Middle), &middle) {
+        RenderRailOutcome::ProviderCompletedResident(frame) => assert!(
+            frame.loaded,
+            "the middle record both loaded the image and kept its own frame"
+        ),
+        other => panic!("a resident-sourced middle record is in class: {other:?}"),
+    }
+
+    // The same position without a resident source: refused by the same slug it
+    // was refused by before R7b, because the class still cannot name the frame
+    // the predecessor produced.
+    let mut source_less = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    source_less.continues_render_pass = true;
+    source_less.render_pass_continues = true;
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::Middle), &source_less) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_chain_middle",
+            "a middle record with no resident source keeps the engine: {reason}"
+        ),
+        other => panic!("a source-less chain middle is out of class: {other:?}"),
+    }
+}
+
+/// R7b's lifecycle answers are the *provider's* own, carried through the rail's
+/// typed decline: an identity nothing stored, the least recently used identity
+/// once the registry is over budget, and an identity asked for at another
+/// geometry.
+///
+/// The two retirements this test cannot drive from reims — a lease release and a
+/// device-epoch advance — are the provider's own suite's
+/// (`metal-api-vulkan`'s `render_e2e.rs`), because the render rail's attachment
+/// allocation is trace-owned rather than leased, and an epoch advance needs a
+/// rebuilt provider. What this test pins is the wiring: reims does not re-name
+/// the provider's answer.
+#[test]
+fn resident_lifecycle_failures_are_the_providers_own_names() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+
+    // (a) A load for an identity nothing ever stored. The class admits the
+    //     shape — it is the resident-load arm — and the *provider* answers.
+    let never_stored = surface_identity(0x7b_00_03);
+    let load = resident_load_request(&never_stored, true);
+    let (slug, detail) = refused_slug("never stored", &stages, &load);
+    assert_eq!(
+        slug, "provider_capability",
+        "an admitted resident load is refused at the provider boundary"
+    );
+    assert!(
+        detail.contains("resident_target_unavailable"),
+        "the provider's own name for an identity that holds no image rides along: {detail}"
+    );
+
+    // (b) The registry's budget: `budget + 2` identities leave the registry
+    //     holding `budget`, and the identity it evicted is refused by name
+    //     while the newest one still resolves.
+    let budget = metal_api_vulkan::RESIDENT_TARGET_BUDGET;
+    let identities: Vec<_> = (0..budget + 2)
+        .map(|index| surface_identity(0x7b_01_00 + u32::try_from(index).expect("index fits")))
+        .collect();
+    for identity in &identities {
+        let seed = resident_seed_request(identity);
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &seed) {
+            RenderRailOutcome::ProviderCompletedResident(_) => (),
+            other => panic!("every seeding store is in class: {other:?}"),
+        }
+    }
+    let (slug, detail) = refused_slug(
+        "evicted",
+        &stages,
+        &resident_load_request(&identities[0], true),
+    );
+    assert!(
+        detail.contains("resident_target_evicted"),
+        "the least recently used identity is refused as evicted: {slug} / {detail}"
+    );
+    let newest = resident_load_request(identities.last().expect("identities"), true);
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &newest) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("the most recent identity is still resident: {other:?}"),
+    }
+
+    // (c) The same identity at another geometry: the provider holds an image of
+    //     one shape and is asked for another.
+    let shaped = surface_identity(0x7b_02_00);
+    let seed = resident_seed_request(&shaped);
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &seed) {
+        RenderRailOutcome::ProviderCompletedResident(_) => (),
+        other => panic!("the shaped seed is in class: {other:?}"),
+    }
+    let (width, height) = extent();
+    let mut smaller = resident_load_request(&shaped, true);
+    // The scissor is the load request's own half-attachment rectangle; a
+    // smaller attachment makes it reach outside, which is a *class* answer and
+    // would hide the shape change behind the scissor's own name.
+    smaller.scissors.clear();
+    smaller.width = width / 2;
+    smaller.height = height / 2;
+    let (slug, detail) = refused_slug("shape changed", &stages, &smaller);
+    assert!(
+        detail.contains("resident_target_shape_changed"),
+        "a load at another geometry is refused as a changed shape: {slug} / {detail}"
+    );
+}
+
+/// R7b's boundary, by name: the shapes *beside* the two resident arms keep the
+/// engine, each under its own slug.
+#[test]
+fn the_shapes_beside_the_resident_arms_stay_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let identity = surface_identity(0x7b_00_04);
+    let out_of_class =
+        |label: &str, req: &DrawRequest, slug: &str| match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            req,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(reason.slug(), slug, "{label}: {reason}")
+            }
+            other => panic!("{label}: expected an out-of-class answer, got {other:?}"),
+        };
+
+    // A store that publishes nothing: no resident, no reader, and no writeback
+    // the caller could land. This is the arm R7b deliberately did *not* open.
+    let mut unpublished = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    unpublished.skip_readback = true;
+    unpublished.readback_skip_reason = ReadbackSkipReason::UnpublishedStore;
+    out_of_class(
+        "unpublished store",
+        &unpublished,
+        "render_provider_out_of_class_unpublished_store",
+    );
+
+    // A resident store with no identity to key the image on.
+    let mut identity_less = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    identity_less.skip_readback = true;
+    identity_less.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    out_of_class(
+        "identity-less resident store",
+        &identity_less,
+        "render_provider_out_of_class_resident_identity",
+    );
+
+    // Guest bytes as the previous contents, with and without a resident source
+    // beside them: one load op per attachment, so the two cannot both be stated.
+    let mut seed_only = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    seed_only.target_rgba8 = Some(std::sync::Arc::new(vec![0u8; 16]));
+    seed_only.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+    out_of_class(
+        "guest seed",
+        &seed_only,
+        "render_provider_out_of_class_load_seed",
+    );
+    let mut both_sources = resident_load_request(&identity, true);
+    both_sources.target_rgba8 = Some(std::sync::Arc::new(vec![0u8; 16]));
+    out_of_class(
+        "both sources",
+        &both_sources,
+        "render_provider_out_of_class_load_source",
+    );
+
+    // A target identity this record neither loads from nor keeps.
+    let mut name_only = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    name_only.target_identity = Some(identity);
+    out_of_class(
+        "identity without an image",
+        &name_only,
+        "render_provider_out_of_class_target",
+    );
+}
 /// The vertex-interface half of the class: one stream per attribute the vertex
 /// stage *reads*, and nothing else.
 ///
@@ -1654,11 +2074,17 @@ fn the_widening_splits_are_counted_under_their_own_names() {
         "the split retired the old bucket rather than charging it beside the two"
     );
 
-    // The readback split: the two rails that skip a readback carry their own
-    // names, and a skip with no recorded reason keeps the old one.
+    // The readback split, after R7b: a store that publishes nothing keeps its
+    // own name, a skip with no recorded reason keeps the old one, and the
+    // *resident* store — the population that used to answer
+    // `render_provider_out_of_class_resident_store` — is now the rail's own
+    // work. Its bucket is retired rather than re-charged, and the positive
+    // counter the seam reads is charged once per admitted resident store.
     let unpublished = count("render_provider_out_of_class_unpublished_store");
-    let resident = count("render_provider_out_of_class_resident_store");
+    let retired_resident = count("render_provider_out_of_class_resident_store");
+    let identity_less = count("render_provider_out_of_class_resident_identity");
     let unnamed = count("render_provider_out_of_class_skip_readback");
+    let kept = count("render_provider_resident_store");
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.skip_readback = true;
     req.readback_skip_reason = ReadbackSkipReason::UnpublishedStore;
@@ -1671,11 +2097,34 @@ fn the_widening_splits_are_counted_under_their_own_names() {
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.skip_readback = true;
     req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
-    submit(&inputs(&stages, RenderChainRole::SoleOrTail), &req);
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_resident_identity",
+            "a resident store with no identity to key its image on is refused by that name: \
+             {reason}"
+        ),
+        other => panic!("a resident store without an identity is out of class: {other:?}"),
+    }
+    assert_eq!(
+        count("render_provider_out_of_class_resident_identity"),
+        identity_less + 1,
+        "the identity-less resident store answers under its own condition"
+    );
     assert_eq!(
         count("render_provider_out_of_class_resident_store"),
-        resident + 1,
-        "a frame in a resident the guest reads back through is the other one"
+        retired_resident,
+        "the bucket the resident arms replaced does not move for the shapes they now execute"
+    );
+    let resident = resident_seed_request(&surface_identity(0x7b_00_05));
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &resident) {
+        RenderRailOutcome::ProviderCompletedResident(_) => (),
+        other => panic!("a resident store with an identity is in class: {other:?}"),
+    }
+    assert_eq!(
+        count("render_provider_resident_store"),
+        kept + 1,
+        "the admitted resident store is counted under the rail's own positive name"
     );
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     req.skip_readback = true;

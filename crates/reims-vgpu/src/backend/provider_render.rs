@@ -63,12 +63,52 @@
 //! - no depth, stencil, MSAA, MRT, resolve, present, blend, colour write mask,
 //!   occlusion query, sampled image, sampler or storage buffer — and every one
 //!   of those is a *reason*, not a silent downgrade;
-//! - no resident, deferred or chained target: the request is the pooled,
-//!   offscreen, CPU-readback shape (`target_identity == None`,
-//!   `skip_readback == false`, no seed and no mapper backing), which is what
-//!   makes the provider's whole-attachment readback the frame the store route
-//!   then lands in guest memory — or, for a chain head, the frame `exec` hands
-//!   to the record after it.
+//! - **the pooled offscreen target, or one of the resident arms** (R7b): the
+//!   request is either the pooled, offscreen, CPU-readback shape
+//!   (`target_identity == None`, `skip_readback == false`, no seed and no
+//!   mapper backing) — which is what makes the provider's whole-attachment
+//!   readback the frame the store route then lands in guest memory, or, for a
+//!   chain head, the frame `exec` hands to the record after it — or a record
+//!   whose attachment is the *provider-owned* image named by the request's own
+//!   [`TargetIdentity`] (`research/docs/23` §76, R7):
+//!   - the frame **stays** there (`StoreOp::Resident`) when the guest's own
+//!     store action is published but this record's readback was withheld
+//!     because the frame landed in a resident (`ReadbackSkipReason::
+//!     ResidentStore`): the two rails that set that pair are the GVA render
+//!     Store and the mapper-ref-texture composite Store
+//!     (`runtime/draw/vulkan.rs`), and the identity is the attachment's own
+//!     `(allocation, view)` pair — one pair per guest target, stable across the
+//!     records of one packet, so a later record of the same chain finds the
+//!     image the earlier one wrote;
+//!   - the pass **begins** from it (`LoadOp::Resident`) when the request's own
+//!     load action names the live GPU image rather than guest bytes
+//!     (`DrawRequest::load_from_target`, the `chain_load_from_target` /
+//!     mapper-currency arm the production profile measured as
+//!     `draw_partial_load_from_target`).
+//!
+//!   The two arms are chosen by the request's own facts and never both: a
+//!   request that carries guest bytes as its previous contents (a CPU seed, a
+//!   guest target backing) stays on the engine under its own name, because the
+//!   canonical attachment is one load op and the class refuses to state two.
+//!   Nothing about the frame's *guest* landing changes here: the provider now
+//!   owns the bytes a later provider pass loads, and the rails that fetch them
+//!   out of the provider for the guest (GVA flush, window publish, scanout) are
+//!   the R4b increment — every shape that reaches this rail is counted under
+//!   `render_provider_resident_store` / `render_provider_resident_load` so that
+//!   population is a number and not a silence.
+//!
+//!   # Routing is per record, and a chain has to be admitted whole
+//!
+//!   The class answers for one record, and a resident store hands the *next*
+//!   record of its packet a frame that now lives in the provider. So a packet
+//!   whose chain is admitted only in part — a resident store that leaves for
+//!   the provider, followed by a record that stays on the engine for any other
+//!   reason — ends with that later record failing by name (`read_target_unknown_
+//!   identity`: the engine resident the caller's own chain would read was never
+//!   written). That is a refusal, not a wrong frame, and it is the price of a
+//!   per-record gate; the packet-level admission ("hold the chain only when the
+//!   whole packet is in class", which the exec walk can answer and this pure
+//!   gate cannot) is the named follow-up, beside R4b's byte channel.
 //!
 //! Anything outside the class returns [`RenderRailOutcome::NotInNarrowClass`]
 //! and the caller runs the self-contained engine unchanged — the feature only
@@ -167,8 +207,8 @@ use super::provider_compute::{
 };
 use super::provider_owner::{self, DeviceLossTeardown};
 use super::vulkan::engine::types::{
-    BufferContent, ColorClearValue, DrawRequest, ReadbackSkipReason, VertexAttributeResource,
-    VertexStepFunction,
+    BufferContent, ColorClearValue, DrawRequest, ReadbackSkipReason, TargetIdentity,
+    VertexAttributeResource, VertexStepFunction,
 };
 use crate::observe::{decline_display, Decline};
 
@@ -294,6 +334,100 @@ const ATTACHMENT_VIEW: ViewId = ViewId::new(1);
 /// stream (when the class carries one) then the index stream.
 const FIRST_INPUT_VIEW: u64 = 2;
 
+/// The allocation namespace resident identities are minted from.
+///
+/// One allocation per guest target, far above both the pooled attachment's own
+/// constant and the input-view namespace, so a resident image can never alias a
+/// view this rail minted for one submission's streams. The registry behind it is
+/// what makes the pair *the attachment's own*: the same guest target always
+/// resolves to the same `(allocation, view)` — across the records of one packet
+/// and across packets — and two distinct targets never share one.
+const RESIDENT_ALLOCATION_BASE: u64 = 0x7265_7369_0000_0000;
+
+/// The view identity of a resident attachment. One view per allocation: the
+/// pair the canonical contract keys a resident target on is `(allocation,
+/// view)`, and the allocation is the half that varies per guest target.
+const RESIDENT_VIEW: ViewId = ViewId::new(1);
+
+/// The provider-owned image one record names, in the two fields the canonical
+/// contract keys a resident target on.
+///
+/// This is not a second naming channel beside `(allocation, view)`: it *is* the
+/// pair the trace declares for the attachment, carried out of the rail so a
+/// caller (and a test) can ask the provider whether that identity is resident
+/// (`VulkanComputeProvider::resident_target_is_live`) without re-deriving it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentAttachment {
+    pub allocation: AllocationId,
+    pub view: ViewId,
+}
+
+/// The process-global mint for resident identities.
+///
+/// A hash of the `TargetIdentity` would have been simpler and is the reason
+/// this is a map: two guest targets that collide would silently share one
+/// provider image, and the failure mode of a collision is a frame read from the
+/// wrong surface — the exact class of defect the resident rail's own documents
+/// call out. A counter cannot collide, and the map is what keeps the mint
+/// *stable*: the same target has to resolve to the same image on every record
+/// of its chain, or the load would be refused by name
+/// (`resident_target_undeclared`) instead of finding the frame.
+struct ResidentIdentities {
+    next: u64,
+    by_target: HashMap<TargetIdentity, ResidentAttachment>,
+}
+
+static RESIDENT_IDENTITIES: OnceLock<Mutex<ResidentIdentities>> = OnceLock::new();
+
+/// The provider image the given guest target renders into.
+///
+/// Memoised, so the answer is stable for the process lifetime; the rail's
+/// provider is itself a process singleton (`render_rail`), so the two lifetimes
+/// agree.
+pub fn resident_attachment(target: &TargetIdentity) -> ResidentAttachment {
+    let registry = RESIDENT_IDENTITIES.get_or_init(|| {
+        Mutex::new(ResidentIdentities {
+            next: 0,
+            by_target: HashMap::new(),
+        })
+    });
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(attachment) = registry.by_target.get(target) {
+        return *attachment;
+    }
+    let allocation = AllocationId::new(RESIDENT_ALLOCATION_BASE + registry.next);
+    registry.next += 1;
+    let attachment = ResidentAttachment {
+        allocation,
+        view: RESIDENT_VIEW,
+    };
+    registry.by_target.insert(target.clone(), attachment);
+    attachment
+}
+
+/// How one admitted pass establishes the attachment's previous contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NarrowLoad {
+    /// Fill every texel with the guest's byte-exact clear.
+    Clear([u8; 4]),
+    /// Keep the bytes the provider already holds under the attachment's own
+    /// identity (`LoadOp::Resident`).
+    Resident(ResidentAttachment),
+}
+
+/// Where one admitted pass's frame goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NarrowStore {
+    /// The completion publishes the whole extent, and the caller's store route
+    /// lands it.
+    Writeback,
+    /// The frame stays in the provider's image under the attachment's own
+    /// identity, and no writeback is published (`StoreOp::Resident`).
+    Resident(ResidentAttachment),
+}
+
 /// Where one record sits in the packet the exec loop walks.
 ///
 /// The 2026-09-17 probe (`evidence/reviews/writeback-class-probe-2026-09-17.md`)
@@ -392,11 +526,30 @@ pub struct RenderRailOutput {
     pub bgra: bool,
 }
 
+/// What one resident-class submission leaves behind.
+///
+/// There are no bytes: the whole point of `StoreOp::Resident` is that the frame
+/// stays in the provider's image and no writeback is published for it. What the
+/// caller gets instead is the identity the frame stayed under, so it can name
+/// the same image the engine rail would have named — and whether this pass also
+/// began from that image, which is what distinguishes a seeding store from a
+/// record that composited onto the frame before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentFrame {
+    pub attachment: ResidentAttachment,
+    /// `true` when the pass declared `LoadOp::Resident` as well, i.e. it read
+    /// the image it then kept.
+    pub loaded: bool,
+}
+
 /// Why one reims render request did not leave this rail for the engine.
 #[derive(Debug)]
 pub enum RenderRailOutcome {
     /// The canonical provider executed the pass.
     ProviderCompleted(RenderRailOutput),
+    /// The canonical provider executed the pass into the provider-owned image
+    /// the attachment names, and published no writeback for it.
+    ProviderCompletedResident(ResidentFrame),
     /// Outside the narrow admitted class. The caller must run the
     /// self-contained engine, exactly as a build without the feature would.
     NotInNarrowClass(OutOfClass),
@@ -538,6 +691,17 @@ pub enum ProviderRenderDecline {
         length: u64,
         expected: u64,
     },
+    /// A resident store's completion published a writeback for the attachment.
+    ///
+    /// `StoreOp::Resident` is defined by *not* publishing one — the frame stays
+    /// in the provider's image and the pass that later loads it is what makes
+    /// the bytes observable. A provider that published one anyway would leave
+    /// this rail unable to say where the frame is, so the shape is declined by
+    /// name rather than accepted under either reading.
+    ResidentWritebackPublished {
+        allocation: AllocationId,
+        view: ViewId,
+    },
     /// The owner rail refused a registration, an import, a retirement or a
     /// release. Not raised by this rail's own class (its inputs are
     /// trace-owned), but shared with the compute rail so one device-loss
@@ -556,6 +720,7 @@ impl Decline for ProviderRenderDecline {
             Self::CompletionNotVisible => "completion_not_visible",
             Self::AttachmentWritebackMissing => "attachment_writeback_missing",
             Self::AttachmentWritebackShape { .. } => "attachment_writeback_shape",
+            Self::ResidentWritebackPublished { .. } => "resident_writeback_published",
             Self::Owner(inner) => inner.slug(),
         }
     }
@@ -615,6 +780,10 @@ impl Decline for ProviderRenderDecline {
                 ("offset", offset.to_string()),
                 ("length", length.to_string()),
                 ("expected", expected.to_string()),
+            ],
+            Self::ResidentWritebackPublished { allocation, view } => vec![
+                ("allocation", format!("{:#x}", allocation.get())),
+                ("view", view.get().to_string()),
             ],
             Self::Owner(inner) => inner.fields(),
         }
@@ -760,7 +929,10 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
         return RenderRailOutcome::NotInNarrowClass(reason);
     }
     match submit_narrow(inputs, &pass) {
-        Ok(output) => RenderRailOutcome::ProviderCompleted(output),
+        Ok(RenderCompletion::Writeback(output)) => RenderRailOutcome::ProviderCompleted(output),
+        Ok(RenderCompletion::Resident(frame)) => {
+            RenderRailOutcome::ProviderCompletedResident(frame)
+        }
         Err(decline) => RenderRailOutcome::ProviderDeclined(decline),
     }
 }
@@ -818,7 +990,10 @@ struct NarrowPass<'a> {
     vertex_entry: String,
     fragment_entry: String,
     format: AttachmentFormat,
-    clear: [u8; 4],
+    /// The previous-contents arm this pass declares ([`NarrowLoad`]).
+    load: NarrowLoad,
+    /// Where this pass's frame goes ([`NarrowStore`]).
+    store: NarrowStore,
     bgra: bool,
     width: u64,
     height: u64,
@@ -896,6 +1071,16 @@ fn narrow_class<'a>(
         // name. The middle is the one position that both takes and hands on a
         // frame, so it has no route here at all; the packet's last record takes
         // one too, and answers for that at the encoder gate below.
+        //
+        // R7b: the middle's frame now *is* nameable when the request says it
+        // begins from the live GPU image (`load_from_target`) under a target
+        // identity — `LoadOp::Resident` names the source and `StoreOp::Resident`
+        // the sink, so the record neither reads nor writes guest bytes. The
+        // admission here is deliberately the request's own pair and not the
+        // computed arms: the deeper conditions below still answer for a middle
+        // that names a resident and then fails on its streams, scissor or
+        // format, and the census keeps those reasons.
+        RenderChainRole::Middle if req.load_from_target && req.target_identity.is_some() => {}
         RenderChainRole::Middle => {
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_chain_middle",
@@ -965,68 +1150,159 @@ fn narrow_class<'a>(
             "render_provider_out_of_class_extent_overflow",
             "an attachment extent that overflows u64 stays on the engine",
         ))?;
-    if req.color0_declared != Some(crate::protocol::pass_action::LoadAction::Clear) {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_load_action",
-            "the canonical class loads by `Clear` only; a Load or DontCare record stays on the \
-             engine",
-        ));
-    }
-    if req.skip_readback {
-        // Which of the two rails set the flag decides the name, because they are
-        // not the same shape: a store that publishes nothing has no resident and
-        // no reader, while a resident store is a frame the guest reads back
-        // through a mapping or a GVA (`draw_partial_load_from_target`). The
-        // class refuses both here — the second until the provider can own a
-        // named resident, the first until its writeback route is reviewed — and
-        // the split is what lets the next census size them separately.
-        return Err(match req.readback_skip_reason {
-            ReadbackSkipReason::ResidentStore => OutOfClass::new(
-                "render_provider_out_of_class_resident_store",
-                "a record whose frame lands in an engine-resident target stays on the engine: the \
-                 resident is what the guest reads back through, and the canonical rail cannot \
-                 name it yet",
-            ),
-            ReadbackSkipReason::UnpublishedStore => OutOfClass::new(
-                "render_provider_out_of_class_unpublished_store",
-                "a record whose store action publishes nothing stays on the engine: the class \
-                 reads its frame back from the completion, and a store that lands nowhere is a \
-                 route this increment has not reviewed",
-            ),
-            // A skip with no recorded reason is a fact about the caller rather
-            // than a third rail, and guessing which of the two it is would name
-            // the wrong population.
-            ReadbackSkipReason::None => OutOfClass::new(
-                "render_provider_out_of_class_skip_readback",
-                "a record that skips its readback for a reason this rail cannot name stays on the \
+    // The provider image this record's own attachment names, when the request
+    // carries a guest target at all. Derived once, from the request, so the load
+    // arm and the store arm below cannot name two images for one attachment.
+    let resident = req.target_identity.as_ref().map(resident_attachment);
+    // Where this record's previous contents come from — the request's own load
+    // action, read in the order `DrawRequest` documents: `load_from_target`
+    // wins, else the declared action decides.
+    //
+    // The two arms are the contract's two attachment loads: the *provider's*
+    // image under the attachment's own identity (`LoadOp::Resident`), or the
+    // guest's byte-exact clear. A record whose previous contents are guest bytes
+    // is a third shape the canonical attachment cannot state beside either (one
+    // load op per attachment), so it keeps the engine by name.
+    let load = if req.load_from_target {
+        let Some(resident) = resident else {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_resident_identity",
+                "a record that loads the live GPU image stays on the engine when it names no \
+                 target identity: the canonical attachment's resident load is keyed on the \
+                 attachment's own (allocation, view), and a pair this rail invented would be an \
+                 image no record ever stored",
+            ));
+        };
+        if req.target_rgba8.is_some() || req.target_guest_seed.is_some() {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_load_source",
+                "a record that carries guest bytes *and* names the live GPU image stays on the \
+                 engine: the canonical attachment states one load op, and the two sources \
+                 disagree about which bytes the pass begins from",
+            ));
+        }
+        NarrowLoad::Resident(resident)
+    } else {
+        if req.target_rgba8.is_some()
+            || req.target_guest_seed.is_some()
+            || req.load_guest_target_backing
+        {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_load_seed",
+                "a record whose previous contents are guest bytes stays on the engine: stating \
+                 them would be the canonical attachment's trace-owned `Load` arm, which this \
+                 class does not carry (its streams travel as bytes, its previous contents do \
+                 not)",
+            ));
+        }
+        if req.color0_declared != Some(crate::protocol::pass_action::LoadAction::Clear) {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_load_action",
+                "the canonical class loads by `Clear` or from the provider's own image; a Load \
+                 or DontCare record whose previous contents this rail cannot name stays on the \
                  engine",
-            ),
-        });
-    }
-    if req.target_identity.is_some()
-        || req.seed_from_target.is_some()
-        || req.load_from_target
-        || req.target_rgba8.is_some()
-        || req.target_guest_seed.is_some()
-        || req.guest_target_memory.is_some()
-        || req.load_guest_target_backing
-        || req.record_guest_store
+            ));
+        }
+        NarrowLoad::Clear(clear)
+    };
+    // Where this record's frame goes. A record that skipped its readback is one
+    // of two rails, and the flag's recorded reason is what tells them apart —
+    // re-deriving the split from the assembler around it is what the 2026-09-17
+    // probe had to do:
+    //
+    // - `ResidentStore` is a frame the record left in an image, and the
+    //   canonical attachment can name that image by the attachment's own
+    //   `(allocation, view)`: `StoreOp::Resident`, no writeback published. The
+    //   request has to carry the identity the image is keyed on; a resident
+    //   store without one is a wiring bug named as such rather than a
+    //   differently-shaped pass.
+    // - `UnpublishedStore` is a store action that publishes nothing: no
+    //   resident, no reader, and no writeback the caller could land. It keeps
+    //   the engine until its route is reviewed, exactly as before.
+    let store =
+        if req.skip_readback {
+            match req.readback_skip_reason {
+                ReadbackSkipReason::ResidentStore => {
+                    let Some(resident) = resident else {
+                        return Err(OutOfClass::new(
+                            "render_provider_out_of_class_resident_identity",
+                            "a record whose frame stays in a resident stays on the engine when it \
+                         names no target identity: the canonical attachment keys its resident on \
+                         the attachment's own (allocation, view), and a pair this rail invented \
+                         would be an image no record ever stored",
+                        ));
+                    };
+                    NarrowStore::Resident(resident)
+                }
+                ReadbackSkipReason::UnpublishedStore => return Err(OutOfClass::new(
+                    "render_provider_out_of_class_unpublished_store",
+                    "a record whose store action publishes nothing stays on the engine: the class \
+                     reads its frame back from the completion, and a store that lands nowhere is \
+                     a route this increment has not reviewed",
+                )),
+                // A skip with no recorded reason is a fact about the caller rather
+                // than a third rail, and guessing which of the two it is would name
+                // the wrong population.
+                ReadbackSkipReason::None => return Err(OutOfClass::new(
+                    "render_provider_out_of_class_skip_readback",
+                    "a record that skips its readback for a reason this rail cannot name stays on \
+                     the engine",
+                )),
+            }
+        } else {
+            NarrowStore::Writeback
+        };
+    // A guest target identity this pass neither loads from nor keeps is a name
+    // without an image: the seams that answer that identity's later readers
+    // would be looking for an image the provider never made, and a class that
+    // drew the frame anyway would be handing the guest a picture its own rails
+    // cannot find. The two resident arms above are the only shapes here that
+    // name an image, and they name it by construction — either one is enough.
+    if resident.is_some()
+        && !matches!(load, NarrowLoad::Resident(_))
+        && !matches!(store, NarrowStore::Resident(_))
     {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_target",
-            "a resident, seeded, chained or guest-backed target stays on the engine: the class \
-             is the pooled offscreen target whose whole frame comes back through the completion",
+            "a record that names a target identity without loading from it or keeping its frame \
+             stays on the engine: the class cannot say which image that name refers to",
         ));
     }
-    // The class executes the record that opens the pass. A record that begins
-    // from a frame produced before it — a packet's last record, which the exec
-    // loop hands a forced `Load` — is a begin-from-the-chain the class cannot
-    // name yet: W1 named the frame's *destination*, and this is its source.
-    if req.continues_render_pass {
+    // A seed copied from *another* resident is a channel of its own: the bytes
+    // travel between two images, which is a copy the class would have to state
+    // as a pass rather than as an attachment load.
+    if req.seed_from_target.is_some() {
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_seed",
+            "a record that seeds itself from another resident stays on the engine: the copy \
+             between two images is not an attachment load the canonical pass can state",
+        ));
+    }
+    // A guest-backed attachment's home is the guest's own pages. The class
+    // renders into the provider's image; a record whose *load* names that
+    // backing already took the resident arm above, and a record that would
+    // render straight into the guest's memory is a landing this rail cannot
+    // perform.
+    if req.guest_target_memory.is_some() && !req.load_from_target {
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_guest_backing",
+            "a record whose attachment is backed by the guest's own pages stays on the engine: \
+             the class renders into a provider image, and writing the guest's pages from it is a \
+             landing this rail does not carry",
+        ));
+    }
+    // W1 named the frame's *destination* for the record that opens a packet;
+    // this is its source. A record that continues an encoder begins from the
+    // frame the record before it produced, and the class can execute it exactly
+    // when that frame is the provider's own image — `LoadOp::Resident`, chosen
+    // above from the request's `load_from_target`. A continuing record that
+    // would begin from guest bytes, or from nothing at all, keeps the engine.
+    if req.continues_render_pass && !matches!(load, NarrowLoad::Resident(_)) {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_encoder",
             "a record that continues a multi-record encoder stays on the engine: it begins from \
-             the frame the record before it produced",
+             the frame the record before it produced, which this class can only name when that \
+             frame is the provider's own image",
         ));
     }
     if !req.secondary_targets.is_empty() {
@@ -1255,7 +1531,8 @@ fn narrow_class<'a>(
         vertex_entry: vertex_entry.to_owned(),
         fragment_entry: fragment_entry.to_owned(),
         format,
-        clear,
+        load,
+        store,
         bgra: format == AttachmentFormat::Bgra8Unorm,
         width: u64::from(req.width),
         height: u64::from(req.height),
@@ -1317,10 +1594,37 @@ fn vertex_format(
     }
 }
 
+/// What one narrow-class submission returned, in the two shapes an attachment
+/// can end in.
+enum RenderCompletion {
+    /// The completion published the attachment's whole extent.
+    Writeback(RenderRailOutput),
+    /// The pass kept the frame in the provider's image and published nothing for
+    /// it (`StoreOp::Resident`).
+    Resident(ResidentFrame),
+}
+
+/// The `(allocation, view)` pair one admitted pass declares for its attachment.
+///
+/// The pooled class names its own two constants; either resident arm names the
+/// request's own identity. Both arms read the same `resident` local out of
+/// `narrow_class`, so a record that loads the image and keeps it cannot name two
+/// — and the fallthrough is the shape that declares neither.
+fn attachment_identity(pass: &NarrowPass<'_>) -> ResidentAttachment {
+    match (pass.load, pass.store) {
+        (NarrowLoad::Resident(resident), _) => resident,
+        (_, NarrowStore::Resident(resident)) => resident,
+        (NarrowLoad::Clear(_), NarrowStore::Writeback) => ResidentAttachment {
+            allocation: ATTACHMENT_ALLOCATION,
+            view: ATTACHMENT_VIEW,
+        },
+    }
+}
+
 fn submit_narrow(
     inputs: &RenderRailInputs<'_>,
     pass: &NarrowPass<'_>,
-) -> Result<RenderRailOutput, ProviderRenderDecline> {
+) -> Result<RenderCompletion, ProviderRenderDecline> {
     let rail = rail().map_err(IntoRender::into_render)?;
     let provider = &rail.provider;
     // The health gate runs before anything is compiled or registered: a
@@ -1332,14 +1636,18 @@ fn submit_narrow(
 
     let declaring = declaring_pipeline(&rail.provider, &rail.device)?;
     let render_pipeline = register_render_pipeline(&rail.provider, &rail.device, inputs, pass)?;
+    let attachment = attachment_identity(pass);
+    let loads_resident = matches!(pass.load, NarrowLoad::Resident(_));
 
     // The trace's own declaration of the attachment view. `OwnedBytes` of the
     // packed extent is what the frozen contract asks a storing attachment to
-    // land through; the load is a clear, so none of these bytes are read.
+    // land through; neither the clear nor either resident arm reads them, and
+    // the byte-less declaration that would lift the copy is the named follow-up
+    // on the emulator side.
     let declaration = BufferView {
-        view_id: ATTACHMENT_VIEW,
+        view_id: attachment.view,
         metal_binding: 0,
-        allocation_id: ATTACHMENT_ALLOCATION,
+        allocation_id: attachment.allocation,
         offset: 0,
         length: pass.extent,
         access: BufferAccess::Read,
@@ -1361,7 +1669,7 @@ fn submit_narrow(
     }
     resources
         .insert_allocation(AllocationRecord {
-            allocation_id: ATTACHMENT_ALLOCATION,
+            allocation_id: attachment.allocation,
             owner_epoch: provider.device_epoch(),
             size: pass.extent,
         })
@@ -1409,13 +1717,19 @@ fn submit_narrow(
     let pass_descriptor = RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
         color_attachments: vec![RenderAttachment {
-            view_id: ATTACHMENT_VIEW,
-            allocation_id: ATTACHMENT_ALLOCATION,
+            view_id: attachment.view,
+            allocation_id: attachment.allocation,
             format: pass.format,
             width: pass.width,
             height: pass.height,
-            load: LoadOp::Clear(ClearColor::new(pass.clear)),
-            store: StoreOp::Store,
+            load: match pass.load {
+                NarrowLoad::Clear(clear) => LoadOp::Clear(ClearColor::new(clear)),
+                NarrowLoad::Resident(_) => LoadOp::Resident,
+            },
+            store: match pass.store {
+                NarrowStore::Writeback => StoreOp::Store,
+                NarrowStore::Resident(_) => StoreOp::Resident,
+            },
         }],
         viewport: [
             0,
@@ -1485,8 +1799,45 @@ fn submit_narrow(
     ) {
         return Err(ProviderRenderDecline::CompletionNotVisible);
     }
+    // The resident arm's whole claim is that the frame stayed in the provider's
+    // image. The one fact that would make that claim unreadable is a published
+    // writeback for the same attachment, so it is checked rather than assumed —
+    // and it is a typed decline, because an in-class shape is never re-run
+    // somewhere else.
+    let resident_writeback = result.writebacks.iter().any(|writeback| {
+        writeback.view_id == attachment.view && writeback.allocation_id == attachment.allocation
+    });
+    if let NarrowStore::Resident(_) = pass.store {
+        if resident_writeback {
+            return Err(ProviderRenderDecline::ResidentWritebackPublished {
+                allocation: attachment.allocation,
+                view: attachment.view,
+            });
+        }
+        // Two populations, counted where they happen: a store that kept the
+        // frame, and a *load* that began from one. The second is counted for
+        // both store arms — a record that loads the image and publishes its own
+        // frame is the shape the next record's chain depends on, and it is the
+        // one the `draw_partial_load_from_target` readers are.
+        crate::runtime::drain::note_store_route("render_provider_resident_store");
+        crate::runtime::drain::note_store_route(if loads_resident {
+            "render_provider_resident_store_chained"
+        } else {
+            "render_provider_resident_store_seed"
+        });
+        if loads_resident {
+            crate::runtime::drain::note_store_route("render_provider_resident_load");
+        }
+        return Ok(RenderCompletion::Resident(ResidentFrame {
+            attachment,
+            loaded: loads_resident,
+        }));
+    }
+    if loads_resident {
+        crate::runtime::drain::note_store_route("render_provider_resident_load");
+    }
     let Some(writeback) = result.writebacks.iter().find(|writeback| {
-        writeback.view_id == ATTACHMENT_VIEW && writeback.allocation_id == ATTACHMENT_ALLOCATION
+        writeback.view_id == attachment.view && writeback.allocation_id == attachment.allocation
     }) else {
         return Err(ProviderRenderDecline::AttachmentWritebackMissing);
     };
@@ -1498,10 +1849,10 @@ fn submit_narrow(
             expected: pass.extent,
         });
     }
-    Ok(RenderRailOutput {
+    Ok(RenderCompletion::Writeback(RenderRailOutput {
         bytes: writeback.bytes.clone(),
         bgra: pass.bgra,
-    })
+    }))
 }
 
 /// Every input allocation the trace's render half carries: one per vertex

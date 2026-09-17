@@ -10009,6 +10009,52 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         bgra: out.bgra,
                     });
                 }
+                RenderRailOutcome::ProviderCompletedResident(frame) => {
+                    // The frame stayed in the provider's image under this
+                    // record's own attachment identity — the resident arm of
+                    // R7b. Nothing comes back through the completion, so the
+                    // span this seam returns is the one the engine would have
+                    // returned for the same shape: the chain's intermediate, or
+                    // one of the two rails that keep the frame for the guest.
+                    // The identity each of those spans carries is the
+                    // *protocol* identity the rails name, which is the same
+                    // `TargetIdentity` the provider's pair is minted from — so
+                    // the two namespaces cannot drift apart.
+                    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
+                    crate::runtime::drain::note_store_route("render_provider_canonical");
+                    let c0 = req.colors.first();
+                    crate::observe::line(format!(
+                        "linux_render_provider ok resident pipe={} {}x{} alloc={:#x} view={} \
+                         load={} gva={:#x} mid={}",
+                        req.pipeline_ref,
+                        w,
+                        h,
+                        frame.attachment.allocation.get(),
+                        frame.attachment.view.get(),
+                        frame.loaded as u8,
+                        c0.map(|c| c.target_gva).unwrap_or(0),
+                        c0.map(|c| c.mapping_id).unwrap_or(0),
+                    ));
+                    if let Some(identity) = gva_resident_store {
+                        return Ok(M2vDrawSpan::ResidentGvaStore { identity });
+                    }
+                    if let Some(identity) = surface_resident_store {
+                        // The provider performed no guest store: the frame is in
+                        // its own image, not in the mapping's guest pages. The
+                        // status is stated rather than borrowed from the engine
+                        // output, because there is no engine output to borrow —
+                        // fetching these bytes out of the provider is R4b.
+                        return Ok(M2vDrawSpan::ResidentSurfaceStore {
+                            identity,
+                            guest_store: GuestStoreStatus {
+                                guest_backed: false,
+                                recorded: false,
+                                footprint: None,
+                            },
+                        });
+                    }
+                    return Ok(M2vDrawSpan::ResidentChain);
+                }
                 RenderRailOutcome::NotInNarrowClass(reason) => {
                     // The aggregate bucket is kept beside the per-reason slab
                     // the rail charges in `submit_render`
