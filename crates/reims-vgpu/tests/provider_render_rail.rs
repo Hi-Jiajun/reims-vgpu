@@ -3763,8 +3763,11 @@ fn the_sampled_texture_shapes_beside_the_entry_stay_on_the_engine_by_name() {
         detail.contains("[[texture(1)]]") || detail.contains("texture 1"),
         "the sentence names the argument and the position: {detail}"
     );
-    //    Two sampled textures: the contract states one, and a longer list is
-    //    refused by the provider's own name.
+    //    Two sampled textures: the widened cap (`research/docs/23` §102,
+    //    E-RS2) admits the declaration, so this shape now reaches the
+    //    binding-pairing gate — the pass binds one view and the second
+    //    declaration has nothing to pair with, which is refused by its own
+    //    name rather than by the count.
     let mut two_textures = sampled_stages();
     let first = two_textures.fragment_texture_declarations[0];
     two_textures.fragment_texture_declarations = vec![
@@ -3778,7 +3781,7 @@ fn the_sampled_texture_shapes_beside_the_entry_stay_on_the_engine_by_name() {
     ];
     let (slug, detail) = answer("two sampled textures", &two_textures, &sampled());
     eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_texture_count");
+    assert_eq!(slug, "render_provider_out_of_class_texture_unbound");
 
     // 4. The module's reflected shape and sampler family.
     let mut arrayed = sampled_stages();
