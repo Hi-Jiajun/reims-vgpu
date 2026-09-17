@@ -251,17 +251,28 @@
 //! out as the **borrowed no-copy** arm (`BufferSource::BorrowedNoCopy`), gated
 //! on the device's own host-pointer import:
 //!
-//! - the staged arm is what the production seam states today, because the draw
-//!   path's binds travel as the CPU staging origin (`BufferContent::Bytes`) and
-//!   the seam states no window for them yet;
-//! - the borrowed arm is wired end to end and driven by
-//!   `a_stage_buffer_in_a_registered_window_leaves_without_a_copy`, which
-//!   registers a real region, states a window over it, and requires the frame to
-//!   follow the owner's own mapping — the increment left is on the seam, which
-//!   has to derive a window from a bind's zero-copy gather (`GuestRunSource`'s
-//!   page runs) before a driven boot can state one;
-//! - a bind that is neither (a gather with no window) keeps the engine by name
-//!   (`render_provider_out_of_class_stage_buffer_gather`).
+//! - the staged arm is what the production seam states for a bind whose bytes
+//!   travel as the CPU staging origin (`BufferContent::Bytes`): the owner holds
+//!   those bytes, and the window they were cut from is not part of what the
+//!   staging read carried;
+//! - the borrowed arm is stated two ways and both are driven. The seam may
+//!   state a window itself
+//!   (`a_stage_buffer_in_a_registered_window_leaves_without_a_copy`, R9d), and
+//!   since R9e it may also leave the window to this rail: a bind the draw path
+//!   resolved through the zero-copy rail arrives as a gather
+//!   (`BufferContent::GuestRuns`), whose page runs already carry the
+//!   provider-shaped window the registration ledger derived for them, so
+//!   [`gather_window`] derives it from the source's one stretch instead
+//!   (`a_stage_buffer_the_seam_derives_from_its_gather_leaves_without_a_copy`).
+//!   Either way the frame follows the owner's own mapping and nothing is
+//!   copied;
+//! - a gather this rail cannot cut a window from — scattered across stretches,
+//!   unregistered, or with a `source_offset` reaching past its stretch's window
+//!   — keeps the engine by name
+//!   (`render_provider_out_of_class_stage_buffer_gather`), and one whose view
+//!   pointer is not a whole number of the device's import granules keeps it
+//!   under `render_provider_out_of_class_stage_buffer_alignment` rather than
+//!   being declined a layer down.
 //!
 //! The rail's other inputs keep the third arm: a vertex stream, the index
 //! stream and the attachment declaration travel as trace-owned bytes
@@ -304,8 +315,8 @@ use super::provider_compute::{
 };
 use super::provider_owner::{self, DeviceLossTeardown};
 use super::vulkan::engine::types::{
-    BufferContent, ColorClearValue, DrawRequest, ReadbackSkipReason, TargetIdentity,
-    VertexAttributeResource, VertexStepFunction,
+    BufferContent, ColorClearValue, DrawRequest, GuestRunSource, ReadbackSkipReason,
+    TargetIdentity, VertexAttributeResource, VertexStepFunction,
 };
 use crate::observe::{decline_display, Decline};
 
@@ -432,6 +443,56 @@ fn attribute_locations_match(attributes: &[VertexAttributeResource], reflected: 
             .all(|attribute| reflected.contains(&attribute.location))
 }
 
+/// The registered window one zero-copy gather was cut from (`R9e`).
+///
+/// The gather's page runs are the guest RAM rail's own bounded references into
+/// the import this process holds, one per maximal stretch, ascending and tiling
+/// the requested window exactly; each carries the provider-shaped window the
+/// registration ledger derived for its own bound
+/// (`crate::runtime::guest_ram_map::GuestWindowRun::window`). The two facts this
+/// function reads are therefore both already derived — where the stretch's
+/// window is, and where inside the stretch the bind's window begins
+/// (`WindowStretch::skip`, the `source_offset` a packed resource binds at).
+///
+/// `None` for every shape a borrowed lease cannot name, and the caller keeps
+/// the draw on the engine for each of them rather than inventing coordinates:
+///
+/// - **more than one stretch** (`single_stretch`): the bytes are scattered, so
+///   no single host range is the bind's bytes — the GPU copy per stretch is an
+///   engine rail (or a named `_gather` bucket here), not a lease;
+/// - **no registered window on the stretch** (`window: None`): the import was
+///   never registered under the current epoch, or its registration was refused,
+///   so there is no provider region to cut a window from;
+/// - **a window that does not cover the bind's own bytes**: a `source_offset`
+///   reaching past the stretch's window is a malformed source rather than a
+///   slow one, and stating it would name bytes the stage never reads.
+///
+/// What the returned window still has to satisfy is a device fact — the view's
+/// own host pointer has to be a whole number of the provider's import
+/// alignment, or the canonical rail refuses the import by name
+/// (`resolve_render_input`'s lease alignment refusal) — so that check lives
+/// with the other device answer in [`submit_render`], not here.
+fn gather_window(source: &GuestRunSource) -> Option<StageBufferWindow> {
+    let stretch = source.single_stretch()?;
+    let window = stretch.window?;
+    if stretch.len == 0 || window.length == 0 {
+        return None;
+    }
+    // The window has to be the bind's own bytes: the view is what the stage
+    // reads, so a head that reaches past the window, or a bind longer than what
+    // is left of it, is a source this rail cannot state as a lease.
+    if stretch.skip.checked_add(stretch.len)? > window.length {
+        return None;
+    }
+    Some(StageBufferWindow {
+        import: window.import.get(),
+        host_va: window.base,
+        length: window.length,
+        head: stretch.skip,
+        bytes_len: stretch.len,
+    })
+}
+
 /// The stage-buffer gate: the v2 census's 99.3% door, answered by what each
 /// stage's own translation declares (`research/docs/23` §3.3, v83 /
 /// `research/docs/26` §R9b and §R9d).
@@ -476,6 +537,21 @@ fn attribute_locations_match(attributes: &[VertexAttributeResource], reflected: 
 /// The count of binds rides in the sentence rather than in the slug: the slug
 /// is the census bucket and has to stay a property of the *shape*, while the
 /// count is a property of this request.
+///
+/// # Where the derived window comes from (R9e)
+///
+/// A bind the draw path resolved through the zero-copy rail arrives as a
+/// gather ([`BufferContent::GuestRuns`]) whose page runs are the *bounded
+/// references into this process's import* the guest RAM rail cut when it built
+/// the resolution (`crate::runtime::guest_ram_map::references_for_runs`), and
+/// each run carries the provider-shaped window the registration ledger derived
+/// for it. So the window a borrowed stage buffer travels under is a fact of the
+/// gather itself — [`gather_window`] reads it off [`GuestRunSource::single_stretch`]
+/// rather than asking the seam to restate coordinates the ledger already
+/// produced. One stretch whose window covers exactly the bind's own bytes is
+/// the whole condition; every other shape keeps the draw on the engine under
+/// the bucket its own fact names, which is what makes this a narrowing and not
+/// a second bind policy.
 fn stage_buffer_gate<'a>(
     inputs: &'a RenderRailInputs<'a>,
     binds: usize,
@@ -652,10 +728,10 @@ fn stage_buffer_gate<'a>(
         }
         let bytes = match bind.content {
             BufferContent::Bytes(bytes) => Some(bytes.as_slice()),
-            // A gather the GPU would perform from guest RAM is not a source
-            // this rail can state: the two arms it mints are the owner's
-            // staged copy and the owner's registered window, and the second is
-            // what a window-backed bind carries below.
+            // A gather the GPU would perform from guest RAM is not staged
+            // bytes: the two arms this rail mints are the owner's staged copy
+            // and the owner's registered window, and R9e derives the second
+            // from the gather's own page runs below.
             BufferContent::GuestRuns(_) => None,
         };
         let window = match bind.window {
@@ -683,7 +759,17 @@ fn stage_buffer_gate<'a>(
                 }
                 Some(window)
             }
-            None => None,
+            // R9e: the seam states no window, but a bind whose bytes the GPU
+            // would gather from one contiguous registered stretch *has* a
+            // window, and the page runs the source was built from name it — so
+            // this rail derives it here rather than asking the seam for a
+            // second copy of the same coordinates. A gather that is scattered,
+            // unregistered, or whose one stretch does not hold the bind's own
+            // bytes derives nothing and keeps the engine by name below.
+            None => match bind.content {
+                BufferContent::GuestRuns(source) => gather_window(source),
+                BufferContent::Bytes(_) => None,
+            },
         };
         if bytes.is_none() && window.is_none() {
             return Err(OutOfClass::owned(
@@ -1727,6 +1813,43 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             );
             reason.note();
             return RenderRailOutcome::NotInNarrowClass(reason);
+        }
+        // The third device answer (R9e): the provider imports the *view's own*
+        // host pointer, so the window's base plus the bind's own head has to be
+        // a whole number of import granules. The registration ledger aligns the
+        // window's base and the window covers the bind's bytes, but a
+        // `source_offset` a packed resource binds at can still leave the view
+        // unaligned — the canonical rail refuses that import by name
+        // (`lease_alignment_*`), and a declined draw where the engine would
+        // have gathered is the wrong answer for a class that only narrows which
+        // submissions change rail. So the shape stays on the engine, under its
+        // own bucket.
+        for buffer in pass.stage_buffers.iter().filter_map(|buffer| buffer.window) {
+            let Some(pointer) = buffer.host_va.checked_add(buffer.head) else {
+                let reason = OutOfClass::new(
+                    "render_provider_out_of_class_stage_buffer_alignment",
+                    "a draw whose stage buffer is covered by a registered guest RAM window stays \
+                     on the engine when the view's own host pointer is not addressable: the \
+                     window's base plus the bind's own head overflows the address space",
+                );
+                reason.note();
+                return RenderRailOutcome::NotInNarrowClass(reason);
+            };
+            if !pointer.is_multiple_of(alignment) {
+                let reason = OutOfClass::owned(
+                    "render_provider_out_of_class_stage_buffer_alignment",
+                    format!(
+                        "a draw whose stage buffer is covered by a registered guest RAM window \
+                         stays on the engine when the view's own host pointer is not a whole \
+                         number of the device's import granules: the pointer is {pointer}, the \
+                         device imports host pointers at {alignment} byte alignment, and the \
+                         canonical rail refuses an unaligned import by name rather than copying \
+                         the bind",
+                    ),
+                );
+                reason.note();
+                return RenderRailOutcome::NotInNarrowClass(reason);
+            }
         }
     }
     match submit_narrow(inputs, &pass) {

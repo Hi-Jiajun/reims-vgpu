@@ -4257,6 +4257,299 @@ fn a_stage_buffer_in_a_registered_window_leaves_without_a_copy() {
     );
 }
 
+/// R9e: the window a borrowed stage buffer travels under is one the *seam*
+/// derives from the bind's own zero-copy gather.
+///
+/// R9d needed the caller to state the window beside the bytes
+/// (`a_stage_buffer_in_a_registered_window_leaves_without_a_copy` above), which
+/// a driven draw path could not do: its binds are resolved by the guest RAM
+/// rail, and the window the registration ledger derived for them rides on the
+/// gather's page runs (`GuestWindowRun::window`). This test hands the rail
+/// exactly that shape — `BufferContent::GuestRuns`, no stated window — and
+/// requires the frame to follow the owner's own mapping, with the lease row
+/// naming the no-copy arm. A rail that still refused every gather would answer
+/// `..._stage_buffer_gather`; one that copied the bind would be unmoved by
+/// moving the mapping.
+#[test]
+fn a_stage_buffer_the_seam_derives_from_its_gather_leaves_without_a_copy() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    let _guard = engine_test_session();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the no-copy arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The mapping holds the fragment's red; the gather's own host run reads the
+    // same bytes, so the engine's answer for this bind is red as well.
+    owner.as_mut_slice()[..4].copy_from_slice(&[0, 0, 0x80, 0x3f]);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let import_id = import.id().get();
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    // The provider-shaped window the ledger would have derived for that run.
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // The bind as the draw path builds it: one page run over the owner's
+    // mapping, the bind's bytes at its start, and the window on the run.
+    let content = BufferContent::GuestRuns(engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            owner.pointer as usize,
+            2 * page as u64,
+            0,
+            16,
+        )
+        .expect("the bind's own bytes are inside the mapping")]),
+        source_offset: 0,
+        total_len: 16,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+            window_offset: 0,
+            guest,
+            window: Some(registered),
+        }])),
+        direct_image: None,
+    });
+    let stages = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: content.clone(),
+        });
+        req
+    };
+    let binds = [StageBufferBind {
+        stage: RenderPipelineStage::Fragment,
+        index: 0,
+        content: &content,
+        // The seam states no window: everything the lease needs is derived.
+        window: None,
+    }];
+    let log_before = std::fs::read_to_string(reims_vgpu_observe::fail_log_path())
+        .unwrap_or_default()
+        .len();
+    let frame = |label: &str| -> Vec<u8> {
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &request(),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!("{label}: a derived-window stage buffer is in class: {other:?}"),
+        }
+    };
+
+    let red = frame("derived window, red in the mapping");
+    eprintln!(
+        "derived stage-buffer window: device host-import alignment = {alignment}; the gather's \
+         one run carries a {page} byte window over registration {import_id}, the bind's bytes \
+         start at its 0th",
+    );
+    eprintln!(
+        "provider texel with the mapping red: {:?}",
+        texel_at(&red, 0, 0),
+    );
+    assert_eq!(
+        texel_at(&red, 0, 0),
+        [255, 0, 0, 255],
+        "the provider read the owner's own mapping through the window the seam derived"
+    );
+    // The lease row, verbatim: the arm this bind left through.
+    let log = std::fs::read_to_string(reims_vgpu_observe::fail_log_path()).expect("fail log");
+    let fresh = &log[log_before.min(log.len())..];
+    let lease = fresh
+        .lines()
+        .find(|line| line.contains("provider_owner_lease") && line.contains("no_copy=1"))
+        .unwrap_or_else(|| panic!("the borrowed lease row was emitted: {fresh}"));
+    eprintln!("lease row: {lease}");
+    assert!(
+        lease.contains("channel=borrowed") && lease.contains(&format!("import={import_id}")),
+        "the row names the no-copy arm and this import: {lease}"
+    );
+
+    // The falsifiable half: move the owner's bytes and the frame follows. A
+    // rail that copied the bind would be unmoved by this.
+    owner.as_mut_slice()[..4].copy_from_slice(&[0, 0, 0, 0]);
+    let black = frame("derived window, black in the mapping");
+    eprintln!(
+        "provider texel after moving the mapping's first float: {:?}",
+        texel_at(&black, 0, 0),
+    );
+    assert_eq!(
+        texel_at(&black, 0, 0),
+        [0, 0, 0, 255],
+        "the same bind now reads the moved bytes"
+    );
+    assert_frames_differ(
+        "the owner's own bytes reach the provider's frame",
+        &red,
+        &black,
+    );
+}
+
+/// R9e's refusal half: a gather the seam cannot cut one window from stays on
+/// the engine, each under the bucket its own fact names.
+///
+/// Three shapes, none of them a looser door: bytes scattered over more than one
+/// run, a run whose import the registration ledger never registered, and a
+/// packed bind whose `source_offset` leaves the view's own host pointer off the
+/// device's import granule. The first two answer `..._stage_buffer_gather` (the
+/// rail mints no copy for them either), and the third answers
+/// `..._stage_buffer_alignment` — a class answer, because the canonical rail
+/// refuses an unaligned import by name and a declined draw is not a fallback.
+#[test]
+fn a_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    let _guard = engine_test_session();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "the refusal half needs the no-copy device too"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let owner = AlignedHost::new(2 * page, page);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let slice = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = || {
+        GuestRef::new(std::sync::Arc::clone(&import), slice)
+            .expect("the slice came from this import")
+    };
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // The gather a test hands the gate: `runs` are not read on the refusal
+    // arms, so one host run covers every shape below.
+    let gather = |source_offset: u64, pages: Vec<GuestWindowRun>| -> BufferContent {
+        BufferContent::GuestRuns(engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                owner.pointer as usize,
+                2 * page as u64,
+                0,
+                16,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset,
+            total_len: 16,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(pages)),
+            direct_image: None,
+        })
+    };
+    let stages = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
+    let answer = |label: &str, content: &BufferContent| -> (String, String) {
+        let binds = [StageBufferBind {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            content,
+            window: None,
+        }];
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &narrow_request(MTL_FORMAT_RGBA8_UNORM),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => {
+                panic!("{label}: a gather with no one-stretch window is out of class: {other:?}")
+            }
+        }
+    };
+
+    // Scattered: two runs tile the bind, so no single host range is its bytes.
+    let scattered = gather(
+        0,
+        vec![
+            GuestWindowRun {
+                window_offset: 0,
+                guest: guest(),
+                window: Some(registered),
+            },
+            GuestWindowRun {
+                window_offset: 8,
+                guest: guest(),
+                window: Some(registered),
+            },
+        ],
+    );
+    let (slug, detail) = answer("scattered gather", &scattered);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
+    assert!(
+        detail.contains("gathers from guest RAM"),
+        "the sentence names the gather: {detail}"
+    );
+
+    // Unregistered: the ledger derived no window for this run.
+    let unregistered = gather(
+        0,
+        vec![GuestWindowRun {
+            window_offset: 0,
+            guest: guest(),
+            window: None,
+        }],
+    );
+    let (slug, detail) = answer("unregistered gather", &unregistered);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
+
+    // Off-granule: the bind starts inside the window, so the view's own host
+    // pointer is not a whole number of the device's import granules.
+    let off_granule = gather(
+        4,
+        vec![GuestWindowRun {
+            window_offset: 0,
+            guest: guest(),
+            window: Some(registered),
+        }],
+    );
+    let (slug, detail) = answer("off-granule gather", &off_granule);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_alignment");
+    assert!(
+        detail.contains(&format!("{alignment} byte alignment")),
+        "the sentence names the alignment it crossed: {detail}"
+    );
+
+    // Both buckets are counters, not latches.
+    assert!(route_count("render_provider_out_of_class_stage_buffer_gather") >= 2);
+    assert!(route_count("render_provider_out_of_class_stage_buffer_alignment") >= 1);
+}
+
 /// A host allocation whose first byte is aligned to `alignment`, so the owner
 /// rail's registration can name it (`research/docs/20` §3.2).
 struct AlignedHost {
