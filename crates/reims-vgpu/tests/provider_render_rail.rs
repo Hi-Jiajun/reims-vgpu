@@ -501,6 +501,115 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     class(&req);
 }
 
+/// The census half of the class boundary: every out-of-class answer is counted
+/// under its own stable bucket, so a boot's `store_routes` says *how much* of a
+/// draw stream each condition kept on the engine and not only that the
+/// condition exists.
+///
+/// Read from the rail's own live window
+/// (`runtime::drain::store_route_count_for_test`) rather than from the emitted
+/// line: `store_routes` is drained on the drain worker's census tick, which an
+/// off-VM rail test never runs, and a counter nobody reads back is one that can
+/// be deleted, renamed, or wired to the wrong `return` with nothing noticing.
+///
+/// The buckets are the 2026-09-17 render profile's eighth observability gap:
+/// the profile had to re-derive the out-of-class population from a dozen
+/// counters in a dozen places ("how much of a boot's draw stream was instanced,
+/// was multisampled, was Load rather than Clear"), because the seam's own
+/// `linux_render_provider out_of_class` line is latched per pipeline and sized
+/// by neither time nor draws.
+#[test]
+fn each_out_of_class_condition_is_counted_under_its_own_bucket() {
+    use reims_vgpu::protocol::pass_action::LoadAction;
+
+    let _guard = engine_test_session();
+    let air = stage_air();
+    let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
+    let out_of_class =
+        |req: &DrawRequest| match provider_render::submit_render(&inputs(&air, true), req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert!(
+                    !reason.detail().is_empty(),
+                    "an out-of-class answer still carries its sentence"
+                );
+            }
+            other => panic!("expected an out-of-class answer, got {other:?}"),
+        };
+
+    let instanced = count("render_provider_out_of_class_instanced");
+    let load_action = count("render_provider_out_of_class_load_action");
+    let depth = count("render_provider_out_of_class_depth");
+    let window = count("render_provider_out_of_class_attachment_window");
+    // A condition none of the shapes below exercises: its bucket must not move
+    // when its neighbours do, or the buckets are one counter wearing five
+    // names.
+    let untouched = count("render_provider_out_of_class_mrt");
+
+    // An in-class shape is not an out-of-class answer and must not charge any
+    // bucket: the counters are charged where the gate answers, not where a
+    // render request arrives.
+    let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    match provider_render::submit_render(&inputs(&air, true), &req) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("the reviewed shape is in class: {other:?}"),
+    }
+
+    // One shape per condition, plus one repeat so the counter is a count and
+    // not a latch.
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.instance_count = Some(4);
+    out_of_class(&req);
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.instance_count = Some(2);
+    out_of_class(&req);
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.color0_declared = Some(LoadAction::Load);
+    out_of_class(&req);
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.depth = Some(DepthState {
+        identity: None,
+        test_enable: false,
+        write_enable: false,
+        compare: Default::default(),
+        clear_value: 1.0,
+        load: false,
+        stencil: None,
+    });
+    out_of_class(&req);
+    let (window_width, window_height) = extent();
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.width = window_width + 1;
+    req.height = window_height;
+    out_of_class(&req);
+
+    assert_eq!(
+        count("render_provider_out_of_class_instanced"),
+        instanced + 2,
+        "two instanced shapes answer the same condition twice, so the bucket counts rather than \
+         latches"
+    );
+    assert_eq!(
+        count("render_provider_out_of_class_load_action"),
+        load_action + 1,
+        "the Load shape is charged to the load-action bucket"
+    );
+    assert_eq!(
+        count("render_provider_out_of_class_depth"),
+        depth + 1,
+        "the depth shape is charged to the depth bucket"
+    );
+    assert_eq!(
+        count("render_provider_out_of_class_attachment_window"),
+        window + 1,
+        "the over-window shape is charged to the window bucket"
+    );
+    assert_eq!(
+        count("render_provider_out_of_class_mrt"),
+        untouched,
+        "a bucket nobody answered with does not move"
+    );
+}
+
 /// The class window is the number the canonical rail declares on this device,
 /// not a copy inside this crate: a shape at the declared window still reaches
 /// the provider, and one texel beyond it stays on the engine *before* the
@@ -552,11 +661,11 @@ fn the_class_window_is_the_providers_declaration() {
         match provider_render::submit_render(&inputs(&air, true), &req) {
             RenderRailOutcome::NotInNarrowClass(reason) => {
                 assert!(
-                    reason.contains(request_extent.as_str()),
+                    reason.detail().contains(request_extent.as_str()),
                     "the reason names the request's own extent: {reason}"
                 );
                 assert!(
-                    reason.contains(declared.as_str()),
+                    reason.detail().contains(declared.as_str()),
                     "the reason names the window the provider declared: {reason}"
                 );
             }

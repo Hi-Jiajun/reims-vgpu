@@ -3243,8 +3243,7 @@ pub fn note_store_route_us(name: &'static str, us: u64) {
 /// placed on the wrong side of an early return without any test noticing — and
 /// several of this crate's readings have turned on exactly which side of a
 /// branch a `note_store_route` sat on.
-#[cfg(test)]
-pub(crate) fn store_route_count(route: &str) -> u64 {
+fn route_count(route: &str) -> u64 {
     STORE_ROUTES
         .lock()
         .ok()
@@ -3253,16 +3252,86 @@ pub(crate) fn store_route_count(route: &str) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
+pub(crate) fn store_route_count(route: &str) -> u64 {
+    route_count(route)
+}
+
+/// [`store_route_count`] at the crate boundary, for the integration tests that
+/// drive a rail end to end.
+///
+/// `tests/provider_render_rail.rs` and its siblings link this crate as a
+/// library, where `cfg(test)` items do not exist, and the alternative — going
+/// through the emitted `store_routes` line — needs a drain census tick that an
+/// off-VM rail test never runs. Reading the live window is the same answer the
+/// crate's own unit tests read, so a rail's counters can be asserted from the
+/// seam the rail is tested at rather than only from inside.
+///
+/// Tests only; the runtime never calls it, and it reads nothing the census
+/// would not print a second later.
+#[doc(hidden)]
+pub fn store_route_count_for_test(route: &str) -> u64 {
+    route_count(route)
+}
+
+/// The route names the window prints even when it counted none of them.
+///
+/// `store_routes` is sparse by construction: a counter that never fired is
+/// left out of the line. For most routes that is the right reading — a boot
+/// that never took a rail did not take it — but for a small set of
+/// *classifications* the absence is ambiguous in exactly the way the 2026-09-17
+/// render profile complained about: "the guest attached no depth buffer this
+/// boot" and "the depth route was never wired" both print nothing. The profile
+/// had to read that difference off a different counter (`depth_image=0` in
+/// `vk_create_sites`) to be sure. A name here prints `name=0` in any window
+/// that prints at all, so the zero is a reading rather than a silence.
+///
+/// The members are the ones whose zero is a *finding* about the workload —
+/// depth, multisample and MRT are the three classes the profile found absent
+/// and the three the widening order keeps last — and whose non-zero reading
+/// comes from a different arm than the one that would have printed.
+const ZERO_VISIBLE_ROUTES: [&str; 5] = [
+    "pass_depth_attached",
+    "pass_sample_2",
+    "pass_sample_4",
+    "pass_sample_gt4",
+    "mrt_draw_multi",
+];
+
+/// [`take_store_routes`] for the crate's own tests: the whole line, not one
+/// counter.
+///
+/// A test that asserts a counter fired proves the counter is wired; a test that
+/// reads the line proves what a reader of the log would *see*, which is a
+/// different claim — [`ZERO_VISIBLE_ROUTES`] is invisible to the first and the
+/// whole point of the second.
+#[cfg(test)]
+pub(crate) fn take_store_routes_for_test() -> Option<String> {
+    take_store_routes()
+}
+
 /// Drain and format the window's route counts, or `None` if none were taken.
 fn take_store_routes() -> Option<String> {
     let routes = STORE_ROUTES.lock().ok()?;
     let mut out = String::from("store_routes");
     let mut any = false;
+    let mut printed: Vec<&'static str> = Vec::with_capacity(ZERO_VISIBLE_ROUTES.len());
     for (route, counter) in routes.iter() {
         let n = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
         if n != 0 {
             out.push_str(&format!(" {route}={n}"));
             any = true;
+            printed.push(route);
+        }
+    }
+    // Printed only into a window that has something to say, so an idle second
+    // still emits no line: the point of a zero here is to be read *beside* the
+    // window's other counts, not to keep the log awake.
+    if any {
+        for route in ZERO_VISIBLE_ROUTES {
+            if !printed.contains(&route) {
+                out.push_str(&format!(" {route}=0"));
+            }
         }
     }
     any.then_some(out)

@@ -178,6 +178,61 @@ mod pass_echo_delta_order {
             "an identical echo continues the standing pass"
         );
     }
+
+    /// Draws per pass, as the census reports it: one band per pass, counted
+    /// where the pass closes.
+    ///
+    /// The 2026-09-17 render profile could only infer this distribution by
+    /// dividing `mrt_draw_single` by `passbegin_*` across a whole boot, which is
+    /// two counters from two rails and cannot see a single pass at all. The
+    /// assertion below is the property that inference lacked: the count a pass
+    /// reports is the count of draws it was given, and the counter that carried
+    /// it does not survive into the next pass.
+    #[test]
+    fn a_passes_draw_count_is_banded_once_when_it_closes() {
+        let count = crate::runtime::drain::store_route_count;
+        let mut pools = ResourcePools::new();
+
+        // Three draws in one pass: the one that opened it plus two joins.
+        let two_to_four = count("pass_draws_2_4");
+        pools.note_pass_opened(echo(1, false));
+        pools.note_pass_draw();
+        pools.note_pass_draw();
+        pools.note_pass_closed();
+        assert_eq!(
+            count("pass_draws_2_4"),
+            two_to_four + 1,
+            "a three-draw pass lands in the 2..=4 band"
+        );
+
+        // A lone draw, then nine: the two ends of the ladder.
+        let one = count("pass_draws_1");
+        pools.note_pass_opened(echo(1, false));
+        pools.note_pass_closed();
+        assert_eq!(count("pass_draws_1"), one + 1, "a one-draw pass is banded");
+        let many = count("pass_draws_gt8");
+        pools.note_pass_opened(echo(1, false));
+        for _ in 0..8 {
+            pools.note_pass_draw();
+        }
+        pools.note_pass_closed();
+        assert_eq!(
+            count("pass_draws_gt8"),
+            many + 1,
+            "the count carries into the open-ended band rather than saturating in one below it"
+        );
+
+        // And the count belongs to the pass that carried it: a close with no
+        // pass behind it reports nothing, so a later pass cannot inherit a
+        // predecessor's draws.
+        let after = count("pass_draws_1");
+        pools.note_pass_closed();
+        assert_eq!(
+            count("pass_draws_1"),
+            after,
+            "a close with no standing pass reports no band"
+        );
+    }
 }
 
 impl ResourcePools {
@@ -345,6 +400,7 @@ impl ResourcePools {
             batch_max_draws: BATCH_MAX_DRAWS,
             last_pass: None,
             open_pass: None,
+            open_pass_draws: 0,
             slab: slab::SlabPool::new(),
             slabs: buffer_slab::BufferSlabs::new(),
             host_ram_imports: host_ram::HostRamImports::default(),
@@ -1891,6 +1947,54 @@ impl ResourcePools {
     pub(crate) fn note_pass_opened(&mut self, echo: PassEcho) {
         self.last_pass = Some(echo);
         self.open_pass = Some(echo);
+        // The draw that opened it is the pass's first, so the band a close
+        // reports is never `pass_draws_0` for a pass that rendered.
+        self.open_pass_draws = 1;
+    }
+
+    /// Record one draw joining the pass that is already open.
+    ///
+    /// Beside [`Self::note_pass_opened`] rather than inferred from
+    /// `pass_continued`, because the band reported at the close has to be the
+    /// count of draws the pass actually received: a continuation that skipped
+    /// this call would turn a multi-draw pass into a single-draw one in the
+    /// census and nothing else would notice.
+    pub(crate) fn note_pass_draw(&mut self) {
+        self.open_pass_draws = self.open_pass_draws.saturating_add(1);
+    }
+
+    /// The band one pass's draw count falls in, reported when it closes.
+    ///
+    /// Powers of two from one, like `passbegin_px_*` and for the same reason:
+    /// the question "is a pass one draw or many" is answered by which band
+    /// holds the mass, and the boundaries have to be coarse enough that the
+    /// answer does not move with the guest's redraw strategy.
+    fn pass_draws_band(draws: u32) -> &'static str {
+        match draws {
+            0..=1 => "pass_draws_1",
+            2..=4 => "pass_draws_2_4",
+            5..=8 => "pass_draws_5_8",
+            _ => "pass_draws_gt8",
+        }
+    }
+
+    /// Report the band of the pass that just stopped standing, and forget its
+    /// count.
+    ///
+    /// Split from [`Self::close_open_pass`] so it can be asserted without a
+    /// device: everything the band depends on is this one counter, and a test
+    /// that had to own a `VkDevice` to read it would be a test of the driver
+    /// rather than of the census.
+    fn note_pass_closed(&mut self) {
+        // Zero is "no pass was standing", not "one that drew nothing": every
+        // pass opens with the draw that opened it, so a close with nothing
+        // behind it (teardown, or a caller that already reported) has no band
+        // to add and must not invent a one-draw pass.
+        if self.open_pass_draws == 0 {
+            return;
+        }
+        crate::runtime::drain::note_store_route(Self::pass_draws_band(self.open_pass_draws));
+        self.open_pass_draws = 0;
     }
 
     /// Whether `echo` is the render pass that is actually still open.
@@ -1909,6 +2013,12 @@ impl ResourcePools {
             open.cb, cb,
             "open render pass belongs to another command buffer"
         );
+        // One band per pass, at the only place a pass stops standing. Every
+        // close site (an outside-pass command, the next pass's begin, the batch
+        // flush, teardown of the batch) funnels through here, so the bands sum
+        // to the passes this device opened and a reader does not have to join
+        // `passbegin_*` against a draw counter to get draws per pass.
+        self.note_pass_closed();
         unsafe { device.cmd_end_render_pass(open.cb) };
     }
 

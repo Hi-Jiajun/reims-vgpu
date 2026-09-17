@@ -570,6 +570,19 @@ pub(crate) struct ResourcePools {
     /// Unlike `last_pass`, this is executable state: every outside-pass command
     /// and every command-buffer end must close it first.
     open_pass: Option<PassEcho>,
+    /// How many draws the open pass has recorded, including the one that
+    /// opened it.
+    ///
+    /// The 2026-09-17 render profile had to *infer* draws per pass from
+    /// `mrt_draw_single` over `passbegin_*`, which is two counters from two
+    /// rails and reads a pass count off a draw count; the profile's gap list
+    /// asked for the distribution directly, at the pass rather than at the
+    /// draw. This is that counter: incremented where a draw joins the open
+    /// pass, and reported as a band when the pass closes — so the sum of the
+    /// bands is the number of passes opened, and `pass_draws_gt8` against
+    /// `passmerge_no_join` says how much of a boot's multi-draw work is
+    /// already sharing one pass.
+    open_pass_draws: u32,
     /// Offset suballocator for DEVICE_LOCAL optimal images (targets, sampled,
     /// storage, resident registry). Sub-allocates many image binds from a few
     /// large `VkDeviceMemory` blocks to collapse the per-image

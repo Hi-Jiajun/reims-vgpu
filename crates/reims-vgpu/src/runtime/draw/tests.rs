@@ -8155,3 +8155,134 @@ fn both_spellings_of_the_channel_exchange_agree_and_are_their_own_inverse() {
         );
     }
 }
+
+/// The shape census counts the draw it is handed, and the window it counts into
+/// prints the zeros as well as the counts.
+///
+/// Two claims, and they are different claims: the bands are counted once per
+/// draw on every axis (so a window's arms sum to its draws and `pass_color1`
+/// rather than a silent absence says "this boot was all single-attachment"), and
+/// the members of `ZERO_VISIBLE_ROUTES` appear in the drained line *even when
+/// nothing incremented them* — the property the 2026-09-17 render profile
+/// needed when it had to prove depth/MRT/MSAA were absent from a boot rather
+/// than unobserved in it.
+///
+/// The counter reads are deltas against the live window, as the census's own
+/// tests are: the window is process-global and the suite runs in parallel, so
+/// an absolute count would be a claim about every other test in the binary.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_draw_shape_census_counts_bands_and_prints_the_zeros() {
+    use crate::protocol::pass_action::MTL_LOAD_ACTION_CLEAR;
+    use crate::runtime::decode::render::DepthAttachment;
+    use crate::runtime::drain::{store_route_count, take_store_routes_for_test};
+
+    let before = |route: &str| store_route_count(route);
+    let (slots, depth, sample4, indexed, streams) = (
+        before("pass_color_slots_1"),
+        before("pass_depth_attached"),
+        before("pass_sample_4"),
+        before("draw_form_indexed"),
+        before("draw_vertex_streams_1"),
+    );
+
+    // One draw that is as far from the canonical class as this census gets:
+    // a single colour attachment, a depth attachment, four samples, one bound
+    // vertex stream, indexed, one instance. Every axis below is read off it.
+    let req = DrawEncodeRequest {
+        pipeline_ref: 7,
+        vertex_count: 6,
+        instance_count: 1,
+        indexed: Some(IndexedDrawInfo {
+            index_type: 0,
+            index_count: 6,
+            index_buffer_ref: 1,
+            index_buffer_offset: 0,
+            base_vertex: 0,
+        }),
+        depth_attach: Some(DepthAttachment {
+            texture_ref: 9,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..DepthAttachment::default()
+        }),
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            texture_ref: 3,
+            mapping_id: 0,
+            target_gva: 0x4000,
+            row_stride: 16,
+            width: 4,
+            height: 4,
+            format: 71,
+            sample_count: 4,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: 0,
+            ..ColorRtRequest::default()
+        }],
+        vertex_buffers: std::sync::Arc::new(vec![crate::runtime::draw::BufferBind {
+            index: 0,
+            buffer_ref: 5,
+            ..crate::runtime::draw::BufferBind::default()
+        }]),
+        ..DrawEncodeRequest::default()
+    };
+    super::vulkan::note_draw_shape(&req);
+
+    assert_eq!(
+        store_route_count("pass_color_slots_1"),
+        slots + 1,
+        "one colour attachment is counted in the single-slot band"
+    );
+    assert_eq!(
+        store_route_count("pass_color_slots_2"),
+        before("pass_color_slots_2"),
+        "and in no other band"
+    );
+    assert_eq!(
+        store_route_count("pass_depth_attached"),
+        depth + 1,
+        "a request that carries a depth attachment is counted as attached"
+    );
+    assert_eq!(
+        store_route_count("pass_sample_4"),
+        sample4 + 1,
+        "the highest sample count any attachment declares is the pass's band"
+    );
+    assert_eq!(
+        store_route_count("draw_form_indexed"),
+        indexed + 1,
+        "an indexed request is counted as indexed"
+    );
+    assert_eq!(
+        store_route_count("draw_form_nonindexed"),
+        before("draw_form_nonindexed"),
+        "an indexed request is not also counted as non-indexed"
+    );
+    assert_eq!(
+        store_route_count("draw_vertex_streams_1"),
+        streams + 1,
+        "one bound stream lands in the one-stream band"
+    );
+    assert_eq!(
+        store_route_count("draw_vertex_streams_gt4"),
+        before("draw_vertex_streams_gt4"),
+        "and in no other stream band"
+    );
+
+    // The line a reader of the log would see. A parallel test that drained the
+    // window first is tolerated — the counter assertions above are the claim —
+    // but when the line is ours, the zeros have to be on it.
+    if let Some(line) = take_store_routes_for_test() {
+        for route in ["pass_depth_attached", "pass_sample_2", "mrt_draw_multi"] {
+            assert!(
+                line.contains(&format!(" {route}=")),
+                "{route} is on the window's line whether or not anything counted it: {line}"
+            );
+        }
+        println!("{line}");
+    } else {
+        eprintln!(
+            "a parallel test drained the window first; the bands above are still the assertion"
+        );
+    }
+}

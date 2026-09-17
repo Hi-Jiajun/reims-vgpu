@@ -971,9 +971,21 @@ fn ensure_cached_async_keyed(
     // Queue census: fires once per cold shader on the normal path — OFF, not a
     // curated failure. The `done` line below stays fail-visible on translation
     // failure (a shader that will not render).
+    //
+    // `mtlb_hash` is the module's content digest — the same `ShaderId::digest`
+    // the cache files it under — and it is here because the guest render
+    // profile's pipeline question had no answer at all: MTLB containers carry no
+    // function names on this rail (the pinned crate has no name table, S1's
+    // finding), so "which shader module is this pass running" can only be asked
+    // as "which module content is it", and a module content is exactly this
+    // number. It is *not* the container's hash: one MTLB can carve several AIR
+    // modules, and this line is one of them, which is why a reader joins it by
+    // `pipe=` and `stage=` as well.
     crate::observe::off(format!(
-        "linux_m2v_async queued pipe={pipeline_ref} stage={stage:?}{dims} air={}",
-        id.air.len()
+        "linux_m2v_async queued pipe={pipeline_ref} stage={stage:?}{dims} air={} \
+         mtlb_hash={:#x}",
+        id.air.len(),
+        id.digest,
     ));
     if start_worker {
         std::thread::spawn(async_worker);

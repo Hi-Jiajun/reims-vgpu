@@ -20,6 +20,10 @@ impl ResourcePools {
         // pool discards the unfinished recording, including an open pass, so
         // there is neither a legal nor a useful cmd_end_render_pass to emit.
         self.open_pass = None;
+        // The pass's draw count dies with the pass it counted. No band is
+        // reported for it for the same reason: a pass that never ends has no
+        // draw count to report, and the census would be claiming one.
+        self.open_pass_draws = 0;
         self.forget_pass_echo();
         // Best-effort quiesce: wait every in-flight fence so no CB references
         // what we are about to destroy. On device loss the waits fail — the

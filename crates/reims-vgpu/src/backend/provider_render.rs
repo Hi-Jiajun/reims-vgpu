@@ -177,17 +177,24 @@ fn declared_attachment_window() -> Result<[u64; 2], ProviderRenderDecline> {
 /// Pure over its inputs, so the boundary is the provider's declaration and
 /// nothing else — the reason names both numbers, because that string is what
 /// the observer reports when the boundary moves.
-fn window_admits(window: [u64; 2], width: u64, height: u64) -> Result<(), Cow<'static, str>> {
+fn window_admits(window: [u64; 2], width: u64, height: u64) -> Result<(), OutOfClass> {
     if width <= window[0] && height <= window[1] {
         return Ok(());
     }
-    Err(Cow::Owned(format!(
-        "an attachment of {width}x{height} is outside the window this device's provider declares \
-         ({}x{}, `max_attachment_dimension`): the canonical rail states the window, admission \
-         refuses a wider attachment by name (`attachment_dimension_limit`), and a shape the \
-         provider always refuses is not one this class executes",
-        window[0], window[1],
-    )))
+    Err(OutOfClass {
+        // The window is one condition however many shapes meet it, so one
+        // bucket: the numbers that moved are in the sentence, and what a reader
+        // wants from the counter is how much of a boot's stream the window
+        // refuses.
+        route: "render_provider_out_of_class_attachment_window",
+        detail: Cow::Owned(format!(
+            "an attachment of {width}x{height} is outside the window this device's provider \
+             declares ({}x{}, `max_attachment_dimension`): the canonical rail states the window, \
+             admission refuses a wider attachment by name (`attachment_dimension_limit`), and a \
+             shape the provider always refuses is not one this class executes",
+            window[0], window[1],
+        )),
+    })
 }
 
 /// The allocation the colour attachment's declaring view lives in.
@@ -251,14 +258,72 @@ pub enum RenderRailOutcome {
     ProviderCompleted(RenderRailOutput),
     /// Outside the narrow admitted class. The caller must run the
     /// self-contained engine, exactly as a build without the feature would.
-    ///
-    /// Borrowed for the class conditions a request answers by itself; owned
-    /// for the one that is a property of the device — the declared attachment
-    /// window — because that answer names the numbers it compared.
-    NotInNarrowClass(Cow<'static, str>),
+    NotInNarrowClass(OutOfClass),
     /// In-class, but the canonical provider refused. The caller must decline
     /// the draw rather than fall back to another rail.
     ProviderDeclined(ProviderRenderDecline),
+}
+
+/// Why a request is outside the admitted class, in the two spellings it needs.
+///
+/// The class gate answers with a *sentence* — the seam prints it beside
+/// `linux_render_provider out_of_class`, and it is what a reader compares
+/// against when the class moves — and with a *bucket*, counted into the
+/// `store_routes` window as `render_provider_out_of_class_<slug>`.
+///
+/// The bucket is the half the 2026-09-17 render profile asked for and the
+/// reason it is a type rather than a lookup: the profile had to *re-derive* the
+/// out-of-class population from a dozen counters in a dozen windows ("how much
+/// of a boot's draw stream was instanced, was multisampled, was Load rather
+/// than Clear"), because the only per-reason answer the seam printed was the
+/// first-appearance line — deduplicated per process and therefore sized by
+/// neither time nor draws. The slug is a stable, spelled-out name beside the
+/// sentence in the same `return`, so the two cannot drift into disagreeing
+/// about which condition fired.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutOfClass {
+    /// The census bucket, as the `store_routes` name it is counted under:
+    /// `render_provider_out_of_class_<slug>`.
+    route: &'static str,
+    /// The sentence the seam reports. Borrowed for the conditions a request
+    /// answers by itself; owned for the one that is a property of the device —
+    /// the declared attachment window — because that answer names the numbers
+    /// it compared.
+    detail: Cow<'static, str>,
+}
+
+impl OutOfClass {
+    /// One class condition a request answers about itself.
+    const fn new(slug: &'static str, detail: &'static str) -> Self {
+        Self {
+            route: slug,
+            detail: Cow::Borrowed(detail),
+        }
+    }
+
+    /// The sentence, for the caller to print.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    /// Count this answer into the census window.
+    ///
+    /// Called at the exit of [`submit_render`] rather than by the seam, so the
+    /// bucket fires for every caller of the rail — including the off-VM tests
+    /// that drive `submit_render` directly — and so a future caller cannot
+    /// forget it.
+    fn note(&self) {
+        crate::runtime::drain::note_store_route(self.route);
+    }
+}
+
+impl std::fmt::Display for OutOfClass {
+    /// The sentence, so a caller that only wants to print the boundary does not
+    /// have to reach for the field — the same shape `Cow<'static, str>` gave
+    /// this answer before it grew a bucket.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
 }
 
 /// A typed refusal of the canonical-provider render rail, nameable in the fail
@@ -492,7 +557,10 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(inputs, req) {
-        Err(reason) => return RenderRailOutcome::NotInNarrowClass(reason.into()),
+        Err(reason) => {
+            reason.note();
+            return RenderRailOutcome::NotInNarrowClass(reason);
+        }
         Ok(pass) => pass,
     };
     // The window is the one class condition a request cannot answer by itself:
@@ -513,6 +581,7 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
         Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
     };
     if let Err(reason) = window_admits(window, pass.width, pass.height) {
+        reason.note();
         return RenderRailOutcome::NotInNarrowClass(reason);
     }
     match submit_narrow(inputs, &pass) {
@@ -607,59 +676,84 @@ impl NarrowPass<'_> {
 fn narrow_class<'a>(
     inputs: &RenderRailInputs<'_>,
     req: &'a DrawRequest,
-) -> Result<NarrowPass<'a>, &'static str> {
+) -> Result<NarrowPass<'a>, OutOfClass> {
     if !inputs.writeback_guest {
-        return Err("a record that does not own the guest writeback stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_writeback",
+            "a record that does not own the guest writeback stays on the engine",
+        ));
     }
     if inputs.vertex_air.is_empty() || inputs.fragment_air.is_empty() {
-        return Err("a request without both translated stages stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_stages",
+            "a request without both translated stages stays on the engine",
+        ));
     }
     let (Some(vertex_entry), Some(fragment_entry)) = (inputs.vertex_entry, inputs.fragment_entry)
     else {
-        return Err(
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_stage_entry",
             "a stage whose translation reports no AIR entry point stays on the engine: the \
              canonical contract names that entry, and a name this rail invented would describe \
              another module",
-        );
+        ));
     };
     let Some(attachment) = req.color_attachment else {
-        return Err("a request that never stated its attachment state stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_attachment_state",
+            "a request that never stated its attachment state stays on the engine",
+        ));
     };
     let format = match attachment.format() {
         ash::vk::Format::R8G8B8A8_UNORM => AttachmentFormat::Rgba8Unorm,
         ash::vk::Format::B8G8R8A8_UNORM => AttachmentFormat::Bgra8Unorm,
         _ => {
-            return Err(
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_format",
                 "only the admitted 8-bit colour formats leave for the canonical rail \
                  (Rgba8Unorm, Bgra8Unorm)",
-            )
+            ))
         }
     };
     let ColorClearValue::Float(clear) = attachment.clear() else {
-        return Err("a non-float clear stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_clear_kind",
+            "a non-float clear stays on the engine",
+        ));
     };
     let Some(clear) = clear_bytes(clear) else {
-        return Err(
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_clear_bytes",
             "a clear that is not byte-exact in the attachment's 8-bit encoding stays on the \
              engine: the canonical pass states bytes, the engine states floats, and the two \
              rounds must be the same value for the rails to agree",
-        );
+        ));
     };
     if req.width == 0 || req.height == 0 {
-        return Err("a zero-sized attachment stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_zero_extent",
+            "a zero-sized attachment stays on the engine",
+        ));
     }
     let extent = u64::from(req.width)
         .checked_mul(u64::from(req.height))
         .and_then(|texels| texels.checked_mul(4))
-        .ok_or("an attachment extent that overflows u64 stays on the engine")?;
+        .ok_or(OutOfClass::new(
+            "render_provider_out_of_class_extent_overflow",
+            "an attachment extent that overflows u64 stays on the engine",
+        ))?;
     if req.color0_declared != Some(crate::protocol::pass_action::LoadAction::Clear) {
-        return Err(
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_load_action",
             "the canonical class loads by `Clear` only; a Load or DontCare record stays on the \
              engine",
-        );
+        ));
     }
     if req.skip_readback {
-        return Err("a record that skips its readback stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_skip_readback",
+            "a record that skips its readback stays on the engine",
+        ));
     }
     if req.target_identity.is_some()
         || req.seed_from_target.is_some()
@@ -670,49 +764,74 @@ fn narrow_class<'a>(
         || req.load_guest_target_backing
         || req.record_guest_store
     {
-        return Err(
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_target",
             "a resident, seeded, chained or guest-backed target stays on the engine: the class \
              is the pooled offscreen target whose whole frame comes back through the completion",
-        );
+        ));
     }
     if req.continues_render_pass || req.render_pass_continues {
-        return Err("a record inside a multi-record encoder stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_encoder",
+            "a record inside a multi-record encoder stays on the engine",
+        ));
     }
     if !req.secondary_targets.is_empty() {
-        return Err("MRT stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_mrt",
+            "MRT stays on the engine",
+        ));
     }
     if req.raster_sample_count > 1 || req.color_sample_count > 1 || req.multisample_resolve {
-        return Err("a multisample or resolving pass stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_multisample",
+            "a multisample or resolving pass stays on the engine",
+        ));
     }
     if req.depth.is_some() {
-        return Err("a depth or stencil state stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_depth",
+            "a depth or stencil state stays on the engine",
+        ));
     }
     if !req.storage_buffers.is_empty() {
-        return Err(
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_buffers",
             "a pass whose stages bind buffers stays on the engine: the canonical render contract \
              has no buffer bindings for a pipeline",
-        );
+        ));
     }
     if !req.sampled_images.is_empty() || !req.samplers.is_empty() || req.color_input {
-        return Err(
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_sampling",
             "a pass that samples stays on the engine: the canonical render pass carries no \
              texture or sampler binding",
-        );
+        ));
     }
     if req.occlusion_query.is_some() {
-        return Err("a visibility-armed draw stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_visibility",
+            "a visibility-armed draw stays on the engine",
+        ));
     }
     if req.blend.is_some() || req.color_write_mask != crate::protocol::blend::ColorWriteMask::ALL {
-        return Err("a blending or write-masked attachment stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_blend",
+            "a blending or write-masked attachment stays on the engine",
+        ));
     }
     if req.blend_color != [0.0; 4] {
-        return Err("a draw with a blend constant stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_blend_color",
+            "a draw with a blend constant stays on the engine",
+        ));
     }
     if !req.viewports.is_empty() || !req.scissors.is_empty() {
-        return Err(
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_viewport",
             "an explicit viewport or scissor stays on the engine: the canonical pass states the \
              attachment-covering viewport and no scissor",
-        );
+        ));
     }
     if req.raster.cull_mode != reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.cull_mode
         || req.raster.winding != reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.winding
@@ -721,39 +840,66 @@ fn narrow_class<'a>(
         || req.raster.fill_mode != reims_vgpu_vulkan::raster::GuestRasterState::DEFAULT.fill_mode
         || req.line_width.is_some()
     {
-        return Err("a non-default raster state stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_raster",
+            "a non-default raster state stays on the engine",
+        ));
     }
     if req.base_instance != 0 {
-        return Err("baseInstance stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_base_instance",
+            "baseInstance stays on the engine",
+        ));
     }
     if req.instance_count != Some(1) {
-        return Err("an instanced draw stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_instanced",
+            "an instanced draw stays on the engine",
+        ));
     }
     if req.first_vertex != 0 {
-        return Err("a non-indexed first-vertex offset stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_first_vertex",
+            "a non-indexed first-vertex offset stays on the engine",
+        ));
     }
     if req.primitive_topology.0 != crate::protocol::topology::PrimitiveType::Triangle {
-        return Err("only a triangle-list draw leaves for the canonical rail");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_topology",
+            "only a triangle-list draw leaves for the canonical rail",
+        ));
     }
     let Some(index) = req.indexed.as_ref() else {
-        return Err(
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_nonindexed",
             "the admitted shape is one indexed draw; a non-indexed draw stays on the engine",
-        );
+        ));
     };
     if index.index_count == 0 {
-        return Err("a zero-length draw stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_index_count_zero",
+            "a zero-length draw stays on the engine",
+        ));
     }
     if index.vertex_offset != 0 {
-        return Err("a baseVertex offset stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_base_vertex",
+            "a baseVertex offset stays on the engine",
+        ));
     }
     let index_format = match index.index_type {
         crate::backend::vulkan::engine::IndexType::U16 => IndexFormat::Uint16,
         crate::backend::vulkan::engine::IndexType::U32 => IndexFormat::Uint32,
     };
-    let index_bytes = staged_bytes(&index.content)
-        .ok_or("an index stream the GPU gathers from guest RAM stays on the engine")?;
+    let index_bytes = staged_bytes(&index.content).ok_or(OutOfClass::new(
+        "render_provider_out_of_class_index_staging",
+        "an index stream the GPU gathers from guest RAM stays on the engine",
+    ))?;
     if index_bytes.is_empty() {
-        return Err("an empty index stream stays on the engine");
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_index_empty",
+            "an empty index stream stays on the engine",
+        ));
     }
 
     // The engine numbers one Vulkan binding per attribute location, so the
@@ -763,29 +909,40 @@ fn narrow_class<'a>(
         [] => None,
         [attribute] => {
             if attribute.binding != 0 || attribute.location != 0 {
-                return Err(
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_vertex_location",
                     "a vertex attribute that is not location 0 of binding 0 stays on the engine",
-                );
+                ));
             }
             if attribute.step_function != VertexStepFunction::PerVertex {
-                return Err("a per-instance vertex stream stays on the engine");
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_vertex_step",
+                    "a per-instance vertex stream stays on the engine",
+                ));
             }
             let Some(format) = vertex_format(attribute.format) else {
-                return Err(
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_vertex_format",
                     "a vertex attribute outside the canonical format set stays on the engine \
                      (Float32x2, Float32x3, Float32x4, Uint32)",
-                );
+                ));
             };
             let stride = u64::from(attribute.stride);
             if stride < u64::from(attribute.offset) + format.bytes() {
-                return Err(
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_vertex_stride",
                     "a vertex layout whose attribute does not fit its stride stays on the engine",
-                );
+                ));
             }
-            let bytes = staged_bytes(&attribute.content)
-                .ok_or("a vertex stream the GPU gathers from guest RAM stays on the engine")?;
+            let bytes = staged_bytes(&attribute.content).ok_or(OutOfClass::new(
+                "render_provider_out_of_class_vertex_staging",
+                "a vertex stream the GPU gathers from guest RAM stays on the engine",
+            ))?;
             if bytes.len() < usize::try_from(stride).unwrap_or(usize::MAX) {
-                return Err("a vertex stream shorter than one record stays on the engine");
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_vertex_short",
+                    "a vertex stream shorter than one record stays on the engine",
+                ));
             }
             Some(NarrowVertexStream {
                 location: attribute.location,
@@ -796,10 +953,11 @@ fn narrow_class<'a>(
             })
         }
         _ => {
-            return Err(
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_vertex_count",
                 "a pass with more than one vertex attribute stays on the engine: the admitted \
                  class is one attribute at location 0",
-            )
+            ))
         }
     };
 

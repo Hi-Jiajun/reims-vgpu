@@ -94,6 +94,155 @@ fn sampled_image_shape(
     })
 }
 
+/// One draw's shape, into the census window and one latch.
+///
+/// # Why this exists
+///
+/// The 2026-09-17 guest render profile read twelve real boots and could not
+/// answer four of its own questions from the log: what an attachment's format
+/// and extent were at the pass that used them (only the backings and the
+/// sampled refs had geometry lines), how many draws a pass carried (it had to
+/// divide a draw counter by a pass counter), what draw *form* the guest issued
+/// (indexed, instanced, carrying a base vertex — the decode knew, the log did
+/// not), and whether depth, multisample or MRT attachments ever appeared at all
+/// (their counters only existed on the paths that *supported* them). Every one
+/// of those is a fact this entry point already holds, so this is one place
+/// where the observation costs a `note_store_route` per draw and no per-pixel
+/// work at all.
+///
+/// # Counting, not listing
+///
+/// Bands are counted — every draw lands in exactly one arm of each axis, so a
+/// window's arms sum to its draws and an absent arm is a zero rather than a
+/// silence. The attachment *shape* is latched instead ([`crate::observe::first_sight`]),
+/// because (slots, format, extent, samples, load, door) is a small closed set
+/// over a boot and a line per draw would bury the set's size in the same
+/// repeated text — the same split `pass_target` and `passbegin_*` already use.
+///
+/// # What it is not
+///
+/// `slots` is what the *request* carries, not what the guest declared one
+/// decode earlier (`mrt_slot_*` is that reading) — `mrt_draw_request` drops a
+/// mismatched attachment before this point, and the contract comment on
+/// `mrt_draw_single` already says the two are different questions. The door
+/// names where the colour attachment's bytes live for this request: a mapper
+/// mapping, a linear GVA target, or a pooled offscreen allocation, which is the
+/// axis the profile's widening order (mapping face first, pooled last) turns
+/// on.
+pub(super) fn note_draw_shape(req: &DrawEncodeRequest) {
+    let Some(c0) = req.colors.first() else {
+        return;
+    };
+    crate::runtime::drain::note_store_route(match req.colors.len() {
+        0 | 1 => "pass_color_slots_1",
+        2 => "pass_color_slots_2",
+        3..=4 => "pass_color_slots_3_4",
+        _ => "pass_color_slots_gt4",
+    });
+    // Depth, the first of the three classes the profile found absent. Both arms
+    // are counted so a boot that attaches none reads `pass_depth_none=<draws>`
+    // rather than an empty field, and `pass_depth_attached` is on the window's
+    // zero-visible list for the windows where it is genuinely zero.
+    crate::runtime::drain::note_store_route(if req.depth_attach.is_some() {
+        "pass_depth_attached"
+    } else {
+        "pass_depth_none"
+    });
+    // Multisample, the second. The highest count any attachment of the request
+    // declares is the pass's raster sample count for every purpose below this
+    // point, and `max(1)` matches the `unwrap_or(1)` the rails use for a target
+    // that states none.
+    let samples = req
+        .colors
+        .iter()
+        .map(|color| color.sample_count.max(1))
+        .max()
+        .unwrap_or(1);
+    crate::runtime::drain::note_store_route(match samples {
+        1 => "pass_sample_1",
+        2 => "pass_sample_2",
+        4 => "pass_sample_4",
+        _ => "pass_sample_gt4",
+    });
+    // The draw's form. Four axes, each with both answers counted, because the
+    // canonical class admits exactly one corner of this space (one indexed
+    // draw, one instance, no base vertex, and — on the stream axis — at most
+    // one vertex stream) and the profile could only measure one of them from
+    // the existing counters.
+    crate::runtime::drain::note_store_route(if req.indexed.is_some() {
+        "draw_form_indexed"
+    } else {
+        "draw_form_nonindexed"
+    });
+    crate::runtime::drain::note_store_route(if req.instance_count > 1 {
+        "draw_form_instances_gt1"
+    } else {
+        "draw_form_instances_1"
+    });
+    // `baseVertex` and `firstVertex` are the same offset on the two draw forms,
+    // so a request that moves either one has left the class.
+    let offset = req.first_vertex != 0
+        || req
+            .indexed
+            .as_ref()
+            .is_some_and(|index| index.base_vertex != 0);
+    crate::runtime::drain::note_store_route(if offset {
+        "draw_form_base_vertex_nonzero"
+    } else {
+        "draw_form_base_vertex_0"
+    });
+    // Bound vertex streams, not pipeline-declared attributes: this is the
+    // number the profile measured as `render_bind_reach_buffer_le16 / draws`
+    // ≈ 3.6, and it is the one the class's "zero or one stream" condition
+    // reads. A slot the guest never bound reads zero and is not a stream.
+    let streams = req
+        .vertex_buffers
+        .iter()
+        .filter(|bind| bind.buffer_ref != 0)
+        .count();
+    crate::runtime::drain::note_store_route(match streams {
+        0 => "draw_vertex_streams_0",
+        1 => "draw_vertex_streams_1",
+        2..=4 => "draw_vertex_streams_2_4",
+        _ => "draw_vertex_streams_gt4",
+    });
+    // The attachment itself: the shape a widening order has to cover, latched
+    // per distinct tuple. The door is in the discriminant and not just on the
+    // line, so a shape that appears once as a mapping target and once as a
+    // pooled one prints both rather than one line whose fields describe the
+    // first sighting.
+    let door = match (c0.mapping_id != 0, c0.target_gva != 0) {
+        (true, _) => 1u64,
+        (false, true) => 2,
+        (false, false) => 0,
+    };
+    let shape = crate::backend::hash::hash_u64(
+        door << 56
+            | (req.colors.len() as u64 & 0xff) << 48
+            | u64::from(c0.format) << 32
+            | u64::from(c0.sample_count.min(0xffff)) << 16
+            | u64::from(c0.load_action),
+        (u64::from(c0.width) << 32) | u64::from(c0.height),
+    );
+    if crate::observe::first_sight("pass_color_shape", shape) {
+        crate::observe::off(format!(
+            "pass_color_shape slots={} fmt={:#x} {}x{} samples={} load={:#x} \
+             target={}",
+            req.colors.len(),
+            c0.format,
+            c0.width,
+            c0.height,
+            c0.sample_count,
+            c0.load_action,
+            match door {
+                1 => "mapping",
+                2 => "gva",
+                _ => "pooled",
+            },
+        ));
+    }
+}
+
 /// Linux / non-Apple product rail: metal2vulkan + Vulkan offscreen, then Store.
 ///
 /// `writeback_guest` is the archive multi-draw store plan (only the last record
@@ -122,6 +271,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     let Some((pass_w, pass_h)) = colors.first().map(|c0| (c0.width, c0.height)) else {
         return (EncodeStatus::BadArgs("draw_vk_no_color_target"), None);
     };
+    // Every draw this rail encodes, before it knows which rail will run it:
+    // the shape census above is about what the guest asked for, and it has to
+    // keep counting when the canonical class takes a submission (where the
+    // engine's own `passbegin_*` never runs) as much as when it does not.
+    note_draw_shape(req);
 
     // What the engine draw did, kept so the skipped-draw tail can name why its
     // draws were skipped instead of guessing.
@@ -1081,8 +1235,17 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 /// A `(task, texture ref)` a bind resolved through.
 type SampledRefKey = (u32, u32);
 
-/// What one resolved to: mapping, and the view extent bound for it.
-type SampledRefBacking = (u32, u32, u32);
+/// What one resolved to: mapping, the view extent bound for it, and the
+/// Vulkan format the view carries.
+///
+/// The format is the third field because the profile could not answer "what
+/// format was this texture, *at the bind*, when it was sampled" from any line:
+/// `backing pages` names a FourCC for the mappings that have one and nothing
+/// for a pooled or aliased target, and `map_fmt` is the mapping's own
+/// declaration rather than the sampled view's. It is what
+/// [`note_sampled_ref_backing`] reports, in the numbering the rail that binds
+/// it uses.
+type SampledRefBacking = (u32, u32, u32, i32);
 
 /// The last resolution reported for each `(task, texture ref)`, so a change of
 /// backing is reportable and a steady bind is silent.
@@ -1091,6 +1254,12 @@ static SAMPLED_REF_BACKING_LAST: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Report what a texture ref resolves to, on every change of backing or extent.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the report names every field of the record it writes: task, ref, extent, \
+              mapping, route and format are one line's columns, and folding them into a \
+              struct would move the shape of the line to the call site"
+)]
 fn note_sampled_ref_backing(
     state: &crate::model::DeviceState,
     task_id: u32,
@@ -1099,8 +1268,9 @@ fn note_sampled_ref_backing(
     height: u32,
     mapping_id: u32,
     route: &str,
+    format: ash::vk::Format,
 ) {
-    let now = (mapping_id, width, height);
+    let now = (mapping_id, width, height, format.as_raw());
     let prior = {
         let mut last = SAMPLED_REF_BACKING_LAST
             .lock()
@@ -1116,12 +1286,15 @@ fn note_sampled_ref_backing(
         .map(|m| (m.width, m.height, m.format))
         .unwrap_or((0, 0, 0));
     let was = match prior {
-        Some((pmid, pw, ph)) => format!(" was=mid{pmid}:{pw}x{ph}"),
+        Some((pmid, pw, ph, pfmt)) => {
+            format!(" was=mid{pmid}:{pw}x{ph}:fmt{pfmt:#x}")
+        }
         None => String::new(),
     };
     crate::observe::off(format!(
         "sampled_ref_backing task={task_id} ref={texture_ref} view={width}x{height} \
-         mid={mapping_id} map={mw}x{mh} map_fmt={mfmt:#x} route={route}{was}"
+         fmt={:#x} mid={mapping_id} map={mw}x{mh} map_fmt={mfmt:#x} route={route}{was}",
+        format.as_raw(),
     ));
 }
 
@@ -7740,6 +7913,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 SampledSourceRequest::Target(..) => "target",
                                 SampledSourceRequest::GuestRuns(..) => "guest_runs",
                             };
+                            // The width the sampled view is bound at, in the
+                            // numbering that view carries. Every arm already
+                            // states one — the CPU rails through the same
+                            // `vk_sampled_bytes` the resource below is built
+                            // with, the resident and zero-copy rails as the view
+                            // format itself — so this is the bind's answer
+                            // rather than a second one derived beside it.
+                            let sampled_format = match &src {
+                                SampledSourceRequest::Bytes(_, _, byte_format, _) => {
+                                    translate::pixel::vk_sampled_bytes(*byte_format)
+                                }
+                                SampledSourceRequest::Target(_, format) => *format,
+                                SampledSourceRequest::GuestRuns(_, _, format, ..) => *format,
+                            };
                             note_sampled_ref_backing(
                                 state,
                                 req.task_id,
@@ -7748,6 +7935,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 rh,
                                 mid,
                                 route,
+                                sampled_format,
+                            );
+                            // And how large the source is, banded. The lines
+                            // above and below this one both require something
+                            // of the source — a change of backing, or ≥1 Mpx —
+                            // so a boot's ordinary small binds (glyph atlases,
+                            // 64x64 tiles) were the ones no counter covered,
+                            // and the profile's "small textures must be
+                            // supported too" conclusion rested on a sample that
+                            // the log could only take every so often. Bands, so
+                            // the population is sized rather than listed.
+                            crate::runtime::drain::note_store_route(
+                                match u64::from(rw).saturating_mul(u64::from(rh)) {
+                                    0..=4_095 => "sampled_source_lt4k",
+                                    4_096..=65_535 => "sampled_source_lt64k",
+                                    65_536..=1_048_575 => "sampled_source_lt1m",
+                                    _ => "sampled_source_ge1m",
+                                },
                             );
                             // Which draw consumed a full-screen source, so a
                             // record of what a source held can be joined to the
@@ -9607,10 +9812,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     });
                 }
                 RenderRailOutcome::NotInNarrowClass(reason) => {
+                    // The aggregate bucket is kept beside the per-reason slab
+                    // the rail charges in `submit_render`
+                    // (`render_provider_out_of_class_<slug>`): the aggregate is
+                    // the ratio's denominator and the buckets are its terms,
+                    // and a reader holding only one of them can see a boundary
+                    // move but not what moved it.
                     crate::runtime::drain::note_store_route("render_provider_out_of_class");
                     crate::observe::off(format!(
-                        "linux_render_provider out_of_class pipe={} reason={reason}",
-                        req.pipeline_ref
+                        "linux_render_provider out_of_class pipe={} reason={}",
+                        req.pipeline_ref,
+                        reason.detail()
                     ));
                 }
                 RenderRailOutcome::ProviderDeclined(decline) => {

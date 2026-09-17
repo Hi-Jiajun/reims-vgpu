@@ -5162,6 +5162,11 @@ pub(crate) unsafe fn execute_draw_inner(
     });
     if continues_open {
         crate::runtime::drain::note_store_route("pass_continued");
+        // This draw is one of the open pass's own, so the band the pass
+        // reports when it closes counts it. Paired with `pass_continued`
+        // beside it: the two are the same event counted at the two places a
+        // reader looks for it.
+        pools.note_pass_draw();
         counters
             .render_pass_continuations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
