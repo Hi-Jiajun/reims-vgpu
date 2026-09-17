@@ -41,17 +41,21 @@
 //!   pixels and `runtime::exec` hands them to the next record as its seed). A
 //!   record *with* a predecessor — the packet's middle, and its last record —
 //!   begins from a frame the class cannot name yet and keeps the engine;
-//! - **up to four vertex streams** and exactly one index stream, each carried
-//!   into the trace as trace-owned bytes, one canonical binding per stream. Four
-//!   is the canonical contract's `MAX_VERTEX_BUFFERS`, and it is the stream axis
-//!   the 2026-09-17 census measured as the one a real draw stream lives on
-//!   (`8327 / 8526` draws bind two to four streams, `199` bind more); a fifth
-//!   stays on the engine by name. The engine numbers one Vulkan binding per
-//!   attribute location, so a request's attribute list is one entry per
-//!   location; the canonical layout states one entry per *fetch table* with the
-//!   attributes that read it (`research/docs/26` §31), and the canonical binding
-//!   index is the table's position in that list, which is why the class
-//!   renumbers rather than carrying the guest's binding numbers across;
+//! - **up to four vertex streams** and exactly one index stream, one canonical
+//!   binding per stream. A stream the request holds as staged bytes is carried
+//!   into the trace as trace-owned bytes; a stream the draw path resolved
+//!   through the zero-copy rail is carried as the registered window its bind
+//!   was cut from, through the owner rail's borrowed arm (`R9q`, the lease
+//!   channel below). Four is the canonical contract's `MAX_VERTEX_BUFFERS`, and
+//!   it is the stream axis the 2026-09-17 census measured as the one a real
+//!   draw stream lives on (`8327 / 8526` draws bind two to four streams, `199`
+//!   bind more); a fifth stays on the engine by name. The engine numbers one
+//!   Vulkan binding per attribute location, so a request's attribute list is
+//!   one entry per location; the canonical layout states one entry per *fetch
+//!   table* with the attributes that read it (`research/docs/26` §31), and the
+//!   canonical binding index is the table's position in that list, which is why
+//!   the class renumbers rather than carrying the guest's binding numbers
+//!   across;
 //! - **at most one scissor rectangle inside the attachment**, and no viewport
 //!   override: the canonical pass states the attachment-covering viewport and
 //!   carries the guest's own rectangle through the pass scissor
@@ -81,7 +85,7 @@
 //!   reflection (stage, index, the access it reports, and the reach it states:
 //!   a static ceiling or the affine proof R9f landed), the view from the
 //!   request's own bind, whose bytes the owner rail imports
-//!   ([`StageBufferBind`], `plan_stage_buffers`) — and a **writable** one is a
+//!   ([`StageBufferBind`], `plan_owner_leases`) — and a **writable** one is a
 //!   landing: its bytes come back through the completion's own
 //!   `BufferWriteback` and the caller places them where the bind's bytes came
 //!   from ([`StageBufferLanding`]). The declaration rides the canonical command
@@ -260,7 +264,7 @@
 //!
 //! R9d wires the first half of that channel on *this* side. A stage buffer whose
 //! bytes the owner holds goes out as an owner-issued **staged lease**
-//! (`plan_stage_buffers` → `provider_owner::plan` → `BufferSource::StagedLease`),
+//! (`plan_owner_leases` → `provider_owner::plan` → `BufferSource::StagedLease`),
 //! and one whose bytes the seam cut out of a registered guest RAM window goes
 //! out as the **borrowed no-copy** arm (`BufferSource::BorrowedNoCopy`), gated
 //! on the device's own host-pointer import:
@@ -288,11 +292,27 @@
 //!   under `render_provider_out_of_class_stage_buffer_alignment` rather than
 //!   being declined a layer down.
 //!
-//! The rail's other inputs keep the third arm: a vertex stream, the index
-//! stream and the attachment declaration travel as trace-owned bytes
-//! (`BufferSource::OwnedBytes`), and a stream the GPU would gather from guest RAM
-//! is still refused by name (`render_provider_out_of_class_vertex_staging`)
-//! rather than read through a lease the seam does not mint for it.
+//! R9q wires the *vertex* half of the same channel. A vertex stream is the same
+//! kind of bind as a stage buffer — the guest's own buffer, resolved by the
+//! draw path's zero-copy rail — so the two arms are the same two arms:
+//!
+//! - staged bytes stay the third arm, trace-owned (`BufferSource::OwnedBytes`):
+//!   they are the bytes the runtime already read, not a guest bind;
+//! - a stream whose one registered window covers the bind's own bytes travels as
+//!   **borrowed no-copy** ([`VertexStreamSource::Window`], derived by the same
+//!   [`gather_window`], imported by the same plan): the frame follows the
+//!   owner's own mapping, and moving that mapping moves the vertex bytes;
+//! - a gather the seam cannot cut one window from still keeps the engine under
+//!   `render_provider_out_of_class_vertex_staging` — the bucket every gather
+//!   answered with before this increment — and one whose view pointer misses the
+//!   device's import granules keeps it under
+//!   `render_provider_out_of_class_vertex_alignment`; a device without
+//!   host-pointer import answers `render_provider_out_of_class_vertex_import`.
+//!
+//! The index stream and the attachment declaration keep the third arm:
+//! trace-owned bytes (`BufferSource::OwnedBytes`), and an index the GPU would
+//! gather from guest RAM is still refused by name
+//! (`render_provider_out_of_class_index_staging`).
 //!
 //! # Error mapping
 //!
@@ -393,6 +413,100 @@ fn declared_host_import() -> Result<u64, ProviderRenderDecline> {
     Ok(rail.provider.no_copy_alignment())
 }
 
+/// The names one window-backed shape answers under (`R9q`).
+///
+/// A binding's spelling in the refusal's sentence, and the two slugs the census
+/// counts it under — one for a device that cannot import host pointers, one for
+/// a view pointer the device's granules do not align. A struct rather than a
+/// pair of arguments because the three travel together at every call site and
+/// the slugs have to stay literal: they are read back out of the static
+/// library's strings.
+#[derive(Clone, Copy)]
+struct WindowShape {
+    name: &'static str,
+    import_slug: &'static str,
+    alignment_slug: &'static str,
+}
+
+/// The stage-buffer half of the window-backed shapes (`R9e`).
+const STAGE_BUFFER_WINDOW: WindowShape = WindowShape {
+    name: "stage buffer",
+    import_slug: "render_provider_out_of_class_stage_buffer_import",
+    alignment_slug: "render_provider_out_of_class_stage_buffer_alignment",
+};
+
+/// The vertex-stream half of the window-backed shapes (`R9q`).
+const VERTEX_STREAM_WINDOW: WindowShape = WindowShape {
+    name: "vertex stream",
+    import_slug: "render_provider_out_of_class_vertex_import",
+    alignment_slug: "render_provider_out_of_class_vertex_alignment",
+};
+
+/// The device answers one window-backed binding needs (`R9e`, `R9q`).
+///
+/// Two questions, both about the device rather than the request, which is why
+/// they are asked here beside [`declared_host_import`] and not inside the pure
+/// gate: the device has to import host pointers at all, and the *view's own*
+/// host pointer — the window's base plus the bind's own head — has to be a
+/// whole number of the device's import granules. The registration ledger aligns
+/// the window's base and the window covers the bind's bytes, but a
+/// `source_offset` a packed resource binds at can still leave the view
+/// unaligned; the canonical rail refuses that import by name
+/// (`lease_alignment_*`), and a declined draw where the engine would have
+/// gathered is the wrong answer for a class that only narrows which submissions
+/// change rail — so the shape stays on the engine, under its own bucket.
+///
+/// `shape` carries the binding's own spelling in the sentence and the two slugs
+/// it answers under, because the bucket is the census's own reading of *which*
+/// shape crossed the device: `..._stage_buffer_import` /
+/// `..._stage_buffer_alignment` and `..._vertex_import` /
+/// `..._vertex_alignment` are four names for two rules.
+fn window_binding_admits(
+    shape: WindowShape,
+    window: StageBufferWindow,
+    alignment: u64,
+) -> Result<(), OutOfClass> {
+    let WindowShape {
+        name,
+        import_slug,
+        alignment_slug,
+    } = shape;
+    if alignment == 0 {
+        return Err(OutOfClass::owned(
+            import_slug,
+            format!(
+                "a draw whose {name} is covered by a registered guest RAM window stays on the \
+                 engine on a device that cannot import host pointers: the canonical rail's \
+                 no-copy arm needs VK_EXT_external_memory_host, and the owner rail refuses a \
+                 window-backed bind rather than silently copying it",
+            ),
+        ));
+    }
+    let Some(pointer) = window.host_va.checked_add(window.head) else {
+        return Err(OutOfClass::owned(
+            alignment_slug,
+            format!(
+                "a draw whose {name} is covered by a registered guest RAM window stays on the \
+                 engine when the view's own host pointer is not addressable: the window's base \
+                 plus the bind's own head overflows the address space",
+            ),
+        ));
+    };
+    if !pointer.is_multiple_of(alignment) {
+        return Err(OutOfClass::owned(
+            alignment_slug,
+            format!(
+                "a draw whose {name} is covered by a registered guest RAM window stays on the \
+                 engine when the view's own host pointer is not a whole number of the device's \
+                 import granules: the pointer is {pointer}, the device imports host pointers at \
+                 {alignment} byte alignment, and the canonical rail refuses an unaligned import \
+                 by name rather than copying the bind",
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether one attachment extent is inside the declared window, and the class
 /// reason that keeps it on the engine when it is not.
 ///
@@ -474,11 +588,14 @@ fn attribute_locations_match(attributes: &[VertexAttributeResource], reflected: 
 /// Three facts decide it, and all three are the request's own. The staged bytes
 /// the two were resolved from: the runtime resolves every attribute that names
 /// one guest vertex buffer through that buffer's single bind, and
-/// [`BufferContent::Bytes`]'s own contract is that the allocation behind it is
+/// [`BufferContent`]'s own contract is that the allocation behind a bind is
 /// *shared* — "several attributes on one interleaved stream, or a stage-in
 /// buffer doubling as a storage bind, reference the same allocation instead of
 /// cloning it" — so two attributes off one interleaved guest stream carry the
-/// same `Arc`. The stride the descriptor declared for that buffer, and the step
+/// same `Arc`, whether the bind's bytes are the owner's staged copy
+/// ([`BufferContent::Bytes`]) or a zero-copy bind's `runs` allocation
+/// ([`BufferContent::GuestRuns`], the same sharing contract's second origin;
+/// R9q). The stride the descriptor declared for that buffer, and the step
 /// beside it: two attributes of one table advance by one stride at one rate.
 ///
 /// Two attributes that agree on all three read one table at two offsets, which
@@ -488,10 +605,16 @@ fn attribute_locations_match(attributes: &[VertexAttributeResource], reflected: 
 /// the guest's own descriptor had, and the gate's vertex-layout rule answers
 /// the same draws it would have answered had this grouping never landed.
 ///
-/// A zero-copy gather is not staged bytes and is answered by name before any
-/// layout is stated from it ([`narrow_class`]'s `vertex_staging` arm), so two
-/// gathers are never *proved* to be one table here: grouping them would move
-/// the stream count the gate reads without a byte this rail could compare.
+/// A zero-copy bind is grouped by the *bind*, not by comparing bytes: the bytes
+/// belong to guest RAM this process maps, and reading them here would be a host
+/// read the zero-copy origin exists to avoid. Two `GuestRuns` name one table
+/// when they share the `runs` allocation — one per resolved bind — at the same
+/// window inside it (`source_offset` and `total_len` are what a packed
+/// resource's per-offset bind varies, `research/docs/26` §14.2), which is
+/// exactly the shape a request that resolved one guest buffer twice hands this
+/// rail. A gather that is neither a staged copy nor one registered window is
+/// answered by name before any layout is stated from it ([`narrow_class`]'s
+/// `vertex_staging` arm), so it never reaches this walk.
 fn one_vertex_stream(a: &VertexAttributeResource, b: &VertexAttributeResource) -> bool {
     a.stride == b.stride
         && a.step_function == b.step_function
@@ -499,6 +622,15 @@ fn one_vertex_stream(a: &VertexAttributeResource, b: &VertexAttributeResource) -
         && match (&a.content, &b.content) {
             (BufferContent::Bytes(left), BufferContent::Bytes(right)) => {
                 std::sync::Arc::ptr_eq(left, right)
+            }
+            // R9q: the zero-copy origin of the same sharing contract. The
+            // `runs` allocation's identity is the bind's, and the window
+            // beside it keeps two binds of one packed resource — same runs,
+            // different offsets — two tables rather than one.
+            (BufferContent::GuestRuns(left), BufferContent::GuestRuns(right)) => {
+                std::sync::Arc::ptr_eq(&left.runs, &right.runs)
+                    && left.source_offset == right.source_offset
+                    && left.total_len == right.total_len
             }
             _ => false,
         }
@@ -568,6 +700,66 @@ fn gather_window(source: &GuestRunSource) -> Option<StageBufferWindow> {
         head: stretch.skip,
         bytes_len: stretch.len,
     })
+}
+
+/// Where one admitted vertex stream's bytes come from (`R9q`).
+///
+/// The same two arms one stage buffer has ([`NarrowStageBuffer`]), on the same
+/// rule: a stream the request already holds as staged bytes travels as
+/// trace-owned bytes, and a stream the draw path resolved through the zero-copy
+/// rail travels as the registered window its bind was cut from — the
+/// `BufferSource::BorrowedNoCopy` arm of the lease channel, imported by
+/// [`plan_owner_leases`] before the trace exists, exactly as a stage buffer's
+/// window is. Nothing is copied on either arm: the staged arm's bytes are the
+/// allocation the request already holds, and the window arm's are the owner's
+/// own mapping.
+enum VertexStreamSource<'a> {
+    /// The owner's staged copy: `BufferContent::Bytes`.
+    Staged(&'a [u8]),
+    /// The registered guest RAM window the bind's bytes were cut from.
+    Window(StageBufferWindow),
+}
+
+impl VertexStreamSource<'_> {
+    /// The bytes this fetch table's view covers.
+    ///
+    /// The staged arm's allocation length, or the bind's own bytes inside its
+    /// window — the number the record-length rule below reads and the length
+    /// the trace states for the view, so the two cannot drift apart.
+    fn len(&self) -> u64 {
+        match self {
+            Self::Staged(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            Self::Window(window) => window.bytes_len,
+        }
+    }
+}
+
+/// The source one request attribute's bytes may be stated from (`R9q`).
+///
+/// Staged bytes are the pre-R9q arm unchanged. A zero-copy bind leaves through
+/// the window the seam derives from its own gather ([`gather_window`]); a
+/// gather the seam cannot cut one window from — scattered over stretches,
+/// never registered under the current epoch, or with a bind reaching past its
+/// stretch's window — keeps the draw on the engine under
+/// `render_provider_out_of_class_vertex_staging`, which is the bucket every
+/// gather answered with before this increment. The narrowing is the arm, not
+/// the rule: the class only claims a gather it can state as one contiguous
+/// registered window, and everything else stays where it was.
+fn vertex_stream_source(content: &BufferContent) -> Result<VertexStreamSource<'_>, OutOfClass> {
+    match content {
+        BufferContent::Bytes(bytes) => Ok(VertexStreamSource::Staged(bytes)),
+        BufferContent::GuestRuns(source) => match gather_window(source) {
+            Some(window) => Ok(VertexStreamSource::Window(window)),
+            None => Err(OutOfClass::new(
+                "render_provider_out_of_class_vertex_staging",
+                "a vertex stream the GPU gathers from guest RAM stays on the engine when the \
+                 gather is not one registered window: this class mints a stream's bytes through \
+                 the owner rail — the staged copy the request holds, or the registered window a \
+                 zero-copy bind was cut from — and a gather that is neither has no source this \
+                 rail can state",
+            )),
+        },
+    }
 }
 
 /// The stage-buffer gate: the v2 census's 99.3% door, answered by what each
@@ -2394,59 +2586,29 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             return RenderRailOutcome::NotInNarrowClass(reason);
         }
     }
-    if pass
-        .stage_buffers
-        .iter()
-        .any(|buffer| buffer.window.is_some())
-    {
+    // The third device answer (R9e/R9q): every window-backed binding this pass
+    // states — a stage buffer's window, and a vertex stream's since R9q — is
+    // imported by the owner rail, and a device that cannot import host pointers
+    // refuses that arm by name rather than turning it into a copy. The answer is
+    // asked once for the pass, in the order the binds are stated (the stage
+    // buffers first, then the streams), so the bucket a refusal lands in is the
+    // one its own shape owns.
+    let window_backed = || {
+        pass.stage_buffers
+            .iter()
+            .filter_map(|buffer| buffer.window.map(|window| (STAGE_BUFFER_WINDOW, window)))
+            .chain(
+                pass.vertex_windows()
+                    .map(|(_, window)| (VERTEX_STREAM_WINDOW, window)),
+            )
+    };
+    if window_backed().next().is_some() {
         let alignment = match declared_host_import() {
             Ok(alignment) => alignment,
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         };
-        if alignment == 0 {
-            let reason = OutOfClass::new(
-                "render_provider_out_of_class_stage_buffer_import",
-                "a draw whose stage buffer is covered by a registered guest RAM window stays on \
-                 the engine on a device that cannot import host pointers: the canonical rail's \
-                 no-copy arm needs VK_EXT_external_memory_host, and the owner rail refuses a \
-                 window-backed bind rather than silently copying it",
-            );
-            reason.note();
-            return RenderRailOutcome::NotInNarrowClass(reason);
-        }
-        // The third device answer (R9e): the provider imports the *view's own*
-        // host pointer, so the window's base plus the bind's own head has to be
-        // a whole number of import granules. The registration ledger aligns the
-        // window's base and the window covers the bind's bytes, but a
-        // `source_offset` a packed resource binds at can still leave the view
-        // unaligned — the canonical rail refuses that import by name
-        // (`lease_alignment_*`), and a declined draw where the engine would
-        // have gathered is the wrong answer for a class that only narrows which
-        // submissions change rail. So the shape stays on the engine, under its
-        // own bucket.
-        for buffer in pass.stage_buffers.iter().filter_map(|buffer| buffer.window) {
-            let Some(pointer) = buffer.host_va.checked_add(buffer.head) else {
-                let reason = OutOfClass::new(
-                    "render_provider_out_of_class_stage_buffer_alignment",
-                    "a draw whose stage buffer is covered by a registered guest RAM window stays \
-                     on the engine when the view's own host pointer is not addressable: the \
-                     window's base plus the bind's own head overflows the address space",
-                );
-                reason.note();
-                return RenderRailOutcome::NotInNarrowClass(reason);
-            };
-            if !pointer.is_multiple_of(alignment) {
-                let reason = OutOfClass::owned(
-                    "render_provider_out_of_class_stage_buffer_alignment",
-                    format!(
-                        "a draw whose stage buffer is covered by a registered guest RAM window \
-                         stays on the engine when the view's own host pointer is not a whole \
-                         number of the device's import granules: the pointer is {pointer}, the \
-                         device imports host pointers at {alignment} byte alignment, and the \
-                         canonical rail refuses an unaligned import by name rather than copying \
-                         the bind",
-                    ),
-                );
+        for (shape, window) in window_backed() {
+            if let Err(reason) = window_binding_admits(shape, window, alignment) {
                 reason.note();
                 return RenderRailOutcome::NotInNarrowClass(reason);
             }
@@ -2603,11 +2765,14 @@ pub(crate) fn on_device_rebuilt() {
 struct NarrowVertexStream<'a> {
     /// Bytes between consecutive vertices of this table.
     stride: u64,
-    /// The request attribute whose staged bytes this table holds: the group's
-    /// identity, which the next attribute of the table is matched against
-    /// ([`one_vertex_stream`]), and the bytes below are its own.
+    /// The request attribute whose bytes this table holds: the group's identity,
+    /// which the next attribute of the table is matched against
+    /// ([`one_vertex_stream`]) — and the source below is that head's own, which
+    /// is why a table several attributes read still travels once.
     head: usize,
-    bytes: &'a [u8],
+    /// Where this table's bytes come from: the owner's staged copy, or the
+    /// registered window a zero-copy bind was cut from (R9q).
+    source: VertexStreamSource<'a>,
     /// Every attribute this table carries, in the request's own order.
     attributes: Vec<NarrowVertexAttribute>,
 }
@@ -2693,6 +2858,21 @@ struct NarrowPass<'a> {
 }
 
 impl NarrowPass<'_> {
+    /// Every vertex stream this pass states as a registered guest RAM window
+    /// (`R9q`): the stream's canonical binding index beside the window its bind
+    /// was cut from. The label is the *stream's* own numbering — one entry per
+    /// fetch table, `research/docs/26` §31 — and never the guest's binding
+    /// number, which is the same rule the layout's entry positions follow.
+    fn vertex_windows(&self) -> impl Iterator<Item = (usize, StageBufferWindow)> + '_ {
+        self.vertex_streams
+            .iter()
+            .enumerate()
+            .filter_map(|(binding, stream)| match &stream.source {
+                VertexStreamSource::Window(window) => Some((binding, *window)),
+                VertexStreamSource::Staged(_) => None,
+            })
+    }
+
     /// The contract's vertex layout for the admitted streams.
     ///
     /// One entry per admitted fetch table, with the attributes that read it at
@@ -3303,11 +3483,14 @@ fn narrow_class<'a>(
                 "a vertex layout whose attribute does not fit its stride stays on the engine",
             ));
         }
-        let bytes = staged_bytes(&attribute.content).ok_or(OutOfClass::new(
-            "render_provider_out_of_class_vertex_staging",
-            "a vertex stream the GPU gathers from guest RAM stays on the engine",
-        ))?;
-        if bytes.len() < usize::try_from(stride).unwrap_or(usize::MAX) {
+        // The stream's source, arm by arm (R9q): the request's own staged bytes,
+        // or the one registered window a zero-copy bind was cut from. The
+        // record-length rule is stated on the arm's own length, so a window
+        // shorter than one record is `vertex_short` exactly as a staged copy
+        // is, and a gather that is no window at all is the named refusal
+        // [`vertex_stream_source`] states.
+        let source = vertex_stream_source(&attribute.content)?;
+        if source.len() < stride {
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_vertex_short",
                 "a vertex stream shorter than one record stays on the engine",
@@ -3330,7 +3513,7 @@ fn narrow_class<'a>(
             None => vertex_streams.push(NarrowVertexStream {
                 stride,
                 head,
-                bytes,
+                source,
                 attributes: vec![stated],
             }),
         }
@@ -3613,6 +3796,12 @@ fn submit_narrow(
             detail: error.to_string(),
         })?;
 
+    // The owner's leases first (R9d/R9q): every window-backed binding this
+    // pass states — a stage buffer's, and a vertex stream's since R9q — is
+    // imported here, and the trace's views below name the allocation and lease
+    // the plan minted for each. Importing before the trace exists is the same
+    // order the compute rail keeps: a refused import never reaches admission.
+    let mut leases = plan_owner_leases(provider, pass, &mut resources)?;
     let mut vertex_buffers = Vec::new();
     let mut next_view = FIRST_INPUT_VIEW;
     for (binding, stream) in pass.vertex_streams.iter().enumerate() {
@@ -3625,16 +3814,40 @@ fn submit_narrow(
         // the same bytes whatever the binding numbers are called — which is why
         // the canonical block is the request's own fetch tables and can be
         // shorter than the attribute list (`research/docs/26` §31).
-        vertex_buffers.push(BufferView {
-            view_id: ViewId::new(next_view),
-            metal_binding: u32::try_from(binding).unwrap_or(u32::MAX),
-            allocation_id: input_allocation(next_view),
-            offset: 0,
-            length: u64::try_from(stream.bytes.len()).unwrap_or(u64::MAX),
-            access: BufferAccess::Read,
-            attribute_stride: None,
-            source: BufferSource::OwnedBytes(stream.bytes.to_vec()),
-        });
+        let view = match &stream.source {
+            VertexStreamSource::Staged(bytes) => BufferView {
+                view_id: ViewId::new(next_view),
+                metal_binding: u32::try_from(binding).unwrap_or(u32::MAX),
+                allocation_id: input_allocation(next_view),
+                offset: 0,
+                length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(bytes.to_vec()),
+            },
+            // R9q: the stream's bytes are the owner's own mapping, imported
+            // for this submission under the label the plan cut for this
+            // stream. The view is the pair the owner's reservation covers —
+            // the window's own offset and the bind's own length — and the
+            // access is the read the class admitted.
+            VertexStreamSource::Window(_) => {
+                let owner = leases
+                    .as_ref()
+                    .and_then(|plan| plan.view(vertex_stream_owner_binding(binding)))
+                    .expect("the owner plan covers every admitted vertex window");
+                BufferView {
+                    view_id: ViewId::new(next_view),
+                    metal_binding: u32::try_from(binding).unwrap_or(u32::MAX),
+                    allocation_id: owner.allocation,
+                    offset: owner.view_offset,
+                    length: owner.view_length,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::BorrowedNoCopy(owner.lease),
+                }
+            }
+        };
+        vertex_buffers.push(view);
         next_view += 1;
     }
     let index_view = ViewId::new(next_view);
@@ -3659,12 +3872,11 @@ fn submit_narrow(
     // buffer lived only in the render pass and nothing declared these views in
     // the pool; a landing declares them.
     next_view += 1;
-    // The v83 stage-buffer half, filled (R9d). One lease per admitted stage
-    // buffer, imported through the owner rail before the trace exists, and one
-    // view per declaration, at the view offset and length the owner's own
-    // lease covers — the pair the pass has to state for the canonical
-    // registration to execute it.
-    let mut leases = plan_stage_buffers(provider, pass, &mut resources)?;
+    // The v83 stage-buffer half, filled (R9d): one view per declaration, at the
+    // view offset and length the owner's own lease covers — the pair the pass
+    // has to state for the canonical registration to execute it. The leases
+    // themselves were imported above, beside the vertex windows, because both
+    // halves name the same plan.
     let mut stage_buffers = Vec::with_capacity(pass.stage_buffers.len());
     // The view identities the completion's writebacks are paired with, kept
     // beside the views for the same reason the compute rail keeps its binding
@@ -3800,16 +4012,21 @@ fn submit_narrow(
         heap: None,
         indirect: None,
     };
-    // R9j: a pass that declares a stage buffer crosses the owner→provider wire
-    // before anything is admitted. The frame is the payload (every declaration,
-    // view and source this rail stated), it is decoded again with the
-    // provider's own decoder, and it is what the admission below sees — so a
-    // field the wire cannot carry is a typed decline here at the seam rather
+    // R9j/R9q: a pass that declares a stage buffer — or, since R9q, carries a
+    // vertex stream through the owner's window — crosses the owner→provider
+    // wire before anything is admitted. The frame is the payload (every
+    // declaration, view and source this rail stated), it is decoded again with
+    // the provider's own decoder, and it is what the admission below sees — so
+    // a field the wire cannot carry is a typed decline here at the seam rather
     // than a difference discovered when the owner and the provider are two
-    // processes. A trace whose stages declare no buffer keeps the exact path
-    // (and bytes) it had before the declaration half existed; the frames of the
-    // shapes this increment does not touch are R9h's 7/7 regression.
-    let (trace, resources) = if pass.stage_buffers.is_empty() {
+    // processes. A trace whose stages declare no buffer *and* whose streams are
+    // all staged keeps the exact path (and bytes) it had before the declaration
+    // half existed; the frames of the shapes this increment does not touch are
+    // R9h's 7/7 regression. The gate is the plan itself rather than the
+    // declaration list, because the plan is exactly the set of bindings that
+    // travel as leases — a vertex window without a declaration crosses the wire
+    // on the same rule (R9q).
+    let (trace, resources) = if leases.is_none() {
         (trace, resources)
     } else {
         let frame = provider_wire::submit_frame(&trace, &resources).map_err(|decline| {
@@ -4090,19 +4307,27 @@ fn stage_buffer_writebacks(
     Ok(out)
 }
 
-/// Every input allocation the trace's render half carries: one per vertex
-/// stream and one for the index stream, with the view's own length as the
-/// extent. One per *stream*, so a table several attributes read travels once —
+/// Every trace-owned input allocation the render half carries: one per *staged*
+/// vertex stream and one for the index stream, with the view's own length as the
+/// extent. One per stream, so a table several attributes read travels once —
 /// the bytes are the same allocation the request already holds
 /// ([`one_vertex_stream`]).
+///
+/// A vertex stream that travels as the owner's window is deliberately absent
+/// (R9q): its allocation is the one [`plan_owner_leases`] minted for the
+/// lease, and the trace's vertex view names that allocation rather than one of
+/// this rail's own. The view *identities* below still advance once per stream,
+/// so a stream's identity never depends on which arm it took.
 fn input_allocations(pass: &NarrowPass<'_>) -> Vec<(AllocationId, u64)> {
     let mut out = Vec::with_capacity(pass.vertex_streams.len() + 1);
     let mut next_view = FIRST_INPUT_VIEW;
     for stream in &pass.vertex_streams {
-        out.push((
-            input_allocation(next_view),
-            u64::try_from(stream.bytes.len()).unwrap_or(u64::MAX),
-        ));
+        if let VertexStreamSource::Staged(bytes) = &stream.source {
+            out.push((
+                input_allocation(next_view),
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            ));
+        }
         next_view += 1;
     }
     out.push((
@@ -4131,7 +4356,23 @@ fn stage_buffer_owner_binding(stage: RenderPipelineStage, index: u32) -> u32 {
     (u32::from(stage.code()) << 16) | index
 }
 
-/// Import the owner's leases for one submission's stage buffers (`R9d`).
+/// The label one vertex stream travels under in the owner rail (`R9q`).
+///
+/// [`stage_buffer_owner_binding`] owns the high halves `0` and `1` — the two
+/// stages' `[[buffer(N)]]` namespaces — and a vertex stream is not an argument
+/// in either of them: the canonical binding it is resolved under is the
+/// layout's own stream numbering (`research/docs/26` §31). The third high half
+/// keeps the two namespaces from ever being compared. The gate refuses a
+/// vertex-stage declaration that lands inside `0..vertex_streams`
+/// (`stage_buffer_shape_vertex_layout`), so the labels could not collide while
+/// that rule holds — but a label is what the plan looks a view up by, and a
+/// lookup answered by the other namespace's lease would be a wrong frame
+/// rather than a refusal.
+fn vertex_stream_owner_binding(stream: usize) -> u32 {
+    (0x0002 << 16) | u32::try_from(stream).unwrap_or(u32::MAX)
+}
+
+/// Import the owner's leases for one submission (`R9d`, `R9q`).
 ///
 /// The three arms `research/docs/26` §13.7 left open are decided here, one
 /// binding at a time, exactly as the compute rail decides them
@@ -4139,25 +4380,36 @@ fn stage_buffer_owner_binding(stage: RenderPipelineStage, index: u32) -> u32 {
 /// out of a registered guest RAM window is imported without copying
 /// (`BufferSource::BorrowedNoCopy`), and a bind the owner holds as staged bytes
 /// is imported as an owner-issued staged lease (`BufferSource::StagedLease`).
-/// The third arm — trace-owned bytes — is what this rail's streams and index
-/// already travel as, and it is not a stage buffer's arm: a stage buffer's
-/// bytes belong to the guest's buffer, which is why the gate admits only the
-/// two owner arms (`..._stage_buffer_gather` is the name for everything else).
+/// The third arm — trace-owned bytes — is what this rail's index stream and its
+/// staged vertex streams already travel as, and it is not a stage buffer's arm:
+/// a stage buffer's bytes belong to the guest's buffer, which is why the gate
+/// admits only the two owner arms (`..._stage_buffer_gather` is the name for
+/// everything else).
+///
+/// R9q puts the *window* arm of the vertex streams in the same plan: a stream
+/// the request holds as a gather whose one registered window covers it is
+/// stated as `BorrowedNoCopy` too, under [`vertex_stream_owner_binding`]. Two
+/// bindings of one registration — a stage buffer and a stream, or two streams —
+/// share the one lease the plan imports for that registration, which is the
+/// contract's own grouping (`research/docs/14`'s "one allocation, many views").
+/// A *staged* vertex stream is deliberately not here: it is not a bind of the
+/// guest's buffer, it is the bytes the runtime already read, and it stays
+/// trace-owned exactly as before.
 ///
 /// Every lease is imported before the trace exists, so a refused import never
 /// reaches admission, and the allocation table is extended with what the plan
 /// minted before the trace is validated against it — the same order the compute
 /// rail uses, for the same reason: an allocation the trace names must be in the
 /// snapshot admission checks.
-fn plan_stage_buffers(
+fn plan_owner_leases(
     provider: &metal_api_vulkan::VulkanComputeProvider,
     pass: &NarrowPass<'_>,
     resources: &mut ResourceTableSnapshot,
 ) -> Result<Option<provider_owner::Plan>, ProviderRenderDecline> {
-    if pass.stage_buffers.is_empty() {
+    if pass.stage_buffers.is_empty() && pass.vertex_windows().next().is_none() {
         return Ok(None);
     }
-    let requests: Vec<provider_owner::Request<'_>> = pass
+    let mut requests: Vec<provider_owner::Request<'_>> = pass
         .stage_buffers
         .iter()
         .map(|buffer| {
@@ -4182,6 +4434,20 @@ fn plan_stage_buffers(
             }
         })
         .collect();
+    let vertex_windows: Vec<provider_owner::Request<'_>> = pass
+        .vertex_windows()
+        .map(|(binding, window)| {
+            provider_owner::Request::Window(provider_owner::Window {
+                binding: vertex_stream_owner_binding(binding),
+                import: window.import,
+                host_va: window.host_va,
+                length: window.length,
+                head: window.head,
+                bytes_len: window.bytes_len,
+            })
+        })
+        .collect();
+    requests.extend(vertex_windows);
     let plan = provider_owner::plan(provider, &requests).map_err(ProviderRenderDecline::Owner)?;
     for (allocation, size, reservation) in plan.leases() {
         if let Err(error) = resources.insert_allocation(AllocationRecord {
@@ -4604,6 +4870,116 @@ mod vertex_stream_tests {
             step_rate: 1,
             content: BufferContent::Bytes(std::sync::Arc::clone(table)),
         }
+    }
+
+    /// One request attribute off one zero-copy bind (`R9q`).
+    ///
+    /// The source is passed in rather than built here for the same reason the
+    /// staged helper passes its allocation in: the identity *is* the bind, and
+    /// a clone of one `GuestRunSource` is exactly what the runtime hands two
+    /// attributes that read one guest vertex buffer.
+    fn guest_attribute(
+        location: u32,
+        offset: u32,
+        stride: u32,
+        source: &crate::backend::vulkan::engine::GuestRunSource,
+    ) -> VertexAttributeResource {
+        VertexAttributeResource {
+            location,
+            binding: location,
+            format: crate::backend::vulkan::engine::VertexAttributeFormat::parse(29)
+                .expect("Float2 is a vertex format"),
+            offset,
+            stride,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: BufferContent::GuestRuns(source.clone()),
+        }
+    }
+
+    /// One zero-copy bind's source over a synthetic mapping: what the draw path
+    /// hands this rail after `bound_buffer_content`.
+    ///
+    /// `runs` is the identity the grouping reads [`one_vertex_stream`] through,
+    /// and `source_offset` / `total_len` are the window inside it — the two
+    /// facts a packed resource's per-offset bind varies. Nothing here reads the
+    /// mapping, so the address is a constant the grouping never dereferences.
+    fn guest_bind(
+        source_offset: u64,
+        total_len: u64,
+    ) -> crate::backend::vulkan::engine::GuestRunSource {
+        let run = crate::backend::vulkan::engine::GuestRun::in_mapping(
+            0x1000,
+            1 << 20,
+            source_offset,
+            total_len,
+        )
+        .expect("the bind's bytes are inside the synthetic mapping");
+        crate::backend::vulkan::engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![run]),
+            source_offset,
+            total_len,
+            row_length_texels: 0,
+            pages: None,
+            direct_image: None,
+        }
+    }
+
+    /// R9q: four attributes over two zero-copy guest binds are two canonical
+    /// streams, exactly as four over two staged tables are.
+    ///
+    /// The census v7 shape, in the arm the boot actually resolved: `attrs=4`
+    /// with two bound vertex buffers, every byte of them arriving as a
+    /// `GuestRuns` bind. R9p's key answered `_ => false` for those, so the
+    /// count stayed 4 and the `[[buffer(2)]]` argument stayed inside the
+    /// streams' block.
+    #[test]
+    fn attributes_of_one_guest_bind_are_one_canonical_stream() {
+        let first = guest_bind(0, 48);
+        let second = guest_bind(0, 48);
+        let interleaved = vec![
+            guest_attribute(0, 0, 16, &first),
+            guest_attribute(1, 8, 16, &first),
+            guest_attribute(2, 0, 16, &second),
+            guest_attribute(3, 8, 16, &second),
+        ];
+        assert_eq!(
+            canonical_vertex_stream_count(&interleaved),
+            2,
+            "two guest binds, four attributes"
+        );
+    }
+
+    /// The window is half of the guest bind's identity, not decoration: two
+    /// attributes that share one `runs` allocation but bind different windows
+    /// inside it — what a packed resource's per-offset binds look like
+    /// (`held_buffer_content` slices one retained alias) — are two tables.
+    #[test]
+    fn two_windows_of_one_guest_allocation_stay_two_streams() {
+        let whole = guest_bind(0, 64);
+        let mut tail = whole.clone();
+        tail.source_offset = 16;
+        tail.total_len = 48;
+        let attributes = vec![
+            guest_attribute(0, 0, 16, &whole),
+            guest_attribute(1, 0, 16, &tail),
+        ];
+        assert_eq!(canonical_vertex_stream_count(&attributes), 2);
+    }
+
+    /// The two origins never join: a staged copy and a zero-copy bind are two
+    /// streams even when their bytes are the same bytes. The staged arm has no
+    /// `runs` allocation to compare, and inventing one would be a byte
+    /// comparison this rail does not perform.
+    #[test]
+    fn a_staged_table_and_a_guest_bind_stay_two_streams() {
+        let staged = std::sync::Arc::new(vec![0u8; 48]);
+        let guest = guest_bind(0, 48);
+        let attributes = vec![
+            attribute(0, 0, 16, &staged),
+            guest_attribute(1, 0, 16, &guest),
+        ];
+        assert_eq!(canonical_vertex_stream_count(&attributes), 2);
     }
 
     /// The census v6 door's own shape, in the terms the seam hands this rail:

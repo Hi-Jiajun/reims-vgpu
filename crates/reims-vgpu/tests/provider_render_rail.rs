@@ -22,7 +22,7 @@
 #![cfg(feature = "provider-render")]
 
 use metal_api_core::provider::{
-    AttachmentFormat, BufferAccess, ComputeProvider, FieldValue, FootprintProof,
+    AttachmentFormat, BufferAccess, BufferSource, ComputeProvider, FieldValue, FootprintProof,
     RenderPipelineContract, RenderPipelineStage, SemanticDigest, StageBufferBinding,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep,
 };
@@ -4787,6 +4787,532 @@ fn a_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     // Both buckets are counters, not latches.
     assert!(route_count("render_provider_out_of_class_stage_buffer_gather") >= 2);
     assert!(route_count("render_provider_out_of_class_stage_buffer_alignment") >= 1);
+}
+
+/// R9q: a vertex stream the draw path resolved through the zero-copy rail
+/// leaves for the canonical provider as the *guest RAM window its bind was cut
+/// from* — not as a copy, and not as a refusal.
+///
+/// The census v7 shape is the one R9p's fixture already states — four
+/// `[[stage_in]]` attributes over two interleaved tables beside a
+/// `[[buffer(2)]]` argument — but the boot resolved those tables through the
+/// zero-copy rail, so every attribute arrived as `BufferContent::GuestRuns`
+/// (`buffer_guest_imports = 359273`, `buffer_guest_gathers = 0`,
+/// `evidence/gate3-census-v7-2026-09-17/`). R9p's grouping key answered
+/// `_ => false` for that arm, the count stayed four, and the argument at Metal
+/// index 2 stayed inside the streams' block: 88968 of the 88982
+/// `stage_buffer_shape_vertex_layout` rows.
+///
+/// This test drives that shape with the bytes in a registered host mapping, so
+/// every fact is checkable at once: the two tables still merge into two
+/// canonical streams, the draw reaches the provider, the provider's frame reads
+/// the owner's own mapping (moving it moves the frame), the frame is
+/// byte-identical to the engine's for the same request, and the lease row names
+/// the no-copy arm. The three-table control beside it is the door that is still
+/// the door: a request whose attributes really do read three guest binds states
+/// three streams, and the same `[[buffer(2)]]` argument then occupies one of
+/// them.
+#[test]
+fn a_vertex_stream_shared_by_two_attributes_reads_its_guest_window_without_a_copy() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    let _guard = engine_test_session();
+    let stages = shared_table_stages();
+    assert_eq!(stages.vertex_attribute_locations, vec![0, 1, 2, 3]);
+    assert_eq!(
+        stages.vertex_stage_buffer_declarations.len(),
+        1,
+        "the fixture's vertex stage declares the [[buffer(2)]] argument: {:#?}",
+        stages.vertex_stage_buffer_declarations
+    );
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the no-copy arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    // Three granules: one per guest vertex bind the request reads, so the
+    // three-table control below has a real registration to name as well.
+    let mut owner = AlignedHost::new(3 * page, page);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 3 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    // One granule per guest vertex bind, so the reference's own bound is the
+    // range the ledger derived the window from — the shape production hands
+    // both rails (`window_range` refuses a window that is not the bound it was
+    // cut from).
+    let guest = |granule: usize| {
+        let anchor = import
+            .slice((granule * page) as u64, page as u64)
+            .expect("one granule is inside the import");
+        GuestRef::new(std::sync::Arc::clone(&import), anchor)
+            .expect("the slice came from this import")
+    };
+    let import_id = import.id().get();
+    // The mapping's own address, copied out here so the controls below can move
+    // the bytes without holding the allocation borrowed.
+    let base = owner.pointer as usize;
+
+    // The two interleaved tables the descriptor behind those four attributes
+    // reads (`shared_table_stages`'s fixture), written into the owner's own
+    // mapping: positions with one offset in the first granule, the other two
+    // offsets in the second. The engine arm below reads the same bytes through
+    // the runs' host pointers, so both rails compare one set of bytes.
+    let positions = [(-1.0_f32, -3.0_f32), (-1.0, 1.0), (3.0, 1.0)];
+    let offsets = |x: f32| [(x, 0.0_f32); 3];
+    let first_bytes = interleaved(positions, offsets(0.125));
+    let second_bytes = interleaved(offsets(0.0625), offsets(0.0625));
+    let third_bytes = interleaved(offsets(0.0625), offsets(0.0625));
+    owner.as_mut_slice()[..48].copy_from_slice(&first_bytes);
+    owner.as_mut_slice()[page..page + 48].copy_from_slice(&second_bytes);
+    owner.as_mut_slice()[2 * page..2 * page + 48].copy_from_slice(&third_bytes);
+
+    // The window the registration ledger would derive for each bind: the
+    // granule the bind's bytes live in, base-aligned and one granule long.
+    let window = |granule: usize| RegisteredWindow {
+        import: import.id(),
+        base: base as u64 + (granule * page) as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // One zero-copy bind as the draw path builds it: one run over the owner's
+    // mapping at the bind's own offset, the bind's bytes at its start, and the
+    // provider-shaped window the ledger derived on the run.
+    let table = |granule: usize, bytes: &[u8]| -> engine::GuestRunSource {
+        engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                base,
+                3 * page as u64,
+                (granule * page) as u64,
+                bytes.len() as u64,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset: 0,
+            total_len: bytes.len() as u64,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+                window_offset: 0,
+                guest: guest(granule),
+                window: Some(window(granule)),
+            }])),
+            direct_image: None,
+        }
+    };
+    let first = table(0, &first_bytes);
+    let second = table(1, &second_bytes);
+
+    let guest_attribute =
+        |location: u32, offset: u32, source: &engine::GuestRunSource| -> VertexAttributeResource {
+            VertexAttributeResource {
+                location,
+                // The engine numbers one Vulkan binding per attribute
+                // *location*, exactly as the staged fixtures do.
+                binding: location,
+                format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
+                    .expect("Float2 is a vertex format"),
+                offset,
+                stride: 16,
+                step_function: VertexStepFunction::PerVertex,
+                step_rate: 1,
+                content: BufferContent::GuestRuns(source.clone()),
+            }
+        };
+    let request = |first: &engine::GuestRunSource,
+                   second: &engine::GuestRunSource,
+                   third: Option<&engine::GuestRunSource>,
+                   tail: &std::sync::Arc<Vec<u8>>| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.vertex_attributes = vec![
+            guest_attribute(0, 0, first),
+            guest_attribute(1, 8, first),
+            guest_attribute(2, 0, second),
+            match third {
+                Some(third) => guest_attribute(3, 0, third),
+                None => guest_attribute(3, 8, second),
+            },
+        ];
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 2,
+            content: BufferContent::Bytes(std::sync::Arc::clone(tail)),
+        });
+        req
+    };
+    let still = std::sync::Arc::new(f32x2(&[(0.0, 0.0)]));
+    let moved = std::sync::Arc::new(f32x2(&[(-0.25, 0.0)]));
+    let (width, _) = extent();
+
+    // The engine's own frame for the same request, before anything is
+    // registered on the owner rail: the engine's device context is created
+    // lazily on its first draw, and that creation resets the owner rail (the
+    // imports die with the device it builds), so the registration below has to
+    // follow it. The shape is one both rails execute, which is what the class
+    // gate promises and what this comparison reads.
+    let Some(engine_frame) = engine_pixels(
+        "two guest tables",
+        &stages,
+        request(&first, &second, None, &still),
+    ) else {
+        return;
+    };
+
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: base,
+        length: 3 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let log_before = std::fs::read_to_string(reims_vgpu_observe::fail_log_path())
+        .unwrap_or_default()
+        .len();
+
+    let frame = |label: &str,
+                 first: &engine::GuestRunSource,
+                 second: &engine::GuestRunSource,
+                 tail: &std::sync::Arc<Vec<u8>>| {
+        let req = request(first, second, None, tail);
+        let content = BufferContent::Bytes(std::sync::Arc::clone(tail));
+        let binds = [staged_bind(RenderPipelineStage::Vertex, 2, &content)];
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &req,
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: a draw whose vertex streams live in guest RAM windows leaves for the \
+                 provider: {other:?}"
+            ),
+        }
+    };
+
+    // The frame the seam encodes for this shape, held so the provider's own
+    // decoder can be asked what crossed the owner→provider wire (R9j's rule:
+    // the wire's reading is the one a remote owner would see).
+    use reims_vgpu::backend::provider_wire;
+
+    provider_wire::capture_submission_frames(true);
+    let frames_before = provider_wire::wire_counts();
+    let delivered = provider_render::provider_submissions();
+    let reviewed = frame("two guest tables", &first, &second, &still);
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    eprintln!(
+        "two-guest-table draw: provider submissions {delivered} -> {}, texel (0, 0) {:?}, \
+         texel (width - 1, 0) {:?}, host-import alignment {alignment}",
+        provider_render::provider_submissions(),
+        texel_at(&reviewed, 0, 0),
+        texel_at(&reviewed, width - 1, 0),
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census pair reaches the canonical provider instead of the engine"
+    );
+    assert_clear_texel("two guest tables: texel (0, 0)", texel_at(&reviewed, 0, 0));
+    assert_texel_near(
+        "two guest tables: texel (width - 1, 0)",
+        texel_at(&reviewed, width - 1, 0),
+        FRAGMENT_TEXEL,
+    );
+    // The frame crossed the owner→provider wire on the plan's own rule — a
+    // vertex window with no stage-buffer declaration is a leasing submission
+    // too (R9q) — and the provider's decoder reads the two streams back as the
+    // borrowed arm.
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        frames_before.submit_frames + 1,
+        "the seam produced exactly one submission frame for the window-backed draw"
+    );
+    assert_eq!(frames.len(), 1, "and the capture holds it");
+    let (wire_trace, _wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let wire_pass = wire_trace
+        .passes
+        .iter()
+        .find_map(|pass| pass.as_render())
+        .expect("the frame carries the render pass");
+    for view in &wire_pass.vertex_buffers {
+        let source = match &view.source {
+            BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
+            BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
+            BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+        };
+        eprintln!(
+            "wire vertex view: binding={} offset={} length={} source={source}",
+            view.metal_binding, view.offset, view.length,
+        );
+        assert!(
+            matches!(view.source, BufferSource::BorrowedNoCopy(_)),
+            "each guest table crosses the wire as the owner's own mapping"
+        );
+    }
+    assert_eq!(
+        wire_pass.vertex_buffers.len(),
+        2,
+        "two fetch tables crossed the wire, not four attributes"
+    );
+
+    // The lease row, verbatim: the arm this draw's vertex bytes left through.
+    // One registration holds both windows, so the plan imports one lease and
+    // the trace resolves two views inside it.
+    let log = std::fs::read_to_string(reims_vgpu_observe::fail_log_path()).expect("fail log");
+    let fresh = &log[log_before.min(log.len())..];
+    let lease = fresh
+        .lines()
+        .find(|line| line.contains("provider_owner_lease") && line.contains("no_copy=1"))
+        .unwrap_or_else(|| panic!("the borrowed lease row was emitted: {fresh}"));
+    eprintln!("lease row: {lease}");
+    assert!(
+        lease.contains("channel=borrowed") && lease.contains(&format!("import={import_id}")),
+        "the row names the no-copy arm and this import: {lease}"
+    );
+    assert_frames_equal("two guest tables, both rails", &reviewed, &engine_frame);
+
+    // Every input of the shape has to reach the frame: the `[[buffer(2)]]`
+    // argument's own bytes, and one attribute of either guest table. The two
+    // table controls move the *owner's own mapping*, which is the falsifiable
+    // half of the no-copy claim: a rail that had copied the bind would be
+    // unmoved by them.
+    let argument_moved = frame("argument bytes moved", &first, &second, &moved);
+    assert_ne!(
+        argument_moved, reviewed,
+        "the [[buffer(2)]] argument's own bytes have to reach the vertex stage"
+    );
+
+    owner.as_mut_slice()[..48].copy_from_slice(&interleaved(positions, offsets(0.0)));
+    let first_zeroed = frame("first table's tail zeroed", &first, &second, &still);
+    assert_ne!(
+        first_zeroed, reviewed,
+        "the first guest table's own bytes have to reach the frame"
+    );
+    owner.as_mut_slice()[..48].copy_from_slice(&first_bytes);
+
+    owner.as_mut_slice()[page..page + 48]
+        .copy_from_slice(&interleaved(offsets(0.0625), offsets(0.0)));
+    let second_zeroed = frame("second table's tail zeroed", &first, &second, &still);
+    assert_ne!(
+        second_zeroed, reviewed,
+        "the second guest table's own bytes have to reach the frame"
+    );
+    owner.as_mut_slice()[page..page + 48].copy_from_slice(&second_bytes);
+
+    // The rule the census read as the door is still the door: a request whose
+    // attributes really do read three guest binds states three canonical
+    // streams, and the same `[[buffer(2)]]` argument then occupies one of
+    // them.
+    let third = table(2, &third_bytes);
+    let three_tables = request(&first, &second, Some(&third), &still);
+    let content = BufferContent::Bytes(std::sync::Arc::clone(&still));
+    let binds = [staged_bind(RenderPipelineStage::Vertex, 2, &content)];
+    let band = route_count("stage_buffer_shape_vertex_layout");
+    let delivered = provider_render::provider_submissions();
+    match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &three_tables,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!(
+                "three guest tables, [[buffer(2)]]: slug={} detail={} route {} -> {}",
+                reason.slug(),
+                reason.detail(),
+                band,
+                route_count("stage_buffer_shape_vertex_layout"),
+            );
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_stage_buffer_shape"
+            );
+            assert!(
+                reason.detail().contains("[[buffer(2)]]")
+                    && reason.detail().contains("3 vertex stream(s)"),
+                "the sentence names the slot and the streams it lands inside: {reason}"
+            );
+        }
+        other => panic!("a declaration inside the stream block stays on the engine: {other:?}"),
+    }
+    assert_eq!(
+        route_count("stage_buffer_shape_vertex_layout"),
+        band + 1,
+        "the arm the census reads is the one this refusal charged"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "and the draw never reaches the provider"
+    );
+}
+
+/// R9q's refusal half: a vertex gather the seam cannot cut one registered
+/// window from stays on the engine, each under the bucket its own fact names.
+///
+/// The same three shapes R9e's refusal half drives for a stage buffer, on the
+/// arm this increment moved: bytes scattered over more than one run, a run
+/// whose import the registration ledger never registered, and a bind whose
+/// `source_offset` leaves the view's own host pointer off the device's import
+/// granule. The first two answer `render_provider_out_of_class_vertex_staging`
+/// — the bucket every gather answered with before this increment — and the
+/// third answers `render_provider_out_of_class_vertex_alignment`, because the
+/// canonical rail refuses an unaligned import by name and a declined draw is
+/// not a fallback.
+#[test]
+fn a_vertex_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    let _guard = engine_test_session();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "the refusal half needs the no-copy device too"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let owner = AlignedHost::new(2 * page, page);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let slice = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = || {
+        GuestRef::new(std::sync::Arc::clone(&import), slice)
+            .expect("the slice came from this import")
+    };
+    let import_id = import.id().get();
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // The gather a test hands the gate: one host run whose bytes are the bind,
+    // and the page runs below are the only variable.
+    let gather = |source_offset: u64, pages: Vec<GuestWindowRun>| -> engine::GuestRunSource {
+        engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                owner.pointer as usize,
+                2 * page as u64,
+                source_offset,
+                16,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset,
+            total_len: 16,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(pages)),
+            direct_image: None,
+        }
+    };
+    let stages = reviewed_stages();
+    let request = |source: &engine::GuestRunSource| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.vertex_attributes = vec![VertexAttributeResource {
+            location: 0,
+            binding: 0,
+            format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
+                .expect("Float2 is a vertex format"),
+            offset: 0,
+            stride: 8,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: BufferContent::GuestRuns(source.clone()),
+        }];
+        req
+    };
+    let answer = |label: &str, source: &engine::GuestRunSource| -> (String, String) {
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(source),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => {
+                panic!("{label}: a vertex gather outside one window is out of class: {other:?}")
+            }
+        }
+    };
+    let delivered = provider_render::provider_submissions();
+
+    // Scattered: two runs tile the bind, so no single host range is its bytes.
+    let scattered = gather(
+        0,
+        vec![
+            GuestWindowRun {
+                window_offset: 0,
+                guest: guest(),
+                window: Some(registered),
+            },
+            GuestWindowRun {
+                window_offset: 8,
+                guest: guest(),
+                window: Some(registered),
+            },
+        ],
+    );
+    let (slug, detail) = answer("scattered vertex gather", &scattered);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_vertex_staging");
+    assert!(
+        detail.contains("gathers from guest RAM"),
+        "the sentence names the gather: {detail}"
+    );
+
+    // Unregistered: the ledger derived no window for this run.
+    let unregistered = gather(
+        0,
+        vec![GuestWindowRun {
+            window_offset: 0,
+            guest: guest(),
+            window: None,
+        }],
+    );
+    let (slug, detail) = answer("unregistered vertex gather", &unregistered);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_vertex_staging");
+
+    // Off-granule: the bind starts inside the window, so the view's own host
+    // pointer is not a whole number of the device's import granules.
+    let off_granule = gather(
+        4,
+        vec![GuestWindowRun {
+            window_offset: 0,
+            guest: guest(),
+            window: Some(registered),
+        }],
+    );
+    let (slug, detail) = answer("off-granule vertex gather", &off_granule);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_vertex_alignment");
+    assert!(
+        detail.contains(&format!("{alignment} byte alignment")),
+        "the sentence names the alignment it crossed: {detail}"
+    );
+
+    // Both buckets are counters, not latches, and no refused shape reaches the
+    // provider.
+    assert!(route_count("render_provider_out_of_class_vertex_staging") >= 2);
+    assert!(route_count("render_provider_out_of_class_vertex_alignment") >= 1);
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a refused vertex gather never reaches the provider"
+    );
+    assert_eq!(registered.import.get(), import_id);
 }
 
 /// A host allocation whose first byte is aligned to `alignment`, so the owner
