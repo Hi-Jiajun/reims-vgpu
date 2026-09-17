@@ -7271,6 +7271,85 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
     }
 }
 
+/// The present tail one record states, or `None` (R4b).
+///
+/// **Probe, default off** — see [`crate::config::RENDER_PRESENT`] for what the
+/// arm is and why the off state is the shipping one. Read once: the value
+/// selects which provider-owned image a frame comes out of, and a boot that
+/// flipped it midway would land frames from two regimes in one log.
+///
+/// The shape rule is deliberately a *narrowing of the probe's own reach* rather
+/// than a second class gate: a record only states a present tail when it already
+/// takes the pooled writeback arm — it owns the packet's frame
+/// (`writeback_guest`, so the frame is the one the guest displays), is the
+/// packet's only record (`!continues_render_pass`), publishes its readback
+/// (`!skip_readback`) and names no resident target (`target_identity.is_none()`)
+/// — and the frame lands in a **guest mapping** (`mapping_id != 0`), which is
+/// the surface the display rail's `capture_present_frame` reads. Every other
+/// record keeps the route R7b gave it: the probe moves the present-bearing
+/// population and nothing else, so a boot can be compared arm against arm
+/// without a second class boundary moving underneath.
+///
+/// The class still answers for the whole shape — the conditions are re-stated
+/// there by name, so a request that reached the rail from any other caller
+/// cannot smuggle a present tail past a shape this one refuses.
+#[cfg(feature = "provider-render")]
+fn render_present_mapping(
+    req: &crate::runtime::draw::DrawEncodeRequest,
+    resources: &crate::backend::vulkan::engine::DrawRequest,
+    owns_guest_writeback: bool,
+) -> Option<u32> {
+    if !owns_guest_writeback
+        || resources.continues_render_pass
+        || resources.skip_readback
+        || resources.target_identity.is_some()
+    {
+        return None;
+    }
+    let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
+    (mapping_id != 0).then_some(mapping_id)
+}
+
+/// [`render_present_mapping`] under the probe switch, with the mapping's
+/// generation folded into the surface identity.
+#[cfg(feature = "provider-render")]
+fn render_present_request(
+    state: &crate::model::DeviceState,
+    req: &crate::runtime::draw::DrawEncodeRequest,
+    resources: &crate::backend::vulkan::engine::DrawRequest,
+    owns_guest_writeback: bool,
+) -> Option<crate::backend::provider_render::RenderPresentRequest> {
+    use crate::backend::provider_render::{PresentSurfaceKey, RenderPresentRequest};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::RENDER_PRESENT).0,
+            crate::config::Switch::On
+        )
+    });
+    if !on {
+        return None;
+    }
+    let mapping_id = render_present_mapping(req, resources, owns_guest_writeback)?;
+    // The generation is part of the surface's identity: a re-mapped mid is
+    // another buffer, and presenting it out of the image the previous
+    // incarnation rendered into is the rubber-band residue class
+    // (`backend/vulkan/present_identity.rs`). Read from the mapping the frame
+    // lands in, at the moment the record is encoded.
+    let map_generation = state
+        .mappings
+        .get(&mapping_id)
+        .map(|entry| entry.map_generation)
+        .unwrap_or(0);
+    Some(RenderPresentRequest {
+        surface: PresentSurfaceKey {
+            mapping_id,
+            map_generation,
+        },
+    })
+}
+
 /// The eight-bit frame [`M2vDrawSpan::Pixels`] speaks, out of a canonical
 /// provider render pass's completion.
 ///
@@ -10051,11 +10130,23 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // instead of being answered by a provider that always refuses
                 // that shape.
                 vertex_attribute_locations: resolved.vertex_attribute_locations.as_ref(),
+                // R4b, probe-gated: the present tail a record states when it is
+                // the one whose frame the guest displays and that frame lands in
+                // a named mapping. `None` is the pre-R4b device.
+                present: render_present_request(state, req, &resources, writeback_guest),
             };
             match provider_render::submit_render(&inputs, &resources) {
                 RenderRailOutcome::ProviderCompleted(out) => {
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
                     crate::runtime::drain::note_store_route("render_provider_canonical");
+                    // Over a present-bearing submission the completion's bytes
+                    // are the provider's *present target* readback rather than
+                    // a pooled scratch image's, so the frame this span hands
+                    // the store route is the one the display rail will capture
+                    // (`runtime::scanout::capture_present_frame` reads what this
+                    // route publishes). The counters are read before the frame
+                    // is moved out of `out`.
+                    let present = out.present;
                     // The completion lands at the attachment's own texel width;
                     // the span's consumers read eight-bit colour, so a wide
                     // frame is narrowed here (`provider_span_pixels`) rather
@@ -10063,7 +10154,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // pass-through arm and keep their bytes exactly.
                     let (bytes, bgra) = provider_span_pixels(&resources, out)?;
                     crate::observe::line(format!(
-                        "linux_render_provider ok pipe={} {}x{} idx={} bgra={}",
+                        "linux_render_provider ok pipe={} {}x{} idx={} bgra={}{}",
                         req.pipeline_ref,
                         w,
                         h,
@@ -10073,6 +10164,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             .map(|index| index.index_count)
                             .unwrap_or(0),
                         bgra as u8,
+                        match present {
+                            None => String::new(),
+                            Some(present) => format!(
+                                " present={}/{} target={:#x}/{}",
+                                present.acquires,
+                                present.presents,
+                                present.attachment.allocation.get(),
+                                present.attachment.view.get(),
+                            ),
+                        },
                     ));
                     return Ok(M2vDrawSpan::Pixels { bytes, bgra });
                 }
@@ -15648,6 +15749,7 @@ mod provider_span_pixels_tests {
                 RenderRailOutput {
                     bytes: frame.clone(),
                     bgra,
+                    present: None,
                 },
             )
             .expect("an eight-bit frame is already what the span speaks");
@@ -15670,6 +15772,7 @@ mod provider_span_pixels_tests {
             RenderRailOutput {
                 bytes: vec![0x04, 0x34, 0x04, 0x38, 0xfe, 0x39, 0x00, 0x3c],
                 bgra: false,
+                present: None,
             },
         )
         .expect("four half channels narrow to four bytes");
@@ -15703,8 +15806,15 @@ mod provider_span_pixels_tests {
                 vec![0x04, 0x34, 0x04, 0x38],
             ),
         ] {
-            let error = provider_span_pixels(&req, RenderRailOutput { bytes, bgra: false })
-                .expect_err(label);
+            let error = provider_span_pixels(
+                &req,
+                RenderRailOutput {
+                    bytes,
+                    bgra: false,
+                    present: None,
+                },
+            )
+            .expect_err(label);
             let DrawError::ProviderRender(decline) = error else {
                 panic!("{label}: the refusal is the rail's own vocabulary: {error:?}");
             };
@@ -15714,5 +15824,83 @@ mod provider_span_pixels_tests {
                 "{label}: {decline}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "provider-render"))]
+mod render_present_probe_tests {
+    use super::*;
+
+    /// The eligible shape: a record that owns the packet's frame and lands it
+    /// in a named mapping.
+    fn eligible() -> (
+        crate::runtime::draw::DrawEncodeRequest,
+        crate::backend::vulkan::engine::DrawRequest,
+    ) {
+        let mut req = crate::runtime::draw::DrawEncodeRequest::default();
+        req.colors.push(crate::runtime::draw::ColorRtRequest {
+            mapping_id: 7,
+            ..Default::default()
+        });
+        (req, crate::backend::vulkan::engine::DrawRequest::default())
+    }
+
+    /// The probe's reach, as a pure rule: only the record that owns the frame
+    /// the guest displays *and* lands it in a mapping may state a present tail.
+    ///
+    /// Each `None` below is a route R7b or W1 already answers for — a chain
+    /// head, a continuing record, a withheld readback, a resident target, a
+    /// frame that lands nowhere the display rail reads — so the probe moves the
+    /// present-bearing population and nothing else. The switch itself is not
+    /// part of this rule; it gates whether the rule is asked at all.
+    #[test]
+    fn the_probe_states_a_tail_only_on_the_frame_owning_mapping_record() {
+        let (req, resources) = eligible();
+        assert_eq!(
+            render_present_mapping(&req, &resources, true),
+            Some(7),
+            "the pooled writeback record that lands in mapping 7 is the shape"
+        );
+        assert_eq!(
+            render_present_mapping(&req, &resources, false),
+            None,
+            "a record that owns no guest writeback hands its frame to the chain, not the display"
+        );
+        let mut continued = crate::backend::vulkan::engine::DrawRequest::default();
+        continued.continues_render_pass = true;
+        assert_eq!(
+            render_present_mapping(&req, &continued, true),
+            None,
+            "a record with a predecessor begins from a frame this probe did not see"
+        );
+        let mut withheld = crate::backend::vulkan::engine::DrawRequest::default();
+        withheld.skip_readback = true;
+        withheld.readback_skip_reason =
+            crate::backend::vulkan::engine::ReadbackSkipReason::ResidentStore;
+        assert_eq!(
+            render_present_mapping(&req, &withheld, true),
+            None,
+            "a withheld readback publishes no frame for the display rail to capture"
+        );
+        let mut resident = crate::backend::vulkan::engine::DrawRequest::default();
+        resident.target_identity = Some(crate::backend::vulkan::engine::TargetIdentity::Surface {
+            id: 7,
+            width: 64,
+            height: 32,
+            generation: 1,
+            format: ash::vk::Format::R8G8B8A8_UNORM,
+        });
+        assert_eq!(
+            render_present_mapping(&req, &resident, true),
+            None,
+            "a record that names a resident target keeps R7b's route"
+        );
+        let mut no_mapping = req.clone();
+        no_mapping.colors[0].mapping_id = 0;
+        assert_eq!(
+            render_present_mapping(&no_mapping, &resources, true),
+            None,
+            "a frame that lands in no mapping is a surface the display rail never reads"
+        );
     }
 }

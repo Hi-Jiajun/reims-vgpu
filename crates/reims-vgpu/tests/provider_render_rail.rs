@@ -27,7 +27,8 @@ use metal_api_vulkan::{
     RenderStage, SpirvFeaturePolicy, TranslatedRenderStage, VulkanComputeProvider, VulkanExecutor,
 };
 use reims_vgpu::backend::provider_render::{
-    self, ProviderRenderDecline, RenderChainRole, RenderRailInputs, RenderRailOutcome,
+    self, PresentSurfaceKey, ProviderRenderDecline, RenderChainRole, RenderPresentRequest,
+    RenderRailInputs, RenderRailOutcome,
 };
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
@@ -335,6 +336,7 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         fragment_entry: Some(stages.fragment_entry),
         role,
         vertex_attribute_locations: &stages.vertex_attribute_locations,
+        present: None,
     }
 }
 
@@ -2805,6 +2807,432 @@ fn the_engines_asymmetric_frame_is_the_metal_ndc_mapping() {
         flip_rows(&engine, ASYMMETRIC_WIDTH, ASYMMETRIC_HEIGHT),
         "the fixture's own frame has to differ from its rows reversed: a shape whose two \
          readings agree would make this pair's expectation vacuous"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R4b: the present tail, and the frame it hands the display rail
+// ---------------------------------------------------------------------------
+
+/// The inputs of one presenting submission: [`inputs`] plus the surface the
+/// record says its frame lands in.
+fn present_inputs<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    surface: PresentSurfaceKey,
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        present: Some(RenderPresentRequest { surface }),
+        ..inputs(stages, role)
+    }
+}
+
+/// One presenting submission of the reviewed shape, returned as the canonical
+/// rail's own completion.
+fn submitted_present(
+    label: &str,
+    stages: &Stages,
+    surface: PresentSurfaceKey,
+) -> provider_render::RenderRailOutput {
+    let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    match provider_render::submit_render(
+        &present_inputs(stages, RenderChainRole::SoleOrTail, surface),
+        &req,
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => out,
+        other => panic!("{label}: the canonical provider has to present this shape: {other:?}"),
+    }
+}
+
+/// R4b: a presenting record's frame is the provider's *present target* readback,
+/// and it is the same picture the pooled arm lands.
+///
+/// The whole claim of the present rail is that nothing about the frame changes:
+/// the pass renders the same shape into the provider's own target, the target
+/// is acquired and presented once, and its bytes come back through the same
+/// completion channel. So the readings are a pair — the presenting frame against
+/// the pooled frame, byte for byte — plus the provider's own counters, which are
+/// the only thing that can say the present action ran at all. The second
+/// reversal is the control: the first present of a surface creates one target,
+/// presenting it again reuses that target, and a *different* mapping is a second
+/// target — the registry is keyed by the surface's own identity, not by the
+/// submission.
+#[test]
+fn a_presenting_record_lands_the_present_targets_own_frame() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+
+    // The frame the same shape lands without a present tail.
+    let pooled = provider_pixels(
+        "pooled frame",
+        &stages,
+        &narrow_request(MTL_FORMAT_RGBA8_UNORM),
+    );
+
+    let surface = PresentSurfaceKey {
+        mapping_id: 0x4b_00_01,
+        map_generation: 1,
+    };
+    let targets_before = provider_render::present_target_count();
+    let counts_before = provider_render::present_counts();
+    let out = submitted_present("first present", &stages, surface);
+    let present = out
+        .present
+        .expect("a present-bearing completion reports the tail it executed");
+    assert_eq!(
+        (present.acquires, present.presents),
+        (1, 1),
+        "the provider acquired the target once and presented it once"
+    );
+    let expected_target = provider_render::present_attachment(
+        &surface,
+        AttachmentFormat::Rgba8Unorm,
+        u64::from(width),
+        u64::from(height),
+    );
+    assert_eq!(
+        present.attachment, expected_target,
+        "the target the completion names is the surface's own mint"
+    );
+    let presented = semantic_rgba(out.bytes.clone(), out.bgra);
+    assert_solid("presented frame", &presented);
+    assert_eq!(
+        presented, pooled,
+        "the present tail changes which image the frame comes out of and nothing about the frame"
+    );
+    let Some(engine) = engine_pixels(
+        "presented frame",
+        &stages,
+        narrow_request(MTL_FORMAT_RGBA8_UNORM),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        presented, engine,
+        "the presented frame is the frame the self-contained engine draws for the same shape"
+    );
+    let counts_after = provider_render::present_counts();
+    assert_eq!(
+        (
+            counts_after.0.saturating_sub(counts_before.0),
+            counts_after.1.saturating_sub(counts_before.1),
+        ),
+        (1, 1),
+        "the submission drove exactly one acquire and one present"
+    );
+    assert_eq!(
+        provider_render::present_target_count(),
+        targets_before + 1,
+        "the first present of a surface creates exactly one provider target"
+    );
+
+    // The same surface again: one more round trip on the *same* target.
+    let again = submitted_present("second present", &stages, surface);
+    assert_eq!(
+        again
+            .present
+            .expect("the second present reports its tail")
+            .attachment,
+        expected_target,
+        "a second present of one surface incarnation names the same target"
+    );
+    assert_eq!(
+        provider_render::present_target_count(),
+        targets_before + 1,
+        "and the provider reused the image instead of minting a second one"
+    );
+    assert_eq!(
+        semantic_rgba(again.bytes, again.bgra),
+        pooled,
+        "the reused target lands the same frame"
+    );
+
+    // Another mapping at the same geometry: another target. This is the
+    // rubber-band residue class `present_identity.rs` records — two guest
+    // surfaces presenting out of one provider image would fuse their damage
+    // histories.
+    let neighbour = PresentSurfaceKey {
+        mapping_id: 0x4b_00_02,
+        map_generation: 1,
+    };
+    let neighbour_out = submitted_present("neighbour surface", &stages, neighbour);
+    assert_ne!(
+        neighbour_out
+            .present
+            .expect("the neighbour present reports its tail")
+            .attachment,
+        expected_target,
+        "two guest surfaces never present out of one target"
+    );
+    assert_eq!(
+        provider_render::present_target_count(),
+        targets_before + 2,
+        "the neighbour's first present is a second target"
+    );
+}
+
+/// R4b's identity rule, as a property of the mint itself.
+///
+/// One target per **surface incarnation**: the same `(mapping, generation)` at
+/// the same shape resolves to the same `(allocation, view)` every time, and each
+/// of the four ways a surface can be *another* surface — another mapping,
+/// another generation, another extent, another format — resolves to a different
+/// one. The last assertion is the namespace half: a present target and the
+/// resident a render record keeps for the same guest target must be two
+/// identities, because they are two provider registries
+/// (`present_targets` / `resident_targets`) and one allocation naming both would
+/// make one registry's eviction retire the other's image.
+#[test]
+fn the_present_identity_follows_the_surface_incarnation_and_its_shape() {
+    let surface = PresentSurfaceKey {
+        mapping_id: 0x4b_01_00,
+        map_generation: 3,
+    };
+    let base = provider_render::present_attachment(&surface, AttachmentFormat::Rgba8Unorm, 64, 32);
+    assert_eq!(
+        base,
+        provider_render::present_attachment(&surface, AttachmentFormat::Rgba8Unorm, 64, 32),
+        "the mint is a function of the surface and its shape"
+    );
+    let other_mapping = provider_render::present_attachment(
+        &PresentSurfaceKey {
+            mapping_id: 0x4b_01_01,
+            map_generation: 3,
+        },
+        AttachmentFormat::Rgba8Unorm,
+        64,
+        32,
+    );
+    assert_ne!(base, other_mapping, "two mappings are two surfaces");
+    let other_generation = provider_render::present_attachment(
+        &PresentSurfaceKey {
+            mapping_id: 0x4b_01_00,
+            map_generation: 4,
+        },
+        AttachmentFormat::Rgba8Unorm,
+        64,
+        32,
+    );
+    assert_ne!(
+        base, other_generation,
+        "a re-mapped surface is another buffer, not another present of the old image"
+    );
+    let other_extent =
+        provider_render::present_attachment(&surface, AttachmentFormat::Rgba8Unorm, 64, 33);
+    assert_ne!(base, other_extent, "the target's extent is part of its key");
+    let other_format =
+        provider_render::present_attachment(&surface, AttachmentFormat::Bgra8Unorm, 64, 32);
+    assert_ne!(base, other_format, "the target's format is part of its key");
+
+    // The resident mint is the other registry's namespace: same guest target,
+    // different provider image.
+    let resident = provider_render::resident_attachment(&engine::TargetIdentity::Surface {
+        id: surface.mapping_id,
+        width: 64,
+        height: 32,
+        generation: u64::from(surface.map_generation),
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+    });
+    assert_ne!(
+        base.allocation, resident.allocation,
+        "a present target is not the resident a render record keeps for the same surface"
+    );
+}
+
+/// R4b: the frame the provider presented is the frame the display rail captures.
+///
+/// The display rail's only frame-fetch entry point is
+/// `runtime::scanout::capture_present_frame`, and its first source is the host
+/// surface cache — the map the Store route publishes a mapper-ref-texture
+/// frame into (`runtime::mapping_write::write_bgra8`'s cache half). So the test
+/// lands the provider's *present target* bytes through that same publish and
+/// asserts the capture API returns them byte for byte; a rail that had
+/// presented a different image would fail here even with identical counters.
+///
+/// The control is the other half of the two-vein rule: a present whose frame
+/// nothing published has no capture at all. The capture refuses and keeps the
+/// prior retain rather than opening a guest-page third source — which is what
+/// "the display rail consumes provider frames" has to mean if the frame is
+/// real.
+#[test]
+fn the_display_rail_fetches_the_present_targets_own_frame() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let mapping_id = 0x4b_02_00;
+    let map_generation = 11;
+    let out = submitted_present(
+        "display rail present",
+        &stages,
+        PresentSurfaceKey {
+            mapping_id,
+            map_generation,
+        },
+    );
+    let frame = out.bytes.clone();
+    assert_texel_count("presented frame", &frame);
+
+    let mut state = reims_vgpu::model::DeviceState::new(
+        reims_vgpu::model::DeviceId(1),
+        reims_vgpu::protocol::gva::PAGE_SHIFT_X86,
+    );
+    reims_vgpu::runtime::surface_cache::store_rows(
+        &mut state,
+        mapping_id,
+        width,
+        height,
+        &frame,
+        width * 4,
+    );
+    assert!(
+        reims_vgpu::runtime::scanout::capture_present_frame(
+            &mut state,
+            mapping_id,
+            width,
+            height,
+            map_generation,
+        ),
+        "the display rail captures the frame the store route published"
+    );
+    assert_frames_equal("display capture", &state.present.frame_bgra, &frame);
+    assert_eq!(
+        state.present.frame_mapping, mapping_id,
+        "the capture names the mapping the provider presented"
+    );
+
+    // The control: the same capture API, the same mapping, nothing published.
+    let mut unpublished = reims_vgpu::model::DeviceState::new(
+        reims_vgpu::model::DeviceId(1),
+        reims_vgpu::protocol::gva::PAGE_SHIFT_X86,
+    );
+    assert!(
+        !reims_vgpu::runtime::scanout::capture_present_frame(
+            &mut unpublished,
+            mapping_id,
+            width,
+            height,
+            map_generation,
+        ),
+        "a present whose frame reached no source fails visibly instead of being invented"
+    );
+    assert!(
+        unpublished.present.frame_bgra.is_empty(),
+        "and the failed capture keeps its (empty) prior retain"
+    );
+}
+
+/// R4b's class boundary: a present tail on any other shape keeps the engine by
+/// name, and the provider never sees the request.
+#[test]
+fn a_presenting_shape_beside_the_class_stays_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let surface = PresentSurfaceKey {
+        mapping_id: 0x4b_03_00,
+        map_generation: 1,
+    };
+    let delivered_before = provider_render::provider_submissions();
+    let refused = |label: &str, role: RenderChainRole, req: &DrawRequest, want: &str| {
+        match provider_render::submit_render(&present_inputs(&stages, role, surface), req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+                reason.slug(),
+                want,
+                "{label}: the class names the condition that kept the shape on the engine: {reason}"
+            ),
+            other => panic!(
+                "{label}: a presenting shape beside the class stays on the engine: {other:?}"
+            ),
+        }
+    };
+
+    // The chain head's frame belongs to the record after it.
+    let head = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    refused(
+        "a presenting chain head",
+        RenderChainRole::Head,
+        &head,
+        "render_provider_out_of_class_present_position",
+    );
+    // And a record that continues an encoder is not the packet's sole record
+    // either, whatever role the caller states.
+    let mut continued = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    continued.continues_render_pass = true;
+    refused(
+        "a presenting continuation",
+        RenderChainRole::SoleOrTail,
+        &continued,
+        "render_provider_out_of_class_present_position",
+    );
+    // A withheld readback would present a target whose bytes never come back.
+    let mut withheld = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    withheld.skip_readback = true;
+    withheld.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    refused(
+        "a presenting record that withholds its readback",
+        RenderChainRole::SoleOrTail,
+        &withheld,
+        "render_provider_out_of_class_present_unpublished",
+    );
+    // A record naming a resident target is the emulator's own
+    // `resident_target_present_unsupported` shape, answered here so the draw
+    // falls back instead of being declined.
+    let mut resident = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    resident.target_identity = Some(surface_identity(0x4b_03_01));
+    refused(
+        "a presenting record that names a resident target",
+        RenderChainRole::SoleOrTail,
+        &resident,
+        "render_provider_out_of_class_present_target",
+    );
+
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered_before,
+        "a present tail the class refuses never reaches the provider"
+    );
+}
+
+/// R4b's fail-closed boundary for a packet whose chain is admitted only in
+/// part.
+///
+/// Routing is per record: a resident store hands the *next* record a frame that
+/// now lives in the provider, and a later record that stays on the engine for
+/// any other reason asks the engine's own registry for that image. The engine
+/// has never held it, so the read is refused by name —
+/// `read_target_unknown_identity` — and that refusal, not a wrong frame, is what
+/// a split chain produces. This test drives the exact pair: the provider keeps
+/// the frame under the resident identity R7b mints, and the engine is asked to
+/// read that identity.
+#[test]
+fn a_split_chain_fails_closed_on_the_engines_own_name() {
+    use reims_vgpu::observe::Decline as _;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let identity = surface_identity(0x4b_04_00);
+
+    // The provider executes the record whose frame stays in its own image.
+    let seed = resident_seed_request(&identity);
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &seed) {
+        RenderRailOutcome::ProviderCompletedResident(_) => (),
+        other => panic!("the resident seed is in class: {other:?}"),
+    }
+
+    // The engine's own registry never saw that identity — the frame is in the
+    // provider's image — so the read a chain-splitting record would perform
+    // refuses by name rather than returning bytes from nothing.
+    let error = match engine::read_target(&identity) {
+        Ok(_) => panic!("the engine holds no resident the provider wrote"),
+        Err(error) => error,
+    };
+    let engine::DrawError::TargetRead(reason) = &error else {
+        panic!("the refusal is the readback rail's own vocabulary: {error:?}");
+    };
+    assert_eq!(
+        reason.slug(),
+        "read_target_unknown_identity",
+        "a frame the provider kept is a named refusal on the engine, not a wrong frame"
     );
 }
 

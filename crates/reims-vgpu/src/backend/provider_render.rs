@@ -66,9 +66,22 @@
 //!   canonical *translated* registration gate
 //!   (`register_translated_render_pipeline`), which checks each stage's
 //!   reflection against the contract field by field;
-//! - no depth, stencil, MSAA, MRT, resolve, present, blend, colour write mask,
+//! - no depth, stencil, MSAA, MRT, resolve, blend, colour write mask,
 //!   occlusion query, sampled image, sampler or storage buffer — and every one
 //!   of those is a *reason*, not a silent downgrade;
+//! - **a present tail, when the caller states one** (R4b): the record owns the
+//!   packet's frame and hands it to the display rail, so the canonical pass
+//!   *presents* the provider's own target for the guest surface the frame lands
+//!   in ([`RenderPresentRequest`]). The target is keyed by the surface's own
+//!   incarnation — mapping and mapping generation, plus the attachment's shape
+//!   ([`present_attachment`]) — and its bytes come back through the same
+//!   completion channel the pooled arm uses, so the frame the store route lands
+//!   (and therefore the frame the display rail's `capture_present_frame` reads)
+//!   *is* the present target's readback. A present tail on any other position —
+//!   a chain record, a withheld readback, a record naming a resident target —
+//!   keeps the engine under its own name, because a present action hands on the
+//!   frame it is attached to and only the packet's sole record owns the frame
+//!   the guest displays;
 //! - **the pooled offscreen target, or one of the resident arms** (R7b): the
 //!   request is either the pooled, offscreen, CPU-readback shape
 //!   (`target_identity == None`, `skip_readback == false`, no seed and no
@@ -242,10 +255,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use metal_api_core::provider::{
-    half_to_f32, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
-    BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
-    ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType,
-    IndexBufferBinding, IndexFormat, LoadOp, OperationId, RenderAttachment, RenderPassDescriptor,
+    half_to_f32, AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess,
+    BufferSource, BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition,
+    CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind,
+    DispatchType, IndexBufferBinding, IndexFormat, InitialState, LoadOp, OperationId,
+    PresentDescriptor, PresentMode, PresentTarget, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp, TracePass,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
     MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
@@ -400,6 +414,21 @@ const RESIDENT_ALLOCATION_BASE: u64 = 0x7265_7369_0000_0000;
 /// view)`, and the allocation is the half that varies per guest target.
 const RESIDENT_VIEW: ViewId = ViewId::new(1);
 
+/// The allocation namespace present target identities are minted from (R4b).
+///
+/// One present target per guest *surface incarnation*, in its own namespace
+/// rather than the resident one: a present target is the image the provider
+/// acquires and presents for a display surface, and the resident mint is the
+/// image a render record keeps. They are different provider registries (and, on
+/// the emulator side, different lifetimes — the present registry is LRU-bounded
+/// on its own), so one namespace's collision would be invisible in the other's.
+const PRESENT_ALLOCATION_BASE: u64 = 0x7265_7072_0000_0000;
+
+/// The view identity of a present target. One view per allocation for the same
+/// reason [`RESIDENT_VIEW`] is one: the pair the provider keys the target on is
+/// `(allocation, view)`, and the allocation is the half that varies per surface.
+const PRESENT_VIEW: ViewId = ViewId::new(1);
+
 /// The provider-owned image one record names, in the two fields the canonical
 /// contract keys a resident target on.
 ///
@@ -455,6 +484,141 @@ pub fn resident_attachment(target: &TargetIdentity) -> ResidentAttachment {
         view: RESIDENT_VIEW,
     };
     registry.by_target.insert(target.clone(), attachment);
+    attachment
+}
+
+/// The guest surface one presenting record hands to the display rail (R4b).
+///
+/// The two fields are the surface's *incarnation*: the guest mapping the frame
+/// lands in (`runtime::draw::vulkan`'s `c0.mapping_id`, the same mid
+/// `mapping_write` stores into) and that mapping's generation at the draw. The
+/// generation is what makes a re-mapped surface a different provider target
+/// instead of a reused image: `present_identity.rs` records why two guest
+/// surfaces sharing one resident fuses their damage histories into the
+/// rubber-band residue class, and a generation is exactly a surface that came
+/// back as another buffer.
+///
+/// Deliberately *not* carrying geometry or format: both are the pass's own
+/// facts, and the mint below reads them from the attachment the same
+/// `narrow_class` pass states — one source, so a caller cannot describe a
+/// surface whose shape disagrees with the pass it is attached to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PresentSurfaceKey {
+    pub mapping_id: u32,
+    pub map_generation: u32,
+}
+
+/// The provider-owned present target one presenting record hands on, in the two
+/// fields the canonical contract keys a present target on
+/// (`PresentTarget::allocation_id` / `view_id`).
+///
+/// The pair is also the attachment's own identity for that pass: the contract
+/// requires the present target's view and allocation to *be* the pass's colour
+/// attachment's (`PresentDescriptor::validate_against`), so the completion's
+/// writeback, the provider's present registry and the trace's attachment all
+/// name one resource. There is no second key to keep in step, which is what
+/// this type is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentAttachment {
+    pub allocation: AllocationId,
+    pub view: ViewId,
+}
+
+/// The present tail one record states for the frame it owns (R4b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderPresentRequest {
+    /// The guest surface the frame lands in. See [`PresentSurfaceKey`] for why
+    /// this is a mapping and a generation rather than a provider identity.
+    pub surface: PresentSurfaceKey,
+}
+
+/// What one present-bearing submission reports back.
+///
+/// The counters are the provider's own acquire/present deltas as the rail read
+/// them around the submission; both are exactly one by the time this value
+/// exists, because the rail refuses the submission rather than reporting a
+/// tail that did not run ([`ProviderRenderDecline::PresentNotExecuted`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentCompletion {
+    /// The target the frame was presented from — the same pair the completion's
+    /// writeback landed under.
+    pub attachment: PresentAttachment,
+    pub acquires: usize,
+    pub presents: usize,
+}
+
+/// The mint key of one present target: the surface's incarnation *and* the
+/// attachment's shape.
+///
+/// Shape is part of the key because the provider reuses a present target by
+/// `(allocation, view)` alone (`metal-api-vulkan`'s `present_target`): an
+/// identity reused at another extent or format would hand the pass an image of
+/// the old shape. Keying the mint on the shape the class states makes that
+/// unrepresentable rather than something a later record could notice.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PresentMintKey {
+    surface: PresentSurfaceKey,
+    /// [`AttachmentFormat::code`], because the provider's format enum is not
+    /// `Hash` — and the code is the value the wire format and the census use.
+    format: u8,
+    width: u64,
+    height: u64,
+}
+
+/// The process-global mint for present target identities.
+///
+/// A counter behind a map, for the reason [`ResidentIdentities`] is one: two
+/// surfaces that collided would silently present out of one provider image, and
+/// the failure mode of that collision is a frame from the wrong surface. The
+/// map is what keeps the mint *stable*: every record that presents the same
+/// surface incarnation resolves to the same target, so the provider's registry
+/// reuses one image (and one layout lock) instead of accumulating one per
+/// submission.
+struct PresentIdentities {
+    next: u64,
+    by_surface: HashMap<PresentMintKey, PresentAttachment>,
+}
+
+static PRESENT_IDENTITIES: OnceLock<Mutex<PresentIdentities>> = OnceLock::new();
+
+/// The provider-owned present target the given surface incarnation presents
+/// from at the given shape.
+///
+/// Memoised for the process lifetime, exactly as [`resident_attachment`] is: the
+/// provider is a process singleton ([`render_rail`]), so the two lifetimes
+/// agree. A surface that changes geometry or format under one generation is a
+/// different mint key and therefore a different target — see [`PresentMintKey`].
+pub fn present_attachment(
+    surface: &PresentSurfaceKey,
+    format: AttachmentFormat,
+    width: u64,
+    height: u64,
+) -> PresentAttachment {
+    let key = PresentMintKey {
+        surface: *surface,
+        format: format.code(),
+        width,
+        height,
+    };
+    let registry = PRESENT_IDENTITIES.get_or_init(|| {
+        Mutex::new(PresentIdentities {
+            next: 0,
+            by_surface: HashMap::new(),
+        })
+    });
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(attachment) = registry.by_surface.get(&key) {
+        return *attachment;
+    }
+    let allocation = AllocationId::new(PRESENT_ALLOCATION_BASE + registry.next);
+    registry.next += 1;
+    let attachment = PresentAttachment {
+        allocation,
+        view: PRESENT_VIEW,
+    };
+    registry.by_surface.insert(key, attachment);
     attachment
 }
 
@@ -569,6 +733,14 @@ pub struct RenderRailInputs<'a> {
     /// reflection type itself so this module keeps its provider-facing imports
     /// and compares the one field the gate reads.
     pub vertex_attribute_locations: &'a [u32],
+    /// The present tail this record carries, when the caller states one (R4b).
+    ///
+    /// `None` is the pre-R4b device: the record's frame comes back through the
+    /// pooled or resident arms and no present action is stated. `Some` asks this
+    /// class for the shape the display rail reads — see [`RenderPresentRequest`]
+    /// — and every position or store this class cannot present keeps the engine
+    /// by name.
+    pub present: Option<RenderPresentRequest>,
 }
 
 /// What one completed narrow-class submission returns.
@@ -588,6 +760,12 @@ pub struct RenderRailOutput {
     /// store route needs to know before it can land them. The wide arm is RGBA,
     /// so this is `false` for it by construction.
     pub bgra: bool,
+    /// The present action this submission executed, when it stated one (R4b).
+    ///
+    /// The bytes above are the presented target's own readback whenever this is
+    /// `Some`, which is what lets the caller say *which* frame the store route
+    /// is about to land.
+    pub present: Option<PresentCompletion>,
 }
 
 /// What one resident-class submission leaves behind.
@@ -755,6 +933,16 @@ pub enum ProviderRenderDecline {
         length: u64,
         expected: u64,
     },
+    /// A record stated a present tail and the provider's acquire/present
+    /// counters did not advance by exactly one each (R4b).
+    ///
+    /// The frame comes back through the same completion either way, so this is
+    /// the one failure that would otherwise be silent: bytes that look like the
+    /// frame while the action that makes it the *presented* frame never ran.
+    /// The observed deltas travel with the refusal because they are the whole
+    /// answer — a zero pair says the action did not run, and a pair above one
+    /// says the counters moved for a submission this one did not drive.
+    PresentNotExecuted { acquires: usize, presents: usize },
     /// The completion's frame carries a texel the seam's span cannot speak: the
     /// attachment's format is wider than four bytes per texel and the engine's
     /// own widening rule has no four-byte meaning for it.
@@ -795,6 +983,7 @@ impl Decline for ProviderRenderDecline {
             Self::AttachmentWritebackMissing => "attachment_writeback_missing",
             Self::AttachmentWritebackShape { .. } => "attachment_writeback_shape",
             Self::AttachmentFrameNotNarrowable { .. } => "attachment_frame_not_narrowable",
+            Self::PresentNotExecuted { .. } => "render_present_not_executed",
             Self::ResidentWritebackPublished { .. } => "resident_writeback_published",
             Self::Owner(inner) => inner.slug(),
         }
@@ -859,6 +1048,10 @@ impl Decline for ProviderRenderDecline {
             Self::AttachmentFrameNotNarrowable { format } => {
                 vec![("format", format!("{format:?}"))]
             }
+            Self::PresentNotExecuted { acquires, presents } => vec![
+                ("acquires", acquires.to_string()),
+                ("presents", presents.to_string()),
+            ],
             Self::ResidentWritebackPublished { allocation, view } => vec![
                 ("allocation", format!("{:#x}", allocation.get())),
                 ("view", view.get().to_string()),
@@ -916,6 +1109,30 @@ static PROVIDER_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 /// only that the answer looked like a fallback.
 pub fn provider_submissions() -> u64 {
     PROVIDER_SUBMISSIONS.load(Ordering::Relaxed)
+}
+
+/// The canonical provider's own presentation counters, as the rail's tests read
+/// them (R4b).
+///
+/// Test observation, like [`provider_submissions`]: production callers do not
+/// read it. `(0, 0)` when this rail's provider has never been built, which is
+/// the honest answer for a process that presented nothing rather than a second
+/// counter this module would have to keep in step with the emulator's.
+pub fn present_counts() -> (usize, usize) {
+    rail()
+        .map(|rail| rail.provider.present_counts())
+        .unwrap_or((0, 0))
+}
+
+/// How many provider-owned present targets the rail's provider currently holds.
+///
+/// Test observation: the rail test that pins target *reuse* reads it, so a
+/// second present of one surface incarnation is a statement about the
+/// provider's registry rather than an inference from the counters.
+pub fn present_target_count() -> usize {
+    rail()
+        .map(|rail| rail.provider.present_target_count())
+        .unwrap_or(0)
 }
 
 fn render_rail() -> &'static RenderRail {
@@ -1088,6 +1305,11 @@ struct NarrowPass<'a> {
     /// attachment — the canonical pass's own default
     /// ([`RenderPassDescriptor::scissor`]).
     scissor: Option<[u32; 4]>,
+    /// The present target this pass hands on, or `None` for the pooled/resident
+    /// arms (R4b). Present whenever the caller stated a present tail; the class
+    /// conditions above are what make that the *only* shape a presenting record
+    /// can reach this point with.
+    present: Option<PresentAttachment>,
 }
 
 impl NarrowPass<'_> {
@@ -1232,6 +1454,67 @@ fn narrow_class<'a>(
             "render_provider_out_of_class_extent_overflow",
             "an attachment extent that overflows u64 stays on the engine",
         ))?;
+    // The present tail (R4b): the record hands the frame it owns to the display
+    // rail through a provider-owned target. The three conditions below are the
+    // whole shape rule — everything else about the record is answered by the
+    // conditions above and below this block, unchanged.
+    //
+    // 1. Only the packet's *sole* record owns the frame the guest displays. A
+    //    chain head's frame belongs to the record after it, and a middle's to
+    //    the one after that, so presenting either would hand the display a
+    //    picture the guest never finished. That is a class answer rather than a
+    //    decline: the record is a shape this class does not execute at all
+    //    (the encoder gate below refuses it for the frame's own reason, and
+    //    this names the position the caller asked to present).
+    if inputs.present.is_some() {
+        if inputs.role != RenderChainRole::SoleOrTail || req.continues_render_pass {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_present_position",
+                "a present tail on a record that is not the packet's sole record stays on the \
+                 engine: the presented frame has to be the one the guest displays, and every \
+                 other record of a chain hands its frame to the record after it",
+            ));
+        }
+        // 2. The frame has to come back to this rail, or the display rail has
+        //    nothing to read: a present action whose record withholds its
+        //    readback would keep the target's bytes in the provider with no
+        //    consumer — the one thing this increment is for.
+        if req.skip_readback {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_present_unpublished",
+                "a present tail on a record whose readback is withheld stays on the engine: the \
+                 provider would present a target whose bytes never come back, and the display \
+                 rail would have nothing to capture",
+            ));
+        }
+        // 3. A record that names a resident target is the emulator's own
+        //    `resident_target_present_unsupported` shape: the present action
+        //    hands on the provider's own target, and a pass that also declares
+        //    the render rail's resident would ask two registries to own one
+        //    identity. Answered here so the draw falls back to the engine
+        //    instead of being declined by the provider.
+        if req.target_identity.is_some() {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_present_target",
+                "a present tail on a record that names a resident target stays on the engine: \
+                 the present action hands on the provider's own target, and the canonical \
+                 provider refuses a pass that declares the resident beside it \
+                 (`resident_target_present_unsupported`)",
+            ));
+        }
+    }
+    // The provider target a presenting record hands on, keyed by the surface
+    // incarnation the caller named and the attachment's own shape. Derived here
+    // rather than in `submit_narrow` so the present conditions above and the
+    // pass the trace states cannot disagree about which surface was presented.
+    let present = inputs.present.map(|present| {
+        present_attachment(
+            &present.surface,
+            format,
+            u64::from(req.width),
+            u64::from(req.height),
+        )
+    });
     // The provider image this record's own attachment names, when the request
     // carries a guest target at all. Derived once, from the request, so the load
     // arm and the store arm below cannot name two images for one attachment.
@@ -1652,6 +1935,7 @@ fn narrow_class<'a>(
             bytes: index_bytes,
         },
         scissor,
+        present,
     })
 }
 
@@ -1800,21 +2084,58 @@ enum RenderCompletion {
     Resident(ResidentFrame),
 }
 
+/// The `(allocation, view)` pair one admitted pass declares for its attachment,
+/// in the one shape every arm below reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttachmentIdentity {
+    allocation: AllocationId,
+    view: ViewId,
+}
+
+impl From<ResidentAttachment> for AttachmentIdentity {
+    fn from(resident: ResidentAttachment) -> Self {
+        Self {
+            allocation: resident.allocation,
+            view: resident.view,
+        }
+    }
+}
+
+impl From<PresentAttachment> for AttachmentIdentity {
+    fn from(present: PresentAttachment) -> Self {
+        Self {
+            allocation: present.allocation,
+            view: present.view,
+        }
+    }
+}
+
 /// The `(allocation, view)` pair one admitted pass declares for its attachment.
 ///
-/// The pooled class names its own two constants; either resident arm names the
-/// request's own identity. Both arms read the same `resident` local out of
-/// `narrow_class`, so a record that loads the image and keeps it cannot name two
-/// — and the fallthrough is the shape that declares neither.
-fn attachment_identity(pass: &NarrowPass<'_>) -> ResidentAttachment {
-    match (pass.load, pass.store) {
+/// Three arms, one per route the class states: the pooled class names its own
+/// two constants, either resident arm names the request's own identity (both
+/// read the same `resident` local out of `narrow_class`, so a record that loads
+/// the image and keeps it cannot name two), and a **presenting** record names
+/// the present target's pair (R4b) — which is not a fourth identity beside the
+/// attachment's but *is* it: the canonical contract requires the present
+/// target's view and allocation to be the pass colour attachment's own, so the
+/// writeback the completion publishes under this pair is the presented target's
+/// readback. The present arm is checked first because the class conditions make
+/// it exclusive: a presenting record is refused if it names a resident target,
+/// so no pass can state both routes' identities at once.
+fn attachment_identity(pass: &NarrowPass<'_>) -> AttachmentIdentity {
+    if let Some(present) = pass.present {
+        return present.into();
+    }
+    let resident = match (pass.load, pass.store) {
         (NarrowLoad::Resident(resident), _) => resident,
         (_, NarrowStore::Resident(resident)) => resident,
         (NarrowLoad::Clear(_), NarrowStore::Writeback) => ResidentAttachment {
             allocation: ATTACHMENT_ALLOCATION,
             view: ATTACHMENT_VIEW,
         },
-    }
+    };
+    resident.into()
 }
 
 fn submit_narrow(
@@ -1948,7 +2269,27 @@ fn submit_narrow(
         stencil_resolve: None,
         stencil_test: None,
         instance_count: 1,
-        present: None,
+        // R4b: a presenting record states the provider-owned target it hands
+        // on. The descriptor restates the attachment's own identity, format and
+        // extent — the four agreements `PresentDescriptor::validate_against`
+        // checks — because those *are* the present target's; `mode` and
+        // `acquire` are the only values the first increment admits, and
+        // `initial` is `Undefined`: the pass loads by `Clear`, so the target's
+        // previous contents are not part of anything either rail states.
+        present: pass.present.map(|present| PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: present.allocation,
+                view_id: present.view,
+                format: pass.format,
+                width: pass.width,
+                height: pass.height,
+                image_count: 1,
+                initial: InitialState::Undefined,
+            },
+            source: attachment.view,
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        }),
         // The v70 sampler channel: this class refuses sampled images, samplers
         // and color input before it ever gets here, so the pass binds none.
         textures: Vec::new(),
@@ -1986,6 +2327,12 @@ fn submit_narrow(
     // the provider's work, so a request that stays on the engine must leave
     // the counter where it was.
     PROVIDER_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
+    // R4b: the provider's presentation counters are the only channel that can
+    // say whether a stated present tail actually acquired and presented. Read
+    // around the submission, exactly as the emulator's own present tests do —
+    // the rail's callers submit from one worker, so the delta names this
+    // submission's action rather than a neighbour's.
+    let present_before = pass.present.map(|_| provider.present_counts());
     let result = provider
         .submit(validated)
         .map_err(|error| refusal_decline(&error, "submission").into_render())?;
@@ -1995,6 +2342,26 @@ fn submit_narrow(
     ) {
         return Err(ProviderRenderDecline::CompletionNotVisible);
     }
+    // A stated present tail that did not run is a decline, never a frame that
+    // looks right: the display rail is about to read these bytes as the
+    // presented frame, so the one fact that makes that claim checkable is the
+    // provider's own acquire/present pair.
+    let present = match (pass.present, present_before) {
+        (Some(target), Some(before)) => {
+            let after = provider.present_counts();
+            let acquires = after.0.saturating_sub(before.0);
+            let presents = after.1.saturating_sub(before.1);
+            if acquires != 1 || presents != 1 {
+                return Err(ProviderRenderDecline::PresentNotExecuted { acquires, presents });
+            }
+            Some(PresentCompletion {
+                attachment: target,
+                acquires,
+                presents,
+            })
+        }
+        _ => None,
+    };
     // The resident arm's whole claim is that the frame stayed in the provider's
     // image. The one fact that would make that claim unreadable is a published
     // writeback for the same attachment, so it is checked rather than assumed —
@@ -2025,7 +2392,10 @@ fn submit_narrow(
             crate::runtime::drain::note_store_route("render_provider_resident_load");
         }
         return Ok(RenderCompletion::Resident(ResidentFrame {
-            attachment,
+            attachment: ResidentAttachment {
+                allocation: attachment.allocation,
+                view: attachment.view,
+            },
             loaded: loads_resident,
         }));
     }
@@ -2045,9 +2415,18 @@ fn submit_narrow(
             expected: pass.extent,
         });
     }
+    // One population of its own, counted where it happens: a submission whose
+    // frame is the provider's own present target rather than a pooled scratch
+    // image. The seam prints the counters beside the same line, so a boot can
+    // read the ratio of present-bearing submissions to the class's whole
+    // population.
+    if present.is_some() {
+        crate::runtime::drain::note_store_route("render_provider_present");
+    }
     Ok(RenderCompletion::Writeback(RenderRailOutput {
         bytes: writeback.bytes.clone(),
         bgra: pass.bgra,
+        present,
     }))
 }
 

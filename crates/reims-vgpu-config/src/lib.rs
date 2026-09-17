@@ -1185,6 +1185,44 @@ pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 /// outcome a tiling compositor already produces. `host_window::present`'s
 /// `WindowMode` owns both halves.
 pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+
+/// **Probe, default off.** `on` asks the canonical-provider render seam
+/// (`feature = "provider-render"`) to state a *present tail* on the records that
+/// own a mapper-ref-texture frame: the packet's sole record, loaded by a
+/// byte-exact `Clear`, stored, and landed in a guest mapping this device can
+/// name. The provider then acquires and presents a target of its own for that
+/// record, and the frame the Store route lands — and therefore the frame the
+/// display rail's `capture_present_frame` reads — is that present target's
+/// readback rather than a pooled scratch image's (`research/docs/26` §19, R4b).
+///
+/// # What it does not change
+///
+/// Nothing about the display protocol. No `VkSurfaceKHR`, no swapchain, no
+/// vsync, no present mode: the host window keeps presenting the mapping the
+/// guest named, and the guest's own DisplaySwap still drives when a frame is
+/// captured. The switch changes *which provider-owned image the frame comes
+/// out of*, not when or whether the guest sees it.
+///
+/// # Why it is off, and why that is not a measurement
+///
+/// This one *widens*, which this file otherwise forbids: `on` puts a new action
+/// (acquire + present of a provider target) on a draw path that runs without it.
+/// Two consequences make the default the shipping answer. An in-class shape the
+/// provider refuses is a decline, not a fallback, so a presentation refusal
+/// ends the draw rather than re-running it on the engine; and every presented
+/// surface holds a provider target image (the registry is LRU-bounded at
+/// `PRESENT_TARGET_BUDGET`), which is memory a boot that never presents through
+/// the provider does not spend. The class answers every shape it cannot state
+/// by *name* before the provider is asked — a chain record, a withheld
+/// readback, a resident target — so with the switch on the only new population
+/// on the provider is the one this increment reviewed.
+///
+/// It is a probe in the narrow sense this file forbids otherwise: not reachable
+/// by accident, not on any shipping path, and the arm it selects is the one a
+/// driven boot has to price before anyone flips a default. `off` is the
+/// pre-R4b device exactly; unset and an unrecognized value are `off` too, so an
+/// operator's typo cannot select a widening rail.
+pub const RENDER_PRESENT: &str = "REIMS_VGPU_RENDER_PRESENT";
 }
 
 counts! {
