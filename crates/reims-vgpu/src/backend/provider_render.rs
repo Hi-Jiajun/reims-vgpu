@@ -69,18 +69,23 @@
 //! - no depth, stencil, MSAA, MRT, resolve, blend, colour write mask,
 //!   occlusion query, sampled image or sampler — and every one of those is a
 //!   *reason*, not a silent downgrade;
-//! - **stage buffers by the stage's own interface** (R9b/R9d): a request whose
-//!   stages bind buffers directly is the v2 census's 99.3% door, and the door
-//!   answers by what each stage's *translation* declares rather than by
+//! - **stage buffers by the stage's own interface** (R9b/R9d/R9j): a request
+//!   whose stages bind buffers directly is the v2 census's 99.3% door, and the
+//!   door answers by what each stage's *translation* declares rather than by
 //!   the presence of the binds. Neither stage declaring a `[[buffer(N)]]`
 //!   argument means the binds fill indices no descriptor can be needed for, so
 //!   the canonical pass declares and binds nothing for them and the draw is
-//!   admitted. A **read-only** declaration leaves for the provider once the
-//!   whole canonical pair can be stated — the declaration from the stage's own
-//!   reflection (stage, index, access, and the static extent it reaches), the
-//!   view from the request's own bind, whose bytes the owner rail imports
-//!   ([`StageBufferBind`], `plan_stage_buffers`) — and the three classes the
-//!   contract cannot state (`unused`, `write`, `unknown`) keep the draw on the
+//!   admitted. A **declared** argument leaves for the provider once the whole
+//!   canonical pair can be stated — the declaration from the stage's own
+//!   reflection (stage, index, the access it reports, and the reach it states:
+//!   a static ceiling or the affine proof R9f landed), the view from the
+//!   request's own bind, whose bytes the owner rail imports
+//!   ([`StageBufferBind`], `plan_stage_buffers`) — and a **writable** one is a
+//!   landing: its bytes come back through the completion's own
+//!   `BufferWriteback` and the caller places them where the bind's bytes came
+//!   from ([`StageBufferLanding`]). The declaration rides the canonical command
+//!   channel for the shapes that carry one ([`provider_wire`]), and the two
+//!   arms the contract cannot state (`unused`, `unknown`) keep the draw on the
 //!   engine under the bucket their own access names
 //!   (`StageBufferDeclaration`, `stage_buffer_gate`);
 //! - **a present tail, when the caller states one** (R4b): the record owns the
