@@ -139,6 +139,60 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     ));
 }
 
+/// The request's stated payload offset must be the offset the canonical
+/// provider's own reflection of the same AIR derives (`research/docs/26` §7):
+/// one exact-thread dispatch writes every region's payload at one offset, and
+/// the two rails read that number from two pinned translators. A request that
+/// states another offset is refused by name — fail-closed, never dispatched on
+/// either rail with the payload where the kernel does not read it.
+#[test]
+fn a_payload_offset_the_contract_does_not_state_is_refused_by_name() {
+    let _guard = owner_rail_guard();
+    let air = fixture_air();
+
+    // Positive control on the same fixture: the offset the translator derives
+    // completes and writes the kernel's result back, so the refusal below is
+    // about the hacked offset rather than about the fixture.
+    let valid = mul3add1_request();
+    match submit_compute(&air, "apv_cs", &valid, &[]) {
+        ComputeRailOutcome::ProviderCompleted(out) => {
+            assert_eq!(
+                readback_words(&out.writebacks[0].bytes),
+                vec![4u32, 7, 10, 13]
+            );
+        }
+        other => panic!("the reviewed fixture must complete: {other:?}"),
+    }
+
+    // The hack: the same payload is claimed to land at offset 16, where the
+    // kernel does not read it. The provider's contract states 0, so the two
+    // claims disagree and the dispatch is declined instead of executed.
+    let mut hacked = mul3add1_request();
+    let ComputeDispatch::Regions { push_offset, .. } = &mut hacked.dispatch else {
+        panic!("the fixture is a regions dispatch");
+    };
+    *push_offset = 16;
+    match submit_compute(&air, "apv_cs", &hacked, &[]) {
+        ComputeRailOutcome::ProviderDeclined(decline) => {
+            assert_eq!(
+                decline,
+                ProviderComputeDecline::PushOffsetMismatch {
+                    request: 16,
+                    contract: 0,
+                },
+                "the refusal names both the request's claim and the contract's offset"
+            );
+            assert_eq!(decline.slug(), "push_offset_mismatch");
+        }
+        ComputeRailOutcome::ProviderCompleted(_) => {
+            panic!("a payload offset the contract does not state must not execute")
+        }
+        ComputeRailOutcome::NotInNarrowClass(reason) => {
+            panic!("the offset agreement is an admission question, not a class one: {reason}")
+        }
+    }
+}
+
 /// S2, mirror direction: a request that stages a binding the canonical contract
 /// does not name is the two pinned translators describing different kernels.
 /// The shape keeps the reims engine — the same answer the forward rule gives —
