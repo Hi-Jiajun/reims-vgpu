@@ -4242,6 +4242,150 @@ fn the_stage_buffer_door_names_every_fact_between_a_declaration_and_the_provider
     }
 }
 
+/// R9o: the shape door's three rules, each charged under its own route.
+///
+/// The census v5 segment's first failure is `stage_buffer_shape` — 88026 of
+/// 89277 seam rows (98.6%) — and that one slug is three rules: a statement
+/// longer than the canonical contract states, one `(stage, index)` declared
+/// twice, and a vertex declaration inside the canonical layout's own
+/// `0..vertex_streams` bindings. A census can size the population of the slug
+/// and nothing about the rules inside it, so the next round's first question
+/// ("which rule answers 88026 draws") has no reading until each arm is counted
+/// beside the refusal it answers. This is that reading.
+///
+/// The refusals themselves do not move: every arm keeps the same slug
+/// (`render_provider_out_of_class_stage_buffer_shape`), the same sentence, the
+/// same point in the gate, and the same `NotInNarrowClass` answer — only the
+/// census key beside it is new. The three routes are charged where the gate
+/// answers (not where a render request arrives), so the in-class shape pays
+/// none of them and each shape below moves exactly one route.
+#[test]
+fn each_stage_buffer_shape_rule_is_counted_under_its_own_route() {
+    let _guard = engine_test_session();
+    let bases = reviewed_stages();
+    let declaration = |index: u32| StageBufferDeclaration {
+        index,
+        access: StageBufferAccess::Read,
+        footprint: StageBufferFootprint::Static { max_bytes: 4 },
+    };
+    let with_declarations = |stages: &Stages,
+                             vertex: Vec<StageBufferDeclaration>,
+                             fragment: Vec<StageBufferDeclaration>| {
+        let mut shaped = stages.clone();
+        shaped.vertex_stage_buffer_declarations = vertex;
+        shaped.fragment_stage_buffer_declarations = fragment;
+        shaped
+    };
+
+    let too_many = [
+        "stage_buffer_shape_gt4",
+        "stage_buffer_shape_duplicate",
+        "stage_buffer_shape_vertex_layout",
+    ];
+    let before = too_many.map(route_count);
+    // The three shapes are fuelled by the reviewed fixture's own vertex stream:
+    // the class states one stream as binding 0, which is what makes arm 3 a
+    // collision and what keeps arm 2's earlier slot non-colliding.
+    assert_eq!(
+        bases.vertex_attribute_locations.len(),
+        1,
+        "the reviewed shape states one vertex stream, the layout arm 3 collides with"
+    );
+
+    // An in-class control: the reviewed shape declares nothing, so it reaches
+    // the provider without the shape door answering — and charges no route.
+    let in_class = with_declarations(&bases, Vec::new(), Vec::new());
+    match provider_render::submit_render(
+        &inputs_with_binds(&in_class, RenderChainRole::SoleOrTail, &[]),
+        &narrow_request(MTL_FORMAT_RGBA8_UNORM),
+    ) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("the reviewed shape is in class: {other:?}"),
+    }
+    assert_eq!(
+        too_many.map(route_count),
+        before,
+        "an in-class shape charges no shape route"
+    );
+
+    // One shape per rule. Each is the smallest shape the rule answers, and each
+    // answers with the same slug the shape door has always used.
+    // Each shape answers with the same slug the shape door has always used;
+    // what is new is the route beside it, and the bind each one states so the
+    // gate reaches the rule rather than an earlier one (the duplicate rule sits
+    // behind the unbound check, so its slot is bound here).
+    let content = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16]));
+    let duplicate_binds = [staged_bind(RenderPipelineStage::Fragment, 1, &content)];
+    let shapes = [
+        (
+            "too many",
+            "render_provider_out_of_class_stage_buffer_shape",
+            "declare 5 stage buffers",
+            with_declarations(
+                &bases,
+                Vec::new(),
+                (0..=metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS as u32)
+                    .map(declaration)
+                    .collect(),
+            ),
+            &[] as &[StageBufferBind<'_>],
+        ),
+        (
+            "one slot twice",
+            "render_provider_out_of_class_stage_buffer_shape",
+            "[[buffer(1)]] twice",
+            with_declarations(&bases, Vec::new(), vec![declaration(1), declaration(1)]),
+            &duplicate_binds,
+        ),
+        (
+            "vertex declaration inside the layout",
+            "render_provider_out_of_class_stage_buffer_shape",
+            "1 vertex stream(s)",
+            with_declarations(&bases, vec![declaration(0)], Vec::new()),
+            &[] as &[StageBufferBind<'_>],
+        ),
+    ];
+    let mut refusals: Vec<(&str, String)> = Vec::new();
+    for (label, expected_slug, expected_sentence, shaped, binds) in &shapes {
+        let answer = match provider_render::submit_render(
+            &inputs_with_binds(shaped, RenderChainRole::SoleOrTail, binds),
+            &narrow_request(MTL_FORMAT_RGBA8_UNORM),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the shape is out of class: {other:?}"),
+        };
+        eprintln!(
+            "shape route reading: {label}\n  slug={}\n  detail={}",
+            answer.0, answer.1
+        );
+        assert_eq!(
+            answer.0, *expected_slug,
+            "{label}: the refusal slug is unchanged"
+        );
+        assert!(
+            answer.1.contains(expected_sentence),
+            "{label}: the sentence is unchanged: {}",
+            answer.1
+        );
+        refusals.push((label, answer.0));
+    }
+    // The one-counter-wearing-three-names check: each route moved exactly once,
+    // and each shape moved the route of its own rule rather than any other.
+    assert_eq!(
+        too_many.map(route_count),
+        [before[0] + 1, before[1] + 1, before[2] + 1],
+        "each rule's route is charged once, by one shape"
+    );
+    for (route, (label, _)) in too_many.into_iter().zip(&refusals) {
+        eprintln!(
+            "shape route charged: {route}={} ({label})",
+            route_count(route)
+        );
+    }
+}
+
 /// R9d's borrowed arm: a stage buffer whose bytes live in a registered guest
 /// RAM window leaves through the canonical rail's *no-copy* arm.
 ///

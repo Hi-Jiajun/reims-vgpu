@@ -773,6 +773,10 @@ fn stage_buffer_gate<'a>(
     let mut ordered = statement.declared;
     ordered.sort_by_key(|(stage, declaration, _)| (stage.code(), declaration.index));
     if ordered.len() > MAX_RENDER_STAGE_BUFFERS {
+        // The first of the three rules this slug names, counted under its own
+        // route so the next census can size it (R9o): the refusal itself is
+        // unchanged, still the bare shape slug.
+        note_stage_buffer_shape(StageBufferShapeRoute::TooMany);
         return Err(OutOfClass::owned(
             "render_provider_out_of_class_stage_buffer_shape",
             format!(
@@ -792,6 +796,8 @@ fn stage_buffer_gate<'a>(
             .iter()
             .any(|stated| stated.stage == stage && stated.index == declaration.index)
         {
+            // The duplicate rule's own route (R9o), beside the unchanged slug.
+            note_stage_buffer_shape(StageBufferShapeRoute::Duplicate);
             return Err(OutOfClass::owned(
                 "render_provider_out_of_class_stage_buffer_shape",
                 format!(
@@ -809,6 +815,9 @@ fn stage_buffer_gate<'a>(
         // described twice is what the contract refuses by name
         // (`StageBufferVertexLayoutConflict`).
         if stage == RenderPipelineStage::Vertex && (declaration.index as usize) < vertex_streams {
+            // The layout-collision rule's own route (R9o), beside the
+            // unchanged slug.
+            note_stage_buffer_shape(StageBufferShapeRoute::VertexLayout);
             return Err(OutOfClass::owned(
                 "render_provider_out_of_class_stage_buffer_shape",
                 format!(
@@ -2440,6 +2449,52 @@ pub fn stage_buffer_unused_skip_route(skipped: usize) -> &'static str {
         2..=4 => "stage_buffer_skipped_unused_2_4",
         _ => "stage_buffer_skipped_unused_gt4",
     }
+}
+
+/// The census route of one `stage_buffer_shape` refusal (R9o,
+/// `research/docs/26` §30).
+///
+/// The refusal slug is one name three rules answer under — more declarations
+/// than the canonical contract states ([`MAX_RENDER_STAGE_BUFFERS`]), one
+/// `(stage, index)` declared twice, and a vertex declaration inside the
+/// canonical layout's own `0..vertex_streams` bindings — and until this
+/// increment every one of them was counted as the bare slug: the
+/// 2026-09-17 census v5 read 88026 / 89277 first failures under
+/// `render_provider_out_of_class_stage_buffer_shape` and could not say which
+/// rule answered them (`research/docs/26` §0.4). Each arm now charges its own
+/// route beside the refusal, `note_store_route(name)` does the counting, and
+/// the sentence every arm answers with is unchanged.
+pub fn stage_buffer_shape_route(stage_buffer_shape: StageBufferShapeRoute) -> &'static str {
+    match stage_buffer_shape {
+        StageBufferShapeRoute::TooMany => "stage_buffer_shape_gt4",
+        StageBufferShapeRoute::Duplicate => "stage_buffer_shape_duplicate",
+        StageBufferShapeRoute::VertexLayout => "stage_buffer_shape_vertex_layout",
+    }
+}
+
+/// Which of [`stage_buffer_shape_route`]'s three rules a draw answered.
+///
+/// An enum rather than a `&'static str` at the call sites for the reason the
+/// routes themselves exist: three arms that answer with different census names
+/// are three facts, and a typo in a bare string would file two of them under
+/// one name with nothing failing. The gate is the only constructor, one arm
+/// per `return`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StageBufferShapeRoute {
+    /// The statement carries more declarations than
+    /// [`MAX_RENDER_STAGE_BUFFERS`] states.
+    TooMany,
+    /// One `(stage, index)` is declared twice.
+    Duplicate,
+    /// A vertex-stage declaration occupies an index the pipeline's own vertex
+    /// layout already describes (`0..vertex_streams`).
+    VertexLayout,
+}
+
+/// Charge one `stage_buffer_shape` arm's route beside the refusal it answers.
+#[inline]
+fn note_stage_buffer_shape(stage_buffer_shape: StageBufferShapeRoute) {
+    crate::runtime::drain::note_store_route(stage_buffer_shape_route(stage_buffer_shape));
 }
 
 /// Drop every render registration that belonged to a device incarnation.
@@ -4359,5 +4414,33 @@ mod clear_payload_tests {
             checked += 1;
         }
         assert_eq!(checked, 65_536 - 2 * 1023);
+    }
+
+    /// The three `stage_buffer_shape` arms' routes are three names, and they
+    /// are *these* three: the census reads those keys by hand, so a rename has
+    /// to fail here rather than silently re-file a population (R9o).
+    #[test]
+    fn the_stage_buffer_shape_arms_charge_three_distinct_routes() {
+        let routes = [
+            stage_buffer_shape_route(StageBufferShapeRoute::TooMany),
+            stage_buffer_shape_route(StageBufferShapeRoute::Duplicate),
+            stage_buffer_shape_route(StageBufferShapeRoute::VertexLayout),
+        ];
+        assert_eq!(
+            routes,
+            [
+                "stage_buffer_shape_gt4",
+                "stage_buffer_shape_duplicate",
+                "stage_buffer_shape_vertex_layout",
+            ]
+        );
+        let mut distinct = routes.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            routes.len(),
+            "one name per rule: {routes:?}"
+        );
     }
 }
