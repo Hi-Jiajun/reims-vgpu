@@ -25,7 +25,7 @@ use metal_api_core::provider::{
     AttachmentFormat, BufferAccess, BufferSource, ComputeProvider, FieldValue, FootprintProof,
     RenderPipelineContract, RenderPipelineStage, SemanticDigest, StageBufferBinding,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep,
-    MAX_RENDER_SAMPLERS,
+    MAX_RENDER_SAMPLERS, MAX_RENDER_TEXTURES,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -254,6 +254,27 @@ fn fetch_and_sample_stages() -> Stages {
     sampled_fragment_stages(
         "render_frag_fetch_and_sample.air",
         "reims_fetch_and_sample_frag",
+    )
+}
+
+/// The sparse shape (R16): the runtime-sampler fixture's own body with its one
+/// texture argument moved to `[[texture(3)]]` — Metal index 3 with nothing in
+/// the argument table below it (`research/docs/23` §104).
+///
+/// This is the census v12 shape: all 35269 positional refusals of that boot read
+/// literally "sampled texture 0 is `[[texture(3)]]`", and the captured modules
+/// behind them carry their `img_tex_0A` texture at index 3 beside the runtime
+/// `img_samp_0` `[[sampler(0)]]` argument — the family this fixture states.
+///
+/// The declarations are the *production* walk over the fixture's own
+/// translation, and the expectation the sparse tests compare them with is
+/// written by hand in `the_sparse_declarations_are_what_the_module_says`, so a
+/// fixture whose reflection moves fails an assertion instead of quietly
+/// changing what the seam is asked about.
+fn sparse_sampled_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_runtime_sampler_index3.air",
+        "reims_runtime_sampled_index3_frag",
     )
 }
 
@@ -4450,25 +4471,19 @@ fn the_sampled_texture_shapes_beside_the_entry_stay_on_the_engine_by_name() {
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_color_input");
 
-    // 3. The module's positional list: `[[texture(1)]]` with no `[[texture(0)]]`
-    //    before it has no entry the contract can state.
-    let mut shifted = sampled_stages();
-    shifted.fragment_texture_declarations = vec![RenderTextureDeclaration {
-        index: 1,
-        ..shifted.fragment_texture_declarations[0]
-    }];
-    let (slug, detail) = answer("shifted texture index", &shifted, &sampled());
-    eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_texture_binding");
-    assert!(
-        detail.contains("[[texture(1)]]") || detail.contains("texture 1"),
-        "the sentence names the argument and the position: {detail}"
-    );
-    //    Two sampled textures: the widened cap (`research/docs/23` §102,
-    //    E-RS2) admits the declaration, so this shape now reaches the
-    //    binding-pairing gate — the pass binds one view and the second
-    //    declaration has nothing to pair with, which is refused by its own
-    //    name rather than by the count.
+    // 3. The module's declaration list (R10/R16, `research/docs/23` §101, §104):
+    //    a `[[texture(n)]]` that is not its own position is *in* the class since
+    //    E-RS3 — the two lists pair by the index each entry states rather than
+    //    by position, and the sparse fixture's own reading lives in
+    //    `a_sparse_texture_declaration_lands_the_dense_frame`. What this walk
+    //    still answers under `..._texture_binding` is the list's own rules — an
+    //    index at the contract's bound and an index stated twice
+    //    (`the_sparse_declaration_rules_stay_refusals_by_name`) — and a
+    //    declaration no draw filled. Two sampled textures: the widened cap
+    //    (`research/docs/23` §102, E-RS2) admits the declarations, so this shape
+    //    reaches the binding-pairing gate — the pass binds one view and the
+    //    second declaration has nothing to pair with, which is refused by its
+    //    own name rather than by the count.
     let mut two_textures = sampled_stages();
     let first = two_textures.fragment_texture_declarations[0];
     two_textures.fragment_texture_declarations = vec![
@@ -5420,6 +5435,268 @@ fn a_declaration_that_does_not_repeat_the_module_is_refused_by_name() {
         refused.fields.get("module_access"),
         Some(&FieldValue::Text("fetched".to_owned())),
         "and the module's own arm: {refused:?}"
+    );
+}
+
+/// R16: the sparse declarations, read back off the fixture's own translation.
+///
+/// The expectation is written by hand — one `[[texture(3)]]` at the translator's
+/// texture band base *plus* its own index, the runtime `[[sampler(0)]]`
+/// argument's device slot beside it, and no AIR static sampler anywhere — so a
+/// fixture or reflection that moves fails here rather than silently changing
+/// what the seam is asked.
+#[test]
+fn the_sparse_declarations_are_what_the_module_says() {
+    let stages = sparse_sampled_stages();
+    assert_eq!(
+        stages.fragment_texture_declarations,
+        vec![RenderTextureDeclaration {
+            index: 3,
+            binding: 35,
+            sampler_binding: 160,
+            sampler: RenderSamplerState::Runtime { index: 0 },
+            shape: RenderTextureShape::Sampled2D,
+        }],
+        "the fragment fixture declares one sampled 2D texture at Metal index 3 — \
+         binding 32 + 3, with nothing declared below it — read through the runtime \
+         `[[sampler(0)]]` argument its own sample site names"
+    );
+    assert_eq!(
+        stages.sampler_family,
+        RenderSamplerFamily {
+            runtime: vec![RenderRuntimeSampler {
+                index: 0,
+                binding: 160,
+            }]
+            .into(),
+            statics: Vec::new().into(),
+        },
+        "the stage binds one runtime `[[sampler(0)]]` argument and carries no AIR static sampler"
+    );
+    assert!(
+        stages.texture_interface_refusals.is_empty(),
+        "a texture at Metal index 3 is inside the translated family: {:?}",
+        stages.texture_interface_refusals
+    );
+    eprintln!(
+        "R16 sparse declarations: {:?} family={:?}",
+        stages.fragment_texture_declarations, stages.sampler_family,
+    );
+}
+
+/// R16: the sparse declaration executes, and lands the dense sibling's own frame.
+///
+/// The census v12 shape — `[[texture(3)]]` with nothing below it — used to be
+/// the class's own answer (`render_provider_out_of_class_texture_binding`,
+/// 35269 = 57.8% of that boot's first-failure lines) because the canonical
+/// contract's texture list was positional. Since E-RS3 (v104) the two lists pair
+/// by the index each entry states, and the two fixtures here are one body under
+/// two indices — the same sample point, the same request state, the same
+/// payload — so the reading is a claim with a falsifier in it:
+///
+/// - the sparse request is *executed by the canonical provider*, not answered by
+///   the class gate, and its frame is byte for byte the `[[texture(0)]]`
+///   sibling's;
+/// - the frame follows the payload the request carries, so the binding really
+///   reached the shader rather than a descriptor nobody filled;
+/// - the engine and the canonical provider land the same frame for the sparse
+///   request, byte for byte.
+#[test]
+fn a_sparse_texture_declaration_lands_the_dense_frame() {
+    let _guard = engine_test_session();
+    let sparse = sparse_sampled_stages();
+    let dense = runtime_sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    use reims_vgpu::protocol::sampler as mtl;
+    let nearest = mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+    let clamp = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    let texel = |texels: &[Vec<u8>], x: usize, y: usize| -> [u8; 4] {
+        let texel = &texels[y * width as usize + x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    // The fixture samples `(1.375, 0.875)` of the 8x4 surface, which clamps to
+    // texel (7, 3) under nearest + clamp-to-edge.
+    let want = texel(&texels, 7, 3);
+    let request = |stages: &Stages, texels: Vec<Vec<u8>>| {
+        runtime_sampled_request(stages, texels, (width, height), nearest, clamp)
+    };
+    let sparse_frame =
+        provider_pixels("sparse texture", &sparse, &request(&sparse, texels.clone()));
+    assert_uniform_frame("sparse texture", &sparse_frame, width, height, want);
+    let dense_frame = provider_pixels("dense sibling", &dense, &request(&dense, texels.clone()));
+    assert_uniform_frame("dense sibling", &dense_frame, width, height, want);
+    assert_frames_equal(
+        "the index is a binding and not a position",
+        &sparse_frame,
+        &dense_frame,
+    );
+    let Some(engine) = engine_pixels("sparse texture", &sparse, request(&sparse, texels.clone()))
+    else {
+        return;
+    };
+    assert_uniform_frame("sparse texture (engine)", &engine, width, height, want);
+    assert_frames_equal("sparse texture", &sparse_frame, &engine);
+
+    // The payload: the texel the fixture reads reaches the frame through the
+    // `[[texture(3)]]` binding, and a texel it never reads does not.
+    let mut moved = texels.clone();
+    moved[3 * width as usize + 7] = vec![17, 200, 0, 255];
+    let moved_frame = provider_pixels(
+        "other sparse texel",
+        &sparse,
+        &request(&sparse, moved.clone()),
+    );
+    assert_uniform_frame(
+        "other sparse texel",
+        &moved_frame,
+        width,
+        height,
+        [17, 200, 0, 255],
+    );
+    assert_frames_differ(
+        "the read texel moved the sparse frame",
+        &sparse_frame,
+        &moved_frame,
+    );
+    let mut unread = texels.clone();
+    unread[0] = vec![9, 9, 9, 255];
+    let untouched = provider_pixels("unread texel", &sparse, &request(&sparse, unread));
+    assert_frames_equal(
+        "a texel the sparse fixture never reads does not reach the frame",
+        &sparse_frame,
+        &untouched,
+    );
+    if let Some(engine_moved) =
+        engine_pixels("other sparse texel", &sparse, request(&sparse, moved))
+    {
+        assert_frames_equal("other sparse texel", &moved_frame, &engine_moved);
+    }
+    eprintln!(
+        "R16 sparse texture: `[[texture(3)]]` (binding 35) declared beside runtime \
+         `[[sampler(0)]]` (160), executed by both rails, frame {:?} byte for byte the \
+         `[[texture(0)]]` sibling's; moving the read texel moved it and an unread one did not",
+        want,
+    );
+}
+
+/// R16: the list's own rules stay refusals by name.
+///
+/// The positional rule is gone, so what is left of the *binding* face is the set
+/// of lists no canonical declaration can state — an index at the contract's own
+/// bound, one index stated twice, more textures than the count cap — beside the
+/// declaration the draw never bound. Each answers under its own name and its
+/// sentence names the fact a census line is read against.
+#[test]
+fn the_sparse_declaration_rules_stay_refusals_by_name() {
+    let _guard = engine_test_session();
+    let stages = sparse_sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    use reims_vgpu::protocol::sampler as mtl;
+    let request = |stages: &Stages, texels: Vec<Vec<u8>>| {
+        runtime_sampled_request(
+            stages,
+            texels,
+            (width, height),
+            mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+            mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        )
+    };
+    let answer = |label: &str, stages: &Stages, req: &DrawRequest| -> (String, String) {
+        match provider_render::submit_render(&inputs(stages, RenderChainRole::SoleOrTail), req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the shape is out of class: {other:?}"),
+        }
+    };
+
+    // The positive control: the fixture's own sparse shape is in the class and
+    // reaches the provider, which is what makes the four refusals below
+    // statements about the *rules* rather than about the shape.
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &request(&stages, texels.clone()),
+    ) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("the sparse fixture is in the class: {other:?}"),
+    }
+
+    // 1. An index at the contract's own bound (`MAX_RENDER_TEXTURE_INDEX`): the
+    //    count cap and the index bound are two different facts.
+    let mut past_the_bound = sparse_sampled_stages();
+    past_the_bound.fragment_texture_declarations = vec![RenderTextureDeclaration {
+        index: 16,
+        binding: 48,
+        ..past_the_bound.fragment_texture_declarations[0]
+    }];
+    let (slug, detail) = answer(
+        "texture index at the bound",
+        &past_the_bound,
+        &request(&past_the_bound, texels.clone()),
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_binding");
+    assert!(
+        detail.contains("[[texture(16)]]")
+            && detail.contains("16")
+            && detail.contains("render_texture_index_unsupported"),
+        "the sentence names the index, the bound and the contract's own refusal: {detail}"
+    );
+
+    // 2. The same index twice: the contract holds no index twice, and this walk
+    //    answers the repeat rather than dropping one of the two declarations.
+    let mut repeated = sparse_sampled_stages();
+    let first = repeated.fragment_texture_declarations[0];
+    repeated.fragment_texture_declarations = vec![first, first];
+    let (slug, detail) = answer(
+        "texture index twice",
+        &repeated,
+        &request(&repeated, texels.clone()),
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_binding");
+    assert!(
+        detail.contains("[[texture(3)]]")
+            && detail.contains("twice")
+            && detail.contains("trace_contract_invalid"),
+        "the sentence names the repeated index and the contract's own refusal: {detail}"
+    );
+
+    // 3. The count cap, one face over from the index bound: more textures than
+    //    the canonical contract states, in canonical order so the cap is what
+    //    the walk answers.
+    let mut wide = sparse_sampled_stages();
+    wide.fragment_texture_declarations = (0..=u32::try_from(MAX_RENDER_TEXTURES).unwrap())
+        .map(|index| RenderTextureDeclaration {
+            index,
+            binding: 32 + index,
+            ..first
+        })
+        .collect::<Vec<_>>();
+    let (slug, detail) = answer(
+        "textures past the cap",
+        &wide,
+        &request(&wide, texels.clone()),
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_count");
+    assert!(
+        detail.contains("8") && detail.contains("9"),
+        "the sentence names the cap and the count: {detail}"
+    );
+
+    // 4. The declaration the draw never bound: the request's own copy sits at
+    //    the *dense* slot, so the `[[texture(3)]]` declaration has no view.
+    let mut unbound = request(&stages, texels.clone());
+    unbound.sampled_images[0].binding = 32;
+    let (slug, detail) = answer("unbound sparse texture", &stages, &unbound);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_unbound");
+    assert!(
+        detail.contains("[[texture(3)]]"),
+        "the sentence names the declaration the draw did not fill: {detail}"
     );
 }
 

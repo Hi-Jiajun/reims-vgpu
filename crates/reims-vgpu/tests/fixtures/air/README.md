@@ -31,3 +31,13 @@ the same bodies as `metal-api-emulator`'s owned synthetic `render_fetch_texture_
 fixtures (E-RS4), with this corpus's datalayout pair — the one this rail's translator reads — and
 this rail's entry names; re-assemble them from the `.ll` with `llvm-as` 22.1.8 like every other
 fixture here.
+
+`render_frag_runtime_sampler_index3.{ll,air}` is the R16 sparse-declaration fixture: the
+runtime-sampler fixture's own body with its one texture argument moved to `[[texture(3)]]`, so the
+stage's texture argument table has nothing at 0, 1 or 2. It is the shape the census v12 read 35269
+times (57.8% of that boot's first-failure lines, every one of them the seam's positional refusal)
+and the shape the captured modules behind those lines carry: a texture declared at Metal index 3
+beside a runtime `[[sampler(0)]]` argument. The `.ll` is the same body as
+`render_frag_runtime_sampler.ll` (R12) under the new index, which is what makes "the index is a
+binding and not a position" a byte-for-byte comparison against that fixture's frame; re-assemble it
+from the `.ll` with `llvm-as` 22.1.8 like every other fixture here.

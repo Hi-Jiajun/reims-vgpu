@@ -71,17 +71,19 @@
 //!   negative or fractional origin, an empty or out-of-bounds rect, a depth
 //!   range of its own, or more than one rect ([`viewport_admits`], one bucket
 //!   per shape);
-//! - **one sampled texture per fragment-stage `[[texture(i)]]`, declared beside
+//! - **one sampled texture per fragment-stage `[[texture(n)]]`, declared beside
 //!   its bind** (R10, `research/docs/23` §101): the canonical pass's texture
 //!   list *is* the fragment stage's texture argument space, so the class states
-//!   one declaration per reflected `[[texture(i)]]` — the module's own AIR
-//!   sampler state, the positional index, and the one shape the render sampler
-//!   uploads (a single-sample, non-arrayed, read-only 2D surface of
-//!   `rgba8_unorm` texels at the render area's own extent) — beside the draw's
-//!   own bind, and requires the bind's sampler state to repeat the module's.
-//!   Every other shape is a named exit ([`sampled_textures`]): a resource
-//!   family the translated rail does not execute, a texture that is not its own
-//!   position, a reflected shape or state outside the family, an unbound
+//!   one declaration per reflected `[[texture(n)]]` — the module's own AIR
+//!   sampler state, the Metal index the entry states (the two lists pair by
+//!   that index rather than by position since E-RS3, §104), and the one shape
+//!   the render sampler uploads (a single-sample, non-arrayed, read-only 2D
+//!   surface of `rgba8_unorm` texels at the render area's own extent) — beside
+//!   the draw's own bind, and requires the bind's sampler state to repeat the
+//!   module's. Every other shape is a named exit ([`sampled_textures`]): a
+//!   resource family the translated rail does not execute, a texture index at
+//!   or above the contract's own bound or a list that repeats an index or walks
+//!   backwards, a reflected shape or state outside the family, an unbound
 //!   declaration, a bind whose texels are a guest gather or a resident image, a
 //!   texture of another extent, and a draw whose sampler says another state;
 //! - **the attachment's own blend state** (R10, `research/docs/23` §100): a
@@ -385,8 +387,8 @@ use metal_api_core::provider::{
     SemanticDigest, StageBufferBinding, StageBufferView, StoreOp, TextureAccess,
     TextureBindingContract, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
-    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_VERTEX_BUFFERS,
-    PROVIDER_SCHEMA_VERSION,
+    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_RENDER_TEXTURE_INDEX,
+    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::Device;
 use metal_api_vulkan::{RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage};
@@ -781,9 +783,11 @@ pub struct RenderSamplerFamily {
 /// own bind pair by number here exactly as they do inside the engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderTextureDeclaration {
-    /// The Metal `[[texture(n)]]` argument index. The canonical contract is
-    /// positional (`entry i` is `[[texture(i)]]`), so a declaration whose index
-    /// is not its position is a shape the class keeps on the engine by name.
+    /// The Metal `[[texture(n)]]` argument index. The canonical contract pairs
+    /// its two texture lists by the index each entry *states* (E-RS3,
+    /// `research/docs/23` §104), so this — and not the entry's position — is
+    /// what the declaration's own `metal_binding` carries and what the two
+    /// lists are held to each other by.
     pub index: u32,
     /// The device binding the request resolves this texture's view at.
     pub binding: u32,
@@ -1232,9 +1236,13 @@ fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
 ///    resource family the translated rail does not execute — a storage image,
 ///    a texture array, a framebuffer-fetch colour input, a vertex-stage image
 ///    — is refused by the provider by name, so the class answers it here
-///    (`render_provider_out_of_class_texture_interface`). A `[[texture(n)]]`
-///    that is not its own position has no positional list the contract can
-///    state (`..._texture_binding`), a reflected shape outside the executable
+///    (`render_provider_out_of_class_texture_interface`). The two texture
+///    lists pair by the index each entry *states* rather than by position (the
+///    rule E-RS3 landed on the canonical side, `research/docs/23` §104), so a
+///    list that skips an index is one the class states — while an index the
+///    contract's own bound refuses, or a list that would repeat an index or
+///    walk backwards out of the module's argument order, stays on the engine
+///    under `..._texture_binding`. A reflected shape outside the executable
 ///    family is `..._texture_shape`, and a missing or unsupported AIR static
 ///    sampler is `..._texture_sampler` — the state comes from the *module*, not
 ///    from the draw, which is exactly the rule E-RS1 landed on the canonical
@@ -1365,17 +1373,62 @@ fn sampled_textures<'a>(
     // them and canonicalised below (the contract's list is ascending and
     // unique).
     let mut runtime_samplers: Vec<NarrowRuntimeSampler> = Vec::new();
-    for (position, declaration) in inputs.fragment_texture_declarations.iter().enumerate() {
-        let position = u32::try_from(position).unwrap_or(u32::MAX);
-        if declaration.index != position {
+    // The index the previous declaration stated (E-RS3, `research/docs/23`
+    // §104): the canonical contract's two texture lists pair by the index each
+    // entry *states* — entry `i` is whatever `[[texture(n)]]` argument it names,
+    // so a list may skip an index — and each list is canonical (ascending by
+    // that index, no index twice). The walk keeps the module's own argument
+    // order and answers a list that would repeat an index or walk backwards by
+    // name instead of reordering or dropping one of its arguments.
+    let mut previous: Option<u32> = None;
+    for declaration in inputs.fragment_texture_declarations.iter() {
+        if let Some(previous) = previous {
+            if previous == declaration.index {
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_texture_binding",
+                    format!(
+                        "a fragment stage that declares `[[texture({})]]` twice stays on the \
+                         engine: the canonical contract's two texture lists pair by the index \
+                         each entry states and hold no index twice, and the contract refuses the \
+                         repeat by name (`trace_contract_invalid`, \"duplicate Metal binding {}\") \
+                         rather than executing one declaration of the two",
+                        declaration.index, declaration.index,
+                    ),
+                ));
+            }
+            if previous > declaration.index {
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_texture_binding",
+                    format!(
+                        "a fragment stage whose `[[texture({})]]` follows `[[texture({previous})]]` \
+                         in its own declaration walk stays on the engine: the canonical \
+                         contract's texture list is canonical — ascending by the index each entry \
+                         states — so a list that would have to walk backwards is not one this \
+                         class states, and the contract refuses it by name \
+                         (`trace_contract_invalid`) rather than sorting a module's own arguments",
+                        declaration.index,
+                    ),
+                ));
+            }
+        }
+        previous = Some(declaration.index);
+        // The *index* bound, one face over from the list's own order (E-RS3):
+        // the count cap and the index bound are two different facts, and the
+        // contract publishes this one for the fragment texture argument table
+        // every admitted device's sampled-image band covers
+        // (`MAX_RENDER_TEXTURE_INDEX`). An index at or above it is refused by
+        // name (`render_texture_index_unsupported`) rather than bound into a
+        // descriptor band the review did not cover.
+        if declaration.index >= MAX_RENDER_TEXTURE_INDEX {
             return Err(OutOfClass::owned(
                 "render_provider_out_of_class_texture_binding",
                 format!(
-                    "a fragment stage whose sampled texture {} is `[[texture({})]]` stays on the \
-                     engine: the canonical contract's texture list is positional — entry `i` is \
-                     the fragment stage's `[[texture(i)]]` and pairs with `pass.textures[i]` — so \
-                     a list that would have to skip an index is not one this class can state",
-                    position, declaration.index,
+                    "a fragment stage whose sampled texture is `[[texture({})]]` stays on the \
+                     engine: the canonical contract's index bound for a render texture is {} \
+                     (`MAX_RENDER_TEXTURE_INDEX`) and the contract refuses an index at or above it \
+                     by name (`render_texture_index_unsupported`) rather than binding a \
+                     descriptor band the review did not cover",
+                    declaration.index, MAX_RENDER_TEXTURE_INDEX,
                 ),
             ));
         }
@@ -1508,10 +1561,11 @@ fn sampled_textures<'a>(
                 "render_provider_out_of_class_texture_unbound",
                 format!(
                     "a draw that samples `[[texture({})]]` without binding a texture there stays \
-                     on the engine: the canonical pass pairs declaration {} with \
-                     `pass.textures[{}]`, and a declaration without a view would leave the \
-                     descriptor the module reads undefined",
-                    declaration.index, position, position,
+                     on the engine: the canonical pass pairs the declaration that states \
+                     `metal_binding` {} with the pass's own view at that index (E-RS3), and a \
+                     declaration without a view would leave the descriptor the module reads \
+                     undefined",
+                    declaration.index, declaration.index,
                 ),
             ));
         };
@@ -4396,12 +4450,13 @@ struct NarrowSampling<'a> {
     runtime_samplers: Vec<NarrowRuntimeSampler>,
 }
 
-/// One admitted texture: the canonical binding (its position), the bytes the
-/// fragment stage reads, and the sampler form its declaration states
-/// (R10/R12/R15).
+/// One admitted texture: the canonical binding (the Metal index it states, in
+/// the contract's ascending order), the bytes the fragment stage reads, and the
+/// sampler form its declaration states (R10/R12/R15/R16).
 struct NarrowTexture<'a> {
-    /// The Metal `[[texture(n)]]` index, which the contract requires to equal
-    /// the entry's position.
+    /// The Metal `[[texture(n)]]` index the entry states — the fact the
+    /// contract pairs the pass's view and the pipeline's declaration by
+    /// (E-RS3), rather than the entry's position.
     index: u32,
     width: u64,
     height: u64,
@@ -4490,10 +4545,13 @@ struct NarrowPass<'a> {
     /// canonical order (vertex bindings first by index, then fragment), empty
     /// for every request whose stages declare no `[[buffer(N)]]` argument.
     stage_buffers: Vec<NarrowStageBuffer<'a>>,
-    /// The sampled textures the pass binds, in the contract's own positional
-    /// order (R10): entry `i` is declaration `i`, which pairs with the
-    /// fragment stage's `[[texture(i)]]`. Empty for every request whose
-    /// fragment stage declares no sampled texture.
+    /// The sampled textures the pass binds, in the contract's own canonical
+    /// order (R10/R16): ascending by the Metal index each view states, which is
+    /// the index the same entry's declaration states — the two lists pair by
+    /// that index rather than by position (E-RS3, `research/docs/23` §104), so
+    /// entry `i` may be any `[[texture(n)]]` argument and a list may skip an
+    /// index. Empty for every request whose fragment stage declares no sampled
+    /// texture.
     textures: Vec<NarrowTexture<'a>>,
     /// The runtime sampler states the pass states (R12): one entry per
     /// `[[sampler(n)]]` argument an admitted texture reads through, ascending
@@ -4590,16 +4648,17 @@ impl NarrowPass<'_> {
     }
 
     /// The render texture declarations this pass's pipeline is registered with
-    /// (R10, `research/docs/23` §101).
+    /// (R10/R16, `research/docs/23` §101, §104).
     ///
-    /// One entry per admitted texture, in the same positional order the pass
-    /// states its views: the contract pairs declaration `i` with
-    /// `pass.textures[i]`. A static-sampled entry carries the module's own AIR
-    /// state — the state the canonical rail creates its `VkSampler` from and
-    /// the state the translated arm compares against its own translation of the
-    /// same module — while a runtime-sampled one names the `[[sampler(n)]]`
-    /// argument it reads through and states no state, which the pass states
-    /// instead (`NarrowPass::runtime_samplers`, R12).
+    /// One entry per admitted texture, in the same canonical order the pass
+    /// states its views — ascending by the Metal index each entry states, which
+    /// is the index the contract pairs the two lists by (E-RS3). A
+    /// static-sampled entry carries the module's own AIR state — the state the
+    /// canonical rail creates its `VkSampler` from and the state the translated
+    /// arm compares against its own translation of the same module — while a
+    /// runtime-sampled one names the `[[sampler(n)]]` argument it reads through
+    /// and states no state, which the pass states instead
+    /// (`NarrowPass::runtime_samplers`, R12).
     fn texture_declarations(&self) -> Vec<TextureBindingContract> {
         self.textures
             .iter()
@@ -5720,11 +5779,12 @@ fn submit_narrow(
     }
 
     // The v101 sampled-texture half (R10): one view per admitted declaration,
-    // in the contract's positional order, each carrying the request's own
-    // tightly packed `rgba8_unorm` copy as a trace-owned source. The sampler
-    // state is *not* a view field: the declaration states it, and the canonical
-    // rail creates its `VkSampler` from that state — which is why the class gate
-    // requires the draw's bind to repeat it rather than trusting either half.
+    // in the contract's canonical order, each carrying the request's own
+    // tightly packed `rgba8_unorm` copy as a trace-owned source and stating the
+    // Metal index its declaration states (E-RS3). The sampler state is *not* a
+    // view field: the declaration states it, and the canonical rail creates its
+    // `VkSampler` from that state — which is why the class gate requires the
+    // draw's bind to repeat it rather than trusting either half.
     let mut textures = Vec::with_capacity(pass.textures.len());
     for texture in &pass.textures {
         textures.push(TextureView {
@@ -5831,10 +5891,10 @@ fn submit_narrow(
             acquire: AcquirePolicy::Blocking,
         }),
         // The v70 sampler channel, filled since v101 (R10): one view per
-        // admitted declaration, in the contract's positional order, paired
-        // with the declaration of the same position by
-        // `validate_against` — and the fragment stage's `[[texture(i)]]` by the
-        // contract's own rule.
+        // admitted declaration, in the contract's canonical order, paired with
+        // the declaration that states the same Metal index by `validate_against`
+        // (E-RS3) — which is the fragment stage's own `[[texture(n)]]` argument
+        // by the contract's own rule, whether or not the list skips an index.
         textures,
         // The v83 stage-buffer half (R9d): one view per declaration the
         // pipeline's own contract carries, in the same canonical order
@@ -6461,10 +6521,10 @@ fn register_render_pipeline(
                 footprint: buffer.proof.clone(),
             })
             .collect(),
-        // The render texture declarations (E-RS1, `research/docs/23` §101):
-        // one entry per admitted sampled texture, each restating the module's
-        // own AIR sampler state, in the positional order the pass's own views
-        // are stated in.
+        // The render texture declarations (E-RS1, `research/docs/23` §101): one
+        // entry per admitted sampled texture, each restating the module's own
+        // AIR sampler state at the Metal index the pass's own view states
+        // (E-RS3, §104), in the same canonical order those views are stated in.
         textures: pass.texture_declarations(),
     };
     let fingerprint = contract_fingerprint(&contract);

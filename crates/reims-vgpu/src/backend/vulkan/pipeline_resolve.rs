@@ -322,10 +322,11 @@ pub struct ResolvedRenderPipeline {
     ///
     /// A *stage-level* fact like the stage-buffer lists beside it, collected
     /// once per resolved pipeline because the reflection is memoized with the
-    /// translation and the class gate runs on every draw. The canonical
-    /// render sampler's contract is positional and its declaration has to
-    /// repeat the module's own state, so this is the half of the pair the
-    /// provider cannot read out of the request.
+    /// translation and the class gate runs on every draw. The canonical render
+    /// sampler's declarations pair with the pass's own binds by the Metal index
+    /// each entry states (E-RS3, `research/docs/23` §104) and have to repeat the
+    /// module's own state, so this is the half of the pair the provider cannot
+    /// read out of the request.
     #[cfg(feature = "provider-render")]
     pub fragment_texture_declarations:
         Arc<[crate::backend::provider_render::RenderTextureDeclaration]>,
