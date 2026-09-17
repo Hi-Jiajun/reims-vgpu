@@ -5136,7 +5136,8 @@ fn narrow_class<'a>(
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_vertex_format",
                 "a vertex attribute outside the canonical format set stays on the engine \
-                 (Float32x2, Float32x3, Float32x4, Uint32)",
+                 (Float32x2, Float32x3, Float32x4, Uint32, Unorm8x2, Unorm8x4, Unorm16x2, \
+                 Unorm16x4)",
             ));
         };
         let stride = u64::from(attribute.stride);
@@ -5359,6 +5360,20 @@ fn staged_bytes(content: &BufferContent) -> Option<&[u8]> {
 }
 
 /// The contract's vertex format for one reims attribute format.
+///
+/// The four normalized 8/16-bit storages are the widening E-VF1 landed on the
+/// canonical contract (`research/docs/23` §103): each is mapped here by the
+/// Metal storage of the same meaning, and the read the contract names (`c / 255`
+/// for the 8-bit pair, `c / 65535` for the 16-bit one) is the one both rails
+/// already apply. Every other storage — the signed normalized family, the
+/// three-channel 8/16-bit shapes, the packed words, the `_bgra` channel order —
+/// keeps the engine under the gate's own name.
+///
+/// The *component shape* a storage pairs with is not this map's answer: an
+/// `unorm*4` declaration beside a `float4` AIR member is the reviewed pairing,
+/// and the same declaration beside a `float2` member is refused by the
+/// provider's own registration gate (`render_stage_reflection_mismatch`), the
+/// shape rule [`VertexFormat`]'s Vulkan side states.
 fn vertex_format(
     format: crate::backend::vulkan::engine::VertexAttributeFormat,
 ) -> Option<VertexFormat> {
@@ -5368,6 +5383,10 @@ fn vertex_format(
         raw::MTL_VERTEX_FORMAT_FLOAT3 => Some(VertexFormat::Float32x3),
         raw::MTL_VERTEX_FORMAT_FLOAT4 => Some(VertexFormat::Float32x4),
         raw::MTL_VERTEX_FORMAT_U_INT => Some(VertexFormat::Uint32),
+        raw::MTL_VERTEX_FORMAT_U_CHAR2_NORMALIZED => Some(VertexFormat::Unorm8x2),
+        raw::MTL_VERTEX_FORMAT_U_CHAR4_NORMALIZED => Some(VertexFormat::Unorm8x4),
+        raw::MTL_VERTEX_FORMAT_U_SHORT2_NORMALIZED => Some(VertexFormat::Unorm16x2),
+        raw::MTL_VERTEX_FORMAT_U_SHORT4_NORMALIZED => Some(VertexFormat::Unorm16x4),
         _ => None,
     }
 }

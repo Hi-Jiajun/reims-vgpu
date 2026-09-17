@@ -166,6 +166,14 @@ fn two_stream_stages() -> Stages {
     )
 }
 
+/// The four-component twin of the reviewed shape (R14): one `float4` attribute
+/// at location 0 whose `x`/`y` become the clip position and whose `w` divides
+/// it — the member shape the canonical contract's `unorm8x4` / `unorm16x4`
+/// storages pair with (`research/docs/23` §103).
+fn vec4_stages() -> Stages {
+    stages("reims_indexed_tri_vec4.air", "reims_vec4_vertex", &[0])
+}
+
 /// The four-stream shape — the widest interface the canonical contract can
 /// state (`max_vertex_buffers`): position at location 0 and three offsets after
 /// it, all read by the vertex stage.
@@ -432,6 +440,50 @@ fn f32x2(records: &[(f32, f32)]) -> Vec<u8> {
     out
 }
 
+/// `unorm8x2` records: one byte per component, in the order the storage names.
+fn unorm8x2(records: &[(u8, u8)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(records.len() * 2);
+    for (x, y) in records {
+        out.extend_from_slice(&[*x, *y]);
+    }
+    out
+}
+
+/// `unorm8x4` records: four bytes per vertex, in the storage's own order.
+fn unorm8x4(records: &[(u8, u8, u8, u8)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(records.len() * 4);
+    for (x, y, z, w) in records {
+        out.extend_from_slice(&[*x, *y, *z, *w]);
+    }
+    out
+}
+
+/// The 16-bit twins of [`unorm8x2`] / [`unorm8x4`], written as `k * 257`.
+///
+/// `k * 257 / 65535` is exactly `k / 255`, so the same quotients the 8-bit
+/// storages name are stated in the 16-bit ones and the frames of the two
+/// storages are compared byte for byte rather than within a rounding step
+/// (`research/docs/23` §103 states the same equality for the contract).
+fn unorm16x2(records: &[(u8, u8)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(records.len() * 4);
+    for (x, y) in records {
+        for component in [x, y] {
+            out.extend_from_slice(&(u16::from(*component) * 257).to_le_bytes());
+        }
+    }
+    out
+}
+
+fn unorm16x4(records: &[(u8, u8, u8, u8)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(records.len() * 8);
+    for (x, y, z, w) in records {
+        for component in [x, y, z, w] {
+            out.extend_from_slice(&(u16::from(*component) * 257).to_le_bytes());
+        }
+    }
+    out
+}
+
 /// The reviewed position stream: `(-1, -3)`, `(-1, 1)`, `(3, 1)` — the
 /// full-screen triangle the reviewed milestone uses, read from a caller-held
 /// stream so the vertex-input half of the class is exercised.
@@ -605,6 +657,41 @@ fn request_with_streams(format: u16, specs: &[StreamSpec]) -> DrawRequest {
         color0_declared: Some(reims_vgpu::protocol::pass_action::LoadAction::Clear),
         ..Default::default()
     }
+}
+
+/// The reviewed request shape with its one attribute declared in `storage`
+/// (R14): the four normalized storages are not the reviewed `float2` shape —
+/// each is its own declaration, a different byte footprint and (for the
+/// four-component pair) a different component shape — so the tests state the
+/// attribute rather than reinterpreting [`request_with_streams`]' specs.
+fn request_with_vertex_storage(
+    format: u16,
+    storage: u32,
+    stride: u32,
+    bytes: Vec<u8>,
+) -> DrawRequest {
+    let mut request = request_with_streams(format, &[]);
+    request.vertex_attributes = vec![VertexAttributeResource {
+        location: 0,
+        binding: 0,
+        format: VertexAttributeFormat::parse(storage).expect("a protocol vertex format"),
+        offset: 0,
+        stride,
+        step_function: VertexStepFunction::PerVertex,
+        step_rate: 1,
+        content: BufferContent::Bytes(std::sync::Arc::new(bytes)),
+    }];
+    request
+}
+
+/// [`request_with_vertex_storage`] at the 8x4 attachment the y-convention
+/// helpers read, so a normalized draw's coverage can be asserted texel by texel
+/// instead of counted in a declared-window frame.
+fn small_request_with_vertex_storage(storage: u32, stride: u32, bytes: Vec<u8>) -> DrawRequest {
+    let mut request = request_with_vertex_storage(MTL_FORMAT_RGBA8_UNORM, storage, stride, bytes);
+    request.width = ASYMMETRIC_WIDTH;
+    request.height = ASYMMETRIC_HEIGHT;
+    request
 }
 
 /// `MTLVertexFormat::Float2`.
@@ -3073,11 +3160,14 @@ fn the_widening_splits_are_counted_under_their_own_names() {
 /// * every format the protocol names has its own route, spelled
 ///   `vertex_format_<name>` — two storages sharing a key would collapse the
 ///   distribution the widening order is sized on;
-/// * the archetypal refused storage (`UChar4Normalized`, the format the class's
-///   own tests use as "outside the canonical set") is charged for a request the
-///   format gate refuses, because the counters are the *declaration*
-///   population: charged before any condition answers, at the same place the
-///   attribute-count band is;
+/// * a storage the format gate refuses (`Char4Normalized`, the signed half of
+///   the family the normalized widening did *not* carry) is charged for its
+///   request, because the counters are the *declaration* population: charged
+///   before any condition answers, at the same place the attribute-count band
+///   is;
+/// * a storage the widening moved into the class (`UChar4Normalized`, since
+///   R14 maps it to the contract's `Unorm8x4`) is charged in the same
+///   population, so the refused and the widened halves line up;
 /// * an admitted storage (`float2`, the reviewed stream) is charged for the same
 ///   reason, so the admitted and refused halves of the distribution line up.
 #[test]
@@ -3111,8 +3201,8 @@ fn the_declared_vertex_formats_are_counted_under_their_own_names() {
         VertexAttributeFormat::ALL.len(),
         "every format the protocol names gets exactly one route"
     );
-    // The four storages the canonical class admits name their own routes, and
-    // so does the storage its own tests use as the archetypal refusal.
+    // The 32-bit storages the class has always admitted, the normalized pair
+    // R14 moved in and the signed half beside it name their own routes.
     assert_eq!(
         vertex_format_route(VertexAttributeFormat::parse(29).expect("Float2 is a vertex format")),
         "vertex_format_float2"
@@ -3127,22 +3217,44 @@ fn the_declared_vertex_formats_are_counted_under_their_own_names() {
         ),
         "vertex_format_uchar4_normalized"
     );
+    assert_eq!(
+        vertex_format_route(
+            VertexAttributeFormat::parse(12).expect("Char4Normalized is a vertex format")
+        ),
+        "vertex_format_char4_normalized"
+    );
 
     // A request the format gate refuses is still in the reading: the sentence
     // says "a vertex attribute outside the canonical format set", and the route
     // is what says which one.
-    let refused_before = count("vertex_format_uchar4_normalized");
+    let refused_before = count("vertex_format_char4_normalized");
     let mut refused = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     refused.vertex_attributes[0].format =
-        VertexAttributeFormat::parse(9).expect("UChar4Normalized is a vertex format");
+        VertexAttributeFormat::parse(12).expect("Char4Normalized is a vertex format");
     submit(&inputs(&stages, RenderChainRole::SoleOrTail), &refused);
     assert_eq!(
-        count("vertex_format_uchar4_normalized"),
+        count("vertex_format_char4_normalized"),
         refused_before + 1,
         "the refused storage is counted by name"
     );
 
-    // And an admitted one is counted beside it, so the two halves of the
+    // A storage the widening moved in is counted in the same place: the
+    // request below passes the format gate and is answered by the provider's
+    // own shape rule (the reviewed fixture reads a `float2`, and `unorm8x4`
+    // pairs with a `float4` one), which is exactly the point — the count is the
+    // *declaration*, not the outcome.
+    let widened_before = count("vertex_format_uchar4_normalized");
+    let mut widened = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    widened.vertex_attributes[0].format =
+        VertexAttributeFormat::parse(9).expect("UChar4Normalized is a vertex format");
+    submit(&inputs(&stages, RenderChainRole::SoleOrTail), &widened);
+    assert_eq!(
+        count("vertex_format_uchar4_normalized"),
+        widened_before + 1,
+        "the widened storage is counted in the same population as the refused one"
+    );
+
+    // And the reviewed storage is counted beside them, so the halves of the
     // distribution are the same measurement.
     let admitted_before = count("vertex_format_float2");
     let admitted = narrow_request(MTL_FORMAT_RGBA8_UNORM);
@@ -3151,6 +3263,289 @@ fn the_declared_vertex_formats_are_counted_under_their_own_names() {
         count("vertex_format_float2"),
         admitted_before + 1,
         "the admitted storage is counted in the same population"
+    );
+}
+
+/// The two-component normalized storages, drawn for real (R14).
+///
+/// `unorm8x2` and `unorm16x2` are the pair of the four E-VF1 storages
+/// (`research/docs/23` §103) whose component shape is the reviewed `float2`:
+/// the same `reims_indexed_tri.air` the class shipped with, declared in a
+/// storage two (or four) bytes wide instead of eight. The claims, in the order
+/// they are read:
+///
+/// * the draw is *in* the class and the provider executes it — the format gate
+///   maps the storage instead of keeping the engine;
+/// * the frame is the *Metal* mapping of the triangle the bytes state, read
+///   from neither rail's own viewport;
+/// * the canonical provider and the self-contained engine land the same bytes;
+/// * the 16-bit twin's frame is byte-identical to the 8-bit one's, because
+///   `k * 257 / 65535` is `k / 255` — the equality the contract itself states;
+/// * moving the vertex bytes moves the frame, so a rail that dropped the
+///   normalized fetch cannot pass by drawing the reviewed triangle.
+#[test]
+fn the_two_component_normalized_storages_land_the_same_bytes_on_both_rails() {
+    use reims_vgpu_core::vertex_format as mtl;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+
+    // The clip-space triangle the bytes state: `(0, 0)`, `(1, 0)` and `(0, 1)`
+    // — the top-right half of the guest's clip square, at the 8x4 attachment
+    // whose edges miss every pixel centre (`assert_frame_is_the_metal_mapping`
+    // carries the tie-rule reasoning). The second triangle moves the third
+    // vertex's corner onto `(1, 1)`.
+    let triangle = [(0u8, 0u8), (255, 0), (0, 255)];
+    let corner = [(0u8, 0u8), (255, 0), (255, 255)];
+
+    let eight = small_request_with_vertex_storage(
+        mtl::MTL_VERTEX_FORMAT_U_CHAR2_NORMALIZED,
+        2,
+        unorm8x2(&triangle),
+    );
+    let eight_frame = provider_pixels("unorm8x2", &stages, &eight);
+    assert_frame_is_the_metal_mapping(
+        "unorm8x2",
+        &eight_frame,
+        [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+    );
+    let Some(engine_eight) = engine_pixels("unorm8x2", &stages, eight) else {
+        return;
+    };
+    assert_frames_equal(
+        "unorm8x2 (engine against provider)",
+        &engine_eight,
+        &eight_frame,
+    );
+
+    let sixteen = small_request_with_vertex_storage(
+        mtl::MTL_VERTEX_FORMAT_U_SHORT2_NORMALIZED,
+        4,
+        unorm16x2(&triangle),
+    );
+    let sixteen_frame = provider_pixels("unorm16x2", &stages, &sixteen);
+    assert_frames_equal(
+        "unorm16x2 against unorm8x2: k * 257 / 65535 is k / 255",
+        &sixteen_frame,
+        &eight_frame,
+    );
+    let Some(engine_sixteen) = engine_pixels("unorm16x2", &stages, sixteen) else {
+        return;
+    };
+    assert_frames_equal(
+        "unorm16x2 (engine against provider)",
+        &engine_sixteen,
+        &sixteen_frame,
+    );
+
+    let moved = small_request_with_vertex_storage(
+        mtl::MTL_VERTEX_FORMAT_U_CHAR2_NORMALIZED,
+        2,
+        unorm8x2(&corner),
+    );
+    let moved_frame = provider_pixels("unorm8x2, third vertex moved", &stages, &moved);
+    assert_frames_differ("unorm8x2, third vertex moved", &moved_frame, &eight_frame);
+    assert_frame_is_the_metal_mapping(
+        "unorm8x2, third vertex moved",
+        &moved_frame,
+        [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+    );
+    let Some(engine_moved) = engine_pixels("unorm8x2, third vertex moved", &stages, moved) else {
+        return;
+    };
+    assert_frames_equal(
+        "unorm8x2, third vertex moved (engine against provider)",
+        &engine_moved,
+        &moved_frame,
+    );
+    eprintln!(
+        "unorm8x2 / unorm16x2 landed the same bytes on both rails; the moved corner moved the \
+         frame"
+    );
+}
+
+/// The four-component normalized storages, drawn for real (R14).
+///
+/// `unorm8x4` and `unorm16x4` pair with a `float4` AIR member, which is what
+/// `reims_indexed_tri_vec4.air` states: its `x`/`y` become the clip position
+/// and its `w` divides it, so the *fourth* component reaches the frame. The
+/// last arm is the one that makes the four-component fetch falsifiable rather
+/// than asserted: it moves only the fourth byte of one vertex — `255` (the
+/// sentinel `w = 1`) to `128` — and the frame has to change, which a rail that
+/// fetched two components cannot do.
+#[test]
+fn the_four_component_normalized_storages_land_the_same_bytes_on_both_rails() {
+    use reims_vgpu_core::vertex_format as mtl;
+
+    let _guard = engine_test_session();
+    let stages = vec4_stages();
+
+    // `(x, y, z, w)` per vertex; the fixture forces `z = 0` and divides by `w`,
+    // so `255` is the sentinel `w = 1` and every triangle below is stated where
+    // the two-component pair states its own.
+    let triangle = [(0u8, 0u8, 0u8, 255u8), (255, 0, 0, 255), (0, 255, 0, 255)];
+    let corner = [(0u8, 0u8, 0u8, 255u8), (255, 0, 0, 255), (255, 255, 0, 255)];
+    let divided = [(0u8, 0u8, 0u8, 255u8), (255, 0, 0, 128), (0, 255, 0, 255)];
+
+    let eight = small_request_with_vertex_storage(
+        mtl::MTL_VERTEX_FORMAT_U_CHAR4_NORMALIZED,
+        4,
+        unorm8x4(&triangle),
+    );
+    let eight_frame = provider_pixels("unorm8x4", &stages, &eight);
+    assert_frame_is_the_metal_mapping(
+        "unorm8x4",
+        &eight_frame,
+        [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+    );
+    let Some(engine_eight) = engine_pixels("unorm8x4", &stages, eight) else {
+        return;
+    };
+    assert_frames_equal(
+        "unorm8x4 (engine against provider)",
+        &engine_eight,
+        &eight_frame,
+    );
+
+    let sixteen = small_request_with_vertex_storage(
+        mtl::MTL_VERTEX_FORMAT_U_SHORT4_NORMALIZED,
+        8,
+        unorm16x4(&triangle),
+    );
+    let sixteen_frame = provider_pixels("unorm16x4", &stages, &sixteen);
+    assert_frames_equal(
+        "unorm16x4 against unorm8x4: k * 257 / 65535 is k / 255",
+        &sixteen_frame,
+        &eight_frame,
+    );
+    let Some(engine_sixteen) = engine_pixels("unorm16x4", &stages, sixteen) else {
+        return;
+    };
+    assert_frames_equal(
+        "unorm16x4 (engine against provider)",
+        &engine_sixteen,
+        &sixteen_frame,
+    );
+
+    let moved = small_request_with_vertex_storage(
+        mtl::MTL_VERTEX_FORMAT_U_CHAR4_NORMALIZED,
+        4,
+        unorm8x4(&corner),
+    );
+    let moved_frame = provider_pixels("unorm8x4, third vertex moved", &stages, &moved);
+    assert_frames_differ("unorm8x4, third vertex moved", &moved_frame, &eight_frame);
+    let Some(engine_moved) = engine_pixels("unorm8x4, third vertex moved", &stages, moved) else {
+        return;
+    };
+    assert_frames_equal(
+        "unorm8x4, third vertex moved (engine against provider)",
+        &engine_moved,
+        &moved_frame,
+    );
+
+    let wide = small_request_with_vertex_storage(
+        mtl::MTL_VERTEX_FORMAT_U_CHAR4_NORMALIZED,
+        4,
+        unorm8x4(&divided),
+    );
+    let wide_frame = provider_pixels("unorm8x4, fourth component moved", &stages, &wide);
+    assert_frames_differ(
+        "unorm8x4, fourth component moved",
+        &wide_frame,
+        &eight_frame,
+    );
+    let Some(engine_wide) = engine_pixels("unorm8x4, fourth component moved", &stages, wide) else {
+        return;
+    };
+    assert_frames_equal(
+        "unorm8x4, fourth component moved (engine against provider)",
+        &engine_wide,
+        &wide_frame,
+    );
+    eprintln!(
+        "unorm8x4 / unorm16x4 landed the same bytes on both rails; moving the fourth component \
+         alone moved the frame"
+    );
+}
+
+/// The normalized storages in the census's own reading (R14): the routes move
+/// on the shapes that actually cross the seam, the storages the mapping does
+/// not carry keep the engine under the format gate's own name, and the shape
+/// rule stays the provider's own answer.
+#[test]
+fn the_normalized_storages_are_counted_and_the_rest_stay_on_the_engine_by_name() {
+    use reims_vgpu_core::vertex_format as mtl;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
+
+    // The draw the widening admitted: the provider executes it, and the
+    // declared storage is what the route names.
+    let admitted_before = count("vertex_format_uchar2_normalized");
+    let admitted = small_request_with_vertex_storage(
+        mtl::MTL_VERTEX_FORMAT_U_CHAR2_NORMALIZED,
+        2,
+        unorm8x2(&[(0, 0), (255, 0), (0, 255)]),
+    );
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &admitted) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("a unorm8x2 draw is in the class: {other:?}"),
+    }
+    assert_eq!(
+        count("vertex_format_uchar2_normalized"),
+        admitted_before + 1,
+        "the admitted normalized storage is counted by name"
+    );
+
+    // A storage the mapping does not carry — the three-channel 16-bit
+    // normalized shape, which Vulkan leaves optional as a vertex input format
+    // — keeps the engine under the format gate's own slug, and its route still
+    // moves: the counters are the declaration population.
+    let refused_before = count("vertex_format_ushort3_normalized");
+    let mut refused = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    refused.vertex_attributes[0].format =
+        VertexAttributeFormat::parse(mtl::MTL_VERTEX_FORMAT_U_SHORT3_NORMALIZED)
+            .expect("UShort3Normalized is a vertex format");
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &refused) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!(
+                "unmapped storage: slug={} detail={}",
+                reason.slug(),
+                reason.detail()
+            );
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_vertex_format",
+                "an unmapped storage keeps the gate's own name: {reason}"
+            );
+        }
+        other => panic!("an unmapped storage stays on the engine: {other:?}"),
+    }
+    assert_eq!(
+        count("vertex_format_ushort3_normalized"),
+        refused_before + 1,
+        "the refused storage is counted by name in the same population"
+    );
+
+    // The seam's half of the shape rule: `unorm8x4` passes the format gate —
+    // that is the R14 mapping — and the provider's registration gate answers
+    // the component shape the reviewed fixture still declares (`float2`). A
+    // typed decline, not an out-of-class fallback, so the two rules stay
+    // readable apart.
+    let mut mismatched = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    mismatched.vertex_attributes[0].format =
+        VertexAttributeFormat::parse(mtl::MTL_VERTEX_FORMAT_U_CHAR4_NORMALIZED)
+            .expect("UChar4Normalized is a vertex format");
+    let (slug, detail) = refused_slug("unorm8x4 beside a float2 member", &stages, &mismatched);
+    eprintln!("unorm8x4 beside a float2 member: slug={slug} detail={detail:?}");
+    assert_eq!(
+        slug, "provider_capability",
+        "an admitted storage beside the wrong AIR shape is answered at the provider boundary"
+    );
+    assert!(
+        detail.contains("render_stage_reflection_mismatch"),
+        "the provider's own name for the shape mismatch rides along: {detail}"
     );
 }
 
