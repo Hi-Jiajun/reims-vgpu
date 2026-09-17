@@ -41,6 +41,7 @@ const OP_IMAGE_TEXEL_POINTER: u16 = 60;
 const OP_LOAD: u16 = 61;
 const OP_COPY_OBJECT: u16 = 83;
 const OP_SAMPLED_IMAGE: u16 = 86;
+const OP_IMAGE_FETCH: u16 = 95;
 const OP_IMAGE_READ: u16 = 98;
 const OP_IMAGE_WRITE: u16 = 99;
 const OP_IMAGE_QUERY_FORMAT: u16 = 101;
@@ -1649,6 +1650,128 @@ impl SamplePairing {
             Self::MultipleSamplers | Self::Unresolved => None,
         }
     }
+}
+
+/// What one descriptor image binding's own sites state in one module
+/// (`research/docs/23` §3.3, v105; R15).
+///
+/// A translation states *which* argument a texture is through the module body,
+/// not through the argument metadata: an `access::read` argument's
+/// `texture.read()` is an `OpImageFetch` that names the image alone, while a
+/// sampled one is an `OpSampledImage` that names an image beside a sampler.
+/// This is the reims half of the canonical rail's own classification
+/// (`metal-api-vulkan`'s `descriptor_image_uses`), read off the very words both
+/// rails execute, so the class gate can state the access the module states
+/// instead of a sampler form the module never carries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DescriptorImageUse {
+    /// At least one site samples this image (`OpSampledImage`).
+    Sampled,
+    /// Every site that touches this image texel-fetches it (`OpImageFetch`)
+    /// and none samples it: `texture.read()`'s shape.
+    Fetched,
+    /// A site reads or writes the image directly (`OpImageRead`,
+    /// `OpImageWrite`, `OpImageTexelPointer`): the storage-image arm, which
+    /// neither read-only render access states.
+    Direct,
+    /// No classified site reaches this binding.
+    Unused,
+    /// A site's image operand is a value this walk cannot follow to a
+    /// decorated descriptor, so which binding that site reads is not
+    /// something this walk can say.
+    Unresolved,
+}
+
+impl DescriptorImageUse {
+    /// Fold two sites of one image into the one answer the class states: a
+    /// sample needs the sampler even when another site fetches that image, a
+    /// direct read needs the storage descriptor neither read-only arm builds,
+    /// and a site this walk cannot read at all outranks a *fetch* — the one
+    /// arm that states a descriptor no sampler fills, so a module with an
+    /// unreadable site is never declared fetched on the strength of the sites
+    /// this walk happened to see.
+    const fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Sampled, _) | (_, Self::Sampled) => Self::Sampled,
+            (Self::Direct, _) | (_, Self::Direct) => Self::Direct,
+            (Self::Unresolved, _) | (_, Self::Unresolved) => Self::Unresolved,
+            (Self::Fetched, _) | (_, Self::Fetched) => Self::Fetched,
+            (Self::Unused, Self::Unused) => Self::Unused,
+        }
+    }
+}
+
+/// The read one descriptor image binding gets from one module's own
+/// instructions (R15).
+///
+/// Deliberately narrower than SPIR-V, exactly as [`sampled_image_pairs`] is:
+/// an image operand this walk cannot follow to a decorated descriptor leaves
+/// the answer [`DescriptorImageUse::Unresolved`] rather than a guess, and a
+/// caller that only executes a fetched image keeps such a module on the engine
+/// instead of declaring an access the module might not state.
+pub fn descriptor_image_use(words: &[u32], wanted_binding: u32) -> DescriptorImageUse {
+    let Some(instrs) = instructions(words) else {
+        return DescriptorImageUse::Unresolved;
+    };
+    let bound = usize::try_from(*words.get(3).unwrap_or(&0)).unwrap_or(0);
+    if bound == 0 {
+        return DescriptorImageUse::Unresolved;
+    }
+    let mut bindings: Vec<Option<u32>> = vec![None; bound];
+    let mut sources: Vec<Option<u32>> = vec![None; bound];
+    for &Instruction {
+        opcode,
+        word_count,
+        at: i,
+    } in &instrs
+    {
+        match opcode {
+            OP_DECORATE if word_count >= 4 && words[i + 2] == DECORATION_BINDING => {
+                if let Some(slot) = bindings.get_mut(words[i + 1] as usize) {
+                    *slot = Some(words[i + 3]);
+                }
+            }
+            OP_LOAD | OP_COPY_OBJECT if word_count >= 4 => {
+                if let Some(slot) = sources.get_mut(words[i + 2] as usize) {
+                    *slot = Some(words[i + 3]);
+                }
+            }
+            _ => {}
+        }
+    }
+    // The image operand each class of site reads: the image an
+    // `OpSampledImage` pairs, the image an `OpImageFetch` or `OpImageRead`
+    // reads, the image an `OpImageTexelPointer` addresses, and the image an
+    // `OpImageWrite` writes.
+    let mut answer = DescriptorImageUse::Unused;
+    for &Instruction {
+        opcode,
+        word_count,
+        at: i,
+    } in &instrs
+    {
+        let (site, image) = match opcode {
+            // The guards are the canonical classifier's own (`operands.len()`
+            // over the words after each instruction's header), so a truncated
+            // instruction is classified by the same opcode and operand either
+            // way rather than skipped by one rail and read by the other.
+            OP_SAMPLED_IMAGE if word_count >= 4 => (DescriptorImageUse::Sampled, words[i + 3]),
+            OP_IMAGE_FETCH if word_count >= 4 => (DescriptorImageUse::Fetched, words[i + 3]),
+            OP_IMAGE_READ if word_count >= 4 => (DescriptorImageUse::Direct, words[i + 3]),
+            OP_IMAGE_TEXEL_POINTER if word_count >= 4 => (DescriptorImageUse::Direct, words[i + 3]),
+            OP_IMAGE_WRITE if word_count >= 2 => (DescriptorImageUse::Direct, words[i + 1]),
+            _ => continue,
+        };
+        match descriptor_binding(&bindings, &sources, image) {
+            Some(binding) if binding == wanted_binding => answer = answer.merge(site),
+            // A site on another binding takes no part in this binding's
+            // answer; a site this walk cannot follow to one might be this
+            // binding's, so it answers for it.
+            Some(_) => {}
+            None => answer = answer.merge(DescriptorImageUse::Unresolved),
+        }
+    }
+    answer
 }
 
 /// Reflect every set-0 sampler descriptor binding declared by a SPIR-V module.
@@ -5899,6 +6022,114 @@ mod more_tests {
                     && words.get(at + 2) == Some(&result)
             })
             .expect("the sample site is in the module")
+    }
+
+    /// One module with a texel-fetched image, a sampled image, and one image
+    /// no classified site reaches — the three answers
+    /// [`descriptor_image_use`] has to tell apart, over the bindings the
+    /// render rail's own fixtures carry (texture band 32/33, sampler band 160).
+    ///
+    /// `%10` is an `OpImageFetch` of the image at binding 32 and `%11` an
+    /// `OpSampledImage` of binding 33 through the sampler at binding 160, which
+    /// is the shape one translated `access::read` argument beside one sampled
+    /// argument has.
+    fn fetch_and_sample_module() -> Vec<u32> {
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 64, 0];
+        // %1 image, %2 sampler, %3/%4 the UniformConstant pointers.
+        words.extend([(9u32 << 16) | OP_TYPE_IMAGE as u32, 1, 99, 1, 0, 0, 0, 1, 0]);
+        words.extend([(2u32 << 16) | OP_TYPE_SAMPLER as u32, 2]);
+        words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 3, 0, 1]);
+        words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 4, 0, 2]);
+        for id in [5u32, 6, 9] {
+            words.extend([
+                (4u32 << 16) | OP_VARIABLE as u32,
+                3,
+                id,
+                STORAGE_CLASS_UNIFORM_CONSTANT,
+            ]);
+        }
+        words.extend([
+            (4u32 << 16) | OP_VARIABLE as u32,
+            4,
+            7,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+        for (id, binding) in [(5u32, 32u32), (6, 33), (7, 160), (9, 34)] {
+            words.extend([
+                (4u32 << 16) | OP_DECORATE as u32,
+                id,
+                DECORATION_BINDING,
+                binding,
+            ]);
+        }
+        for (id, pointer) in [(10u32, 5u32), (11, 6), (12, 7), (13, 9)] {
+            words.extend([(4u32 << 16) | OP_LOAD as u32, 1, id, pointer]);
+        }
+        // OpImageFetch %image %coordinate: the `texture.read()` site.
+        words.extend([(5u32 << 16) | OP_IMAGE_FETCH as u32, 1, 14, 10, 0]);
+        words.extend([(5u32 << 16) | OP_SAMPLED_IMAGE as u32, 1, 15, 11, 12]);
+        words
+    }
+
+    #[test]
+    fn descriptor_image_use_tells_fetch_sample_direct_and_untouched_apart() {
+        let words = fetch_and_sample_module();
+        assert_eq!(
+            descriptor_image_use(&words, 32),
+            DescriptorImageUse::Fetched,
+            "binding 32 is only texel-fetched"
+        );
+        assert_eq!(
+            descriptor_image_use(&words, 33),
+            DescriptorImageUse::Sampled,
+            "binding 33 is sampled"
+        );
+        assert_eq!(
+            descriptor_image_use(&words, 34),
+            DescriptorImageUse::Unused,
+            "binding 34 is declared and never read"
+        );
+        assert_eq!(
+            descriptor_image_use(&words, 99),
+            DescriptorImageUse::Unused,
+            "a binding no decoration names has no sites at all"
+        );
+    }
+
+    #[test]
+    fn one_image_that_is_fetched_and_sampled_is_sampled() {
+        let mut words = fetch_and_sample_module();
+        // The same image %10 (binding 32) read through the sampler as well.
+        words.extend([(5u32 << 16) | OP_SAMPLED_IMAGE as u32, 1, 20, 10, 12]);
+        assert_eq!(
+            descriptor_image_use(&words, 32),
+            DescriptorImageUse::Sampled,
+            "a sample site wins over a fetch site of the same image"
+        );
+    }
+
+    #[test]
+    fn a_direct_read_is_its_own_answer() {
+        let mut words = fetch_and_sample_module();
+        // OpImageRead on the fetched image: the storage-image arm, not fetch.
+        words.extend([(5u32 << 16) | OP_IMAGE_READ as u32, 1, 21, 10, 0]);
+        assert_eq!(
+            descriptor_image_use(&words, 32),
+            DescriptorImageUse::Direct,
+            "a direct read wins over a fetch site of the same image"
+        );
+    }
+
+    #[test]
+    fn a_site_whose_image_operand_does_not_resolve_leaves_the_slot_unresolved() {
+        let mut words = fetch_and_sample_module();
+        // One more fetch whose image operand no instruction produced: the
+        // walk cannot say which binding it belongs to, so it says so.
+        words.extend([(5u32 << 16) | OP_IMAGE_FETCH as u32, 1, 22, 0xffff, 0]);
+        assert_eq!(
+            descriptor_image_use(&words, 32),
+            DescriptorImageUse::Unresolved
+        );
     }
 
     #[test]

@@ -217,6 +217,46 @@ fn runtime_sampled_stages() -> Stages {
     )
 }
 
+/// The texel-fetched shape (R15): the reviewed vertex stage beside a fragment
+/// stage that reads one `[[texture(0)]]` with `texture.read()` — Metal's
+/// `access::read` qualifier.
+///
+/// The module carries no sampler at all: no AIR `constexpr sampler`, no runtime
+/// `[[sampler(n)]]` argument, because an `access::read` argument is fetched by
+/// integer coordinate at an explicit level of detail. The declarations are the
+/// *production* walk over the fixture's own translation
+/// (`provider_render::texture_declarations`), which is the fact the runtime
+/// hands the rail; the expectation the fetch tests compare them with is written
+/// by hand in `the_fetch_only_declarations_are_what_the_module_says`, so a
+/// fixture or reflection that moves fails an assertion instead of quietly
+/// changing what the seam is asked about.
+fn fetch_stages() -> Stages {
+    sampled_fragment_stages("render_frag_fetch_texture_2d.air", "reims_fetch_frag")
+}
+
+/// The fetched shape's sibling fixture: the same stage, binding and declaration
+/// with the two texels it reads moved, so a test can watch the frame follow the
+/// *coordinates* rather than anything the declaration states (R15).
+fn fetch_far_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_fetch_texture_2d_far.air",
+        "reims_fetch_far_frag",
+    )
+}
+
+/// The mixed shape (R15): one fragment stage with a fetched `[[texture(0)]]`
+/// and a sampled `[[texture(1)]]` — the sampled half reading through the
+/// runtime `[[sampler(0)]]` argument R12 states.
+///
+/// One module, one draw, both access arms, which is the shape the guest's own
+/// captures carry (one fetch-only texture beside runtime-sampled textures).
+fn fetch_and_sample_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_fetch_and_sample.air",
+        "reims_fetch_and_sample_frag",
+    )
+}
+
 /// One fragment fixture's class-gate facts, taken from its own translation:
 /// the texture declarations (`texture_declarations`, the walk that reads the
 /// module's own sample sites for the runtime sampler family) and the sampler
@@ -303,12 +343,27 @@ fn sampled_request(stages: &Stages, texels: Vec<Vec<u8>>, extent: (u32, u32)) ->
     req.width = extent.0;
     req.height = extent.1;
     let declaration = stages.fragment_texture_declarations[0];
+    req.sampled_images
+        .push(image_resource(declaration.binding, texels, extent));
+    req.samplers
+        .push(sampled_sampler_resource(declaration.sampler_binding));
+    req
+}
+
+/// One texture the draw binds at `binding`: the request's own tightly packed
+/// `rgba8_unorm` copy of `texels`, whose extent is the attachment's own (the
+/// class gate's extent rule).
+///
+/// One spelling for every texture arm — a sampled texture, a runtime-sampled
+/// one and a texel-fetched one reach the pass as the same view, because what
+/// tells them apart is the declaration's sampler half and nothing in the view.
+fn image_resource(binding: u32, texels: Vec<Vec<u8>>, extent: (u32, u32)) -> SampledImageResource {
     let mut bytes = Vec::with_capacity(texels.len() * 4);
     for texel in texels {
         bytes.extend_from_slice(&texel);
     }
-    req.sampled_images.push(SampledImageResource {
-        binding: declaration.binding,
+    SampledImageResource {
+        binding,
         array_element: 0,
         descriptor_count: 1,
         width: extent.0,
@@ -321,9 +376,49 @@ fn sampled_request(stages: &Stages, texels: Vec<Vec<u8>>, extent: (u32, u32)) ->
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),
-    });
-    req.samplers
-        .push(sampled_sampler_resource(declaration.sampler_binding));
+    }
+}
+
+/// The attachment-covering draw with one texel-fetched texture bound (R15):
+/// the reviewed position stream beside the request's own copy of `texels`, at
+/// the device binding the fragment stage's declaration names — and **no**
+/// sampler resource at all, because the module names no sampler and the
+/// canonical contract's fetched arm states none.
+fn fetched_request(stages: &Stages, texels: Vec<Vec<u8>>, extent: (u32, u32)) -> DrawRequest {
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = extent.0;
+    req.height = extent.1;
+    let declaration = stages.fragment_texture_declarations[0];
+    req.sampled_images
+        .push(image_resource(declaration.binding, texels, extent));
+    req
+}
+
+/// The attachment-covering draw with one fetched and one sampled texture bound
+/// (R15): both at the device bindings their declarations name, one view each,
+/// beside the runtime `[[sampler(0)]]` state the sampled half reads through —
+/// nearest filtering with clamped addressing, which is the state the fixture's
+/// fixed coordinate is read against (R12's family).
+fn fetch_and_sample_request(
+    stages: &Stages,
+    texels: Vec<Vec<u8>>,
+    extent: (u32, u32),
+) -> DrawRequest {
+    use reims_vgpu::protocol::sampler as mtl;
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = extent.0;
+    req.height = extent.1;
+    let fetched = stages.fragment_texture_declarations[0];
+    let sampled = stages.fragment_texture_declarations[1];
+    req.sampled_images
+        .push(image_resource(fetched.binding, texels.clone(), extent));
+    req.sampled_images
+        .push(image_resource(sampled.binding, texels, extent));
+    req.samplers.push(family_sampler_resource(
+        sampled.sampler_binding,
+        mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+        mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    ));
     req
 }
 
@@ -374,25 +469,8 @@ fn runtime_sampled_request(
     req.height = extent.1;
     let declaration = stages.fragment_texture_declarations[0];
     let runtime = stages.sampler_family.runtime[0];
-    let mut bytes = Vec::with_capacity(texels.len() * 4);
-    for texel in texels {
-        bytes.extend_from_slice(&texel);
-    }
-    req.sampled_images.push(SampledImageResource {
-        binding: declaration.binding,
-        array_element: 0,
-        descriptor_count: 1,
-        width: extent.0,
-        height: extent.1,
-        layers: 1,
-        kind: reims_vgpu_core::texture_shape::TextureKind::D2,
-        multisampled: false,
-        source: SampledSource::Bytes(std::sync::Arc::new(bytes)),
-        byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
-        identity: None,
-        swizzle: Default::default(),
-    });
+    req.sampled_images
+        .push(image_resource(declaration.binding, texels, extent));
     req.samplers.push(family_sampler_resource(
         runtime.binding,
         min_mag_filter,
@@ -4924,6 +5002,424 @@ fn the_runtime_sampler_shapes_beside_the_entry_stay_on_the_engine_by_name() {
     assert!(
         detail.contains("runtime sampler list"),
         "the sentence names what the frame does not carry: {detail}"
+    );
+}
+
+/// R15: the fetch-only declarations, read back off the fixture's own
+/// translation (`research/docs/23` §3.3, v105).
+///
+/// The expectation is written by hand — one `[[texture(0)]]` at the
+/// translator's texture band base, no sampler slot at all, and the sampler-free
+/// arm the module's own image sites state — so a fixture or reflection that
+/// moves fails here rather than silently changing what the seam is asked about.
+#[test]
+fn the_fetch_only_declarations_are_what_the_module_says() {
+    for (label, stages) in [
+        ("the fetch fixture", fetch_stages()),
+        ("the far fetch fixture", fetch_far_stages()),
+    ] {
+        assert_eq!(
+            stages.fragment_texture_declarations,
+            vec![RenderTextureDeclaration {
+                index: 0,
+                binding: 32,
+                sampler_binding: 0,
+                sampler: RenderSamplerState::Fetched,
+                shape: RenderTextureShape::Sampled2D,
+            }],
+            "{label}: one 2D texture the module's own `OpImageFetch` reads, \
+             with no sampler form at all"
+        );
+        assert_eq!(
+            stages.sampler_family,
+            RenderSamplerFamily::default(),
+            "{label}: the stage carries neither an AIR static sampler nor a runtime \
+             `[[sampler(n)]]` argument"
+        );
+        assert!(
+            stages.texture_interface_refusals.is_empty(),
+            "{label}: a fetched texture is inside the translated family: {:?}",
+            stages.texture_interface_refusals
+        );
+        eprintln!(
+            "R15 {label} declarations: {:?} family={:?}",
+            stages.fragment_texture_declarations, stages.sampler_family,
+        );
+    }
+}
+
+/// R15: the fetched reading, and the frames the texels land.
+///
+/// The fragment half fetches two fixed texels of the 4x4 surface — texel
+/// (1, 0).x into red and texel (0, 1).y into green — so the whole attachment is
+/// those two channels of the texture the request carries. Four falsifiable
+/// halves:
+///
+/// - the frame *is* those texels, not the surface's first one (every texel is
+///   distinct, so any other texel would be another frame);
+/// - moving the texel the shader fetches moves the frame, while moving a texel
+///   it never reads leaves it alone — the bytes reach the shader through the
+///   binding the request and the declaration agree on, with no sampler bound;
+/// - the sibling fixture that differs only in the two coordinates it reads
+///   lands another frame, over the same declaration;
+/// - the engine and the canonical provider land the same frame byte for byte,
+///   under a declaration whose sampler half is absent on both rails.
+#[test]
+fn a_fetched_texture_lands_the_texels_it_reads_and_agrees_with_the_engine() {
+    let _guard = engine_test_session();
+    let stages = fetch_stages();
+    let (width, height) = (4u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let texel = |texels: &[Vec<u8>], x: usize, y: usize| -> [u8; 4] {
+        let texel = &texels[y * width as usize + x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    let want = [texel(&texels, 1, 0)[0], texel(&texels, 0, 1)[1], 0, 255];
+    assert_eq!(
+        want,
+        [16, 64, 0, 255],
+        "the fixture reads texel (1, 0).x and texel (0, 1).y"
+    );
+    let provider = provider_pixels(
+        "fetched texture",
+        &stages,
+        &fetched_request(&stages, texels.clone(), (width, height)),
+    );
+    assert_uniform_frame("fetched texture", &provider, width, height, want);
+    let Some(engine) = engine_pixels(
+        "fetched texture",
+        &stages,
+        fetched_request(&stages, texels.clone(), (width, height)),
+    ) else {
+        return;
+    };
+    assert_uniform_frame("fetched texture (engine)", &engine, width, height, want);
+    assert_frames_equal("fetched texture", &provider, &engine);
+
+    // The payload: the fetched texel's bytes reach the frame through the
+    // sampler-free binding, and a texel no fetch reads does not.
+    let mut moved = texels.clone();
+    moved[1] = vec![201, 7, 7, 255];
+    let moved_frame = provider_pixels(
+        "other fetched texel",
+        &stages,
+        &fetched_request(&stages, moved.clone(), (width, height)),
+    );
+    assert_uniform_frame(
+        "other fetched texel",
+        &moved_frame,
+        width,
+        height,
+        [201, 64, 0, 255],
+    );
+    assert_frames_differ("the fetched texel moved the frame", &provider, &moved_frame);
+    let mut unread = texels.clone();
+    unread[2 * width as usize + 2] = vec![9, 9, 9, 255];
+    let untouched = provider_pixels(
+        "unread texel",
+        &stages,
+        &fetched_request(&stages, unread, (width, height)),
+    );
+    assert_frames_equal(
+        "a texel no fetch reads does not reach the frame",
+        &provider,
+        &untouched,
+    );
+    if let Some(engine_moved) = engine_pixels(
+        "other fetched texel (engine)",
+        &stages,
+        fetched_request(&stages, moved, (width, height)),
+    ) {
+        assert_frames_equal("other fetched texel (engine)", &moved_frame, &engine_moved);
+    }
+
+    // The coordinates: the sibling fixture states the same declaration and
+    // reads other texels, so the frame can only have followed them.
+    let far_stages = fetch_far_stages();
+    let far_want = [texel(&texels, 3, 0)[0], texel(&texels, 0, 3)[1], 0, 255];
+    assert_eq!(
+        far_want,
+        [48, 192, 0, 255],
+        "the sibling reads texel (3, 0).x and texel (0, 3).y"
+    );
+    let far_provider = provider_pixels(
+        "far fetched texture",
+        &far_stages,
+        &fetched_request(&far_stages, texels.clone(), (width, height)),
+    );
+    assert_uniform_frame(
+        "far fetched texture",
+        &far_provider,
+        width,
+        height,
+        far_want,
+    );
+    assert_frames_differ("the coordinates moved the frame", &provider, &far_provider);
+    if let Some(far_engine) = engine_pixels(
+        "far fetched texture",
+        &far_stages,
+        fetched_request(&far_stages, texels, (width, height)),
+    ) {
+        assert_uniform_frame(
+            "far fetched texture (engine)",
+            &far_engine,
+            width,
+            height,
+            far_want,
+        );
+        assert_frames_equal("far fetched texture", &far_provider, &far_engine);
+    }
+    eprintln!(
+        "R15 fetched texture: attachment {width}x{height}, no sampler resource bound — \
+         texel (1, 0).x and (0, 1).y landed {want:?}, the sibling's (3, 0).x and (0, 3).y \
+         landed {far_want:?}, moving the fetched texel moved the frame and an unread one \
+         did not; provider and engine agree byte for byte",
+    );
+}
+
+/// R15: one module, two textures, two access arms — and both of them land.
+///
+/// The declaration list carries a sampler-free entry and a runtime-sampled one
+/// at once, which is the shape the guest's own captures have. Two falsifiable
+/// halves beyond the declarations themselves: the two halves of the frame move
+/// with the two different textures (so both bindings reached the shader), and
+/// the engine and the canonical provider land the same bytes.
+#[test]
+fn a_fetched_and_a_sampled_texture_are_declared_apart_and_both_land() {
+    let _guard = engine_test_session();
+    let stages = fetch_and_sample_stages();
+    assert_eq!(
+        stages.fragment_texture_declarations,
+        vec![
+            RenderTextureDeclaration {
+                index: 0,
+                binding: 32,
+                sampler_binding: 0,
+                sampler: RenderSamplerState::Fetched,
+                shape: RenderTextureShape::Sampled2D,
+            },
+            RenderTextureDeclaration {
+                index: 1,
+                binding: 33,
+                sampler_binding: 160,
+                sampler: RenderSamplerState::Runtime { index: 0 },
+                shape: RenderTextureShape::Sampled2D,
+            },
+        ],
+        "the fixture's `[[texture(0)]]` is fetched and its `[[texture(1)]]` is sampled \
+         through the runtime `[[sampler(0)]]` argument"
+    );
+    assert_eq!(
+        stages.sampler_family,
+        RenderSamplerFamily {
+            runtime: vec![RenderRuntimeSampler {
+                index: 0,
+                binding: 160,
+            }]
+            .into(),
+            statics: Vec::new().into(),
+        },
+        "the stage binds one runtime `[[sampler(0)]]` argument and carries no AIR static sampler"
+    );
+    let (width, height) = (4u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let texel = |texels: &[Vec<u8>], x: usize, y: usize| -> [u8; 4] {
+        let texel = &texels[y * width as usize + x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    let want = [texel(&texels, 1, 0)[0], texel(&texels, 3, 2)[1], 0, 255];
+    assert_eq!(
+        want,
+        [16, 128, 0, 255],
+        "the fetched half reads texel (1, 0).x and the sampled half texel (3, 2).y"
+    );
+    let provider = provider_pixels(
+        "fetched + sampled",
+        &stages,
+        &fetch_and_sample_request(&stages, texels.clone(), (width, height)),
+    );
+    assert_uniform_frame("fetched + sampled", &provider, width, height, want);
+    let Some(engine) = engine_pixels(
+        "fetched + sampled",
+        &stages,
+        fetch_and_sample_request(&stages, texels.clone(), (width, height)),
+    ) else {
+        return;
+    };
+    assert_uniform_frame("fetched + sampled (engine)", &engine, width, height, want);
+    assert_frames_equal("fetched + sampled", &provider, &engine);
+
+    // Each half of the frame follows its own texture: the fetched texel moves
+    // red alone, the sampled texel moves green alone.
+    let mut moved_fetch = texels.clone();
+    moved_fetch[1] = vec![201, 7, 7, 255];
+    let fetch_moved = provider_pixels(
+        "other fetched texel (mixed)",
+        &stages,
+        &fetch_and_sample_request(&stages, moved_fetch.clone(), (width, height)),
+    );
+    assert_uniform_frame(
+        "other fetched texel (mixed)",
+        &fetch_moved,
+        width,
+        height,
+        [201, 128, 0, 255],
+    );
+    assert_frames_differ("the fetched texel moved the frame", &provider, &fetch_moved);
+    let mut moved_sample = texels.clone();
+    moved_sample[2 * width as usize + 3] = vec![1, 202, 1, 255];
+    let sample_moved = provider_pixels(
+        "other sampled texel (mixed)",
+        &stages,
+        &fetch_and_sample_request(&stages, moved_sample.clone(), (width, height)),
+    );
+    assert_uniform_frame(
+        "other sampled texel (mixed)",
+        &sample_moved,
+        width,
+        height,
+        [16, 202, 0, 255],
+    );
+    assert_frames_differ(
+        "the sampled texel moved the frame",
+        &provider,
+        &sample_moved,
+    );
+    assert_frames_differ("the two halves moved apart", &fetch_moved, &sample_moved);
+    if let Some(engine_moved) = engine_pixels(
+        "other sampled texel (mixed, engine)",
+        &stages,
+        fetch_and_sample_request(&stages, moved_sample, (width, height)),
+    ) {
+        assert_frames_equal("other sampled texel (mixed)", &sample_moved, &engine_moved);
+    }
+    eprintln!(
+        "R15 fetched + sampled: declarations [Fetched@32, Runtime{{index: 0}}@33→160], \
+         frame {want:?}; the fetched texel moved red to 201 and the sampled texel moved \
+         green to 202, independently; provider and engine agree byte for byte",
+    );
+}
+
+/// R15: a declaration that does not repeat the module's own access.
+///
+/// The production walk reads the module, so the two halves cannot disagree
+/// through it — which is exactly why the door has to be probed with a
+/// declaration stated by hand. Two readings of the same pair:
+///
+/// - through this rail: the class gate admits the *declaration* (it trusts the
+///   walk that produced it) and the canonical registration refuses the pair by
+///   name, so the seam declines the draw instead of executing a substituted
+///   descriptor;
+/// - through the provider's own registration entry point: the refusal's raw
+///   fields name both access arms and the binding, which is the vocabulary a
+///   reader compares a census line against.
+#[test]
+fn a_declaration_that_does_not_repeat_the_module_is_refused_by_name() {
+    let _guard = engine_test_session();
+    let stages = fetch_stages();
+    let (width, height) = (4u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let sampled_state = metal_api_core::provider::SamplerPolicy {
+        filter: metal_api_core::provider::SamplerFilter::Nearest,
+        address: metal_api_core::provider::SamplerAddressMode::ClampToEdge,
+    };
+
+    // 1. The rail's own answer: a declaration that says the AIR static arm for
+    //    a module whose sites only fetch it.
+    let mut forged = stages.clone();
+    forged.fragment_texture_declarations = vec![RenderTextureDeclaration {
+        index: 0,
+        binding: 32,
+        sampler_binding: 160,
+        sampler: RenderSamplerState::Policy(sampled_state),
+        shape: RenderTextureShape::Sampled2D,
+    }];
+    let mut forged_request = fetched_request(&forged, texels.clone(), (width, height));
+    forged_request.samplers.push(sampled_sampler_resource(160));
+    match provider_render::submit_render(
+        &inputs(&forged, RenderChainRole::SoleOrTail),
+        &forged_request,
+    ) {
+        RenderRailOutcome::ProviderDeclined(decline) => {
+            eprintln!("R15 forged sample declaration on the fetch module: {decline:?}");
+            let ProviderRenderDecline::ProviderRefused { step, detail, .. } = &decline else {
+                panic!("the forgery has to be a provider refusal: {decline:?}");
+            };
+            assert_eq!(*step, "registration");
+            assert!(
+                detail.starts_with("render_texture_access_unsupported: "),
+                "the provider names the access mismatch: {detail}"
+            );
+        }
+        other => panic!("a declaration the module does not repeat has to be refused: {other:?}"),
+    }
+
+    // 2. The provider's own registration, for the raw field map.
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let provider = VulkanComputeProvider::with_executor(std::sync::Arc::clone(&executor))
+        .expect("the canonical provider builds");
+    let device =
+        Device::new(std::sync::Arc::clone(&executor) as std::sync::Arc<dyn ComputeExecutor>);
+    let policy = provider.spirv_feature_policy();
+    let translate = |air: &[u8], stage: RenderStage, entry: &str| {
+        let function = device
+            .new_library_with_binary_air(air.to_vec())
+            .expect("the fixture is a binary AIR module")
+            .function(entry)
+            .expect("the fixture's entry exists");
+        TranslatedRenderStage::translate_with_policy(stage, &function, policy)
+            .expect("the fixture translates under this device's policy")
+    };
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: stages.vertex_entry.to_owned(),
+                fragment_entry: stages.fragment_entry.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
+                    stride: 8,
+                    step: VertexStep::PerVertex,
+                    attributes: vec![VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                }]),
+                stage_buffers: Vec::new(),
+                // The declaration states the sampled arm the module's own
+                // instructions do not: the fetched image is written through
+                // `texture.read()`, so no `OpSampledImage` reaches it.
+                textures: vec![metal_api_core::provider::TextureBindingContract::sampled(
+                    0,
+                    metal_api_core::provider::TextureFormat::Rgba8Unorm,
+                    sampled_state,
+                )],
+            },
+            vertex: translate(&stages.air.0, RenderStage::Vertex, stages.vertex_entry),
+            fragment: translate(&stages.air.1, RenderStage::Fragment, stages.fragment_entry),
+            logical_digest: SemanticDigest::new(
+                "reims-provider-render-rail-r15",
+                b"fetched-module-sampled-declaration".to_vec(),
+            )
+            .expect("the digest names a case"),
+        })
+        .expect_err("the module's own fetches do not repeat a sampled declaration");
+    eprintln!("R15 provider answer for the forged declaration: {refused:?}");
+    assert_eq!(refused.slug, "render_texture_access_unsupported");
+    assert_eq!(
+        refused.fields.get("binding"),
+        Some(&FieldValue::Unsigned(0)),
+        "the refusal names the Metal texture index: {refused:?}"
+    );
+    assert_eq!(
+        refused.fields.get("declared_access"),
+        Some(&FieldValue::Text("Sampled".to_owned())),
+        "the refusal names the declaration's arm: {refused:?}"
+    );
+    assert_eq!(
+        refused.fields.get("module_access"),
+        Some(&FieldValue::Text("fetched".to_owned())),
+        "and the module's own arm: {refused:?}"
     );
 }
 

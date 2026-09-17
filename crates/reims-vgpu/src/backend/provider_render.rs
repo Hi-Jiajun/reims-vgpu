@@ -683,8 +683,8 @@ impl RenderTextureShapeRefusal {
 }
 
 /// The sampler form one fragment-stage `[[texture(i)]]` argument's samples read
-/// through, as the module's own translation states it (R10/R12,
-/// `research/docs/23` §101, §102).
+/// through, as the module's own translation states it (R10/R12/R15,
+/// `research/docs/23` §101, §102, §3.3).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderSamplerState {
     /// An AIR `constexpr sampler` the module carries: the state the canonical
@@ -697,6 +697,13 @@ pub enum RenderSamplerState {
         /// The Metal `[[sampler(n)]]` argument index.
         index: u32,
     },
+    /// The module's own image sites only texel-fetch this texture (R15): it
+    /// carries no AIR sampler state and names no runtime `[[sampler(n)]]`
+    /// argument, because `texture.read()` is an `OpImageFetch` of the image
+    /// alone. The declaration states no sampler form at all and the canonical
+    /// rail binds the image descriptor by itself
+    /// ([`TextureBindingContract::fetched`]).
+    Fetched,
     /// A sampler form this class cannot name, with the fact that stopped it.
     Unsupported(RenderSamplerRefusal),
 }
@@ -783,9 +790,12 @@ pub struct RenderTextureDeclaration {
     /// The device binding of the sampler this texture's samples go through:
     /// the AIR static sampler [`Self::sampler`] states the policy of, or — for
     /// the runtime family (R12) — the `[[sampler(n)]]` argument
-    /// [`Self::sampler`] names the Metal index of.
+    /// [`Self::sampler`] names the Metal index of. A texel-fetched declaration
+    /// ([`RenderSamplerState::Fetched`], R15) states none, and this is the
+    /// contract's own zero — the arm reads no sampler slot.
     pub sampler_binding: u32,
-    /// The module's own state for that sampler.
+    /// The module's own state for that sampler, or the sampler-free arm the
+    /// module's own image sites state.
     pub sampler: RenderSamplerState,
     /// The reflected texture shape.
     pub shape: RenderTextureShape,
@@ -812,7 +822,8 @@ pub struct RenderInterfaceRefusal {
 
 /// The `[[texture(i)]]` arguments one fragment stage's reflection declares, with
 /// the AIR sampler state its samples were lowered against (R10,
-/// `research/docs/23` §101).
+/// `research/docs/23` §101) — or the sampler-free answer a texture only
+/// `texture.read()` reaches states (R15, §3.3).
 ///
 /// The canonical render sampler pairs the *i*-th reflected sampled texture with
 /// the *i*-th AIR static sampler (`metal-api-vulkan`'s
@@ -915,7 +926,9 @@ pub fn texture_declarations(
     }
 
     // The AIR static samplers first: the canonical rail pairs them with the
-    // sampled textures by position, and so does the loop below.
+    // *sampled* textures by position — a texel-fetched texture states no
+    // sampler, so it takes no position in that pairing (R15) — and so does the
+    // loop below.
     let samplers = reflection
         .bindings
         .iter()
@@ -935,16 +948,35 @@ pub fn texture_declarations(
                 .map(|slot| (binding.metal_index, slot))
         })
         .collect::<Vec<_>>();
+    // The position among the *sampled* textures, which is the one the
+    // positional static pairing counts against: the canonical rail skips a
+    // fetched binding when it advances its own static sampler, so this walk
+    // has to skip it too (R15).
+    let mut static_read = 0usize;
     reflection
         .bindings
         .iter()
         .filter(|binding| binding.kind == ResourceKind::Texture)
-        .enumerate()
-        .map(|(position, texture)| {
-            let paired = samplers.get(position);
+        .map(|texture| {
             let binding = texture
                 .descriptor
                 .map_or(0, |descriptor| descriptor.binding);
+            // Which arm the module's own image sites state for this slot
+            // (R15): a texture whose sites are all `OpImageFetch` and no
+            // `OpSampledImage` is fetched, and its declaration states no
+            // sampler at all. Every other answer — sampled, directly read,
+            // never read, or unreadable — keeps the R10/R12 walk below, which
+            // either names the sampler the module samples through or refuses
+            // the shape by name.
+            let fetched = crate::runtime::spirv_bind::descriptor_image_use(words, binding)
+                == crate::runtime::spirv_bind::DescriptorImageUse::Fetched;
+            let paired = if fetched {
+                None
+            } else {
+                let paired = samplers.get(static_read);
+                static_read += 1;
+                paired
+            };
             // The device binding the runtime resolves this draw's own sampler
             // bind at: the translator's sampler band is widened into the
             // device's before any shader is cached
@@ -967,7 +999,12 @@ pub fn texture_declarations(
                     .find(|(_, runtime_slot)| *runtime_slot == slot)
                     .copied()
             });
-            let (sampler_binding, sampler) =
+            // The sampler-free declaration states no slot: the canonical
+            // contract's fetched arm carries no sampler, so a number here
+            // would be a binding nothing reads.
+            let (sampler_binding, sampler) = if fetched {
+                (0, RenderSamplerState::Fetched)
+            } else {
                 match paired.and_then(|sampler| sampler.static_sampler.as_ref()) {
                     Some(state) => (
                         static_slot,
@@ -992,7 +1029,8 @@ pub fn texture_declarations(
                             RenderSamplerState::Unsupported(RenderSamplerRefusal::SampleSite),
                         ),
                     },
-                };
+                }
+            };
             RenderTextureDeclaration {
                 index: texture.metal_index,
                 binding,
@@ -1343,6 +1381,13 @@ fn sampled_textures<'a>(
         }
         let sampler = match declaration.sampler {
             RenderSamplerState::Policy(policy) => NarrowSampler::Static(policy),
+            // The sampler-free arm (R15): the module's own sites texel-fetch
+            // this texture, so the declaration states no sampler and the class
+            // has none to resolve — neither from the module nor from the
+            // request. The bind the draw states at some sampler slot is not
+            // this texture's fact, exactly as the canonical contract's fetched
+            // arm states none.
+            RenderSamplerState::Fetched => NarrowSampler::Fetched,
             // The runtime half (R12): the declaration's Metal index has to be
             // one the stage's own reflection binds, at the device slot the
             // declaration states — the two are one measurement of one
@@ -4351,22 +4396,23 @@ struct NarrowSampling<'a> {
     runtime_samplers: Vec<NarrowRuntimeSampler>,
 }
 
-/// One admitted sampled texture: the canonical binding (its position), the
-/// bytes the fragment stage samples, and the sampler form its declaration
-/// states (R10/R12).
+/// One admitted texture: the canonical binding (its position), the bytes the
+/// fragment stage reads, and the sampler form its declaration states
+/// (R10/R12/R15).
 struct NarrowTexture<'a> {
     /// The Metal `[[texture(n)]]` index, which the contract requires to equal
     /// the entry's position.
     index: u32,
     width: u64,
     height: u64,
-    /// The sampler form the declaration states.
+    /// The sampler form the declaration states, or the sampler-free fetched
+    /// arm (R15).
     sampler: NarrowSampler,
     /// The texels, as the request's own tightly packed `rgba8_unorm` copy.
     bytes: &'a [u8],
 }
 
-/// Which sampler form one admitted texture's declaration states (R10/R12).
+/// Which sampler form one admitted texture's declaration states (R10/R12/R15).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NarrowSampler {
     /// The AIR static state the module carries: the declaration states it, the
@@ -4377,6 +4423,10 @@ enum NarrowSampler {
     /// declaration states the pair, and the pass states the state, which is the
     /// request's own fact (R12).
     Runtime { index: u32 },
+    /// No sampler at all (R15): the module's own sites texel-fetch the image,
+    /// so the canonical declaration binds the `SAMPLED_IMAGE` descriptor alone
+    /// and the pass states no sampler state for it.
+    Fetched,
 }
 
 /// One runtime sampler state the request states for an admitted pass (R12):
@@ -4564,6 +4614,13 @@ impl NarrowPass<'_> {
                     TextureFormat::Rgba8Unorm,
                     index,
                 ),
+                // The sampler-free arm (R15): the declaration states the image
+                // alone, and the module's own `OpImageFetch` reads it — a rail
+                // that bound a sampler would be filling a descriptor nothing
+                // samples through.
+                NarrowSampler::Fetched => {
+                    TextureBindingContract::fetched(texture.index, TextureFormat::Rgba8Unorm)
+                }
             })
             .collect()
     }
@@ -5681,7 +5738,14 @@ fn submit_narrow(
             depth: 1,
             array_length: 1,
             sample_count: 1,
-            access: TextureAccess::Sampled,
+            // The access the declaration states (R15): a fetched texture's
+            // view is the image alone, and the canonical admission holds the
+            // view's access to the declaration's field by field
+            // (`TextureAccessMismatch`), so the two halves cannot drift.
+            access: match texture.sampler {
+                NarrowSampler::Fetched => TextureAccess::Fetched,
+                NarrowSampler::Static(_) | NarrowSampler::Runtime { .. } => TextureAccess::Sampled,
+            },
             source: TextureSource::OwnedBytes(texture.bytes.to_vec()),
         });
         next_view += 1;
