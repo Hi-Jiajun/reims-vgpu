@@ -10258,6 +10258,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     })
                     .collect::<Vec<_>>()
             };
+            // The stage's runtime sampler family (R12) in the same numbering
+            // and under the same flag: the relocation moves the sampler band
+            // the declarations' `sampler_binding`s were resolved in, so the
+            // family list has to move with it or the gate would look for the
+            // draw's bind at the pre-relocation slot.
+            let sampler_family = {
+                use crate::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET;
+                let base_off = if separate_sampled {
+                    FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+                } else {
+                    0
+                };
+                provider_render::RenderSamplerFamily {
+                    runtime: resolved
+                        .sampler_family
+                        .runtime
+                        .iter()
+                        .map(|sampler| provider_render::RenderRuntimeSampler {
+                            binding: sampler.binding + base_off,
+                            ..*sampler
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                    statics: resolved.sampler_family.statics.clone(),
+                }
+            };
             let inputs = RenderRailInputs {
                 vertex_air: resolved.vertex_air.as_ref(),
                 fragment_air: resolved.fragment_air.as_ref(),
@@ -10298,6 +10324,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // image). The class gate states the declarations in the
                 // canonical contract and answers the rest by name.
                 fragment_texture_declarations: &fragment_texture_declarations,
+                sampler_family: &sampler_family,
                 texture_interface_refusals: resolved.texture_interface_refusals.as_ref(),
                 stage_buffer_binds: &stage_buffer_binds,
                 // R4b, probe-gated: the present tail a record states when it is

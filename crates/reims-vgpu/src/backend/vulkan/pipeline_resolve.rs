@@ -329,6 +329,17 @@ pub struct ResolvedRenderPipeline {
     #[cfg(feature = "provider-render")]
     pub fragment_texture_declarations:
         Arc<[crate::backend::provider_render::RenderTextureDeclaration]>,
+    /// The sampler family the fragment stage's own translation declares (R12,
+    /// `research/docs/23` §102): every runtime `[[sampler(n)]]` argument the
+    /// reflection binds, beside the AIR static samplers it carries.
+    ///
+    /// The same stage-level fact as the declaration list above, collected with
+    /// it: the canonical contract pairs each runtime argument with a texture
+    /// declaration that names it, and a stage whose two sampler forms mix or
+    /// whose arguments the registration would refuse by name is a shape the
+    /// class gate has to answer before the provider is asked.
+    #[cfg(feature = "provider-render")]
+    pub sampler_family: Arc<crate::backend::provider_render::RenderSamplerFamily>,
     /// The Metal arguments outside the family the canonical translated render
     /// rail executes, across both stages (R10).
     #[cfg(feature = "provider-render")]
@@ -406,6 +417,8 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
         // sampled texture" — the same shape the two lists above give it.
         #[cfg(feature = "provider-render")]
         fragment_texture_declarations: Arc::from(Vec::new()),
+        #[cfg(feature = "provider-render")]
+        sampler_family: Arc::new(Default::default()),
         #[cfg(feature = "provider-render")]
         texture_interface_refusals: Arc::from(Vec::new()),
     })
@@ -894,10 +907,18 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
     let fragment_stage_buffer_declarations = stage_buffer_declarations(&fragment.reflection);
     // The sampled-texture half (R10): the fragment stage's `[[texture(i)]]`
     // arguments beside the AIR sampler state each was lowered against, and the
-    // arguments outside the family the translated rail executes.
+    // arguments outside the family the translated rail executes. The
+    // declarations are read off the *translated module* as well as the
+    // reflection (R12): which runtime `[[sampler(n)]]` argument a texture reads
+    // through is a fact of the module body, so the same words the two rails
+    // execute are what answer it.
     #[cfg(feature = "provider-render")]
-    let fragment_texture_declarations =
-        crate::backend::provider_render::texture_declarations(&fragment.reflection);
+    let fragment_texture_declarations = crate::backend::provider_render::texture_declarations(
+        &fragment.reflection,
+        &fragment.words,
+    );
+    #[cfg(feature = "provider-render")]
+    let sampler_family = crate::backend::provider_render::sampler_family(&fragment.reflection);
     #[cfg(feature = "provider-render")]
     let texture_interface_refusals = crate::backend::provider_render::texture_interface_refusals(
         &vertex.reflection,
@@ -926,6 +947,8 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         fragment_stage_buffer_declarations,
         #[cfg(feature = "provider-render")]
         fragment_texture_declarations,
+        #[cfg(feature = "provider-render")]
+        sampler_family: Arc::new(sampler_family),
         #[cfg(feature = "provider-render")]
         texture_interface_refusals,
     })

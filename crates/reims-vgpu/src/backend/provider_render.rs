@@ -381,11 +381,12 @@ use metal_api_core::provider::{
     DispatchKind, DispatchType, FootprintProof, IndexBufferBinding, IndexFormat, InitialState,
     LoadOp, NoCopyLeaseImporter, OperationId, PresentDescriptor, PresentMode, PresentTarget,
     RenderAttachment, RenderPassBlend, RenderPassDescriptor, RenderPipelineContract,
-    RenderPipelineStage, ResourceTableSnapshot, SamplerPolicy, SemanticDigest, StageBufferBinding,
-    StageBufferView, StoreOp, TextureAccess, TextureBindingContract, TextureFormat, TextureSource,
-    TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexLayout, VertexStep, ViewId, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
-    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    RenderPipelineStage, RenderSamplerBinding, ResourceTableSnapshot, SamplerPolicy,
+    SemanticDigest, StageBufferBinding, StageBufferView, StoreOp, TextureAccess,
+    TextureBindingContract, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
+    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_VERTEX_BUFFERS,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::Device;
 use metal_api_vulkan::{RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage};
@@ -681,22 +682,84 @@ impl RenderTextureShapeRefusal {
     }
 }
 
-/// The state one fragment-stage `[[texture(i)]]` argument's samples were
-/// lowered against, as the module's own AIR carries it (R10,
-/// `research/docs/23` §101).
+/// The sampler form one fragment-stage `[[texture(i)]]` argument's samples read
+/// through, as the module's own translation states it (R10/R12,
+/// `research/docs/23` §101, §102).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderSamplerState {
-    /// The state the canonical rail creates a `VkSampler` from.
+    /// An AIR `constexpr sampler` the module carries: the state the canonical
+    /// rail creates its `VkSampler` from (R10).
     Policy(SamplerPolicy),
-    /// The module names no AIR static sampler for this texture — the other
-    /// Metal sampler family is a runtime `[[sampler(n)]]` object, which the
-    /// canonical translated rail refuses by name
-    /// (`render_stage_unsupported_interface`).
-    Runtime,
-    /// The AIR state is outside the family the canonical rail creates: a
-    /// differing min/mag filter, a mip filter, non-normalized coordinates, a
-    /// compare function, anisotropy, or a reduction.
-    Unsupported,
+    /// A runtime `[[sampler(n)]]` argument the module's own sample sites name
+    /// (R12): the module carries no state, so the *request* states it and this
+    /// is the Metal index it belongs to.
+    Runtime {
+        /// The Metal `[[sampler(n)]]` argument index.
+        index: u32,
+    },
+    /// A sampler form this class cannot name, with the fact that stopped it.
+    Unsupported(RenderSamplerRefusal),
+}
+
+/// Why one sampled texture's sampler form is not one this class states.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderSamplerRefusal {
+    /// The AIR `constexpr sampler`'s state is outside the family the canonical
+    /// rail creates (R10): a differing min/mag filter, a mip filter,
+    /// non-normalized coordinates, a compare function, anisotropy, or a
+    /// reduction.
+    AirState,
+    /// The module's own sample sites do not name a runtime `[[sampler(n)]]`
+    /// argument the reflection binds for this texture (R12): no sample site
+    /// reaches it, two samplers do, or the site's operands are values the
+    /// module's own walk cannot follow to a descriptor.
+    SampleSite,
+}
+
+impl RenderSamplerRefusal {
+    /// The fact, as the refusal's sentence names it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::AirState => {
+                "the AIR state is outside the family the canonical rail creates — nearest or \
+                 linear filtering with clamped or repeating addressing, one mip level, \
+                 normalized coordinates, no comparison, no anisotropy"
+            }
+            Self::SampleSite => {
+                "the module's own sample sites name no runtime `[[sampler(n)]]` argument the \
+                 reflection binds for it"
+            }
+        }
+    }
+}
+
+/// One runtime `[[sampler(n)]]` argument the fragment stage's reflection binds
+/// (R12, `research/docs/23` §102).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderRuntimeSampler {
+    /// The Metal `[[sampler(n)]]` argument index.
+    pub index: u32,
+    /// The device binding the runtime resolves this draw's own sampler bind at,
+    /// before the fragment sampled-band relocation the draw adds on top.
+    pub binding: u32,
+}
+
+/// The sampler family one fragment stage's translation declares (R12).
+///
+/// Two lists rather than one because the class asks two different questions of
+/// them: which runtime `[[sampler(n)]]` arguments the stage binds (each of which
+/// the canonical contract has to pair with a texture, or the provider refuses
+/// the registration by name), and whether the stage carries AIR static samplers
+/// at all — the two families do not mix in one stage the canonical rail can
+/// pair, because its static half pairs positionally and its runtime half by the
+/// declaration's own index.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RenderSamplerFamily {
+    pub runtime: Arc<[RenderRuntimeSampler]>,
+    /// The Metal index of every `ResourceKind::StaticSampler` binding, in the
+    /// reflection's own order — the order the canonical rail's positional
+    /// pairing counts against.
+    pub statics: Arc<[u32]>,
 }
 
 /// One `[[texture(i)]]` argument the fragment stage's own translation declares
@@ -717,7 +780,10 @@ pub struct RenderTextureDeclaration {
     pub index: u32,
     /// The device binding the request resolves this texture's view at.
     pub binding: u32,
-    /// The device binding of the AIR static sampler the samples go through.
+    /// The device binding of the sampler this texture's samples go through:
+    /// the AIR static sampler [`Self::sampler`] states the policy of, or — for
+    /// the runtime family (R12) — the `[[sampler(n)]]` argument
+    /// [`Self::sampler`] names the Metal index of.
     pub sampler_binding: u32,
     /// The module's own state for that sampler.
     pub sampler: RenderSamplerState,
@@ -760,12 +826,22 @@ pub struct RenderInterfaceRefusal {
 /// `Some` exactly for the states the canonical rail creates a `VkSampler` from
 /// — nearest or linear min/mag filtering, identical on all three axes, one mip
 /// level, normalized coordinates, no comparison, no anisotropy, weighted-average
-/// reduction — and the two refusals the gate answers with otherwise. The
-/// refusals' *names* live in the rail (`RenderSamplerState`), the facts live
-/// here.
+/// reduction — and the refusals the gate answers with otherwise. The refusals'
+/// *names* live in the rail (`RenderSamplerState`), the facts live here.
+///
+/// A texture with no AIR static sampler beside it reads through the *other*
+/// Metal sampler family: a runtime `[[sampler(n)]]` argument, whose state the
+/// pass states rather than the module (R12, `research/docs/23` §102). Which
+/// argument a texture reads through is not in the argument metadata — the
+/// translation states it in the module body — so this walk asks `words`, the
+/// module this resolution translated, for the pairing its own sample sites
+/// name (`runtime::spirv_bind::sampled_image_pairs`). A texture whose sites
+/// name no such argument, or more than one, is `Unsupported` with that fact,
+/// and the gate keeps it on the engine by name.
 #[cfg(feature = "provider-render")]
 pub fn texture_declarations(
     reflection: &metal2vulkan::reflect::ShaderReflection,
+    words: &[u32],
 ) -> Arc<[RenderTextureDeclaration]> {
     use metal2vulkan::meta::{TextureComponent, TextureDimension, TextureShape};
     use metal2vulkan::reflect::{
@@ -845,6 +921,20 @@ pub fn texture_declarations(
         .iter()
         .filter(|binding| binding.kind == ResourceKind::StaticSampler)
         .collect::<Vec<_>>();
+    // The runtime `[[sampler(n)]]` arguments beside the pairing the module's
+    // own sample sites state (R12): the walk answers with *descriptor
+    // bindings*, and this list is what turns a binding back into the Metal
+    // index the contract names.
+    let pairing = crate::runtime::spirv_bind::sampled_image_pairs(words);
+    let runtime_samplers = reflection
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::Sampler)
+        .filter_map(|binding| {
+            crate::runtime::spirv_bind::reflected_sampler_binding(binding, false)
+                .map(|slot| (binding.metal_index, slot))
+        })
+        .collect::<Vec<_>>();
     reflection
         .bindings
         .iter()
@@ -852,33 +942,62 @@ pub fn texture_declarations(
         .enumerate()
         .map(|(position, texture)| {
             let paired = samplers.get(position);
+            let binding = texture
+                .descriptor
+                .map_or(0, |descriptor| descriptor.binding);
+            // The device binding the runtime resolves this draw's own sampler
+            // bind at: the translator's sampler band is widened into the
+            // device's before any shader is cached
+            // (`runtime::spirv_bind::widen_sampled_bands`), and the fragment
+            // sampled-band relocation is added per draw on top of that (see
+            // [`RenderTextureDeclaration::sampler_binding`]). The one helper
+            // that states the pair is the runtime's own, and it is the same
+            // helper [`sampler_family`] reads the stage's runtime list with —
+            // so the declaration and the gate name one device slot.
+            let static_slot = paired
+                .and_then(|sampler| {
+                    crate::runtime::spirv_bind::reflected_sampler_binding(sampler, false)
+                })
+                .unwrap_or(0);
+            // The runtime `[[sampler(n)]]` argument the module's own sample
+            // sites pair this texture with, as `(metal index, device slot)`.
+            let runtime_pair = pairing.sampler_of(binding).and_then(|slot| {
+                runtime_samplers
+                    .iter()
+                    .find(|(_, runtime_slot)| *runtime_slot == slot)
+                    .copied()
+            });
+            let (sampler_binding, sampler) =
+                match paired.and_then(|sampler| sampler.static_sampler.as_ref()) {
+                    Some(state) => (
+                        static_slot,
+                        match air_sampler_policy(state) {
+                            Some(policy) => RenderSamplerState::Policy(policy),
+                            None => RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState),
+                        },
+                    ),
+                    // No decoded AIR state beside this texture: either the
+                    // AIR static sampler carries none the translator could
+                    // read (the provider refuses that by name), or the texture
+                    // reads through a runtime `[[sampler(n)]]` argument, whose
+                    // slot and index the module's own sample sites name.
+                    None => match runtime_pair {
+                        Some((index, slot)) => (slot, RenderSamplerState::Runtime { index }),
+                        None if paired.is_some() => (
+                            static_slot,
+                            RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState),
+                        ),
+                        None => (
+                            0,
+                            RenderSamplerState::Unsupported(RenderSamplerRefusal::SampleSite),
+                        ),
+                    },
+                };
             RenderTextureDeclaration {
                 index: texture.metal_index,
-                binding: texture
-                    .descriptor
-                    .map_or(0, |descriptor| descriptor.binding),
-                // The device binding the runtime resolves this draw's own
-                // sampler bind at: the translator's sampler band is widened
-                // into the device's before any shader is cached
-                // (`runtime::spirv_bind::widen_sampled_bands`), and the
-                // fragment sampled-band relocation is added per draw on top of
-                // that (see [`RenderTextureDeclaration::sampler_binding`]).
-                // The one helper that states the pair is the runtime's own.
-                sampler_binding: paired
-                    .and_then(|sampler| {
-                        crate::runtime::spirv_bind::reflected_sampler_binding(sampler, false)
-                    })
-                    .unwrap_or(0),
-                sampler: match paired.and_then(|sampler| sampler.static_sampler.as_ref()) {
-                    Some(state) => match air_sampler_policy(state) {
-                        Some(policy) => RenderSamplerState::Policy(policy),
-                        None => RenderSamplerState::Unsupported,
-                    },
-                    // No AIR static sampler pairs with this texture: the other
-                    // Metal sampler family is a runtime `[[sampler(n)]]`
-                    // object, which the translated rail does not execute.
-                    None => RenderSamplerState::Runtime,
-                },
+                binding,
+                sampler_binding,
+                sampler,
                 shape: sampled_shape(texture),
             }
         })
@@ -890,11 +1009,14 @@ pub fn texture_declarations(
 /// executes, across both stages (R10).
 ///
 /// The translated rail binds `[[buffer(n)]]` arguments, one sampled
-/// `[[texture(i)]]` per AIR static sampler, and nothing else: every other kind
-/// (a runtime `[[sampler(n)]]`, a storage image, a texture array, a
-/// framebuffer-fetch `[[color(n)]]`) is refused by the provider by name
-/// (`render_stage_unsupported_interface`), so the class gate answers them here
-/// rather than letting the provider decline a draw the engine could run.
+/// `[[texture(i)]]` per AIR static sampler, and a fragment stage's runtime
+/// `[[sampler(n)]]` arguments since v102 (R12 states their pairing and state in
+/// the class gate): every other kind (a storage image, a texture array, a
+/// framebuffer-fetch `[[color(n)]]`, and a *vertex* stage's runtime sampler,
+/// which the translated rail's texture walk never reaches) is refused by the
+/// provider by name (`render_stage_unsupported_interface`), so the class gate
+/// answers them here rather than letting the provider decline a draw the engine
+/// could run.
 #[cfg(feature = "provider-render")]
 pub fn texture_interface_refusals(
     vertex: &metal2vulkan::reflect::ShaderReflection,
@@ -937,10 +1059,21 @@ pub fn texture_interface_refusals(
             .bindings
             .iter()
             .filter(|binding| {
-                !matches!(
+                if matches!(
                     binding.kind,
                     ResourceKind::Buffer | ResourceKind::Texture | ResourceKind::StaticSampler
-                )
+                ) {
+                    return false;
+                }
+                // A fragment stage's runtime `[[sampler(n)]]` argument is the
+                // translated rail's own family (v102, `research/docs/23`
+                // §102): the class gate states the pairing the module's sample
+                // sites name and the state the request binds, and answers the
+                // stage-level shapes it cannot state under their own names
+                // rather than under this one. A *vertex* stage's stays here:
+                // the translated rail walks the fragment stage's textures.
+                !(stage == metal_api_core::provider::RenderPipelineStage::Fragment
+                    && binding.kind == ResourceKind::Sampler)
             })
             .map(|binding| RenderInterfaceRefusal {
                 stage,
@@ -958,6 +1091,44 @@ pub fn texture_interface_refusals(
         fragment,
     ));
     out.into()
+}
+
+/// The sampler family one fragment stage's translation declares (R12,
+/// `research/docs/23` §102).
+///
+/// A *stage-level* fact like the texture declarations beside it, collected once
+/// per resolved pipeline from the same reflection they are: which runtime
+/// `[[sampler(n)]]` arguments the stage binds — each of which the canonical
+/// contract has to pair with a sampled texture, or the registration is refused
+/// by name — and whether the stage carries AIR static samplers at all, because
+/// the canonical rail pairs those positionally and one stage's two sampler
+/// forms are not a shape the class states.
+#[cfg(feature = "provider-render")]
+pub fn sampler_family(fragment: &metal2vulkan::reflect::ShaderReflection) -> RenderSamplerFamily {
+    use metal2vulkan::reflect::ResourceKind;
+
+    let runtime = fragment
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::Sampler)
+        .map(|binding| RenderRuntimeSampler {
+            index: binding.metal_index,
+            // The same helper the declarations above use, so the class gate's
+            // two halves name one device slot.
+            binding: crate::runtime::spirv_bind::reflected_sampler_binding(binding, false)
+                .unwrap_or(0),
+        })
+        .collect::<Vec<_>>();
+    let statics = fragment
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::StaticSampler)
+        .map(|binding| binding.metal_index)
+        .collect::<Vec<_>>();
+    RenderSamplerFamily {
+        runtime: runtime.into(),
+        statics: statics.into(),
+    }
 }
 /// One `MTLBlendFactor` ordinal in the canonical contract's own vocabulary
 /// (`research/docs/23` §100, E-RV1/v100).
@@ -1020,9 +1191,9 @@ fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
 /// own name rather than narrowing anything:
 ///
 /// 1. **What the module declares.** A fragment stage whose reflection names a
-///    resource family the translated rail does not execute — a runtime
-///    `[[sampler(n)]]`, a storage image, an arrayed texture, a vertex-stage
-///    image — is refused by the provider by name, so the class answers it here
+///    resource family the translated rail does not execute — a storage image,
+///    a texture array, a framebuffer-fetch colour input, a vertex-stage image
+///    — is refused by the provider by name, so the class answers it here
 ///    (`render_provider_out_of_class_texture_interface`). A `[[texture(n)]]`
 ///    that is not its own position has no positional list the contract can
 ///    state (`..._texture_binding`), a reflected shape outside the executable
@@ -1030,6 +1201,18 @@ fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
 ///    sampler is `..._texture_sampler` — the state comes from the *module*, not
 ///    from the draw, which is exactly the rule E-RS1 landed on the canonical
 ///    side.
+///
+///    The module's `[[texture(i)]]` arguments may also read through the *other*
+///    Metal sampler family, a runtime `[[sampler(n)]]` argument whose state the
+///    request states (R12, `research/docs/23` §102). That family is admitted
+///    through the pairing the module's own sample sites name, and the
+///    stage-level shapes it cannot be admitted through are answered under their
+///    own names: a stage that carries both sampler forms
+///    (`..._texture_sampler_family`), more runtime arguments than the Metal
+///    sampler table holds (`..._texture_sampler_count`), a runtime argument no
+///    texture reads through (`..._texture_sampler_unpaired`), and a declaration
+///    whose index, device slot or module the reflection does not back
+///    (`..._texture_sampler_mismatch`).
 /// 2. **What the draw bound.** Declaration `i` pairs with the request's own
 ///    bind at the device binding the runtime resolved it at; a declaration
 ///    without one is `..._texture_unbound`, a bind whose shape the pass cannot
@@ -1046,6 +1229,12 @@ fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
 ///    while the canonical rail creates its sampler from the declaration, and
 ///    the two frames would differ with nothing named.
 ///
+///    A runtime sampler's state is the *request's* fact, so the same rule reads
+///    the other way round: the draw's own bind at the argument's device slot is
+///    what the pass states, and a slot the draw leaves unbound
+///    (`..._texture_unbound`) or a bind outside the canonical policy family
+///    (`..._texture_state`) keeps the draw on the engine.
+///
 /// Binds the module does not declare (a vertex stage's texture, or a fragment
 /// texture no reflected slot names) are **not** an error: neither rail's module
 /// reads them, so the pass states nothing for them and both frames are the
@@ -1054,7 +1243,7 @@ fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
 fn sampled_textures<'a>(
     inputs: &RenderRailInputs<'_>,
     req: &'a DrawRequest,
-) -> Result<Vec<NarrowTexture<'a>>, OutOfClass> {
+) -> Result<NarrowSampling<'a>, OutOfClass> {
     if req.color_input {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_color_input",
@@ -1085,8 +1274,9 @@ fn sampled_textures<'a>(
             format!(
                 "a draw whose {} stage declares a {} at Metal index {} stays on the engine: the \
                  canonical translated rail executes `[[buffer(n)]]` arguments, one sampled \
-                 `[[texture(i)]]` per AIR static sampler and nothing else, and every other \
-                 resource kind is refused by the provider's own name \
+                 `[[texture(i)]]` per AIR static sampler beside a fragment stage's runtime \
+                 `[[sampler(n)]]` arguments, and every other resource kind is refused by the \
+                 provider's own name \
                  (`render_stage_unsupported_interface`) rather than executed with the binding \
                  dropped",
                 match refused.stage {
@@ -1098,7 +1288,45 @@ fn sampled_textures<'a>(
             ),
         ));
     }
+    // The stage's sampler family (R12, `research/docs/23` §102), before any
+    // texture is weighed against its bind: a stage that carries both sampler
+    // forms, or more runtime `[[sampler(n)]]` arguments than Metal's own
+    // sampler table holds, is a shape the canonical rail's registration rules
+    // refuse by name, so the class answers it here instead of letting the
+    // provider decline a draw the engine could run.
+    let family = inputs.sampler_family;
+    if !family.runtime.is_empty() && !family.statics.is_empty() {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_texture_sampler_family",
+            format!(
+                "a fragment stage that carries both AIR static samplers and runtime \
+                 `[[sampler(n)]]` arguments stays on the engine: {} static sampler(s) and {} \
+                 runtime sampler(s) are two forms the canonical rail pairs by different rules — \
+                 the static half by position, the runtime half by the index a declaration names — \
+                 and one stage's textures do not state both",
+                family.statics.len(),
+                family.runtime.len(),
+            ),
+        ));
+    }
+    if family.runtime.len() > MAX_RENDER_SAMPLERS {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_texture_sampler_count",
+            format!(
+                "a fragment stage that binds {} runtime `[[sampler(n)]]` arguments stays on the \
+                 engine: Metal's sampler argument table holds {MAX_RENDER_SAMPLERS} \
+                 (`MAX_RENDER_SAMPLERS`), and a longer list is refused by name \
+                 (`render_sampler_limit`) rather than executed with the rest dropped",
+                family.runtime.len(),
+            ),
+        ));
+    }
     let mut textures = Vec::with_capacity(inputs.fragment_texture_declarations.len());
+    // The runtime sampler states the pass states, one per Metal index the
+    // admitted declarations pair with, kept in the order the declarations name
+    // them and canonicalised below (the contract's list is ascending and
+    // unique).
+    let mut runtime_samplers: Vec<NarrowRuntimeSampler> = Vec::new();
     for (position, declaration) in inputs.fragment_texture_declarations.iter().enumerate() {
         let position = u32::try_from(position).unwrap_or(u32::MAX);
         if declaration.index != position {
@@ -1114,31 +1342,101 @@ fn sampled_textures<'a>(
             ));
         }
         let sampler = match declaration.sampler {
-            RenderSamplerState::Policy(policy) => policy,
-            RenderSamplerState::Runtime => {
-                return Err(OutOfClass::owned(
-                    "render_provider_out_of_class_texture_sampler",
-                    format!(
-                        "a fragment stage whose `[[texture({})]]` samples through a runtime \
-                         `[[sampler(n)]]` object stays on the engine: the canonical render sampler \
-                         is the AIR static sampler the module was lowered against \
-                         (`constexpr sampler`), and a runtime sampler object is a resource kind \
-                         the translated rail refuses by name \
-                         (`render_stage_unsupported_interface`)",
-                        declaration.index,
-                    ),
-                ))
+            RenderSamplerState::Policy(policy) => NarrowSampler::Static(policy),
+            // The runtime half (R12): the declaration's Metal index has to be
+            // one the stage's own reflection binds, at the device slot the
+            // declaration states — the two are one measurement of one
+            // translation — and the state is the *request's*, read off the
+            // draw's own bind at that slot.
+            RenderSamplerState::Runtime { index } => {
+                let Some(runtime) = family.runtime.iter().find(|runtime| runtime.index == index)
+                else {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_texture_sampler_mismatch",
+                        format!(
+                            "a fragment stage whose `[[texture({})]]` is declared against runtime \
+                             `[[sampler({index})]]` stays on the engine: the stage's own \
+                             reflection binds no runtime sampler argument at that index, so the \
+                             declaration and the module disagree, and the canonical rail refuses \
+                             such a pairing by name (`render_runtime_sampler_unpaired`) rather \
+                             than filling a descriptor nothing samples through",
+                            declaration.index,
+                        ),
+                    ));
+                };
+                if runtime.binding != declaration.sampler_binding {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_texture_sampler_mismatch",
+                        format!(
+                            "a fragment stage whose `[[texture({})]]` reads through \
+                             `[[sampler({index})]]` stays on the engine: the declaration resolves \
+                             that argument at device binding {}, while the stage's own reflection \
+                             resolves it at {} — the canonical rail fills the descriptor the \
+                             module samples through, so a declaration naming another slot would \
+                             state a pairing the two halves do not share",
+                            declaration.index, declaration.sampler_binding, runtime.binding,
+                        ),
+                    ));
+                }
+                let Some(bound) = req
+                    .samplers
+                    .iter()
+                    .find(|sampler| sampler.binding == runtime.binding)
+                else {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_texture_unbound",
+                        format!(
+                            "a draw that samples `[[texture({})]]` through runtime \
+                             `[[sampler({index})]]` without binding a sampler state at device \
+                             binding {} stays on the engine: the module carries no state for that \
+                             argument — the request states it — and the canonical rail refuses a \
+                             declaration whose sampler the pass leaves unstated by name \
+                             (`render_runtime_sampler_missing`) rather than filling the descriptor \
+                             with a sampler nobody stated",
+                            declaration.index, runtime.binding,
+                        ),
+                    ));
+                };
+                let policy = request_sampler_policy(bound).ok_or_else(|| {
+                    OutOfClass::owned(
+                        "render_provider_out_of_class_texture_state",
+                        format!(
+                            "a draw whose runtime sampler at `[[sampler({index})]]` is outside \
+                             the family the canonical rail creates stays on the engine: the \
+                             canonical `VkSampler` is created from nearest or linear filtering \
+                             with clamped or repeating addressing, one mip level, normalized \
+                             coordinates, no comparison and no anisotropy, and the bind at device \
+                             binding {} states another filter, another address mode, a mip \
+                             filter, unnormalized coordinates, a comparison or anisotropy",
+                            runtime.binding,
+                        ),
+                    )
+                })?;
+                // Canonical: the contract's sampler list is ascending by Metal
+                // index and unique, and two textures may read through one
+                // argument — the state is the same bind either way.
+                match runtime_samplers
+                    .iter_mut()
+                    .find(|sampler| sampler.index == index)
+                {
+                    Some(existing) => existing.policy = policy,
+                    None => runtime_samplers.push(NarrowRuntimeSampler { index, policy }),
+                }
+                NarrowSampler::Runtime { index }
             }
-            RenderSamplerState::Unsupported => {
+            RenderSamplerState::Unsupported(reason) => {
                 return Err(OutOfClass::owned(
                     "render_provider_out_of_class_texture_sampler",
                     format!(
-                        "a fragment stage whose `[[texture({})]]` carries an AIR sampler state \
-                         outside the family the canonical rail creates stays on the engine: the \
-                         declaration has to repeat the module's own state, and the rail's \
-                         sampler family is nearest or linear filtering with clamped or repeating \
-                         addressing, one mip level, normalized coordinates and no comparison",
+                        "a fragment stage whose `[[texture({})]]` samples through a sampler form \
+                         this class cannot name stays on the engine: {}. The canonical render \
+                         sampler executes the module's own AIR static state — nearest or linear \
+                         filtering with clamped or repeating addressing, one mip level, \
+                         normalized coordinates, no comparison, no anisotropy — or the runtime \
+                         `[[sampler(n)]]` argument the module's own sample sites name, one per \
+                         sampled texture",
                         declaration.index,
+                        reason.name(),
                     ),
                 ))
             }
@@ -1250,48 +1548,53 @@ fn sampled_textures<'a>(
                 ),
             ));
         }
-        let Some(bound) = req
-            .samplers
-            .iter()
-            .find(|sampler| sampler.binding == declaration.sampler_binding)
-        else {
-            return Err(OutOfClass::owned(
-                "render_provider_out_of_class_texture_unbound",
-                format!(
-                    "a draw that samples `[[texture({})]]` without binding a sampler for the \
-                     module's own AIR state stays on the engine: the declaration states the state \
-                     the module was lowered against, and the engine samples through the bind — a \
-                     missing bind is a state the two rails would resolve differently",
-                    declaration.index,
-                ),
-            ));
-        };
-        let bound = request_sampler_policy(bound).ok_or_else(|| {
-            OutOfClass::owned(
-                "render_provider_out_of_class_texture_state",
-                format!(
-                    "a draw whose sampler at `[[texture({})]]`'s slot is outside the family the \
-                     canonical rail creates stays on the engine: the bind states a state the \
-                     declaration could not repeat (nearest or linear filtering, clamped or \
-                     repeating addressing, one mip level, normalized coordinates, no comparison, \
-                     no anisotropy)",
-                    declaration.index,
-                ),
-            )
-        })?;
-        if bound != sampler {
-            return Err(OutOfClass::owned(
-                "render_provider_out_of_class_texture_state",
-                format!(
-                    "a draw whose sampler at `[[texture({})]]`'s slot does not repeat the \
-                     module's own AIR state stays on the engine: the module's samples were \
-                     lowered against {sampler:?} and the engine would execute the bind's {bound:?} \
-                     while \
-                     the canonical rail creates its sampler from the declaration — the two rails \
-                     would sample differently with nothing named",
-                    declaration.index,
-                ),
-            ));
+        // The static half's own rule (R10): the draw's bound sampler at the
+        // declaration's slot has to repeat the state the module was lowered
+        // against. The runtime half's state was resolved above — there it is
+        // the *request's* fact, so there is nothing to repeat.
+        if let NarrowSampler::Static(sampler) = sampler {
+            let Some(bound) = req
+                .samplers
+                .iter()
+                .find(|sampler| sampler.binding == declaration.sampler_binding)
+            else {
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_texture_unbound",
+                    format!(
+                        "a draw that samples `[[texture({})]]` without binding a sampler for the \
+                         module's own AIR state stays on the engine: the declaration states the \
+                         state the module was lowered against, and the engine samples through the \
+                         bind — a missing bind is a state the two rails would resolve differently",
+                        declaration.index,
+                    ),
+                ));
+            };
+            let bound = request_sampler_policy(bound).ok_or_else(|| {
+                OutOfClass::owned(
+                    "render_provider_out_of_class_texture_state",
+                    format!(
+                        "a draw whose sampler at `[[texture({})]]`'s slot is outside the family \
+                         the canonical rail creates stays on the engine: the bind states a state \
+                         the declaration could not repeat (nearest or linear filtering, clamped or \
+                         repeating addressing, one mip level, normalized coordinates, no \
+                         comparison, no anisotropy)",
+                        declaration.index,
+                    ),
+                )
+            })?;
+            if bound != sampler {
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_texture_state",
+                    format!(
+                        "a draw whose sampler at `[[texture({})]]`'s slot does not repeat the \
+                         module's own AIR state stays on the engine: the module's samples were \
+                         lowered against {sampler:?} and the engine would execute the bind's \
+                         {bound:?} while the canonical rail creates its sampler from the \
+                         declaration — the two rails would sample differently with nothing named",
+                        declaration.index,
+                    ),
+                ));
+            }
         }
         textures.push(NarrowTexture {
             index: declaration.index,
@@ -1301,7 +1604,40 @@ fn sampled_textures<'a>(
             bytes,
         });
     }
-    Ok(textures)
+    // Every runtime `[[sampler(n)]]` argument the stage binds has to be one a
+    // texture declaration pairs with: a state nothing samples through would
+    // fill a descriptor slot the registration never said a texture reads
+    // through, and the canonical rail refuses exactly that by name
+    // (`render_runtime_sampler_undeclared`) — a refusal, not a fallback, so the
+    // class answers it here rather than letting the provider decline a draw the
+    // engine could run.
+    if let Some(unpaired) = family
+        .runtime
+        .iter()
+        .find(|runtime| !runtime_samplers.iter().any(|s| s.index == runtime.index))
+    {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_texture_sampler_unpaired",
+            format!(
+                "a fragment stage that binds runtime `[[sampler({})]]` at device binding {} \
+                 without a sampled texture reading through it stays on the engine: the canonical \
+                 contract pairs every runtime `[[sampler(n)]]` argument with a texture \
+                 declaration, and the registration refuses one nothing pairs with by name \
+                 (`render_runtime_sampler_undeclared`) rather than binding a state nothing \
+                 samples through",
+                unpaired.index, unpaired.binding,
+            ),
+        ));
+    }
+    // The contract's sampler list is canonical: ascending Metal index, unique —
+    // two textures may read through one argument, and the state is the bind's
+    // either way.
+    runtime_samplers.sort_unstable_by_key(|sampler| sampler.index);
+    runtime_samplers.dedup_by_key(|sampler| sampler.index);
+    Ok(NarrowSampling {
+        textures,
+        runtime_samplers,
+    })
 }
 
 /// One bound sampler resource in the canonical policy's own two fields, or
@@ -2982,6 +3318,17 @@ pub struct RenderRailInputs<'a> {
     /// list and the request's own binds, so entry `i` and the draw's bind at
     /// the same number are one binding on both sides of this seam.
     pub fragment_texture_declarations: &'a [RenderTextureDeclaration],
+    /// The sampler family the fragment stage's own translation declares (R12,
+    /// `research/docs/23` §102): every runtime `[[sampler(n)]]` argument the
+    /// reflection binds beside the AIR static samplers it carries.
+    ///
+    /// Carried for the reason the declaration list above is: the canonical
+    /// contract pairs each runtime argument with a texture declaration
+    /// [`RenderTextureDeclaration::sampler`] names, and a stage whose two
+    /// sampler forms or whose unpaired arguments the registration would refuse
+    /// by name is a shape the class has to answer before the provider is asked
+    /// ([`sampled_textures`]).
+    pub sampler_family: &'a RenderSamplerFamily,
     /// The Metal arguments outside the family the canonical translated rail
     /// executes, across both stages (R10). A draw whose module declares one
     /// keeps the engine under the class's own name; empty is every shape whose
@@ -3897,20 +4244,50 @@ struct NarrowIndexStream<'a> {
     source: StreamSource<'a>,
 }
 
+/// The sampling half of one admitted pass (R10/R12): the textures it binds,
+/// beside the runtime sampler states the request states for them.
+struct NarrowSampling<'a> {
+    textures: Vec<NarrowTexture<'a>>,
+    /// One entry per runtime `[[sampler(n)]]` argument an admitted texture reads
+    /// through, ascending by Metal index.
+    runtime_samplers: Vec<NarrowRuntimeSampler>,
+}
+
 /// One admitted sampled texture: the canonical binding (its position), the
-/// bytes the fragment stage samples, and the state the module's own AIR says
-/// its samples were lowered against (R10).
+/// bytes the fragment stage samples, and the sampler form its declaration
+/// states (R10/R12).
 struct NarrowTexture<'a> {
     /// The Metal `[[texture(n)]]` index, which the contract requires to equal
     /// the entry's position.
     index: u32,
     width: u64,
     height: u64,
-    /// The state the declaration states and the canonical rail creates its
-    /// `VkSampler` from.
-    sampler: SamplerPolicy,
+    /// The sampler form the declaration states.
+    sampler: NarrowSampler,
     /// The texels, as the request's own tightly packed `rgba8_unorm` copy.
     bytes: &'a [u8],
+}
+
+/// Which sampler form one admitted texture's declaration states (R10/R12).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NarrowSampler {
+    /// The AIR static state the module carries: the declaration states it, the
+    /// canonical rail creates its `VkSampler` from it, and the draw's bind has
+    /// to repeat it (R10).
+    Static(SamplerPolicy),
+    /// The runtime `[[sampler(n)]]` argument the texture reads through: the
+    /// declaration states the pair, and the pass states the state, which is the
+    /// request's own fact (R12).
+    Runtime { index: u32 },
+}
+
+/// One runtime sampler state the request states for an admitted pass (R12):
+/// the Metal `[[sampler(n)]]` index the declaration pairs with a texture, and
+/// the policy the draw's own bind resolves to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NarrowRuntimeSampler {
+    index: u32,
+    policy: SamplerPolicy,
 }
 
 /// One admitted stage buffer: a `[[buffer(N)]]` argument a stage's own
@@ -3970,6 +4347,11 @@ struct NarrowPass<'a> {
     /// fragment stage's `[[texture(i)]]`. Empty for every request whose
     /// fragment stage declares no sampled texture.
     textures: Vec<NarrowTexture<'a>>,
+    /// The runtime sampler states the pass states (R12): one entry per
+    /// `[[sampler(n)]]` argument an admitted texture reads through, ascending
+    /// by Metal index — the canonical contract's own order. Empty for every
+    /// stage that samples through its own AIR static state.
+    runtime_samplers: Vec<NarrowRuntimeSampler>,
     /// The scissor rectangle the pass states, or `None` for the whole
     /// attachment — the canonical pass's own default
     /// ([`RenderPassDescriptor::scissor`]).
@@ -4064,19 +4446,26 @@ impl NarrowPass<'_> {
     ///
     /// One entry per admitted texture, in the same positional order the pass
     /// states its views: the contract pairs declaration `i` with
-    /// `pass.textures[i]`, and the sampler state each entry carries is the
-    /// module's own AIR state — the state the canonical rail creates its
-    /// `VkSampler` from and the state the translated arm compares against its
-    /// own translation of the same module.
+    /// `pass.textures[i]`. A static-sampled entry carries the module's own AIR
+    /// state — the state the canonical rail creates its `VkSampler` from and
+    /// the state the translated arm compares against its own translation of the
+    /// same module — while a runtime-sampled one names the `[[sampler(n)]]`
+    /// argument it reads through and states no state, which the pass states
+    /// instead (`NarrowPass::runtime_samplers`, R12).
     fn texture_declarations(&self) -> Vec<TextureBindingContract> {
         self.textures
             .iter()
-            .map(|texture| {
-                TextureBindingContract::sampled(
+            .map(|texture| match texture.sampler {
+                NarrowSampler::Static(policy) => TextureBindingContract::sampled(
                     texture.index,
                     TextureFormat::Rgba8Unorm,
-                    texture.sampler,
-                )
+                    policy,
+                ),
+                NarrowSampler::Runtime { index } => TextureBindingContract::sampled_runtime(
+                    texture.index,
+                    TextureFormat::Rgba8Unorm,
+                    index,
+                ),
             })
             .collect()
     }
@@ -4473,7 +4862,7 @@ fn narrow_class<'a>(
     // binds — the canonical pass carries both, and the wire carries the pass's
     // texture list like any other view — and every shape the provider or the
     // module refuses keeps the engine under its own name ([`sampled_textures`]).
-    let textures = sampled_textures(inputs, req)?;
+    let sampling = sampled_textures(inputs, req)?;
     if req.occlusion_query.is_some() {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_visibility",
@@ -4695,6 +5084,35 @@ fn narrow_class<'a>(
         }
     }
 
+    // R12: a pass whose runtime `[[sampler(n)]]` states the command channel
+    // cannot carry stays on the engine by name. The frame format states the
+    // pass's sampled *textures* (the v70 channel) but not its runtime sampler
+    // list yet (`research/docs/23` §3.3, v102: the decoder states an empty
+    // list), so a trace that crosses the owner→provider wire would reach
+    // admission with the states dropped and be refused there
+    // (`render_runtime_sampler_missing`) — a decline, not a fallback. The same
+    // rule the v40 blend section's two shapes keep: the class answers the wire
+    // question before the frame exists.
+    let wire_carries_samplers = stage_buffers.is_empty()
+        && vertex_streams
+            .iter()
+            .all(|stream| !matches!(stream.source, StreamSource::Window(_)))
+        && !matches!(index_source, StreamSource::Window(_));
+    if !sampling.runtime_samplers.is_empty() && !wire_carries_samplers {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_texture_sampler_wire",
+            format!(
+                "a draw whose runtime `[[sampler(n)]]` states would travel the owner→provider \
+                 frame stays on the engine: the frame format does not carry the pass's runtime \
+                 sampler list yet (`research/docs/23` §3.3, v102), so the decoded pass would \
+                 state no sampler and the provider would refuse the declaration by name \
+                 (`render_runtime_sampler_missing`) rather than execute a pass that samples \
+                 through a state nobody stated — {} runtime sampler state(s) beside a declared \
+                 stage buffer or a window-backed stream are that shape",
+                sampling.runtime_samplers.len(),
+            ),
+        ));
+    }
     Ok(NarrowPass {
         vertex_entry: vertex_entry.to_owned(),
         fragment_entry: fragment_entry.to_owned(),
@@ -4712,7 +5130,8 @@ fn narrow_class<'a>(
             source: index_source,
         },
         stage_buffers,
-        textures,
+        textures: sampling.textures,
+        runtime_samplers: sampling.runtime_samplers,
         scissor,
         viewport,
         blend,
@@ -5154,11 +5573,17 @@ fn submit_narrow(
     let pass_descriptor = RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
         // The runtime `[[sampler(n)]]` bindings the fragment stage executes
-        // with stay empty until the seam states them (`research/docs/23`
-        // §102, E-RS2): the canonical pass admits them, and a declaration
-        // this seam has not made is refused by the pairing rule rather
-        // than invented here.
-        samplers: Vec::new(),
+        // with (R12, `research/docs/23` §102): one state per argument an
+        // admitted texture reads through, in the contract's canonical order,
+        // each read off the draw's own bind at the device slot the module's
+        // reflection resolves that argument at. Empty for every stage that
+        // samples through its own AIR static state, which is the shape every
+        // pre-R12 pass keeps byte for byte.
+        samplers: pass
+            .runtime_samplers
+            .iter()
+            .map(|sampler| RenderSamplerBinding::new(sampler.index, sampler.policy))
+            .collect(),
         color_attachments: vec![RenderAttachment {
             view_id: attachment.view,
             allocation_id: attachment.allocation,

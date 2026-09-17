@@ -40,6 +40,7 @@ const OP_FUNCTION_CALL: u16 = 57;
 const OP_IMAGE_TEXEL_POINTER: u16 = 60;
 const OP_LOAD: u16 = 61;
 const OP_COPY_OBJECT: u16 = 83;
+const OP_SAMPLED_IMAGE: u16 = 86;
 const OP_IMAGE_READ: u16 = 98;
 const OP_IMAGE_WRITE: u16 = 99;
 const OP_IMAGE_QUERY_FORMAT: u16 = 101;
@@ -1503,6 +1504,151 @@ pub fn ensure_image_capabilities(
             ensure_capability(words, CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT);
     }
     added
+}
+
+/// Which sampler descriptor each sampled-image descriptor reads through, as one
+/// translated module's own sample sites state it (`research/docs/23` §3.3,
+/// v102; R12).
+///
+/// A runtime `[[sampler(n)]]` argument carries no state: the module names the
+/// descriptor, and *which* texture reads through it is a fact of the module
+/// body rather than of the argument metadata — `air.sampler` names an index,
+/// not an association. `OpSampledImage` is the instruction that states the
+/// association, and this walk answers the pairing the canonical render
+/// contract has to state over the very module the runtime translated, instead
+/// of a positional rule that could disagree with it.
+///
+/// The walk is deliberately narrower than SPIR-V. An operand that is not a
+/// load (or copy) of a descriptor variable decorated with a `Binding` — a
+/// `select` between two sampler pointers, a function call's result, an
+/// argument-buffer access — is a pairing this walk cannot name, and the caller
+/// keeps such a shape on the engine rather than reading a pair out of a value
+/// that is not one. A module whose instruction stream does not walk cleanly at
+/// all is the same answer.
+pub fn sampled_image_pairs(words: &[u32]) -> SamplePairing {
+    let Some(instrs) = instructions(words) else {
+        return SamplePairing::Unresolved;
+    };
+    let bound = usize::try_from(*words.get(3).unwrap_or(&0)).unwrap_or(0);
+    if bound == 0 {
+        return SamplePairing::Unresolved;
+    }
+    // Both maps are keyed by the module's own id space, which `bound` bounds.
+    // `bindings` is the `OpDecorate Binding` value of a variable id, `sources`
+    // the operand of the load (or copy) that produced a value id.
+    let mut bindings: Vec<Option<u32>> = vec![None; bound];
+    let mut sources: Vec<Option<u32>> = vec![None; bound];
+    for &Instruction {
+        opcode,
+        word_count,
+        at: i,
+    } in &instrs
+    {
+        match opcode {
+            OP_DECORATE if word_count >= 4 && words[i + 2] == DECORATION_BINDING => {
+                if let Some(slot) = bindings.get_mut(words[i + 1] as usize) {
+                    *slot = Some(words[i + 3]);
+                }
+            }
+            OP_LOAD | OP_COPY_OBJECT if word_count >= 4 => {
+                if let Some(slot) = sources.get_mut(words[i + 2] as usize) {
+                    *slot = Some(words[i + 3]);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    for &Instruction {
+        opcode,
+        word_count,
+        at: i,
+    } in &instrs
+    {
+        if opcode != OP_SAMPLED_IMAGE {
+            continue;
+        }
+        // The sampled-image operand and the sampler operand are the two values
+        // the sampling operations below read through, in that order.
+        if word_count < 5 {
+            return SamplePairing::Unresolved;
+        }
+        let Some(image) = descriptor_binding(&bindings, &sources, words[i + 3]) else {
+            return SamplePairing::Unresolved;
+        };
+        let Some(sampler) = descriptor_binding(&bindings, &sources, words[i + 4]) else {
+            return SamplePairing::Unresolved;
+        };
+        match pairs
+            .iter_mut()
+            .find(|(bound_image, _)| *bound_image == image)
+        {
+            // One image read through two samplers has no single pairing the
+            // contract can state (its declaration names exactly one sampler),
+            // so the caller answers that shape by name.
+            Some((_, bound_sampler)) if *bound_sampler != sampler => {
+                return SamplePairing::MultipleSamplers;
+            }
+            Some(_) => {}
+            None => pairs.push((image, sampler)),
+        }
+    }
+    pairs.sort_unstable_by_key(|(image, _)| *image);
+    SamplePairing::Paired(pairs)
+}
+
+/// The descriptor binding a sample-site operand stands for, following the one
+/// producer chain the translator emits for it.
+///
+/// Bounded rather than recursive: a chain of loads and copies ending nowhere is
+/// a module this walk refuses to pair, not one it walks forever.
+fn descriptor_binding(
+    bindings: &[Option<u32>],
+    sources: &[Option<u32>],
+    mut id: u32,
+) -> Option<u32> {
+    for _ in 0..DESCRIPTOR_CHAIN_LIMIT {
+        let at = usize::try_from(id).ok()?;
+        if let Some(binding) = bindings.get(at).copied().flatten() {
+            return Some(binding);
+        }
+        id = sources.get(at).copied().flatten()?;
+    }
+    None
+}
+
+/// How many producers one sample-site operand may stand behind before this walk
+/// refuses to follow it (`OpLoad` → `OpCopyObject` → … over the translator's
+/// own output is one step; the limit is here so a malformed module cannot make
+/// the walk spin).
+const DESCRIPTOR_CHAIN_LIMIT: usize = 8;
+
+/// What [`sampled_image_pairs`] could name for one module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SamplePairing {
+    /// One `(image binding, sampler binding)` entry per image binding, ascending
+    /// by image binding: every sample site of that image reads through the one
+    /// sampler beside it.
+    Paired(Vec<(u32, u32)>),
+    /// One image's sample sites name more than one sampler, so "the" sampler of
+    /// that image is not a pairing this walk can state.
+    MultipleSamplers,
+    /// A sample site's operand is not a load of a decorated descriptor
+    /// variable, or the instruction stream does not walk cleanly at all.
+    Unresolved,
+}
+
+impl SamplePairing {
+    /// The sampler binding `image` reads through, when this pairing named one.
+    pub fn sampler_of(&self, image: u32) -> Option<u32> {
+        match self {
+            Self::Paired(pairs) => pairs
+                .iter()
+                .find(|(bound_image, _)| *bound_image == image)
+                .map(|(_, sampler)| *sampler),
+            Self::MultipleSamplers | Self::Unresolved => None,
+        }
+    }
 }
 
 /// Reflect every set-0 sampler descriptor binding declared by a SPIR-V module.
@@ -5689,5 +5835,110 @@ mod more_tests {
         words.extend([(4u32 << 16) | OP_DECORATE as u32, 3, DECORATION_BINDING, 66]);
         words.extend([(4u32 << 16) | OP_DECORATE as u32, 4, DECORATION_BINDING, 99]);
         assert_eq!(sampler_bindings(&words), vec![66]);
+    }
+
+    /// One sample-site module, spelled the way the translator emits it: two
+    /// image variables and two sampler variables in `UniformConstant`, each
+    /// decorated with its own binding, loaded and paired by `OpSampledImage`,
+    /// plus a third image no sample site reaches.
+    fn two_image_two_sampler_module() -> Vec<u32> {
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 24, 0];
+        // %1 image, %2 sampler, %3/%4 the UniformConstant pointers.
+        words.extend([(9u32 << 16) | OP_TYPE_IMAGE as u32, 1, 99, 1, 0, 0, 0, 1, 0]);
+        words.extend([(2u32 << 16) | OP_TYPE_SAMPLER as u32, 2]);
+        words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 3, 0, 1]);
+        words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 4, 0, 2]);
+        for id in [5u32, 6] {
+            words.extend([
+                (4u32 << 16) | OP_VARIABLE as u32,
+                3,
+                id,
+                STORAGE_CLASS_UNIFORM_CONSTANT,
+            ]);
+        }
+        for id in [7u32, 8] {
+            words.extend([
+                (4u32 << 16) | OP_VARIABLE as u32,
+                4,
+                id,
+                STORAGE_CLASS_UNIFORM_CONSTANT,
+            ]);
+        }
+        words.extend([
+            (4u32 << 16) | OP_VARIABLE as u32,
+            3,
+            9,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+        for (id, binding) in [(5u32, 32u32), (6, 33), (7, 160), (8, 161), (9, 34)] {
+            words.extend([
+                (4u32 << 16) | OP_DECORATE as u32,
+                id,
+                DECORATION_BINDING,
+                binding,
+            ]);
+        }
+        for (id, pointer) in [(10u32, 5u32), (11, 6), (12, 7), (13, 8), (15, 9)] {
+            words.extend([(4u32 << 16) | OP_LOAD as u32, 1, id, pointer]);
+        }
+        words.extend([(5u32 << 16) | OP_SAMPLED_IMAGE as u32, 1, 16, 10, 12]);
+        words.extend([(5u32 << 16) | OP_SAMPLED_IMAGE as u32, 1, 17, 11, 13]);
+        words.extend([(5u32 << 16) | OP_SAMPLED_IMAGE as u32, 1, 18, 10, 12]);
+        words.extend([(4u32 << 16) | OP_COPY_OBJECT as u32, 1, 19, 13]);
+        words.extend([(5u32 << 16) | OP_SAMPLED_IMAGE as u32, 1, 20, 11, 19]);
+        words
+    }
+
+    /// The header word of the `OpSampledImage` whose result is `result`, so a
+    /// test can move one operand of one sample site without depending on the
+    /// module's word offsets.
+    fn sample_site_of(words: &[u32], result: u32) -> usize {
+        (0..words.len())
+            .find(|&at| {
+                words[at] == ((5u32 << 16) | OP_SAMPLED_IMAGE as u32)
+                    && words.get(at + 2) == Some(&result)
+            })
+            .expect("the sample site is in the module")
+    }
+
+    #[test]
+    fn sampled_image_pairs_name_the_sampler_beside_each_image() {
+        let words = two_image_two_sampler_module();
+        // %15 loads %9, the image no sample site reaches: the pairing names the
+        // two images that are sampled and stays silent about the third.
+        assert_eq!(
+            sampled_image_pairs(&words),
+            SamplePairing::Paired(vec![(32, 160), (33, 161)])
+        );
+        let pairing = sampled_image_pairs(&words);
+        assert_eq!(pairing.sampler_of(32), Some(160));
+        assert_eq!(pairing.sampler_of(33), Some(161));
+        assert_eq!(pairing.sampler_of(34), None);
+    }
+
+    #[test]
+    fn a_sample_site_operand_that_is_not_a_load_is_unresolved() {
+        // The same module with the second image's sample site reading a value
+        // no instruction produced: a pairing the walk must not invent.
+        let mut words = two_image_two_sampler_module();
+        let at = sample_site_of(&words, 17);
+        words[at + 3] = 0xffff;
+        assert_eq!(sampled_image_pairs(&words), SamplePairing::Unresolved);
+    }
+
+    #[test]
+    fn one_image_through_two_samplers_is_not_a_pairing() {
+        let mut words = two_image_two_sampler_module();
+        let at = sample_site_of(&words, 18);
+        // Image %10 read through sampler %13 as well as through %12.
+        words[at + 4] = 13;
+        assert_eq!(sampled_image_pairs(&words), SamplePairing::MultipleSamplers);
+    }
+
+    #[test]
+    fn a_stream_that_does_not_walk_is_unresolved() {
+        let mut words = two_image_two_sampler_module();
+        words[5] = OP_TYPE_SAMPLER as u32;
+        assert_eq!(sampled_image_pairs(&words), SamplePairing::Unresolved);
     }
 }

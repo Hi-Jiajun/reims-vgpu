@@ -25,6 +25,7 @@ use metal_api_core::provider::{
     AttachmentFormat, BufferAccess, BufferSource, ComputeProvider, FieldValue, FootprintProof,
     RenderPipelineContract, RenderPipelineStage, SemanticDigest, StageBufferBinding,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep,
+    MAX_RENDER_SAMPLERS,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -34,10 +35,11 @@ use metal_api_vulkan::{
 use reims_vgpu::backend::provider_owner::{self, Region};
 use reims_vgpu::backend::provider_render::{
     self, PresentSurfaceKey, ProviderRenderDecline, RenderChainRole, RenderInterfaceRefusal,
-    RenderPresentRequest, RenderRailInputs, RenderRailOutcome, RenderSamplerState,
-    RenderTextureDeclaration, RenderTextureShape, RenderTextureShapeRefusal, StageBufferAccess,
-    StageBufferBind, StageBufferDeclaration, StageBufferFootprint, StageBufferLanding,
-    StageBufferWindow, StageWriteback,
+    RenderPresentRequest, RenderRailInputs, RenderRailOutcome, RenderRuntimeSampler,
+    RenderSamplerFamily, RenderSamplerRefusal, RenderSamplerState, RenderTextureDeclaration,
+    RenderTextureShape, RenderTextureShapeRefusal, StageBufferAccess, StageBufferBind,
+    StageBufferDeclaration, StageBufferFootprint, StageBufferLanding, StageBufferWindow,
+    StageWriteback,
 };
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
@@ -121,6 +123,11 @@ struct Stages {
     /// device bindings this crate's runtime resolves the request's own binds
     /// at (R10). Empty for every fixture whose fragment stage samples nothing.
     fragment_texture_declarations: Vec<RenderTextureDeclaration>,
+    /// The sampler family the fragment stage's reflection declares (R12): the
+    /// runtime `[[sampler(n)]]` arguments it binds and the AIR static samplers
+    /// it carries. Empty for every fixture whose fragment stage samples through
+    /// neither form, and filled from the translation itself where it does.
+    sampler_family: RenderSamplerFamily,
     /// The Metal arguments outside the family the canonical translated render
     /// rail executes, across both stages (R10).
     texture_interface_refusals: Vec<RenderInterfaceRefusal>,
@@ -138,6 +145,7 @@ fn stages(vertex_fixture: &str, vertex_entry: &'static str, locations: &[u32]) -
         vertex_stage_buffer_declarations: Vec::new(),
         fragment_stage_buffer_declarations: Vec::new(),
         fragment_texture_declarations: Vec::new(),
+        sampler_family: RenderSamplerFamily::default(),
         texture_interface_refusals: Vec::new(),
     }
 }
@@ -180,18 +188,41 @@ fn four_stream_stages() -> Stages {
 /// so a fixture whose reflection moves fails an assertion instead of quietly
 /// changing what the seam is asked about.
 fn sampled_stages() -> Stages {
-    let fragment_entry = "reims_sampled_frag";
+    sampled_fragment_stages("render_frag_sampled_2d.air", "reims_sampled_frag")
+}
+
+/// The runtime-sampled shape (R12): the reviewed vertex stage beside a fragment
+/// stage that reads one `[[texture(0)]]` through a runtime `[[sampler(0)]]`
+/// argument — the module carries no sampler state, so the *request* states it
+/// (`research/docs/23` §102).
+///
+/// The declarations and the sampler family are the *production* walks over the
+/// fixture's own translation, which is the fact the runtime hands the rail; the
+/// expectations the R12 tests compare them with are written by hand in
+/// `the_runtime_sampler_declarations_are_what_the_module_says`, so a fixture or
+/// reflection that moves fails an assertion instead of quietly changing what
+/// the seam is asked about.
+fn runtime_sampled_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_runtime_sampler.air",
+        "reims_runtime_sampled_frag",
+    )
+}
+
+/// One fragment fixture's class-gate facts, taken from its own translation:
+/// the texture declarations (`texture_declarations`, the walk that reads the
+/// module's own sample sites for the runtime sampler family) and the sampler
+/// family (`sampler_family`).
+fn sampled_fragment_stages(fragment_fixture: &str, fragment_entry: &'static str) -> Stages {
     let mut stages = Stages {
-        air: (
-            fixture("reims_indexed_tri.air"),
-            fixture("render_frag_sampled_2d.air"),
-        ),
+        air: (fixture("reims_indexed_tri.air"), fixture(fragment_fixture)),
         vertex_entry: "reims_indexed_vertex",
         fragment_entry,
         vertex_attribute_locations: vec![0],
         vertex_stage_buffer_declarations: Vec::new(),
         fragment_stage_buffer_declarations: Vec::new(),
         fragment_texture_declarations: Vec::new(),
+        sampler_family: RenderSamplerFamily::default(),
         texture_interface_refusals: Vec::new(),
     };
     let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
@@ -204,10 +235,26 @@ fn sampled_stages() -> Stages {
         .expect("the fixture's entry exists");
     let translated = TranslatedRenderStage::translate(RenderStage::Fragment, &function)
         .expect("the fixture translates");
+    // The same words both rails execute, in the numbering the declarations are
+    // stated in: the translator's own, before any draw adds the fragment
+    // sampled-band relocation.
+    let words = translated
+        .spirv()
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect::<Vec<u32>>();
     stages.fragment_texture_declarations =
-        reims_vgpu::backend::provider_render::texture_declarations(translated.reflection())
+        reims_vgpu::backend::provider_render::texture_declarations(translated.reflection(), &words)
             .to_vec();
-    stages.texture_interface_refusals = Vec::new();
+    stages.sampler_family =
+        reims_vgpu::backend::provider_render::sampler_family(translated.reflection());
+    // The same production read for the `[[buffer(N)]]` half, so a sampling
+    // fixture that also declares a buffer hands the gate the declaration its
+    // own translation reports rather than an empty list.
+    stages.vertex_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.0, RenderStage::Vertex, stages.vertex_entry);
+    stages.fragment_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.1, RenderStage::Fragment, stages.fragment_entry);
     stages
 }
 
@@ -270,6 +317,91 @@ fn sampled_request(stages: &Stages, texels: Vec<Vec<u8>>, extent: (u32, u32)) ->
     req.samplers
         .push(sampled_sampler_resource(declaration.sampler_binding));
     req
+}
+
+/// One sampler resource in the canonical policy family's own four states
+/// (R12): the `MTL*` ordinals the runtime's `request_sampler_policy` maps onto
+/// `SamplerPolicy`, with every other field at the neutral value that family
+/// admits.
+fn family_sampler_resource(
+    binding: u32,
+    min_mag_filter: u32,
+    address_mode: u32,
+) -> SamplerResource {
+    use reims_vgpu::protocol::sampler as mtl;
+    SamplerResource {
+        binding,
+        min_filter: min_mag_filter,
+        mag_filter: min_mag_filter,
+        mip_filter: mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        address_mode_u: address_mode,
+        address_mode_v: address_mode,
+        address_mode_w: address_mode,
+        border_color: mtl::MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK,
+        compare_function: engine::SamplerCompareFunction::Never,
+        lod_min: 0.0f32.to_bits(),
+        lod_max: f32::MAX.to_bits(),
+        max_anisotropy: 1,
+        unnormalized_coordinates: false,
+    }
+}
+
+/// The attachment-covering draw with the runtime-sampled pair bound (R12): one
+/// 8x4 `rgba8_unorm` texture at the declaration's device binding, and one
+/// sampler state at the runtime `[[sampler(0)]]` argument's own device binding.
+///
+/// The state travels as the `MTL*` ordinals the runtime resolves the guest's
+/// `MTLSamplerState` into, which is what `request_sampler_policy` maps onto the
+/// canonical policy — the two arms of every reading below are therefore the two
+/// states the *request* can state, and no state lives in the module.
+fn runtime_sampled_request(
+    stages: &Stages,
+    texels: Vec<Vec<u8>>,
+    extent: (u32, u32),
+    min_mag_filter: u32,
+    address_mode: u32,
+) -> DrawRequest {
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = extent.0;
+    req.height = extent.1;
+    let declaration = stages.fragment_texture_declarations[0];
+    let runtime = stages.sampler_family.runtime[0];
+    let mut bytes = Vec::with_capacity(texels.len() * 4);
+    for texel in texels {
+        bytes.extend_from_slice(&texel);
+    }
+    req.sampled_images.push(SampledImageResource {
+        binding: declaration.binding,
+        array_element: 0,
+        descriptor_count: 1,
+        width: extent.0,
+        height: extent.1,
+        layers: 1,
+        kind: reims_vgpu_core::texture_shape::TextureKind::D2,
+        multisampled: false,
+        source: SampledSource::Bytes(std::sync::Arc::new(bytes)),
+        byte_origin: Default::default(),
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    req.samplers.push(family_sampler_resource(
+        runtime.binding,
+        min_mag_filter,
+        address_mode,
+    ));
+    req
+}
+
+/// A half-step linear blend of two texels: what the fixture's wrapped
+/// coordinate lands. Exact in eight bits because every channel of the tests'
+/// texture is a multiple of sixteen.
+fn half_blend(first: [u8; 4], second: [u8; 4]) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for channel in 0..4 {
+        out[channel] = ((u16::from(first[channel]) + u16::from(second[channel])) / 2) as u8;
+    }
+    out
 }
 
 /// One 8x4 texture whose texels are all distinct, and the colour of the texel
@@ -493,6 +625,10 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // pre-R10 test in this file is about, and one whose requests answer
         // exactly as they did before the sampled-texture face existed.
         fragment_texture_declarations: &stages.fragment_texture_declarations,
+        // The R12 half beside it: every fixture whose fragment stage declares
+        // no sampler of either form carries the empty family, which is the
+        // shape every pre-R12 test in this file is about.
+        sampler_family: &stages.sampler_family,
         texture_interface_refusals: &stages.texture_interface_refusals,
         // The R9d half: no stage buffer of this draw is stated, which is the
         // shape every pre-R9d test in this file is about — a request whose
@@ -3798,15 +3934,22 @@ fn the_sampled_texture_shapes_beside_the_entry_stay_on_the_engine_by_name() {
     );
     let mut runtime_sampler = sampled_stages();
     runtime_sampler.fragment_texture_declarations = vec![RenderTextureDeclaration {
-        sampler: RenderSamplerState::Runtime,
+        sampler: RenderSamplerState::Runtime { index: 0 },
         ..runtime_sampler.fragment_texture_declarations[0]
     }];
     let (slug, detail) = answer("runtime sampler state", &runtime_sampler, &sampled());
     eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_texture_sampler");
+    // The R10 fixture's stage binds no runtime sampler argument, so a
+    // declaration that names one disagrees with the reflection: R12 answers
+    // that with its own name rather than the old "runtime samplers do not
+    // exist" sentence.
+    assert_eq!(
+        slug,
+        "render_provider_out_of_class_texture_sampler_mismatch"
+    );
     let mut unsupported_state = sampled_stages();
     unsupported_state.fragment_texture_declarations = vec![RenderTextureDeclaration {
-        sampler: RenderSamplerState::Unsupported,
+        sampler: RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState),
         ..unsupported_state.fragment_texture_declarations[0]
     }];
     let (slug, detail) = answer("unsupported sampler state", &unsupported_state, &sampled());
@@ -3889,6 +4032,412 @@ fn the_sampled_texture_shapes_beside_the_entry_stay_on_the_engine_by_name() {
     anisotropic.samplers[0].max_anisotropy = 4;
     let (slug, _) = answer("anisotropic bind", &stages, &anisotropic);
     assert_eq!(slug, "render_provider_out_of_class_texture_state");
+}
+
+/// R12: the runtime-sampler declarations, read back off the fixture's own
+/// translation.
+///
+/// The expectation is written by hand — one `[[texture(0)]]` at the
+/// translator's texture band base, one runtime `[[sampler(0)]]` at the device's
+/// sampler band base, the pairing the module's own sample sites name — so a
+/// fixture or reflection that moves fails here rather than silently changing
+/// what the seam is asked.
+#[test]
+fn the_runtime_sampler_declarations_are_what_the_module_says() {
+    let stages = runtime_sampled_stages();
+    assert_eq!(
+        stages.fragment_texture_declarations,
+        vec![RenderTextureDeclaration {
+            index: 0,
+            binding: 32,
+            sampler_binding: 160,
+            sampler: RenderSamplerState::Runtime { index: 0 },
+            shape: RenderTextureShape::Sampled2D,
+        }],
+        "the fragment fixture declares one sampled 2D texture read through the \
+         runtime `[[sampler(0)]]` argument its own sample site names"
+    );
+    assert_eq!(
+        stages.sampler_family,
+        RenderSamplerFamily {
+            runtime: vec![RenderRuntimeSampler {
+                index: 0,
+                binding: 160,
+            }]
+            .into(),
+            statics: Vec::new().into(),
+        },
+        "the stage binds one runtime `[[sampler(0)]]` argument and carries no AIR static sampler"
+    );
+    assert!(
+        stages.texture_interface_refusals.is_empty(),
+        "the runtime sampler family is inside the translated rail since v102: {:?}",
+        stages.texture_interface_refusals
+    );
+    eprintln!(
+        "R12 fixture declarations: {:?} family={:?} interface={:?}",
+        stages.fragment_texture_declarations,
+        stages.sampler_family,
+        stages.texture_interface_refusals,
+    );
+}
+
+/// R12: the runtime-sampler reading, and the frames the request's own states
+/// land.
+///
+/// The fragment half samples one fixed coordinate — `(1.375, 0.875)` of the
+/// 8x4 surface: texel `(7, 3)`'s centre after clamping, `x = 3.0` after
+/// wrapping, row 3 under either filter — so the four states the canonical
+/// policy family has land three different readings, and the module carries
+/// **none** of them. Three falsifiable halves:
+///
+/// - the state is the request's: the address mode moves the frame under both
+///   filters, the filter moves it under repeat, and clamp-to-edge lands one
+///   texel under either filter because the coordinate clamps to its centre;
+/// - the texture's own bytes still reach the shader through the binding the
+///   declaration names: the read texel moves the frame and an unread one does
+///   not;
+/// - the engine and the canonical provider land the same frame byte for byte
+///   under all four states.
+#[test]
+fn a_runtime_sampler_lands_the_texels_its_request_states_and_agrees_with_the_engine() {
+    let _guard = engine_test_session();
+    let stages = runtime_sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let texel = |texels: &[Vec<u8>], x: usize, y: usize| -> [u8; 4] {
+        let texel = &texels[y * width as usize + x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    use reims_vgpu::protocol::sampler as mtl;
+    let nearest = mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+    let linear = mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR;
+    let clamp = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    let repeat = mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT;
+    let blend = half_blend(texel(&texels, 2, 3), texel(&texels, 3, 3));
+    let arms = [
+        (
+            "runtime sampler nearest + clamp",
+            nearest,
+            clamp,
+            texel(&texels, 7, 3),
+        ),
+        (
+            "runtime sampler linear + clamp",
+            linear,
+            clamp,
+            texel(&texels, 7, 3),
+        ),
+        (
+            "runtime sampler nearest + repeat",
+            nearest,
+            repeat,
+            texel(&texels, 3, 3),
+        ),
+        ("runtime sampler linear + repeat", linear, repeat, blend),
+    ];
+    let mut frames: Vec<(&str, Vec<u8>)> = Vec::new();
+    for (what, filter, address, want) in arms {
+        let request =
+            runtime_sampled_request(&stages, texels.clone(), (width, height), filter, address);
+        let provider = provider_pixels(what, &stages, &request);
+        assert_uniform_frame(what, &provider, width, height, want);
+        let Some(engine) = engine_pixels(what, &stages, request) else {
+            return;
+        };
+        assert_uniform_frame(what, &engine, width, height, want);
+        assert_frames_equal(what, &provider, &engine);
+        frames.push((what, provider));
+    }
+    // The state is the only thing that moved between the arms.
+    assert_frames_differ(
+        "the address mode moved the frame",
+        &frames[0].1,
+        &frames[2].1,
+    );
+    assert_frames_differ(
+        "the filter moved the frame under repeat",
+        &frames[2].1,
+        &frames[3].1,
+    );
+    assert_frames_equal(
+        "clamp-to-edge lands one texel under either filter",
+        &frames[0].1,
+        &frames[1].1,
+    );
+
+    // The texture's own bytes reach the shader through the binding the
+    // declaration names: the texel the wrapped coordinate reads moves the
+    // frame, and a texel no sample reads does not.
+    let mut moved = texels.clone();
+    moved[3 * width as usize + 3] = vec![255, 0, 128, 255];
+    let moved_frame = provider_pixels(
+        "other sampled texel (runtime sampler)",
+        &stages,
+        &runtime_sampled_request(&stages, moved.clone(), (width, height), nearest, repeat),
+    );
+    assert_uniform_frame(
+        "other sampled texel (runtime sampler)",
+        &moved_frame,
+        width,
+        height,
+        [255, 0, 128, 255],
+    );
+    assert_frames_differ(
+        "the read texel's bytes moved the frame",
+        &frames[2].1,
+        &moved_frame,
+    );
+    let mut unread = texels.clone();
+    unread[0] = vec![7, 7, 7, 255];
+    let untouched = provider_pixels(
+        "unread texel (runtime sampler)",
+        &stages,
+        &runtime_sampled_request(&stages, unread, (width, height), nearest, repeat),
+    );
+    assert_frames_equal(
+        "a texel no sample reads does not reach the frame",
+        &frames[2].1,
+        &untouched,
+    );
+    if let Some(engine_moved) = engine_pixels(
+        "other sampled texel (runtime sampler, engine)",
+        &stages,
+        runtime_sampled_request(&stages, moved, (width, height), nearest, repeat),
+    ) {
+        assert_frames_equal("other sampled texel (engine)", &moved_frame, &engine_moved);
+    }
+    eprintln!(
+        "R12 runtime sampler: attachment {width}x{height}, one request fact per arm — \
+         clamp lands texel (7, 3), repeat (3, 3) and its linear reading the half blend \
+         {blend:?}; the module states none of them, provider and engine agree byte for byte \
+         on all four arms, moving the read texel moved the frame and an unread one did not",
+    );
+}
+
+/// R12: the runtime-sampler shapes beside the admitted entry, each under its
+/// own name.
+///
+/// One door per rule the canonical contract states for the runtime family: the
+/// stage's sampler forms (both families in one stage, more arguments than
+/// Metal's table holds, an argument no texture reads through), the
+/// declaration's own index and device slot against the reflection, the draw's
+/// bind and its state, the module's sample sites, and the command channel's own
+/// ceiling — the frame carries the pass's sampled textures and not its runtime
+/// sampler list, so a pass whose declaration makes the trace cross that wire
+/// keeps the engine rather than losing the states in the decode.
+#[test]
+fn the_runtime_sampler_shapes_beside_the_entry_stay_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = runtime_sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    use reims_vgpu::protocol::sampler as mtl;
+    let nearest = mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+    let clamp = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    let answer =
+        |label: &str, stages: &Stages, req: &DrawRequest, binds: &[StageBufferBind<'_>]| {
+            let inputs = inputs_with_binds(stages, RenderChainRole::SoleOrTail, binds);
+            match provider_render::submit_render(&inputs, req) {
+                RenderRailOutcome::NotInNarrowClass(reason) => {
+                    (reason.slug().to_owned(), reason.detail().to_owned())
+                }
+                other => panic!("{label}: the shape is out of class: {other:?}"),
+            }
+        };
+    let in_class =
+        |label: &str, stages: &Stages, req: &DrawRequest| match provider_render::submit_render(
+            &inputs(stages, RenderChainRole::SoleOrTail),
+            req,
+        ) {
+            RenderRailOutcome::ProviderCompleted(_) => (),
+            other => panic!("{label}: the shape is in the class: {other:?}"),
+        };
+    let request = |stages: &Stages| {
+        runtime_sampled_request(stages, texels.clone(), (width, height), nearest, clamp)
+    };
+
+    // The positive control: the fixture's own shape is in the class.
+    in_class("the runtime-sampled fixture", &stages, &request(&stages));
+
+    // 1. The stage's sampler family: both forms in one stage is not a shape
+    //    one canonical pairing rule can state — its static half pairs by
+    //    position, its runtime half by the index a declaration names.
+    let mut mixed = runtime_sampled_stages();
+    mixed.sampler_family.statics = vec![0].into();
+    let (slug, detail) = answer("mixed sampler families", &mixed, &request(&mixed), &[]);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_sampler_family");
+    assert!(
+        detail.contains("static") && detail.contains("runtime"),
+        "the sentence names both forms: {detail}"
+    );
+
+    // 2. More runtime arguments than Metal's own sampler table holds.
+    let mut wide = runtime_sampled_stages();
+    wide.sampler_family.runtime = (0..=u32::try_from(MAX_RENDER_SAMPLERS).unwrap())
+        .map(|index| RenderRuntimeSampler {
+            index,
+            binding: 160 + index,
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let (slug, detail) = answer(
+        "runtime samplers past the table",
+        &wide,
+        &request(&wide),
+        &[],
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_sampler_count");
+    assert!(
+        detail.contains("16") && detail.contains("17"),
+        "the sentence names both counts: {detail}"
+    );
+
+    // 3. A runtime argument no texture reads through: the module binds
+    //    `[[sampler(1)]]` beside the one the declaration names.
+    let mut unpaired = runtime_sampled_stages();
+    unpaired.sampler_family.runtime = vec![
+        RenderRuntimeSampler {
+            index: 0,
+            binding: 160,
+        },
+        RenderRuntimeSampler {
+            index: 1,
+            binding: 161,
+        },
+    ]
+    .into();
+    let mut unpaired_request = request(&unpaired);
+    unpaired_request
+        .samplers
+        .push(family_sampler_resource(161, nearest, clamp));
+    let (slug, detail) = answer(
+        "unpaired runtime sampler",
+        &unpaired,
+        &unpaired_request,
+        &[],
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(
+        slug,
+        "render_provider_out_of_class_texture_sampler_unpaired"
+    );
+    assert!(
+        detail.contains("[[sampler(1)]]") && detail.contains("161"),
+        "the sentence names the argument and its device slot: {detail}"
+    );
+
+    // 4. The declaration against the reflection: an argument the stage's
+    //    reflection does not bind, and the right argument at another device
+    //    slot.
+    let mut wrong_index = runtime_sampled_stages();
+    wrong_index.fragment_texture_declarations = vec![RenderTextureDeclaration {
+        sampler: RenderSamplerState::Runtime { index: 1 },
+        ..wrong_index.fragment_texture_declarations[0]
+    }];
+    let (slug, detail) = answer(
+        "missing runtime index",
+        &wrong_index,
+        &request(&wrong_index),
+        &[],
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(
+        slug,
+        "render_provider_out_of_class_texture_sampler_mismatch"
+    );
+    assert!(
+        detail.contains("[[sampler(1)]]"),
+        "the sentence names the index the reflection does not bind: {detail}"
+    );
+    let mut wrong_slot = runtime_sampled_stages();
+    wrong_slot.fragment_texture_declarations = vec![RenderTextureDeclaration {
+        sampler_binding: 161,
+        ..wrong_slot.fragment_texture_declarations[0]
+    }];
+    let (slug, detail) = answer(
+        "runtime sampler slot drift",
+        &wrong_slot,
+        &request(&wrong_slot),
+        &[],
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(
+        slug,
+        "render_provider_out_of_class_texture_sampler_mismatch"
+    );
+    assert!(
+        detail.contains("160") && detail.contains("161"),
+        "the sentence names both device slots: {detail}"
+    );
+
+    // 5. The draw's own half: no state at the argument's slot, and a state
+    //    outside the family the canonical rail creates.
+    let mut unbound = request(&stages);
+    unbound.samplers.clear();
+    let (slug, detail) = answer("unbound runtime sampler", &stages, &unbound, &[]);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_unbound");
+    assert!(
+        detail.contains("[[sampler(0)]]"),
+        "the sentence names the argument: {detail}"
+    );
+    let mut anisotropic = request(&stages);
+    anisotropic.samplers[0].max_anisotropy = 4;
+    let (slug, detail) = answer("anisotropic runtime state", &stages, &anisotropic, &[]);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_state");
+    assert!(
+        detail.contains("[[sampler(0)]]"),
+        "the sentence names the argument: {detail}"
+    );
+
+    // 6. The module's own sample sites: a texture whose sites name no runtime
+    //    argument carries the walk's own answer, and the class keeps it on the
+    //    engine under the sampler name.
+    let mut unnamed = runtime_sampled_stages();
+    unnamed.fragment_texture_declarations = vec![RenderTextureDeclaration {
+        sampler: RenderSamplerState::Unsupported(RenderSamplerRefusal::SampleSite),
+        ..unnamed.fragment_texture_declarations[0]
+    }];
+    let (slug, detail) = answer("unnamed runtime pairing", &unnamed, &request(&unnamed), &[]);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_sampler");
+    assert!(
+        detail.contains("sample sites"),
+        "the sentence names the fact: {detail}"
+    );
+
+    // 7. The command channel: the very same shape beside one `[[buffer(0)]]`
+    //    argument — a stated stage buffer is what makes the trace cross the
+    //    owner→provider wire, and the frame carries the pass's sampled textures
+    //    (v70) and not its runtime sampler list.
+    let wired = sampled_fragment_stages(
+        "render_frag_runtime_sampler_buffer.air",
+        "reims_runtime_sampled_buffer_frag",
+    );
+    assert_eq!(
+        wired.fragment_stage_buffer_declarations.len(),
+        1,
+        "the fixture declares one fragment stage buffer"
+    );
+    let wired_request = request(&wired);
+    let content = BufferContent::from(vec![0u8; 4]);
+    let binds = [staged_bind(RenderPipelineStage::Fragment, 0, &content)];
+    let (slug, detail) = answer(
+        "runtime sampler across the wire",
+        &wired,
+        &wired_request,
+        &binds,
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_sampler_wire");
+    assert!(
+        detail.contains("runtime sampler list"),
+        "the sentence names what the frame does not carry: {detail}"
+    );
 }
 
 /// The self-contained engine draws the y-asymmetric fixture the way Metal's clip
@@ -4394,6 +4943,7 @@ fn buffer_declaring_stages(fragment_fixture: &str, fragment_entry: &'static str)
         vertex_stage_buffer_declarations: Vec::new(),
         fragment_stage_buffer_declarations: Vec::new(),
         fragment_texture_declarations: Vec::new(),
+        sampler_family: RenderSamplerFamily::default(),
         texture_interface_refusals: Vec::new(),
     };
     stages.vertex_stage_buffer_declarations =
@@ -6924,6 +7474,7 @@ fn an_affine_stage_buffer_footprint_is_bounded_by_the_draw() {
         vertex_stage_buffer_declarations: Vec::new(),
         fragment_stage_buffer_declarations: Vec::new(),
         fragment_texture_declarations: Vec::new(),
+        sampler_family: RenderSamplerFamily::default(),
         texture_interface_refusals: Vec::new(),
     };
     stages.vertex_stage_buffer_declarations =
@@ -7942,6 +8493,7 @@ fn shared_table_stages() -> Stages {
         vertex_stage_buffer_declarations: Vec::new(),
         fragment_stage_buffer_declarations: Vec::new(),
         fragment_texture_declarations: Vec::new(),
+        sampler_family: RenderSamplerFamily::default(),
         texture_interface_refusals: Vec::new(),
     };
     stages.vertex_stage_buffer_declarations =
