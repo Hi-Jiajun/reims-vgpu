@@ -79,6 +79,16 @@ const CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT: u32 = 55;
 /// image whose declared format is outside the core set. Paired with the Vulkan
 /// feature `shaderStorageImageExtendedFormats`.
 const CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS: u32 = 49;
+/// SPIR-V `Capability FloatControls2`, paired with the Vulkan extension
+/// `VK_KHR_shader_float_controls2`.
+///
+/// The `43c46ac` translator declares it — together with
+/// `OpExtension "SPV_KHR_float_controls2"` — for any module that carries an
+/// `FPFastMathMode` decoration, and it emits that decoration on every float
+/// binary op that withholds a rewrite permission, a bare un-flagged op
+/// included (no flag grants all of them). So this is the capability number a
+/// device that compiled such a module had to have enabled at creation.
+pub const CAPABILITY_FLOAT_CONTROLS2: u32 = 6029;
 
 // The three are distinct and none is `Shader` (1), which is the one every module
 // already declares. A collision here would make a splice a silent no-op.
@@ -1363,6 +1373,42 @@ fn storage_format_is_extended(raw: u32) -> bool {
 ///
 /// The walk is structural throughout and never looks at debug names or guest
 /// object ids.
+/// Whether `words` declares the SPIR-V capability `capability`.
+///
+/// Structural, like every walk here: `OpCapability` is a two-word instruction
+/// whose only operand is the capability number, and it is only legal in the
+/// module's declaration section, so the walk stops at the first function. That
+/// is what keeps the scan off the instruction stream, where a coincidental pair
+/// of words could read as a declaration.
+///
+/// This is the read side of the device's capability answer for capabilities the
+/// *translator* may declare but the *device* must have enabled — today
+/// [`CAPABILITY_FLOAT_CONTROLS2`], which the pin emits for every float op that
+/// withholds a rewrite permission. `spirv-val` cannot stand in for it: a module
+/// that names a capability the device was not created with is well-formed
+/// SPIR-V and still invalid usage.
+pub fn declares_capability(words: &[u32], capability: u32) -> bool {
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = (words[i] & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            return false;
+        }
+        match opcode {
+            OP_CAPABILITY => {
+                if word_count == 2 && words[i + 1] == capability {
+                    return true;
+                }
+            }
+            OP_FUNCTION => return false,
+            _ => {}
+        }
+        i += word_count;
+    }
+    false
+}
+
 pub fn required_image_capabilities(words: &[u32]) -> RequiredImageCapabilities {
     let mut need = RequiredImageCapabilities::default();
     if words.len() < HEADER_WORDS {
@@ -2209,6 +2255,12 @@ pub fn reflected_storage_image_format(
         TextureFormat::Rgba8ui => ImageFormat::Rgba8Uint,
         TextureFormat::Rgba16ui => ImageFormat::Rgba16Uint,
         TextureFormat::Rgba8i => ImageFormat::Rgba8Sint,
+        // New in the `43c46ac` pin (reflection v55 names the width a
+        // `texture2d<short, write>` lowers to). This device's storage-image
+        // vocabulary has no 16-bit signed surface — 8-bit is the only signed
+        // width it names — so the format declines by its own SPIR-V ordinal
+        // (22) instead of being rounded to the 8- or 32-bit neighbour's.
+        TextureFormat::Rgba16i => ImageFormat::Unsupported(22),
     })
 }
 
@@ -3860,6 +3912,38 @@ mod more_tests {
         // `specialize_image_formats` can request and verify it.
         assert_eq!(ImageFormat::from_raw(0), ImageFormat::Unknown);
         assert_eq!(ImageFormat::Unknown.raw(), 0);
+    }
+
+    #[test]
+    fn a_capability_is_read_from_the_declaration_section_only() {
+        // `FloatControls2` in the declaration section is a declaration.
+        let declared = test_support::module_with(&[
+            (2u32 << 16) | OP_CAPABILITY as u32,
+            CAPABILITY_FLOAT_CONTROLS2,
+            (2u32 << 16) | OP_FUNCTION as u32,
+            7,
+        ]);
+        assert!(declares_capability(&declared, CAPABILITY_FLOAT_CONTROLS2));
+        // The same two words after `OpFunction` are the instruction stream: a
+        // number that happens to match is not a declaration, and the walk stops
+        // there rather than reading an operand pair as one.
+        let after_function = test_support::module_with(&[
+            (2u32 << 16) | OP_FUNCTION as u32,
+            7,
+            (2u32 << 16) | OP_CAPABILITY as u32,
+            CAPABILITY_FLOAT_CONTROLS2,
+        ]);
+        assert!(!declares_capability(
+            &after_function,
+            CAPABILITY_FLOAT_CONTROLS2
+        ));
+        // Every module declares `Shader`; a different number is not a match.
+        let shader_only = test_support::module_with(&[]);
+        assert!(declares_capability(&shader_only, 1));
+        assert!(!declares_capability(
+            &shader_only,
+            CAPABILITY_FLOAT_CONTROLS2
+        ));
     }
 
     use metal2vulkan::meta::{FunctionConstant, TextureComponent, TextureShape};

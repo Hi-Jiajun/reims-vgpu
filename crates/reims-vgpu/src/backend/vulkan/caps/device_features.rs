@@ -434,6 +434,24 @@ pub struct DeviceFeatures {
     /// to allow a cross-class change — it just runs — which is exactly why it
     /// is asked structurally.
     pub dynamic_primitive_topology_unrestricted: bool,
+    /// `VK_KHR_shader_float_controls2`'s `shaderFloatControls2` — whether a
+    /// module may carry `OpCapability FloatControls2` with the
+    /// `FPFastMathMode` decorations the translator now emits.
+    ///
+    /// The `43c46ac` metal2vulkan pin decorates **every** float binary op that
+    /// withholds a rewrite permission, and a bare operation with no flag at
+    /// all withholds all of them, so this is not a rare shape: it is every
+    /// float op Apple did not compile with `fast`. Each one demands
+    /// `FloatControls2` + `SPV_KHR_float_controls2` for the module, and the
+    /// modules this engine compiles are exactly the translator's. A module
+    /// naming a capability whose feature was not enabled at device creation is
+    /// invalid usage rather than a slower path, so the device is asked for it
+    /// wherever it answers.
+    ///
+    /// `true` only where the extension was advertised *and* the feature bit
+    /// came back set — the conjunction the device create info enables and the
+    /// only reading that admits a decorated module.
+    pub shader_float_controls2: bool,
     /// `VkPhysicalDeviceFeatures::textureCompressionBC` — whether this device
     /// can sample the BC (DXT / S3TC) block-compressed families.
     ///
@@ -648,6 +666,17 @@ impl DeviceFeatures {
             .storage_buffer16_bit_access(self.storage16)
     }
 
+    /// `VK_KHR_shader_float_controls2`'s feature struct, for a device that
+    /// advertised it. Chained only where [`Self::shader_float_controls2`] is
+    /// set: the bit is both the query and the enable, and a device that did
+    /// not advertise the extension may not accept the structure at all.
+    pub fn enabled_shader_float_controls2(
+        &self,
+    ) -> vk::PhysicalDeviceShaderFloatControls2FeaturesKHR<'static> {
+        vk::PhysicalDeviceShaderFloatControls2FeaturesKHR::default()
+            .shader_float_controls2(self.shader_float_controls2)
+    }
+
     /// One line naming every feature and limit this backend resolved against the
     /// bound device, so a boot says what it turned on and what it did without.
     ///
@@ -710,6 +739,7 @@ impl DeviceFeatures {
             dynamic_polygon_mode,
             dynamic_depth_clamp,
             dynamic_primitive_topology_unrestricted,
+            shader_float_controls2,
             depth_clamp,
             multi_viewport,
             max_viewports,
@@ -763,6 +793,7 @@ impl DeviceFeatures {
              dyn_polygon_mode={dynamic_polygon_mode} \
              dyn_depth_clamp={dynamic_depth_clamp} \
              dyn_topology_unrestricted={dynamic_primitive_topology_unrestricted} \
+             shader_float_controls2={shader_float_controls2} \
              depth_clamp={depth_clamp} multi_viewport={multi_viewport} max_viewports={max_viewports} \
              occlusion_query_precise={occlusion_query_precise}",
             missing(sampled_linear_filter),
@@ -794,6 +825,9 @@ impl DeviceFeatures {
         // buys nothing and still has to be reported as enabled.
         if self.dynamic_polygon_mode || self.dynamic_depth_clamp {
             out.push(vk::EXT_EXTENDED_DYNAMIC_STATE3_NAME.as_ptr());
+        }
+        if self.shader_float_controls2 {
+            out.push(vk::KHR_SHADER_FLOAT_CONTROLS2_NAME.as_ptr());
         }
         out
     }
@@ -975,6 +1009,22 @@ pub unsafe fn query(
         } else {
             false
         };
+    // Asked only where the extension was advertised, on the same rule as
+    // `attachment_feedback_loop_layout` above: a structure that exists only
+    // with its extension is chained only on a device that named it. The
+    // feature *is* the extension — neither `FloatControls2`'s capability nor
+    // its `FPFastMathMode` decoration has a core-promoted spelling on the 1.2
+    // baseline — so the two readings stay together as one answer, unlike
+    // `mirror_clamp_to_edge` where the how-changed rung is what the enable
+    // side needs.
+    let shader_float_controls2 = if has_extension(vk::KHR_SHADER_FLOAT_CONTROLS2_NAME) {
+        let mut fcs2 = vk::PhysicalDeviceShaderFloatControls2FeaturesKHR::default();
+        let mut chained = vk::PhysicalDeviceFeatures2::default().push_next(&mut fcs2);
+        unsafe { instance.get_physical_device_features2(pd, &mut chained) };
+        fcs2.shader_float_controls2 == vk::TRUE
+    } else {
+        false
+    };
 
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
@@ -995,6 +1045,7 @@ pub unsafe fn query(
         dynamic_polygon_mode,
         dynamic_depth_clamp,
         dynamic_primitive_topology_unrestricted,
+        shader_float_controls2,
         texture_compression_bc: supported.texture_compression_bc == vk::TRUE,
         depth_clamp: supported.depth_clamp == vk::TRUE,
         multi_viewport: supported.multi_viewport == vk::TRUE,
@@ -1066,6 +1117,7 @@ mod tests {
             dynamic_polygon_mode: true,
             dynamic_depth_clamp: true,
             dynamic_primitive_topology_unrestricted: true,
+            shader_float_controls2: true,
             wide_lines: true,
             line_width_range: [1.0, 8.0],
             robust_buffer_access: true,

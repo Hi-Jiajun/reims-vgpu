@@ -42,6 +42,22 @@ pub enum DrawReason {
     /// this device declining to risk the process on undefined behaviour inside
     /// a driver, and it costs the guest the whole dispatch.
     SpirvInvalid,
+    /// The module declares `FloatControls2`, which the `43c46ac` translator
+    /// puts on every float op that withholds a rewrite permission, and this
+    /// device was not created with `VK_KHR_shader_float_controls2`.
+    ///
+    /// Distinct from [`Self::SpirvInvalid`]: the module is well-formed, and a
+    /// driver may even run it. What is missing is the ask: naming a capability
+    /// whose feature was not enabled at device creation is invalid usage, so a
+    /// device that answered neither `VK_KHR_shader_float_controls2` nor its
+    /// feature bit must decline the module by name rather than let one driver's
+    /// tolerance become this device's contract. The number and the module's
+    /// word count ride the `spirv_capability` fail line beside it.
+    ///
+    /// See `caps::device_features::DeviceFeatures::shader_float_controls2` for
+    /// the enable side and `runtime::spirv_bind::declares_capability` for the
+    /// read side.
+    FloatControls2Unsupported,
     /// A previous process died inside the driver call this request would make,
     /// with these exact modules, so this device will not make it again.
     ///
@@ -332,6 +348,7 @@ impl crate::observe::Decline for DrawReason {
     fn slug(&self) -> &'static str {
         match self {
             Self::SpirvInvalid => "spirv_module_invalid",
+            Self::FloatControls2Unsupported => "float_controls2_unsupported",
             Self::UsedBindingAbsentFromLayout { .. } => "draw_used_binding_absent_from_layout",
             Self::DriverCallQuarantined => "driver_call_quarantined",
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",

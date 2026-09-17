@@ -2639,6 +2639,7 @@ pub fn unpin_resident_target(identity: &TargetIdentity) {
 enum EngineProbe {
     StorageWriteWithoutFormat,
     SampledLayoutLinearFilter,
+    FloatControls2,
 }
 
 impl EngineProbe {
@@ -2646,6 +2647,7 @@ impl EngineProbe {
         match self {
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
             Self::SampledLayoutLinearFilter => "sampled_layout_linear_filter",
+            Self::FloatControls2 => "float_controls2",
         }
     }
 
@@ -2655,6 +2657,7 @@ impl EngineProbe {
         match self {
             Self::StorageWriteWithoutFormat => 7,
             Self::SampledLayoutLinearFilter => 9,
+            Self::FloatControls2 => 10,
         }
     }
 }
@@ -2776,6 +2779,35 @@ pub fn supports_storage_image_write_without_format() -> bool {
         Err(error) => {
             engine_probe_decline(EngineProbe::StorageWriteWithoutFormat, &error)
                 .fail_once(EngineProbe::StorageWriteWithoutFormat.discriminant());
+            false
+        }
+    }
+}
+
+/// Whether the engine's own device was created with
+/// `VK_KHR_shader_float_controls2` — the capability the `43c46ac` translator
+/// demands for every float op that withholds a rewrite permission.
+///
+/// This is the engine's answer for the device it bound, not a second query of
+/// the host: a module may only name `FloatControls2` where this is `true`, and
+/// the answer is already on the boot's `vk_features` line. A test that draws a
+/// module with the decoration has no other way to know whether the frame it
+/// asked for is one this host can run, which is why the answer is published
+/// rather than left inside the context.
+///
+/// Returns `false` if the engine cannot initialize.
+pub fn float_controls2_enabled() -> bool {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    match owner.ensure(counters) {
+        Ok(ctx) => ctx.features.shader_float_controls2,
+        Err(error) => {
+            engine_probe_decline(EngineProbe::FloatControls2, &error)
+                .fail_once(EngineProbe::FloatControls2.discriminant());
             false
         }
     }

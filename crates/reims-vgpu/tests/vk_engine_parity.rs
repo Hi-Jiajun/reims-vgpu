@@ -117,6 +117,32 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
     words
 }
 
+/// Whether the module carries `OpExtension "name"` (opcode 10, one literal
+/// string). The pin's demand is the pair it emits together, so a test that
+/// checked only the capability would miss half of what a device has to answer.
+fn declares_extension(words: &[u32], name: &str) -> bool {
+    let mut at = 5;
+    while at < words.len() {
+        let word_count = (words[at] >> 16) as usize;
+        let opcode = words[at] & 0xffff;
+        if word_count == 0 || at + word_count > words.len() {
+            return false;
+        }
+        if opcode == 10 {
+            let bytes: Vec<u8> = words[at + 1..at + word_count]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            if bytes[..end] == *name.as_bytes() {
+                return true;
+            }
+        }
+        at += word_count;
+    }
+    false
+}
+
 /// The device binding number for sampler `index`.
 ///
 /// `translate_words` widens the translator's bands, which moves a sampler out of
@@ -1823,6 +1849,78 @@ fn vertex_buffers_bind_in_one_bulk_call_without_losing_slots() {
             );
             eprintln!("attr path named failure (ok): {s}");
         }
+    }
+}
+
+/// The pin's withheld-rewrite-permission module, on the engine's own device.
+///
+/// `43c46ac` decorates every float binary op that withholds a rewrite
+/// permission — including one with no flag at all — and demands `FloatControls2`
+/// plus `SPV_KHR_float_controls2` for the module that carries it.
+/// `reims_indexed_tri_two_stream_precise.air` is exactly that shape (a bare
+/// `fadd` over two vertex streams), so this is where the pin and the engine's
+/// device have to agree: the capability is only admissible on a device created
+/// with the extension and the feature enabled, which is what
+/// `caps::device_features` now asks for and `engine::context` chains in. A host
+/// that answers for neither must refuse the module by name rather than be
+/// handed one it may not compile.
+#[test]
+fn the_withheld_rewrite_permission_reaches_a_device_that_answers_for_it() {
+    let _g = engine_test_session();
+    use reims_vgpu::runtime::spirv_bind::{declares_capability, CAPABILITY_FLOAT_CONTROLS2};
+    let v = translate_words("reims_indexed_tri_two_stream_precise.air", Stage::Vertex);
+    assert!(
+        declares_capability(&v, CAPABILITY_FLOAT_CONTROLS2)
+            && declares_extension(&v, "SPV_KHR_float_controls2"),
+        "the pinned translator no longer demands FloatControls2 for this fixture; \
+         the premise of the enable in `caps::device_features` moved with it"
+    );
+    let f = translate_words("render_frag.air", Stage::Fragment);
+    let mut req = engine_req(&v, &f, 8, 8);
+    // The two streams are added into the position, so a fullscreen triangle in
+    // the first and a zero offset in the second covers the target.
+    let triangle: [[f32; 2]; 3] = [[-1.0, -3.0], [-1.0, 1.0], [3.0, 1.0]];
+    let stream = |vertices: &[[f32; 2]; 3]| -> Vec<u8> {
+        vertices
+            .iter()
+            .flat_map(|v| v.iter().flat_map(|c| c.to_le_bytes()))
+            .collect()
+    };
+    for (location, binding, content) in [
+        (0u32, 0u32, stream(&triangle)),
+        (1, 1, stream(&[[0.0, 0.0]; 3])),
+    ] {
+        req.vertex_attributes.push(VertexAttributeResource {
+            location,
+            binding,
+            format: VertexAttributeFormat::Float2,
+            offset: 0,
+            stride: 8,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: content.into(),
+        });
+    }
+    if !engine::float_controls2_enabled() {
+        // Neither the extension nor the feature came back, so the device could
+        // not have been created with the capability. Running the module would
+        // be invalid usage; a named refusal is the only correct answer.
+        match engine::execute_draw_request(engine_device(), &req) {
+            Ok(_) => panic!("the device answered no FloatControls2 and the module drew anyway"),
+            Err(error) => eprintln!(
+                "the host answers no FloatControls2; the module is refused as expected: {error}"
+            ),
+        }
+        let refused = engine::execute_draw_request(engine_device(), &req)
+            .expect_err("a second attempt is refused from the negative cache too");
+        assert!(
+            refused.to_string().contains("float_controls2_unsupported"),
+            "the refusal must name the capability it could not admit: {refused}"
+        );
+        return;
+    }
+    if let Some(px) = draw_or_skip("float_controls2_precise", &req) {
+        assert_fullscreen_fragment_color("float_controls2_precise", &px, 8, 8);
     }
 }
 

@@ -1223,6 +1223,14 @@ impl DeviceContext {
         let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
         let mut en_extended_dynamic_state = features.enabled_extended_dynamic_state();
         let mut en_extended_dynamic_state3 = features.enabled_extended_dynamic_state3();
+        // The `43c46ac` translator decorates every float op that withholds a
+        // rewrite permission and demands `FloatControls2` for the module, so a
+        // device that answers for the capability has to be created with it —
+        // see `caps::device_features::DeviceFeatures::shader_float_controls2`.
+        // Chained only where it was answered: the structure exists only with
+        // its extension, and the extension string is in `enabled_device_extensions`
+        // on exactly the same condition (`required_extensions`).
+        let mut en_float_controls2 = features.enabled_shader_float_controls2();
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -1245,6 +1253,9 @@ impl DeviceContext {
         }
         if features.wants_extended_dynamic_state3() {
             dci = dci.push_next(&mut en_extended_dynamic_state3);
+        }
+        if features.shader_float_controls2 {
+            dci = dci.push_next(&mut en_float_controls2);
         }
         let device = instance
             .create_device(pd, &dci, None)

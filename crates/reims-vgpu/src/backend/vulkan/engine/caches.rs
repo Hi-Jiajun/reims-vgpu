@@ -1961,6 +1961,29 @@ impl ObjectCaches {
             self.shaders.insert_negative(key, err.clone());
             return Err(err);
         }
+        // A capability the *translator* declared and the *device* was not
+        // created with. `43c46ac` decorates every float op that withholds a
+        // rewrite permission and demands `FloatControls2` for the module, so
+        // this is the module-level half of the device-side enable in
+        // `caps::device_features`: on a host that answered neither the
+        // extension nor its feature, the module is invalid usage that one
+        // driver may run and the next may kill the process over. The device
+        // declines it by name here, before the bytes reach a driver.
+        if !ctx.features.shader_float_controls2
+            && crate::runtime::spirv_bind::declares_capability(
+                words,
+                crate::runtime::spirv_bind::CAPABILITY_FLOAT_CONTROLS2,
+            )
+        {
+            let err = DrawError::Unsupported(super::reason::DrawReason::FloatControls2Unsupported);
+            crate::observe::fail(format!(
+                "spirv_capability reason=float_controls2_unsupported words={} capability={}",
+                words.len(),
+                crate::runtime::spirv_bind::CAPABILITY_FLOAT_CONTROLS2,
+            ));
+            self.shaders.insert_negative(key, err.clone());
+            return Err(err);
+        }
         // The driver parses SPIR-V here, so this is one of the three calls that
         // can end the process on a module this device assembled — the other two
         // being the compute and graphics pipeline compiles below. See
