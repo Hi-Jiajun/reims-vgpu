@@ -39,6 +39,19 @@ use std::sync::{Mutex, OnceLock};
 /// The engine is process-global, and so is the canonical rail's provider; the
 /// engine suite's own lock is private to that test binary, so this file takes
 /// its own and resets the engine under it, exactly as `vk_engine_parity` does.
+///
+/// The engine's own per-device state lives in a `DeviceState` the caller now
+/// owns, so this file keeps one per process exactly as `vk_engine_batch` does.
+fn engine_device() -> &'static reims_vgpu::model::DeviceState {
+    static DEVICE: OnceLock<reims_vgpu::model::DeviceState> = OnceLock::new();
+    DEVICE.get_or_init(|| {
+        reims_vgpu::model::DeviceState::new(
+            reims_vgpu::model::DeviceId(1),
+            reims_vgpu::protocol::gva::PAGE_SHIFT_X86,
+        )
+    })
+}
+
 fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let guard = LOCK
@@ -48,7 +61,7 @@ fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
         })
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    engine::test_reset_engine();
+    engine::test_reset_engine(engine_device());
     guard
 }
 
@@ -284,7 +297,7 @@ fn the_production_seam_completes_the_reviewed_shape_and_agrees_with_the_engine()
     assert_solid("provider", &provider_pixels);
 
     let engine_req = engine_request(&air, MTL_FORMAT_RGBA8_UNORM);
-    let engine_out = match engine::execute_draw_request(&engine_req) {
+    let engine_out = match engine::execute_draw_request(engine_device(), &engine_req) {
         Ok(out) => out,
         Err(error) => {
             let text = error.to_string();

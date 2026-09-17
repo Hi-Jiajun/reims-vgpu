@@ -35,6 +35,7 @@
 //! `preflight_memo_*` route names remain for longitudinal log compatibility;
 //! a hit now means a retained pipeline-state lookup, not a byte comparison.
 
+use reims_vgpu_core::pipeline::{PipelineState, RefusalReason};
 use std::sync::{Arc, OnceLock};
 
 use crate::backend::vulkan::engine::DrawPreparationDecline;
@@ -97,7 +98,7 @@ pub struct VertexBindPlan {
 }
 
 impl VertexBindPlan {
-    fn build(desc: &RenderPipelineDescriptor) -> Self {
+    pub(crate) fn build(desc: &RenderPipelineDescriptor) -> Self {
         let mut constant_step: Vec<u32> = desc
             .vertex_attributes
             .iter()
@@ -149,6 +150,32 @@ impl VertexBindPlan {
     pub fn feeds_stage_in(&self, buffer_index: u32) -> bool {
         self.attribute.binary_search(&buffer_index).is_ok()
     }
+
+    /// Every buffer index the attribute list names, sorted.
+    ///
+    /// The set half of [`Self::feeds_stage_in`], for a caller that has to walk
+    /// it rather than ask about one index — see
+    /// [`crate::backend::vulkan::binding_usage`], which needs the whole set
+    /// because the vertex fetch's reads are exactly the ones the reflection
+    /// does not carry.
+    pub(crate) fn attribute_slots(&self) -> &[u32] {
+        &self.attribute
+    }
+
+    /// A plan stating only its attribute slots, for tests about what those
+    /// mean. Not a door into the real construction: [`Self::build`] derives
+    /// both sets from one descriptor and remains the only way a live plan is
+    /// made.
+    #[cfg(test)]
+    pub(crate) fn for_test(attribute: &[u32]) -> Self {
+        let mut attribute = attribute.to_vec();
+        attribute.sort_unstable();
+        attribute.dedup();
+        Self {
+            constant_step: Box::new([]),
+            attribute: attribute.into_boxed_slice(),
+        }
+    }
 }
 
 /// Per-task render pipeline states, keyed by the pipeline API's reference
@@ -164,6 +191,14 @@ pub type TaskRenderPipelineStates = TaskReferenceStates<ResolvedRenderPipeline>;
 #[derive(Debug, Default)]
 pub struct VulkanDeviceState {
     pub render_pipelines: TaskRenderPipelineStates,
+    /// The immutable-object caches — shader modules, layouts, render passes,
+    /// pipelines, samplers — this rail builds for one device's lifetime.
+    ///
+    /// They were the process-global engine's until they moved here. Every entry
+    /// is keyed by something the *guest* declared, so the population ends when
+    /// the guest's device does, and the engine that kept them beside its
+    /// `VkInstance` made them outlive every device on the process.
+    pub(crate) caches: crate::backend::vulkan::engine::DeviceObjectCaches,
 }
 
 impl RailDeviceState for VulkanDeviceState {
@@ -179,6 +214,27 @@ impl RailDeviceState for VulkanDeviceState {
             "pipeline_state_task_deleted",
             self.render_pipelines.delete_task(task_id) as u64,
         );
+    }
+
+    /// The device's end ends every reference this rail holds under it, whatever
+    /// task declared it — including the tasks the guest never got to delete,
+    /// which is every one of them when the device goes away under a running
+    /// guest.
+    ///
+    /// Reported under its own name rather than folded into
+    /// `pipeline_state_task_deleted`: an orderly per-task teardown and a device
+    /// disappearing with work still declared are different facts about a boot,
+    /// and one counter carrying both cannot say which happened.
+    fn end_device(&self) {
+        note_store_route_n(
+            "pipeline_state_device_ended",
+            self.render_pipelines.clear() as u64,
+        );
+        // The caches hold native objects, so their ending is a destruction and
+        // not a drop. It goes through whatever context the engine still has,
+        // which is the engine's half of this division: the device owns *when*,
+        // the rail owns *what it costs*.
+        self.caches.end_device();
     }
 }
 
@@ -359,12 +415,16 @@ pub fn resolve<M: HostMemory + HostOps>(
 ) -> Result<Arc<ResolvedRenderPipeline>, DrawPreparationDecline> {
     if !memo_enabled() {
         note_store_route("pipe_memo_off");
-        return resolve_uncached(state, host, task_id, pipeline_ref).map(Arc::new);
+        return resolve_uncached(state, host, task_id, pipeline_ref)
+            .inspect(|resolved| ready(state, host, task_id, pipeline_ref, resolved))
+            .map(Arc::new);
     }
 
     let Some(states) = retained(state) else {
         note_store_route("pipe_memo_off");
-        return resolve_uncached(state, host, task_id, pipeline_ref).map(Arc::new);
+        return resolve_uncached(state, host, task_id, pipeline_ref)
+            .inspect(|resolved| ready(state, host, task_id, pipeline_ref, resolved))
+            .map(Arc::new);
     };
     if let Some(resolved) = states.get(task_id, pipeline_ref) {
         note_store_route("pipe_memo_hit");
@@ -374,7 +434,9 @@ pub fn resolve<M: HostMemory + HostOps>(
 
     let mut resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
     resolved.pipeline_object = Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new());
-    Ok(states.register(task_id, pipeline_ref, Arc::new(resolved)))
+    let registered = states.register(task_id, pipeline_ref, Arc::new(resolved));
+    ready(state, host, task_id, pipeline_ref, &registered);
+    Ok(registered)
 }
 
 /// The sample count an attachment bound with this pipeline must carry.
@@ -413,11 +475,141 @@ fn resolve_uncached<M: HostMemory + HostOps>(
     task_id: u32,
     pipeline_ref: u32,
 ) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
+    resolve_uncached_inner(state, host, task_id, pipeline_ref).inspect_err(|decline| {
+        // A decline here is terminal for the pipeline, not for the draw that
+        // happened to ask: none of the seven inputs below is re-read on a later
+        // draw with a different answer, so retrying costs one guest walk per
+        // frame and produces the same refusal. The one exception is
+        // `PipelineMissing`, which is the *pipeline* not being there — nothing
+        // was declared, so there is nothing to refuse, and refusing it would
+        // name a slot the ordering plane has no entry for.
+        let reason = match decline {
+            DrawPreparationDecline::PipelineMissing { .. } => return,
+            DrawPreparationDecline::VertexMtlbMissing { .. } => {
+                RefusalReason::CompilationFailed("vertex_mtlb_missing")
+            }
+            DrawPreparationDecline::FragmentMtlbMissing { .. } => {
+                RefusalReason::CompilationFailed("fragment_mtlb_missing")
+            }
+            DrawPreparationDecline::VertexAirExtract { .. } => {
+                RefusalReason::CompilationFailed("vertex_air_extract")
+            }
+            DrawPreparationDecline::FragmentAirExtract { .. } => {
+                RefusalReason::CompilationFailed("fragment_air_extract")
+            }
+            DrawPreparationDecline::VertexTranslate { .. } => {
+                RefusalReason::TranslationFailed("vertex_translate")
+            }
+            DrawPreparationDecline::FragmentTranslate { .. } => {
+                RefusalReason::TranslationFailed("fragment_translate")
+            }
+            // `DrawPreparationDecline` is the whole draw rail's decline set,
+            // three dozen variants of which only the seven above can be
+            // returned by `resolve_uncached_inner`. The rest are the encoder's
+            // and say nothing about whether the pipeline can be built, so they
+            // must not refuse it; counted so that "impossible" stays a
+            // measurement rather than an assumption.
+            other => {
+                let _ = other;
+                note_store_route("pipeline_refuse_not_a_build_decline");
+                return;
+            }
+        };
+        crate::runtime::draw::refuse_pipeline(state, host, task_id, pipeline_ref, reason);
+    })
+}
+
+/// The publish half of [`ready`], skipped when the pre-scan already answered.
+///
+/// Split out so the gate and the work are one statement: a caller that checked
+/// the gate and then built the tables anyway would pay for them twice, and a
+/// caller that built them and let the model refuse the write would pay for them
+/// on every resolve.
+fn publish_usage_if_unpublished<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    resolved: &ResolvedRenderPipeline,
+) {
+    let Some(name) = crate::runtime::objects::name_resource(state, host, task_id, pipeline_ref)
+    else {
+        note_store_route("pipeline_usage_unnamed");
+        return;
+    };
+    if state.pipeline_usage_published(name) {
+        note_store_route("render_usage_already_published");
+        return;
+    }
+    let (usage, refusals) = crate::backend::vulkan::binding_usage::render(
+        &resolved.vertex.reflection,
+        &resolved.bind_plan,
+        &resolved.fragment.reflection,
+    );
+    for refusal in refusals.into_iter().flatten() {
+        // A stage that cannot be published is a stage left at `Unknown`, which
+        // costs ordering and never correctness — so it is counted rather than
+        // failed, and the count is what says which reason is worth closing.
+        note_store_route(refusal.slug());
+    }
+    crate::runtime::draw::publish_pipeline_usage(state, host, task_id, pipeline_ref, usage);
+}
+
+/// Tell the ordering plane this pipeline is usable, which releases the exec
+/// transactions parked on its lease.
+///
+/// Called after the retained state is filed rather than before, so that the
+/// first work released cannot arrive at a registry that does not yet hold what
+/// it will ask for.
+/// Published before the `Ready` step, never after: `Ready` is what lets a
+/// transaction lease this pipeline, and the walk asks for the reflection once
+/// at admission and never again. So a lease taken between the two would carry
+/// a footprint that stays `Unknown` for the life of that transaction.
+///
+/// **This is the later of the two publish sites, and the fallback.**
+/// `runtime::exec::vulkan::publish_render_usage` publishes from the pre-scan,
+/// which runs before admission readies the lease and is therefore in front of
+/// the draw that would otherwise miss it. This site is what answers on a path
+/// with no pre-scan — the memo-off ablation, and a direct resolve. The model's
+/// `pipeline_usage_published` is the single arbiter, so the pipeline's binding
+/// set is enumerated once whichever site reaches it first.
+fn ready<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    resolved: &ResolvedRenderPipeline,
+) {
+    publish_usage_if_unpublished(state, host, task_id, pipeline_ref, resolved);
+    crate::runtime::draw::advance_pipeline(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+        PipelineState::Ready,
+    );
+}
+
+fn resolve_uncached_inner<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
     let desc = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
         .ok_or(DrawPreparationDecline::PipelineMissing {
             task_id,
             pipeline_ref,
         })?;
+    // The descriptor decoded and the pipeline is declared; the guest's shader
+    // form is about to become the host's.
+    crate::runtime::draw::advance_pipeline(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+        PipelineState::Translating,
+    );
     // The same three sub-phases the call site used to open around this work,
     // moved in with it. They are inert outside a live `ChainTimer`, so the two
     // non-draw callers of the loaders below are unaffected — and on the draw
@@ -479,6 +671,15 @@ fn resolve_uncached<M: HostMemory + HostOps>(
         pipeline_ref,
         reason,
     })?;
+    // Both stages are SPIR-V now. What is left is this rail building the
+    // pipeline object out of them, which is `Compiling`.
+    crate::runtime::draw::advance_pipeline(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+        PipelineState::Compiling,
+    );
     let bind_plan = Arc::new(VertexBindPlan::build(&desc));
     Ok(ResolvedRenderPipeline {
         pipeline_object: None,
@@ -580,6 +781,41 @@ mod tests {
         pipelines(&state).register(3, 9, retained_pipeline_for_test());
         assert!(state.delete_task(3));
         assert!(!pipelines(&state).contains(3, 9));
+    }
+
+    /// The device ending takes what no task deletion ever named.
+    ///
+    /// The guest is under no obligation to delete its tasks before the device
+    /// goes away — a reset under a running guest is exactly the case where it
+    /// does not — so the states left behind are the *normal* population at this
+    /// event, not an error path. `delete_task` cannot reach them: it is told one
+    /// id at a time and nothing here enumerates the guest's ids.
+    #[test]
+    fn a_device_ending_releases_every_task_no_deletion_named() {
+        let mut state = DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        state.define_task(3, 1 << 20, 8);
+        state.define_task(4, 2 << 20, 8);
+        pipelines(&state).register(3, 9, retained_pipeline_for_test());
+        pipelines(&state).register(3, 10, retained_pipeline_for_test());
+        let held = pipelines(&state).register(4, 9, retained_pipeline_for_test());
+
+        let rail = state
+            .rail_state::<VulkanDeviceState>()
+            .expect("this rail holds the slot");
+        rail.end_device();
+
+        assert!(!pipelines(&state).contains(3, 9));
+        assert!(!pipelines(&state).contains(3, 10));
+        assert!(
+            !pipelines(&state).contains(4, 9),
+            "every task, not the one that happened to be asked about"
+        );
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "a state an encoder still owns outlives the table, as it does \
+             across a reference delete"
+        );
     }
 
     /// The two sets [`VertexBindPlan`] carries used to be rebuilt inside the
