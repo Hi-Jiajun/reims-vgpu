@@ -52,7 +52,9 @@ fn mul3add1_request() -> ComputeRequest {
             regions: vec![ComputeDispatchRegion {
                 local_size: [4, 1, 1],
                 group_count: [1, 1, 1],
-                push_constants: [0; 12],
+                // The translator's own payload for four threads in 4-wide
+                // groups; the rail verifies it against its plan.
+                push_constants: [4, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1],
             }],
         },
         storage_buffers: vec![ComputeBufferResource {

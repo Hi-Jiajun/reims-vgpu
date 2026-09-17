@@ -11,10 +11,16 @@
 //! The admitted class is deliberately the smallest falsifiable shape:
 //!
 //! - no sampled images, samplers, or storage images (pure storage buffers);
-//! - a `ComputeDispatch::Regions` launch with exactly one region — the shape
-//!   the canonical Vulkan provider can express as one `ThreadsExact` dispatch
-//!   (it refuses whole-workgroup launches today, `supports_threadgroups` is
-//!   false);
+//! - a `ComputeDispatch::Regions` exact-thread launch — one region or the
+//!   several a partial threadgroup decomposes into — whose region list is
+//!   exactly the decomposition the translator derives for the launch it
+//!   carries. The canonical trace spells such a launch as *one* `ThreadsExact`
+//!   pass in Metal units (`grid` threads in `threads_per_threadgroup`-sized
+//!   groups) and the provider re-derives the tail regions itself
+//!   (`research/docs/11` §3.4), so the rail admits a request only when the
+//!   translator reproduces its regions — same order, shapes, bases and
+//!   per-region payload — from the recovered launch. Whole-workgroup launches
+//!   keep the engine (`supports_threadgroups` is false);
 //! - every buffer binding the compiled canonical contract names must be
 //!   present in the reims-staged request, so `Unused`/`Absent` reflection
 //!   cases stay on the reims engine;
@@ -425,13 +431,15 @@ pub fn submit_compute(
     req: &ComputeRequest,
     windows: &[Window],
 ) -> ComputeRailOutcome {
-    if let Some(reason) = narrow_class_reason(req) {
-        return ComputeRailOutcome::NotInNarrowClass(reason);
-    }
-    match submit_narrow(air, entry, req, windows) {
-        Ok(NarrowOutcome::Completed(output)) => ComputeRailOutcome::ProviderCompleted(output),
-        Ok(NarrowOutcome::Outside(reason)) => ComputeRailOutcome::NotInNarrowClass(reason),
-        Err(decline) => ComputeRailOutcome::ProviderDeclined(decline),
+    // The class gate is pure and runs first: an out-of-class shape never
+    // touches the rail (no device, no compile, no lease).
+    match narrow_class(req) {
+        Err(reason) => ComputeRailOutcome::NotInNarrowClass(reason),
+        Ok(launch) => match submit_narrow(air, entry, req, launch, windows) {
+            Ok(NarrowOutcome::Completed(output)) => ComputeRailOutcome::ProviderCompleted(output),
+            Ok(NarrowOutcome::Outside(reason)) => ComputeRailOutcome::NotInNarrowClass(reason),
+            Err(decline) => ComputeRailOutcome::ProviderDeclined(decline),
+        },
     }
 }
 
@@ -565,27 +573,131 @@ enum NarrowOutcome {
     Outside(&'static str),
 }
 
-fn narrow_class_reason(req: &ComputeRequest) -> Option<&'static str> {
+/// The Metal-level launch one admitted `Regions` request is the device work of.
+///
+/// The canonical trace carries a compute pass in *Metal* units — a thread grid
+/// and a threadgroup size — and the provider derives the device-side tail
+/// regions itself (`research/docs/11` §3.4: the canonical trace 只携带 Metal
+/// grid/local). A reims request is the other half of the same fact: it carries
+/// the tiled decomposition. This is the launch that decomposition belongs to,
+/// recovered from the tiles themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NarrowLaunch {
+    /// Exact threads of the whole launch, the canonical `ThreadsExact` grid.
+    grid: [u64; 3],
+    /// The launch's threadgroup shape, the nominal local size the regions were
+    /// tiled at.
+    threads_per_threadgroup: [u64; 3],
+}
+
+/// The launch `req`'s dispatch decomposes, or why the request stays on the
+/// self-contained engine.
+///
+/// The recovered launch is *verified*, not assumed: the translator must
+/// reproduce exactly this region list — same order, shapes, bases, and
+/// per-region payload — for the recovered `(grid, local)`. That verification is
+/// what makes one canonical pass a faithful spelling of the whole launch: the
+/// provider re-derives the device work from `(grid, local)` with the same
+/// planner, so a region list it would not derive (a hand-built list, a list
+/// whose payloads disagree with the plan, a shape whose tiles cannot be
+/// re-derived) keeps the engine rather than silently dispatching other threads.
+/// The whole check is pure — it runs before the rail is even created, so a
+/// refused shape costs the provider nothing.
+fn narrow_class(req: &ComputeRequest) -> Result<NarrowLaunch, &'static str> {
     if !req.sampled_images.is_empty() || !req.samplers.is_empty() || !req.storage_images.is_empty()
     {
-        return Some("compute images/samplers stay on the self-contained engine");
+        return Err("compute images/samplers stay on the self-contained engine");
     }
-    let ComputeDispatch::Regions { regions, .. } = &req.dispatch else {
-        return Some(
+    let ComputeDispatch::Regions {
+        threadgroups_per_grid,
+        regions,
+        ..
+    } = &req.dispatch
+    else {
+        return Err(
             "whole-workgroup launches stay on the self-contained engine \
              (the canonical Vulkan provider admits exact threads only)",
         );
     };
-    if regions.len() != 1 {
-        return Some("multi-region exact-thread launches stay on the self-contained engine");
+    if regions.is_empty() {
+        return Err("a launch with no regions stays on the self-contained engine");
     }
-    None
+
+    // The launch's extent is the tiling's own cover: a region's threads start
+    // at the origin its payload pushes (words 3..6 — the base the kernel adds
+    // to its invocation ids) and reach `base + local_size * group_count`, so
+    // the widest region of each axis reaches the whole launch's thread count.
+    // Its threadgroup shape is the widest local size the plan specialized a
+    // pipeline to — the nominal size for axes the plan tiles, and the effective
+    // size for an axis whose whole grid is one partial threadgroup. The base is
+    // read out of the payload rather than a struct field because the payload is
+    // what the device pushes; a base the planner would not derive fails below,
+    // where the plan is compared word for word against it.
+    let mut grid = [0u64; 3];
+    let mut local = [0u64; 3];
+    for region in regions {
+        let base = [
+            region.push_constants[3],
+            region.push_constants[4],
+            region.push_constants[5],
+        ];
+        for axis in 0..3 {
+            let local_size = region.local_size[axis];
+            let group_count = region.group_count[axis];
+            if local_size == 0 || group_count == 0 {
+                return Err("a region that launches no threads stays on the self-contained engine");
+            }
+            let span = u64::from(base[axis])
+                .saturating_add(u64::from(local_size) * u64::from(group_count));
+            grid[axis] = grid[axis].max(span);
+            local[axis] = local[axis].max(u64::from(local_size));
+        }
+    }
+
+    // The planner speaks the translator's `u32` ABI; a launch that does not fit
+    // it cannot be re-derived here, and the engine keeps that shape.
+    let mut planned_grid = [0u32; 3];
+    let mut planned_local = [0u32; 3];
+    for axis in 0..3 {
+        planned_grid[axis] = u32::try_from(grid[axis])
+            .map_err(|_| "a thread grid wider than the translator's u32 stays on the engine")?;
+        planned_local[axis] = u32::try_from(local[axis])
+            .map_err(|_| "a local size wider than the translator's u32 stays on the engine")?;
+    }
+    // The dynamic variant is the one whose plan depends only on `(grid, local)`
+    // — which is what the canonical pass carries. A kernel whose AIR bakes a
+    // fixed grid is checked by the provider it is compiled against: it either
+    // agrees (same grid, same plan) or the provider refuses the pass, which is
+    // a typed decline rather than a fallback to the engine.
+    let plan = metal2vulkan::reflect::KernelDispatch::ThreadsDynamic { offset: 0 }
+        .plan(planned_local, Some(planned_grid))
+        .map_err(|_| {
+            "a launch the translator refuses to plan stays on the self-contained engine"
+        })?;
+    let reproduced = plan.threadgroups_per_grid == *threadgroups_per_grid
+        && plan.regions.len() == regions.len()
+        && plan.regions.iter().zip(regions).all(|(planned, carried)| {
+            planned.local_size == carried.local_size
+                && planned.group_count == carried.group_count
+                && plan.push_constants(*planned) == carried.push_constants
+        });
+    if !reproduced {
+        return Err(
+            "a region list the translator would not derive from one exact-thread launch \
+             stays on the self-contained engine",
+        );
+    }
+    Ok(NarrowLaunch {
+        grid,
+        threads_per_threadgroup: local,
+    })
 }
 
 fn submit_narrow(
     air: &[u8],
     entry: &str,
     req: &ComputeRequest,
+    launch: NarrowLaunch,
     windows: &[Window],
 ) -> Result<NarrowOutcome, ProviderComputeDecline> {
     let rail = rail()?;
@@ -597,23 +709,13 @@ fn submit_narrow(
         return Err(decline);
     }
 
-    let ComputeDispatch::Regions { regions, .. } = &req.dispatch else {
-        unreachable!("narrow_class_reason admitted the class");
-    };
-    let region = &regions[0];
-
-    // The single region covers the whole logical grid, so the canonical
-    // `ThreadsExact` grid is the region's group count times its local size,
-    // and its threadgroup shape is the region's local size.
-    let mut grid = [0u64; 3];
-    for axis in 0..3 {
-        grid[axis] = u64::from(region.group_count[axis])
-            .checked_mul(u64::from(region.local_size[axis]))
-            .ok_or_else(|| ProviderComputeDecline::TraceAdmission {
-                detail: format!("axis {axis} thread grid overflows u64"),
-            })?;
-    }
-    let threads_per_threadgroup = region.local_size.map(u64::from);
+    // One canonical pass carries the whole launch in Metal units, and the
+    // provider re-derives the device-side regions from exactly these two
+    // numbers — the tiling `narrow_class` verified the request's own.
+    let NarrowLaunch {
+        grid,
+        threads_per_threadgroup,
+    } = launch;
 
     let pipeline = {
         let mut cache =
@@ -914,6 +1016,7 @@ fn staged_writebacks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::vulkan::engine::ComputeDispatchRegion;
     use metal_api_core::provider::{
         AllocationId, BufferLease, DeviceEpoch, LeaseId, LeaseReservation, ProviderPhase,
     };
@@ -950,6 +1053,178 @@ mod tests {
             offset,
             bytes,
         }
+    }
+
+    /// One `ComputeRequest` whose dispatch is exactly the translator's own
+    /// decomposition of `grid` threads in `local`-sized threadgroups.
+    fn request_of_launch(grid: [u32; 3], local: [u32; 3]) -> ComputeRequest {
+        let plan = metal2vulkan::reflect::KernelDispatch::ThreadsDynamic { offset: 0 }
+            .plan(local, Some(grid))
+            .expect("the launch plans");
+        ComputeRequest {
+            spirv: Vec::new(),
+            entry: "main".into(),
+            dispatch: ComputeDispatch::Regions {
+                push_offset: 0,
+                threadgroups_per_grid: plan.threadgroups_per_grid,
+                regions: plan
+                    .regions
+                    .iter()
+                    .map(|region| ComputeDispatchRegion {
+                        local_size: region.local_size,
+                        group_count: region.group_count,
+                        push_constants: plan.push_constants(*region),
+                    })
+                    .collect(),
+            },
+            storage_buffers: vec![crate::backend::vulkan::engine::ComputeBufferResource {
+                binding: 0,
+                bytes: vec![0u8; 64],
+                writable: true,
+            }],
+            sampled_images: Vec::new(),
+            samplers: Vec::new(),
+            storage_images: Vec::new(),
+        }
+    }
+
+    /// The class admits exactly the translator's own decomposition of one
+    /// exact-thread launch — the single-region shape, and the several regions a
+    /// partial threadgroup tiles into — and recovers that launch's Metal-level
+    /// `(grid, local)` from the tiles.
+    ///
+    /// The recovered launch is what the canonical pass carries, so it is the
+    /// thing to assert: for a tail launch the widest region is the interior
+    /// (whose local size is the nominal one) and the far edge is the tail's
+    /// `thread_base + local_size` — not the tail region's own renumbered grid.
+    #[test]
+    fn the_class_recovers_the_launch_a_region_list_decomposes() {
+        // The single-region control: the old mapping and the recovered launch
+        // are the same numbers.
+        let single = narrow_class(&request_of_launch([4, 1, 1], [4, 1, 1]))
+            .expect("one exact region is the class");
+        assert_eq!(single.grid, [4, 1, 1]);
+        assert_eq!(single.threads_per_threadgroup, [4, 1, 1]);
+
+        // A tail launch: 6 threads in 4-wide groups are two regions (the
+        // interior 0..3 and the slab 4..5), and the launch they decompose is
+        // still 6 threads in 4-wide groups.
+        let tail_request = request_of_launch([6, 1, 1], [4, 1, 1]);
+        let ComputeDispatch::Regions { regions, .. } = &tail_request.dispatch else {
+            panic!("a tail launch is a regions dispatch");
+        };
+        assert_eq!(regions.len(), 2, "a partial threadgroup is two regions");
+        assert_eq!(
+            regions[1].push_constants[3..6],
+            [4, 0, 0],
+            "the slab's payload starts its threads at 4"
+        );
+        let tail = narrow_class(&tail_request).expect("the translator's own tiling is the class");
+        assert_eq!(tail.grid, [6, 1, 1], "the launch is the tiling's cover");
+        assert_eq!(tail.threads_per_threadgroup, [4, 1, 1]);
+
+        // Eight regions (a boundary on every axis): the cover is the whole
+        // grid, not any one region's span.
+        let all_axes = narrow_class(&request_of_launch([130, 5, 3], [64, 2, 2]))
+            .expect("an eight-region tiling is the class");
+        assert_eq!(all_axes.grid, [130, 5, 3]);
+        assert_eq!(all_axes.threads_per_threadgroup, [64, 2, 2]);
+
+        // A grid smaller than one threadgroup is a single slab: the recovered
+        // local size is the effective one, and re-planning it reproduces the
+        // same single region.
+        let sub_group = narrow_class(&request_of_launch([3, 1, 1], [8, 1, 1]))
+            .expect("a sub-threadgroup grid is the class");
+        assert_eq!(sub_group.grid, [3, 1, 1]);
+        assert_eq!(sub_group.threads_per_threadgroup, [3, 1, 1]);
+    }
+
+    /// Every way a region list can fail to be the translator's decomposition is
+    /// named as out of class — the engine keeps the shape instead of the
+    /// provider dispatching other threads.
+    #[test]
+    fn a_region_list_the_translator_would_not_derive_stays_on_the_engine() {
+        const NOT_A_DECOMPOSITION: &str =
+            "a region list the translator would not derive from one exact-thread launch \
+             stays on the self-contained engine";
+        let reason_of = |request: &ComputeRequest| {
+            narrow_class(request).expect_err("this list is not a decomposition")
+        };
+
+        // A second copy of the interior region: no single launch tiles into the
+        // same threads twice.
+        let mut duplicated = request_of_launch([6, 1, 1], [4, 1, 1]);
+        let ComputeDispatch::Regions { regions, .. } = &mut duplicated.dispatch else {
+            unreachable!()
+        };
+        regions.push(regions[0]);
+        assert_eq!(reason_of(&duplicated), NOT_A_DECOMPOSITION);
+
+        // The tail slab's base moved to zero: the same shapes, but the threads
+        // they cover are not this launch's.
+        let mut rebased = request_of_launch([6, 1, 1], [4, 1, 1]);
+        let ComputeDispatch::Regions { regions, .. } = &mut rebased.dispatch else {
+            unreachable!()
+        };
+        regions[1].push_constants[3] = 0;
+        assert_eq!(reason_of(&rebased), NOT_A_DECOMPOSITION);
+
+        // A payload the plan would not produce: the engine would push these
+        // words where the provider pushes its own.
+        let mut doctored = request_of_launch([6, 1, 1], [4, 1, 1]);
+        let ComputeDispatch::Regions { regions, .. } = &mut doctored.dispatch else {
+            unreachable!()
+        };
+        regions[1].push_constants[0] = 5;
+        assert_eq!(reason_of(&doctored), NOT_A_DECOMPOSITION);
+
+        // A dropped region: the launch would lose its slab.
+        let mut truncated = request_of_launch([6, 1, 1], [4, 1, 1]);
+        let ComputeDispatch::Regions { regions, .. } = &mut truncated.dispatch else {
+            unreachable!()
+        };
+        regions.truncate(1);
+        assert_eq!(reason_of(&truncated), NOT_A_DECOMPOSITION);
+
+        // A region that launches nothing.
+        let mut empty = request_of_launch([6, 1, 1], [4, 1, 1]);
+        let ComputeDispatch::Regions { regions, .. } = &mut empty.dispatch else {
+            unreachable!()
+        };
+        regions[0].group_count = [0, 1, 1];
+        assert_eq!(
+            reason_of(&empty),
+            "a region that launches no threads stays on the self-contained engine"
+        );
+
+        // A dispatch with no regions at all.
+        let mut none = request_of_launch([6, 1, 1], [4, 1, 1]);
+        let ComputeDispatch::Regions { regions, .. } = &mut none.dispatch else {
+            unreachable!()
+        };
+        regions.clear();
+        assert_eq!(
+            reason_of(&none),
+            "a launch with no regions stays on the self-contained engine"
+        );
+
+        // A threadgroup census that disagrees with the tiling.
+        let mut wrong_census = request_of_launch([6, 1, 1], [4, 1, 1]);
+        let ComputeDispatch::Regions {
+            threadgroups_per_grid,
+            ..
+        } = &mut wrong_census.dispatch
+        else {
+            unreachable!()
+        };
+        *threadgroups_per_grid = [9, 1, 1];
+        assert_eq!(reason_of(&wrong_census), NOT_A_DECOMPOSITION);
+
+        // Whole-workgroup launches keep the engine: the canonical Vulkan
+        // provider admits exact threads only.
+        let mut workgroups = request_of_launch([6, 1, 1], [4, 1, 1]);
+        workgroups.dispatch = ComputeDispatch::Workgroups([1, 1, 1]);
+        assert!(reason_of(&workgroups).contains("whole-workgroup"));
     }
 
     /// Every normalized provider class is named by its own reims slug, and the

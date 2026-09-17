@@ -1437,10 +1437,12 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         out
     };
     // Gate 2 production seam: while `provider-compute` is on, the narrow
-    // reviewed class (pure storage buffers, single-region exact threads) is
-    // submitted through the canonical provider. Out-of-class shapes fall
-    // through to the self-contained engine unchanged; an in-class provider
-    // refusal declines the dispatch instead of silently switching rails.
+    // reviewed class (pure storage buffers, exact-thread launches whose region
+    // list is the translator's own decomposition — one region or the several a
+    // partial threadgroup tiles into) is submitted through the canonical
+    // provider. Out-of-class shapes fall through to the self-contained engine
+    // unchanged; an in-class provider refusal declines the dispatch instead of
+    // silently switching rails.
     #[cfg(feature = "provider-compute")]
     let out_result = {
         use crate::backend::provider_compute::{self, ComputeRailOutcome};

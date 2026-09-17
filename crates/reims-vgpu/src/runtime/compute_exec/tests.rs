@@ -1095,6 +1095,109 @@ fn dispatch_mul3add1_submits_through_the_canonical_provider() {
     );
 }
 
+/// The widened narrow class against the engine, on the *same* request, for a
+/// launch whose thread grid is not a multiple of its threadgroup — the shape
+/// the translator decomposes into several regions.
+///
+/// The request is built the way production builds it: this crate's own
+/// reflection picks the dispatch contract, `kernel_dispatch_launch` plans the
+/// regions and writes their payloads, and the same request then runs on both
+/// rails. The engine executes the regions it was handed; the canonical provider
+/// is given the launch in Metal units (one `ThreadsExact` pass) and re-derives
+/// the regions itself. The two must agree byte for byte, which is the only
+/// thing that makes the single-pass spelling faithful — and the tail's words
+/// are the falsifier: a mapping that spelled a region as its own pass would run
+/// the slab's threads renumbered from zero and overwrite words 1 and 2 instead
+/// of writing words 5 and 6.
+#[test]
+#[cfg(all(feature = "backend-vulkan", feature = "provider-compute"))]
+fn a_tiled_launch_is_byte_identical_across_the_engine_and_the_canonical_provider() {
+    use crate::backend::provider_compute::{self, ComputeRailOutcome};
+    use crate::backend::vulkan::engine as vk_engine;
+    use crate::backend::vulkan::engine::{ComputeDispatch, ComputeRequest};
+    use std::path::PathBuf;
+
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb");
+    let mtlb = std::fs::read(&path).expect("compute_mul3add1.mtlb fixture");
+    let air = crate::runtime::mtlb::extract_air(&mtlb)
+        .expect("wrapped AIR bitcode")
+        .to_vec();
+    let local = [4u32, 1, 1];
+    let shader =
+        crate::runtime::m2v_cache::translate_cached_kernel_reflected(&air, local, 0x9_1001)
+            .expect("the reviewed fixture translates");
+    let kernel_dispatch = shader
+        .reflection
+        .kernel_dispatch
+        .expect("the fixture's kernel declares a dispatch contract");
+
+    // One launch per shape: an exact multiple (one region, the old class), a
+    // partial threadgroup (interior + slab), and one whose interior itself
+    // holds more than one threadgroup.
+    for (grid, regions) in [([4u32, 1, 1], 1usize), ([6, 1, 1], 2), ([10, 1, 1], 2)] {
+        let dispatch = kernel_dispatch_launch(kernel_dispatch, local, [0, 0, 0], local, Some(grid))
+            .expect("an exact-thread launch plans its regions");
+        let ComputeDispatch::Regions { regions: tiles, .. } = &dispatch else {
+            panic!("an exact-thread contract must plan regions");
+        };
+        assert_eq!(tiles.len(), regions, "grid {grid:?} tiles into {regions}");
+
+        let words: Vec<u32> = (1..=grid[0]).collect();
+        let input: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let request = ComputeRequest {
+            spirv: shader.words.to_vec(),
+            entry: "main".into(),
+            dispatch,
+            storage_buffers: vec![crate::backend::vulkan::engine::ComputeBufferResource {
+                binding: 0,
+                bytes: input,
+                writable: true,
+            }],
+            sampled_images: Vec::new(),
+            samplers: Vec::new(),
+            storage_images: Vec::new(),
+        };
+        let expected: Vec<u32> = words.iter().map(|word| word * 3 + 1).collect();
+
+        let engine = vk_engine::execute_compute_request(&request).expect("the engine runs");
+        assert_eq!(engine.buffers.len(), 1, "one writable binding");
+        let engine_words: Vec<u32> = engine.buffers[0]
+            .bytes
+            .chunks(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("4-byte chunk")))
+            .collect();
+        assert_eq!(engine_words, expected, "the engine ran the tiled launch");
+
+        // `apv_cs` is the AIR entry the canonical translator reports for this
+        // fixture — the entry the production seam passes through, not the
+        // reims SPIR-V entry `main`.
+        match provider_compute::submit_compute(&air, "apv_cs", &request, &[]) {
+            ComputeRailOutcome::ProviderCompleted(out) => {
+                assert_eq!(out.writebacks.len(), 1, "one writable binding readback");
+                assert_eq!(out.writebacks[0].binding, 0);
+                assert_eq!(out.writebacks[0].offset, 0);
+                let provider_words: Vec<u32> = out.writebacks[0]
+                    .bytes
+                    .chunks(4)
+                    .map(|word| u32::from_le_bytes(word.try_into().expect("4-byte chunk")))
+                    .collect();
+                assert_eq!(
+                    provider_words, engine_words,
+                    "the provider's one-pass spelling of grid {grid:?} must be the \
+                     engine's own device work, byte for byte"
+                );
+            }
+            ComputeRailOutcome::NotInNarrowClass(reason) => {
+                panic!("a tiled exact-thread launch is in the widened class; refused: {reason}")
+            }
+            ComputeRailOutcome::ProviderDeclined(decline) => {
+                panic!("the canonical provider declined grid {grid:?}: {decline}")
+            }
+        }
+    }
+}
+
 /// Gate 2 writeback discipline (`research/docs/20` §3.3): the guest write channel
 /// moves exactly the interval its producer named — byte-for-byte and page-for-page
 /// — rather than assuming the whole staged buffer was written.

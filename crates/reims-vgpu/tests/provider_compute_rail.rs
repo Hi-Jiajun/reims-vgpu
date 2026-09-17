@@ -43,7 +43,11 @@ fn mul3add1_request() -> ComputeRequest {
             regions: vec![ComputeDispatchRegion {
                 local_size: [4, 1, 1],
                 group_count: [1, 1, 1],
-                push_constants: [0; 12],
+                // The payload the translator derives for this launch: four
+                // threads in 4-wide groups, no region base, one threadgroup.
+                // The rail verifies it against its own plan, so a placeholder
+                // would keep the shape on the engine.
+                push_constants: [4, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1],
             }],
         },
         storage_buffers: vec![ComputeBufferResource {
@@ -66,8 +70,23 @@ fn fixture_air() -> Vec<u8> {
         .to_vec()
 }
 
+/// The owner rail's ledger and registrations are process-global, so a test
+/// that resets them (`provider_owner::reset()`, at the end of the tests that
+/// register) would otherwise refuse a lease another test had in flight — the
+/// two would be sharing one ledger by accident. Every test here that submits
+/// through the rail or plans an owner lease takes this lock, which is what
+/// makes them independent without also making them serial by construction.
+static OWNER_RAIL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn owner_rail_guard() -> std::sync::MutexGuard<'static, ()> {
+    OWNER_RAIL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn the_production_seam_submits_the_reviewed_fixture_through_the_canonical_provider() {
+    let _guard = owner_rail_guard();
     let air = fixture_air();
     let request = mul3add1_request();
     // `apv_cs` is the AIR entry point this fixture's kernel metadata names;
@@ -100,6 +119,7 @@ fn the_production_seam_submits_the_reviewed_fixture_through_the_canonical_provid
 
 #[test]
 fn out_of_class_shapes_stay_on_the_self_contained_engine() {
+    let _guard = owner_rail_guard();
     let air = fixture_air();
 
     let mut whole_workgroups = mul3add1_request();
@@ -126,6 +146,7 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
 /// seam could only notice after the provider had already run).
 #[test]
 fn a_staged_binding_the_canonical_contract_does_not_name_stays_on_the_engine() {
+    let _guard = owner_rail_guard();
     let air = fixture_air();
 
     let mut extra = mul3add1_request();
@@ -162,6 +183,7 @@ fn a_staged_binding_the_canonical_contract_does_not_name_stays_on_the_engine() {
 /// self-contained engine.
 #[test]
 fn an_in_class_shape_the_provider_refuses_is_a_typed_decline() {
+    let _guard = owner_rail_guard();
     let air = fixture_air();
     let mut short = mul3add1_request();
     // The kernel's four threads reach 4 × 4 bytes; staging one word makes the
@@ -197,6 +219,7 @@ fn an_in_class_shape_the_provider_refuses_is_a_typed_decline() {
 /// by the first entry's cached pipeline.
 #[test]
 fn a_second_entry_over_the_same_air_does_not_hit_the_cached_pipeline() {
+    let _guard = owner_rail_guard();
     let air = fixture_air();
     let request = mul3add1_request();
     assert!(
@@ -239,6 +262,7 @@ fn a_second_entry_over_the_same_air_does_not_hit_the_cached_pipeline() {
 /// behind the ledger's back.
 #[test]
 fn an_aborted_settle_keeps_a_lease_the_owner_ledger_still_holds() {
+    let _guard = owner_rail_guard();
     let executor = VulkanExecutor::new().expect("a Vulkan executor");
     let provider = VulkanComputeProvider::with_executor(executor).expect("provider");
     let bytes = vec![0xA5u8; 64];
@@ -333,6 +357,45 @@ fn input_words(words: [u32; 4]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
+/// One request whose dispatch is exactly the translator's own decomposition of
+/// `grid` threads in `local`-sized threadgroups: the shape the production seam
+/// builds in `runtime/compute_exec/vulkan.rs::kernel_dispatch_launch`, plan and
+/// payloads included. This is the stimulus the widened class admits — the rail
+/// verifies the region list against the same planner, so a hand-written
+/// decomposition would not do.
+fn request_of_launch(grid: [u32; 3], local: [u32; 3], words: &[u32]) -> (ComputeRequest, usize) {
+    let plan = metal2vulkan::reflect::KernelDispatch::ThreadsDynamic { offset: 0 }
+        .plan(local, Some(grid))
+        .expect("an exact-thread launch plans its regions");
+    let input: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let request = ComputeRequest {
+        spirv: Vec::new(),
+        entry: "main".into(),
+        dispatch: ComputeDispatch::Regions {
+            push_offset: 0,
+            threadgroups_per_grid: plan.threadgroups_per_grid,
+            regions: plan
+                .regions
+                .iter()
+                .map(|region| ComputeDispatchRegion {
+                    local_size: region.local_size,
+                    group_count: region.group_count,
+                    push_constants: plan.push_constants(*region),
+                })
+                .collect(),
+        },
+        storage_buffers: vec![ComputeBufferResource {
+            binding: 0,
+            bytes: input,
+            writable: true,
+        }],
+        sampled_images: Vec::new(),
+        samplers: Vec::new(),
+        storage_images: Vec::new(),
+    };
+    (request, plan.regions.len())
+}
+
 fn readback_words(out: &[u8]) -> Vec<u32> {
     out.chunks(4)
         .map(|word| u32::from_le_bytes(word.try_into().expect("4-byte chunk")))
@@ -351,6 +414,7 @@ fn readback_words(out: &[u8]) -> Vec<u32> {
 /// whole lease lifecycle are the shipped ones.
 #[test]
 fn a_registered_guest_window_is_imported_without_copying_and_released_after_completion() {
+    let _guard = owner_rail_guard();
     let alignment = host_import_alignment().expect("the provider rail");
     assert!(
         alignment > 0,
@@ -471,11 +535,193 @@ fn a_registered_guest_window_is_imported_without_copying_and_released_after_comp
     provider_owner::reset();
 }
 
+/// A launch whose thread grid is not a multiple of its threadgroup is *one*
+/// Metal `dispatchThreads` that the device tiles into several regions, and the
+/// canonical trace spells it as one `ThreadsExact` pass carrying the launch's
+/// own `(grid, local)`. The provider re-derives the regions, and the readback
+/// proves the derivation is the request's: the slab's threads run at their
+/// launch offsets (words 5 and 6), not renumbered from zero — which is exactly
+/// what spelling the slab as its own pass would have produced.
+#[test]
+fn a_partial_threadgroup_launch_reaches_the_provider_as_one_threads_exact_pass() {
+    let _guard = owner_rail_guard();
+    let air = fixture_air();
+    let (request, regions) = request_of_launch([6, 1, 1], [4, 1, 1], &[1, 2, 3, 4, 5, 6]);
+    assert_eq!(
+        regions, 2,
+        "6 threads in 4-wide groups tile into two regions"
+    );
+
+    match submit_compute(&air, "apv_cs", &request, &[]) {
+        ComputeRailOutcome::ProviderCompleted(out) => {
+            assert_eq!(out.images.len(), 0, "the narrow class carries no images");
+            assert_eq!(out.writebacks.len(), 1, "one writable binding readback");
+            let writeback = &out.writebacks[0];
+            assert_eq!(writeback.binding, 0);
+            assert_eq!(writeback.offset, 0);
+            assert_eq!(
+                readback_words(&writeback.bytes),
+                vec![4, 7, 10, 13, 16, 19],
+                "the interior's four threads and the slab's two each ran at their \
+                 launch offsets: the slab is words 5 and 6 (16 and 19), not a \
+                 renumbered 4 and 7"
+            );
+        }
+        ComputeRailOutcome::NotInNarrowClass(reason) => {
+            panic!("a partial-threadgroup launch is in the widened class; refused: {reason}")
+        }
+        ComputeRailOutcome::ProviderDeclined(decline) => {
+            panic!("the canonical provider declined the tiled launch: {decline}")
+        }
+    }
+}
+
+/// Submission order is the ordering the narrow class has — and the ordering it
+/// can promise. The regions of one tiled launch are *one* Metal
+/// `dispatchThreads`, and both rails say so: the engine's own compute path
+/// documents that no barrier separates the regions and that its "threads have
+/// no ordering among themselves", and the provider's executor loops the same
+/// way inside a pass. So the falsifiable claim here is the one the guest can
+/// actually depend on: a *later* submission reads the bytes an earlier one
+/// wrote, tiled launch after tiled launch.
+#[test]
+fn a_second_tiled_submission_reads_the_first_one_s_writeback() {
+    let _guard = owner_rail_guard();
+    let air = fixture_air();
+    let mut words = vec![1u32, 2, 3, 4, 5, 6];
+    for expected in [vec![4u32, 7, 10, 13, 16, 19], vec![13, 22, 31, 40, 49, 58]] {
+        let (request, regions) = request_of_launch([6, 1, 1], [4, 1, 1], &words);
+        assert_eq!(regions, 2, "each submission tiles the same way");
+        match submit_compute(&air, "apv_cs", &request, &[]) {
+            ComputeRailOutcome::ProviderCompleted(out) => {
+                words = readback_words(&out.writebacks[0].bytes);
+                assert_eq!(
+                    words, expected,
+                    "the second submission's input is the first one's writeback"
+                );
+            }
+            ComputeRailOutcome::NotInNarrowClass(reason) => {
+                panic!("a partial-threadgroup launch is in the widened class; refused: {reason}")
+            }
+            ComputeRailOutcome::ProviderDeclined(decline) => {
+                panic!("the canonical provider declined the tiled launch: {decline}")
+            }
+        }
+    }
+}
+
+/// The counterexample half of the widening: a region list the translator would
+/// not derive from one exact-thread launch keeps the engine — the whole
+/// launch, not just the offending region — and the provider is never handed
+/// the shape.
+///
+/// The window is the evidence that "never handed" is causal rather than
+/// bookkeeping: the same registration and the same request submit a valid
+/// tiled launch that the device writes *in place* (the borrowed channel), while
+/// the corrupted request leaves every byte of that owner memory alone even
+/// though a provider that had run would have written into it.
+#[test]
+fn a_region_list_the_translator_would_not_derive_never_reaches_the_provider() {
+    let _guard = owner_rail_guard();
+    let alignment = host_import_alignment().expect("the provider rail");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the owner channel"
+    );
+    let page = usize::try_from(alignment).expect("alignment fits usize");
+    let mut owner = AlignedBuffer::new(page, page);
+    let input = [1u32, 2, 3, 4, 5, 6]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<u8>>();
+    owner.as_mut_slice().fill(0xA5);
+    owner.as_mut_slice()[..input.len()].copy_from_slice(&input);
+
+    let import = 0x5eed_6a11_u64;
+    provider_owner::register(Region {
+        import,
+        epoch: 1,
+        host_pointer: owner.as_ptr() as usize,
+        length: page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x20_0000),
+    })
+    .expect("a page-aligned, page-sized registration is a legal provider region");
+    let window = Window {
+        binding: 0,
+        import,
+        host_va: owner.as_ptr() as u64,
+        length: page as u64,
+        head: 0,
+        bytes_len: input.len() as u64,
+    };
+    let air = fixture_air();
+
+    // Positive control on this very registration: the valid tiled launch does
+    // write through the window, so "the bytes are still the input" below is
+    // evidence about the rail and not about an inert setup.
+    let (valid, _) = request_of_launch([6, 1, 1], [4, 1, 1], &[1, 2, 3, 4, 5, 6]);
+    match submit_compute(&air, "apv_cs", &valid, &[window]) {
+        ComputeRailOutcome::ProviderCompleted(out) => assert_eq!(
+            readback_words(&out.writebacks[0].bytes),
+            vec![4u32, 7, 10, 13, 16, 19]
+        ),
+        ComputeRailOutcome::NotInNarrowClass(reason) => {
+            panic!("a partial-threadgroup launch is in the widened class; refused: {reason}")
+        }
+        ComputeRailOutcome::ProviderDeclined(decline) => {
+            panic!("the canonical provider declined the tiled launch: {decline}")
+        }
+    }
+    assert_eq!(
+        readback_words(&owner.as_slice()[..input.len()]),
+        vec![4u32, 7, 10, 13, 16, 19],
+        "the owner mapping itself carries the result before the corruption"
+    );
+
+    // Restore the input, then corrupt the decomposition: the slab's payload
+    // claims its threads start at zero, which is a list the planner would not
+    // derive for this launch.
+    owner.as_mut_slice()[..input.len()].copy_from_slice(&input);
+    let (mut corrupted, _) = request_of_launch([6, 1, 1], [4, 1, 1], &[1, 2, 3, 4, 5, 6]);
+    let ComputeDispatch::Regions { regions, .. } = &mut corrupted.dispatch else {
+        panic!("the tiled launch is a regions dispatch");
+    };
+    regions[1].push_constants[3] = 0;
+    match submit_compute(&air, "apv_cs", &corrupted, &[window]) {
+        ComputeRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason,
+            "a region list the translator would not derive from one exact-thread launch \
+             stays on the self-contained engine",
+            "the whole launch keeps the engine"
+        ),
+        ComputeRailOutcome::ProviderCompleted(_) => {
+            panic!("a region list outside the class must not reach the provider")
+        }
+        ComputeRailOutcome::ProviderDeclined(decline) => {
+            panic!("out-of-class shapes fall back to the engine, not to a decline: {decline}")
+        }
+    }
+    assert_eq!(
+        &owner.as_slice()[..input.len()],
+        input.as_slice(),
+        "the provider never ran over the window: every byte is the input again"
+    );
+    assert!(
+        owner.as_slice()[input.len()..]
+            .iter()
+            .all(|byte| *byte == 0xA5),
+        "and nothing else in the registration moved either"
+    );
+    provider_owner::reset();
+}
+
 /// A lease from a previous device incarnation is refused by the provider, and
 /// the refusal is a typed decline on reims' own vocabulary — never a silent
 /// re-run on another rail.
 #[test]
 fn a_lease_from_a_previous_incarnation_is_refused_by_the_provider() {
+    let _guard = owner_rail_guard();
     let executor = VulkanExecutor::new().expect("a Vulkan executor");
     let provider = VulkanComputeProvider::with_executor(executor).expect("provider");
     let current = provider.device_epoch().get();
