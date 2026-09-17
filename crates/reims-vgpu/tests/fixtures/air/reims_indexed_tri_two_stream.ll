@@ -16,10 +16,11 @@
 ; is what a Metal module compiled with the default (fast) math mode carries: the
 ; translator revision the canonical provider pins decorates a float result with
 ; `FPFastMathMode` whenever the source instruction *withholds* a permission, and
-; that decoration demands `FloatControls2` + `SPV_KHR_float_controls2`, neither
-; of which the provider's Phase-1 capability subset admits. Without the flag run
-; this module is refused at translation — a typed decline, not a fallback — which
-; is the boundary the increment's report records beside this file.
+; that decoration demands `FloatControls2` + `SPV_KHR_float_controls2`. The
+; capability is answered by the executing device (R8) and the rail's translation
+; takes that answer (R8b), so this module translates on every device while its
+; `..._precise.air` twin translates exactly where the device answers for the
+; capability.
 ;
 ; The offset is what makes the second stream falsifiable: the shader adds it to
 ; the position, so a rail that dropped it, or bound the first stream's bytes

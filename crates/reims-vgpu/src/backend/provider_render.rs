@@ -1610,6 +1610,18 @@ fn register_render_pipeline(
     if let Some(pipeline) = pipelines.get(&key) {
         return Ok(pipeline.clone());
     }
+    // The device's own capability answer, not the translation entry point's
+    // Phase-1 default: both stages are registered against the very device this
+    // provider answers for, so a module the device stated it can execute has to
+    // survive translation here too. R8 made the capability device-answered
+    // (`FloatControls2` + `SPV_KHR_float_controls2`, admitted only by the
+    // extension-and-feature conjunction) and R8b adopts that answer on this
+    // seam: before it, a vertex stage whose floating-point operation withholds
+    // a fast-math permission was refused by the Phase-1 default even on a
+    // device that answered for the capability. A device without the feature
+    // derives the Phase-1 policy, so its refusal text stays byte for byte what
+    // it was.
+    let policy = provider.spirv_feature_policy();
     let stage = |air: &[u8], entry: &str, which: &'static str, stage| {
         let function = device
             .new_library_with_binary_air(air.to_vec())
@@ -1622,7 +1634,7 @@ fn register_render_pipeline(
                 step: which,
                 detail: error.to_string(),
             })?;
-        TranslatedRenderStage::translate(stage, &function).map_err(|error| {
+        TranslatedRenderStage::translate_with_policy(stage, &function, policy).map_err(|error| {
             ProviderRenderDecline::PipelineCompile {
                 step: which,
                 detail: error.to_string(),

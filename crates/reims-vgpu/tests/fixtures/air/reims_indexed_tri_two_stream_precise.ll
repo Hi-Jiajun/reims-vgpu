@@ -2,14 +2,17 @@
 ; from its add — the shape a Metal module compiled for `precise` arithmetic (or
 ; any module whose instruction withholds a floating-point permission) carries.
 ;
-; It exists to witness a boundary rather than to be drawn: the translator
-; revision the canonical provider pins decorates a float result with
-; `FPFastMathMode` whenever the source instruction withholds a permission, and
-; that decoration demands `FloatControls2` + `SPV_KHR_float_controls2`, neither
-; of which the provider's Phase-1 capability subset admits. The rail answers
-; such a shape with a *typed decline* rather than a silent fallback, which is
-; what `a_float_op_that_withholds_a_permission_is_a_typed_decline` beside it
-; asserts (the increment's report records the finding and its follow-up).
+; It is drawn, and it is the pair's falsifiable half: the translator revision
+; the canonical provider pins decorates a float result with `FPFastMathMode`
+; whenever the source instruction withholds a permission, and that decoration
+; demands `FloatControls2` + `SPV_KHR_float_controls2`. The capability is
+; answered by the executing device (R8) and the rail's translation takes that
+; answer (R8b), so this module executes on a device that answers for it — and has
+; to land exactly the `fast` twin's bytes. A device without the feature still
+; refuses it with the same typed decline R6 recorded:
+; `a_float_op_that_withholds_a_permission_lands_the_fast_twins_bytes` and
+; `a_device_without_the_feature_still_refuses_the_withheld_permission_module`
+; assert the two arms.
 ;
 ; `reims_indexed_tri_two_stream_precise.air` is `llvm-as` output of this file:
 ;

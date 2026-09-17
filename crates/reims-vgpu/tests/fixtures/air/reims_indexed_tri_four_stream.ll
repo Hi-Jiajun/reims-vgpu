@@ -8,7 +8,8 @@
 ; this file draw the shape and then zero one stream's value at a time, and every
 ; move lands a different frame. The `fast` flag runs on the adds for the reason
 ; the two-stream fixture beside this one states — a withheld permission turns
-; the module into one the canonical provider's capability subset refuses.
+; the module into one whose admission is the executing device's own answer
+; (R8/R8b), which is why the fast runs stay.
 ;
 ; `reims_indexed_tri_four_stream.air` is `llvm-as` output of this file:
 ;

@@ -22,7 +22,10 @@
 #![cfg(feature = "provider-render")]
 
 use metal_api_core::provider::{AttachmentFormat, ComputeProvider, VertexFormat};
-use metal_api_vulkan::{VulkanComputeProvider, VulkanExecutor};
+use metal_api_core::{ComputeExecutor, Device};
+use metal_api_vulkan::{
+    RenderStage, SpirvFeaturePolicy, TranslatedRenderStage, VulkanComputeProvider, VulkanExecutor,
+};
 use reims_vgpu::backend::provider_render::{
     self, ProviderRenderDecline, RenderChainRole, RenderRailInputs, RenderRailOutcome,
 };
@@ -259,11 +262,15 @@ fn position_streams() -> [StreamSpec; 1] {
 /// One stream of the multi-stream shapes: `float2` records at `location`, stride
 /// eight.
 ///
-/// The fixtures behind these streams assemble their clip position by extraction
-/// and insertion rather than by arithmetic — the canonical provider's translator
-/// revision asks for `FloatControls2` on every floating-point operation and its
-/// capability subset refuses it, so a shader with an `fadd` in it never reaches
-/// this rail at all (the increment's report records that finding).
+/// The fixtures behind these streams add the offset streams into the position
+/// with `fadd fast` — the flag run a Metal module compiled with the default math
+/// mode carries, and the reason the fast twins keep translating on every device.
+/// A module whose add *withholds* the permission is admitted exactly when the
+/// device answers for `FloatControls2` (R8 in the emulator, adopted on this seam
+/// by R8b, `a_float_op_that_withholds_a_permission_lands_the_fast_twins_bytes`).
+/// The offsets the tests hand these streams are exact binary fractions, so the
+/// two rails' own arithmetic rounds them the same way and parity stays an
+/// assertion about stream plumbing.
 fn stream(location: u32, records: &[(f32, f32)]) -> StreamSpec {
     StreamSpec {
         location,
@@ -1680,74 +1687,152 @@ fn the_widening_splits_are_counted_under_their_own_names() {
     );
 }
 
-/// A boundary this widening measured, pinned where it was found.
+/// The boundary R6 measured, now closed on this seam by adopting the device's
+/// own capability answer (R8b).
 ///
-/// The rail's promise is that everything it admits is a shape the provider
-/// *executes*, and that a shape the provider refuses ends the draw rather than
-/// silently falling back. There is one class of shape the gate cannot answer
-/// before the provider does, because the condition is a property of the
-/// translation rather than of the request: a vertex stage whose floating-point
-/// operation *withholds* a fast-math permission is decorated `FPFastMathMode` by
-/// the translator revision the canonical provider pins, which demands
-/// `FloatControls2` + `SPV_KHR_float_controls2` — neither of which the provider's
-/// Phase-1 capability subset admits. The two-stream fixture beside this test
-/// carries the `fast` flag run a Metal module compiled with the default math mode
-/// carries and executes; this one, the same module without it, is refused.
+/// R6 pinned where the rail *found* the boundary rather than pinning the
+/// limitation: a vertex stage whose floating-point operation *withholds* a
+/// fast-math permission is decorated `FPFastMathMode` by the translator
+/// revision the canonical provider pins, which demands `FloatControls2` +
+/// `SPV_KHR_float_controls2`. The seam translated the stages through the
+/// translation entry point's Phase-1 default, so the module was refused with a
+/// typed decline even though the condition is a property of the translation and
+/// not of the request. The emulator answered the capability from the selected
+/// device (R8: the extension *and* the feature bit, nothing else), and this seam
+/// now translates with that answer (`provider.spirv_feature_policy()`), so the
+/// same fixture has to *execute*.
 ///
-/// The assertions below pin the *boundary's shape* and not the limitation as a
-/// requirement: `ProviderDeclined` is the fail-closed answer (the draw ends, the
-/// engine is not run behind the guest's back), the decline names the provider
-/// step that refused, and its detail carries the provider's own words. A
-/// translator pin or capability-gate change that admits this module will fail
-/// this test — which is the point of writing it down: the increment's report
-/// names the follow-up rather than leaving the boundary to be rediscovered.
+/// What it has to land is the `fast` twin's own bytes: the withheld permission
+/// must not change the drawn frame, only the module's capability set. The
+/// request is the one R6 used — the second stream's offset is `(0.25, 0)`, so
+/// the triangle's left edge sits at `-0.25` and the attachment's left column
+/// keeps the clear sentinel while the right column carries the fragment's own
+/// texel. A rail that dropped the withheld-permission module cannot pass by
+/// drawing the reviewed frame either, because the twin's frame and the reviewed
+/// frame differ (the offset shifts the covered columns).
+///
+/// The fail-closed arm R6 wrote is not deleted, it moved to its own test beside
+/// this one: `a_device_without_the_feature_still_refuses_the_withheld_permission_module`
+/// hands the translator the Phase-1 policy a device without the feature
+/// derives, whatever this machine's device answers.
 #[test]
-fn a_float_op_that_withholds_a_permission_is_a_typed_decline() {
+fn a_float_op_that_withholds_a_permission_lands_the_fast_twins_bytes() {
     let _guard = engine_test_session();
-    let stages = stages(
+    let fast = two_stream_stages();
+    let precise = stages(
         "reims_indexed_tri_two_stream_precise.air",
         "reims_two_stream_vertex",
         &[0, 1],
     );
+    let (width, height) = extent();
     let req = request_with_streams(
         MTL_FORMAT_RGBA8_UNORM,
         &[position_stream(), stream(1, &[(0.25, 0.0); 3])],
     );
-    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
-        RenderRailOutcome::ProviderDeclined(decline) => {
-            // The reading, beside the assertions: the provider's own words are
-            // what a reader compares against the day this boundary moves.
-            eprintln!(
-                "withheld float permission: slug={} fields={:?}",
-                decline.slug(),
-                decline.fields()
-            );
-            assert_eq!(
-                decline.slug(),
-                "pipeline_compile",
-                "the refusal is the translation step's own class: {decline}"
-            );
-            let fields = decline.fields();
-            assert!(
-                fields
-                    .iter()
-                    .any(|(key, value)| *key == "step" && value == "vertex_stage"),
-                "the refusal names which stage refused: {fields:?}"
-            );
-            assert!(
-                fields
-                    .iter()
-                    .any(|(key, value)| *key == "detail" && value.contains("Phase 1 subset")),
-                "the provider's own words ride along: {fields:?}"
-            );
-        }
-        RenderRailOutcome::ProviderCompleted(_) => panic!(
-            "the canonical provider executed a module its capability subset refuses: the boundary \
-             this test pins has moved, and the fixtures' own comment says so"
+    let reviewed_req = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[position_stream(), stream(1, &[(0.0, 0.0); 3])],
+    );
+
+    let fast_pixels = provider_pixels("fast twin", &fast, &req);
+    let precise_pixels = provider_pixels("withheld float permission", &precise, &req);
+    let reviewed_pixels = provider_pixels(
+        "withheld float permission, zero offset",
+        &precise,
+        &reviewed_req,
+    );
+    // The reading, beside the assertions: the frame this module lands is what a
+    // reader compares against the day the translator's decoration moves again.
+    eprintln!(
+        "withheld-permission module landed [{}] texels, left column {:02x?}, right column {:02x?}",
+        precise_pixels.len() / 4,
+        texel_at(&precise_pixels, 0, 0),
+        texel_at(&precise_pixels, width - 1, 0)
+    );
+    assert_texel_count("withheld float permission", &precise_pixels);
+    for row in [0, height / 2, height - 1] {
+        assert_clear_texel(
+            &format!("withheld permission: texel (0, {row})"),
+            texel_at(&precise_pixels, 0, row),
+        );
+    }
+    assert_texel_near(
+        "withheld permission: texel (width - 1, 0)",
+        texel_at(&precise_pixels, width - 1, 0),
+        FRAGMENT_TEXEL,
+    );
+    assert_ne!(
+        precise_pixels, reviewed_pixels,
+        "the second stream's offset has to reach the drawn frame: without it the frame is the \
+         reviewed one, which is what a rail that dropped the offset stream would land"
+    );
+    assert_eq!(
+        precise_pixels, fast_pixels,
+        "the withheld permission must not change the drawn bytes: the module has to land exactly \
+         what its `fast` twin lands"
+    );
+    let Some(engine_frame) = engine_pixels("withheld float permission", &precise, req) else {
+        return;
+    };
+    assert_eq!(
+        precise_pixels, engine_frame,
+        "the withheld-permission module, drawn by the canonical provider and by the \
+         self-contained engine, has to land the same bytes"
+    );
+}
+
+/// R8b's fail-closed arm, simulated rather than deleted: a device that reports
+/// no `shaderFloatControls2` still gets the sentence R6 recorded.
+///
+/// The acceptance environment's device (Lavapipe) answers for the capability,
+/// so this test does not wait for a no-feature device: it hands the translator
+/// exactly the policy such a device derives — `SpirvFeaturePolicy::PHASE1`,
+/// which is what `FloatControls2Support::policy()` returns while the extension
+/// name or the feature bit is missing — and asserts the refusal is still the
+/// *translation*'s own, capability number and subset sentence included. The
+/// same module under this device's own answer has to translate instead, so the
+/// test separates the two arms the way the rail does rather than only checking
+/// that a refusal exists.
+#[test]
+fn a_device_without_the_feature_still_refuses_the_withheld_permission_module() {
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let device =
+        Device::new(std::sync::Arc::clone(&executor) as std::sync::Arc<dyn ComputeExecutor>);
+    let function = device
+        .new_library_with_binary_air(fixture("reims_indexed_tri_two_stream_precise.air"))
+        .expect("the precise fixture is a binary AIR module")
+        .function("reims_two_stream_vertex")
+        .expect("the fixture's entry exists");
+    let error = match TranslatedRenderStage::translate_with_policy(
+        RenderStage::Vertex,
+        &function,
+        SpirvFeaturePolicy::PHASE1,
+    ) {
+        Ok(_) => panic!("a device that does not answer for FloatControls2 refuses the module"),
+        Err(error) => error,
+    };
+    let text = error.to_string();
+    eprintln!("no-feature device refusal: {text}");
+    assert!(
+        text.contains("capability 6029"),
+        "the refusal keeps the capability number R6 recorded: {text}"
+    );
+    assert!(
+        text.contains("Phase 1 subset"),
+        "the refusal keeps the translation's own sentence R6 recorded: {text}"
+    );
+
+    let provider = VulkanComputeProvider::with_executor(std::sync::Arc::clone(&executor))
+        .expect("the canonical provider builds");
+    let policy = provider.spirv_feature_policy();
+    match TranslatedRenderStage::translate_with_policy(RenderStage::Vertex, &function, policy) {
+        Ok(_) => assert!(
+            policy.float_controls2(),
+            "the device did not answer for FloatControls2 and the module translated anyway"
         ),
-        RenderRailOutcome::NotInNarrowClass(reason) => panic!(
-            "a withheld float permission is the translation's condition and not the gate's; a \
-             class answer here means the gate learned something this test does not know: {reason}"
+        Err(error) => assert!(
+            !policy.float_controls2(),
+            "the device answered for FloatControls2 and the module still failed: {error}"
         ),
     }
 }
