@@ -15662,9 +15662,9 @@ mod provider_span_pixels_tests {
     #[test]
     fn a_wide_frame_is_narrowed_under_the_engines_own_name() {
         let before = crate::runtime::drain::store_route_count_for_test("target_read_narrowed");
-        // 0.2509765625, 0.501953125, 0.7490234375, 1.0 — the halves of the
-        // fixture fragment's `64/255, 128/255, 191/255, 1` outputs as Lavapipe
-        // rounds them (`research/docs/23` §78's own reading).
+        // 0.2509765625, 0.501953125, 0.7490234375, 1.0 — the halves a driver
+        // makes of `64/255, 128/255, 191/255, 1`, which is the reading the E
+        // side's §78 device test publishes for the same texel.
         let (bytes, order) = provider_span_pixels(
             &request(MTL_FORMAT_RGBA16_FLOAT, 1, 1),
             RenderRailOutput {
