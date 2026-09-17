@@ -6155,6 +6155,405 @@ fn a_vertex_stream_shared_by_two_attributes_reads_its_guest_window_without_a_cop
     );
 }
 
+/// R11: the draw's *index* stream, resolved by the draw path through the
+/// zero-copy rail, leaves for the canonical provider as the guest RAM window
+/// its bind was cut from — not as a copy, and not as a refusal.
+///
+/// Census v9 (`evidence/gate3-census-v9-2026-09-17/`) is the reading this
+/// increment answers: once R10's sampling declarations opened, the
+/// second-largest first failure of the boot's 90618 seam rows was
+/// `render_provider_out_of_class_index_staging` — 25489 rows, 28.1% — because
+/// the class's index arm was `staged_bytes` only. A real boot resolves an
+/// indexed draw's buffer through the same zero-copy rail as its vertex streams
+/// (`runtime/draw/vulkan.rs`'s `load_index_content_reason` →
+/// `load_buffer_content_resolved`, both with the zero-copy rail allowed), so
+/// those draws arrived as `BufferContent::GuestRuns` and had no source this
+/// rail could state.
+///
+/// This test drives that shape with the index bytes in a registered host
+/// mapping, so every fact is checkable at once: the draw reaches the provider,
+/// the wire's index view names the borrowed arm, the provider's frame reads the
+/// owner's own mapping (moving it moves the frame), and the frame is
+/// byte-identical to the engine's for the same request and the same bytes.
+#[test]
+fn an_index_stream_in_a_registered_window_leaves_without_a_copy() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the no-copy arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    // Two granules: the three indices live in the first, so the window the
+    // ledger derives is a real sub-range of an imported block rather than the
+    // block itself.
+    let mut owner = AlignedHost::new(2 * page, page);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let guest = || {
+        let anchor = import
+            .slice(0, page as u64)
+            .expect("the first granule is inside the import");
+        GuestRef::new(std::sync::Arc::clone(&import), anchor)
+            .expect("the slice came from this import")
+    };
+    let import_id = import.id().get();
+    let base = owner.pointer as usize;
+    // The index bytes the draw reads, written into the owner's own mapping:
+    // the reviewed shape's own `[0, 1, 2]`, so the frame the provider lands has
+    // to be the frame the engine draws from the same request and the same
+    // bytes.
+    owner.as_mut_slice()[..INDEX_BYTES.len()].copy_from_slice(&INDEX_BYTES);
+    // The provider-shaped window the registration ledger would derive for the
+    // draw's index bind: the granule its bytes were cut from.
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: base as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // The index bind as the draw path builds it: one host run over the owner's
+    // mapping, the three `u32` indices at its start, and the window the ledger
+    // derived on the run. Nothing here reads the mapping — the engine arm below
+    // reads it through the run, and the provider arm through the lease.
+    let indices = || engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            base,
+            2 * page as u64,
+            0,
+            INDEX_BYTES.len() as u64,
+        )
+        .expect("the bind's own bytes are inside the mapping")]),
+        source_offset: 0,
+        total_len: INDEX_BYTES.len() as u64,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+            window_offset: 0,
+            guest: guest(),
+            window: Some(registered),
+        }])),
+        direct_image: None,
+    };
+    let request = |source: &engine::GuestRunSource| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.indexed = Some(IndexedDrawResource {
+            index_type: IndexType::U32,
+            index_count: 3,
+            vertex_offset: 0,
+            content: BufferContent::GuestRuns(source.clone()),
+        });
+        req
+    };
+    // The engine's own frame for the same request, before anything is
+    // registered on the owner rail: the engine's device context is created
+    // lazily on its first draw, and that creation resets the owner rail (the
+    // imports die with the device it builds), so the registration below has to
+    // follow it.
+    let Some(engine_frame) = engine_pixels("index window", &stages, request(&indices())) else {
+        return;
+    };
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: base,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let log_before = std::fs::read_to_string(reims_vgpu_observe::fail_log_path())
+        .unwrap_or_default()
+        .len();
+    let frame = |label: &str| -> Vec<u8> {
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(&indices()),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: a draw whose index stream lives in a guest RAM window leaves for the \
+                 provider: {other:?}"
+            ),
+        }
+    };
+
+    // The frame the seam encodes for this shape, held so the provider's own
+    // decoder can be asked what crossed the owner→provider wire.
+    use reims_vgpu::backend::provider_wire;
+
+    provider_wire::capture_submission_frames(true);
+    let frames_before = provider_wire::wire_counts();
+    let delivered = provider_render::provider_submissions();
+    let reviewed = frame("guest index window");
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    eprintln!(
+        "guest index window draw: provider submissions {delivered} -> {}, texel (0, 0) {:?}, \
+         host-import alignment {alignment}, window {page} byte(s) of registration {import_id}",
+        provider_render::provider_submissions(),
+        texel_at(&reviewed, 0, 0),
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census shape reaches the canonical provider instead of the engine"
+    );
+    assert_solid("guest index window", &reviewed);
+    // The frame crossed the owner→provider wire on the plan's own rule — a
+    // window-backed index bind is a leasing submission even with no stage
+    // buffer declaration and no vertex window — and the provider's decoder
+    // reads the index view back as the borrowed arm.
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        frames_before.submit_frames + 1,
+        "the seam produced exactly one submission frame for the window-backed draw"
+    );
+    assert_eq!(frames.len(), 1, "and the capture holds it");
+    let (wire_trace, _wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let wire_pass = wire_trace
+        .passes
+        .iter()
+        .find_map(|pass| pass.as_render())
+        .expect("the frame carries the render pass");
+    let index_view = wire_pass
+        .indices
+        .as_ref()
+        .expect("the frame carries the index binding");
+    let source = match &index_view.view.source {
+        BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
+        BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
+        BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+    };
+    eprintln!(
+        "wire index view: binding={} offset={} length={} source={source}",
+        index_view.view.metal_binding, index_view.view.offset, index_view.view.length,
+    );
+    assert!(
+        matches!(index_view.view.source, BufferSource::BorrowedNoCopy(_)),
+        "the index stream crosses the wire as the owner's own mapping"
+    );
+    assert_eq!(
+        index_view.view.length,
+        INDEX_BYTES.len() as u64,
+        "the view is the bind's own three indices, not the whole granule"
+    );
+
+    // The lease row, verbatim: the arm this draw's index bytes left through.
+    // The label is the index stream's own namespace (`0x30000`), which is how
+    // the plan found the view it minted for this bind.
+    let log = std::fs::read_to_string(reims_vgpu_observe::fail_log_path()).expect("fail log");
+    let fresh = &log[log_before.min(log.len())..];
+    let lease = fresh
+        .lines()
+        .find(|line| line.contains("provider_owner_lease") && line.contains("no_copy=1"))
+        .unwrap_or_else(|| panic!("the borrowed lease row was emitted: {fresh}"));
+    eprintln!("lease row: {lease}");
+    assert!(
+        lease.contains("channel=borrowed")
+            && lease.contains(&format!("import={import_id}"))
+            && lease.contains("binding=196608"),
+        "the row names the no-copy arm, this import and the index stream's own label: {lease}"
+    );
+    assert_frames_equal("guest index window, both rails", &reviewed, &engine_frame);
+
+    // The falsifiable half: rewrite the owner's own mapping, with nothing else
+    // touched. Every index becomes zero, both triangles degenerate and the
+    // attachment keeps the clear's bytes wherever the quad would have covered —
+    // a rail that had copied the indices into its own trace would be unmoved by
+    // this.
+    owner.as_mut_slice()[..INDEX_BYTES.len()].fill(0);
+    let degenerated = frame("guest index window, indices rewritten to zero");
+    let (width, _) = extent();
+    eprintln!(
+        "provider texel after the owner's index bytes became zeros: {:?}",
+        texel_at(&degenerated, 0, 0),
+    );
+    assert_clear_texel(
+        "degenerated window indices: texel (0, 0)",
+        texel_at(&degenerated, 0, 0),
+    );
+    assert_clear_texel(
+        "degenerated window indices: texel (width - 1, 0)",
+        texel_at(&degenerated, width - 1, 0),
+    );
+    assert_frames_differ(
+        "the owner's own index bytes reach the provider's frame",
+        &reviewed,
+        &degenerated,
+    );
+}
+
+/// R11's refusal half: an index gather the seam cannot cut one registered
+/// window from stays on the engine, each under the bucket its own fact names.
+///
+/// The same three shapes R9q's refusal half drives for a vertex stream, on the
+/// arm this increment moved: bytes scattered over more than one run, a run
+/// whose import the registration ledger never registered, and a bind whose
+/// `source_offset` leaves the view's own host pointer off the device's import
+/// granule. The first two answer
+/// `render_provider_out_of_class_index_staging` — the bucket every index
+/// gather answered with before this increment — and the third answers
+/// `render_provider_out_of_class_index_alignment`, because the canonical rail
+/// refuses an unaligned import by name and a declined draw is not a fallback.
+#[test]
+fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "the refusal half needs the no-copy device too"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let owner = AlignedHost::new(2 * page, page);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let slice = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = || {
+        GuestRef::new(std::sync::Arc::clone(&import), slice)
+            .expect("the slice came from this import")
+    };
+    let import_id = import.id().get();
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // The gather a test hands the gate: one host run holding the three indices,
+    // and the page runs below are the only variable.
+    let gather = |source_offset: u64, pages: Vec<GuestWindowRun>| -> engine::GuestRunSource {
+        engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                owner.pointer as usize,
+                2 * page as u64,
+                source_offset,
+                INDEX_BYTES.len() as u64,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset,
+            total_len: INDEX_BYTES.len() as u64,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(pages)),
+            direct_image: None,
+        }
+    };
+    let request = |source: &engine::GuestRunSource| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.indexed = Some(IndexedDrawResource {
+            index_type: IndexType::U32,
+            index_count: 3,
+            vertex_offset: 0,
+            content: BufferContent::GuestRuns(source.clone()),
+        });
+        req
+    };
+    let answer = |label: &str, source: &engine::GuestRunSource| -> (String, String) {
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(source),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => {
+                panic!("{label}: an index gather outside one window is out of class: {other:?}")
+            }
+        }
+    };
+    let delivered = provider_render::provider_submissions();
+
+    // Scattered: two runs tile the bind, so no single host range is its bytes.
+    let scattered = gather(
+        0,
+        vec![
+            GuestWindowRun {
+                window_offset: 0,
+                guest: guest(),
+                window: Some(registered),
+            },
+            GuestWindowRun {
+                window_offset: 6,
+                guest: guest(),
+                window: Some(registered),
+            },
+        ],
+    );
+    let (slug, detail) = answer("scattered index gather", &scattered);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_index_staging");
+    assert!(
+        detail.contains("gathers from guest RAM"),
+        "the sentence names the gather: {detail}"
+    );
+
+    // Unregistered: the ledger derived no window for this run.
+    let unregistered = gather(
+        0,
+        vec![GuestWindowRun {
+            window_offset: 0,
+            guest: guest(),
+            window: None,
+        }],
+    );
+    let (slug, detail) = answer("unregistered index gather", &unregistered);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_index_staging");
+
+    // Off-granule: the bind starts inside the window, so the view's own host
+    // pointer is not a whole number of the device's import granules.
+    let off_granule = gather(
+        4,
+        vec![GuestWindowRun {
+            window_offset: 0,
+            guest: guest(),
+            window: Some(registered),
+        }],
+    );
+    let (slug, detail) = answer("off-granule index gather", &off_granule);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_index_alignment");
+    assert!(
+        detail.contains(&format!("{alignment} byte alignment")),
+        "the sentence names the alignment it crossed: {detail}"
+    );
+
+    // Both buckets are counters, not latches, and no refused shape reaches the
+    // provider.
+    assert!(route_count("render_provider_out_of_class_index_staging") >= 2);
+    assert!(route_count("render_provider_out_of_class_index_alignment") >= 1);
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a refused index gather never reaches the provider"
+    );
+    assert_eq!(registered.import.get(), import_id);
+}
+
 /// R9q's refusal half: a vertex gather the seam cannot cut one registered
 /// window from stays on the engine, each under the bucket its own fact names.
 ///
