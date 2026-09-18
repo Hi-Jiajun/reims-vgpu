@@ -10691,6 +10691,50 @@ fn narrow_class<'a>(
             NarrowLoad::Clear(clear)
         }
     };
+    // R42's second narrowing: whether this rail may keep *this* record's frame
+    // in an image the attachment's own declaration can name.
+    //
+    // The relay's promise is about an image this rail mints under the record's
+    // own target identity (`ChainHandoffProbe::attachment`), and one route
+    // cannot name that image. A record whose load is the guest-runs seed — the
+    // run list of R32's seed door, R38's own guest backing, or the
+    // mapper-ref-texture surface's windows — declares its attachment under the
+    // **owner plan's** registration allocation: the contract pairs every run's
+    // reservation with the declaring view's own allocation (`LeaseMismatch`
+    // otherwise), which is exactly why `submit_narrow` skips the pooled
+    // allocation record for that arm. A store this rail elects as `Resident`
+    // beside it would be a *second* identity for one attachment: the trace's
+    // declaring pass would name the resident mint the resource table
+    // deliberately omits, and the canonical admission refuses the whole
+    // submission by name (`resource_contract_invalid: unknown allocation`)
+    // after the packet's remaining records are already committed to it.
+    //
+    // That is the rung the two commits before this one left standing: fp8's
+    // single residual record and census v33's 245
+    // `draws_skipped_after_engine_refusal` — one per frame, an 80x64 layer at
+    // `mid=0` whose successor's probe admitted the promise (its own identity
+    // resolved the same pair, because the probe reports the *identity's* mint
+    // and not the arm's declaration). fp4's four surface records are the same
+    // mechanism one door over: the surface seed (`DrawRequest::target_guest_seed`)
+    // is a run list too, so the fp8 surface gate only moved *which* run-list
+    // door could reach this line.
+    //
+    // So the promise is honoured only where the attachment's own declaration
+    // can carry the kept image. Everywhere else the record takes the answer it
+    // took before R42 — the frame is published, or lands in the window it began
+    // from — and the walk reads that answer (`provider_resident_chain` is set
+    // from the *outcome*, never from the promise) and hands the bytes on.
+    //
+    // The capability half (`resident_frames_fetchable`) is gated the same way
+    // and for the same reason: a caller that can fetch kept frames still cannot
+    // keep a frame whose attachment is the owner's registration. That flag is
+    // `false` in production until R4b's byte channel lands, so R4b must keep
+    // this rule when it flips it.
+    let seed_is_guest_runs = matches!(load, NarrowLoad::GuestRuns(_));
+    let relay_keeps_frame =
+        inputs.chain_keeps_frame && !relay_surface_target && !seed_is_guest_runs;
+    let keeps_frame =
+        !seed_is_guest_runs && (inputs.resident_frames_fetchable || relay_keeps_frame);
     // Where this record's frame goes. A record that skipped its readback is one
     // of two rails, and the flag's recorded reason is what tells them apart —
     // re-deriving the split from the assembler around it is what the 2026-09-17
@@ -10745,13 +10789,12 @@ fn narrow_class<'a>(
                     // (`resource_contract_invalid: unknown allocation`) and
                     // whose packets then lost their remaining draws (1 402 and
                     // 1 668 `draws_skipped_after_engine_refusal`, against zero
-                    // on the base round). The capability path
-                    // (`resident_frames_fetchable`) is unchanged: a caller that
-                    // can fetch a kept frame is the one that owns that
-                    // generation and lands the frame itself.
-                    if inputs.resident_frames_fetchable
-                        || (inputs.chain_keeps_frame && !relay_surface_target)
-                    {
+                    // on the base round). The surface half of the door is
+                    // untouched: a relayed store beside a surface identity
+                    // answers as it did before R42. The run-list half is where
+                    // this increment's promise is *not* honoured, and why, is
+                    // stated once at `keeps_frame` above.
+                    if keeps_frame {
                         NarrowStore::Resident(resident)
                     } else if carried_attachment_guest_window
                         && inputs.role == RenderChainRole::SoleOrTail
@@ -10810,7 +10853,11 @@ fn narrow_class<'a>(
     // the very shapes census v15 measured it must answer (the head record of
     // every split packet is a named identity with a `Clear` load and a withheld
     // readback).
-    if (inputs.resident_frames_fetchable || inputs.chain_keeps_frame || inputs.chain_loads_resident)
+    // The arms the rule reads are the ones this record's own declaration
+    // *elected* ([`keeps_frame`]), not the caller's promise: a promise this
+    // class cannot honour — the relay beside a run-list seed — is answered by
+    // the published (or windowed) arm above, and the walk reads that answer.
+    if (keeps_frame || inputs.chain_loads_resident)
         && resident.is_some()
         && !matches!(load, NarrowLoad::Resident(_))
         && !matches!(store, NarrowStore::Resident(_))
