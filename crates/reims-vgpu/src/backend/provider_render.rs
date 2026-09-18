@@ -1909,6 +1909,76 @@ fn sampled_bind_window(lanes: NarrowLanes) -> &'static str {
     }
 }
 
+/// Which half of a refused bind's folded channel mapping charged the census.
+///
+/// One read-only probe beside this door's refusal, added for the 2026-09-18
+/// question census v29 left open: of its 472 `render_provider_out_of_class_texture_bind`
+/// records, 471 carried every shape axis inside the window and a texel lane the
+/// provider's own frame lists, and the *only* condition that kept them on the
+/// engine was [`swizzle_is_identity`](crate::protocol::pixel_format::swizzle_is_identity)
+/// — the sentence names seven of the gate's eight conditions, and the eighth is
+/// the channel mapping it deliberately does not print.
+///
+/// # The fold, and what a reading of it can and cannot recover
+///
+/// `image.swizzle` is **one** plan rather than two because a Vulkan image view
+/// carries one component mapping: the runtime folds the guest's own
+/// texture-view swizzle *after* the plan the texel's own format contributes
+/// (`runtime/draw/vulkan.rs`: `view_swizzle.unwrap_or_default().after(&sampled_components)`,
+/// composed by [`SwizzlePlan::after`](crate::protocol::pixel_format::SwizzlePlan::after)).
+/// The gate reads that fold, so the two sources cannot be separated by
+/// inverting it. What *is* decidable from the fold alone is this:
+///
+/// - a plan that is the unit names neither source, and never reaches this
+///   reading — the refusal it writes is charged to whatever else failed;
+/// - with the view's contribution the unit the folded plan **is** the format's
+///   own plan, and this codebase has exactly one format whose plan is not the
+///   unit: `A8Unorm`'s `ALPHA_IN_RED` on the `R8_UNORM` its single byte rides
+///   in (`reims_vgpu_vulkan::pixel`'s table, the standing case
+///   [`reims_vgpu_vulkan::pixel`] documents as such);
+/// - with the format's contribution the unit the folded plan **is** the view's
+///   own swizzle, whatever the guest asked for.
+///
+/// So the reading attributes the one standing format plan to the format and
+/// every other non-identity plan to the view. The census's next round reads the
+/// two counts against this door's bucket knowing exactly what that convention
+/// does to the three shapes it cannot always separate:
+///
+/// - **the format's plan alone** (`A8Unorm` sampled through an identity view):
+///   counted as the format's, which is what it is;
+/// - **the view's plan alone**: counted as the view's — including the one view
+///   swizzle this device's vocabulary cannot tell from the bullet above, a
+///   guest view that spells `ALPHA_IN_RED` over an `R8_UNORM` bind, which is
+///   one plan on one format name and is counted as the format's;
+/// - **both at once**: counted as the view's, since a composition whose format
+///   half is the unit is `identity.after(format)` and every other composition
+///   is reached by *some* view plan — except the compositions that land on
+///   `ALPHA_IN_RED` exactly, which the first bullet swallows.
+///
+/// # What this is not
+///
+/// Not a verdict: `bindable`, the slug and every word of the sentence are the
+/// ones this gate shipped, and the plan is still refused by name rather than
+/// folded into bytes — the fold (widening the bind to `rgba8_unorm` and
+/// applying the plan to the texels) is the increment after this one, and it is
+/// the reading below that says which half of the plan that fold has to answer
+/// for.
+fn swizzled_bind_route(
+    image: &crate::backend::vulkan::engine::SampledImageResource,
+) -> &'static str {
+    // The format's own plan, as the gate can see it: the plan `A8Unorm`
+    // contributes on its own, on the one Vulkan format that spells it. A plan
+    // of any other shape, or the same plan on any other format, needs a view
+    // contribution to exist at all (see the doc comment above).
+    if image.format == ash::vk::Format::R8_UNORM
+        && image.swizzle == crate::backend::vulkan::translate::pixel::ALPHA_IN_RED
+    {
+        "render_provider_texture_bind_swizzled_format"
+    } else {
+        "render_provider_texture_bind_swizzled_view"
+    }
+}
+
 /// The sampled textures one request's fragment stage declares, weighed against
 /// the module's own declarations (R10, `research/docs/23` §101).
 ///
@@ -2330,6 +2400,16 @@ fn sampled_textures<'a>(
             && image.height != 0
             && crate::protocol::pixel_format::swizzle_is_identity(&image.swizzle);
         let Some(format) = format.filter(|_| bindable) else {
+            // One read-only probe beside the refusal (2026-09-19, census v29's
+            // `texture_bind` bucket): which half of the folded channel mapping
+            // kept this bind on the engine — the view's own swizzle or the
+            // plan its texel format contributes. Charged where the refusal is
+            // built, so the two counts split exactly this door's records, and
+            // only for a plan that is not the unit: an identity mapping is not
+            // this door's answer and is charged to whatever condition did fire.
+            if !crate::protocol::pixel_format::swizzle_is_identity(&image.swizzle) {
+                crate::runtime::drain::note_store_route(swizzled_bind_route(image));
+            }
             return Err(OutOfClass::owned(
                 "render_provider_out_of_class_texture_bind",
                 format!(
