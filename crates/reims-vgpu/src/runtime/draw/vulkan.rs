@@ -10323,6 +10323,38 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             } else {
                 None
             };
+            // This record's place in the packet the exec loop is walking: the
+            // store plan's `do_writeback` says where the frame goes, and
+            // `continues_render_pass` says whether a record precedes it. Both
+            // are the walk's own facts rather than this seam's — `writeback_guest`
+            // is the plan's answer, and the request carries the chain position
+            // (`render_pass_chain_position`).
+            let role = RenderChainRole::of(writeback_guest, resources.continues_render_pass);
+            // R25: the packet's own chain value, materialized for the canonical
+            // rail's middle-record byte arm
+            // (`RenderRailInputs::chain_middle_source_bytes`).
+            //
+            // The request's `target_rgba8` *is* this record's previous contents
+            // here: the exec walk hands a continuing record the bytes its
+            // predecessor returned (`multi_draw_chain_source`'s CPU arm writes
+            // `colors[0].target_seed_rgba`), and `encode_draw_chain` normalizes
+            // both rails' chain values to `SeedOrder::Rgba8` before the walk
+            // takes them — the same bytes the engine's own staging copy would
+            // take. The canonical attachment uploads them verbatim into the
+            // pass's own image, which is the attachment's own view, so the
+            // frame has to travel in the *attachment's* order: the exchange the
+            // engine folds into its staging copy is folded here, once, for the
+            // record whose frame the walk hands on. `None` is every record that
+            // is not a middle, a middle whose previous contents are the chain's
+            // own resident (R7b/R23's arms elect those), and a frame that
+            // cannot travel as four-byte colour; the class then keeps the
+            // record on the engine by name.
+            let middle_source_frame =
+                if role == RenderChainRole::Middle && !resources.load_from_target {
+                    chain_middle_source_frame(&resources)
+                } else {
+                    None
+                };
             let inputs = RenderRailInputs {
                 vertex_air: resolved.vertex_air.as_ref(),
                 fragment_air: resolved.fragment_air.as_ref(),
@@ -10331,13 +10363,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // compute rail's `air_entry` does.
                 vertex_entry: resolved.vertex.reflection.entry_point.as_deref(),
                 fragment_entry: resolved.fragment.reflection.entry_point.as_deref(),
-                // This record's place in the packet the exec loop is walking:
-                // the store plan's `do_writeback` says where the frame goes,
-                // and `continues_render_pass` says whether a record precedes
-                // it. Both are the walk's own facts rather than this seam's —
-                // `writeback_guest` is the plan's answer, and the request
-                // carries the chain position (`render_pass_chain_position`).
-                role: RenderChainRole::of(writeback_guest, resources.continues_render_pass),
+                role,
                 // `false`: this caller cannot read a frame the canonical rail
                 // keeps in its own image (R4b's byte channel is what will make
                 // this `true`). Every reader of a render target on this side —
@@ -10360,6 +10386,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // travels through. `None` for every other record, including the
                 // two Load elisions, whose frames stay where they are.
                 resident_source_bytes: resident_source_frame.as_deref(),
+                // R25: the frame the record *before* this one produced, when
+                // this record is the packet's middle and the caller holds that
+                // frame as the walk's own chain value
+                // (`chain_middle_source_frame`, in the attachment's own order).
+                // The class then states the same trace-owned `Load` arm R23's
+                // bytes take: the frame's bytes are the one channel a chain
+                // travels through once the record before this one published its
+                // own — and the middle is the position that both takes and
+                // hands one on.
+                chain_middle_source_bytes: middle_source_frame.as_deref(),
                 // The stage's own attribute locations, so a request whose
                 // declared streams disagree with them stays on the engine
                 // instead of being answered by a provider that always refuses
@@ -11739,6 +11775,64 @@ fn resident_chain_source_frame(
     } else {
         frame.into_rgba8()
     }
+}
+
+/// The frame the record before this one produced, in the order the record's own
+/// attachment declares, for the canonical rail's middle-record byte arm (R25).
+///
+/// The request's `target_rgba8` *is* that frame on a continuing record: the
+/// exec walk hands every record after the packet's first the bytes its
+/// predecessor returned (`runtime::exec`'s `multi_draw_chain_source`, the CPU
+/// arm), and those bytes are `SeedOrder::Rgba8` by the same statement
+/// `encode_draw_chain` turns a `!writeback_guest` readback into before it hands
+/// them on. The canonical attachment uploads the caller's bytes verbatim into
+/// the pass's own image, and that image is the attachment's own view — so a
+/// frame crossing from the seed's order to the attachment's is exchanged here,
+/// exactly where the engine's staging copy exchanges it
+/// (`engine::exec`'s `write_staging_swap_rb`), which is also why the fold
+/// follows `target_seed_order` rather than assuming the walk's own order: a
+/// record whose walk lost the chain arrives with whatever its request's Load
+/// seed door resolved, and the engine stages *that* under the order it states.
+///
+/// `None` is a frame that cannot travel this arm at all, and the class then
+/// keeps the record on the engine by name: an attachment that is not one of the
+/// two four-byte 8-bit colour orders (the walk's chain value is eight-bit
+/// RGBA, and a wider texel cannot hold it without the widening pass the engine
+/// performs and this arm does not carry), and a seed that is not the
+/// attachment's whole tightly packed extent (a hand-over the canonical
+/// declaration could not state — the class would have to refuse it, and this
+/// question is asked before anything is paid for).
+///
+/// Unlike [`resident_chain_source_frame`] this reads no registry: the bytes are
+/// already in the caller's own hand, which is the whole difference between the
+/// two arms.
+#[cfg(feature = "provider-render")]
+fn chain_middle_source_frame(
+    resources: &crate::backend::vulkan::engine::DrawRequest,
+) -> Option<Vec<u8>> {
+    let attachment = resources.color_attachment?;
+    let layout = translate::pixel::texel_layout_of(attachment.format())?;
+    if !layout.is_four_byte_color() {
+        return None;
+    }
+    let seed = resources.target_rgba8.as_deref()?;
+    let pixels = usize::try_from(resources.width)
+        .ok()?
+        .checked_mul(usize::try_from(resources.height).ok()?)?;
+    if seed.len() != pixels.checked_mul(4)? {
+        return None;
+    }
+    let mut bytes = seed.to_vec();
+    if matches!(
+        resources.target_seed_order,
+        crate::backend::vulkan::engine::SeedOrder::Bgra8
+    ) != translate::pixel::has_bgra_order(attachment.format())
+    {
+        for texel in bytes.chunks_exact_mut(4) {
+            texel.swap(0, 2);
+        }
+    }
+    Some(bytes)
 }
 
 /// Read a resident render-pass chain back to host memory so the exec loop can
@@ -16281,6 +16375,128 @@ mod render_present_probe_tests {
             render_present_mapping(&no_mapping, &resources, true),
             None,
             "a frame that lands in no mapping is a surface the display rail never reads"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "provider-render"))]
+mod chain_middle_source_tests {
+    use super::chain_middle_source_frame;
+    use crate::backend::vulkan::engine::{ColorAttachmentState, DrawRequest, SeedOrder};
+    use reims_vgpu_protocol::pixel_format::{
+        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM,
+    };
+
+    /// The attachment a frame is handed over for: the format the canonical pass
+    /// declares its view with, which is the order the bytes have to be in.
+    fn attachment(mtl: u16) -> ColorAttachmentState {
+        crate::backend::vulkan::translate::pixel::color_attachment(mtl)
+            .expect("the fixture's attachment format is renderable")
+            .0
+            .with_clear([0.0, 0.0, 0.0, 1.0])
+    }
+
+    /// A request of the shape the seam asks about: one attachment, the walk's
+    /// seed, and the order the seed states for itself.
+    fn request(
+        mtl: u16,
+        width: u32,
+        height: u32,
+        seed_order: SeedOrder,
+        seed: Vec<u8>,
+    ) -> DrawRequest {
+        DrawRequest {
+            width,
+            height,
+            color_attachment: Some(attachment(mtl)),
+            target_rgba8: Some(std::sync::Arc::new(seed)),
+            target_seed_order: seed_order,
+            ..Default::default()
+        }
+    }
+
+    fn texels(rgba: [u8; 4], count: usize) -> Vec<u8> {
+        rgba.iter().copied().cycle().take(count * 4).collect()
+    }
+
+    /// The exchange belongs to the view: a walk seed in `SeedOrder::Rgba8`
+    /// reaches a scanout-order attachment with its first and third channels
+    /// exchanged, exactly once — and a seed that already states the view's own
+    /// order crosses unchanged, because it is the same frame.
+    #[test]
+    fn the_walks_frame_reaches_the_view_in_the_views_own_order() {
+        let seed = texels([32, 64, 128, 255], 6);
+        let frame = chain_middle_source_frame(&request(
+            MTL_FORMAT_BGRA8_UNORM,
+            3,
+            2,
+            SeedOrder::Rgba8,
+            seed.clone(),
+        ))
+        .expect("the walk's whole frame crosses into a scanout-order view");
+        assert_eq!(
+            frame,
+            texels([128, 64, 32, 255], 6),
+            "the bytes cross into the order the pass declares its view with"
+        );
+        assert_ne!(
+            frame, seed,
+            "the walk's order is not the view's order, so an arm that uploaded verbatim would \
+             hand the pass red and blue exchanged"
+        );
+
+        let already_view_order = chain_middle_source_frame(&request(
+            MTL_FORMAT_BGRA8_UNORM,
+            3,
+            2,
+            SeedOrder::Bgra8,
+            seed.clone(),
+        ))
+        .expect("a seed that states the view's own order crosses unchanged");
+        assert_eq!(already_view_order, seed);
+    }
+
+    /// The frames this arm cannot state keep the record on the engine by name:
+    /// a texel wider than the four bytes the walk's chain value carries (this
+    /// arm folds an exchange, not a widening), a hand-over that is not the
+    /// attachment's tightly packed extent, and a middle whose walk carried
+    /// nothing at all.
+    #[test]
+    fn a_frame_the_class_cannot_still_state_stays_on_the_engine() {
+        assert!(
+            chain_middle_source_frame(&request(
+                MTL_FORMAT_RGBA16_FLOAT,
+                3,
+                2,
+                SeedOrder::Rgba8,
+                texels([32, 64, 128, 255], 6),
+            ))
+            .is_none(),
+            "a wide view cannot hold the walk's eight-bit frame without a widening pass"
+        );
+        assert!(
+            chain_middle_source_frame(&request(
+                MTL_FORMAT_RGBA8_UNORM,
+                3,
+                2,
+                SeedOrder::Rgba8,
+                texels([32, 64, 128, 255], 5),
+            ))
+            .is_none(),
+            "a hand-over that is not the attachment's extent is refused here, before anything \
+             is paid for"
+        );
+        let mut no_seed = request(
+            MTL_FORMAT_RGBA8_UNORM,
+            3,
+            2,
+            SeedOrder::Rgba8,
+            texels([32, 64, 128, 255], 6),
+        );
+        no_seed.target_rgba8 = None;
+        assert!(
+            chain_middle_source_frame(&no_seed).is_none(),
+            "a middle whose walk carried nothing has no frame to hand over"
         );
     }
 }

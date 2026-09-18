@@ -254,6 +254,28 @@
 //!   Bytes that are not the attachment's own extent, and a record whose caller
 //!   hands nothing over, keep the engine under the names above.
 //!
+//!   # The packet's own chain value, carried into the middle (R25)
+//!
+//!   Census v18 (`evidence/gate3-census-v18-2026-09-18`, same rig) moved the
+//!   boundary one record further into the same packet. With R23 in place the
+//!   class answers the chain's *head* from the frame's bytes, and the record
+//!   after it begins from the frame the head published — the exec walk's own
+//!   chain value, which is what `encode_draw_chain` normalizes a
+//!   `!writeback_guest` readback to and hands on as the request's
+//!   `target_rgba8`. That population is the census's fourth bucket,
+//!   `chain_middle` at 657 records (8.0 %), every one of them `fmt=0x50`,
+//!   `load=Load`, `wb=0`, `skip=resident`, `store=1`, `seed=bytes`,
+//!   `continues=1`. `LoadOp::Resident` cannot name that frame either (no
+//!   provider pass stored one under the attachment's identity), so the class
+//!   carries it the same way R23 carries the engine's: the caller hands the
+//!   frame over ([`RenderRailInputs::chain_middle_source_bytes`]) and the pass
+//!   states the contract's trace-owned load (`NarrowLoad::Bytes` →
+//!   `LoadOp::Load`). The record's own frame is published for the walk to hand
+//!   to the record after it, exactly as R23's arm publishes it. A middle whose
+//!   caller hands nothing over, one whose frame cannot travel as four-byte
+//!   colour, and a hand-over that is not the attachment's own extent keep the
+//!   engine under the names above.
+//!
 //! Anything outside the class returns [`RenderRailOutcome::NotInNarrowClass`]
 //! and the caller runs the self-contained engine unchanged — the feature only
 //! narrows which submissions change rail. An in-class submission the provider
@@ -3720,15 +3742,25 @@ enum NarrowLoad<'a> {
     /// The contract's trace-owned load arm, and the only one that can state
     /// contents the provider never stored: the bytes travel with the trace
     /// exactly as a stream's do, and the rail uploads them into the pass's own
-    /// image before it opens. The class elects it for one shape only (R23): a
-    /// record whose previous contents are the live GPU image the caller's chain
-    /// names, on a caller that cannot hand this rail an image under that
-    /// identity ([`RenderRailInputs::resident_frames_fetchable`]) but *can*
-    /// hand over the frame itself — the engine's own registry holds it, and the
-    /// caller is the one that reads it out. Every other byte-bearing shape is
-    /// still refused by name: a guest seed is a source the class cannot confirm
-    /// is the live image, and an assertion this rail cannot check is not a load
-    /// arm it may state.
+    /// image before it opens. The class elects it for two shapes, and both are
+    /// one statement: the request names where its previous contents come from,
+    /// and the caller owns the bytes that are those contents.
+    ///
+    /// * R23: a record whose previous contents are the live GPU image the
+    ///   caller's chain names, on a caller that cannot hand this rail an image
+    ///   under that identity
+    ///   ([`RenderRailInputs::resident_frames_fetchable`]) but *can* hand over
+    ///   the frame itself — the engine's own registry holds it, and the caller
+    ///   is the one that reads it out
+    ///   ([`RenderRailInputs::resident_source_bytes`]).
+    /// * R25: the packet's middle record, whose previous contents are the frame
+    ///   the record before it produced. That frame is the exec walk's own chain
+    ///   value, and the walk — the caller — hands it over
+    ///   ([`RenderRailInputs::chain_middle_source_bytes`]).
+    ///
+    /// Every other byte-bearing shape is still refused by name: a guest seed is
+    /// a source the class cannot confirm is the live image, and an assertion
+    /// this rail cannot check is not a load arm it may state.
     Bytes(&'a [u8]),
 }
 
@@ -4078,6 +4110,35 @@ pub struct RenderRailInputs<'a> {
     /// under their own slug rather than being uploaded and rejected by the
     /// contract, because a decline is never a fallback.
     pub resident_source_bytes: Option<&'a [u8]>,
+    /// The frame a middle record's previous contents are, when the caller
+    /// hands it over (R25).
+    ///
+    /// A packet's records share one attachment, so every record after the first
+    /// begins from the frame its predecessor produced — and the exec walk is
+    /// what carries that frame between records: a record whose predecessor
+    /// returned bytes arrives with them as the request's own `target_rgba8`,
+    /// in `SeedOrder::Rgba8` (`encode_draw_chain` normalizes both rails' chain
+    /// values to it before the walk takes them). Those bytes are the caller's,
+    /// exactly as R23's are: the walk owns the frame it hands on. The class
+    /// states them for the attachment's view through the contract's trace-owned
+    /// load ([`NarrowLoad::Bytes`]) instead of leaving the middle on the engine
+    /// — the position that both takes and hands on a frame, and the one census
+    /// v18 named `chain_middle` at 657 records.
+    ///
+    /// The bytes follow the same two rules R23's do, and for the same reason —
+    /// the canonical attachment uploads them verbatim into the pass's own
+    /// image: they are the attachment's own texel at the attachment's own
+    /// tightly packed extent, in the attachment's own order (`pass.format` is
+    /// the view they are declared for, and the seam folds the walk's
+    /// `SeedOrder::Rgba8` into it). A hand-over that is not exactly the
+    /// attachment's extent is a caller wiring bug and is refused under
+    /// `render_provider_out_of_class_chain_middle_shape` rather than being
+    /// uploaded and rejected by the contract.
+    ///
+    /// `None` is every caller that does not hand the frame over — and every
+    /// record that is not the packet's middle — and those records keep the
+    /// class's refusal by name.
+    pub chain_middle_source_bytes: Option<&'a [u8]>,
     /// The *vertex stage's own* attribute locations, as the translation that
     /// produced `vertex_air` reflected them
     /// (`CachedShader::reflection.vertex_attributes`), in the reflection's
@@ -5345,6 +5406,13 @@ struct NarrowPass<'a> {
     /// number rather than the silence a route counter that only fires on the
     /// elected arm would leave.
     published_held_resident: bool,
+    /// Whether this pass's previous contents are the packet's own chain value,
+    /// handed over by the caller (R25). Counted as
+    /// `render_provider_chain_middle_source_bytes` beside R23's
+    /// `render_provider_resident_source_bytes`, so the two byte arms are two
+    /// numbers rather than one: R23 carries the frame the *engine's* registry
+    /// holds, R25 the frame the *walk* holds.
+    carried_chain_middle: bool,
     bgra: bool,
     width: u64,
     height: u64,
@@ -5536,6 +5604,16 @@ fn narrow_class<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &'a DrawRequest,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
+    // R25: the packet's own chain value, when the caller hands it over for the
+    // record that continues the chain. Role-gated here so the class states the
+    // election once: only a middle has a predecessor whose frame the walk
+    // carries, and the load gate below trusts this admission instead of asking
+    // the role a second time. A record of any other position that arrives with
+    // bytes keeps the refusals its own position gives it.
+    let chain_middle_source_bytes = match inputs.role {
+        RenderChainRole::Middle => inputs.chain_middle_source_bytes,
+        RenderChainRole::Head | RenderChainRole::SoleOrTail => None,
+    };
     match inputs.role {
         // W1. The packet's first record owns the pass's own beginning — the
         // class's `Clear` — so no frame has to be seeded into it, and its frame
@@ -5559,12 +5637,27 @@ fn narrow_class<'a>(
         // that names a resident and then fails on its streams, scissor or
         // format, and the census keeps those reasons.
         RenderChainRole::Middle if req.load_from_target && req.target_identity.is_some() => {}
+        // R25: the middle whose previous contents are the frame its predecessor
+        // produced, handed over by the caller that carries it. As with R7b's
+        // arm, the admission is the request's own statement of where those
+        // contents come from (`target_rgba8` — the exec walk's chain value, the
+        // one writer of a continuing record's seed) beside the caller's bytes,
+        // and nothing more: the deeper conditions below still answer for a
+        // middle that states them and then fails on its streams, scissor or
+        // format. A middle that states any other source, or one whose caller
+        // hands nothing over, keeps the refusal below.
+        RenderChainRole::Middle
+            if req.target_rgba8.is_some()
+                && req.target_guest_seed.is_none()
+                && !req.load_guest_target_backing
+                && chain_middle_source_bytes.is_some() => {}
         RenderChainRole::Middle => {
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_chain_middle",
-                "a record in the middle of a multi-record packet stays on the engine: it begins \
-                 from the frame the record before it produced, which is a rail this class does \
-                 not execute",
+                "a record in the middle of a multi-record packet stays on the engine while the \
+                 caller does not hand it the frame the record before it produced: the middle \
+                 begins from that frame, and this class carries it only as the caller's own \
+                 bytes",
             ))
         }
         RenderChainRole::SoleOrTail => {}
@@ -5708,6 +5801,7 @@ fn narrow_class<'a>(
     // previous contents are guest bytes is still a shape the class does not
     // carry (one load op per attachment, and the rail cannot confirm a seed is
     // the live image), so it keeps the engine by name.
+    let mut carried_chain_middle = false;
     let load = if req.load_from_target {
         let Some(resident) = resident else {
             return Err(OutOfClass::new(
@@ -5767,6 +5861,27 @@ fn narrow_class<'a>(
         } else {
             NarrowLoad::Resident(resident)
         }
+    } else if let Some(bytes) = chain_middle_source_bytes {
+        // R25: the middle's previous contents are the frame its predecessor
+        // produced, handed over by the caller that carries it. The role gate
+        // above admitted exactly this pair — the request's own `target_rgba8`
+        // beside the caller's bytes — so this arm states the contract's
+        // trace-owned load for it, the same load R23's arm states for the
+        // frame the engine holds. The bytes have to be the attachment's own
+        // tightly packed extent for the same reason R23's do: the canonical
+        // attachment uploads the view's declared bytes verbatim, and a shorter
+        // or longer buffer would begin the pass from bytes no record wrote.
+        if u64::try_from(bytes.len()).ok() != Some(extent) {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_chain_middle_shape",
+                "a middle record whose predecessor's frame is handed over at a width or extent \
+                 other than the attachment's own stays on the engine: the canonical attachment \
+                 uploads exactly the view's declared bytes, so a shorter or longer buffer would \
+                 begin the pass from bytes no record wrote",
+            ));
+        }
+        carried_chain_middle = true;
+        NarrowLoad::Bytes(bytes)
     } else {
         if req.target_rgba8.is_some()
             || req.target_guest_seed.is_some()
@@ -6304,6 +6419,7 @@ fn narrow_class<'a>(
         load,
         store,
         published_held_resident,
+        carried_chain_middle,
         bgra: format == AttachmentFormat::Bgra8Unorm,
         width: u64::from(req.width),
         height: u64::from(req.height),
@@ -7211,13 +7327,18 @@ fn submit_narrow(
     if loads_resident {
         crate::runtime::drain::note_store_route("render_provider_resident_load");
     }
-    // R23's own population, counted where the answer happens for the reason
-    // above: the chain's frame was carried into the pass as bytes (the caller
-    // read it out of the registry the chain names), so neither resident arm
-    // moved and this is the only name that says the record was answered this
-    // way.
+    // The two byte arms' own populations, counted where the answer happens for
+    // the reason above: the frame was carried into the pass as bytes, so
+    // neither resident arm moved and these are the only names that say the
+    // record was answered this way. R23's is the frame the caller read out of
+    // the engine's registry; R25's is the packet's own chain value, handed on
+    // by the walk.
     if matches!(pass.load, NarrowLoad::Bytes(_)) {
-        crate::runtime::drain::note_store_route("render_provider_resident_source_bytes");
+        crate::runtime::drain::note_store_route(if pass.carried_chain_middle {
+            "render_provider_chain_middle_source_bytes"
+        } else {
+            "render_provider_resident_source_bytes"
+        });
     }
     // The held arm's own population: a caller withheld its readback and this
     // rail published the frame because the caller cannot fetch a kept one.
