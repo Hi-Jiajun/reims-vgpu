@@ -900,6 +900,9 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // out of the engine's own registry and states them here — the shape
         // [`inputs_held_with_source`] drives.
         resident_source_bytes: None,
+        // R26: the same read for the surface the *LOAD elision* named, stated
+        // only by the shape [`inputs_held_with_surface_source`] drives.
+        surface_resident_source_bytes: None,
         // R25: no predecessor's frame is handed over unless a test states the
         // bytes the walk carries — the shape
         // [`inputs_held_with_chain_value`] drives.
@@ -978,6 +981,30 @@ fn inputs_held_with_chain_value<'a>(
 ) -> RenderRailInputs<'a> {
     RenderRailInputs {
         chain_middle_source_bytes: Some(value),
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_held`] with the frame of the surface the *LOAD elision* named handed
+/// over as bytes (R26).
+///
+/// The seam's own statement of this door: the mapper-ref-texture composite's
+/// LOAD was elided because the engine's registry already holds the surface's
+/// contents under the identity the record itself names
+/// (`mapper_ref_texture_load_currency_query` returns that identity), and the
+/// caller that read the elision out owns the registry it read. The class states
+/// the same trace-owned load R23's arm states, counts the population under its
+/// own name (`render_provider_surface_resident_source_bytes`), and the caller's
+/// own obligation — the landing that consumes this frame must advance the
+/// mapping's content epoch — is stated where the seam hands the bytes over, not
+/// here.
+fn inputs_held_with_surface_source<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    source: &'a [u8],
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        surface_resident_source_bytes: Some(source),
         ..inputs_held(stages, role)
     }
 }
@@ -3924,6 +3951,197 @@ fn the_chain_value_the_walk_carries_reaches_the_provider() {
             );
         }
         other => panic!("a short carried chain value is not the class's: {other:?}"),
+    }
+}
+
+/// R26: the frame of the *surface* the LOAD elision names — the
+/// mapper-ref-texture composite's own spelling of the fact R23's chain states.
+///
+/// Census v19 (`evidence/gate3-census-v19-2026-09-18`) leaves `resident_source`
+/// at 919 records (26.9 %), and 47.8 % of them are this shape:
+/// `fmt=0x50 load=Load door=mapping skip=resident store=1 seed=none wb=1
+/// continues=0 pass_cont=0` — the composite whose LOAD the engine elided
+/// (`mapper_ref_texture_load_currency_query`) because its registry already
+/// holds the surface's contents under the identity the record itself names.
+/// The caller that read the elision out owns that registry, so it can hand the
+/// same frame over on `RenderRailInputs::surface_resident_source_bytes`, and
+/// the class answers under its own counter
+/// (`render_provider_surface_resident_source_bytes`) — the load it states is
+/// R23's, the obligation the caller states is not (the landing that consumes
+/// this record's frame has to be the one that moves the mapping's content
+/// epoch).
+///
+/// The comparison is the engine's own answer for the same record from the same
+/// previous contents: the engine's registry still holds them, because the
+/// provider never wrote there — which is also what keeps the elision's
+/// currency test honest.
+#[test]
+fn the_surfaces_frame_the_elision_names_carries_the_composite_into_the_provider() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+
+    // 1. The frame the elision will name: an engine record that lands its frame
+    //    in the engine's registry under a *surface* identity, with nothing
+    //    published — the mapper-ref-texture rail's own Store.
+    let identity = surface_identity(0x7b_26_01);
+    let Some(seed) = engine_pixels("surface seed", &stages, resident_seed_request(&identity))
+    else {
+        return;
+    };
+    assert!(
+        seed.is_empty(),
+        "a resident store publishes nothing on the engine either"
+    );
+
+    // 2. The widened door: the composite's own fields (`load_from_target`, the
+    //    half-attachment scissor, the withheld readback with its recorded
+    //    reason), and the caller's copy of the registry's frame on R26's input.
+    let resident = engine_chain_source(&identity);
+    let request = resident_load_request(&identity, false);
+    let answers_before = route_count("render_provider_surface_resident_source_bytes");
+    let published_before = route_count("render_provider_publish_held_resident");
+    let chain_bytes_before = route_count("render_provider_resident_source_bytes");
+    let store_before = route_count("render_provider_resident_store");
+    let load_before = route_count("render_provider_resident_load");
+    let provider = match provider_render::submit_render(
+        &inputs_held_with_surface_source(&stages, RenderChainRole::SoleOrTail, &resident),
+        &request,
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the surface's frame, handed over, is the held class's: {other:?}"),
+    };
+    eprintln!(
+        "R26 handed over {} bytes; provider published {} bytes; counters: \
+         surface_resident_source_bytes +{}, publish_held_resident +{}, chain_source_bytes +{}, \
+         resident_store +{}, resident_load +{}",
+        resident.len(),
+        provider.len(),
+        route_count("render_provider_surface_resident_source_bytes") - answers_before,
+        route_count("render_provider_publish_held_resident") - published_before,
+        route_count("render_provider_resident_source_bytes") - chain_bytes_before,
+        route_count("render_provider_resident_store") - store_before,
+        route_count("render_provider_resident_load") - load_before,
+    );
+    assert_texel_count("the composite's published frame", &provider);
+    assert_eq!(
+        route_count("render_provider_surface_resident_source_bytes") - answers_before,
+        1,
+        "the door's own population is counted where the answer happens"
+    );
+    assert_eq!(
+        route_count("render_provider_publish_held_resident") - published_before,
+        1,
+        "the held population is counted where the answer happens"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_source_bytes") - chain_bytes_before,
+        0,
+        "R23's arm is its own population: the chain's frame and the surface's are two numbers"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_store") - store_before,
+        0,
+        "no frame stays in an image this caller cannot read"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_load") - load_before,
+        0,
+        "this arm loads from the caller's bytes, not from a resident of this rail's own"
+    );
+
+    // 3. The engine's own answer for the same record from the same previous
+    //    contents, with its readback kept: the two rails' frames agree, and the
+    //    half the composite did not draw keeps the surface's own bytes.
+    let mut engine_control = resident_load_request(&identity, false);
+    engine_control.skip_readback = false;
+    engine_control.readback_skip_reason = ReadbackSkipReason::None;
+    let Some(engine_frame) = engine_pixels("surface composite", &stages, engine_control) else {
+        return;
+    };
+    assert!(
+        !engine_frame.is_empty(),
+        "the engine's control keeps its readback, so it has a frame to compare"
+    );
+    // The two rails translate the fixture's vertex stage separately, so the
+    // half the composite *drew* may differ by one step a channel
+    // (`assert_frames_within_a_step`, the same tolerance every two-rail
+    // comparison in this file states).
+    assert_frames_within_a_step(
+        "the composite the two rails draw from one surface frame",
+        &provider,
+        &engine_frame,
+    );
+    // The half it did *not* draw is the surface frame both rails began from,
+    // and that half is byte-for-byte the same: the frame travelled as bytes and
+    // neither rail reinterpreted it.
+    assert_texel_near(
+        "the composite's own half, at the scissor edge",
+        texel_at(&provider, half_of(width) - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    for y in 0..height {
+        for x in half_of(width)..width {
+            assert_eq!(
+                texel_at(&provider, x, y),
+                texel_at(&engine_frame, x, y),
+                "the undrawn texel ({x}, {y}) is the same on both rails: this half is the \
+                 surface frame they both began from, handed over as bytes"
+            );
+        }
+    }
+    for x in half_of(width)..width {
+        assert_eq!(
+            texel_at(&provider, x, height / 2),
+            RESIDENT_SEED_TEXEL,
+            "texel ({x}, {}) keeps the surface frame's own bytes: a route that cleared instead \
+             of loading lands another colour here",
+            height / 2,
+        );
+    }
+
+    // 4. The same request with nothing handed over: exactly what census v19
+    //    counts under `resident_source`, and what every record of the GVA
+    //    elision and every mapper-ref-texture record without a guest writeback
+    //    still gets.
+    let bucket_before = route_count("render_provider_out_of_class_resident_source");
+    match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+        &request,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("R26 un-widened door, verbatim: {}", reason.detail());
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_resident_source",
+                "a record whose frame the caller does not hand over keeps the engine: {reason}"
+            );
+        }
+        other => panic!("a source-less resident load is not the held class's: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_resident_source") - bucket_before,
+        1,
+        "the refusal is counted under the census's own bucket vocabulary"
+    );
+
+    // 5. A caller that hands over bytes of the wrong extent is a wiring bug
+    //    named as one, not a provider decline.
+    let short = &resident[..resident.len() - 4];
+    match provider_render::submit_render(
+        &inputs_held_with_surface_source(&stages, RenderChainRole::SoleOrTail, short),
+        &request,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("R26 short hand-over, verbatim: {}", reason.detail());
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_surface_resident_shape",
+                "bytes that are not the attachment's extent keep the record on the engine: \
+                 {reason}"
+            );
+        }
+        other => panic!("a short surface hand-over is not the class's: {other:?}"),
     }
 }
 

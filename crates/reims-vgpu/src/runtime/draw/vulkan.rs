@@ -505,6 +505,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         record_plane_draw(req);
         req.chain_resident_established = false;
+        req.resident_frame_published_by_provider = false;
         let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
         // Set from the result itself rather than inside the arms, because the
         // arms are where this went wrong: the refusal slug was assigned only in
@@ -803,13 +804,31 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             );
                         }
                         if let Some(epoch) = sync_epoch {
-                            stamp_mapper_ref_texture_resident(
-                                state,
-                                host,
-                                req,
-                                writeback_guest,
-                                epoch,
-                            );
+                            // R26: the stamp claims "the resident the Store
+                            // rendered into holds these pixels as of `epoch`".
+                            // That is true when the engine drew this record —
+                            // it rendered into the resident — and false when
+                            // the canonical rail did: no draw here wrote that
+                            // image, and stamping it would let the surface's
+                            // next LOAD elide onto pixels this frame replaced.
+                            // Skipped instead, which leaves the stamp at the
+                            // epoch of the last engine Store: the mapping's own
+                            // epoch has just advanced past it, so the currency
+                            // test fails and the next LOAD takes its seed — a
+                            // copy, never a wrong frame.
+                            if !req.resident_frame_published_by_provider {
+                                stamp_mapper_ref_texture_resident(
+                                    state,
+                                    host,
+                                    req,
+                                    writeback_guest,
+                                    epoch,
+                                );
+                            } else {
+                                crate::runtime::drain::note_store_route(
+                                    "mapper_ref_texture_resident_stamp_skipped",
+                                );
+                            }
                         }
                         crate::observe::when_verbose(|| {
                             // Order-independent: both fields reduce over the three
@@ -8799,6 +8818,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // avoid).
         #[cfg(feature = "provider-render")]
         let mut chain_source_is_engine_resident = false;
+        // R26: the identity the mapper-ref-texture LOAD elision chained from,
+        // when this record is also the one whose own frame lands in the
+        // mapping's guest pages (`writeback_guest`). That landing is what
+        // advances the mapping's `surface_content_epoch`, which is the epoch
+        // half of the elision's currency test — so it is the one landing after
+        // which the resident's older stamp can no longer vouch for a frame no
+        // draw here wrote. Every other record of the same elision (a packet
+        // head whose frame goes to the record after it, and every record of
+        // the GVA elision) leaves the stamp alone and stays on the engine by
+        // name; see `RenderRailInputs::surface_resident_source_bytes`.
+        #[cfg(feature = "provider-render")]
+        let mut mapper_ref_load_handover: Option<
+            crate::backend::vulkan::engine::TargetIdentity,
+        > = None;
         // Resolved once and read by both the Load gate below and the
         // `target_identity` assignment further down, so the record that loads
         // from a resident is by construction the record that renders into it.
@@ -8947,6 +8980,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if resident_current {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("mapper_ref_texture_seed_elided");
+                    // R26: this record's own frame is the one that lands in the
+                    // mapping's guest pages, so this is the record whose frame
+                    // the canonical rail may be handed — and whose landing
+                    // moves the epoch the elision reads. A record without the
+                    // guest writeback has no such landing and keeps its bytes
+                    // to itself (the class then refuses it by name, as before).
+                    #[cfg(feature = "provider-render")]
+                    {
+                        mapper_ref_load_handover =
+                            mapper_ref_texture_resident_handover(writeback_guest, Some(&identity));
+                    }
                     if backing
                         == Some(
                             crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation,
@@ -10323,6 +10367,38 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             } else {
                 None
             };
+            // R26: the same read, for the other naming of the same fact. The
+            // frame the mapper-ref-texture LOAD elided onto lives in the
+            // engine's registry under the identity the elision returned — the
+            // very identity this record's own `target_identity` names — and the
+            // caller that read the elision out owns that registry. Materialized
+            // only for the record whose own frame lands in the mapping's guest
+            // pages, because that landing is what advances the surface's
+            // `surface_content_epoch` and so keeps the resident's older stamp
+            // from vouching for pixels this rail never wrote. `None` is the
+            // answer for every other record of the elision, for a frame that
+            // cannot travel as four-byte colour, and for a readback that is not
+            // ready; those keep the class's refusal by name.
+            #[cfg(feature = "provider-render")]
+            let surface_resident_source_frame = match mapper_ref_load_handover.as_ref() {
+                // The identity the elision named has to be the identity this
+                // record's own attachment names, or the frame read here would
+                // be the previous contents of an image the pass is not
+                // declaring. The two are the same call
+                // (`mapper_ref_texture_render_identity`) at two moments in this
+                // function, and a guest write that moved the mapping's
+                // generation in between would part them — so the agreement is
+                // asked rather than assumed, and a disagreement hands nothing
+                // over (the class then refuses the record by name).
+                Some(identity) if resources.target_identity.as_ref() == Some(identity) => {
+                    let frame = resident_chain_source_frame(&resources, identity);
+                    if frame.is_some() {
+                        crate::runtime::drain::note_store_route("mapper_ref_texture_seed_carried");
+                    }
+                    frame
+                }
+                _ => None,
+            };
             // This record's place in the packet the exec loop is walking: the
             // store plan's `do_writeback` says where the frame goes, and
             // `continues_render_pass` says whether a record precedes it. Both
@@ -10397,6 +10473,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // travels through. `None` for every other record, including the
                 // two Load elisions, whose frames stay where they are.
                 resident_source_bytes: resident_source_frame.as_deref(),
+                // R26: the frame of the surface the mapper-ref-texture LOAD
+                // elision named, read out of the same registry by the same
+                // call, for the one record of that elision whose own frame
+                // lands in the mapping's guest pages
+                // (`surface_resident_source_frame`). The class states the same
+                // trace-owned `Load` arm for it and counts it under its own
+                // name, because the caller's obligation is a different one:
+                // the landing that consumes this frame is the one that moves
+                // the epoch the elision reads. The GVA elision and the
+                // mapper-ref-texture records without a guest writeback hand
+                // nothing over and keep the class's refusal by name.
+                surface_resident_source_bytes: surface_resident_source_frame.as_deref(),
                 // R25: the frame the record *before* this one produced, when
                 // this record is the packet's middle and the caller holds that
                 // frame as the walk's own chain value
@@ -10451,6 +10539,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 RenderRailOutcome::ProviderCompleted(out) => {
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
                     crate::runtime::drain::note_store_route("render_provider_canonical");
+                    // R26: out-flag for the Store route below. This frame was
+                    // rendered by the canonical rail, so the engine's registry
+                    // holds no image under this record's identity for it — and
+                    // the Store must not stamp a resident it did not write.
+                    // Read there (`stamp_mapper_ref_texture_resident`) rather
+                    // than derived, because "which rail drew this" is not a
+                    // property of the request.
+                    req.resident_frame_published_by_provider = true;
                     // R9j: the writable stage buffers' bytes land in the guest
                     // before the frame is handed on. The destination is the
                     // bind's own address and the pages it resolved to *before*
@@ -11236,6 +11332,41 @@ pub(super) fn mapper_ref_texture_load_currency_query(
     Some((identity, mapping_epoch))
 }
 
+/// The identity whose frame this record's caller may hand to the canonical
+/// rail, given what the mapper-ref-texture LOAD elision returned (R26).
+///
+/// Two conditions, and each is one the class cannot ask of the request:
+///
+/// * the elision fired, so the registry holds a frame under the surface's own
+///   identity and the caller that read the elision out owns the registry —
+///   that is the frame this record's previous contents are (`identity`);
+/// * this record is the one whose own frame lands in the mapping's guest pages
+///   (`writeback_guest`). That landing is what advances the mapping's
+///   `surface_content_epoch`, which is the epoch half of the elision's currency
+///   test — so it is the only landing after which the resident's older stamp
+///   cannot vouch for pixels no draw here wrote. A record without it (the
+///   packet's head, whose frame the walk carries on) has no such landing, and
+///   the class keeps its refusal by name (`resident_source`), exactly as every
+///   record of the GVA elision does: that elision's witness is
+///   `resident_content_ready` on the attachment's own identity, and no in-tree
+///   API can un-ready a render resident once the rail has answered it.
+///
+/// `None` — because the elision did not fire, or because there is no landing —
+/// is the answer that leaves the record where it is: on the engine, loading the
+/// image in place. A function with a test rather than a condition at the call
+/// site, because the census ranks this door's population by *shape*
+/// (`wb`/`pass_cont`), and a call site cannot be read back as the rule.
+#[cfg(feature = "provider-render")]
+fn mapper_ref_texture_resident_handover(
+    writeback_guest: bool,
+    elided: Option<&crate::backend::vulkan::engine::TargetIdentity>,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    if !writeback_guest {
+        return None;
+    }
+    elided.cloned()
+}
+
 /// Has the guest written this surface's pages since the Store that produced a
 /// copied resident stamped them?
 ///
@@ -11748,8 +11879,16 @@ pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
     }
 }
 
-/// The frame the engine's own chain resident holds, in the order the target's
-/// attachment declares, for the canonical rail's byte arm (R23).
+/// The frame the engine's registry holds under an identity the request names,
+/// in the order the target's attachment declares, for the canonical rail's byte
+/// arms (R23's chain frame, R26's surface-elision frame).
+///
+/// Two doors read through this one function and they are the same question over
+/// the same registry: which frame the record's previous contents are, under the
+/// identity the request itself names. Which door a record came in through is
+/// the caller's own statement rather than this read's — the obligations differ
+/// (R26's caller must land the frame where the mapping's content epoch moves),
+/// the bytes and the extent rule do not.
 ///
 /// This is a *question* rather than a payment, which is why it is not
 /// [`read_resident_chain`]: a caller asks whether the chain's frame can travel
@@ -16591,6 +16730,49 @@ mod chain_middle_source_tests {
         assert!(
             chain_middle_source_frame(&no_seed).is_none(),
             "a middle whose walk carried nothing has no frame to hand over"
+        );
+    }
+}
+
+/// R26: which records of the mapper-ref-texture LOAD elision may hand the frame
+/// they elided onto to the canonical rail.
+#[cfg(all(test, feature = "provider-render"))]
+mod mapper_ref_handover_tests {
+    use super::mapper_ref_texture_resident_handover;
+    use crate::backend::vulkan::engine::TargetIdentity;
+    use ash::vk::Format;
+
+    fn surface() -> TargetIdentity {
+        TargetIdentity::Surface {
+            id: 0x7b_26,
+            width: 64,
+            height: 32,
+            generation: 1,
+            format: Format::R8G8B8A8_UNORM,
+        }
+    }
+
+    #[test]
+    fn the_records_own_landing_is_what_lets_the_surfaces_frame_travel() {
+        let identity = surface();
+        assert_eq!(
+            mapper_ref_texture_resident_handover(true, Some(&identity)),
+            Some(identity.clone()),
+            "the record whose frame lands in the mapping's guest pages is the one whose landing \
+             moves the epoch the elision reads, so its frame may travel"
+        );
+        assert_eq!(
+            mapper_ref_texture_resident_handover(false, Some(&identity)),
+            None,
+            "a record without the guest writeback has no landing that moves the epoch: handing \
+             its frame over would leave the resident's older stamp vouching for pixels the \
+             canonical rail never wrote, so it stays on the engine by name"
+        );
+        assert_eq!(
+            mapper_ref_texture_resident_handover(true, None),
+            None,
+            "no elision, no frame to hand over — the GVA elision and every record whose previous \
+             contents are not this surface's resident are refused by the class's own name"
         );
     }
 }
