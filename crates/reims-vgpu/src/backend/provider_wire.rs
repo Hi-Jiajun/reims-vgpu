@@ -129,6 +129,51 @@ pub fn compute_texture_support(
     })
 }
 
+/// The render-texture half of one provider capability snapshot, read back out
+/// of the response frame the provider would send (`research/docs/23` §3.3,
+/// v70's `CAPABILITY_RENDER_TEXTURE_TAIL`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderTextureSupport {
+    /// Whether the provider declares it samples render-pass textures at all.
+    pub supported: bool,
+    /// The most sampled textures one render pass may bind, as the same frame
+    /// declares it.
+    pub maximum: u32,
+    /// The formats the same frame admits for a sampled render texture.
+    pub formats: Vec<TextureFormat>,
+}
+
+/// Encode a capability answer, decode it again, and read the render-texture
+/// bits out of the decoded value.
+///
+/// The third reading of the same one-snapshot rule ([`stage_buffer_support`],
+/// [`compute_texture_support`]), and the one R28 needs: a sampled pass whose
+/// bind is an owner lease crosses the submission frame, so the *frame's* own
+/// answer — `supports_render_texture_sampling`, `max_render_textures` and
+/// `supported_render_texture_formats`, the section v70 gave the tail — is what
+/// decides whether the pass may leave for the provider. Asking the in-process
+/// snapshot instead would read a bit no remote owner ever sees.
+///
+/// The section answers the *provider's* side of the question (it will create
+/// the views and samplers this shape needs). That the frame also *carries* the
+/// pass's own texture list and its render contract's declarations is the
+/// codec's side, and it is not assumed here: it is read back from the frame
+/// this rail produces before every lease-carrying submission
+/// ([`carried_submission`], `render_provider_wire render_texture` lines), and
+/// the rail's own tests decode a captured frame and assert the declarations and
+/// the lease sources survived the round trip.
+pub fn render_texture_support(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<RenderTextureSupport, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(RenderTextureSupport {
+        supported: decoded.supports_render_texture_sampling,
+        maximum: decoded.max_render_textures,
+        formats: decoded.supported_render_texture_formats,
+    })
+}
+
 /// The provider's own capability snapshot as it comes back out of the frame
 /// the owner would receive.
 ///

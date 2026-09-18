@@ -24,8 +24,9 @@
 use metal_api_core::provider::{
     AttachmentFormat, BufferAccess, BufferSource, ComputeProvider, FieldValue, FootprintProof,
     RenderPipelineContract, RenderPipelineStage, SemanticDigest, StageBufferBinding,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep,
-    MAX_RENDER_SAMPLERS, MAX_RENDER_TEXTURES,
+    TextureBindingContract, TextureSource, TextureView, TracePass, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, MAX_RENDER_SAMPLERS,
+    MAX_RENDER_TEXTURES,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -51,6 +52,12 @@ use reims_vgpu::observe::Decline as _;
 use reims_vgpu::protocol::pixel_format::{
     MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM,
 };
+// The R28 helpers below are file-scope, so the two runtime types they name are
+// too: the guest reference a window's run carries, and the window the
+// registration ledger derived for it.
+use reims_vgpu::backend::provider_wire;
+use reims_vgpu::runtime::guest_ram::GuestRef;
+use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -13288,24 +13295,29 @@ fn a_productions_window_backed_bind_is_re_imported_into_the_consuming_trace() {
     );
 }
 
-/// R22: a sampled pass whose binds the owner→provider frame has to carry stays
-/// on the engine **by name**, rather than being admitted and then refused.
+/// R28: the sample pass whose binds the owner→provider frame has to carry now
+/// leaves for the provider, and the *frame* is what says so.
 ///
-/// The frame's render contract carries no texture declarations yet
-/// (`research/docs/23` §101.5): the codec has a kind for the compute half's
-/// declarations and none for the render half's, so a sampled pass whose binds
-/// travel as leases reaches admission with its declarations dropped and is
-/// refused there (`UndeclaredTextureBinding`). That is a *decline*, not a
-/// fallback — and before this condition existed the rail answered exactly that
-/// way for this shape (the reading is archived in the R22 evidence directory).
-/// The class answers the wire question before the frame exists, so the shape
-/// falls back instead: the same two device answers the runtime sampler
-/// condition above keeps.
+/// R22's guard kept this shape on the engine by name, because the frame's
+/// render contract carried no texture declarations then
+/// (`research/docs/23` §101.5: a codec kind for the compute half's declarations
+/// and none for the render half's), so the decoded pass bound views no contract
+/// declared and admission refused it (`UndeclaredTextureBinding`) — a decline,
+/// not a fallback. E-TX4 gave the frame both halves of that statement (the
+/// render contract's texture declarations and the pass block that pairs them
+/// with the views), and this increment reads the frame rather than assuming
+/// either answer: the class asks the wire's own capability section
+/// (`declared_render_texture_support`) and the submission's frame is decoded
+/// and read back.
+///
+/// The falsifiable half is the decoded frame: one declaration at the Metal
+/// index the module states, one view under it, the view's source arm named. A
+/// frame that stripped the declarations would decode `view=absent`, which is
+/// the reading that used to make this shape a decline.
 #[test]
-fn a_sampled_pass_the_wire_would_strip_stays_on_the_engine_by_name() {
+fn a_sampled_pass_whose_frame_carries_the_declarations_leaves_for_the_provider() {
     use reims_vgpu::backend::provider_compute::device_epoch;
-    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
-    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
 
     let _guard = engine_test_session();
     let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
@@ -13325,15 +13337,6 @@ fn a_sampled_pass_the_wire_would_strip_stays_on_the_engine_by_name() {
     let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
         .expect("the slice came from this import");
     let import_id = import.id().get();
-    provider_owner::register(Region {
-        import: import_id,
-        epoch: device_epoch().expect("the rail's provider epoch"),
-        host_pointer: owner.pointer as usize,
-        length: 2 * page as u64,
-        page_size: alignment,
-        gpa_base: Some(0x42_0000),
-    })
-    .expect("a page-aligned registration is a legal provider region");
     let registered = RegisteredWindow {
         import: import.id(),
         base: owner.pointer as u64,
@@ -13359,26 +13362,506 @@ fn a_sampled_pass_the_wire_would_strip_stays_on_the_engine_by_name() {
         direct_image: None,
     });
     let stages = sampled_stages();
-    let mut request = sampled_request(&stages, sampled_texels(8, 4), (8, 4));
-    request.vertex_attributes[0].content = content;
+    let request = || {
+        let mut request = sampled_request(&stages, sampled_texels(8, 4), (8, 4));
+        request.vertex_attributes[0].content = content.clone();
+        request
+    };
+    // The engine arm runs first: the engine's device context is created lazily
+    // on its first draw, and that creation resets the owner rail — a
+    // registration made before it would be dropped before the provider asked
+    // for it.
+    let engine = engine_pixels("R28 wire-carrying sampled pass", &stages, request())
+        .expect("the engine draws this shape");
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x42_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
     let wire_before = route_count("render_provider_out_of_class_texture_wire");
     let submissions = provider_render::provider_submissions();
-    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &request) {
-        RenderRailOutcome::NotInNarrowClass(reason) => {
-            eprintln!("door: {}\n  {}", reason.slug(), reason.detail());
-            assert_eq!(reason.slug(), "render_provider_out_of_class_texture_wire");
-        }
-        other => panic!("a sampled pass the wire would strip stays on the engine: {other:?}"),
-    }
+    // The frame this submission produces is kept, so the reading below is taken
+    // from the bytes that travel rather than from the values this test built.
+    let (declarations, views, provider) =
+        wire_textures_of_one_submission("R28 wire-carrying sampled pass", || {
+            provider_pixels("R28 wire-carrying sampled pass", &stages, &request())
+        });
+    assert_frames_equal(
+        "the sampled pass lands the engine's frame",
+        &provider,
+        &engine,
+    );
     assert_eq!(
         route_count("render_provider_out_of_class_texture_wire") - wire_before,
-        1,
-        "the refused shape is counted under its own name"
+        0,
+        "the shape is no longer a wire refusal: the frame carries its declarations"
     );
     assert_eq!(
         provider_render::provider_submissions(),
-        submissions,
-        "the draw never reaches the provider — a fallback, not the decline the frame would earn"
+        submissions + 1,
+        "the draw reached the provider instead of falling back"
+    );
+    // The frame's own reading: one texture declaration, one view under it, and
+    // the source arm the class stated.
+    assert_eq!(declarations.len(), 1, "the frame carries the declaration");
+    assert_eq!(declarations[0].metal_binding, 0);
+    assert_eq!(views.len(), 1, "the frame carries the pass's own view");
+    assert_eq!(views[0].metal_binding, declarations[0].metal_binding);
+    assert!(
+        !matches!(views[0].source, TextureSource::TraceView),
+        "the sampled pass's view is a view the frame carries, not a dropped one"
+    );
+    eprintln!(
+        "R28 wire: {} declaration(s) beside {} view(s); view source = {:?}; provider frame == \
+         engine frame",
+        declarations.len(),
+        views.len(),
+        texture_source_arm(&views[0].source),
+    );
+}
+
+/// The name one decoded texture view's source arm is reported under, with the
+/// lease it names when it names one (R28).
+fn texture_source_arm(source: &TextureSource) -> String {
+    match source {
+        TextureSource::OwnedBytes(bytes) => format!("owned_bytes={}", bytes.len()),
+        TextureSource::StagedLease(lease) => format!("staged_lease={}", lease.get()),
+        TextureSource::BorrowedNoCopy(lease) => format!("borrowed_lease={}", lease.get()),
+        TextureSource::TraceView => "trace_view".to_owned(),
+    }
+}
+
+/// One submission's *decoded* frame, read for the texture declarations the
+/// pipeline entry carries and the views the pass carries under them (R28).
+///
+/// The reading is taken from the bytes the rail produced — the capture facility
+/// in [`reims_vgpu::backend::provider_wire`] — and decoded with the provider's
+/// own decoder, because "the frame carries the pass's texture declarations" is
+/// a statement about bytes and every other reading would be a second spelling
+/// of the values the rail built.
+fn wire_textures_of_one_submission(
+    label: &str,
+    submit: impl FnOnce() -> Vec<u8>,
+) -> (Vec<TextureBindingContract>, Vec<TextureView>, Vec<u8>) {
+    provider_wire::capture_submission_frames(true);
+    let frame_bytes = submit();
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    let decoded = frames
+        .iter()
+        .filter_map(|frame| provider_wire::carried_submission(frame).ok())
+        .find_map(|(trace, _)| {
+            let declarations = trace
+                .pipelines
+                .iter()
+                .find_map(|pipeline| pipeline.render.as_ref())
+                .map(|render| render.textures.clone())?;
+            let pass = trace.passes.iter().find_map(TracePass::as_render)?;
+            Some((declarations, pass.textures.clone()))
+        })
+        .unwrap_or_else(|| panic!("{label}: the submission's frame decodes as a sampled pass"));
+    (decoded.0, decoded.1, frame_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// R28: the sampled texture's own window — the guest gather, declared
+// ---------------------------------------------------------------------------
+
+/// One sampled texture the *zero-copy rail* resolved: the request carries no
+/// copy of the texels, the bytes live in the owner's registered mapping, and
+/// the one run names the provider-shaped window the ledger derived for it.
+///
+/// `head` is the byte distance from the window's first byte to the texture's
+/// (the run's own in-granule offset plus the source's `source_offset`), which
+/// is the one fact that decides between the two arms the class can state: a
+/// window whose first byte *is* the texture's leaves as the borrowed no-copy
+/// lease, and one that starts earlier leaves as the owner's staged copy of the
+/// extent ([`texture_window_arm`]).
+fn sampled_window_source(
+    base: usize,
+    mapping_len: u64,
+    guest: GuestRef,
+    window: RegisteredWindow,
+    head: u64,
+    extent: u64,
+) -> SampledSource {
+    SampledSource::GuestRuns(
+        engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                base,
+                mapping_len,
+                0,
+                head + extent,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset: head,
+            total_len: extent,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+                window_offset: 0,
+                guest,
+                window: Some(window),
+            }])),
+            direct_image: None,
+        },
+        reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+    )
+}
+
+/// R28: the sampled texture whose texels are the guest's own pages — the arm
+/// census v19 read 288 times as `texture_source` — leaves for the canonical
+/// provider through the owner rail's *borrowed* window.
+///
+/// The shape is the vertex streams' R9q arm one binding over: the bind's one
+/// page run carries the window the registration ledger derived for it, the
+/// window's first byte is the texture's own (so the contract's window rule —
+/// a texture's tightly packed extent at the reservation's own start — states
+/// exactly these bytes), and the declaration names the lease the plan imported.
+///
+/// Three readings, because each one alone would pass for a rail that did
+/// something else:
+///
+/// - the frame the provider lands is the texel the shader samples *out of the
+///   owner's mapping*, not a colour the request carries: the request states no
+///   bytes at all for this bind;
+/// - moving the mapping's read texel moves the provider's frame with it, so the
+///   bytes travel from the mapping rather than from a copy taken anywhere else;
+/// - the submission's own frame decodes with the declaration beside the view
+///   and the view's source named `borrowed_lease`, which is the wire's statement
+///   that this is the no-copy arm and not a staged one.
+///
+/// The engine and the provider land the same frame byte for byte on top of
+/// that.
+#[test]
+fn a_sampled_texture_in_a_registered_window_leaves_without_a_copy() {
+    use reims_vgpu::backend::provider_compute::device_epoch;
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let (read_x, read_y) = SAMPLED_TEXEL;
+    let read_bytes = |texels: &[Vec<u8>]| {
+        let texel = &texels[read_y * width as usize + read_x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    let flat =
+        |texels: &[Vec<u8>]| -> Vec<u8> { texels.iter().flat_map(|texel| texel.clone()).collect() };
+    let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
+        .expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the no-copy arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The texture's whole extent at the window's own first byte: the shape the
+    // borrowed arm is the answer to.
+    let bytes = flat(&texels);
+    owner.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let import_id = import.id().get();
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // The request as the zero-copy rail builds it: no bytes for the bind, one
+    // run over the owner's mapping and the window the ledger derived.
+    // The mapping's own address, read once: the closure below must not borrow
+    // the owner itself, because the falsifiable half moves its bytes.
+    let base = owner.pointer as usize;
+    let request = || {
+        let mut request = sampled_request(&stages, texels.clone(), (width, height));
+        request.sampled_images[0].source = sampled_window_source(
+            base,
+            2 * page as u64,
+            guest.clone(),
+            registered,
+            0,
+            bytes.len() as u64,
+        );
+        request
+    };
+    // The engine arm first: its device context is created lazily on the first
+    // draw, and that creation resets the owner rail.
+    let engine = engine_pixels("R28 borrowed sampled window", &stages, request())
+        .expect("the engine gathers this shape");
+    assert_uniform_frame(
+        "R28 borrowed sampled window (engine)",
+        &engine,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x44_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let borrowed_before = route_count("render_provider_sampled_window_borrowed");
+    let staged_before = route_count("render_provider_sampled_window_staged");
+    let (declarations, views, provider) =
+        wire_textures_of_one_submission("R28 borrowed sampled window", || {
+            provider_pixels("R28 borrowed sampled window", &stages, &request())
+        });
+    assert_uniform_frame(
+        "R28 borrowed sampled window (provider)",
+        &provider,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+    assert_frames_equal("the two rails agree on the window", &provider, &engine);
+    assert_eq!(
+        route_count("render_provider_sampled_window_borrowed") - borrowed_before,
+        1,
+        "the arm the device took is the borrowed window"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_window_staged") - staged_before,
+        0,
+        "nothing was copied for this bind"
+    );
+    assert_eq!(declarations.len(), 1, "the frame carries the declaration");
+    assert_eq!(views.len(), 1, "the frame carries the pass's own view");
+    assert!(
+        matches!(views[0].source, TextureSource::BorrowedNoCopy(_)),
+        "the declaration names the owner's no-copy window: {:?}",
+        texture_source_arm(&views[0].source)
+    );
+
+    // The falsifiable half: move the texel the fragment samples in the owner's
+    // own mapping, re-submit, and the provider's frame follows — the bytes came
+    // from the mapping, not from a copy this rail took elsewhere.
+    let mut moved = texels.clone();
+    moved[read_y * width as usize + read_x] = vec![255, 0, 128, 255];
+    owner.as_mut_slice()[..bytes.len()].copy_from_slice(&flat(&moved));
+    let after = provider_pixels("R28 borrowed sampled window (moved)", &stages, &request());
+    assert_uniform_frame(
+        "R28 borrowed sampled window (moved)",
+        &after,
+        width,
+        height,
+        read_bytes(&moved),
+    );
+    assert_frames_differ("the mapping's own bytes reach the frame", &provider, &after);
+    eprintln!(
+        "R28 borrowed sampled window: {width}x{height} texels in one registered window, head=0; \
+         provider frame == engine frame == {:?}; the read texel's move moved it; the frame's view \
+         is {}",
+        read_bytes(&texels),
+        texture_source_arm(&views[0].source),
+    );
+}
+
+/// R28: the same gather whose window starts *before* the texture is the arm the
+/// contract's window rule cannot state as a borrow, and the class copies the
+/// extent out of the registration instead.
+///
+/// E reads a lease-backed texture at the reservation's own start (the window
+/// rule is "the texture's tightly packed extent at the reservation's start"), so
+/// a texture whose first byte is four bytes into the granule would be read from
+/// the wrong bytes by the borrowed arm. That is the same shape R18 answered for
+/// a stage buffer whose view pointer the granules turn away — this is its
+/// sampled sibling, and the copy is the arm the class states.
+///
+/// What has to be falsifiable is *which* bytes the copy read: the pattern is
+/// offset by four bytes inside the window, so a copy taken from the window's
+/// start would land the neighbouring texel's colour in the frame, and the
+/// assertions below would name it rather than pass.
+#[test]
+fn a_sampled_texture_whose_window_starts_inside_the_granule_is_copied() {
+    use reims_vgpu::backend::provider_compute::device_epoch;
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    /// The texture's first byte inside its window (R18's own head).
+    const HEAD: u64 = 4;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let (read_x, read_y) = SAMPLED_TEXEL;
+    let read_bytes = |texels: &[Vec<u8>]| {
+        let texel = &texels[read_y * width as usize + read_x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    let flat =
+        |texels: &[Vec<u8>]| -> Vec<u8> { texels.iter().flat_map(|texel| texel.clone()).collect() };
+    let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
+        .expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let bytes = flat(&texels);
+    // Four bytes the texture does not own, then the extent — so a copy that
+    // started at the window's own first byte would sample another colour.
+    owner.as_mut_slice()[..4].copy_from_slice(&[1, 2, 3, 255]);
+    owner.as_mut_slice()[HEAD as usize..HEAD as usize + bytes.len()].copy_from_slice(&bytes);
+    let shifted = {
+        let mut shifted = texels.clone();
+        // The texel a window-start read would land: one texel earlier, which
+        // every pattern here makes a different colour.
+        shifted[read_y * width as usize + read_x] =
+            texels[read_y * width as usize + read_x - 1].clone();
+        read_bytes(&shifted)
+    };
+    assert_ne!(
+        shifted,
+        read_bytes(&texels),
+        "the fixture has to make a shifted read visible"
+    );
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let import_id = import.id().get();
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    let request = || {
+        let mut request = sampled_request(&stages, texels.clone(), (width, height));
+        request.sampled_images[0].source = sampled_window_source(
+            owner.pointer as usize,
+            2 * page as u64,
+            guest.clone(),
+            registered,
+            HEAD,
+            bytes.len() as u64,
+        );
+        request
+    };
+    let engine = engine_pixels("R28 copied sampled window", &stages, request())
+        .expect("the engine gathers this shape");
+    assert_uniform_frame(
+        "R28 copied sampled window (engine)",
+        &engine,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x45_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let staged_before = route_count("render_provider_sampled_window_staged");
+    let staged_bytes_before = route_count("render_provider_sampled_window_bytes");
+    let (declarations, views, provider) =
+        wire_textures_of_one_submission("R28 copied sampled window", || {
+            provider_pixels("R28 copied sampled window", &stages, &request())
+        });
+    assert_uniform_frame(
+        "R28 copied sampled window (provider)",
+        &provider,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+    assert_frames_equal("the two rails agree on the copy", &provider, &engine);
+    assert_eq!(
+        route_count("render_provider_sampled_window_staged") - staged_before,
+        1,
+        "the arm the class took is the owner's staged copy"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_window_bytes") - staged_bytes_before,
+        bytes.len() as u64,
+        "the copy is exactly the texture's extent"
+    );
+    assert_eq!(declarations.len(), 1, "the frame carries the declaration");
+    assert!(
+        matches!(views[0].source, TextureSource::StagedLease(_)),
+        "the declaration names the owner's staged copy: {:?}",
+        texture_source_arm(&views[0].source)
+    );
+    eprintln!(
+        "R28 copied sampled window: the extent starts {HEAD} byte(s) into the window; provider \
+         frame == engine frame == {:?} (a window-start copy would have landed {shifted:?}); the \
+         frame's view is {}",
+        read_bytes(&texels),
+        texture_source_arm(&views[0].source),
+    );
+}
+
+/// R28: the answer the class's texture-wire question reads comes out of the
+/// *frame*, and it is falsifiable in both directions.
+///
+/// The gate asks `render_texture_support`, which encodes the provider's own
+/// capability snapshot, decodes it again with the provider's decoder and reads
+/// the render-sampler section back out. Two readings of one snapshot below: the
+/// device's own (the section is present and holds the two 8-bit orders) and the
+/// same snapshot with the section's bits cleared, which the codec keeps as the
+/// shorter legacy frame and the decoder reads as the section's defaults —
+/// `false`/`0`/empty, the answer that keeps a sampled pass on the engine.
+#[test]
+fn the_render_texture_capability_the_class_reads_comes_out_of_the_frame() {
+    use metal_api_core::provider::TextureFormat;
+
+    let _guard = engine_test_session();
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let provider =
+        VulkanComputeProvider::with_executor(executor).expect("the canonical provider builds");
+    let epoch = provider.device_epoch();
+    let declared = provider_wire::render_texture_support(epoch, &provider.capabilities())
+        .expect("the capability frame round-trips");
+    assert!(
+        declared.supported,
+        "the acceptance environment's provider declares render texture sampling"
+    );
+    assert!(declared.maximum >= 1, "and a binding it admits");
+    assert!(declared.formats.contains(&TextureFormat::Rgba8Unorm));
+    assert!(declared.formats.contains(&TextureFormat::Bgra8Unorm));
+
+    let mut refused = provider.capabilities();
+    refused.supports_render_texture_sampling = false;
+    refused.max_render_textures = 0;
+    refused.supported_render_texture_formats.clear();
+    let silent = provider_wire::render_texture_support(epoch, &refused)
+        .expect("the shorter frame still round-trips");
+    assert!(
+        !silent.supported && silent.maximum == 0 && silent.formats.is_empty(),
+        "a snapshot without the section reads as the refusal: {silent:?}"
+    );
+    eprintln!(
+        "R28 wire capability: supported={} max={} formats={:?}; the same snapshot without the \
+         section reads supported={} max={} formats={:?}",
+        declared.supported,
+        declared.maximum,
+        declared.formats,
+        silent.supported,
+        silent.maximum,
+        silent.formats,
     );
 }
 
@@ -13828,5 +14311,186 @@ fn a_carried_frames_own_record_is_restatable_as_a_production() {
          {:?}, no frame handed to the consumer — R22's arm restated the producing pass",
         texel_at(&sampled, 0, 0),
         texel_at(&engine_sampled, 0, 0),
+    );
+}
+/// R28: the gathers the class *cannot* state as one registered window keep the
+/// engine under the same bucket, one sentence naming the fact that refused.
+///
+/// The window the contract states for a texture is its tightly packed extent at
+/// the reservation's own start, so every gather outside that shape is an exit —
+/// and each one below is a different fact, not one looser rule: no registration
+/// under the current epoch, padded guest rows (a lease window carries no
+/// stride), more than one stretch (no single host range is the bind's), a span
+/// that is not the texture's extent, and a window that does not reach the
+/// extent from its first byte. The class is pure here: no provider is asked and
+/// no lease is minted for a shape that stays on the engine.
+#[test]
+fn the_gathers_outside_one_registered_window_stay_on_the_engine_by_name() {
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let extent = u64::from(width) * u64::from(height) * 4;
+    let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
+        .expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let base = owner.pointer as usize;
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: base as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // One run over the owner's mapping, `len` bytes long, and the page runs the
+    // gather carries: the two numbers a shape below varies.
+    let gather = |spec: (u64, u32, Vec<GuestWindowRun>)| {
+        let (total_len, row_length_texels, pages) = spec;
+        SampledSource::GuestRuns(
+            engine::GuestRunSource {
+                runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                    base,
+                    2 * page as u64,
+                    0,
+                    extent,
+                )
+                .expect("the bind's own bytes are inside the mapping")]),
+                source_offset: 0,
+                total_len,
+                row_length_texels,
+                pages: Some(std::sync::Arc::new(pages)),
+                direct_image: None,
+            },
+            reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+        )
+    };
+    let run = |guest: GuestRef, window: Option<RegisteredWindow>| GuestWindowRun {
+        window_offset: 0,
+        guest,
+        window,
+    };
+    let short_window = RegisteredWindow {
+        length: extent / 2,
+        ..registered
+    };
+    let answer = |label: &str, source: SampledSource| -> (String, String) {
+        let mut request = sampled_request(&stages, texels.clone(), (width, height));
+        request.sampled_images[0].source = source;
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the shape is out of class: {other:?}"),
+        }
+    };
+    let deliveries = provider_render::provider_submissions();
+
+    // No registration under the current epoch: the one run carries no window.
+    let unregistered = answer(
+        "unregistered gathered texture",
+        gather((extent, 0, vec![run(guest.clone(), None)])),
+    );
+    eprintln!("door: {}\n  {}", unregistered.0, unregistered.1);
+    assert_eq!(
+        unregistered.0,
+        "render_provider_out_of_class_texture_source"
+    );
+    assert!(
+        unregistered.1.contains("no registered window"),
+        "the sentence names the fact that met it: {}",
+        unregistered.1
+    );
+
+    // Padded rows: a lease window carries a tightly packed extent, not a
+    // stride, so the stride is a fact this class cannot state.
+    let padded = answer(
+        "padded-row gathered texture",
+        gather((extent, width, vec![run(guest.clone(), Some(registered))])),
+    );
+    eprintln!("door: {}\n  {}", padded.0, padded.1);
+    assert_eq!(padded.0, "render_provider_out_of_class_texture_source");
+    assert!(
+        padded.1.contains("rows are padded") && padded.1.contains("row_length_texels`=8"),
+        "the sentence names the stride: {}",
+        padded.1
+    );
+
+    // Two stretches: no single host range is the bind's bytes.
+    let scattered = answer(
+        "scattered gathered texture",
+        gather((
+            extent,
+            0,
+            vec![
+                run(guest.clone(), Some(registered)),
+                GuestWindowRun {
+                    window_offset: extent / 2,
+                    ..run(guest.clone(), Some(registered))
+                },
+            ],
+        )),
+    );
+    eprintln!("door: {}\n  {}", scattered.0, scattered.1);
+    assert_eq!(scattered.0, "render_provider_out_of_class_texture_source");
+    assert!(
+        scattered.1.contains("scattered over 2 stretch(es)"),
+        "the sentence names the scatter: {}",
+        scattered.1
+    );
+
+    // A span that is not the texture's extent: the lease reads exactly the
+    // extent, so a short window is a shape this class does not guess at.
+    let short_span = answer(
+        "short-span gathered texture",
+        gather((extent - 4, 0, vec![run(guest.clone(), Some(registered))])),
+    );
+    eprintln!("door: {}\n  {}", short_span.0, short_span.1);
+    assert_eq!(short_span.0, "render_provider_out_of_class_texture_source");
+    assert!(
+        short_span.1.contains("span is 124 byte(s) for a 128 byte"),
+        "the sentence names both numbers: {}",
+        short_span.1
+    );
+
+    // A window that does not reach the extent from the texture's first byte.
+    let short_window_answer = answer(
+        "short-window gathered texture",
+        gather((extent, 0, vec![run(guest.clone(), Some(short_window))])),
+    );
+    eprintln!(
+        "door: {}\n  {}",
+        short_window_answer.0, short_window_answer.1
+    );
+    assert_eq!(
+        short_window_answer.0,
+        "render_provider_out_of_class_texture_source"
+    );
+    assert!(
+        short_window_answer
+            .1
+            .contains("starts 0 byte(s) into a 64 byte window"),
+        "the sentence names the window and the extent: {}",
+        short_window_answer.1
+    );
+
+    // The class is pure for every one of them: no provider, no lease.
+    assert_eq!(
+        provider_render::provider_submissions(),
+        deliveries,
+        "a gather outside one registered window never reaches the provider"
     );
 }
