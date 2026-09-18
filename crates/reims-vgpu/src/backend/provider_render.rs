@@ -87,15 +87,23 @@
 //!   render sampler uploads (a single-sample, non-arrayed, read-only 2D
 //!   surface whose texels are one of the two four-byte 8-bit UNORM byte orders
 //!   — `rgba8_unorm`/`bgra8_unorm`, the provider's whole `RENDER_SAMPLED`
-//!   window since E-TX1/§107 — at the render area's own extent unless the
-//!   device's frame declares the gather below, R37) — beside the draw's own
-//!   bind, and requires the bind's sampler state to repeat the module's. Every
-//!   other shape is a named exit ([`sampled_textures`]): a resource family the
+//!   window since E-TX1/§107, **and, while the device's own capability frame
+//!   lists them, the two narrow lanes E's `render-sampled-narrow-lanes`
+//!   appended to that same list** — `r8_unorm` and `r8g8_unorm`, R39, whose
+//!   texels the canonical rail uploads at their own width and samples as the
+//!   lane's own channels name: `(r,0,0,1)` and `(r,g,0,1)`, which is the texel
+//!   the format declares rather than a four-channel summary of its bytes — at
+//!   the render area's own extent unless the device's frame declares the gather
+//!   below, R37) — beside the draw's own bind, and requires the bind's sampler
+//!   state to repeat the module's. Every other shape is a named exit
+//!   ([`sampled_textures`]): a resource family the
 //!   translated rail does not execute, a texture index at or above the
 //!   contract's own bound or a list that repeats an index or walks backwards, a
 //!   reflected shape or state outside the family, an unbound declaration, a
-//!   bind whose texels are a resident image, a texture of another extent, and a
-//!   draw whose sampler says another state;
+//!   bind whose texels are a resident image, a texture of another extent, a lane
+//!   the frame does not list — the fail-closed half of R39, which reads the
+//!   sentence this class shipped before the increment, verbatim — and a draw
+//!   whose sampler says another state;
 //! - **a sampled texture whose texels are the guest's own pages** (R28): the
 //!   bind a real boot resolves through the zero-copy rail
 //!   (`SampledSource::GuestRuns`) leaves for the provider through the owner
@@ -1832,6 +1840,39 @@ fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
     })
 }
 
+/// The texel lanes the bind sentence names as the provider's window (R39).
+///
+/// The two four-byte orders are the window this class has stated since E-TX1
+/// and are named whatever the frame says: a device that omitted one of them is
+/// answered by R28's own wire reading when the pass crosses the frame, not by a
+/// second spelling of that rule here, so that half of the sentence keeps the
+/// reading it always had. The two narrow lanes are named exactly while the
+/// device's own frame lists them — and with neither lane stated the string
+/// below is the sentence this class shipped, byte for byte, which is what keeps
+/// a pre-increment device's refusal (and the census's reading of it) unchanged.
+///
+/// One phrase per shape of the answer rather than a list assembled at run time:
+/// the sentence is the census's own key for this door, so it is written out.
+fn sampled_bind_window(lanes: NarrowLanes) -> &'static str {
+    match (lanes.r8, lanes.rg8) {
+        (false, false) => {
+            "`rgba8_unorm` or `bgra8_unorm` texels (the provider's whole `RENDER_SAMPLED` window)"
+        }
+        (true, false) => {
+            "`rgba8_unorm`, `bgra8_unorm` or `r8_unorm` texels (the format lanes the provider's \
+             own frame lists)"
+        }
+        (false, true) => {
+            "`rgba8_unorm`, `bgra8_unorm` or `r8g8_unorm` texels (the format lanes the provider's \
+             own frame lists)"
+        }
+        (true, true) => {
+            "`rgba8_unorm`, `bgra8_unorm`, `r8_unorm` or `r8g8_unorm` texels (the provider's whole \
+             `RENDER_SAMPLED` window)"
+        }
+    }
+}
+
 /// The sampled textures one request's fragment stage declares, weighed against
 /// the module's own declarations (R10, `research/docs/23` §101).
 ///
@@ -1870,8 +1911,10 @@ fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
 /// 2. **What the draw bound.** Declaration `i` pairs with the request's own
 ///    bind at the device binding the runtime resolved it at; a declaration
 ///    without one is `..._texture_unbound`, a bind whose shape the pass cannot
-///    state (dimensionality, layers, descriptor count, a texel outside the two
-///    8-bit byte orders `rgba8_unorm`/`bgra8_unorm`, a view swizzle) is
+///    state (dimensionality, layers, descriptor count, a texel outside the
+///    lanes the device's own frame lists — the two 8-bit byte orders
+///    `rgba8_unorm`/`bgra8_unorm`, and since R39 the one- and two-byte UNORM
+///    lanes beside them — a view swizzle) is
 ///    `..._texture_bind`, and a bind whose texels are a guest
 ///    gather or a resident image rather than the request's own copy is
 ///    `..._texture_source` — this increment carries text-owned bytes the way
@@ -1908,6 +1951,12 @@ fn sampled_textures<'a>(
     // ([`sampled_source_of_another_extent`]) — the gate below is pure and reads
     // no device answer of its own.
     render_texture_gathered_extent: bool,
+    // The device's own answer to the narrow-lane rule's one question (R39),
+    // read by [`submit_render`] out of the same frame exactly when the request
+    // names a sampled bind whose view format is one of the two lanes
+    // ([`sampled_bind_of_a_narrow_lane`]) — the gate below is pure and reads no
+    // device answer of its own.
+    render_texture_narrow_lanes: NarrowLanes,
 ) -> Result<NarrowSampling<'a>, OutOfClass> {
     if req.color_input {
         return Err(OutOfClass::new(
@@ -2210,18 +2259,26 @@ fn sampled_textures<'a>(
         };
         // The texel the canonical render sampler uploads, named by the bind's
         // own Vulkan view format (E-TX1, `research/docs/23` §107): the
-        // provider's whole `RENDER_SAMPLED` window is the two four-byte 8-bit
-        // UNORM byte orders, and the bytes travel verbatim into the image the
-        // *name* selects, so the fragment stage reads the channels the guest's
-        // own view states. Any other format — the narrow single- and
-        // dual-channel lanes and the wide half-float the census counts — is
-        // refused by the provider under `render_texture_format_unsupported`, so
-        // this class answers it here rather than handing the provider a draw
-        // the engine would have run.
+        // provider's window on this device is the two four-byte 8-bit UNORM
+        // byte orders and — when the device's own frame lists them (R39, E's
+        // `render-sampled-narrow-lanes`) — the one- and two-byte UNORM lanes
+        // beside them, and the bytes travel verbatim into the image the *name*
+        // selects, so the fragment stage reads the channels the guest's own
+        // view states (`r8_unorm` reads `(r,0,0,1)`, `r8g8_unorm` reads
+        // `(r,g,0,1)`, which is the texel each lane's own format declares and
+        // not a four-channel summary of it). Any other format — the wide
+        // half-float, the sRGB spellings of the two byte orders, the integer
+        // lanes the census counts — is refused by the provider under
+        // `render_texture_format_unsupported`, so this class answers it here
+        // rather than handing the provider a draw the engine would have run.
         let format = match image.format {
             ash::vk::Format::R8G8B8A8_UNORM => Some(TextureFormat::Rgba8Unorm),
             ash::vk::Format::B8G8R8A8_UNORM => Some(TextureFormat::Bgra8Unorm),
-            _ => None,
+            // The two lanes E appended to `RENDER_SAMPLED`, each admitted only
+            // while the device's own frame lists it: the answer is asked once
+            // per request and travels as a value, so a frame that does not
+            // carry a lane leaves this arm's `None` exactly where it was.
+            narrow => render_texture_narrow_lanes.admits(narrow),
         };
         let bindable = image.array_element == 0
             && image.descriptor_count == 1
@@ -2237,13 +2294,13 @@ fn sampled_textures<'a>(
                 format!(
                     "a draw that binds a texture of its own shape at `[[texture({})]]` stays on \
                      the engine: the canonical pass states one single-sample, non-arrayed 2D view \
-                     with one descriptor, `rgba8_unorm` or `bgra8_unorm` texels (the provider's \
-                     whole `RENDER_SAMPLED` window) and an identity channel mapping, and the bind \
+                     with one descriptor, {} and an identity channel mapping, and the bind \
                      is {}x{} {:?} (kind {:?}, layers {}, descriptors {}, element {}, multisampled \
                      {}) — a texel outside that window is refused by the provider by name \
                      (`render_texture_format_unsupported`) rather than uploaded under another \
                      format",
                     declaration.index,
+                    sampled_bind_window(render_texture_narrow_lanes),
                     image.width,
                     image.height,
                     image.format,
@@ -2261,9 +2318,10 @@ fn sampled_textures<'a>(
         // through `TextureSource::TraceView`.
         let source = match &image.source {
             crate::backend::vulkan::engine::SampledSource::Bytes(bytes) => {
-                // Both window formats are four-byte texels, and the count comes
-                // from the format the bind states rather than from a constant
-                // here, so a later widening of the provider's window has one
+                // The count comes from the format the bind states rather than
+                // from a constant here — four bytes per texel for the two
+                // original orders, one or two for the narrow lanes R39
+                // admitted — so a widening of the provider's window has one
                 // place to answer for its own texel width.
                 let expected = u64::from(image.width)
                     .checked_mul(u64::from(image.height))
@@ -4379,6 +4437,165 @@ pub fn override_render_vertex_interface_superset(
     }
 }
 
+/// The two narrow sampled lanes the device's own frame lists (R39).
+///
+/// The render-sampler section's format list read one lane at a time, by the
+/// same one-snapshot-two-readings rule [`declared_render_texture_support`]
+/// states: E's `render-sampled-narrow-lanes` appended `r8_unorm` and
+/// `r8g8_unorm` to the contract's `RENDER_SAMPLED` list (design decision: the
+/// list is widened rather than a second list added), so a frame that carries
+/// them is a frame whose owner sees a provider that creates those views, and
+/// the class may state a bind of one.
+///
+/// `false` is the fail-closed answer for each lane: a frame written before the
+/// two codes existed decodes to a list without them, and an older *decoder*
+/// refuses the frame by name (`UnknownEnumValue`) rather than reading one of
+/// the new codes as another format, so this read can only ever widen the class
+/// by what the device states.
+///
+/// The bit is asked by shape and not by format: the class asks for the answer
+/// exactly when the request names a sampled bind whose view format is one of
+/// the two lanes ([`sampled_bind_of_a_narrow_lane`]), so a request whose binds
+/// are all four-byte texels reaches the rail's provider no earlier than it did.
+fn declared_render_texture_narrow_lanes() -> Result<NarrowLanes, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it. The list is widened or
+    // narrowed *in place*: the section is one presence-tagged block whose
+    // format list is the field in question, so a test's answer travels as the
+    // list an old (narrower) or a new (wider) frame carries.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match NARROW_LANES_ANSWER.load(Ordering::Relaxed) {
+            NARROW_LANES_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                let state_the_lanes = answer == NARROW_LANES_DECLARED;
+                declared.supported_render_texture_formats.retain(|format| {
+                    state_the_lanes
+                        || !matches!(format, TextureFormat::R8Unorm | TextureFormat::R8G8Unorm)
+                });
+                if state_the_lanes {
+                    for lane in [TextureFormat::R8Unorm, TextureFormat::R8G8Unorm] {
+                        if !declared.supported_render_texture_formats.contains(&lane) {
+                            declared.supported_render_texture_formats.push(lane);
+                        }
+                    }
+                }
+                declared
+            }
+        }
+    };
+    let support =
+        provider_wire::render_texture_narrow_lanes(rail.provider.device_epoch(), &capabilities)
+            .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+                step: decline.step,
+                detail: decline.detail,
+            })?;
+    Ok(NarrowLanes {
+        r8: support.r8,
+        rg8: support.rg8,
+    })
+}
+
+/// Which of the two narrow sampled lanes this class may state for a bind (R39),
+/// as the device's own frame lists them.
+///
+/// A copy value rather than a borrow of the reading: the class gate is pure and
+/// takes it as an argument ([`submit_render`] reads it), exactly as the R37
+/// extent answer travels.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NarrowLanes {
+    /// Whether the frame's format list carries `r8_unorm`.
+    r8: bool,
+    /// Whether the same list carries `r8g8_unorm`.
+    rg8: bool,
+}
+
+impl NarrowLanes {
+    /// The answer a device that lists neither lane gives, which is also what
+    /// every request whose binds state no narrow view reads: the class gate
+    /// then answers exactly as it did before this increment.
+    const NONE: Self = Self {
+        r8: false,
+        rg8: false,
+    };
+
+    /// The contract format this device's answer states for one bind's own
+    /// Vulkan view of a narrow lane, or `None` when the frame does not list it.
+    ///
+    /// The two wide lanes are deliberately **not** here: they are the window
+    /// the class has stated since E-TX1, and a device whose frame omitted one of
+    /// them is answered by R28's own wire reading when the pass crosses the
+    /// frame rather than by a second spelling of that rule in this gate.
+    fn admits(self, format: ash::vk::Format) -> Option<TextureFormat> {
+        match format {
+            ash::vk::Format::R8_UNORM if self.r8 => Some(TextureFormat::R8Unorm),
+            ash::vk::Format::R8G8_UNORM if self.rg8 => Some(TextureFormat::R8G8Unorm),
+            _ => None,
+        }
+    }
+}
+
+/// The device's own answer for the narrow lanes (R39), and the states the test
+/// instrument below can put it in.
+const NARROW_LANES_DEVICE: u8 = 0;
+const NARROW_LANES_NOT_DECLARED: u8 = 1;
+const NARROW_LANES_DECLARED: u8 = 2;
+
+/// Whether the narrow lanes are read from the device's own frame
+/// ([`NARROW_LANES_DEVICE`], what production runs) or from an answer a test
+/// stated.
+static NARROW_LANES_ANSWER: AtomicU8 = AtomicU8::new(NARROW_LANES_DEVICE);
+
+/// A test's own answer for the two narrow lanes, restored when it drops (R39).
+///
+/// The rail reads the lanes out of the provider's capability frame, and a test
+/// that has to see the fail-closed arm cannot make an admitted device stop
+/// listing them. While this guards an answer, the capability question is asked
+/// of a snapshot carrying (or missing) the two lanes — written, encoded and
+/// decoded through the same frame — so the arm a test sees is the arm an old
+/// frame gives (`absent` reads as undeclared), and the reading is still the
+/// wire's.
+///
+/// A guard rather than a plain setter for the reason
+/// [`RenderTextureGatheredExtentOverride`] is one: this changes a *decision*
+/// and not an observation, so a test that unwound through a failed assertion
+/// would otherwise leave the next shape in the same binary answering from a
+/// device that is not its own.
+pub struct RenderTextureNarrowLanesOverride {
+    previous: u8,
+}
+
+impl Drop for RenderTextureNarrowLanesOverride {
+    fn drop(&mut self) {
+        NARROW_LANES_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the narrow lanes as `declared` until the returned guard drops, or as the
+/// device's own answer for `None` (R39).
+///
+/// `Some(true)` states both lanes, `Some(false)` states neither: the contract's
+/// list is one list, so a device that lists one of the two lanes and not the
+/// other is not a shape this instrument has to be able to spell — and the class
+/// reads each lane separately from whatever the frame carries, so a frame that
+/// did carry one would be answered lane by lane rather than by a pair.
+pub fn override_render_texture_narrow_lanes(
+    declared: Option<bool>,
+) -> RenderTextureNarrowLanesOverride {
+    let answer = match declared {
+        None => NARROW_LANES_DEVICE,
+        Some(false) => NARROW_LANES_NOT_DECLARED,
+        Some(true) => NARROW_LANES_DECLARED,
+    };
+    RenderTextureNarrowLanesOverride {
+        previous: NARROW_LANES_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
 /// The highest vertex one indexed draw's own index bytes name, over the first
 /// `count` indices of the declared width, or `None` when the bytes stop short of
 /// them.
@@ -4703,6 +4920,39 @@ fn vertex_interface_declared_superset(
         }) => Some(u32::try_from(distance).unwrap_or(u32::MAX)),
         _ => None,
     }
+}
+
+/// The narrow-lane rule's own test (R39): the Metal index of the first
+/// declaration whose bind states one of the two narrow texel lanes this
+/// increment opened.
+///
+/// The sibling of [`sampled_source_of_another_extent`] and for the same reason:
+/// this is the shape test that lets the class ask the *device's* own answer
+/// before the pure gate runs, so a request whose sampled binds are all the
+/// window the class has always stated reaches the rail's provider no earlier
+/// than it did. It decides nothing about the shape — the gate weighs the bind's
+/// format against the device's answer and answers under
+/// `..._texture_bind` when the lane is not there.
+///
+/// The test is on the bind's *Vulkan view format* rather than on the contract
+/// format, because the contract format is what the answer decides: the mapping
+/// from one to the other is the gate's and asking it here would be a second
+/// spelling of it.
+fn sampled_bind_of_a_narrow_lane(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Option<u32> {
+    inputs
+        .fragment_texture_declarations
+        .iter()
+        .find_map(|declaration| {
+            let image = req
+                .sampled_images
+                .iter()
+                .find(|image| image.binding == declaration.binding)?;
+            matches!(
+                image.format,
+                ash::vk::Format::R8_UNORM | ash::vk::Format::R8G8_UNORM
+            )
+            .then_some(declaration.index)
+        })
 }
 
 /// The request's two stages' `[[buffer(N)]]` statement, every rule the class
@@ -7223,6 +7473,27 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // R39: the fourth device answer this rail asks *before* the gate, on the
+    // same terms as the three above. Which texel lanes the class may state for a
+    // sampled bind is the provider's own declaration — E's narrow-lane change
+    // appended `r8_unorm`/`r8g8_unorm` to the contract's `RENDER_SAMPLED` list,
+    // and the frame's format list is where a device states that it creates
+    // those views — so the answer is read out of the capability frame exactly
+    // when the request names a sampled bind whose view format is one of the two
+    // lanes ([`sampled_bind_of_a_narrow_lane`]). A request whose binds are all
+    // four-byte texels never asks, and the gate it reaches is the one this rail
+    // shipped: `NarrowLanes::NONE` states neither lane, so the narrow formats
+    // keep the refusal they had, by name, at the same point in the same order.
+    let render_texture_narrow_lanes = match sampled_bind_of_a_narrow_lane(inputs, req) {
+        None => NarrowLanes::NONE,
+        Some(_) => match declared_render_texture_narrow_lanes() {
+            Ok(declared) => declared,
+            // The same fail-closed rule as the three answers above: a provider
+            // that cannot answer is not a provider this rail may widen the
+            // class for.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(
@@ -7231,6 +7502,7 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
         stage_buffer_namespace_split,
         render_texture_gathered_extent,
         render_vertex_interface_superset,
+        render_texture_narrow_lanes,
     ) {
         Err(reason) => {
             reason.note();
@@ -7366,9 +7638,10 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     // does not hold the render-sampler section, or one whose section covers
     // fewer textures (or other formats) than this pass declares, keeps the draw
     // on the engine under the same bucket. Every texture this class admits is
-    // in the section's own format family (the two four-byte 8-bit UNORM byte
-    // orders, `RENDER_SAMPLED`), so the format half is a check and not a
-    // widening.
+    // in the section's own format family — the two four-byte 8-bit UNORM byte
+    // orders, plus the two narrow lanes R39 admits *only* while this same
+    // frame lists them (`declared_render_texture_narrow_lanes`) — so the
+    // format half is a check and not a widening.
     if !pass.textures.is_empty() && pass.crosses_the_frame() {
         let support = match declared_render_texture_support() {
             Ok(support) => support,
@@ -8413,17 +8686,19 @@ struct NarrowTexture<'a> {
     width: u64,
     height: u64,
     /// The texel the bind's own view names, resolved to the contract's format
-    /// (E-TX1, `research/docs/23` §107): one of the two four-byte 8-bit UNORM
-    /// byte orders, which is the provider's whole `RENDER_SAMPLED` window. The
-    /// declaration, the view and the byte count all read it, so the bytes and
-    /// the name they are uploaded under cannot drift apart.
+    /// (E-TX1, `research/docs/23` §107; the narrow lanes since R39): one of the
+    /// two four-byte 8-bit UNORM byte orders, or one of the one- and two-byte
+    /// lanes the device's own frame lists beside them. The declaration, the
+    /// view and the byte count all read it, so the bytes and the name they are
+    /// uploaded under cannot drift apart.
     format: TextureFormat,
     /// The sampler form the declaration states, or the sampler-free fetched
     /// arm (R15).
     sampler: NarrowSampler,
     /// Where the texels come from: the request's own tightly packed copy —
-    /// four bytes per texel, in the byte order [`Self::format`] names — or the
-    /// trace's own production of the identity the bind resolved to (R22).
+    /// at the texel width [`Self::format`] names, in the byte order it names —
+    /// or the trace's own production of the identity the bind resolved to
+    /// (R22).
     source: NarrowTextureSource<'a>,
 }
 
@@ -8796,6 +9071,7 @@ fn narrow_class<'a>(
     stage_buffer_namespace_split: bool,
     render_texture_gathered_extent: bool,
     render_vertex_interface_superset: bool,
+    render_texture_narrow_lanes: NarrowLanes,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R25: the packet's own chain value, when the caller hands it over for the
     // record that continues the chain. Role-gated here so the class states the
@@ -9515,7 +9791,12 @@ fn narrow_class<'a>(
     // binds — the canonical pass carries both, and the wire carries the pass's
     // texture list like any other view — and every shape the provider or the
     // module refuses keeps the engine under its own name ([`sampled_textures`]).
-    let sampling = sampled_textures(inputs, req, render_texture_gathered_extent)?;
+    let sampling = sampled_textures(
+        inputs,
+        req,
+        render_texture_gathered_extent,
+        render_texture_narrow_lanes,
+    )?;
     if req.occlusion_query.is_some() {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_visibility",

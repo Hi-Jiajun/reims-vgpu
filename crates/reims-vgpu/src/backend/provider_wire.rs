@@ -174,6 +174,48 @@ pub fn render_texture_support(
     })
 }
 
+/// The two narrow sampled lanes of one provider capability snapshot, read back
+/// out of the response frame the provider would send (`research/docs/23` §3.3,
+/// E's `render-sampled-narrow-lanes` / R39).
+///
+/// The seventh reading of the same one-snapshot rule ([`stage_buffer_support`],
+/// [`compute_texture_support`], [`render_texture_support`],
+/// [`render_sampler_carriage`], [`stage_buffer_namespace_split`],
+/// [`render_texture_gathered_extent`]), and it is R28's reading looked at one
+/// lane at a time: the section's own format list is what decides which texels
+/// the provider creates a sampled view for (`supported_render_texture_formats`,
+/// the field E's narrow-lane change widened), so the two lanes this rail asks
+/// about are answered by membership in *that* list and not by a second table
+/// here.
+///
+/// `false` is the fail-closed answer for each lane, and it is what a frame
+/// written before the lane existed decodes to: the two codes E appended
+/// (`5`/`6`) are absent from an older frame's list, and a decoder that met one
+/// is refusing the frame outright rather than reading it as another format, so
+/// a device whose section lists neither lane is a device that keeps those binds
+/// on the engine under the class's own name.
+pub fn render_texture_narrow_lanes(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<NarrowLaneSupport, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    let formats = decoded.supported_render_texture_formats;
+    Ok(NarrowLaneSupport {
+        r8: formats.contains(&TextureFormat::R8Unorm),
+        rg8: formats.contains(&TextureFormat::R8G8Unorm),
+    })
+}
+
+/// The two narrow sampled lanes of one provider capability snapshot, one bit
+/// each, as [`render_texture_narrow_lanes`] reads them out of the frame.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NarrowLaneSupport {
+    /// Whether the frame's format list carries `r8_unorm`.
+    pub r8: bool,
+    /// Whether the same list carries `r8g8_unorm`.
+    pub rg8: bool,
+}
+
 /// The runtime-sampler half of the same render-sampler section (R36).
 ///
 /// The fifth reading of the one-snapshot rule ([`stage_buffer_support`],
