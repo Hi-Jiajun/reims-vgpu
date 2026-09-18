@@ -96,9 +96,17 @@
 //!   tightly packed extent ([`sampled_gather_window`]), stated as the borrowed
 //!   no-copy window when the texture starts at the reservation's own first byte
 //!   and as the owner's staged copy of exactly the extent when it does not
-//!   ([`texture_window_arm`]). Everything else — a gather scattered over
-//!   stretches, one no registration covers, padded rows, a window that does not
-//!   reach the extent — keeps the draw on the engine under
+//!   ([`texture_window_arm`]). A gather whose *rows are padded* (`R36`) is the
+//!   one shape the two window arms cannot state — a lease names a tightly
+//!   packed extent, and the reservation holds the guest's rows with their
+//!   padding — so the class repacks the texture's own extent out of the
+//!   registration ([`PaddedRows::depad`], [`RowCopies`]) and states it as the
+//!   trace's own bytes (`TextureSource::OwnedBytes`), the arm the request's own
+//!   copy and R24's frame already take; a padded stride narrower than the
+//!   texture's own row and a padded span the stated row count cannot tile are
+//!   refusals by name. Everything else — a gather scattered over
+//!   stretches, one no registration covers, a window that does not
+//!   reach the span — keeps the draw on the engine under
 //!   `..._texture_source`, and a pass whose such bind crosses the
 //!   owner→provider frame also needs the frame to carry its declarations, which
 //!   the class reads out of the frame's own capability answer
@@ -940,6 +948,42 @@ impl WindowCopies {
         self.entries
             .iter()
             .find(|(label, _)| *label == binding)
+            .map(|(_, bytes)| bytes.as_slice())
+    }
+}
+
+/// The bytes one pass repacked out of a padded-row gather (`R36`), under the
+/// Metal `[[texture(n)]]` index the declaration is keyed by.
+///
+/// The sibling of [`WindowCopies`], with the same division of labour and for
+/// the same reason: the copy is made in the class gate, where the bytes behind
+/// a registered window are readable and where the device answers live, and
+/// [`submit_narrow`] states them. It is a second carrier rather than a second
+/// use of the first because the bytes are not a window's own range — they are
+/// the texture's tightly packed extent, assembled one row at a time — and
+/// because nothing about them is imported by the owner plan: a padded gather's
+/// declaration is the trace's own bytes (`TextureSource::OwnedBytes`), so no
+/// lease is minted and the owner binding label a [`WindowCopies`] entry travels
+/// under has no reader.
+///
+/// The key is the texture's own Metal index — the fact the contract pairs a
+/// declaration and a view by — rather than the entry's position, exactly as
+/// [`NarrowTexture::index`] is.
+#[derive(Default)]
+struct RowCopies {
+    entries: Vec<(u32, Vec<u8>)>,
+}
+
+impl RowCopies {
+    fn insert(&mut self, index: u32, bytes: Vec<u8>) {
+        self.entries.push((index, bytes));
+    }
+
+    /// The repacked bytes for one sampled texture, when this pass padded one.
+    fn bytes(&self, index: u32) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .find(|(label, _)| *label == index)
             .map(|(_, bytes)| bytes.as_slice())
     }
 }
@@ -2198,21 +2242,22 @@ fn sampled_textures<'a>(
             // first into. Every other gather keeps the engine under this
             // bucket.
             crate::backend::vulkan::engine::SampledSource::GuestRuns(source, _vouch) => {
-                // The texture's own tightly packed extent: the number the
-                // lease window reads and the copy reads, so one arithmetic
-                // feeds both arms.
-                let extent = u64::from(image.width)
-                    .checked_mul(u64::from(image.height))
-                    .and_then(|texels| texels.checked_mul(format.bytes_per_texel()));
-                let window = match extent {
-                    Some(extent) => sampled_gather_window(source, extent),
-                    None => Err(SampledGatherExit::Span {
-                        span: source.total_len,
-                        extent: 0,
-                    }),
-                };
-                let window = match window {
-                    Ok(window) => window,
+                // The texture's own view — its extent in texels beside the
+                // bytes one texel takes — rather than one multiplied-out
+                // number, because a padded source's span is a product of the
+                // stride the guest states and the row *this* view states
+                // (R36). One arithmetic feeds the lease window, the check and
+                // the copy, so the three cannot disagree.
+                let gather = sampled_gather_window(
+                    source,
+                    TextureExtent {
+                        width: image.width,
+                        height: image.height,
+                        bytes_per_texel: format.bytes_per_texel(),
+                    },
+                );
+                let gather = match gather {
+                    Ok(gather) => gather,
                     Err(exit) => {
                         return Err(OutOfClass::owned(
                             "render_provider_out_of_class_texture_source",
@@ -2230,9 +2275,21 @@ fn sampled_textures<'a>(
                         ));
                     }
                 };
-                NarrowTextureSource::Window {
-                    binding: texture_owner_binding(declaration.index),
-                    window,
+                match gather.rows {
+                    // The guest's own rows are padded (R36): the class gate
+                    // repacks them into the texture's tightly packed extent
+                    // before anything is declared, because every lease window
+                    // this rail can cut names the reservation's own bytes —
+                    // which for a padded gather are the rows *with* their
+                    // padding.
+                    Some(rows) => NarrowTextureSource::Depadded {
+                        window: gather.window,
+                        rows,
+                    },
+                    None => NarrowTextureSource::Window {
+                        binding: texture_owner_binding(declaration.index),
+                        window: gather.window,
+                    },
                 }
             }
         };
@@ -3043,8 +3100,120 @@ impl LoadSeedRunExit {
     }
 }
 
+/// The extent one sampled texture's own view states: its extent in texels
+/// beside the bytes one texel of its format takes (`R36`).
+///
+/// The three numbers travel together because every rule below reads at least
+/// two of them: one tightly packed row, the tightly packed extent, and the byte
+/// stride a guest `bufferRowLength` states are all products of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextureExtent {
+    width: u32,
+    height: u32,
+    bytes_per_texel: u64,
+}
+
+impl TextureExtent {
+    /// Bytes one tightly packed row of this extent holds.
+    fn tight_row(self) -> Option<u64> {
+        u64::from(self.width).checked_mul(self.bytes_per_texel)
+    }
+
+    /// Bytes the whole tightly packed extent holds — the number a lease window
+    /// names and the number the declaration's `OwnedBytes` arm carries.
+    fn tight(self) -> Option<u64> {
+        self.tight_row()?.checked_mul(u64::from(self.height))
+    }
+}
+
+/// The stride one padded-row gather states, beside the tight row and the row
+/// count the texture's own extent names (`R36`).
+///
+/// `bufferRowLength` is a texel count, so the guest's byte stride is its
+/// product with the view's own bytes per texel — the same arithmetic
+/// `runtime::draw::vulkan`'s `strided_window_extent` made when it built the
+/// source, re-derived here because the two have to agree and this rail is the
+/// one that states the bytes. A gather whose span is not `stride * (rows - 1) +
+/// tight_row` is refused rather than repacked: the last row's trailing padding
+/// is outside the gather's window by construction, so a span that does not end
+/// there is a source whose rows this rail cannot locate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PaddedRows {
+    /// The guest's own `bufferRowLength`, in texels — the fact the refusal and
+    /// the census both name.
+    row_length_texels: u32,
+    /// Bytes one guest row strides: `row_length_texels * bytes_per_texel`.
+    stride: u64,
+    /// Bytes one tightly packed row of the texture holds.
+    tight_row: u64,
+    /// The rows the gather's window holds — the texture's own height.
+    rows: u32,
+}
+
+impl PaddedRows {
+    /// Bytes the gather's own window holds: every row but the last at the
+    /// guest's stride, then one tight row.
+    fn span(self) -> u64 {
+        self.stride
+            .saturating_mul(u64::from(self.rows.saturating_sub(1)))
+            .saturating_add(self.tight_row)
+    }
+
+    /// Bytes the tightly packed copy holds.
+    fn tight(self) -> u64 {
+        self.tight_row.saturating_mul(u64::from(self.rows))
+    }
+
+    /// Bytes the copy drops: every row but the last carries this much padding.
+    fn padding(self) -> u64 {
+        self.span().saturating_sub(self.tight())
+    }
+
+    /// The tightly packed rows, assembled out of the guest's padded window.
+    ///
+    /// `None` when the window is not the span this layout named, which is a
+    /// caller-side wiring bug rather than a shape the guest's bytes can state:
+    /// every reader of this type goes through this one function, so the copy
+    /// and the byte count the declaration states cannot disagree.
+    fn depad(self, padded: &[u8]) -> Option<Vec<u8>> {
+        if u64::try_from(padded.len()).ok() != Some(self.span()) {
+            return None;
+        }
+        let row = usize::try_from(self.tight_row).ok()?;
+        let stride = usize::try_from(self.stride).ok()?;
+        let mut out = Vec::with_capacity(usize::try_from(self.tight()).ok()?);
+        for index in 0..usize::try_from(self.rows).ok()? {
+            let start = index.checked_mul(stride)?;
+            out.extend_from_slice(padded.get(start..start.checked_add(row)?)?);
+        }
+        Some(out)
+    }
+}
+
+/// What one sampled texture's zero-copy gather is on this device (`R28`,
+/// `R36`): the registered window its bytes live in, and the guest stride when
+/// its rows are padded.
+///
+/// `rows: None` is the tight shape [`texture_window_arm`] decides between the
+/// borrowed and the staged lease arm; `rows: Some` is the padded shape the
+/// class gate repacks into the texture's own extent, which is stated as the
+/// trace's own bytes ([`NarrowTextureSource::Depadded`]) rather than as any
+/// lease — a lease window names the reservation's own bytes, which for a padded
+/// gather are the guest's rows *with* their padding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SampledGather {
+    /// The window the bind's bytes live in, with the texture's own coordinates
+    /// inside it. `bytes_len` is the span the gather states: the tightly packed
+    /// extent when the rows are tight, the guest's padded span when they are
+    /// not.
+    window: StageBufferWindow,
+    /// The stride when the guest's rows are padded (`bufferRowLength`).
+    rows: Option<PaddedRows>,
+}
+
 /// The registered window one sampled texture's zero-copy gather was cut from
-/// (`R28`).
+/// (`R28`), and the stride the class repacks its rows out of when the guest's
+/// own rows are padded (`R36`).
 ///
 /// The sampled sibling of [`gather_window`], on the same fact — one page run
 /// whose registered window covers the bind's bytes — read for the window rule
@@ -3053,10 +3222,18 @@ impl LoadSeedRunExit {
 /// start" (`TextureSource`'s doc, `research/docs/23` §75/R5c), and two
 /// conditions follow from that rule that a buffer's window does not have:
 ///
-/// - **the rows have to be tight** (`row_length_texels == 0`). The extent the
-///   lease window names is `width * height * bytes_per_texel`; a window whose
-///   guest rows are padded is still a bind the engine gathers, but it is not
-///   one a lease can describe, because the reservation carries no stride;
+/// - **the rows have to be tight** for the *lease* arms (`row_length_texels ==
+///   0`). The extent a lease window names is `width * height *
+///   bytes_per_texel`; a window whose guest rows are padded is still a bind the
+///   engine gathers, but it is not one a lease can describe, because the
+///   reservation carries no stride. R36 answers that shape with the trace's own
+///   bytes instead of a lease: the class gate copies the guest's padded rows
+///   into the texture's tightly packed extent ([`PaddedRows::depad`],
+///   [`RowCopies`]) and the declaration states `TextureSource::OwnedBytes`, the
+///   arm the request's own copy and R24's frame already take. The
+///   stride-carrying *zero-copy* window — E's `BorrowedNoCopy` rule read for a
+///   padded source — is a contract-level increment and not one this rail can
+///   state;
 /// - **the window has to start at the texture's first byte**, which is what
 ///   [`StageBufferWindow::head`] measures here: the distance from the window's
 ///   base to the texture's first byte is the run's own in-granule head
@@ -3067,10 +3244,11 @@ impl LoadSeedRunExit {
 ///   ([`texture_window_arm`]), because a borrowed reservation would name the
 ///   window's own bytes as the texture's.
 ///
-/// `extent` is the texture's tightly packed extent, so the returned window's
-/// `bytes_len` is that extent rather than the whole span the gather covers:
-/// the lease reads exactly the extent, and the class states the *same* byte
-/// count on the copy arm.
+/// `extent` is the texture's own view — its extent in texels beside the bytes
+/// one texel takes — so the returned window's `bytes_len` is the span the
+/// gather states: the tightly packed extent when the rows are tight (what a
+/// lease reads, and the *same* byte count the class states on its copy arm),
+/// and the guest's own padded span when they are not.
 ///
 /// `Err` is every gather that is not one such window, and it names the fact
 /// that met it ([`SampledGatherExit`]) rather than one sentence for five
@@ -3078,13 +3256,24 @@ impl LoadSeedRunExit {
 /// condition the stream is behind.
 fn sampled_gather_window(
     source: &GuestRunSource,
-    extent: u64,
-) -> Result<StageBufferWindow, SampledGatherExit> {
-    if source.row_length_texels != 0 {
-        return Err(SampledGatherExit::PaddedRows {
-            row_length_texels: source.row_length_texels,
-        });
-    }
+    extent: TextureExtent,
+) -> Result<SampledGather, SampledGatherExit> {
+    let span = source.total_len;
+    // The texture's own tightly packed row and extent: the two numbers a lease
+    // window names, and the two a padded gather's copy is assembled from. An
+    // extent of zero bytes is nothing a view can state, whatever the source
+    // carries.
+    let tight_row = extent
+        .tight_row()
+        .filter(|row| *row != 0)
+        .ok_or(SampledGatherExit::Span { span, extent: 0 })?;
+    let tight = extent
+        .tight()
+        .filter(|tight| *tight != 0)
+        .ok_or(SampledGatherExit::Span {
+            span,
+            extent: tight_row,
+        })?;
     let Some(runs) = source.pages.as_ref() else {
         return Err(SampledGatherExit::Unregistered);
     };
@@ -3099,14 +3288,69 @@ fn sampled_gather_window(
     let Some(window) = only.window else {
         return Err(SampledGatherExit::Unregistered);
     };
-    let span = source.total_len;
-    if span != extent
-        || source
-            .source_offset
-            .checked_add(span)
-            .is_none_or(|end| end > only.guest.requested())
+    // The span the gather's own window covers, and the stride when the guest's
+    // rows are padded: the tightly packed extent is the whole answer when
+    // `bufferRowLength` is zero, and a padded source states a row count this
+    // rail has to agree with before it can locate a single row's bytes.
+    let rows = match source.row_length_texels {
+        0 => {
+            if span != tight {
+                return Err(SampledGatherExit::Span {
+                    span,
+                    extent: tight,
+                });
+            }
+            None
+        }
+        row_length_texels => {
+            let stride = u64::from(row_length_texels)
+                .checked_mul(extent.bytes_per_texel)
+                .ok_or(SampledGatherExit::PaddedRowNarrow {
+                    row_length_texels,
+                    tight_row,
+                    stride: u64::MAX,
+                })?;
+            // A stride narrower than one tightly packed row is not padding:
+            // those rows would overlap, so there are no bytes to repack.
+            if stride < tight_row {
+                return Err(SampledGatherExit::PaddedRowNarrow {
+                    row_length_texels,
+                    tight_row,
+                    stride,
+                });
+            }
+            let rows = PaddedRows {
+                row_length_texels,
+                stride,
+                tight_row,
+                rows: extent.height,
+            };
+            // The span the guest's own translation derived
+            // (`strided_window_extent`), re-derived here because the statement
+            // below is about bytes.
+            if span != rows.span() {
+                return Err(SampledGatherExit::PaddedRowCount {
+                    span,
+                    stride,
+                    tight_row,
+                    rows: extent.height,
+                });
+            }
+            Some(rows)
+        }
+    };
+    // The run states how many bytes it asked for, and this rail reads the whole
+    // span out of it: a padded gather's window carries its padding, so the
+    // number checked here is the span rather than the extent.
+    if source
+        .source_offset
+        .checked_add(span)
+        .is_none_or(|end| end > only.guest.requested())
     {
-        return Err(SampledGatherExit::Span { span, extent });
+        return Err(SampledGatherExit::Span {
+            span,
+            extent: tight,
+        });
     }
     // The run's first byte is the window the gather asked for; the texture's
     // first byte is `source_offset` further in, and the *registration's* window
@@ -3116,22 +3360,22 @@ fn sampled_gather_window(
         .head()
         .checked_add(source.source_offset)
         .unwrap_or(u64::MAX);
-    if head
-        .checked_add(extent)
-        .is_none_or(|end| end > window.length)
-    {
+    if head.checked_add(span).is_none_or(|end| end > window.length) {
         return Err(SampledGatherExit::Window {
             head,
-            extent,
+            span,
             window: window.length,
         });
     }
-    Ok(StageBufferWindow {
-        import: window.import.get(),
-        host_va: window.base,
-        length: window.length,
-        head,
-        bytes_len: extent,
+    Ok(SampledGather {
+        window: StageBufferWindow {
+            import: window.import.get(),
+            host_va: window.base,
+            length: window.length,
+            head,
+            bytes_len: span,
+        },
+        rows,
     })
 }
 
@@ -3140,12 +3384,32 @@ fn sampled_gather_window(
 ///
 /// One variant per condition, because the refusal's own sentence is what a
 /// reader of a boot's fail log has: the bucket (`..._texture_source`) says the
-/// family, and this says which fact in it the stream is behind.
+/// family, and this says which fact in it the stream is behind. R36 retired the
+/// `PaddedRows` exit that used to answer *every* padded gather with one
+/// sentence: a padded source whose stride, row count and window agree is
+/// repacked and leaves for the provider, and the two padded variants below are
+/// the shapes that still do not — a stride narrower than the texture's own row,
+/// and a span the stated row count cannot tile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampledGatherExit {
-    /// The guest rows are padded (`bufferRowLength`): a lease window names a
-    /// tightly packed extent, and this class states no stride.
-    PaddedRows { row_length_texels: u32 },
+    /// The guest's `bufferRowLength` names fewer texels than one tightly packed
+    /// row of the texture holds (`R36`): a stride narrower than the extent
+    /// would make the rows overlap rather than be padded, so there are no bytes
+    /// this class could repack.
+    PaddedRowNarrow {
+        row_length_texels: u32,
+        tight_row: u64,
+        stride: u64,
+    },
+    /// The gather's span is not `stride * (rows - 1) + tight_row` (`R36`): the
+    /// guest's rows do not tile the window this rail read, so no single row's
+    /// own bytes can be located inside it.
+    PaddedRowCount {
+        span: u64,
+        stride: u64,
+        tight_row: u64,
+        rows: u32,
+    },
     /// More than one stretch tiles the bind (or the one run does not begin at
     /// the gather's own first byte), so no single host range is its bytes.
     Scattered { runs: usize },
@@ -3156,18 +3420,37 @@ enum SampledGatherExit {
     /// The gather's own span is not the texture's tightly packed extent (or
     /// reaches past the run it names): the lease reads exactly the extent.
     Span { span: u64, extent: u64 },
-    /// The window does not cover the extent from the texture's first byte.
-    Window { head: u64, extent: u64, window: u64 },
+    /// The window does not cover the span this gather reads from the texture's
+    /// first byte.
+    Window { head: u64, span: u64, window: u64 },
 }
 
 impl SampledGatherExit {
     /// The fact, stated as the refusal's second half.
     fn sentence(&self) -> String {
         match self {
-            Self::PaddedRows { row_length_texels } => format!(
-                "the gather's rows are padded: its window carries \
-                 `row_length_texels`={row_length_texels}, while a lease window names a tightly \
-                 packed extent and no stride",
+            Self::PaddedRowNarrow {
+                row_length_texels,
+                tight_row,
+                stride,
+            } => format!(
+                "the gather's rows are padded (`row_length_texels`={row_length_texels}, {stride} \
+                 byte(s) of stride) and that stride is narrower than the {tight_row} byte(s) one \
+                 tightly packed row of the texture holds, so the rows overlap rather than carry \
+                 padding this class could drop",
+            ),
+            Self::PaddedRowCount {
+                span,
+                stride,
+                tight_row,
+                rows,
+            } => format!(
+                "the gather's rows are padded ({stride} byte(s) of stride over {rows} row(s), \
+                 whose last row is {tight_row} byte(s) tight), which tiles {} byte(s) rather \
+                 than the {span} byte(s) the gather carries",
+                stride
+                    .saturating_mul(u64::from(rows.saturating_sub(1)))
+                    .saturating_add(*tight_row),
             ),
             Self::Scattered { runs } => format!(
                 "the gather is scattered over {runs} stretch(es), so no single registered window \
@@ -3181,13 +3464,9 @@ impl SampledGatherExit {
                 "the gather's own span is {span} byte(s) for a {extent} byte tightly packed \
                  extent, and a lease reads exactly the extent",
             ),
-            Self::Window {
-                head,
-                extent,
-                window,
-            } => format!(
+            Self::Window { head, span, window } => format!(
                 "the texture starts {head} byte(s) into a {window} byte window, which does not \
-                 hold its {extent} byte extent from its own first byte",
+                 hold the {span} byte(s) this gather reads from its own first byte",
             ),
         }
     }
@@ -4487,12 +4766,20 @@ fn production_recordable(req: &DrawRequest, pass: &NarrowPass<'_>) -> bool {
     // R28's window arm joins them: its lease cannot cross submissions either,
     // and [`production_bytes`] restates the extent out of the registration the
     // window names — the same bytes the borrowed arm would have read.
+    //
+    // R36's repacked rows join them on the same fact one step further in: the
+    // descriptor the producing submission built already carries the texture's
+    // tightly packed extent as bytes (`TextureSource::OwnedBytes`), because
+    // that is the arm the padded gather left through — so re-running the pass
+    // in a later trace states exactly the bytes this one sampled, with no
+    // window left to re-read.
     if pass.textures.iter().any(|texture| {
         !matches!(
             texture.source,
             NarrowTextureSource::Bytes(_)
                 | NarrowTextureSource::Frame(_)
                 | NarrowTextureSource::Window { .. }
+                | NarrowTextureSource::Depadded { .. }
         )
     }) {
         return false;
@@ -6327,7 +6614,100 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             }
         }
     }
-    match submit_narrow(inputs, req, &pass, &copies) {
+    // R36: the sampled gathers whose guest rows are padded. The one arm the
+    // class states for those bytes is a copy — the contract's window arms name
+    // a *tightly packed* extent at the reservation's own start, and what the
+    // reservation holds here is the guest's rows with their padding — so the
+    // class makes it here, where the bytes behind a registered window are
+    // readable, and states the texture's own extent through the same trace-owned
+    // arm every other copy this rail read out of a registry takes
+    // (`TextureSource::OwnedBytes`).
+    //
+    // The read goes through the owner rail's registration rather than the
+    // gather's own host runs, for the reason the R18/R28 staging copies do:
+    // `provider_owner::window_bytes` is the one reader that answers whether
+    // these bytes are still this process's to read (the import's registration
+    // under the current epoch), and the copy is made before the submission that
+    // names it. No device *capability* is asked, because no lease is minted for
+    // this arm: a device that cannot import host pointers executes it exactly
+    // as this one does.
+    let mut rows = RowCopies::default();
+    for texture in &pass.textures {
+        let NarrowTextureSource::Depadded {
+            window,
+            rows: layout,
+        } = &texture.source
+        else {
+            continue;
+        };
+        // The padded span, read out of the registration the window names. A
+        // window this rail cannot read keeps the draw on the engine *by name* —
+        // a decline is not a fallback, and a shape the class cannot state is
+        // not one the engine's own answer may be inferred from.
+        let padded = match provider_owner::window_bytes(owner_window(
+            texture_owner_binding(texture.index),
+            *window,
+        )) {
+            Ok(bytes) => bytes,
+            Err(decline) => {
+                let reason = OutOfClass::owned(
+                    "render_provider_out_of_class_texture_source",
+                    format!(
+                        "a draw whose `[[texture({})]]` texels are gathered from a guest \
+                             window with padded rows stays on the engine when the window's bytes \
+                             cannot be copied out of the registration that names it: the class \
+                             states the texture's tightly packed extent as the trace's own bytes, \
+                             and the rows this rail repacks it from are the registration's own \
+                             (`{}`)",
+                        texture.index,
+                        decline.slug(),
+                    ),
+                );
+                reason.note();
+                return RenderRailOutcome::NotInNarrowClass(reason);
+            }
+        };
+        // The repack's own shape check: the registration read has to be the
+        // span the guest's stride and row count tile, or the window this
+        // declaration names is not the one the gather measured. A refusal here
+        // is the same answer as the pure gate's — the shape is not this class's
+        // — and it is never a shorter copy.
+        let Some(tight) = layout.depad(&padded) else {
+            let reason = OutOfClass::owned(
+                "render_provider_out_of_class_texture_source",
+                format!(
+                    "a draw whose `[[texture({})]]` texels are gathered from a guest window with \
+                     padded rows stays on the engine when the window does not hold the span the \
+                     guest's own stride and row count tile: the gather states {} byte(s) of \
+                     stride over {} row(s) ending in a {} byte tight row ({} byte(s)), while the \
+                     registration handed back {} byte(s)",
+                    texture.index,
+                    layout.stride,
+                    layout.rows,
+                    layout.tight_row,
+                    layout.span(),
+                    padded.len(),
+                ),
+            );
+            reason.note();
+            return RenderRailOutcome::NotInNarrowClass(reason);
+        };
+        // The reading a boot's census takes: one route per repacked texture,
+        // the bytes the copy kept beside the bytes it dropped, so the two halves
+        // of the arm are countable from the log rather than inferred from a
+        // frame that looks right.
+        crate::runtime::drain::note_store_route("render_provider_sampled_rows_depadded");
+        crate::runtime::drain::note_store_route_n(
+            "render_provider_sampled_rows_bytes",
+            u64::try_from(tight.len()).unwrap_or(u64::MAX),
+        );
+        crate::runtime::drain::note_store_route_n(
+            "render_provider_sampled_rows_padding",
+            layout.padding(),
+        );
+        rows.insert(texture.index, tight);
+    }
+    match submit_narrow(inputs, req, &pass, &copies, &rows) {
         Ok(RenderCompletion::Writeback(output)) => RenderRailOutcome::ProviderCompleted(output),
         Ok(RenderCompletion::Resident(frame)) => {
             RenderRailOutcome::ProviderCompletedResident(frame)
@@ -7001,6 +7381,54 @@ enum NarrowTextureSource<'a> {
         /// The window, with the texture's own coordinates inside it.
         window: StageBufferWindow,
     },
+    /// The registered guest RAM window the bind's own zero-copy gather was cut
+    /// from when the guest's rows are padded (R36): the same one page run the
+    /// [`Self::Window`] arm names, with a `bufferRowLength` the guest's own
+    /// translation stated.
+    ///
+    /// The window arms cannot state it, either of them: a lease names the
+    /// texture's tightly packed extent *at the reservation's own start*, and
+    /// what the reservation holds here is the guest's rows with their padding.
+    /// The class gate therefore repacks the rows into the texture's own extent
+    /// — one row at a time, out of the registration the window names
+    /// ([`RowCopies`]) — and the declaration states those bytes the way it
+    /// states every other copy this rail read out of a registry (the request's
+    /// own copy, R24's frame): as the trace's own bytes
+    /// (`TextureSource::OwnedBytes`). No lease is minted for this arm, so a
+    /// pass whose only guest-backed bind is one of these keeps the in-process
+    /// path.
+    ///
+    /// `rows` is the stride the guest stated beside the tight row and row count
+    /// the texture's own view states, so the repack is total: the source has
+    /// been read, and its span measured against the stride, before this arm
+    /// exists.
+    Depadded {
+        /// The window the rows live in, with the texture's own coordinates
+        /// inside it. Its `bytes_len` is the guest's padded span, the number of
+        /// bytes [`RowCopies`] read out of the registration.
+        window: StageBufferWindow,
+        /// The guest stride, the tight row and the row count.
+        rows: PaddedRows,
+    },
+}
+
+impl NarrowTextureSource<'_> {
+    /// The bytes this source carries when it is one of the trace-owned arms
+    /// (R36): the request's own copy, the caller's frame out of the engine's
+    /// registry, or the tightly packed rows the class gate repacked out of a
+    /// padded gather.
+    ///
+    /// One function for the two readers that have to agree about a texture's
+    /// byte count — [`input_allocations`] when the view's allocation is minted
+    /// and the declaration when the bytes are stated — so a padded gather's
+    /// copy cannot be sized by one and stated by the other.
+    fn owned_bytes<'a>(&'a self, rows: &'a RowCopies, index: u32) -> Option<&'a [u8]> {
+        match self {
+            Self::Bytes(bytes) | Self::Frame(bytes) => Some(bytes),
+            Self::Depadded { .. } => rows.bytes(index),
+            Self::Produced { .. } | Self::Window { .. } => None,
+        }
+    }
 }
 
 /// One admitted texture: the canonical binding (the Metal index it states, in
@@ -8618,6 +9046,7 @@ fn submit_narrow(
     req: &DrawRequest,
     pass: &NarrowPass<'_>,
     copies: &WindowCopies,
+    rows: &RowCopies,
 ) -> Result<RenderCompletion, ProviderRenderDecline> {
     let rail = rail().map_err(IntoRender::into_render)?;
     let provider = &rail.provider;
@@ -8633,7 +9062,7 @@ fn submit_narrow(
     let loads_resident = matches!(pass.load, NarrowLoad::Resident(_));
 
     let mut resources = ResourceTableSnapshot::new();
-    for allocation in input_allocations(pass) {
+    for allocation in input_allocations(pass, rows) {
         let (allocation_id, size) = allocation;
         resources
             .insert_allocation(AllocationRecord {
@@ -8914,10 +9343,26 @@ fn submit_narrow(
             // R24's frame is the same arm one step further in: the bytes are
             // the caller's copy of the target image, declared for this view
             // exactly as a request-carried copy is.
-            NarrowTextureSource::Bytes(bytes) | NarrowTextureSource::Frame(bytes) => (
+            //
+            // R36's repacked rows are the third spelling of that one arm: the
+            // bytes are the class gate's own copy of the texture's tightly
+            // packed extent, assembled row by row out of the guest's padded
+            // window ([`RowCopies`]), so they are stated exactly as the other
+            // two are. Its byte count comes from the one accessor the
+            // allocation above reads, so the view and its allocation are sized
+            // by one number.
+            NarrowTextureSource::Bytes(_)
+            | NarrowTextureSource::Frame(_)
+            | NarrowTextureSource::Depadded { .. } => (
                 ViewId::new(next_view),
                 input_allocation(next_view),
-                TextureSource::OwnedBytes(bytes.to_vec()),
+                TextureSource::OwnedBytes(
+                    texture
+                        .source
+                        .owned_bytes(rows, texture.index)
+                        .expect("an admitted byte-bearing texture carries its bytes")
+                        .to_vec(),
+                ),
             ),
             NarrowTextureSource::Produced { production, .. } => {
                 let position = pass
@@ -9637,7 +10082,7 @@ fn stage_buffer_writebacks(
 /// allocation rather than one of this rail's own. The view *identities* below
 /// still advance once per stream, so a stream's identity never depends on
 /// which arm it took.
-fn input_allocations(pass: &NarrowPass<'_>) -> Vec<(AllocationId, u64)> {
+fn input_allocations(pass: &NarrowPass<'_>, rows: &RowCopies) -> Vec<(AllocationId, u64)> {
     let mut out = Vec::with_capacity(pass.vertex_streams.len() + 1 + pass.textures.len());
     let mut next_view = FIRST_INPUT_VIEW;
     for stream in &pass.vertex_streams {
@@ -9663,19 +10108,18 @@ fn input_allocations(pass: &NarrowPass<'_>) -> Vec<(AllocationId, u64)> {
     let texture_base = next_view + 1 + u64::try_from(pass.stage_buffers.len()).unwrap_or(u64::MAX);
     for (index, texture) in pass.textures.iter().enumerate() {
         // Both byte-bearing arms — the request's own copy and the caller's
-        // frame (R24) — mint their own view's allocation here. A
-        // trace-produced texture names the identity its production stored
-        // under (R22): that allocation is declared from the production's side
-        // of the trace, and re-declaring it here would be a second record for
-        // one view.
+        // frame (R24), beside R36's repacked rows, which
+        // [`NarrowTextureSource::owned_bytes`] reads out of the gate's own copy
+        // — mint their own view's allocation here. A trace-produced texture
+        // names the identity its production stored under (R22): that allocation
+        // is declared from the production's side of the trace, and re-declaring
+        // it here would be a second record for one view.
         // R28 adds the third arm to that rule: a window-backed texture's
         // allocation is the one [`plan_owner_leases`] minted for its lease, so
         // the trace's view names that allocation rather than one of this
         // rail's own — its view *identity* below still advances, so a texture's
         // identity never depends on which arm it took.
-        let (NarrowTextureSource::Bytes(bytes) | NarrowTextureSource::Frame(bytes)) =
-            &texture.source
-        else {
+        let Some(bytes) = texture.source.owned_bytes(rows, texture.index) else {
             continue;
         };
         let view_number = texture_base + u64::try_from(index).unwrap_or(u64::MAX);
@@ -10345,6 +10789,100 @@ mod clear_payload_tests {
             routes.len(),
             "one name per rule: {routes:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod padded_rows_tests {
+    use super::*;
+
+    /// The stride one padded gather states, spelled the way the draw path
+    /// spells it: `bufferRowLength` in texels times the view's own bytes per
+    /// texel, beside the tight row and the row count its extent names.
+    fn rows(texels_per_row: u32, width: u32, height: u32) -> PaddedRows {
+        PaddedRows {
+            row_length_texels: texels_per_row,
+            stride: u64::from(texels_per_row) * 4,
+            tight_row: u64::from(width) * 4,
+            rows: height,
+        }
+    }
+
+    /// R36: the three numbers one padded gather is measured by — the span the
+    /// guest's window holds, the extent the copy keeps, and the padding it drops
+    /// — are one arithmetic, and the padding is the guest's stride minus the
+    /// tight row for every row but the last.
+    ///
+    /// The shape is census v25b's head: a 135-texel-wide view at
+    /// `bufferRowLength` 144, which is the reading that bucket's 444 records
+    /// carried (`evidence/gate3-census-v25b-2026-09-18`).
+    #[test]
+    fn a_padded_sources_spans_are_the_guest_stride_and_the_tight_extent() {
+        let layout = rows(144, 135, 16);
+        assert_eq!(layout.tight_row, 540);
+        assert_eq!(layout.tight(), 8_640);
+        assert_eq!(layout.span(), 144 * 4 * 15 + 540);
+        assert_eq!(layout.padding(), (144 * 4 - 540) * 15);
+        // One row: the gather's span *is* the extent and no padding is
+        // reachable at all, which is what "the last row's trailing padding is
+        // outside the gather's window" means for the smallest case.
+        let single = rows(144, 135, 1);
+        assert_eq!(single.span(), single.tight());
+        assert_eq!(single.padding(), 0);
+    }
+
+    /// R36: the repack reads one tight row per stride and writes them back to
+    /// back, so the padding between the rows never reaches the copy; and a
+    /// window that is not the span this layout named is a caller-side wiring bug
+    /// rather than a shorter copy.
+    #[test]
+    fn the_repack_reads_one_tight_row_per_stride() {
+        const PAD: u8 = 0xee;
+        let layout = rows(4, 2, 2);
+        assert_eq!(layout.stride, 16);
+        assert_eq!(layout.tight_row, 8);
+        let mut padded = Vec::new();
+        for row in 0..2u8 {
+            padded.extend_from_slice(&[row, 1, 2, 3, 4, 5, 6, 7]);
+            padded.extend_from_slice(&[PAD; 8]);
+        }
+        // The last row's trailing padding is outside the gather's window.
+        padded.truncate(usize::try_from(layout.span()).expect("the span fits usize"));
+        let tight = layout
+            .depad(&padded)
+            .expect("the window is the span this layout named");
+        assert_eq!(
+            tight.len(),
+            usize::try_from(layout.tight()).expect("the extent fits usize")
+        );
+        assert_eq!(&tight[..8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(&tight[8..], &[1, 1, 2, 3, 4, 5, 6, 7]);
+        assert!(
+            !tight.contains(&PAD),
+            "the padding between the rows never reaches the copy: {tight:?}"
+        );
+        assert_eq!(
+            layout.depad(&padded[..padded.len() - 1]),
+            None,
+            "a window short of the span names no rows"
+        );
+    }
+
+    /// R36: a guest that states its own tight row as `bufferRowLength` is the
+    /// degenerate padded shape — the source says the rows stride and the stride
+    /// *is* the row — so the copy is the identity rather than a refusal. The
+    /// draw path never builds one (`runtime::draw::vulkan`'s
+    /// `strided_window_extent` answers zero for it), and census v25b's
+    /// `row_length_texels` buckets are the ones that do; this rail reads the
+    /// source rather than the builder, so both shapes have to answer.
+    #[test]
+    fn a_stride_that_is_the_row_is_an_identity_copy() {
+        let layout = rows(8, 8, 4);
+        assert_eq!(layout.stride, layout.tight_row);
+        assert_eq!(layout.span(), layout.tight());
+        assert_eq!(layout.padding(), 0);
+        let texels: Vec<u8> = (0..layout.tight()).map(|byte| byte as u8).collect();
+        assert_eq!(layout.depad(&texels), Some(texels));
     }
 }
 
