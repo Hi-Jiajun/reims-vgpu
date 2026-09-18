@@ -1057,6 +1057,13 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // 6 833 `load_target_content_not_ready`, one driven boot). A test that
         // wants the seam's own answer states it through [`inputs_held`].
         resident_frames_fetchable: true,
+        // R42: the in-packet relay's two facts. Every fixture that drives the
+        // resident arms states the guest-side capability above; these state the
+        // walk's in-packet proof instead, and they are what the production seam
+        // states (with `resident_frames_fetchable: false`) once the chain-middle
+        // handoff admits a packet.
+        chain_keeps_frame: false,
+        chain_loads_resident: false,
         // R23: no previous contents are handed over unless a test reads them
         // out of the engine's own registry and states them here — the shape
         // [`inputs_held_with_source`] drives.
@@ -1185,6 +1192,41 @@ fn inputs_held_with_chain_value<'a>(
     RenderRailInputs {
         chain_middle_source_bytes: Some(value),
         ..inputs_held(stages, role)
+    }
+}
+
+/// R42's production pair: the caller still cannot fetch a kept frame for the
+/// guest's readers (`inputs_held`), and states the walk's in-packet proof
+/// instead.
+///
+/// `keeps` is the promise that the *next* record of this packet will load the
+/// frame this pass produces from this rail's own image; `loads` is the proof
+/// arriving: this pass begins from an image the record before it kept. Either
+/// one is a caller statement about who reads the frame, which is why the class
+/// never elects a resident arm on the strength of a request alone.
+fn inputs_relay<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    keeps: bool,
+    loads: bool,
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        chain_keeps_frame: keeps,
+        chain_loads_resident: loads,
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_relay`] with the walk's chain value handed over as well — the
+/// position a census reads as `chain_middle`.
+fn inputs_relay_with_chain_value<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    value: &'a [u8],
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        chain_keeps_frame: true,
+        ..inputs_held_with_chain_value(stages, role, value)
     }
 }
 
@@ -3589,6 +3631,26 @@ fn route_count(route: &str) -> u64 {
     reims_vgpu::runtime::drain::store_route_count_for_test(route)
 }
 
+/// The identity R42's relay is elected for: a **linear GVA** target, whose
+/// identity stands still for a packet's length.
+///
+/// The relay's promise is written against the identity the record before it
+/// resolved, so the class refuses it for a mapper-ref-texture *surface* — whose
+/// generation the guest may advance mid-packet (fp4, fp6: three to four records
+/// per boot, each refused by the canonical admission after its packet's
+/// remaining draws were committed). A GVA target has no such door, which is
+/// what makes it the shape these tests drive.
+fn gva_identity(gva: u64, format: ash::vk::Format) -> engine::TargetIdentity {
+    let (width, height) = extent();
+    engine::TargetIdentity::Gva {
+        gva,
+        width,
+        height,
+        generation: 1,
+        format,
+    }
+}
+
 /// The rail's answer for one resident-shaped request the class admitted.
 fn declined(label: &str, stages: &Stages, req: &DrawRequest) -> ProviderRenderDecline {
     match provider_render::submit_render(&inputs(stages, RenderChainRole::SoleOrTail), req) {
@@ -3756,6 +3818,272 @@ fn a_resident_middle_record_is_admitted_and_a_source_less_one_is_not() {
             "a middle record with no resident source keeps the engine: {reason}"
         ),
         other => panic!("a source-less chain middle is out of class: {other:?}"),
+    }
+}
+
+/// R42: the chain-middle handoff's own two-record shape, driven through the
+/// rails in the *production* capability state.
+///
+/// The production seam states `resident_frames_fetchable: false` — no caller
+/// can fetch a frame this rail keeps for the guest's readers (R4b's byte
+/// channel is still missing) — and what it states instead is the walk's
+/// in-packet proof: the next record's own class was asked with
+/// `chain_loads_resident` and admitted. This drives that pair. The head keeps
+/// its frame under the promise, the record after it loads that image and
+/// publishes the composite, and the engine's own two-record chain is compared
+/// byte for byte — the oracle this increment's frames have to pass.
+#[test]
+fn the_in_packet_relay_keeps_the_frame_the_next_record_loads() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let identity = gva_identity(0x42_00_01, ash::vk::Format::R8G8B8A8_UNORM);
+    let attachment = provider_render::resident_attachment(&identity);
+    let stores_before = route_count("render_provider_resident_store");
+    let loads_before = route_count("render_provider_resident_load");
+    let held_before = route_count("render_provider_publish_held_resident");
+
+    // 1. The head. Its frame has exactly one reader — the record after it — and
+    //    the caller proves it by having asked that record's class first. The
+    //    guest-side capability stays false: this is the in-packet half only.
+    let head = resident_seed_request(&identity);
+    let frame = match provider_render::submit_render(
+        &inputs_relay(&stages, RenderChainRole::Head, true, false),
+        &head,
+    ) {
+        RenderRailOutcome::ProviderCompletedResident(frame) => frame,
+        other => panic!("the relay's head keeps its frame: {other:?}"),
+    };
+    assert_eq!(
+        frame.attachment, attachment,
+        "the frame stayed under the request's own identity"
+    );
+    assert!(
+        !frame.loaded,
+        "a head that clears cannot have loaded the image it keeps"
+    );
+    assert_eq!(
+        route_count("render_provider_publish_held_resident") - held_before,
+        0,
+        "the promise turns the published answer into a kept one"
+    );
+
+    // 2. The record after it, in the shape the walk admitted: the frame it
+    //    begins from is this rail's own image, and it publishes what it
+    //    composites — the record whose frame the guest's own Store lands.
+    let chained = resident_load_request(&identity, true);
+    let provider = match provider_render::submit_render(
+        &inputs_relay(&stages, RenderChainRole::SoleOrTail, false, true),
+        &chained,
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("a resident load with a published store is in class: {other:?}"),
+    };
+    assert_texel_count("in-packet relay (provider)", &provider);
+    assert_texel_near(
+        "in-packet relay: the last texel inside the rectangle",
+        texel_at(&provider, half_of(width) - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    for x in half_of(width)..width {
+        assert_eq!(
+            texel_at(&provider, x, height / 2),
+            RESIDENT_SEED_TEXEL,
+            "texel ({x}, {}) keeps the kept frame's own bytes: a rail that cleared instead of \
+             loading, or that loaded an image no record stored, lands another colour here",
+            height / 2,
+        );
+    }
+
+    // 3. The engine's own chain, from the same two requests. Its second record
+    //    loads the engine's resident, which is what makes the comparison a
+    //    statement about the two rails and not about one rail twice.
+    let Some(engine_seed_pixels) =
+        engine_pixels("relay head", &stages, resident_seed_request(&identity))
+    else {
+        return;
+    };
+    assert!(
+        engine_seed_pixels.is_empty(),
+        "a resident store's readback is withheld on the engine too"
+    );
+    let Some(engine_chained) = engine_pixels(
+        "relay chain",
+        &stages,
+        resident_load_request(&identity, true),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        provider, engine_chained,
+        "the relay's frame and the engine's own chain land the same frame"
+    );
+
+    assert_eq!(
+        route_count("render_provider_resident_store") - stores_before,
+        1,
+        "one submission kept its frame under the in-packet promise"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_load") - loads_before,
+        1,
+        "one submission began from the provider's image"
+    );
+}
+
+/// R42: the same relay on the position a census reads as `chain_middle` — a
+/// record that begins from the bytes the walk carries and keeps its own frame
+/// for the record after it.
+///
+/// This is the shape the handoff turns into a device-side relay in the middle
+/// of a packet: the bytes still cross the bus *once* (the record before it
+/// published them), and everything after that frame stays on the device.
+#[test]
+fn the_in_packet_relay_starts_from_the_walks_bytes_and_keeps_its_own() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let half = half_of(width);
+    let identity = gva_identity(0x42_00_02, ash::vk::Format::B8G8R8A8_UNORM);
+    let mut seed = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for _ in 0..(width * height) {
+        seed.extend_from_slice(&WALK_SEED_TEXEL);
+    }
+    let handed = scanout_order(&seed);
+    let middle = || {
+        let mut middle = request_with_streams(MTL_FORMAT_BGRA8_UNORM, &position_streams());
+        middle.target_identity = Some(identity.clone());
+        middle.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        middle.target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
+        middle.skip_readback = true;
+        middle.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        middle.continues_render_pass = true;
+        middle.render_pass_continues = true;
+        middle.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        middle
+    };
+
+    // 1. The promise is what makes the class keep this frame. The caller cannot
+    //    fetch one (R20's arm is unchanged), and the same shape without the
+    //    promise is the published answer the census counts as `chain_middle`.
+    let stores_before = route_count("render_provider_resident_store");
+    let held_before = route_count("render_provider_publish_held_resident");
+    match provider_render::submit_render(
+        &inputs_relay_with_chain_value(&stages, RenderChainRole::Middle, &handed),
+        &middle(),
+    ) {
+        RenderRailOutcome::ProviderCompletedResident(frame) => assert!(
+            !frame.loaded,
+            "a record that begins from the caller's bytes cannot have loaded the image it keeps"
+        ),
+        other => panic!("the relay keeps a middle's frame: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_resident_store") - stores_before,
+        1,
+        "one submission kept its frame under the promise"
+    );
+    assert_eq!(
+        route_count("render_provider_publish_held_resident") - held_before,
+        0,
+        "the kept answer is not the published one"
+    );
+
+    // 2. The record after it loads that image and publishes the composite, so
+    //    the frame the guest's Store lands is built from the frame the middle
+    //    kept — the byte-level statement that the relay carried the right
+    //    content.
+    let mut tail = narrow_request(MTL_FORMAT_BGRA8_UNORM);
+    tail.target_identity = Some(identity.clone());
+    tail.load_from_target = true;
+    tail.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+    tail.scissors.push(ScissorResource {
+        x: 0,
+        y: 0,
+        width: half,
+        height,
+    });
+    let frame = match provider_render::submit_render(
+        &inputs_relay(&stages, RenderChainRole::SoleOrTail, false, true),
+        &tail,
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => {
+            assert!(out.bgra, "a Bgra8Unorm attachment reads back in BGRA order");
+            semantic_rgba(out.bytes, out.bgra)
+        }
+        other => panic!("a resident load with a published store is in class: {other:?}"),
+    };
+    assert_texel_count("in-packet relay from the walk's bytes", &frame);
+    assert_texel_near(
+        "in-packet relay: the last texel inside the rectangle",
+        texel_at(&frame, half_of(half) - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    for x in half..width {
+        assert_eq!(
+            texel_at(&frame, x, height / 2),
+            WALK_SEED_TEXEL,
+            "texel ({x}, {}) is the frame the middle kept: a relay that dropped the frame, or \\
+             that kept an image the successor never read, lands another colour here",
+            height / 2,
+        );
+    }
+}
+
+/// R42: the probe and the submission are the same function, so they cannot
+/// disagree about a shape — and a probe submits nothing.
+#[test]
+fn the_class_probe_answers_without_submitting_anything() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let identity = gva_identity(0x42_00_03, ash::vk::Format::R8G8B8A8_UNORM);
+
+    // A shape the class answers: the relay's head, whose promise is the only
+    // reason this rail keeps a frame its caller cannot fetch.
+    let head = resident_seed_request(&identity);
+    let head_inputs = inputs_relay(&stages, RenderChainRole::Head, true, false);
+    let submissions_before = provider_render::provider_submissions();
+    assert_eq!(
+        provider_render::render_class_probe(&head_inputs, &head),
+        provider_render::RenderClassProbe::InClass,
+        "a relay head is in class"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions_before,
+        "a probe reaches no provider submission"
+    );
+    assert!(
+        matches!(
+            provider_render::submit_render(&head_inputs, &head),
+            RenderRailOutcome::ProviderCompletedResident(_)
+        ),
+        "the same shape submitted is answered with the kept frame"
+    );
+
+    // A shape the class refuses: the middle the caller hands nothing to, under
+    // the census's own bucket and sentence.
+    let mut source_less = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    source_less.continues_render_pass = true;
+    source_less.render_pass_continues = true;
+    let middle_inputs = inputs_held(&stages, RenderChainRole::Middle);
+    assert_eq!(
+        provider_render::render_class_probe(&middle_inputs, &source_less),
+        provider_render::RenderClassProbe::OutOfClass,
+        "the probe keeps the refusal the submission keeps"
+    );
+    match provider_render::submit_render(&middle_inputs, &source_less) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_chain_middle",
+            "the submission's own name for the same shape: {reason}"
+        ),
+        other => panic!("a source-less chain middle is not the class's: {other:?}"),
     }
 }
 

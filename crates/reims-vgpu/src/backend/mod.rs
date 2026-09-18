@@ -300,6 +300,25 @@ pub(crate) trait Backend: Copy {
         force_full_store: bool,
     ) -> (EncodeStatus, Option<Vec<u8>>);
 
+    /// R42: whether the canonical rail would answer this record, asked without
+    /// submitting anything.
+    ///
+    /// The chain-middle handoff's admission reads it for the *next* record of a
+    /// packet, before the record before it keeps a frame only that rail can
+    /// reach: the walk states `chain_keeps_frame` for a record exactly when the
+    /// record after it was probed admitted with `chain_loads_resident` set. A
+    /// backend with no canonical rail answers
+    /// [`crate::runtime::draw::ChainProbe::Unavailable`], which is the
+    /// fail-closed answer — the walk keeps nothing and the packet runs exactly
+    /// as it did before this increment.
+    fn probe_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &mut DrawEncodeRequest,
+        writeback_guest: bool,
+    ) -> crate::runtime::draw::ChainHandoffProbe;
+
     /// Execute a range of an indirect command buffer the guest has filled.
     ///
     /// A backend may not have one: `executeCommandsInBuffer:` is a Metal
@@ -1295,6 +1314,21 @@ impl Backend for SelectedBackend {
             Self::Vulkan(b) => {
                 b.encode_draw_chain(state, host, req, writeback_guest, force_full_store)
             }
+        }
+    }
+
+    fn probe_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &mut DrawEncodeRequest,
+        writeback_guest: bool,
+    ) -> crate::runtime::draw::ChainHandoffProbe {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.probe_draw_chain(state, host, req, writeback_guest),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.probe_draw_chain(state, host, req, writeback_guest),
         }
     }
 

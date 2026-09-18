@@ -551,6 +551,55 @@ pub struct VisibilityArming {
 /// through backend preparation.
 pub type BindTable<T> = std::sync::Arc<Vec<T>>;
 
+/// The class-only answer one record's encode can give before anything runs
+/// (R42).
+///
+/// The chain-middle handoff needs the *next* record's verdict while the record
+/// before it is still deciding whether to keep its frame, and the only answer
+/// that cannot drift from the submission's own is the canonical class gate's.
+/// `draw::vulkan::probe_draw_chain` is the entry that asks for it; the seam
+/// stops where a submission would have left the gate, so no provider pass and
+/// no engine draw happens on this path. Defined here rather than beside that
+/// entry because the backend trait names it, and the trait is compiled on hosts
+/// whose only rail is Metal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChainProbe {
+    /// The canonical rail would answer this record.
+    Admitted,
+    /// The record stays on the self-contained engine, by the class's own name.
+    Refused,
+    /// The device could not be asked (a provider capability answer declined).
+    /// Fail-closed: the walk treats it exactly as [`Self::Refused`].
+    #[default]
+    Unavailable,
+}
+
+/// What one class-only probe answered, and the image it would keep or load
+/// (R42).
+///
+/// The verdict alone is not enough for the chain-middle handoff: the frame the
+/// record before it keeps is keyed on the **identity** that record resolved, and
+/// the record after it loads it by resolving an identity of its own. The two
+/// agree while a packet's surface holds still, and the fp4 round measured what
+/// happens when they do not — the canonical admission refused the trace with
+/// `resource_contract_invalid: unknown allocation` (a kept frame's allocation,
+/// minted but never stored, because the load resolved a *different* identity)
+/// and the rest of that packet was skipped. Four such records cost 1 668
+/// `draws_skipped_after_engine_refusal` against a same-caliber base round's
+/// zero.
+///
+/// So a probe reports the pair it resolved, and the walk keeps a frame only
+/// when its successor's probe resolves the *same* pair: the rail mints one
+/// allocation per identity and never reuses one, so equality of these two
+/// numbers is equality of the identities that produced them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainHandoffProbe {
+    pub verdict: ChainProbe,
+    /// The `(allocation, view)` pair of the provider image this record's own
+    /// target identity names, when it names one.
+    pub attachment: Option<(u64, u64)>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DrawEncodeRequest {
     pub task_id: u32,
@@ -623,6 +672,44 @@ pub struct DrawEncodeRequest {
     /// content from the engine target instead of a CPU seed. Set by the exec
     /// chain loop (Vulkan rail only); default false.
     pub chain_from_resident: bool,
+    /// R42: this record's frame is consumed by the **next record of the same
+    /// packet**, which will load it from the canonical provider's own image, so
+    /// the frame must stay there instead of being published.
+    ///
+    /// Set by the exec chain loop, and only after the walk has *probed* the next
+    /// record's own class with [`Self::chain_loads_resident`] stated: an
+    /// admitted probe is the proof that the next record will take the frame
+    /// from that image, which is what lets the canonical rail keep a frame its
+    /// caller cannot fetch for anyone else (`resident_frames_fetchable` stays
+    /// false — R4b's byte channel is still missing). `false` is every record
+    /// whose frame has a reader outside the packet, and every record whose
+    /// successor's probe was refused.
+    pub chain_keeps_frame: bool,
+    /// R42: the frame this record's pass begins from is the canonical
+    /// provider's own image, kept by the record before it under
+    /// [`Self::chain_keeps_frame`].
+    ///
+    /// Set by the exec chain loop from the predecessor's *answer* (only a
+    /// `ProviderCompletedResident` sets it), so it never claims a frame the
+    /// engine's registry holds. The seam reads it twice: the class states
+    /// `LoadOp::Resident` for the load instead of asking the caller for bytes,
+    /// and a record that states it is refused by name rather than handed to the
+    /// self-contained engine, whose LOAD gate has no frame under that identity.
+    pub chain_loads_resident: bool,
+    /// R42: the `(allocation, view)` pair the frame this record begins from is
+    /// kept under, as the caller's own record of its predecessor's answer.
+    ///
+    /// Stated beside [`Self::chain_loads_resident`], and *checked* by the seam:
+    /// the identity this record's own pass resolves must mint to the same pair,
+    /// or the load would name an image no submission of this rail ever stored —
+    /// which the canonical admission refuses by name
+    /// (`resource_contract_invalid: unknown allocation`) after the packet's
+    /// remaining draws are already committed to it. A mismatch is refused
+    /// before the submission, and the walk abandons that packet's chain under
+    /// `provider_chain_middle_handoff_lost` — the one case the probe could not
+    /// see, because the walk's own probe runs before the predecessor has
+    /// answered.
+    pub chain_resident_attachment: Option<(u64, u64)>,
     /// This draw continues the Metal render encoder of the preceding draw in
     /// the same decoded stream. Vulkan may keep an identical render pass open
     /// when no command that is illegal inside it intervenes.
@@ -652,6 +739,24 @@ pub struct DrawEncodeRequest {
     /// target (no CPU pixels, no guest Store). The exec chain loop arms
     /// `chain_from_resident` for the next record when set.
     pub chain_resident_established: bool,
+    /// Out-flag (R42): the frame this record kept stayed in the **canonical
+    /// provider's** image rather than the engine's registry.
+    ///
+    /// Read beside [`Self::chain_resident_established`], which both rails set:
+    /// the engine can read back its own registry under the identity, the
+    /// provider's image can only be reached by naming it, so the exec loop arms
+    /// [`Self::chain_loads_resident`] for the next record on this flag and the
+    /// engine's byte door on the other. Vulkan rail only.
+    pub chain_resident_held_by_provider: bool,
+    /// Out-flag (R42): the `(allocation, view)` pair the provider kept this
+    /// record's frame under, read from the *provider's own answer*
+    /// (`ResidentFrame::attachment`) rather than re-derived.
+    ///
+    /// The walk carries it to the next record as
+    /// [`Self::chain_resident_attachment`], which is what makes a chained load
+    /// name the image its predecessor actually stored even if the surface's own
+    /// identity has moved between the two records' resolutions.
+    pub chain_resident_kept_attachment: Option<(u64, u64)>,
     /// Out-flag (R26): the canonical rail answered this record and published
     /// its frame, so the engine's registry holds **no** image under this
     /// record's identity for the pixels it produced — the frame travelled back

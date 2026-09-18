@@ -170,6 +170,16 @@ impl Backend for VulkanBackend {
         draw::vulkan::encode_draw_chain(state, host, req, writeback_guest, force_full_store)
     }
 
+    fn probe_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &mut DrawEncodeRequest,
+        writeback_guest: bool,
+    ) -> crate::runtime::draw::ChainHandoffProbe {
+        draw::vulkan::probe_draw_chain(state, host, req, writeback_guest)
+    }
+
     fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         &self,
         state: &mut DeviceState,
