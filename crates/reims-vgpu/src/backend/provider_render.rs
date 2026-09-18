@@ -8787,6 +8787,124 @@ pub fn resident_source_route_bytes(route: ResidentSourceRoute) -> &'static str {
     }
 }
 
+/// The three routes the B3 probe charges beside the `guest_backing` refusal,
+/// one per state of the window door the seam answered with.
+///
+/// `guest_backing` is the one bucket whose population is *not* visible in the
+/// request: the gate reads `guest_target_memory`, `load_from_target`, the
+/// carried-window flag and the record's place in its packet, and the axis that
+/// actually decides whether the class *could* carry the landing — whether the
+/// elision door cut a window for this record — is stated only in
+/// [`RenderRailInputs::attachment_guest_window`]. Census v31/v32
+/// (`evidence/gate3-census-v31-2026-09-18`, `…-v32-…`) read 690 / 5.19-a-window
+/// records in this bucket with no counter that could say which of the three
+/// states they were in, so the recon that precedes this increment could only
+/// decompose the bucket arithmetically.
+///
+/// The probe is read-only and moves no admit/refuse edge: the slug, the
+/// sentence and the bucket's own count are unchanged, and the three families
+/// partition the bucket by construction — every refusal charges exactly one of
+/// them, which is what the rail asserts (`…_sum == bucket delta`).
+pub const GUEST_BACKING_WINDOW_NONE: &str =
+    "render_provider_out_of_class_guest_backing_window_none";
+pub const GUEST_BACKING_WINDOW_RUNS: &str =
+    "render_provider_out_of_class_guest_backing_window_runs";
+
+/// The route label for one window door's state, as the `guest_backing` refusal
+/// charges it.
+///
+/// `None` is "no door stated a window for this record at all" — every door that
+/// did not apply, and (with the witness's own decline charged beside it) a door
+/// that applied and found the pages were not the frame the record begins from.
+/// `Runs` is the canary: a record the class refused *while* its seam stated a
+/// window is a wiring gap rather than a shape, and it is a number of its own
+/// rather than being folded into the state it resembles.
+pub fn guest_backing_window_route_label(
+    window: Option<&AttachmentGuestWindow<'_>>,
+) -> &'static str {
+    match window {
+        Some(AttachmentGuestWindow::Runs(_)) => GUEST_BACKING_WINDOW_RUNS,
+        Some(AttachmentGuestWindow::Refused(route)) => guest_backing_window_refused_label(*route),
+        None => GUEST_BACKING_WINDOW_NONE,
+    }
+}
+
+/// The nine facts a *window* refusal can state, one label each, plus the
+/// defensive arm for the routes a window door cannot produce.
+///
+/// `Refused` is minted by exactly one producer
+/// (`runtime::draw::vulkan::AttachmentWindowMiss::route`), whose arms are these
+/// nine. The other nine routes name the three resident-source doors, and a
+/// window refusal carrying one of them would mean a second producer had
+/// appeared — named as its own counter rather than silently reading as a
+/// window fact, because a non-zero reading there is evidence about the seam.
+pub fn guest_backing_window_refused_label(route: ResidentSourceRoute) -> &'static str {
+    match route {
+        ResidentSourceRoute::WindowUnregistered => {
+            "render_provider_out_of_class_guest_backing_window_refused_unregistered"
+        }
+        ResidentSourceRoute::WindowUnwindowed => {
+            "render_provider_out_of_class_guest_backing_window_refused_unwindowed"
+        }
+        ResidentSourceRoute::WindowPaddedRows => {
+            "render_provider_out_of_class_guest_backing_window_refused_padded_rows"
+        }
+        ResidentSourceRoute::WindowExtent => {
+            "render_provider_out_of_class_guest_backing_window_refused_extent"
+        }
+        ResidentSourceRoute::WindowRegistrations => {
+            "render_provider_out_of_class_guest_backing_window_refused_registrations"
+        }
+        ResidentSourceRoute::WindowGeometry => {
+            "render_provider_out_of_class_guest_backing_window_refused_geometry"
+        }
+        ResidentSourceRoute::WindowIdentityMoved => {
+            "render_provider_out_of_class_guest_backing_window_refused_identity_moved"
+        }
+        ResidentSourceRoute::WindowLandingRefused => {
+            "render_provider_out_of_class_guest_backing_window_refused_landing_refused"
+        }
+        ResidentSourceRoute::WindowSpanUnmapped => {
+            "render_provider_out_of_class_guest_backing_window_refused_span_unmapped"
+        }
+        _ => "render_provider_out_of_class_guest_backing_window_refused_non_window_route",
+    }
+}
+
+/// Every route [`guest_backing_window_route_label`] can charge, so a reader can
+/// sum the three families and compare them with the bucket it partitions.
+///
+/// The list is the probe's own contract with the census: a label the function
+/// returns that is missing here would make the sum read short, and a label here
+/// the function never returns would read as a state nothing was ever in. The
+/// rail sums exactly this list against the bucket's delta.
+pub const GUEST_BACKING_WINDOW_LABELS: [&str; 12] = [
+    GUEST_BACKING_WINDOW_NONE,
+    GUEST_BACKING_WINDOW_RUNS,
+    "render_provider_out_of_class_guest_backing_window_refused_unregistered",
+    "render_provider_out_of_class_guest_backing_window_refused_unwindowed",
+    "render_provider_out_of_class_guest_backing_window_refused_padded_rows",
+    "render_provider_out_of_class_guest_backing_window_refused_extent",
+    "render_provider_out_of_class_guest_backing_window_refused_registrations",
+    "render_provider_out_of_class_guest_backing_window_refused_geometry",
+    "render_provider_out_of_class_guest_backing_window_refused_identity_moved",
+    "render_provider_out_of_class_guest_backing_window_refused_landing_refused",
+    "render_provider_out_of_class_guest_backing_window_refused_span_unmapped",
+    "render_provider_out_of_class_guest_backing_window_refused_non_window_route",
+];
+
+/// The route one `guest_backing` refusal charges for a door that *cut* a window
+/// and found the pages were not the frame the record begins from (`INV-LAND`'s
+/// witness).
+///
+/// Counted **beside** the three families rather than inside them: a witnessed
+/// decline is a `None` window to the class (`GUEST_BACKING_WINDOW_NONE` is what
+/// partitions the bucket), and this name is what says the door was asked and
+/// answered — the reading that separates "no door applied" from "the door
+/// applied and the bytes disagreed".
+pub const GUEST_BACKING_WINDOW_WITNESS_DECLINED: &str =
+    "render_provider_out_of_class_guest_backing_window_witness_declined";
+
 /// Which of [`resident_source_route`]'s doors and misses a record answered.
 ///
 /// An enum rather than a `&'static str` at the call sites for the reason the
@@ -10243,6 +10361,41 @@ fn narrow_class<'a>(
     } else {
         // R32: the two seed doors, in the order the two statements differ.
         //
+        // B3: a window the seam states for *this* record's own pages is asked
+        // first, and only where the record states no load source of its own: no
+        // `target_guest_seed` (the R32 run-list arm below names the same pages
+        // through its own carrier), no `target_rgba8` (the caller's own bytes —
+        // the exec walk's chain value, or the seed the request builder
+        // resolved), and a declared action that preserves prior contents (a
+        // `Clear` is not a load, and answering one with the window would clear
+        // nothing).
+        //
+        // The rule is deliberately the narrow one. The window is the
+        // attachment's own declaration, so a record whose *whole* statement of
+        // previous contents is that declaration is admitted with no readback
+        // and no copy of its own: the provider gathers the guest's live pages
+        // (E-TX6) and the packet's last record lands its frame back in the same
+        // window (E-TX8). A record that states a source of its own is **not**
+        // converted here — two declarations for one attachment's contents is
+        // the disagreement the `load_from_target` arm above refuses by name, and
+        // silently preferring one of them is how a wrong frame becomes
+        // unobservable. Converting those needs the seam to *prove* the two
+        // statements are one frame (a byte-level witness, `INV-LAND`), which is
+        // not in this increment; a seam that states a window for such a record
+        // is visible instead: the record keeps the `guest_backing` refusal and
+        // the probe charges it under `…_window_runs`.
+        if let Some(AttachmentGuestWindow::Runs(runs)) = inputs
+            .attachment_guest_window
+            .as_ref()
+            .filter(|_| req.target_guest_seed.is_none() && req.target_rgba8.is_none())
+            .filter(|_| {
+                req.color0_declared
+                    .is_some_and(|declared| declared.preserves_prior_contents())
+            })
+        {
+            carried_attachment_guest_window = true;
+            NarrowLoad::GuestRuns(runs.to_vec())
+        } else
         // The mapper-ref-texture surface's seed: the request carries the
         // bytes themselves, as the ordered list of windows inside the surface's
         // registered pages (`research/docs/23` §113, E-TX6). The class states
@@ -10487,6 +10640,14 @@ fn narrow_class<'a>(
         && !carried_attachment_guest_window
         && inputs.role == RenderChainRole::SoleOrTail
     {
+        // B3 probe: the window door's own state, charged beside the refusal and
+        // not instead of it. The gate's judgement, slug, sentence and count are
+        // untouched — the three families partition this bucket (`…_sum ==
+        // bucket delta`, pinned by the rail), and the census reads which of the
+        // three states the 690 records were in.
+        crate::runtime::drain::note_store_route(guest_backing_window_route_label(
+            inputs.attachment_guest_window.as_ref(),
+        ));
         return Err(OutOfClass::new(
             "render_provider_out_of_class_guest_backing",
             "a record whose attachment is backed by the guest's own pages stays on the engine \

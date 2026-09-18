@@ -14506,6 +14506,81 @@ mod vulkan_split_tests {
         assert!(!mapper_ref_texture_resident_is_current(Some(4), Some(5)));
     }
 
+    /// B3's two completion guards, asserted where the completion runs: a frame
+    /// the **provider** landed in the owner's own window (`StoreOp::Borrowed`)
+    /// is a page write like any other — the surface's epoch and content
+    /// generation move exactly once — and it must **not** stamp the engine's
+    /// resident as current.
+    ///
+    /// The second half is the one with a silent failure mode: the engine's
+    /// resident holds the frame the *engine* last drew, which is not the frame
+    /// the provider just landed. A stamp there would make the next LOAD elision
+    /// read that older image as current, the pass would composite onto it, and
+    /// the Store would publish it back over the guest's pages — the
+    /// "renders correctly for a few frames then stays corrupted" fixpoint this
+    /// file's own note above `mapper_ref_texture_load_currency_query` describes.
+    /// `mapper_ref_texture_resident_stamp_skipped` is the only thing that makes
+    /// the omission visible, so the guard is asserted by name rather than by
+    /// reading the registry afterwards.
+    ///
+    /// Both counters are process-global, so every assertion is a delta: the
+    /// rest of the suite shares the map.
+    #[test]
+    fn a_provider_landed_frame_moves_the_epoch_once_and_skips_the_resident_stamp() {
+        use crate::runtime::drain::store_route_count;
+        const SKIPPED: &str = "mapper_ref_texture_resident_stamp_skipped";
+        const LANDED: &str = "render_provider_borrowed_landing_mapper";
+
+        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let mapping = 7;
+        assert!(state.set_mapping_geom(mapping, 8, 4, 0x1e));
+        let before = state.mappings.get(&mapping).expect("the mapping exists");
+        let (epoch_before, generation_before) =
+            (before.surface_content_epoch, before.content_generation);
+        let skipped_before = store_route_count(SKIPPED);
+        let landed_before = store_route_count(LANDED);
+
+        let colors = vec![ColorRtRequest {
+            mapping_id: mapping,
+            width: 8,
+            height: 4,
+            format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            ..Default::default()
+        }];
+        let request = DrawEncodeRequest {
+            task_id: 1,
+            pipeline_ref: 1,
+            ..Default::default()
+        };
+        let bytes = vec![0x2bu8; 8 * 4 * 4];
+
+        let status = borrowed_landing_store(&mut state, &mut host, &request, &colors, &bytes, true);
+        assert!(matches!(status, EncodeStatus::Ok));
+
+        let after = state.mappings.get(&mapping).expect("the mapping survives");
+        assert_eq!(
+            after.surface_content_epoch,
+            epoch_before + 1,
+            "the provider's landing is the frame's one page write: the epoch moves once"
+        );
+        assert_eq!(
+            after.content_generation,
+            generation_before + 1,
+            "content_generation moves with the epoch, exactly as the CPU landing's tail does"
+        );
+        assert_eq!(
+            store_route_count(SKIPPED) - skipped_before,
+            1,
+            "the frame is the provider's, so the engine's resident is not re-stamped as current"
+        );
+        assert_eq!(
+            store_route_count(LANDED) - landed_before,
+            1,
+            "the mapper arm of the landing is what this completion accounts for"
+        );
+    }
+
     /// Every guest-page writer in this crate goes through
     /// `mark_mapping_written`, so making that advance the surface epoch is what
     /// closes the writer set without enumerating it. A blit or a guest CPU
