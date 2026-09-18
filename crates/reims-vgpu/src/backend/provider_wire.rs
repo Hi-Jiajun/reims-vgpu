@@ -174,6 +174,33 @@ pub fn render_texture_support(
     })
 }
 
+/// The folded-pair half of one provider capability snapshot, read back out of
+/// the response frame the provider would send (`research/docs/23` §3.3,
+/// E-TX9 / R33).
+///
+/// The fourth reading of the same one-snapshot rule ([`stage_buffer_support`],
+/// [`compute_texture_support`], [`render_texture_support`]), and the one this
+/// rail's folded exit needs: a `[[buffer(n)]]` argument at *both* stages of one
+/// pass is a shape the canonical rail refuses when the two halves fold onto one
+/// descriptor (`render_stage_buffer_layout_unsupported`), unless the provider
+/// declares that it arranges the two index spaces apart — the vertex stage's
+/// whole layout in the canonical namespace set
+/// (`metal_api_vulkan::stage_buffer_namespace_layout`).
+///
+/// `true` is that declaration. `false` is the fail-closed answer, and it is
+/// what a frame written before the bit existed decodes to
+/// (`CAPABILITY_STAGE_BUFFER_NAMESPACE_TAIL` is a presence tag: absent means
+/// the shape was never declared), so the class gate that reads this reading
+/// keeps the folded pair on the engine under R31's own name rather than
+/// handing the provider a shape the frame never carried.
+pub fn stage_buffer_namespace_split(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_stage_buffer_namespace_split)
+}
+
 /// The provider's own capability snapshot as it comes back out of the frame
 /// the owner would receive.
 ///
