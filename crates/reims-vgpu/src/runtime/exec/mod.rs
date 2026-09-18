@@ -5169,6 +5169,15 @@ fn finish_stream<M: HostMemory + HostOps>(
             .filter(|pd| pd.pipeline_ref != 0 && pd.draw.vertex_count > 0)
             .collect();
         let mut chain_rgba: Option<Vec<u8>> = None;
+        // fp3 probe, pure observation: where the frame `chain_rgba` currently
+        // holds came from. `true` means the canonical provider published it as
+        // its answer (a readback this device paid for), rather than the engine
+        // having produced it on the CPU side already. The walk is the only
+        // place that knows a chain frame's consumer — the next record's seed,
+        // `land_chain_before_abandon`, or nothing at all — which is what makes
+        // "was this readback ever consumed" a reading here and a guess anywhere
+        // else.
+        let mut chain_from_provider = false;
         // Occlusion counts, keyed by the guest byte offset each lands at.
         //
         // Summed rather than replaced because one Metal counter can span
@@ -5260,7 +5269,25 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                         MultiDrawChainSource::Cpu => {
                             if let Some(c0) = req.colors.first_mut() {
+                                // fp3 probe: this is the consumption point of a
+                                // chain frame — the bytes become the next
+                                // record's seed. Counted here rather than where
+                                // the seed is uploaded, because a frame nobody
+                                // takes (below) is the population that makes
+                                // "the readback was wasted" a measurement.
+                                if chain_from_provider {
+                                    if let Some(frame) = chain_rgba.as_ref() {
+                                        crate::runtime::drain::note_store_route(
+                                            "provider_chain_seed_consumed",
+                                        );
+                                        crate::runtime::drain::note_store_route_n(
+                                            "provider_chain_seed_consumed_bytes",
+                                            u64::try_from(frame.len()).unwrap_or(u64::MAX),
+                                        );
+                                    }
+                                }
                                 c0.target_seed_rgba = chain_rgba.take();
+                                chain_from_provider = false;
                             }
                         }
                         MultiDrawChainSource::Missing => {
@@ -5344,6 +5371,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // after it from a stale image, silently losing this
                         // record's draw.
                         resident_chain = false;
+                        // fp3 probe: the frame's provenance travels with it, so
+                        // the consumption below can say whether the bytes the
+                        // canonical rail published were read by anyone.
+                        chain_from_provider = req.resident_frame_published_by_provider;
                         chain_rgba = Some(rgba);
                     }
                     (EncodeStatus::Ok, None) if req.chain_resident_established => {
@@ -5435,6 +5466,23 @@ fn finish_stream<M: HostMemory + HostOps>(
                         break;
                     }
                 }
+            }
+        }
+        // fp3 probe: a frame the canonical provider published that this packet
+        // never consumed — the literal "readback superseded with no reader"
+        // population. Two arms consume a chain frame (the next record's seed
+        // above, and `land_chain_before_abandon` for a broken chain), so a
+        // non-zero here is a frame read back for nothing; a zero is itself the
+        // finding, because it says the avoidable cost is not "bytes nobody
+        // read" but "bytes that never had to leave the device" — which is what
+        // `provider_held_chain_middle` measures one layer up.
+        if chain_from_provider {
+            if let Some(frame) = chain_rgba.as_ref() {
+                crate::runtime::drain::note_store_route("provider_writeback_superseded");
+                crate::runtime::drain::note_store_route_n(
+                    "provider_writeback_superseded_bytes",
+                    u64::try_from(frame.len()).unwrap_or(u64::MAX),
+                );
             }
         }
         fin.enter(crate::runtime::drain::FinishPhase::Tail);
