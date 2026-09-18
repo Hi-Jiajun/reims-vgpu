@@ -2236,20 +2236,35 @@ fn sampled_textures<'a>(
                 }
             }
         };
-        // The canonical render sampler executes one texture *extent*: the
-        // render area's own, so every fragment's sample stands on a texel
-        // centre of the surface it reads (the rail's
-        // `render_texture_extent_unsupported`). A texture of another extent is
-        // a shape the provider always refuses, so the class answers it here.
+        // The canonical render sampler of *this* class executes one texture
+        // extent — the render area's own, so every fragment's sample stands on
+        // a texel centre of the surface it reads — and the two rails E ships
+        // answer the shape beside it in two different ways (R35). The sentence
+        // below states that disagreement rather than a provider rule that
+        // stopped being true at E-TX5: `research/docs/23` §111 widened the
+        // *Vulkan* rail, where a source of another extent is gathered into the
+        // render area's own grid and `render_texture_extent_unsupported` is
+        // kept for the owner's no-copy window alone, while the native rail's
+        // own extent rule answers *every* source of another extent with that
+        // same name — so no Apple-side frame exists to reconcile a widened
+        // answer against. The class keeps the draw because it reads no
+        // capability bit that could tell a frame's reader which of the two
+        // answers produced it, and the refusal is counted under the arm the
+        // bind would have stated ([`texture_extent_route`]).
         if image.width != req.width || image.height != req.height {
+            note_texture_extent(texture_extent_arm(&source));
             return Err(OutOfClass::owned(
                 "render_provider_out_of_class_texture_extent",
                 format!(
                     "a draw whose `[[texture({})]]` is {}x{} in a {}x{} pass stays on the engine: \
-                     the canonical render sampler samples a texture of the render area's own \
-                     extent (the provider refuses another extent by name, \
-                     `render_texture_extent_unsupported`), and a shape the provider always \
-                     refuses is not one this class executes",
+                     the two rails E ships answer this shape differently and no capability this \
+                     class reads tells them apart — the Vulkan provider gathers a source of \
+                     another extent into the render area's own grid and keeps \
+                     `render_texture_extent_unsupported` for the owner's no-copy window alone \
+                     (`research/docs/23` §111, E-TX5), while the native rail answers *every* \
+                     other extent with that same name — so the draw goes to the engine, the rail \
+                     that runs the shape on both, rather than to a provider whose answer the \
+                     Apple-side oracle does not state",
                     declaration.index, image.width, image.height, req.width, req.height,
                 ),
             ));
@@ -6598,6 +6613,99 @@ pub enum ResidentSourceRoute {
 fn note_resident_source(route: ResidentSourceRoute, extent: u64) {
     crate::runtime::drain::note_store_route(resident_source_route(route));
     crate::runtime::drain::note_store_route_n(resident_source_route_bytes(route), extent);
+}
+
+/// The census route of one `texture_extent` refusal (R35).
+///
+/// Census v25b (`evidence/gate3-census-v25b-2026-09-18`) reads 10 368 of that
+/// boot's 30 373 seam first-failures (34.1 %) under the bare
+/// `render_provider_out_of_class_texture_extent` slug, and nothing in the log
+/// says which source those records named — while that is the one question the
+/// bucket's next decision turns on, because E's two rails are not of one mind
+/// about the shape. The Vulkan rail gathers a source of another extent into the
+/// render area's own grid and keeps `render_texture_extent_unsupported` for the
+/// owner's no-copy window alone (`research/docs/23` §111, E-TX5); the
+/// `metal-api-native` rail refuses *every* source of another extent by that
+/// same name. A bucket that is mostly host bytes is a widening the Vulkan rail
+/// can already execute and the class has not followed; a bucket that is mostly
+/// the no-copy window is a shape this fork's refusal already agrees with the
+/// provider about.
+///
+/// Each arm charges its own route beside the refusal, [`texture_extent_route`]
+/// names it, and `note_store_route` counts it. The refusal itself moves in this
+/// increment only in its sentence, which used to claim the provider refuses
+/// another extent by name — a rule the Vulkan rail stopped having at E-TX5 —
+/// and now states what the two rails answer; the slug, the gate's position and
+/// its verdict are unchanged.
+pub fn texture_extent_route(route: TextureExtentRoute) -> &'static str {
+    match route {
+        TextureExtentRoute::BorrowedNoCopy => "texture_extent_borrowed_no_copy",
+        TextureExtentRoute::HostBytes => "texture_extent_host_bytes",
+    }
+}
+
+/// Which of [`texture_extent_route`]'s two arms one refused draw's sampled
+/// texture names.
+///
+/// The arms are E's question rather than this rail's: the one source the
+/// Vulkan rail cannot gather into the render area's own grid is the owner's
+/// no-copy window (`RenderInputSource::Borrowed` is its only arm with no host
+/// bytes), and that is the arm [`texture_window_arm`] leaves at the owner's own
+/// mapping — the window whose first byte *is* the texture's, which is that
+/// function's own first condition (`head == 0`). Every other source is bytes a
+/// rail holds and can gather: the request's own copy, the caller's frame out of
+/// the engine's registry (R24), the trace's own production (R22), and the
+/// window whose extent does not start at the window's first byte, which the
+/// class gate copies out of the registration.
+///
+/// One residual, named rather than hidden: [`texture_window_arm`]'s second
+/// condition is about the *submission* — a window that is not its
+/// registration's earliest in this pass is copied too — and this gate runs
+/// before the class gate's window walk, so a `head == 0` window that another
+/// bind of the same registration precedes is counted here under the borrowed
+/// arm while the class gate would have copied it. The direction is the one that
+/// matters for the bucket's question: a window whose `head` is not zero is
+/// *always* copied, so `texture_extent_host_bytes` is never charged for a
+/// source E's Vulkan rail refuses — the borrowed arm reads as an upper bound
+/// and the host-bytes arm as the matching lower bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureExtentRoute {
+    /// The owner's no-copy window: the one arm E's Vulkan rail refuses another
+    /// extent for, and the one this fork's refusal already agrees with.
+    BorrowedNoCopy,
+    /// Every source a rail reads off the host — the request's own copy, the
+    /// caller's frame, the trace's production, and the window the class gate
+    /// copies — which the Vulkan rail gathers into the render area's grid.
+    HostBytes,
+}
+
+/// The arm one refused draw's sampled source would be declared under, as the
+/// gate that answers it can read it.
+///
+/// One constructor for the two arms ([`texture_extent_route`]'s own reason for
+/// being an enum): the extent gate, which is the refusal's only charger.
+fn texture_extent_arm(source: &NarrowTextureSource<'_>) -> TextureExtentRoute {
+    match source {
+        // The window whose first byte is the texture's: the only shape
+        // [`texture_window_arm`] can leave at the owner's own mapping, and so
+        // the only source whose declaration can name
+        // `TextureSource::BorrowedNoCopy` — the arm the Vulkan rail has no host
+        // bytes to gather another extent from.
+        NarrowTextureSource::Window { window, .. } if window.head == 0 => {
+            TextureExtentRoute::BorrowedNoCopy
+        }
+        // Everything else carries bytes a rail can read: the request's own
+        // copy, the caller's frame out of the engine's registry (R24), the
+        // trace's own production (R22), and every window the class gate copies
+        // because the texture's extent does not start at its first byte.
+        _ => TextureExtentRoute::HostBytes,
+    }
+}
+
+/// Charge one `texture_extent` arm's route beside the refusal it answers.
+#[inline]
+fn note_texture_extent(route: TextureExtentRoute) {
+    crate::runtime::drain::note_store_route(texture_extent_route(route));
 }
 
 /// Drop every render registration that belonged to a device incarnation.
