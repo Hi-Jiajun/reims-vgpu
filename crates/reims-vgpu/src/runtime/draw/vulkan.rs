@@ -11373,11 +11373,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // The split is charged here rather than in
                     // `provider_render` because the *reason* belongs to the
                     // caller — which rail armed the withhold — while the rail
-                    // only sees the pair. The three names must therefore sum to
-                    // `render_provider_publish_held_resident`, the rail's own
-                    // count of the published-instead-of-kept answer: the two are
-                    // each other's identity check, and a mismatch is a wiring
-                    // finding rather than a reading.
+                    // only sees the pair. The identity these names have to
+                    // satisfy is against *both* arms that publish a withheld
+                    // record's bytes: the three sum to
+                    // `render_provider_publish_held_resident` (published instead
+                    // of kept) plus `render_provider_borrowed_landing` (B3: the
+                    // frame is already in the guest's own pages and the bytes
+                    // are published for the account, `landed_in_window` below).
+                    // A mismatch outside those two arms is a wiring finding
+                    // rather than a reading.
                     if resources.skip_readback
                         && matches!(
                             resources.readback_skip_reason,
