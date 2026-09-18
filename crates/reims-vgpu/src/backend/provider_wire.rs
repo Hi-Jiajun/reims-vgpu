@@ -303,9 +303,11 @@ pub fn stage_buffer_namespace_split(
 /// rather than handing the provider a source of another extent.
 ///
 /// The arm the bit deliberately does *not* cover is the owner's no-copy window:
-/// a borrowed window of another extent would need a host copy E's window rule
-/// has no channel for, so that shape keeps its refusal on both rails and this
-/// reading is never asked for it.
+/// a borrowed window of another extent is read without any host copy at all, so
+/// E's window rule answers it with code of its own and E-TX12 publishes that
+/// answer as a second bit — [`render_texture_gathered_extent_no_copy`], which is
+/// the reading that arm is asked for. A device that declares this reading and
+/// not that one keeps the no-copy arm on the engine.
 pub fn render_texture_gathered_extent(
     epoch: DeviceEpoch,
     capabilities: &ProviderCapabilities,
@@ -349,6 +351,44 @@ pub fn render_vertex_interface_superset(
 ) -> Result<bool, WireDecline> {
     let decoded = capabilities_frame(epoch, capabilities)?;
     Ok(decoded.supports_render_vertex_interface_superset)
+}
+
+/// The gathered extent's *no-copy* half of one provider capability snapshot,
+/// read back out of the response frame the provider would send
+/// (`research/docs/23` §111, E-TX12 / R40).
+///
+/// The sibling of [`render_texture_gathered_extent`] and the fourth tag of the
+/// same escape family, and the one this rail's extent exit needs beside it: the
+/// shape the two arms of R35 split is answered by *different* code on the
+/// canonical side, so one bit could never state both. E-TX10's bit states the
+/// arm whose bytes a rail reads off the host — a source gathered into the render
+/// area's own grid. This bit states the arm with no host bytes at all: the
+/// owner's no-copy window, which a registration executing the reviewed sampling
+/// module's *gathered* sibling reads in place, on the device, at the
+/// destination grid's own integer index (E-TX12's `OpImageFetch` with the two
+/// extents as specialization constants), and which a *translated* fragment
+/// stage reads at the source's own extent exactly as it reads the trace's own
+/// bytes.
+///
+/// `true` is the Vulkan rail's own declaration that it executes that arm —
+/// without a host copy of the owner's mapping, which is the whole statement of
+/// the arm. `false` is the fail-closed answer, and it is what a frame written
+/// before the bit existed decodes to (it is the escape family E-TX9 opened with
+/// its fourth in-family tag, `0x00 0x04 <bool>`, so its absence reads as
+/// undeclared), so the class gate that reads this reading keeps the draw on the
+/// engine under R35's own name, sentence and route rather than handing the
+/// provider a window the frame never stated it could read.
+///
+/// The arms the bit deliberately does *not* cover are the ones E-TX10's reading
+/// states: a source a rail gathers off the host, and every source whose extent
+/// *is* the pass's own. Neither is an arm this reading can widen, and a device
+/// that declares only this one still keeps the host-bytes arm on the engine.
+pub fn render_texture_gathered_extent_no_copy(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_texture_gathered_extent_no_copy)
 }
 
 /// The provider's own capability snapshot as it comes back out of the frame

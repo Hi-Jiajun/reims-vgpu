@@ -611,7 +611,7 @@
 //! written before the bit existed — keeps R31's refusal, its sentence and its
 //! own census route, byte for byte, at the same point in the same walk.
 //!
-//! # The sampled source of another extent (R35, R37)
+//! # The sampled source of another extent (R35, R37, R40)
 //!
 //! One extent rule answered this shape until R37: a draw whose sampled bind is
 //! not the pass's own extent stayed on the engine by name
@@ -636,9 +636,10 @@
 //! ([`sampled_source_of_another_extent`]), and hands the host-bytes arm of the
 //! rule to the provider when the answer is yes. The arm is read where the rule
 //! is ([`texture_extent_arm`]), because one request may state both arms: the
-//! owner's no-copy window of another extent needs a host copy E's window rule
-//! has no channel for, so it keeps the refusal on every device, under its own
-//! route.
+//! owner's no-copy window of another extent was the arm E-TX10's bit did *not*
+//! cover — its own sentence says the host gather's bit must not be read as "the
+//! snapshot executes the owner's no-copy window" — so it kept the refusal,
+//! under its own route, until R40.
 //!
 //! Nothing about the admitted shape changes beside the verdict: the
 //! declaration already states the bind's own extent (the extent the module's
@@ -646,6 +647,32 @@
 //! by), no copy is made, and the pass's trace is the trace it was. An answer of
 //! no — the native rail, and every frame written before the bit existed — keeps
 //! R35's refusal, sentence, route and gate position, byte for byte.
+//!
+//! R40 retires the exit for the arm E-TX12 opened, and it is read out of its
+//! *own* bit for that same reason. The owner's no-copy window of another extent
+//! is the one source R35's split names as having no bytes a rail can gather, and
+//! E-TX12 answers it with code of its own rather than with the host gather: a
+//! *translated* fragment stage — the registration path this fork takes, whose
+//! module states its own sample coordinates — binds the window at the source's
+//! own extent exactly as it binds the trace's own bytes, while the reviewed
+//! sampling pair's *gathered* sibling reads the window in place on the device,
+//! at the destination grid's own integer index
+//! (`metal-api-vulkan`'s `gathered_fetch.frag.spv`, `research/docs/23` §111).
+//! `ProviderCapabilities::supports_render_texture_gathered_extent_no_copy` is
+//! that answer, written into the capability tail as the escape family's fourth
+//! tag (`0x00 0x04 <bool>`, after E-TX11's `0x00 0x03 <bool>`), and this rail
+//! reads it out of the provider's own frame
+//! ([`provider_wire::render_texture_gathered_extent_no_copy`]) under the same
+//! shape test as E-TX10's bit. Each arm of the rule is then weighed against the
+//! declaration of *that* arm: a device that declares one and not the other
+//! keeps the other on the engine, and a frame written before either bit existed
+//! keeps both, under R35's own slug, sentence, route and gate position.
+//!
+//! What R40 does *not* add is a copy. The arm's whole statement is that the
+//! device reads the owner's mapping: no host bytes are gathered, the bind's
+//! declaration is the same `TextureSource::BorrowedNoCopy` window it was, and
+//! the frame the provider lands is the frame this project's oracle states for
+//! the source's own extent.
 //!
 //! # The vertex interface, and the declared superset (R-VI1)
 //!
@@ -1960,6 +1987,11 @@ fn sampled_textures<'a>(
     // ([`sampled_source_of_another_extent`]) — the gate below is pure and reads
     // no device answer of its own.
     render_texture_gathered_extent: bool,
+    // The device's own answer to the extent rule's *other* question (R40), read
+    // by [`submit_render`] out of the same frame under the same condition — the
+    // two arms E answers with different code state themselves separately, so
+    // the walk below weighs each arm against its own bit.
+    render_texture_gathered_extent_no_copy: bool,
     // The device's own answer to the narrow-lane rule's one question (R39),
     // read by [`submit_render`] out of the same frame exactly when the request
     // names a sampled bind whose view format is one of the two lanes
@@ -2574,21 +2606,47 @@ fn sampled_textures<'a>(
         // false by default and false out of any frame that does not carry it),
         // and [`submit_render`] hands this walk the frame's own reading of it.
         //
-        // So the shape leaves for the provider only where both facts hold at
-        // once: the source carries bytes a rail can read
-        // ([`texture_extent_arm`]'s `HostBytes` arm — the request's own copy,
-        // the caller's frame, the trace's production, the window the class gate
-        // copies, and R36's repacked rows) *and* the frame declares the gather.
-        // The owner's no-copy window keeps this refusal on every device, and so
-        // does every source of another extent on a device whose frame does not
-        // declare the bit: R35's slug, sentence, gate and route, byte for byte.
-        // Nothing about the admitted arm changes shape, trace or copy — the
-        // declaration states the bind's own extent, which is what the Vulkan
+        // So the shape leaves for the provider one arm at a time, and each arm
+        // only where its own fact holds: the host-bytes arm
+        // ([`texture_extent_arm`]'s `HostBytes` — the request's own copy, the
+        // caller's frame, the trace's production, the window the class gate
+        // copies, and R36's repacked rows) where the frame declares the gather
+        // (R37), and the owner's no-copy window where the frame declares that
+        // *it* reads the window in place (R40). A device whose frame declares
+        // neither keeps this refusal for both arms, and a device that declares
+        // one keeps it for the other: R35's slug, sentence, gate and route, byte
+        // for byte. Nothing about an admitted arm changes shape, trace or copy —
+        // the declaration states the bind's own extent, which is what the Vulkan
         // rail binds by — and the refusal is counted under the arm the bind
         // would have stated ([`texture_extent_route`]).
+        //
+        // R40 is that same reading for the arm E-TX12 opened, and it is read out
+        // of its *own* bit rather than out of E-TX10's (`research/docs/23` §111,
+        // E-TX10's own sentence says the host-gather bit must not be read as
+        // "the snapshot executes the owner's no-copy window"): the window whose
+        // first byte is the texture's carries no host bytes to gather, so the
+        // canonical rail answers it with code of its own — a *translated*
+        // fragment stage binds the window at the source's own extent exactly as
+        // it binds the trace's own bytes, which is the arm this rail registers
+        // (`metal-api-vulkan`'s `register_translated_render_pipeline`), and the
+        // reviewed sampling pair's gathered sibling reads it in place at the
+        // destination grid's own index. Each arm is therefore weighed against
+        // the frame's own declaration of *that* arm, and an arm whose bit the
+        // frame leaves out keeps R35's slug, sentence, gate and route, byte for
+        // byte, exactly as it did before either bit existed.
         if image.width != req.width || image.height != req.height {
             let arm = texture_extent_arm(&source);
-            if arm == TextureExtentRoute::BorrowedNoCopy || !render_texture_gathered_extent {
+            let declared = match arm {
+                // The owner's no-copy window: the arm E-TX12 publishes, whose
+                // statement is that the device reads the owner's mapping and
+                // makes no host copy of it (R40).
+                TextureExtentRoute::BorrowedNoCopy => render_texture_gathered_extent_no_copy,
+                // Every source a rail reads off the host: the arm E-TX10
+                // publishes, whose statement is the gather into the render
+                // area's own grid (R37).
+                TextureExtentRoute::HostBytes => render_texture_gathered_extent,
+            };
+            if !declared {
                 note_texture_extent(arm);
                 return Err(OutOfClass::owned(
                     "render_provider_out_of_class_texture_extent",
@@ -4271,8 +4329,9 @@ pub fn override_stage_buffer_namespace_split(
 /// ever widen the class by what the device states.
 ///
 /// The bit is asked by arm and not by shape: the owner's no-copy window of
-/// another extent needs a host copy E's window rule has no channel for, so that
-/// arm keeps R35's refusal whatever this answers.
+/// another extent is the arm a rail reads *without* a host copy, so E-TX12
+/// publishes it as a bit of its own ([`declared_render_texture_gathered_extent_no_copy`],
+/// R40) and that arm keeps R35's refusal whatever *this* reading answers.
 fn declared_render_texture_gathered_extent() -> Result<bool, ProviderRenderDecline> {
     let rail = rail().map_err(IntoRender::into_render)?;
     // The one thing that ever replaces the device's own snapshot is the test
@@ -4346,6 +4405,106 @@ pub fn override_render_texture_gathered_extent(
     };
     RenderTextureGatheredExtentOverride {
         previous: GATHERED_EXTENT_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
+/// The gathered extent's *no-copy* half of the same device answer (R40).
+///
+/// One snapshot, two readings, exactly as [`declared_render_texture_gathered_extent`]:
+/// the bit the *frame* carries is the one the class gate gets, because a
+/// provider whose capability answer cannot hold it is a provider whose remote
+/// owner never sees it. What it answers is whether this provider executes the
+/// other arm of R35's split — a sampled bind whose source is the owner's
+/// no-copy window at an extent other than the pass's, which E-TX12's rail reads
+/// *in place*: the translated fragment stage binds the window at the source's
+/// own extent exactly as it binds the trace's own bytes, and the reviewed
+/// sampling pair's gathered sibling fetches the destination grid's texel on the
+/// device (`research/docs/23` §111). Neither arm copies the owner's mapping to
+/// the host, which is the whole statement of the bit.
+///
+/// `false` is the fail-closed answer *and* what a frame written before the bit
+/// existed decodes to (`provider_wire::render_texture_gathered_extent_no_copy`,
+/// the fourth tag of the escape family E-TX9 opened), so this read can only ever
+/// widen the class by what the device states — and it widens the no-copy arm
+/// alone: E-TX10's reading is the host-bytes arm's own bit, and a device that
+/// declares one keeps the other arm on the engine.
+fn declared_render_texture_gathered_extent_no_copy() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match GATHERED_EXTENT_NO_COPY_ANSWER.load(Ordering::Relaxed) {
+            GATHERED_EXTENT_NO_COPY_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_texture_gathered_extent_no_copy =
+                    answer == GATHERED_EXTENT_NO_COPY_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::render_texture_gathered_extent_no_copy(
+        rail.provider.device_epoch(),
+        &capabilities,
+    )
+    .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+        step: decline.step,
+        detail: decline.detail,
+    })
+}
+
+/// The device's own answer for the no-copy half of the gathered extent (R40),
+/// and the states the test instrument below can put it in.
+const GATHERED_EXTENT_NO_COPY_DEVICE: u8 = 0;
+const GATHERED_EXTENT_NO_COPY_NOT_DECLARED: u8 = 1;
+const GATHERED_EXTENT_NO_COPY_DECLARED: u8 = 2;
+
+/// Whether the no-copy half of the gathered extent is read from the device's own
+/// frame ([`GATHERED_EXTENT_NO_COPY_DEVICE`], what production runs) or from an
+/// answer a test stated.
+static GATHERED_EXTENT_NO_COPY_ANSWER: AtomicU8 = AtomicU8::new(GATHERED_EXTENT_NO_COPY_DEVICE);
+
+/// A test's own answer for the no-copy half of the gathered extent, restored
+/// when it drops (R40).
+///
+/// The sibling of [`RenderTextureGatheredExtentOverride`] and for the same
+/// reason: the rail reads the bit out of the provider's capability frame, and a
+/// test that has to see the fail-closed arm cannot make an admitted device stop
+/// declaring the shape. While this guards an answer, the capability question is
+/// asked of a snapshot carrying it — written, encoded and decoded through the
+/// same frame — so the arm a test sees is the arm a frame written before the bit
+/// gives (`absent` reads as undeclared), and the reading is still the wire's.
+///
+/// A guard rather than a plain setter for the reason
+/// [`StageBufferNamespaceSplitOverride`] is one: this changes a *decision* and
+/// not an observation, so a test that unwound through a failed assertion would
+/// otherwise leave the next shape in the same binary answering from a device
+/// that is not its own.
+pub struct RenderTextureGatheredExtentNoCopyOverride {
+    previous: u8,
+}
+
+impl Drop for RenderTextureGatheredExtentNoCopyOverride {
+    fn drop(&mut self) {
+        GATHERED_EXTENT_NO_COPY_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the no-copy half of the gathered extent as `declared` until the returned
+/// guard drops, or as the device's own answer for `None` (R40).
+pub fn override_render_texture_gathered_extent_no_copy(
+    declared: Option<bool>,
+) -> RenderTextureGatheredExtentNoCopyOverride {
+    let answer = match declared {
+        None => GATHERED_EXTENT_NO_COPY_DEVICE,
+        Some(false) => GATHERED_EXTENT_NO_COPY_NOT_DECLARED,
+        Some(true) => GATHERED_EXTENT_NO_COPY_DECLARED,
+    };
+    RenderTextureGatheredExtentNoCopyOverride {
+        previous: GATHERED_EXTENT_NO_COPY_ANSWER.swap(answer, Ordering::Relaxed),
     }
 }
 
@@ -7442,10 +7601,10 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     // A device (or a frame) that declares the gathered extent executes the
     // host-bytes arm of the shape — the canonical Vulkan rail gathers such a
     // source into the render area's own grid (`research/docs/23` §111, E-TX5)
-    // — and a device whose frame leaves the bit out, like the owner's no-copy
-    // window on any device, keeps R35's answer, by name, at the same point in
-    // the same order. The bit is asked for the *shape* here and read by arm
-    // inside the walk, because one request may state both arms.
+    // — and a device whose frame leaves the bit out keeps R35's answer for that
+    // arm, by name, at the same point in the same order. The bit is asked for
+    // the *shape* here and read by arm inside the walk, because one request may
+    // state both arms.
     let render_texture_gathered_extent = match sampled_source_of_another_extent(inputs, req) {
         None => false,
         Some(_) => match declared_render_texture_gathered_extent() {
@@ -7455,6 +7614,29 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             // candidate: fail closed, exactly as `submit_narrow` does for the
             // shapes it refuses, rather than running the shape on a rail the
             // class never named.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
+    // R40: the same condition and the same gate position, asked of the extent
+    // rule's *other* arm. E-TX12 publishes the owner's no-copy window as a bit
+    // of its own rather than as a second reading of E-TX10's, because the two
+    // arms are answered by different code on the canonical side — and E-TX10's
+    // own sentence says so: its bit states the host gather and must not be read
+    // as "the snapshot executes the owner's no-copy window". This rail therefore
+    // reads each arm's declaration out of the arm's own bit, under the one shape
+    // test both arms share ([`sampled_source_of_another_extent`]), so a request
+    // whose sampled binds are all the pass's own extent still reaches the rail's
+    // provider no earlier than it did. A frame that leaves this bit out keeps
+    // R35's answer for the no-copy arm alone, by name, at the same point in the
+    // same order as before this bit existed.
+    let render_texture_gathered_extent_no_copy = match sampled_source_of_another_extent(inputs, req)
+    {
+        None => false,
+        Some(_) => match declared_render_texture_gathered_extent_no_copy() {
+            Ok(declared) => declared,
+            // The same fail-closed rule as every answer above: a provider
+            // that cannot answer is not a provider this rail may widen the
+            // class for.
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
@@ -7514,6 +7696,7 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
         req,
         stage_buffer_namespace_split,
         render_texture_gathered_extent,
+        render_texture_gathered_extent_no_copy,
         render_vertex_interface_superset,
         render_texture_narrow_lanes,
     ) {
@@ -9176,8 +9359,9 @@ fn nonindexed_vertex_span(
 ///
 /// Pure over the request and this rail's own recorded state — plus the one
 /// device answers the caller hands it (`stage_buffer_namespace_split`, R33, and
-/// `render_texture_gathered_extent`, R37) — and ordered cheapest-first so a
-/// refused shape costs nothing: no provider call, no translation, and no
+/// the extent rule's two arms, `render_texture_gathered_extent`, R37, and
+/// `render_texture_gathered_extent_no_copy`, R40) — and ordered cheapest-first
+/// so a refused shape costs nothing: no provider call, no translation, and no
 /// registration. Every refusal names the condition that kept the shape on the
 /// engine, because that string is what the observer reports when a class
 /// boundary moves.
@@ -9196,6 +9380,7 @@ fn narrow_class<'a>(
     req: &'a DrawRequest,
     stage_buffer_namespace_split: bool,
     render_texture_gathered_extent: bool,
+    render_texture_gathered_extent_no_copy: bool,
     render_vertex_interface_superset: bool,
     render_texture_narrow_lanes: NarrowLanes,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
@@ -9921,6 +10106,7 @@ fn narrow_class<'a>(
         inputs,
         req,
         render_texture_gathered_extent,
+        render_texture_gathered_extent_no_copy,
         render_texture_narrow_lanes,
     )?;
     if req.occlusion_query.is_some() {
