@@ -190,6 +190,30 @@
 //!   whole packet is in class", which the exec walk can answer and this pure
 //!   gate cannot) is the named follow-up, beside R4b's byte channel.
 //!
+//!   # The resident arms are the caller's capability, and it is held today
+//!
+//!   That refusal is not hypothetical, and census v15 measured its price:
+//!   11 892 `ok resident` answers, 6 824 `chain_resident_land_fail`
+//!   (6 821 `read_target_no_ready_content` + 3 `read_target_unknown_identity`)
+//!   and 6 833 `load_target_content_not_ready` on one driven macos-13 boot —
+//!   every failure on a GVA whose frame the provider had answered for moments
+//!   earlier, and a guest desktop with its Dock unpainted. The engine's
+//!   refusal is not a race to be waited out: the frame is not *pending*, it is
+//!   in an image the engine's registry never held, and no caller-side reader
+//!   (the deferred GVA debt, the mapper-ref-texture store, the next record of
+//!   the packet) can reach it.
+//!
+//!   So the arms are elected by what the caller can consume
+//!   ([`RenderRailInputs::resident_frames_fetchable`]): a caller that cannot
+//!   fetch a kept frame gets the frame **published** instead (the pooled arm's
+//!   own answer, `render_provider_publish_held_resident`), and a record whose
+//!   previous contents are this rail's own image stays on the engine by name
+//!   (`render_provider_out_of_class_resident_source`). The production seam
+//!   states `false` until R4b's byte channel lands; this rail's own tests state
+//!   `true`, because the capability is what they drive. The packet-level
+//!   admission above remains the follow-up for the state where the arms are
+//!   live.
+//!
 //! Anything outside the class returns [`RenderRailOutcome::NotInNarrowClass`]
 //! and the caller runs the self-contained engine unchanged — the feature only
 //! narrows which submissions change rail. An in-class submission the provider
@@ -3490,6 +3514,37 @@ pub struct RenderRailInputs<'a> {
     /// it, because what the class has to be able to name is where the frame
     /// goes: to guest memory, or back to the caller that owns the chain.
     pub role: RenderChainRole,
+    /// Whether the caller can read a frame this rail keeps in its own image.
+    ///
+    /// The two resident arms (`LoadOp::Resident` / `StoreOp::Resident`, R7b)
+    /// leave a frame somewhere only this rail can see it. That is an answer
+    /// only for a caller that can fetch it back: every reader of a render
+    /// target on the reims side — the deferred GVA debt, the mapper-ref-texture
+    /// store, and the next record of a packet when it lands back on the engine
+    /// — reads the *engine's* registry, and a frame kept here is a frame none
+    /// of them can reach.
+    ///
+    /// Measured, not assumed. Census v15 (`evidence/gate3-census-v15-2026-09-18`,
+    /// `REIMS_VGPU_DRAW_LOG=1`, driven macos-13): **11 892** `ok resident`
+    /// answers, **6 824** `chain_resident_land_fail` (6 821
+    /// `read_target_no_ready_content`, 3 `read_target_unknown_identity`) and
+    /// 6 833 `load_target_content_not_ready` — a garbled guest desktop with the
+    /// Dock unpainted. Every one of the 6 824 land failures has an `ok resident`
+    /// answer on the same GVA earlier in the same packet, and the engine's
+    /// refusal is not a race: at `t=45522` the provider answered `resident` for
+    /// `gva=0x3cd2000` and at `t=45525` the next record of that packet asked
+    /// the engine's LOAD gate for the same identity and was refused, because
+    /// the engine had never held it.
+    ///
+    /// While this is `false` the class answers a record that withheld its
+    /// readback by **publishing** its frame instead of keeping it (the route
+    /// the pooled arm has always carried, and the one every caller-side reader
+    /// already consumes), and a record whose previous contents are this rail's
+    /// own image stays on the engine by name — so no answer this rail gives can
+    /// leave a frame only the provider can see. `true` is a caller that can
+    /// fetch a kept frame; R4b's byte channel is what makes the production seam
+    /// state it, and until then the seam states `false`.
+    pub resident_frames_fetchable: bool,
     /// The *vertex stage's own* attribute locations, as the translation that
     /// produced `vertex_air` reflected them
     /// (`CachedShader::reflection.vertex_attributes`), in the reflection's
@@ -4727,6 +4782,13 @@ struct NarrowPass<'a> {
     load: NarrowLoad,
     /// Where this pass's frame goes ([`NarrowStore`]).
     store: NarrowStore,
+    /// Whether the caller withheld its readback and this pass answered by
+    /// publishing the frame anyway, because the caller cannot read a frame this
+    /// rail keeps ([`RenderRailInputs::resident_frames_fetchable`]). Counted as
+    /// `render_provider_publish_held_resident`, so the held population is a
+    /// number rather than the silence a route counter that only fires on the
+    /// elected arm would leave.
+    published_held_resident: bool,
     bgra: bool,
     width: u64,
     height: u64,
@@ -5082,6 +5144,22 @@ fn narrow_class<'a>(
                  disagree about which bytes the pass begins from",
             ));
         }
+        if !inputs.resident_frames_fetchable {
+            // The resident the caller's own chain names lives in the *engine*'s
+            // registry (`render_chain_identity`, `gva_chain_identity`), and
+            // while the arms are held this rail writes no image of its own for
+            // it — so `LoadOp::Resident` here would name an image no record
+            // ever stored, which the contract refuses by name
+            // (`resident_target_undeclared`) and which this rail must not turn
+            // into a dropped draw. The engine owns the frame and only the
+            // engine can load it.
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_resident_source",
+                "a record whose previous contents are the live GPU image stays on the engine \
+                 while the caller cannot read a frame this rail keeps: the resident the chain \
+                 names is the engine's own, and this rail defines no image under it",
+            ));
+        }
         NarrowLoad::Resident(resident)
     } else {
         if req.target_rgba8.is_some()
@@ -5117,9 +5195,20 @@ fn narrow_class<'a>(
     //   request has to carry the identity the image is keyed on; a resident
     //   store without one is a wiring bug named as such rather than a
     //   differently-shaped pass.
+    //
+    //   **The arm is the caller's capability, not the shape's.** The frame it
+    //   keeps is one only a caller that can fetch it can use
+    //   ([`RenderRailInputs::resident_frames_fetchable`]); a caller that cannot
+    //   gets the frame *published* instead — the pooled arm's own answer, which
+    //   is a superset of what it asked for and the only one its readers (the
+    //   engine's registry, the deferred GVA debt, the mapper-ref-texture store,
+    //   the next record of its packet) can consume. Census v15 measured what
+    //   the other choice costs: 11 892 kept frames and 6 824 frames the guest
+    //   never got.
     // - `UnpublishedStore` is a store action that publishes nothing: no
     //   resident, no reader, and no writeback the caller could land. It keeps
     //   the engine until its route is reviewed, exactly as before.
+    let mut published_held_resident = false;
     let store =
         if req.skip_readback {
             match req.readback_skip_reason {
@@ -5133,7 +5222,18 @@ fn narrow_class<'a>(
                          would be an image no record ever stored",
                         ));
                     };
-                    NarrowStore::Resident(resident)
+                    if inputs.resident_frames_fetchable {
+                        NarrowStore::Resident(resident)
+                    } else {
+                        // The caller asked to skip the readback; this rail
+                        // declines the *optimisation* and answers with the
+                        // bytes, never with a frame the caller cannot reach.
+                        // The identity is still required above: a resident
+                        // store that names none is the caller's wiring bug
+                        // either way.
+                        published_held_resident = true;
+                        NarrowStore::Writeback
+                    }
                 }
                 ReadbackSkipReason::UnpublishedStore => return Err(OutOfClass::new(
                     "render_provider_out_of_class_unpublished_store",
@@ -5159,7 +5259,16 @@ fn narrow_class<'a>(
     // drew the frame anyway would be handing the guest a picture its own rails
     // cannot find. The two resident arms above are the only shapes here that
     // name an image, and they name it by construction — either one is enough.
-    if resident.is_some()
+    //
+    // The rule belongs to the state where the arms are *elected* — a caller
+    // that can read kept frames. While they are held every answer publishes its
+    // bytes through the pooled pair, so the name is one the caller keys its own
+    // landing on and not an image this rail has to own: the rule would refuse
+    // the very shapes census v15 measured it must answer (the head record of
+    // every split packet is a named identity with a `Clear` load and a withheld
+    // readback).
+    if inputs.resident_frames_fetchable
+        && resident.is_some()
         && !matches!(load, NarrowLoad::Resident(_))
         && !matches!(store, NarrowStore::Resident(_))
     {
@@ -5529,6 +5638,7 @@ fn narrow_class<'a>(
         format,
         load,
         store,
+        published_held_resident,
         bgra: format == AttachmentFormat::Bgra8Unorm,
         width: u64::from(req.width),
         height: u64::from(req.height),
@@ -6304,6 +6414,13 @@ fn submit_narrow(
     }
     if loads_resident {
         crate::runtime::drain::note_store_route("render_provider_resident_load");
+    }
+    // The held arm's own population: a caller withheld its readback and this
+    // rail published the frame because the caller cannot fetch a kept one.
+    // Counted here rather than where the arm was elected, so a submission that
+    // never reached the caller is not counted as an answer.
+    if pass.published_held_resident {
+        crate::runtime::drain::note_store_route("render_provider_publish_held_resident");
     }
     let Some(writeback) = result.writebacks.iter().find(|writeback| {
         writeback.view_id == attachment.view && writeback.allocation_id == attachment.allocation

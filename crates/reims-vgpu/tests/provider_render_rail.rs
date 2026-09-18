@@ -832,6 +832,14 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         vertex_entry: Some(stages.vertex_entry),
         fragment_entry: Some(stages.fragment_entry),
         role,
+        // `true`: the capability the resident arms are elected by, and the one
+        // this file's R7b battery drives. The *production* seam states `false`
+        // until R4b's byte channel lands — every caller-side reader of a render
+        // target reads the engine's registry, and census v15 measured what a
+        // frame kept here costs them (6 824 `chain_resident_land_fail`,
+        // 6 833 `load_target_content_not_ready`, one driven boot). A test that
+        // wants the seam's own answer states it through [`inputs_held`].
+        resident_frames_fetchable: true,
         vertex_attribute_locations: &stages.vertex_attribute_locations,
         vertex_stage_buffer_declarations: &stages.vertex_stage_buffer_declarations,
         fragment_stage_buffer_declarations: &stages.fragment_stage_buffer_declarations,
@@ -850,6 +858,21 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // stages declare nothing answers exactly as it did before.
         stage_buffer_binds: &[],
         present: None,
+    }
+}
+
+/// The same inputs with the caller stating that it **cannot** read a frame this
+/// rail keeps — the production seam's own answer until R4b's byte channel
+/// lands.
+///
+/// The class answers a record that withheld its readback by publishing the
+/// frame instead of keeping it, and a record whose previous contents are this
+/// rail's own image stays on the engine by name. See
+/// [`RenderRailInputs::resident_frames_fetchable`].
+fn inputs_held<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        resident_frames_fetchable: false,
+        ..inputs(stages, role)
     }
 }
 
@@ -2943,6 +2966,173 @@ fn a_resident_middle_record_is_admitted_and_a_source_less_one_is_not() {
             "a middle record with no resident source keeps the engine: {reason}"
         ),
         other => panic!("a source-less chain middle is out of class: {other:?}"),
+    }
+}
+
+/// R20: the split census v15 measured, reproduced on the rail, and the answer
+/// the production seam states today.
+///
+/// A record that withholds its readback leaves a frame somebody else has to
+/// read — the deferred GVA debt, the mapper-ref-texture store, and the next
+/// record of the packet all read the *engine's* registry. A caller that cannot
+/// fetch a kept frame therefore gets the frame **published** instead
+/// (`render_provider_publish_held_resident`), and a record whose previous
+/// contents are this rail's own image stays on the engine by name
+/// (`render_provider_out_of_class_resident_source`).
+///
+/// Census v15 (`evidence/gate3-census-v15-2026-09-18`, driven macos-13,
+/// `REIMS_VGPU_DRAW_LOG=1`) is the pair driven below: at `t=45522` the provider
+/// answered `ok resident` for `gva=0x3cd2000`, and at `t=45525` the next record
+/// of that packet was refused by the engine's LOAD gate
+/// (`vk_draw_exec_load_target_content_not_ready`) and then failed its landing
+/// (`chain_resident_land_fail ... read_target_no_ready_content`): 6 824 land
+/// failures and a garbled desktop in one boot, every one of them on a GVA the
+/// provider had just answered for. Step 0 reproduces that pair through the
+/// rails; steps 1-3 are what the seam's own state does instead, and the last
+/// assertion is that the frame lands.
+#[test]
+fn a_frame_the_caller_cannot_fetch_is_published_and_never_kept() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let identity = surface_identity(0x7b_00_04);
+
+    // 0. The failure, reproduced. A caller that *can* fetch a kept frame is
+    //    answered with one, and the engine — asked for that identity's content
+    //    the way the next record of a packet asks — refuses by name, because
+    //    the frame is in the provider's image and no record ever stored it in
+    //    the engine.
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &resident_seed_request(&identity),
+    ) {
+        RenderRailOutcome::ProviderCompletedResident(_) => (),
+        other => panic!("the kept arm is what a fetching caller is answered with: {other:?}"),
+    }
+    let split = match engine::read_target(&identity) {
+        Ok(_) => panic!("the engine holds no resident the provider wrote"),
+        Err(error) => error,
+    };
+    let engine::DrawError::TargetRead(reason) = &split else {
+        panic!("the refusal is the readback rail's own vocabulary: {split:?}");
+    };
+    assert_eq!(
+        reason.slug(),
+        "read_target_unknown_identity",
+        "the split's own refusal, which `a_split_chain_fails_closed_on_the_engines_own_name` \
+         pins, and the one the seam's state has to stop producing"
+    );
+
+    // 1. The same record under the seam's own state: the frame comes back as
+    //    bytes — byte for byte the frame the engine's own record lands — and
+    //    nothing stays in an image this caller cannot read.
+    let published_before = route_count("render_provider_publish_held_resident");
+    let stores_before = route_count("render_provider_resident_store");
+    let seed = match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+        &resident_seed_request(&identity),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("a withheld readback is answered with the frame: {other:?}"),
+    };
+    assert_texel_count("published held frame", &seed);
+    assert_eq!(
+        route_count("render_provider_publish_held_resident") - published_before,
+        1,
+        "the held population is counted where the answer happens"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_store") - stores_before,
+        0,
+        "no frame stays in an image this caller cannot read"
+    );
+    // The engine's own answer for the same shape, with its readback *kept*: a
+    // resident-store record withholds it there too, so the control states the
+    // one difference this comparison is about.
+    let mut engine_control = resident_seed_request(&identity);
+    engine_control.skip_readback = false;
+    engine_control.readback_skip_reason = ReadbackSkipReason::None;
+    let Some(engine_seed) = engine_pixels("published seed", &stages, engine_control) else {
+        return;
+    };
+    assert!(
+        !engine_seed.is_empty() && seed == engine_seed,
+        "the published frame is the frame the engine's own record lands, not any frame: \
+         provider {} bytes against the engine's {}",
+        seed.len(),
+        engine_seed.len()
+    );
+
+    // 2. A record whose previous contents are this rail's own image: while the
+    //    arms are held no record here ever stored that image, so the record
+    //    stays on the engine — which owns the resident the caller's chain
+    //    names — instead of being answered with an image nothing wrote.
+    let chained = resident_load_request(&identity, true);
+    let source_bucket_before = route_count("render_provider_out_of_class_resident_source");
+    match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+        &chained,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_resident_source",
+            "a resident-sourced record keeps the engine while the arms are held: {reason}"
+        ),
+        other => panic!("a resident-sourced record is not the held class's: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_resident_source") - source_bucket_before,
+        1,
+        "the refused shape is counted under its own name in the census's own bucket vocabulary"
+    );
+
+    // 3. The route the walk takes instead: the publish answer is handed on as a
+    //    CPU seed (`multi_draw_chain_source`'s `Cpu` arm), and the frame lands.
+    //    The engine's own two-record resident chain is the control.
+    let mut seeded = resident_load_request(&identity, true);
+    seeded.load_from_target = false;
+    seeded.target_rgba8 = Some(std::sync::Arc::new(seed));
+    match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+        &seeded,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_load_seed",
+            "a CPU-seeded record stays on the engine: {reason}"
+        ),
+        other => panic!("a seeded record is not the provider's: {other:?}"),
+    }
+    let Some(landed) = engine_pixels("published chain", &stages, seeded) else {
+        return;
+    };
+    let Some(own_chain) = engine_pixels(
+        "resident chain",
+        &stages,
+        resident_load_request(&identity, true),
+    ) else {
+        return;
+    };
+    assert!(
+        !landed.is_empty() && landed == own_chain,
+        "the seed the caller carried forward lands the same composite as the engine's own \
+         resident chain ({} bytes against {}): the split's frame is not lost, it is handed on",
+        landed.len(),
+        own_chain.len()
+    );
+    assert_texel_near(
+        "published chain: the last texel inside the rectangle",
+        texel_at(&landed, half_of(width) - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    for x in half_of(width)..width {
+        assert_eq!(
+            texel_at(&landed, x, height / 2),
+            RESIDENT_SEED_TEXEL,
+            "texel ({x}, {}) keeps the published frame's own bytes: a route that cleared \
+             instead of seeding lands another colour here",
+            height / 2,
+        );
     }
 }
 

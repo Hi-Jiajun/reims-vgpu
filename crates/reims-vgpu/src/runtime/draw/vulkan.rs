@@ -10299,6 +10299,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // `writeback_guest` is the plan's answer, and the request
                 // carries the chain position (`render_pass_chain_position`).
                 role: RenderChainRole::of(writeback_guest, resources.continues_render_pass),
+                // `false`: this caller cannot read a frame the canonical rail
+                // keeps in its own image (R4b's byte channel is what will make
+                // this `true`). Every reader of a render target on this side —
+                // the deferred GVA debt, the mapper-ref-texture store, and the
+                // next record of a packet once it lands back on the engine —
+                // reads the *engine's* registry, and census v15 measured what a
+                // kept frame costs them: 6 824 `chain_resident_land_fail` and
+                // 6 833 `load_target_content_not_ready` on one driven boot,
+                // every one of them behind an `ok resident` answer on the same
+                // GVA. While this is `false` the rail publishes the frames it
+                // answers instead of keeping them.
+                resident_frames_fetchable: false,
                 // The stage's own attribute locations, so a request whose
                 // declared streams disagree with them stays on the engine
                 // instead of being answered by a provider that always refuses
