@@ -15243,6 +15243,381 @@ fn a_sampled_texture_whose_window_starts_inside_the_granule_is_copied() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// R36: the padded-row gather — repacked into the texture's own extent
+// ---------------------------------------------------------------------------
+
+/// One padded-row gather the *zero-copy rail* resolved: the request carries no
+/// copy of the texels, the bytes live in the owner's registered mapping, and the
+/// guest's own `bufferRowLength` says how the rows stride inside it.
+///
+/// The tight sibling of this source is [`sampled_window_source`]; the one
+/// difference is the stride, which is the fact E's window arms cannot state (a
+/// lease names a *tightly packed* extent, and the reservation here holds the
+/// guest's rows with their padding).
+fn padded_window_source(
+    base: usize,
+    mapping_len: u64,
+    guest: GuestRef,
+    window: RegisteredWindow,
+    head: u64,
+    span: u64,
+    row_length_texels: u32,
+) -> SampledSource {
+    SampledSource::GuestRuns(
+        engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                base,
+                mapping_len,
+                0,
+                head + span,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset: head,
+            total_len: span,
+            row_length_texels,
+            pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+                window_offset: 0,
+                guest,
+                window: Some(window),
+            }])),
+            direct_image: None,
+        },
+        reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+    )
+}
+
+/// R36: the sampled texture whose guest rows are padded leaves for the canonical
+/// provider as the texture's own tightly packed extent, repacked one row at a
+/// time out of the registered window its gather was cut from.
+///
+/// The shape is the one census v25b read 1 651 times as
+/// `render_provider_out_of_class_texture_source`
+/// (`evidence/gate3-census-v25b-2026-09-18`): the bind resolves through the
+/// zero-copy rail (`SampledSource::GuestRuns`) and the guest's rows carry a
+/// `bufferRowLength` the texture's own extent does not name. E's lease arms name
+/// a *tightly packed* extent at the reservation's own start, and what the
+/// reservation holds here is the guest's rows with their padding — so the class
+/// copies the rows out and states them as the trace's own bytes
+/// (`TextureSource::OwnedBytes`), the arm the request's own copy and R24's frame
+/// already take, with no lease minted and no E-side change.
+///
+/// Four readings, because each one alone would pass for a rail that did
+/// something else:
+///
+/// - the provider's frame is the texel the shader samples out of the owner's
+///   mapping, and it is the engine's own frame byte for byte;
+/// - the padding *between* the rows is never read: moving it leaves the frame
+///   exactly where it was, which a copy taken tight from the window's start
+///   would not — that copy would land a padding texel in the frame, and the
+///   fixture's padding is a colour no texel of the pattern can have;
+/// - moving the texture's own read texel moves the frame, so the rows travel
+///   from the guest's strided pages rather than from anywhere else;
+/// - the route counters name the arm (`..._sampled_rows_depadded`) and both
+///   byte counts beside it: the extent the copy kept and the padding it
+///   dropped, which is exactly what the guest's stride says they must be.
+#[test]
+fn a_padded_row_gather_leaves_as_the_textures_own_extent() {
+    use reims_vgpu::backend::provider_compute::device_epoch;
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    /// The guest's own row, in texels: the texture's eight, then eight more of
+    /// padding. `row_length_texels` is a texel count, so the fixture's byte
+    /// stride is this number times the view's four bytes per texel.
+    const ROW_TEXELS: u32 = 16;
+    /// The padding the guest's rows carry, so a copy that read the window
+    /// tightly would land it: `sampled_texels` writes `[x*16, y*64, (x+y)*8]`
+    /// and this colour is none of them.
+    const PADDING: [u8; 4] = [1, 2, 3, 255];
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let (read_x, read_y) = SAMPLED_TEXEL;
+    let read_bytes = |texels: &[Vec<u8>]| {
+        let texel = &texels[read_y * width as usize + read_x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    let tight_row = (width * 4) as usize;
+    let stride = (ROW_TEXELS * 4) as usize;
+    let tight = tight_row * height as usize;
+    // The guest's own span: every row but the last at the stride, then one
+    // tightly packed row — the arithmetic `strided_window_extent` makes, and the
+    // one this rail re-derives before it repacks anything.
+    let span = stride * (height as usize - 1) + tight_row;
+    let padding = span - tight;
+    // The guest's window: each row's own texels, then that row's padding.
+    let padded = |texels: &[Vec<u8>]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(stride * height as usize);
+        for row in 0..height as usize {
+            for column in 0..width as usize {
+                out.extend_from_slice(&texels[row * width as usize + column]);
+            }
+            for _ in 0..(ROW_TEXELS - width) {
+                out.extend_from_slice(&PADDING);
+            }
+        }
+        out
+    };
+    let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
+        .expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the window to be read"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(4 * page, page);
+    assert!(
+        span <= 4 * page,
+        "the fixture's padded span fits the mapping: {span} against {}",
+        4 * page
+    );
+    owner.as_mut_slice()[..padded(&texels).len()].copy_from_slice(&padded(&texels));
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 4 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, 4 * page as u64)
+        .expect("the mapping is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let import_id = import.id().get();
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: 4 * page as u64,
+        epoch: 1,
+    };
+    // The request as the zero-copy rail builds it: no bytes for the bind, one
+    // run over the owner's mapping, the window the ledger derived and the
+    // guest's own row stride.
+    let base = owner.pointer as usize;
+    let request = || {
+        let mut request = sampled_request(&stages, texels.clone(), (width, height));
+        request.sampled_images[0].source = padded_window_source(
+            base,
+            4 * page as u64,
+            guest.clone(),
+            registered,
+            0,
+            span as u64,
+            ROW_TEXELS,
+        );
+        request
+    };
+    // The engine arm first: its device context is created lazily on the first
+    // draw, and that creation resets the owner rail.
+    let engine = engine_pixels("R36 padded-row gather", &stages, request())
+        .expect("the engine gathers this shape");
+    assert_uniform_frame(
+        "R36 padded-row gather (engine)",
+        &engine,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 4 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x46_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let depadded_before = route_count("render_provider_sampled_rows_depadded");
+    let rows_bytes_before = route_count("render_provider_sampled_rows_bytes");
+    let rows_padding_before = route_count("render_provider_sampled_rows_padding");
+    let out_of_class_before = route_count("render_provider_out_of_class_texture_source");
+    let submissions_before = provider_render::provider_submissions();
+    let provider = provider_pixels("R36 padded-row gather", &stages, &request());
+    assert_uniform_frame(
+        "R36 padded-row gather (provider)",
+        &provider,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+    assert_frames_equal("the two rails agree on the repack", &provider, &engine);
+    assert_eq!(
+        provider_render::provider_submissions() - submissions_before,
+        1,
+        "the draw reaches the provider"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source") - out_of_class_before,
+        0,
+        "a padded gather with a stride this class can tile is not a texture_source refusal"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_rows_depadded") - depadded_before,
+        1,
+        "the arm the class took is the repack"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_rows_bytes") - rows_bytes_before,
+        tight as u64,
+        "the copy kept the texture's own tightly packed extent"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_rows_padding") - rows_padding_before,
+        padding as u64,
+        "the copy dropped exactly the guest's padding"
+    );
+
+    // Falsifiable half one: the padding *between* the rows is not read. A copy
+    // that took the window's bytes tightly — or that read every stride's bytes
+    // rather than one tight row — would land this colour in the frame.
+    let moved_padding = {
+        let mut bytes = padded(&texels);
+        bytes[..4].copy_from_slice(&[250, 251, 252, 255]);
+        bytes
+    };
+    owner.as_mut_slice()[..moved_padding.len()].copy_from_slice(&moved_padding);
+    let after_padding =
+        provider_pixels("R36 padded-row gather (padding moved)", &stages, &request());
+    assert_frames_equal(
+        "the guest's padding never reaches the frame",
+        &after_padding,
+        &provider,
+    );
+
+    // Falsifiable half two: the texture's own texels do. The read texel sits on
+    // the last row, whose bytes are the ones a mis-strided read would lose
+    // first.
+    let mut moved = texels.clone();
+    moved[read_y * width as usize + read_x] = vec![255, 0, 128, 255];
+    let moved_texels = padded(&moved);
+    owner.as_mut_slice()[..moved_texels.len()].copy_from_slice(&moved_texels);
+    let after = provider_pixels("R36 padded-row gather (texel moved)", &stages, &request());
+    assert_uniform_frame(
+        "R36 padded-row gather (texel moved)",
+        &after,
+        width,
+        height,
+        read_bytes(&moved),
+    );
+    assert_frames_differ("the guest's own texel reaches the frame", &provider, &after);
+    eprintln!(
+        "R36 padded-row gather: {width}x{height} texels at a guest stride of {ROW_TEXELS} texels \
+         ({stride} byte(s) per row over {height} row(s) = {span} byte(s)), repacked into \
+         {tight} byte(s); provider frame == engine frame == {:?}; the padding moved the frame \
+         nowhere and the read texel moved it; routes: depadded=1, bytes={tight}, \
+         padding={padding}",
+        read_bytes(&texels),
+    );
+}
+
+/// R36: a padded gather whose view is *not* the pass's own extent is stated by
+/// this increment and then answered by the class's next door — the extent rule
+/// (R35) — so the padded-rows obstacle is gone while the draw is still not
+/// canonical, and no copy is made on the way.
+///
+/// This is the reading the next census needs, because census v25b's padded
+/// bucket is mostly draws whose sampled view is not their pass: the bucket's own
+/// shapes read `fmt=0x50 1920x1080 ...` (the *pass*), while the views the
+/// reconnaissance sampled are `26x26`, `135x16`, `896x1024` and the like. After
+/// this increment those records leave `..._texture_source` and land in
+/// `..._texture_extent` under R35's `host_bytes` route, and the repack counters
+/// do *not* move: the extent rule is part of the pure gate, which refuses the
+/// draw before the gate's own copy loop ever runs — so a record that lands there
+/// cost this rail no copy at all.
+#[test]
+fn a_padded_gather_of_another_extent_is_answered_by_the_extent_rule() {
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    /// The guest's row, in texels: the view's four, then four more of padding.
+    const ROW_TEXELS: u32 = 8;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    // The pass the draw states, and the view it binds: two extents, which is
+    // exactly the shape the class's extent rule answers (R35).
+    let (pass_width, pass_height) = (8u32, 4u32);
+    let (view_width, view_height) = (4u32, 2u32);
+    let texels = sampled_texels(view_width, view_height);
+    let tight_row = (view_width * 4) as usize;
+    let stride = (ROW_TEXELS * 4) as usize;
+    let span = stride * (view_height as usize - 1) + tight_row;
+    let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
+        .expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    owner.as_mut_slice()[..span].fill(7);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, 2 * page as u64)
+        .expect("the mapping is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    // The request as the zero-copy rail builds it, with the pass's own extent
+    // beside the view's: the draw's attachment is 8x4 and the bind reads a 4x2
+    // surface out of the guest's padded rows.
+    let mut request = sampled_request(&stages, texels, (view_width, view_height));
+    request.width = pass_width;
+    request.height = pass_height;
+    request.sampled_images[0].source = padded_window_source(
+        owner.pointer as usize,
+        2 * page as u64,
+        guest,
+        RegisteredWindow {
+            import: import.id(),
+            base: owner.pointer as u64,
+            length: 2 * page as u64,
+            epoch: 1,
+        },
+        0,
+        span as u64,
+        ROW_TEXELS,
+    );
+    let depadded_before = route_count("render_provider_sampled_rows_depadded");
+    let host_bytes_before = route_count("texture_extent_host_bytes");
+    let source_before = route_count("render_provider_out_of_class_texture_source");
+    let submissions_before = provider_render::provider_submissions();
+    let reason = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &request,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => reason,
+        other => panic!("the extent rule answers this shape, not the provider: {other:?}"),
+    };
+    eprintln!("door: {}\n  {}", reason.slug(), reason.detail());
+    assert_eq!(reason.slug(), "render_provider_out_of_class_texture_extent");
+    assert!(
+        reason.detail().contains("is 4x2 in a 8x4 pass"),
+        "the sentence names the view and the pass: {}",
+        reason.detail()
+    );
+    // The door the padded bucket moves to, and the fact that it moved there
+    // *without* the copy: the extent rule is the pure gate's, so the gate's own
+    // repack loop is never reached for this draw.
+    assert_eq!(
+        route_count("texture_extent_host_bytes") - host_bytes_before,
+        1,
+        "the extent refusal is counted under the arm the padded gather now names"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_rows_depadded") - depadded_before,
+        0,
+        "the draw is refused before the gate's copy loop, so nothing was repacked"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source") - source_before,
+        0,
+        "the padded-rows obstacle is gone; the extent rule is what answered"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions_before,
+        "no submission is made for a draw the pure gate refuses"
+    );
+}
+
 /// R35: the extent refusal is counted under the arm the bind's source would
 /// state, and that arm is the one E's own question turns on.
 ///
@@ -15951,11 +16326,17 @@ fn a_carried_frames_own_record_is_restatable_as_a_production() {
 /// The window the contract states for a texture is its tightly packed extent at
 /// the reservation's own start, so every gather outside that shape is an exit —
 /// and each one below is a different fact, not one looser rule: no registration
-/// under the current epoch, padded guest rows (a lease window carries no
-/// stride), more than one stretch (no single host range is the bind's), a span
-/// that is not the texture's extent, and a window that does not reach the
-/// extent from its first byte. The class is pure here: no provider is asked and
-/// no lease is minted for a shape that stays on the engine.
+/// under the current epoch, a padded stride narrower than the texture's own row
+/// (R36: those rows would overlap rather than carry padding), a padded span the
+/// stated stride and row count cannot tile (R36: no row's own bytes are
+/// locatable), more than one stretch (no single host range is the bind's), a
+/// span that is not the texture's extent, and a window that does not reach the
+/// span from its first byte. A padded gather whose stride, row count and window
+/// *do* agree is no longer one of them: R36 repacks it and the declaration
+/// states the texture's own extent
+/// ([`a_padded_row_gather_leaves_as_the_textures_own_extent`]). The class is
+/// pure here: no provider is asked and no lease is minted for a shape that stays
+/// on the engine.
 #[test]
 fn the_gathers_outside_one_registered_window_stay_on_the_engine_by_name() {
     use reims_vgpu::runtime::guest_ram::GuestRamImport;
@@ -16047,18 +16428,47 @@ fn the_gathers_outside_one_registered_window_stay_on_the_engine_by_name() {
         unregistered.1
     );
 
-    // Padded rows: a lease window carries a tightly packed extent, not a
-    // stride, so the stride is a fact this class cannot state.
-    let padded = answer(
-        "padded-row gathered texture",
-        gather((extent, width, vec![run(guest.clone(), Some(registered))])),
+    // Padded rows whose stride is *narrower* than one tightly packed row of the
+    // texture (R36): those rows would overlap rather than carry padding, so
+    // there is no copy this class could make. The stride is read as a texel
+    // count, so six texels of stride are 24 bytes against the texture's 32.
+    let narrow = answer(
+        "narrow-stride padded gathered texture",
+        gather((
+            extent,
+            width - 2,
+            vec![run(guest.clone(), Some(registered))],
+        )),
     );
-    eprintln!("door: {}\n  {}", padded.0, padded.1);
-    assert_eq!(padded.0, "render_provider_out_of_class_texture_source");
+    eprintln!("door: {}\n  {}", narrow.0, narrow.1);
+    assert_eq!(narrow.0, "render_provider_out_of_class_texture_source");
     assert!(
-        padded.1.contains("rows are padded") && padded.1.contains("row_length_texels`=8"),
-        "the sentence names the stride: {}",
-        padded.1
+        narrow.1.contains("rows are padded") && narrow.1.contains("stride is narrower than the 32"),
+        "the sentence names the stride and the row it cannot carry: {}",
+        narrow.1
+    );
+
+    // Padded rows whose span the stated stride and row count cannot tile
+    // (R36): the last row's trailing padding is outside the gather's window by
+    // construction, so a span that does not end there names no row this rail
+    // could locate. Sixteen texels of stride over four rows tile 224 bytes,
+    // while this gather carries the texture's 128.
+    let miscount = answer(
+        "row-count-mismatched padded gathered texture",
+        gather((
+            extent,
+            width * 2,
+            vec![run(guest.clone(), Some(registered))],
+        )),
+    );
+    eprintln!("door: {}\n  {}", miscount.0, miscount.1);
+    assert_eq!(miscount.0, "render_provider_out_of_class_texture_source");
+    assert!(
+        miscount
+            .1
+            .contains("tiles 224 byte(s) rather than the 128 byte(s)"),
+        "the sentence names both spans: {}",
+        miscount.1
     );
 
     // Two stretches: no single host range is the bind's bytes.
