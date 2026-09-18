@@ -9552,6 +9552,7 @@ fn an_unaligned_stage_buffer_window_is_copied_into_the_owner_staged_arm() {
         BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
         BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
         BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+        BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
     };
     eprintln!(
         "wire stage-buffer view: stage={:?} offset={} length={} source={source}",
@@ -10158,6 +10159,7 @@ fn a_vertex_stream_shared_by_two_attributes_reads_its_guest_window_without_a_cop
             BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
             BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
             BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+            BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
         };
         eprintln!(
             "wire vertex view: binding={} offset={} length={} source={source}",
@@ -10439,6 +10441,7 @@ fn an_index_stream_in_a_registered_window_leaves_without_a_copy() {
         BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
         BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
         BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+        BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
     };
     eprintln!(
         "wire index view: binding={} offset={} length={} source={source}",
@@ -10651,6 +10654,7 @@ fn an_unaligned_index_stream_window_is_copied_into_the_owner_staged_arm() {
         BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
         BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
         BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+        BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
     };
     eprintln!(
         "wire index view: offset={} length={} source={source}",
@@ -11081,6 +11085,7 @@ fn an_unaligned_vertex_stream_window_is_copied_into_the_owner_staged_arm() {
             BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
             BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
             BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+            BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
         })
         .collect();
     eprintln!("wire vertex views: {arms:?}");
@@ -11761,6 +11766,9 @@ fn the_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
         }
         metal_api_core::provider::BufferSource::BorrowedNoCopy(lease) => {
             format!("borrowed_lease={}", lease.get())
+        }
+        metal_api_core::provider::BufferSource::GuestRuns(runs) => {
+            format!("guest_runs={}", runs.len())
         }
     };
     eprintln!(

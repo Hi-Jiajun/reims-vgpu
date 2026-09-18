@@ -3217,6 +3217,10 @@ fn note_wire_stage_buffers(trace: &ComputeTrace) {
             Some(BufferSource::BorrowedNoCopy(lease)) => {
                 format!("borrowed_lease={}", lease.get())
             }
+            // E-TX6 (`metal-api-core` v113) added the guest-runs source arm
+            // (`BufferSource::GuestRuns`); the seam does not declare it yet, so
+            // the wire note names the population rather than inventing a view.
+            Some(BufferSource::GuestRuns(runs)) => format!("guest_runs={}", runs.len()),
             None => "view=absent".to_owned(),
         };
         crate::observe::line(format!(
