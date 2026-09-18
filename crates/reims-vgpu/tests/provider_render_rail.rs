@@ -18192,6 +18192,358 @@ fn an_affine_stage_buffer_footprint_is_bounded_by_the_draw() {
     );
 }
 
+/// R9j's second half: the same affine proof on the contract's *non-indexed*
+/// arm (R39).
+///
+/// The shape is the one the census reads under
+/// `render_provider_out_of_class_stage_buffer_footprint` — a draw that names its
+/// vertices `0..3`, declares no vertex stream and reads them out of a
+/// `[[buffer(0)]]` argument with an affine reach — and until this increment the
+/// class answered it by name because the counts the proof is bounded by were read
+/// out of an index buffer, which this arm does not have. The arm's count is the
+/// request's own `vertex_count`, which is the number the contract reads for a
+/// pass whose `indices` is `None`.
+///
+/// The falsifiable half is not "the draw was accepted". The same three vertices
+/// reached through `[0, 1, 2]` and through the request's own `0..3` have to land
+/// the same frame on the canonical rail *and* against the self-contained engine,
+/// and the frame has to follow the buffer's own bytes — so a rail that bounded
+/// the proof at zero, or that read the other arm's count, fails one of those.
+/// The refusals beside it are the two the proof cannot be evaluated over, the
+/// bind that stops short of the bound this arm's own count states, and the doors
+/// each arm keeps: a non-zero `firstVertex` and a `baseVertex` with an index
+/// buffer both still answer under their own names rather than being swallowed by
+/// the arm this increment opened.
+#[test]
+fn a_non_indexed_affine_stage_buffer_footprint_is_bounded_by_the_draw() {
+    let _guard = engine_test_session();
+    let (width, height) = extent();
+    let mut stages = Stages {
+        air: (
+            fixture("render_vtx_buffer_positions.air"),
+            fixture("render_frag.air"),
+        ),
+        vertex_entry: "reims_buffer_positions_vertex",
+        fragment_entry: FRAGMENT_ENTRY,
+        // The stage reads its vertices through the buffer, not through
+        // `[[stage_in]]`: no attribute locations, and the request declares no
+        // streams at all on this arm.
+        vertex_attribute_locations: Vec::new(),
+        vertex_stage_buffer_declarations: Vec::new(),
+        fragment_stage_buffer_declarations: Vec::new(),
+        fragment_texture_declarations: Vec::new(),
+        sampler_family: RenderSamplerFamily::default(),
+        texture_interface_refusals: Vec::new(),
+    };
+    stages.vertex_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.0, RenderStage::Vertex, stages.vertex_entry);
+    stages.fragment_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.1, RenderStage::Fragment, stages.fragment_entry);
+    assert_eq!(
+        stages.vertex_stage_buffer_declarations.len(),
+        1,
+        "the fixture declares the one `[[buffer(0)]]` argument it reads: {:#?}",
+        stages.vertex_stage_buffer_declarations
+    );
+    assert!(
+        stages.fragment_stage_buffer_declarations.is_empty(),
+        "and the fragment half declares no buffer: {:#?}",
+        stages.fragment_stage_buffer_declarations
+    );
+
+    let positions = |records: &[(f32, f32)]| -> BufferContent {
+        BufferContent::Bytes(std::sync::Arc::new(f32x2(records)))
+    };
+    const FULL_SCREEN: [(f32, f32); 3] = [(-1.0, -3.0), (-1.0, 1.0), (3.0, 1.0)];
+
+    // The two arms of the contract's one draw over the same bytes: `0..3` and
+    // `[0, 1, 2]`. Both carry the buffer the vertex stage reads, because the two
+    // rails have to read one set of bytes for the comparison to mean anything:
+    // the canonical rail takes it as the stage's bind, the engine as the storage
+    // buffer the translated module declares.
+    let direct_request = |content: &BufferContent| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.indexed = None;
+        req.vertex_attributes.clear();
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: content.clone(),
+        });
+        req
+    };
+    let indexed_request = |content: &BufferContent| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.vertex_attributes.clear();
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: content.clone(),
+        });
+        req
+    };
+    let provider_frame = |label: &str, req: &DrawRequest, content: &BufferContent| -> Vec<u8> {
+        let binds = [staged_bind(RenderPipelineStage::Vertex, 0, content)];
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            req,
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: a non-indexed draw with an affine stage buffer is in class: {other:?}"
+            ),
+        }
+    };
+
+    let delivered = provider_render::provider_submissions();
+    let bucket = route_count("render_provider_out_of_class_stage_buffer_footprint");
+    let screen_bytes = positions(&FULL_SCREEN);
+    let screen = provider_frame(
+        "non-indexed affine",
+        &direct_request(&screen_bytes),
+        &screen_bytes,
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered + 1,
+        "the shape the footprint bucket used to hold reaches the provider"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_footprint"),
+        bucket,
+        "and the bucket charges nothing for it any more"
+    );
+    assert_texel_count(
+        "non-indexed affine stage buffer, full-screen triangle",
+        &screen,
+    );
+
+    // The indexed twin: the same three vertices through `[0, 1, 2]`. Its own
+    // count is `base_vertex + highest index + 1` over the same bytes, so both
+    // arms state the same bound and have to land the same frame.
+    let indexed_bytes = positions(&FULL_SCREEN);
+    let indexed = provider_frame(
+        "indexed affine",
+        &indexed_request(&indexed_bytes),
+        &indexed_bytes,
+    );
+    assert_frames_equal("the two arms of the affine proof", &screen, &indexed);
+
+    // The engine's own frame, byte for byte: the fixture reads
+    // `positions[vertex_id]`, and `vertex_id` is the same `0..3` on either arm.
+    let Some(engine_screen) = engine_pixels(
+        "non-indexed affine stage buffer, full-screen triangle",
+        &stages,
+        direct_request(&screen_bytes),
+    ) else {
+        return;
+    };
+    assert_frames_equal("non-indexed affine stage buffer", &screen, &engine_screen);
+    eprintln!(
+        "R9j non-indexed affine: {width}x{height} attachment, the `[[buffer(0)]]` argument's \
+         three `float2` vertices draw texel (0, 0) = {:?} on the provider and on the engine, \
+         byte-equal ({bytes} bytes), and the indexed twin of the same draw is byte-equal too",
+        texel_at(&screen, 0, 0),
+        bytes = screen.len(),
+    );
+
+    // The buffer decides this arm's frame too: three coincident vertices cover
+    // nothing, which is what makes the proof's bound the number the view's length
+    // was proven against rather than a constant of the rail.
+    let degenerate_bytes = positions(&[(-1.0, -3.0); 3]);
+    let degenerate = provider_frame(
+        "non-indexed affine, degenerate",
+        &direct_request(&degenerate_bytes),
+        &degenerate_bytes,
+    );
+    assert_frames_differ(
+        "the stage buffer's bytes reach the vertex stage",
+        &screen,
+        &degenerate,
+    );
+
+    // The two proofs this arm's own count cannot be evaluated over. Both are
+    // proofs the contract refuses by name, so the draw stays on the engine under
+    // the footprint bucket rather than being declined by the provider — under
+    // *this arm's* sentence now, which is what the count made reachable.
+    let content = positions(&FULL_SCREEN);
+    let refuses = |label: &str, footprint: StageBufferFootprint| -> (String, String) {
+        let mut refusing = stages.clone();
+        refusing.vertex_stage_buffer_declarations = vec![StageBufferDeclaration {
+            index: 0,
+            access: StageBufferAccess::Read,
+            footprint,
+        }];
+        let binds = [staged_bind(RenderPipelineStage::Vertex, 0, &content)];
+        match provider_render::submit_render(
+            &inputs_with_binds(&refusing, RenderChainRole::SoleOrTail, &binds),
+            &direct_request(&content),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: an unevaluable affine proof stays on the engine: {other:?}"),
+        }
+    };
+    let (slug, detail) = refuses("unbounded reach", StageBufferFootprint::Unstated);
+    eprintln!("non-indexed affine refusal, unbounded: slug={slug} detail={detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_footprint");
+    assert!(
+        detail.contains("unbounded") && detail.contains("[[buffer(0)]]"),
+        "the sentence names the reach and the slot: {detail}"
+    );
+    let (slug, detail) = refuses(
+        "an axis a draw does not have",
+        StageBufferFootprint::Affine {
+            accesses: vec![metal_api_core::provider::AffineAccess {
+                base_offset: 0,
+                access_size: 4,
+                terms: vec![metal_api_core::provider::AffineTerm { axis: 3, stride: 4 }],
+            }],
+        },
+    );
+    eprintln!("non-indexed affine refusal, no such axis: slug={slug} detail={detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_footprint");
+    assert!(
+        detail.contains("axis") && detail.contains("invocation counts"),
+        "the sentence names what could not be evaluated: {detail}"
+    );
+    assert!(
+        !detail.contains("not readable"),
+        "and it is this arm's own sentence: the count came from the request rather than from \
+         bytes this rail could not read: {detail}"
+    );
+    let (slug, detail) = refuses(
+        "an expression that overflows the byte extent",
+        StageBufferFootprint::Affine {
+            accesses: vec![metal_api_core::provider::AffineAccess {
+                base_offset: u64::MAX,
+                access_size: 4,
+                terms: vec![metal_api_core::provider::AffineTerm { axis: 0, stride: 4 }],
+            }],
+        },
+    );
+    eprintln!("non-indexed affine refusal, overflow: slug={slug} detail={detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_footprint");
+    assert!(
+        detail.contains("overflow") && detail.contains("invocation counts"),
+        "the sentence names the arithmetic that could not be evaluated: {detail}"
+    );
+
+    // The bind that stops short of the bound this arm's count states: the count
+    // is the draw's own `3`, so the two-access proof reaches `4 + 4 + 2 * 8`, and
+    // a bind of one `float2` is short of it. On the indexed arm a window naming
+    // one vertex would have been enough, which is the difference the arm's own
+    // count carries.
+    let short = BufferContent::Bytes(std::sync::Arc::new(f32x2(&[(0.0, 0.0)])));
+    let binds = [staged_bind(RenderPipelineStage::Vertex, 0, &short)];
+    match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &direct_request(&short),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("non-indexed affine refusal, short bind: {reason}");
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_stage_buffer_short",
+                "a bind short of the proof's bound is one the contract would refuse"
+            );
+            assert!(
+                reason.detail().contains("24 byte"),
+                "and the sentence names the bound: {}",
+                reason.detail()
+            );
+        }
+        other => panic!("a bind short of the affine bound stays on the engine: {other:?}"),
+    }
+
+    // The doors each arm keeps. A non-indexed draw that starts anywhere but zero
+    // is a shape the contract has no spelling for (`BaseVertexRequiresIndices`),
+    // and the door that says so answers *beside* the count this increment added
+    // rather than behind it; the indexed arm's `baseVertex` door answers for its
+    // own arm under its own name. The binds here are generous on purpose, so the
+    // count is evaluable and the draw reaches the door rather than stopping at
+    // the proof.
+    let roomy = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 64]));
+    let mut offset = direct_request(&roomy);
+    offset.first_vertex = 1;
+    let binds = [staged_bind(RenderPipelineStage::Vertex, 0, &roomy)];
+    match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &offset,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_first_vertex",
+                "a first-vertex offset stays on the engine: {reason}"
+            );
+        }
+        other => panic!("a non-indexed first-vertex offset is out of class: {other:?}"),
+    }
+    let mut based = indexed_request(&roomy);
+    based
+        .indexed
+        .as_mut()
+        .expect("the indexed arm")
+        .vertex_offset = 1;
+    let binds = [staged_bind(RenderPipelineStage::Vertex, 0, &roomy)];
+    match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &based,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_base_vertex",
+                "and a `baseVertex` offset answers for the indexed arm: {reason}"
+            );
+        }
+        other => panic!("a baseVertex offset is out of class: {other:?}"),
+    }
+
+    // The stream proof beside the affine one: a non-indexed draw that declares a
+    // vertex stream *and* a `[[buffer(1)]]` argument, with the stream too short
+    // for the vertices the draw names. The affine proof is evaluable now, so what
+    // answers is the provider's own coverage proof — `vertices * stride` over
+    // every per-vertex stream, which is stricter than the indexed arm's — and not
+    // the footprint bucket this arm used to leave on.
+    let mut mixed = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[stream(0, &[(-1.0, -3.0), (3.0, 1.0)])],
+    );
+    mixed.indexed = None;
+    mixed.storage_buffers.push(engine::StorageBufferResource {
+        binding: 1,
+        content: roomy.clone(),
+    });
+    let mut streamed = stages.clone();
+    streamed.vertex_attribute_locations = vec![0];
+    streamed.vertex_stage_buffer_declarations = vec![StageBufferDeclaration {
+        index: 1,
+        access: StageBufferAccess::Read,
+        footprint: stages.vertex_stage_buffer_declarations[0].footprint.clone(),
+    }];
+    let binds = [staged_bind(RenderPipelineStage::Vertex, 1, &roomy)];
+    match provider_render::submit_render(
+        &inputs_with_binds(&streamed, RenderChainRole::SoleOrTail, &binds),
+        &mixed,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("non-indexed affine beside a short stream: {reason}");
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_vertex_span",
+                "the stream proof answers for the shape the affine count cannot carry: {reason}"
+            );
+            assert!(
+                reason.detail().contains("24 bytes"),
+                "and it names the span the stream owes: {}",
+                reason.detail()
+            );
+        }
+        other => panic!("a short stream beside an affine buffer is out of class: {other:?}"),
+    }
+}
+
 /// R9j, wire half: the declaration this rail states is carried by an `MCC1`
 /// frame, the provider's own decoder reads it back, and the provider's own
 /// admission answers for what it read.

@@ -5182,17 +5182,41 @@ fn highest_index(
 /// The two invocation counts one draw's affine stage-buffer footprint is
 /// bounded by (`research/docs/23` §3.3, v86).
 ///
-/// The same two numbers the canonical contract reads out of the trace's own
-/// index bytes (`metal-api-core`'s `render_affine_axis_counts`): axis 0 counts
-/// the vertices the draw names — for this class's indexed draws
-/// `base_vertex + highest index + 1`, over the same bytes the pass binds — and
-/// axis 1 its instances, which the class fixes at one. `None` is a draw whose
-/// index bytes do not travel with the trace (a lease-backed window, `R11`),
-/// which is a proof this rail cannot evaluate here: the stage-buffer gate keeps
-/// such a draw on the engine by name rather than inventing a bound over bytes
-/// this derivation cannot read.
+/// The same two numbers the canonical contract reads out of the trace itself
+/// (`metal-api-core`'s `render_affine_axis_counts`), stated here over the
+/// request the trace will be built from. The contract's one draw has two arms
+/// (R39) and they count axis 0 differently; the difference is the *draw form*
+/// and nothing else, so both are stated below and neither is a relaxation:
+///
+/// - the **indexed** arm counts the vertices the draw names,
+///   `base_vertex + highest index + 1`, over the same index bytes the pass
+///   binds. `None` is a draw whose index bytes do not travel with the trace (a
+///   lease-backed window or a gather, `R11`), which is a proof this rail cannot
+///   evaluate here: the stage-buffer gate keeps such a draw on the engine by
+///   name rather than inventing a bound over bytes this derivation cannot read.
+/// - the **non-indexed** arm has no index bytes to read at all (R9j's second
+///   half): the draw names its vertices `0..vertices`, so the count is the
+///   request's own `vertex_count` — the same number `narrow_class` states as
+///   the pass's `draw_count` and the same one [`nonindexed_vertex_span`] proves
+///   the per-vertex streams against. Nothing narrows it: `firstVertex` is a
+///   shape this class refuses by name and the contract has no spelling for
+///   (`BaseVertexRequiresIndices`), so the lowest vertex either arm reads is
+///   zero, and this arm never answers `None` — its count is a number the
+///   request carries rather than one this rail has to find in bytes.
+///
+/// Axis 1 is the instance count on both arms, and the class fixes it at one
+/// (its own `render_provider_out_of_class_instanced` door answers every other
+/// count) — the number the frame states (`instance_count: 1`), so the count
+/// this gate proves the bind against and the one the contract reads back are
+/// the same number.
 fn stage_buffer_affine_counts(req: &DrawRequest) -> Option<[u64; 2]> {
-    let index = req.indexed.as_ref()?;
+    let instances = u64::from(req.instance_count.unwrap_or(1));
+    // The non-indexed arm: the draw's own vertex count is axis 0, and it is a
+    // number the request carries rather than one this rail has to read out of
+    // bytes.
+    let Some(index) = req.indexed.as_ref() else {
+        return Some([u64::from(req.vertex_count), instances]);
+    };
     let bytes = staged_bytes(&index.content)?;
     // The same reader the class's own span gate uses, so the highest index an
     // affine proof is evaluated over and the highest index that gate weighs a
@@ -5202,7 +5226,7 @@ fn stage_buffer_affine_counts(req: &DrawRequest) -> Option<[u64; 2]> {
         .ok()?
         .checked_add(highest)?
         .checked_add(1)?;
-    Some([vertices, u64::from(req.instance_count.unwrap_or(1))])
+    Some([vertices, instances])
 }
 
 /// The byte extent one affine proof reaches over a draw's own invocation counts
@@ -5735,7 +5759,11 @@ fn stage_buffer_gate<'a>(
         // invocation counts — the same arithmetic (`stage_buffer_affine_counts`
         // → `stage_buffer_affine_required_bytes`) the canonical admission runs
         // over the same bytes, because a proof this rail cannot evaluate is one
-        // the provider would refuse by name.
+        // the provider would refuse by name. Both of the contract's draw arms
+        // answer those counts (R9j's second half): the indexed one out of the
+        // trace's own index bytes, the non-indexed one out of the request's own
+        // `vertex_count`, which is the count the contract reads for a draw that
+        // names its vertices `0..vertices`.
         let (proof, max_bytes) = match &declaration.footprint {
             StageBufferFootprint::Static { max_bytes } => (
                 FootprintProof::Static {
@@ -14672,6 +14700,197 @@ mod nonindexed_span_tests {
             refusal.detail().contains("binding 1"),
             "the refusal names the stream it measured: {}",
             refusal.detail()
+        );
+    }
+}
+
+/// The two invocation counts an affine proof is bounded by, and the byte extent
+/// the access set reaches over them (R9j's second half).
+///
+/// The gate proves a bind against `stage_buffer_affine_counts` →
+/// `stage_buffer_affine_required_bytes` and the canonical admission proves the
+/// pass's view against `metal-api-core`'s own pair over the same trace, so the
+/// two have to read one arithmetic off one draw. What this module pins is that
+/// they do, arm by arm: the non-indexed arm's axis 0 is the request's own
+/// `vertex_count` — a number the request carries, so that arm has no `None` —
+/// while the indexed arm keeps its own reading of the index bytes, `None`
+/// included for the arms whose bytes do not travel (R11). Axis 1 is the
+/// instance count on both.
+#[cfg(test)]
+mod stage_buffer_affine_count_tests {
+    use super::*;
+    use crate::backend::vulkan::engine::{
+        GuestRun, GuestRunSource, IndexType, IndexedDrawResource,
+    };
+    use metal_api_core::provider::AffineTerm;
+
+    /// One index stream of `u32` values, little-endian and native-order, which
+    /// is the width and order the engine's own reader states.
+    fn index_bytes(values: &[u32]) -> BufferContent {
+        BufferContent::Bytes(std::sync::Arc::new(
+            values
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect(),
+        ))
+    }
+
+    /// The reviewed draw's counts, before either arm is stated.
+    fn request() -> DrawRequest {
+        DrawRequest {
+            vertex_count: 3,
+            instance_count: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn indexed(content: BufferContent, count: u32, base_vertex: i32) -> DrawRequest {
+        DrawRequest {
+            indexed: Some(IndexedDrawResource {
+                index_type: IndexType::U32,
+                index_count: count,
+                vertex_offset: base_vertex,
+                content,
+            }),
+            ..request()
+        }
+    }
+
+    #[test]
+    fn the_counts_are_the_contracts_own_numbers_on_both_arms() {
+        // The non-indexed arm: the draw's own count, and the vertex count is
+        // what decides it rather than anything read out of bytes.
+        for vertices in [0, 3, 6] {
+            let mut req = request();
+            req.vertex_count = vertices;
+            assert_eq!(
+                stage_buffer_affine_counts(&req),
+                Some([u64::from(vertices), 1]),
+                "a non-indexed draw names its vertices `0..{vertices}`"
+            );
+        }
+
+        // Axis 1 is the instance count on both arms — the class admits one, and
+        // the arithmetic states what the contract would read for the others.
+        let mut four = request();
+        four.instance_count = Some(4);
+        assert_eq!(stage_buffer_affine_counts(&four), Some([3, 4]));
+        let mut unstated = request();
+        unstated.instance_count = None;
+        assert_eq!(
+            stage_buffer_affine_counts(&unstated),
+            Some([3, 1]),
+            "an instance count the request does not state reads as the one instance the frame \
+             itself declares"
+        );
+
+        // The indexed arm keeps its own reading: `base_vertex + highest index +
+        // 1`, over the bytes the pass binds — and not the request's own vertex
+        // count, which is the other arm's number.
+        let mut stride = indexed(index_bytes(&[0, 5, 2]), 3, 0);
+        stride.vertex_count = 9;
+        assert_eq!(stage_buffer_affine_counts(&stride), Some([6, 1]));
+        assert_eq!(
+            stage_buffer_affine_counts(&indexed(index_bytes(&[0, 5, 2]), 3, 2)),
+            Some([8, 1]),
+            "`base_vertex` is part of the indexed count"
+        );
+        assert_eq!(
+            stage_buffer_affine_counts(&indexed(index_bytes(&[7, 7, 7]), 3, 0)),
+            Some([8, 1]),
+            "the highest index the count reaches is the one the bytes name"
+        );
+
+        // The arms whose bytes do not travel answer `None` — the shape the gate
+        // keeps on the engine by name rather than bounding on a guess. This is
+        // the indexed arm's own boundary and not a statement about the other
+        // one, whose count needs no bytes at all.
+        let gathered = BufferContent::GuestRuns(GuestRunSource {
+            runs: std::sync::Arc::new(vec![
+                GuestRun::whole(0x1000, 12).expect("a fixture run covers its own span")
+            ]),
+            source_offset: 0,
+            total_len: 12,
+            row_length_texels: 0,
+            pages: None,
+            direct_image: None,
+        });
+        assert_eq!(
+            stage_buffer_affine_counts(&indexed(gathered, 3, 0)),
+            None,
+            "a gathered index view is guest RAM this derivation has not read"
+        );
+        assert_eq!(
+            stage_buffer_affine_counts(&indexed(index_bytes(&[0, 1]), 3, 0)),
+            None,
+            "and so is a window that stops short of the indices the draw fetches"
+        );
+    }
+
+    #[test]
+    fn the_required_bytes_reach_the_widest_access_over_both_axes() {
+        let term = |axis: u8, stride: u64| AffineTerm { axis, stride };
+        let access = |base_offset: u64, access_size: u64, stride: u64| AffineAccess {
+            base_offset,
+            access_size,
+            terms: vec![term(0, stride)],
+        };
+
+        // The fixture's own pair, over the non-indexed arm's counts: the widest
+        // access is the second one, `4 + 4 + 2 * 8` — the whole `float2` of the
+        // third vertex, which is the bind's own length.
+        let positions = [access(0, 4, 8), access(4, 4, 8)];
+        assert_eq!(
+            stage_buffer_affine_required_bytes(&positions, [3, 1]),
+            Some(24)
+        );
+        assert_eq!(
+            stage_buffer_affine_required_bytes(&positions, [1, 1]),
+            Some(8),
+            "one vertex reaches the first `float2` and no further"
+        );
+        assert_eq!(
+            stage_buffer_affine_required_bytes(&positions, [0, 1]),
+            Some(8),
+            "and a count of zero bounds the expression at its constant term"
+        );
+
+        // Axis 1 is a real axis: the instance stride is what the instance count
+        // multiplies, and it is not folded into axis 0.
+        let per_instance = [AffineAccess {
+            base_offset: 8,
+            access_size: 8,
+            terms: vec![term(1, 16)],
+        }];
+        assert_eq!(
+            stage_buffer_affine_required_bytes(&per_instance, [64, 4]),
+            Some(8 + 8 + 3 * 16)
+        );
+
+        // An axis the draw does not have, and an expression that overflows the
+        // byte extent: both are proofs the contract refuses by name, so this
+        // answers `None` rather than a bound nothing states.
+        assert_eq!(
+            stage_buffer_affine_required_bytes(
+                &[AffineAccess {
+                    base_offset: 0,
+                    access_size: 4,
+                    terms: vec![term(3, 4)],
+                }],
+                [3, 1],
+            ),
+            None
+        );
+        assert_eq!(
+            stage_buffer_affine_required_bytes(
+                &[AffineAccess {
+                    base_offset: u64::MAX,
+                    access_size: 4,
+                    terms: vec![],
+                }],
+                [3, 1],
+            ),
+            None
         );
     }
 }
