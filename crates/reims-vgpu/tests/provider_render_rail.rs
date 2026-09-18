@@ -38,9 +38,9 @@ use reims_vgpu::backend::provider_render::{
     self, PresentSurfaceKey, ProviderRenderDecline, RenderChainRole, RenderInterfaceRefusal,
     RenderPresentRequest, RenderRailInputs, RenderRailOutcome, RenderRuntimeSampler,
     RenderSamplerFamily, RenderSamplerRefusal, RenderSamplerState, RenderTextureDeclaration,
-    RenderTextureShape, RenderTextureShapeRefusal, StageBufferAccess, StageBufferBind,
-    StageBufferDeclaration, StageBufferFootprint, StageBufferLanding, StageBufferWindow,
-    StageWriteback,
+    RenderTextureShape, RenderTextureShapeRefusal, ResidentSourceRoute, StageBufferAccess,
+    StageBufferBind, StageBufferDeclaration, StageBufferFootprint, StageBufferLanding,
+    StageBufferWindow, StageWriteback,
 };
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
@@ -922,6 +922,12 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // R26: the same read for the surface the *LOAD elision* named, stated
         // only by the shape [`inputs_held_with_surface_source`] drives.
         surface_resident_source_bytes: None,
+        // R34: the door and the read this record's chain arrived through, which
+        // only the seam knows and which the class charges beside its refusal.
+        // `None` is every fixture whose request names no chain at all; a test
+        // that drives the refusal's routes states one through
+        // [`inputs_held_with_route`].
+        resident_source_route: None,
         // R25: no predecessor's frame is handed over unless a test states the
         // bytes the walk carries — the shape
         // [`inputs_held_with_chain_value`] drives.
@@ -986,6 +992,28 @@ fn inputs_held_with_source<'a>(
 ) -> RenderRailInputs<'a> {
     RenderRailInputs {
         resident_source_bytes: Some(source),
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_held`] with the door this record's chain arrived through stated
+/// (R34), and no byte arm stated: the shape the class's `resident_source`
+/// refusal is about.
+///
+/// One slug and one sentence three doors answer under — the serialized packet
+/// chain, the GVA LOAD elision, and the mapper-ref-texture composite's — so the
+/// seam states which of them produced the record, together with what its own
+/// read declined on (`runtime::draw::vulkan`'s `ResidentSourceDoors`), and the
+/// class charges that route beside the refusal. A fixture states the route the
+/// way the seam would have stated it; which route the seam *does* state is
+/// pinned by the module's own decision-table test.
+fn inputs_held_with_route<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    route: ResidentSourceRoute,
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        resident_source_route: Some(route),
         ..inputs_held(stages, role)
     }
 }
@@ -4363,6 +4391,179 @@ fn the_surfaces_frame_the_elision_names_carries_the_composite_into_the_provider(
         }
         other => panic!("a short surface hand-over is not the class's: {other:?}"),
     }
+}
+
+/// R34: the two families inside `resident_source`, counted as the doors that
+/// produced them.
+///
+/// Census v24 (`evidence/gate3-census-v24-2026-09-18`) counted 646 records —
+/// 11.3 % of that boot's draws — under the bare slug, and the recon that
+/// precedes this increment could only decompose the bucket arithmetically
+/// (`gvaseed_elided` 330 + the mapper-ref elision's unlanded half 316 = 646),
+/// because nothing in the log names the door. The two families are priced
+/// completely differently: one is a read-side condition the caller could
+/// repair, the other a policy whose whole point is *not* to pay that read — so
+/// the census has to be able to tell them apart before anybody chooses between
+/// them.
+///
+/// This is the class's half of the separation, and the assertions are the
+/// behavior-neutrality proof: every route answers with the bucket's own slug
+/// and its own sentence, byte for byte; each route moves its own counter by one
+/// and no sibling's; each prices through its own byte name at the whole
+/// attachment the record would have had to carry; and neither byte arm's
+/// population moves, because no route here hands a frame over. Which route the
+/// *seam* states for a given door is its own decision table, pinned where the
+/// doors are (`runtime::draw::vulkan`'s `ResidentSourceDoors`).
+#[test]
+fn the_resident_source_bucket_is_counted_by_the_door_that_produced_it() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let identity = surface_identity(0x7b_34_01);
+    // The shape this bucket is about: the record's previous contents are the
+    // live GPU image and the caller hands nothing over. The R26 fixture is the
+    // one request in this file that states exactly that.
+    let request = resident_load_request(&identity, false);
+    // The whole attachment the record would have had to carry, which is what
+    // the route's byte name is priced by — `NarrowPass::extent`, the same
+    // length both byte arms have to carry, not a texel count.
+    let price = u64::from(width) * u64::from(height) * 4;
+    let routes = [
+        ResidentSourceRoute::ChainOrderMismatch,
+        ResidentSourceRoute::ChainGeometryMismatch,
+        ResidentSourceRoute::ChainReadUnavailable,
+        ResidentSourceRoute::ChainTexelUnavailable,
+        ResidentSourceRoute::GvaElision,
+        ResidentSourceRoute::MapperRefNoLanding,
+        ResidentSourceRoute::MapperRefIdentityMismatch,
+        ResidentSourceRoute::MapperRefFrameUnavailable,
+        ResidentSourceRoute::Undeclared,
+    ];
+
+    // 1. The bucket's own answer, with no door stated: the slug and the
+    //    sentence every route below has to keep, byte for byte.
+    let bucket_before = route_count("render_provider_out_of_class_resident_source");
+    let sentence = match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+        &request,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_resident_source",
+                "a source-less resident load keeps the engine: {reason}"
+            );
+            reason.detail().to_string()
+        }
+        other => panic!("a source-less resident load is not the held class's: {other:?}"),
+    };
+    eprintln!("R34 un-routed bucket, verbatim: {sentence}");
+    assert_eq!(
+        route_count("render_provider_out_of_class_resident_source") - bucket_before,
+        1,
+        "the refusal is counted under the census's own bucket vocabulary"
+    );
+
+    // 2. Every route, one at a time. Each is the same refusal to the reader and
+    //    its own number to the census.
+    for route in routes {
+        let names = routes.map(provider_render::resident_source_route);
+        let prices = routes.map(provider_render::resident_source_route_bytes);
+        let counted: Vec<u64> = names.iter().map(|name| route_count(name)).collect();
+        let priced: Vec<u64> = prices.iter().map(|name| route_count(name)).collect();
+        let before = route_count("render_provider_out_of_class_resident_source");
+        let chain_before = route_count("render_provider_resident_source_bytes");
+        let surface_before = route_count("render_provider_surface_resident_source_bytes");
+        let resident_arm_before = route_count("render_provider_resident_load");
+        match provider_render::submit_render(
+            &inputs_held_with_route(&stages, RenderChainRole::SoleOrTail, route),
+            &request,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                eprintln!(
+                    "R34 route {}, verbatim: {}",
+                    provider_render::resident_source_route(route),
+                    reason.detail()
+                );
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_resident_source",
+                    "a route renames nothing: {reason}"
+                );
+                assert_eq!(
+                    reason.detail(),
+                    sentence,
+                    "a route re-spells nothing: {} answers with the bucket's own sentence",
+                    provider_render::resident_source_route(route)
+                );
+            }
+            other => panic!("a source-less resident load is not the held class's: {other:?}"),
+        }
+        assert_eq!(
+            route_count("render_provider_out_of_class_resident_source") - before,
+            1,
+            "the bucket still counts one refusal per record"
+        );
+        assert_eq!(
+            route_count("render_provider_resident_source_bytes") - chain_before,
+            0,
+            "R23's arm states a frame; no route of this refusal's does"
+        );
+        assert_eq!(
+            route_count("render_provider_surface_resident_source_bytes") - surface_before,
+            0,
+            "R26's arm states a frame for the same reason"
+        );
+        assert_eq!(
+            route_count("render_provider_resident_load") - resident_arm_before,
+            0,
+            "a route that is refused never loads from a resident of this rail's own"
+        );
+        for (index, other) in routes.iter().enumerate() {
+            assert_eq!(
+                route_count(names[index]) - counted[index],
+                u64::from(*other == route),
+                "{} is charged by its own arm and by no other",
+                names[index]
+            );
+            assert_eq!(
+                route_count(prices[index]) - priced[index],
+                if *other == route { price } else { 0 },
+                "{} prices its own arm at the whole attachment, and no other arm at all",
+                prices[index]
+            );
+        }
+    }
+
+    // 3. The vocabulary itself: one name per route, its byte price beside it, no
+    //    name shared and no name reused across the two tables. A collision here
+    //    would file two facts under one census number with every assertion above
+    //    still green, which is the failure the enum exists to make impossible —
+    //    so it is asked directly rather than inferred from the counts.
+    let mut vocabulary: Vec<&str> = routes
+        .iter()
+        .map(|route| provider_render::resident_source_route(*route))
+        .chain(
+            routes
+                .iter()
+                .map(|route| provider_render::resident_source_route_bytes(*route)),
+        )
+        .collect();
+    let total = vocabulary.len();
+    vocabulary.sort_unstable();
+    vocabulary.dedup();
+    assert_eq!(
+        vocabulary.len(),
+        total,
+        "every route and every byte price has its own name: {vocabulary:?}"
+    );
+    assert!(
+        routes
+            .iter()
+            .all(|route| provider_render::resident_source_route(*route)
+                .starts_with("resident_source_")),
+        "the shell prints one vocabulary: every route is a `resident_source_*` name"
+    );
 }
 
 /// R7b's lifecycle answers are the *provider's* own, carried through the rail's
