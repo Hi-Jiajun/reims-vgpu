@@ -88,6 +88,21 @@
 //!   backwards, a reflected shape or state outside the family, an unbound
 //!   declaration, a bind whose texels are a guest gather or a resident image, a
 //!   texture of another extent, and a draw whose sampler says another state;
+//! - **a sampled texture whose texels are the trace's own production** (R22,
+//!   E-TX3/`research/docs/23` §110): a request whose bind resolved to a GPU
+//!   target (`SampledSource::Target`) leaves for the provider once a pass of
+//!   this rail has declared that guest target's production — the producing
+//!   record's own pass rides the consuming record's trace ahead of it, the
+//!   consuming declaration samples it through `TextureSource::TraceView`, and
+//!   the frame the producing record landed is the frame the consumer reads. A
+//!   target no pass here produced (`..._texture_source_undeclared`), a record
+//!   that samples the attachment it writes (`..._texture_source_order`), a
+//!   declaration that restates another shape than the production stored
+//!   (`..._texture_source_shape`) and a sampled pass whose binds the
+//!   owner→provider frame would have to carry (`..._texture_wire`, whose
+//!   contract still carries no texture declarations) all stay on the engine.
+//!   The zero-copy guest gather keeps its own exit
+//!   (`..._texture_source`) — that arm is the increment after this one;
 //! - **the attachment's own blend state** (R10, `research/docs/23` §100): a
 //!   blend the canonical pass can state *and* the command channel's v40 section
 //!   carries (blending enabled, one operation for both channel pairs, every
@@ -432,7 +447,7 @@ use metal_api_core::provider::{
     TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource, TextureType,
     TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
     VertexStep, ViewId, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
-    MAX_RENDER_TEXTURE_INDEX, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    MAX_RENDER_TEXTURE_INDEX, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::Device;
 use metal_api_vulkan::{RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage};
@@ -1761,41 +1776,126 @@ fn sampled_textures<'a>(
                 ),
             ));
         };
-        let crate::backend::vulkan::engine::SampledSource::Bytes(bytes) = &image.source else {
-            return Err(OutOfClass::owned(
-                "render_provider_out_of_class_texture_source",
-                format!(
-                    "a draw whose `[[texture({})]]` texels come from the GPU rather than the \
-                     request's own copy stays on the engine: this class carries a sampled \
-                     texture as trace-owned bytes, the way the vertex streams' staged arm does, \
-                     and the guest-gather and resident arms are the increments after it",
-                    declaration.index,
-                ),
-            ));
+        // Where the texels come from (E-TX3/R22): the request's own copy, or —
+        // the arm this increment opens — the trace's own production of a guest
+        // target, which the trace carries ahead of this pass and samples
+        // through `TextureSource::TraceView`.
+        let source = match &image.source {
+            crate::backend::vulkan::engine::SampledSource::Bytes(bytes) => {
+                // Both window formats are four-byte texels, and the count comes
+                // from the format the bind states rather than from a constant
+                // here, so a later widening of the provider's window has one
+                // place to answer for its own texel width.
+                let expected = u64::from(image.width)
+                    .checked_mul(u64::from(image.height))
+                    .and_then(|texels| texels.checked_mul(format.bytes_per_texel()));
+                if expected != u64::try_from(bytes.len()).ok() {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_texture_bind",
+                        format!(
+                            "a draw whose `[[texture({})]]` view carries {} byte(s) for a {}x{} \
+                             {:?} surface stays on the engine: the canonical view's byte source \
+                             has to be the whole tightly packed extent ({} byte(s))",
+                            declaration.index,
+                            bytes.len(),
+                            image.width,
+                            image.height,
+                            image.format,
+                            u64::from(image.width)
+                                * u64::from(image.height)
+                                * format.bytes_per_texel(),
+                        ),
+                    ));
+                }
+                NarrowTextureSource::Bytes(bytes)
+            }
+            crate::backend::vulkan::engine::SampledSource::Target(identity) => {
+                // A record that samples the attachment it writes would need the
+                // production *after* the read: the canonical contract refuses a
+                // pass that samples an identity it stores as an attachment
+                // (`RenderTextureAttachmentConflict`), and the trace order this
+                // class states has no second reading for it either, so the
+                // shape is answered by name rather than reordered.
+                if req.writes_attachment(identity) {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_texture_source_order",
+                        format!(
+                            "a draw whose `[[texture({})]]` samples the very attachment it \
+                             renders into stays on the engine: the texels this class serves are \
+                             the trace's own earlier production of that identity, and a record \
+                             that writes the view it reads would put its own store after the \
+                             read — the contract refuses that shape by name \
+                             (`RenderTextureAttachmentConflict`)",
+                            declaration.index,
+                        ),
+                    ));
+                }
+                let Some(production) = recorded_production(identity) else {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_texture_source_undeclared",
+                        format!(
+                            "a draw whose `[[texture({})]]` texels come from a GPU target stays on \
+                             the engine when no pass of this rail has declared that target's \
+                             production: the canonical rail samples a trace-produced view \
+                             (`TextureSource::TraceView`) by restating the pass that stored it, \
+                             and the resident and guest-gather arms are the increments after \
+                             this one — a production no record here stated is one this class \
+                             cannot restate either",
+                            declaration.index,
+                        ),
+                    ));
+                };
+                // The sampled declaration has to restate the stored surface's
+                // format and extent, exactly as the contract holds it
+                // (`RenderTextureSourceShapeMismatch`): the bytes the trace
+                // produces are the *stored* surface's, so a declaration that
+                // names another texel order or another extent would sample
+                // texels the production never wrote.
+                if production.format.as_texture_format() != format
+                    || [production.width, production.height]
+                        != [u64::from(image.width), u64::from(image.height)]
+                {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_texture_source_shape",
+                        format!(
+                            "a draw whose `[[texture({})]]` is {}x{} {:?} stays on the engine \
+                             when the target's own production stored {:?} at {}x{}: the \
+                             canonical rail pairs a trace-produced declaration with the store \
+                             that defines its bytes field by field and refuses a disagreement by \
+                             name (`render_texture_source_shape_mismatch`), and a declaration \
+                             that restates another shape is not one this class executes",
+                            declaration.index,
+                            image.width,
+                            image.height,
+                            image.format,
+                            production.format,
+                            production.width,
+                            production.height,
+                        ),
+                    ));
+                }
+                NarrowTextureSource::Produced {
+                    production: Arc::clone(&production),
+                }
+            }
+            // The zero-copy guest gather: the bytes are the guest's own pages,
+            // read inside the draw's command buffer, which is the increment
+            // after this one (`render_provider_out_of_class_texture_source`
+            // is how much of the census's stream is still behind it).
+            crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => {
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_texture_source",
+                    format!(
+                        "a draw whose `[[texture({})]]` texels are gathered from guest memory \
+                         rather than from a copy the request carries stays on the engine: this \
+                         class carries a sampled texture as trace-owned bytes or as the trace's \
+                         own production, the way the vertex streams' two arms do, and the \
+                         guest-gather arm is the increment after them",
+                        declaration.index,
+                    ),
+                ));
+            }
         };
-        // Both window formats are four-byte texels, and the count comes from
-        // the format the bind states rather than from a constant here, so a
-        // later widening of the provider's window has one place to answer for
-        // its own texel width.
-        let expected = u64::from(image.width)
-            .checked_mul(u64::from(image.height))
-            .and_then(|texels| texels.checked_mul(format.bytes_per_texel()));
-        if expected != u64::try_from(bytes.len()).ok() {
-            return Err(OutOfClass::owned(
-                "render_provider_out_of_class_texture_bind",
-                format!(
-                    "a draw whose `[[texture({})]]` view carries {} byte(s) for a {}x{} {:?} \
-                     surface stays on the engine: the canonical view's byte source has to be the \
-                     whole tightly packed extent ({} byte(s))",
-                    declaration.index,
-                    bytes.len(),
-                    image.width,
-                    image.height,
-                    image.format,
-                    u64::from(image.width) * u64::from(image.height) * format.bytes_per_texel(),
-                ),
-            ));
-        }
         // The canonical render sampler executes one texture *extent*: the
         // render area's own, so every fragment's sample stands on a texel
         // centre of the surface it reads (the rail's
@@ -1868,7 +1968,7 @@ fn sampled_textures<'a>(
             height: u64::from(image.height),
             format,
             sampler,
-            bytes,
+            source,
         });
     }
     // Every runtime `[[sampler(n)]]` argument the stage binds has to be one a
@@ -1901,9 +2001,26 @@ fn sampled_textures<'a>(
     // either way.
     runtime_samplers.sort_unstable_by_key(|sampler| sampler.index);
     runtime_samplers.dedup_by_key(|sampler| sampler.index);
+    // The productions this record's trace has to carry ahead of its own pass,
+    // in the order the textures state them. Deduplicated by identity, because
+    // two textures of one pass may well sample the same target and the trace
+    // states its production once.
+    let mut productions: Vec<Arc<RecordedProduction>> = Vec::new();
+    for texture in &textures {
+        let NarrowTextureSource::Produced { production, .. } = &texture.source else {
+            continue;
+        };
+        if !productions
+            .iter()
+            .any(|known| known.identity == production.identity)
+        {
+            productions.push(Arc::clone(production));
+        }
+    }
     Ok(NarrowSampling {
         textures,
         runtime_samplers,
+        productions,
     })
 }
 
@@ -3113,6 +3230,315 @@ pub fn resident_attachment(target: &TargetIdentity) -> ResidentAttachment {
     };
     registry.by_target.insert(target.clone(), attachment);
     attachment
+}
+
+/// The view-number namespace one recorded production's own views are minted
+/// from (R22, `research/docs/26` §46).
+///
+/// Far above the consuming pass's own numbering (which starts at
+/// [`FIRST_INPUT_VIEW`] and stays in the low thousands at worst), so a
+/// production's streams, index and textures can never alias a view the
+/// consuming pass states in the same trace. The value itself is private to
+/// this rail: what leaves the rail is the `(allocation, view)` pair the trace
+/// declares, and the two rails compare those, not this counter.
+///
+/// The contract's view-id namespace is one per trace — its conflict and
+/// declaration walks are keyed by [`ViewId`] alone — so two productions of one
+/// trace, and a production beside the consuming pass's own views, have to be
+/// distinct ids and not merely distinct pairs. [`PRODUCTION_VIEW_STRIDE`] is
+/// what keeps the productions apart.
+const PRODUCTION_VIEW_BASE: u64 = 0x0000_0001_0000_0000;
+
+/// The view-number block one production owns inside that namespace: the
+/// production at position `i` mints `PRODUCTION_VIEW_BASE + i * STRIDE + k`,
+/// and `k` is the recorded view's own number, which is a handful for every
+/// shape this rail admits (`FIRST_INPUT_VIEW`'s streams, the index stream, the
+/// stage buffers and the textures).
+const PRODUCTION_VIEW_STRIDE: u64 = 0x0000_0000_0001_0000;
+
+/// How many productions this rail keeps, one per guest target that a later
+/// record may sample.
+///
+/// A bound rather than a promise: the map is keyed by [`TargetIdentity`], every
+/// entry holds the pass that produced that target (its own stream bytes
+/// included), and a guest that renders into thousands of distinct surfaces in
+/// one session would otherwise keep a copy of every one of them alive for the
+/// process lifetime. The oldest entry is evicted past this many — the shape a
+/// re-production of the same identity takes is a replacement in place, so the
+/// eviction only ever costs a consumer *its* production, and a consumer with no
+/// production stays on the engine by name.
+const PRODUCTION_LIMIT: usize = 64;
+
+/// One pass of this rail a later record can sample (R22, E-TX3's
+/// `TextureSource::TraceView`).
+///
+/// The census's head gate is `render_provider_out_of_class_texture_source`: a
+/// draw whose sampled texture's texels come from the GPU rather than from a
+/// copy the request carries. The canonical contract's answer is
+/// `TextureSource::TraceView` — the sampled declaration names a view an
+/// *earlier render pass of the same trace* stored — so the fork's answer is to
+/// carry the pass that produced the target into the consuming record's own
+/// trace, where the provider can produce and sample it without a CPU round
+/// trip.
+///
+/// The fields are the producing pass's own facts, kept in the terms the trace
+/// states them:
+///
+/// * `descriptor` is the pass descriptor the producing submission built,
+///   already carrying the trace-owned copies of its streams and textures. The
+///   consuming trace shifts its view numbers into the production namespace and
+///   restates its attachment as the identity's own view with
+///   [`StoreOp::Store`], which is what makes the frame land in the trace's
+///   writeback channel;
+/// * `identity` / `attachment` are the guest target and the provider
+///   `(allocation, view)` pair both passes name — one identity, not a second
+///   name a trace could get wrong;
+/// * `format`, `width`, `height` and `extent` are the attachment's, which is
+///   what the contract compares the consuming declaration against
+///   (`RenderTextureSourceShapeMismatch`) and what this rail compares in its
+///   own gate;
+/// * `pipeline` is the registered render pipeline, which the provider already
+///   holds: the consuming trace lists it beside the consumer's, so no
+///   translation or registration is paid on the sampling side;
+/// * `allocations` are the staged views' allocation records the consuming
+///   trace has to declare, and `windows` the binds that are re-imported.
+struct RecordedProduction {
+    identity: TargetIdentity,
+    /// The provider allocation the guest target's images live under, minted by
+    /// [`resident_attachment`] and therefore stable for the process: the
+    /// *view* is minted per trace ([`PRODUCTION_VIEW_BASE`]), because the
+    /// contract's view-id namespace is one per trace.
+    allocation: AllocationId,
+    format: AttachmentFormat,
+    width: u64,
+    height: u64,
+    extent: u64,
+    /// The pass descriptor the producing submission built, with every bind
+    /// restated as the trace's own bytes: see [`production_bytes`] for why the
+    /// bytes are read at record time rather than re-imported at consume time.
+    descriptor: RenderPassDescriptor,
+    pipeline: CompiledComputePipeline,
+    /// How many views this pass costs the trace's serial pool: its attachment,
+    /// its streams, its index stream, its stage buffers and its textures — the
+    /// same walk [`serial_resource_budget`] makes over a consuming pass, so the
+    /// budget below is one sum of one count.
+    views: usize,
+    /// Monotone mint order, for the eviction above. One number per recording,
+    /// so "the oldest" is a fact this rail wrote rather than a property of
+    /// [`HashMap`]'s iteration order.
+    sequence: u64,
+}
+
+/// The process-global registry of recorded productions, one per guest target.
+struct ProductionRegistry {
+    next: u64,
+    by_identity: HashMap<TargetIdentity, Arc<RecordedProduction>>,
+}
+
+static PRODUCTIONS: OnceLock<Mutex<ProductionRegistry>> = OnceLock::new();
+
+fn production_registry() -> &'static Mutex<ProductionRegistry> {
+    PRODUCTIONS.get_or_init(|| {
+        Mutex::new(ProductionRegistry {
+            next: 0,
+            by_identity: HashMap::new(),
+        })
+    })
+}
+
+/// The production a later record may sample, or `None` when no pass of this
+/// rail ever produced that identity.
+fn recorded_production(identity: &TargetIdentity) -> Option<Arc<RecordedProduction>> {
+    let registry = production_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.by_identity.get(identity).cloned()
+}
+
+/// Restate one producing pass's binds as the trace's own bytes, in place.
+///
+/// The reason is the one thing a recorded pass cannot carry across
+/// submissions: a *lease*. Every window-backed bind of the producing pass — a
+/// vertex stream (R9q), the index stream (R11) or a stage buffer (R9e/R18) —
+/// travels into its trace as a lease, and [`provider_owner::Plan::settle`]
+/// retires that lease with the producing submission's completion. A stage
+/// buffer is a lease in **both** of its arms, so the staged copy beside a
+/// window is retired the same way.
+///
+/// The two alternatives were re-importing the window inside the consuming
+/// submission, or restating the bytes. The bytes are restated because a
+/// consuming trace that states no lease needs no owner plan at all: it stays
+/// the in-process trace every sampled pass before R22 was. That matters because
+/// the owner→provider wire's render contract still drops a pass's texture
+/// declarations (`research/docs/23` §101.5) — a sampled pass that crosses the
+/// wire is a typed decline today — so a production carrying a lease would push
+/// every trace-produced consumer onto that decline.
+///
+/// The bytes are the ones the producing record *read*: a staged stream's own
+/// copy, or [`provider_owner::window_bytes`]' range for a window, which is the
+/// range the borrowed arm would have bound. `None` is a window this rail
+/// cannot read — the same refusal the class answers for a live window bind, at
+/// the one moment the production is recorded rather than the moment it is
+/// consumed, so a production whose bytes this rail cannot state is simply not
+/// recorded and its consumer keeps the engine by name.
+fn production_bytes(pass: &NarrowPass<'_>, descriptor: &mut RenderPassDescriptor) -> Option<()> {
+    fn own(view: &mut BufferView, bytes: Vec<u8>) {
+        view.offset = 0;
+        view.length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        view.source = BufferSource::OwnedBytes(bytes);
+    }
+    for (binding, stream) in pass.vertex_streams.iter().enumerate() {
+        let view = &mut descriptor.vertex_buffers[binding];
+        match &stream.source {
+            // A staged stream already travels as the trace's own bytes.
+            StreamSource::Staged(_) => {}
+            StreamSource::Window(window) => {
+                let bytes = provider_owner::window_bytes(owner_window(
+                    vertex_stream_owner_binding(binding),
+                    *window,
+                ))
+                .ok()?;
+                own(view, bytes);
+            }
+        }
+    }
+    if let Some(indices) = descriptor.indices.as_mut() {
+        if let StreamSource::Window(window) = &pass.index_stream.source {
+            let bytes =
+                provider_owner::window_bytes(owner_window(index_stream_owner_binding(), *window))
+                    .ok()?;
+            own(&mut indices.view, bytes);
+        }
+    }
+    for (index, buffer) in pass.stage_buffers.iter().enumerate() {
+        let view = &mut descriptor.stage_buffers[index].view;
+        let label = stage_buffer_owner_binding(buffer.stage, buffer.index);
+        let bytes = match (buffer.window, buffer.bytes) {
+            (Some(window), _) => provider_owner::window_bytes(owner_window(label, window)).ok()?,
+            (None, Some(bytes)) => bytes.to_vec(),
+            // A bind with neither a window nor staged bytes is an arm the
+            // class admits only under its own name; a pass that reached a
+            // completion carries one of the two.
+            (None, None) => continue,
+        };
+        own(view, bytes);
+    }
+    Some(())
+}
+
+/// Record one successful submission's pass as the production of a guest
+/// target, or leave the registry untouched when the pass is not one a later
+/// trace can restate.
+///
+/// `None` is deliberately not one condition: a pass that loads from the
+/// provider's own image (no such image exists in the consuming trace's
+/// registry), one that *writes* a stage buffer (its landing would be paid
+/// twice), one that presents, and one that itself samples a trace-produced
+/// texture are all shapes whose re-run would state a different trace than the
+/// one that ran. Each keeps the consuming record on the engine by name —
+/// `render_provider_out_of_class_texture_source_undeclared` — rather than
+/// letting this rail invent the production's bytes.
+fn production_recordable(req: &DrawRequest, pass: &NarrowPass<'_>) -> bool {
+    if req.target_identity.is_none() {
+        return false;
+    }
+    if !matches!(pass.load, NarrowLoad::Clear(_)) {
+        return false;
+    }
+    if pass.present.is_some() {
+        return false;
+    }
+    if pass
+        .stage_buffers
+        .iter()
+        .any(|buffer| buffer.access.is_writable())
+    {
+        return false;
+    }
+    if pass
+        .textures
+        .iter()
+        .any(|texture| !matches!(texture.source, NarrowTextureSource::Bytes(_)))
+    {
+        return false;
+    }
+    true
+}
+
+fn record_production(
+    req: &DrawRequest,
+    pass: &NarrowPass<'_>,
+    pipeline: &CompiledComputePipeline,
+    descriptor: &RenderPassDescriptor,
+) -> Option<Arc<RecordedProduction>> {
+    if !production_recordable(req, pass) {
+        return None;
+    }
+    let identity = req.target_identity.clone()?;
+    // One identity, minted the one way this rail mints resident pairs: the same
+    // call the pass's own attachment went through, so the production and the
+    // consumer's sampled view cannot name two images.
+    let attachment = resident_attachment(&identity);
+    match pass.store {
+        // The frame went back to the caller and the caller's store route landed
+        // it under this identity (the R20 published arm is the shape the
+        // production seam states for a withheld readback).
+        NarrowStore::Writeback => {}
+        // The frame stayed in the provider's own image under the identity.
+        NarrowStore::Resident(resident) if resident == attachment => {}
+        NarrowStore::Resident(_) => return None,
+    }
+    // The descriptor is kept as the producing submission built it, with one
+    // rewrite: every bind that traveled as a lease becomes the trace's own
+    // bytes, because a lease is retired with the submission that imported it.
+    // The views themselves are minted into the production's own namespace when
+    // this record is *consumed*, because the contract's view-id namespace is
+    // one per trace and the production's position in that trace is not known
+    // here.
+    let mut descriptor = descriptor.clone();
+    production_bytes(pass, &mut descriptor)?;
+    let registry = production_registry();
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.next += 1;
+    let production = Arc::new(RecordedProduction {
+        identity: identity.clone(),
+        allocation: attachment.allocation,
+        format: pass.format,
+        width: pass.width,
+        height: pass.height,
+        extent: pass.extent,
+        descriptor,
+        pipeline: pipeline.clone(),
+        views: pass.views(),
+        sequence: registry.next,
+    });
+    registry
+        .by_identity
+        .insert(identity, Arc::clone(&production));
+    while registry.by_identity.len() > PRODUCTION_LIMIT {
+        let Some(oldest) = registry
+            .by_identity
+            .iter()
+            .min_by_key(|(_, production)| production.sequence)
+            .map(|(identity, _)| identity.clone())
+        else {
+            break;
+        };
+        registry.by_identity.remove(&oldest);
+    }
+    Some(production)
+}
+
+/// Drop every recorded production, for the one event that retires the traces
+/// they were recorded in: a rebuilt device.
+fn clear_productions() {
+    let registry = production_registry();
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.by_identity.clear();
 }
 
 /// The guest surface one presenting record hands to the display rail (R4b).
@@ -4464,7 +4890,7 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             }
         }
     }
-    match submit_narrow(inputs, &pass, &copies) {
+    match submit_narrow(inputs, req, &pass, &copies) {
         Ok(RenderCompletion::Writeback(output)) => RenderRailOutcome::ProviderCompleted(output),
         Ok(RenderCompletion::Resident(frame)) => {
             RenderRailOutcome::ProviderCompletedResident(frame)
@@ -4682,6 +5108,11 @@ pub(crate) fn on_device_rebuilt() {
     if let Ok(mut pipelines) = rail.pipelines.lock() {
         pipelines.clear();
     }
+    // R22: a production names a registered pipeline and the passes of one
+    // device epoch; a rebuilt device holds neither, so the recorded
+    // productions go with them rather than being re-run against a provider
+    // that never registered their pipelines.
+    clear_productions();
 }
 
 /// One admitted vertex stream: one fetch table, and the attributes read out of
@@ -4740,6 +5171,23 @@ struct NarrowSampling<'a> {
     /// One entry per runtime `[[sampler(n)]]` argument an admitted texture reads
     /// through, ascending by Metal index.
     runtime_samplers: Vec<NarrowRuntimeSampler>,
+    /// The productions the pass's own trace has to carry ahead of it (R22):
+    /// one entry per distinct trace-produced identity the textures bind.
+    productions: Vec<Arc<RecordedProduction>>,
+}
+
+/// Where one admitted texture's texels come from (R10/R22).
+#[derive(Clone)]
+enum NarrowTextureSource<'a> {
+    /// The request's own tightly packed copy, the arm every earlier increment
+    /// carried.
+    Bytes(&'a [u8]),
+    /// The trace's own production (R22, E-TX3): the view an earlier pass of
+    /// this record's own trace stores, named by the guest target the bind's
+    /// `SampledSource::Target` resolved to. The bytes do not exist before the
+    /// trace runs, so the view travels as `TextureSource::TraceView` and the
+    /// production rides the same trace ahead of this pass.
+    Produced { production: Arc<RecordedProduction> },
 }
 
 /// One admitted texture: the canonical binding (the Metal index it states, in
@@ -4761,9 +5209,10 @@ struct NarrowTexture<'a> {
     /// The sampler form the declaration states, or the sampler-free fetched
     /// arm (R15).
     sampler: NarrowSampler,
-    /// The texels, as the request's own tightly packed copy — four bytes per
-    /// texel, in the byte order [`Self::format`] names.
-    bytes: &'a [u8],
+    /// Where the texels come from: the request's own tightly packed copy —
+    /// four bytes per texel, in the byte order [`Self::format`] names — or the
+    /// trace's own production of the identity the bind resolved to (R22).
+    source: NarrowTextureSource<'a>,
 }
 
 /// Which sampler form one admitted texture's declaration states (R10/R12/R15).
@@ -4864,6 +5313,12 @@ struct NarrowPass<'a> {
     /// by Metal index — the canonical contract's own order. Empty for every
     /// stage that samples through its own AIR static state.
     runtime_samplers: Vec<NarrowRuntimeSampler>,
+    /// The passes this record's own trace has to carry ahead of it so the
+    /// textures above can sample them (R22): one entry per distinct
+    /// trace-produced identity the pass binds, in the order the textures state
+    /// them — which is what makes the trace's pass order the production's own
+    /// order.
+    productions: Vec<Arc<RecordedProduction>>,
     /// The scissor rectangle the pass states, or `None` for the whole
     /// attachment — the canonical pass's own default
     /// ([`RenderPassDescriptor::scissor`]).
@@ -4886,6 +5341,16 @@ struct NarrowPass<'a> {
 }
 
 impl NarrowPass<'_> {
+    /// The views this pass spends the trace's serial pool on: its attachment,
+    /// its vertex streams, its index stream, its stage buffers and its sampled
+    /// textures. The trace's own budget is
+    /// [`MAX_SERIAL_RESOURCES`](metal_api_core::provider::MAX_SERIAL_RESOURCES)
+    /// views, and a record that carries productions spends theirs beside this
+    /// pass's — [`serial_views_admit`] is the one place that sum is compared.
+    fn views(&self) -> usize {
+        1 + self.vertex_streams.len() + 1 + self.stage_buffers.len() + self.textures.len()
+    }
+
     /// Every vertex stream this pass states as a registered guest RAM window
     /// (`R9q`): the stream's canonical binding index beside the window its bind
     /// was cut from. The label is the *stream's* own numbering — one entry per
@@ -4990,13 +5455,21 @@ impl NarrowPass<'_> {
 /// Whether one request is the narrow class, and the facts the trace is built
 /// from when it is.
 ///
-/// Pure, and ordered cheapest-first so a refused shape costs nothing: no
-/// provider call, no translation, no registration. Every refusal names the
+/// Pure over the request and this rail's own recorded state, and ordered
+/// cheapest-first so a refused shape costs nothing: no provider call, no
+/// translation, no registration, and no device read. Every refusal names the
 /// condition that kept the shape on the engine, because that string is what the
-/// observer reports when a class boundary moves. The one condition that is not
-/// a property of the request — the attachment window, which belongs to the
-/// device's provider — is [`declared_attachment_window`]'s, asked by
-/// [`submit_render`] after this gate has accepted the shape.
+/// observer reports when a class boundary moves.
+///
+/// Two facts this gate reads are not properties of the request. One is the
+/// attachment window, which belongs to the device's provider and is
+/// [`declared_attachment_window`]'s — asked by [`submit_render`] after this
+/// gate has accepted the shape. The other is the production registry
+/// ([`recorded_production`], R22): a trace-produced sampled texture is in class
+/// exactly when a pass of this rail has already declared that guest target's
+/// production, which is the arm E-TX3's `TextureSource::TraceView` states — the
+/// registry read is a lock and a lookup, and it is the whole of what "the
+/// trace's own production" means on this side of the seam.
 fn narrow_class<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &'a DrawRequest,
@@ -5677,6 +6150,60 @@ fn narrow_class<'a>(
             ),
         ));
     }
+    // The same wire question for the pass's sampled *textures* themselves
+    // (`research/docs/23` §101.5): the frame's pipeline entry carries a render
+    // contract with an **empty** texture list — the codec has a kind for the
+    // compute half's declarations (`PIPELINE_KIND_COMPUTE_TEXTURES`) and none
+    // for the render half's — so a sampled pass that crosses the frame reaches
+    // admission with its declarations dropped and is refused by name
+    // (`UndeclaredTextureBinding`, measured on this rail *before* this
+    // condition existed: `evidence/r22-reims-target-source-<sha>/`'s
+    // pre-guard reading). A decline is not a fallback, so the class answers
+    // the wire question before the frame exists, exactly as the runtime
+    // sampler condition above does — and the shapes this keeps on the engine
+    // are the ones whose binds the frame has to carry (a window-backed stream,
+    // the index stream, or a declared stage buffer of either arm).
+    if !sampling.textures.is_empty() && !wire_carries_samplers {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_texture_wire",
+            format!(
+                "a draw whose {} sampled texture(s) would travel the owner→provider frame stays \
+                 on the engine: the frame's render contract carries no texture declarations yet \
+                 (`research/docs/23` §101.5), so the decoded pass would bind views no contract \
+                 declares and admission would refuse it by name \
+                 (`UndeclaredTextureBinding`) — a decline, not a fallback, and the trace-produced \
+                 arm above is exactly the shape this increment adds to that population",
+                sampling.textures.len(),
+            ),
+        ));
+    }
+    // R22: a record that carries productions spends the trace's serial pool on
+    // *both* passes' views. The pool's own bound is the contract's
+    // (`serial_resource_limit` at admission), and a shape above it is one the
+    // provider always refuses — so the class answers it here, by name, rather
+    // than handing admission a trace it can only decline.
+    let views = 1
+        + vertex_streams.len()
+        + 1
+        + stage_buffers.len()
+        + sampling.textures.len()
+        + sampling
+            .productions
+            .iter()
+            .map(|production| production.views)
+            .sum::<usize>();
+    if views > MAX_SERIAL_RESOURCES {
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_texture_production_budget",
+            format!(
+                "a draw whose trace would declare {views} views stays on the engine: the \
+                 canonical trace's serial pool holds {MAX_SERIAL_RESOURCES} \
+                 (`serial_resource_limit`), and a draw that carries a production beside its own \
+                 pass spends the pool on both — a shape the provider always refuses is not one \
+                 this class executes",
+            ),
+        ));
+    }
     Ok(NarrowPass {
         vertex_entry: vertex_entry.to_owned(),
         fragment_entry: fragment_entry.to_owned(),
@@ -5697,6 +6224,7 @@ fn narrow_class<'a>(
         stage_buffers,
         textures: sampling.textures,
         runtime_samplers: sampling.runtime_samplers,
+        productions: sampling.productions,
         scissor,
         viewport,
         blend,
@@ -5923,6 +6451,7 @@ fn attachment_identity(pass: &NarrowPass<'_>) -> AttachmentIdentity {
 
 fn submit_narrow(
     inputs: &RenderRailInputs<'_>,
+    req: &DrawRequest,
     pass: &NarrowPass<'_>,
     copies: &WindowCopies,
 ) -> Result<RenderCompletion, ProviderRenderDecline> {
@@ -5977,13 +6506,39 @@ fn submit_narrow(
         .map_err(|error| ProviderRenderDecline::TraceAdmission {
             detail: error.to_string(),
         })?;
-
     // The owner's leases first (R9d/R9q): every window-backed binding this
     // pass states — a stage buffer's, and a vertex stream's since R9q — is
     // imported here, and the trace's views below name the allocation and lease
     // the plan minted for each. Importing before the trace exists is the same
     // order the compute rail keeps: a refused import never reaches admission.
     let mut leases = plan_owner_leases(provider, pass, &mut resources, copies)?;
+    // R22: the productions this record's trace carries, restated in this
+    // trace's own view namespace. Built before the views below because the
+    // consuming declarations name the very views these passes store.
+    let in_flight: Vec<ProductionInFlight> = pass
+        .productions
+        .iter()
+        .enumerate()
+        .map(|(index, production)| production_in_flight(production, index))
+        .collect();
+    for production in &in_flight {
+        for (allocation_id, size) in production
+            .allocations
+            .iter()
+            .copied()
+            .chain(std::iter::once((production.allocation, production.extent)))
+        {
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id,
+                    owner_epoch: provider.device_epoch(),
+                    size,
+                })
+                .map_err(|error| ProviderRenderDecline::TraceAdmission {
+                    detail: error.to_string(),
+                })?;
+        }
+    }
     let mut vertex_buffers = Vec::new();
     let mut next_view = FIRST_INPUT_VIEW;
     for (binding, stream) in pass.vertex_streams.iter().enumerate() {
@@ -6155,10 +6710,38 @@ fn submit_narrow(
     // repeat it rather than trusting either half.
     let mut textures = Vec::with_capacity(pass.textures.len());
     for texture in &pass.textures {
+        // Where the texels come from decides the identity, and so the source
+        // arm: the request's own copy is a view this rail mints, while a
+        // trace-produced texture *is* the identity the production stored under
+        // (`Research/docs/23` §110: the view's own `(allocation, view)` pair
+        // is the production's identity, so the declaration and its producer
+        // agree by construction). The view number still advances for a
+        // produced texture, so the numbering `input_allocations` derives stays
+        // in lockstep with the views stated here.
+        let (view_id, allocation_id, source) = match &texture.source {
+            NarrowTextureSource::Bytes(bytes) => (
+                ViewId::new(next_view),
+                input_allocation(next_view),
+                TextureSource::OwnedBytes(bytes.to_vec()),
+            ),
+            NarrowTextureSource::Produced { production, .. } => {
+                let position = pass
+                    .productions
+                    .iter()
+                    .position(|known| Arc::ptr_eq(known, production))
+                    .expect("every produced texture names a production of this pass");
+                let in_flight = &in_flight[position];
+                (
+                    in_flight.attachment,
+                    in_flight.allocation,
+                    TextureSource::TraceView,
+                )
+            }
+        };
         textures.push(TextureView {
-            view_id: ViewId::new(next_view),
+            view_id,
             metal_binding: texture.index,
-            allocation_id: input_allocation(next_view),
+            allocation_id,
             texture_type: TextureType::D2,
             format: texture.format,
             width: texture.width,
@@ -6174,7 +6757,7 @@ fn submit_narrow(
                 NarrowSampler::Fetched => TextureAccess::Fetched,
                 NarrowSampler::Static(_) | NarrowSampler::Runtime { .. } => TextureAccess::Sampled,
             },
-            source: TextureSource::OwnedBytes(texture.bytes.to_vec()),
+            source,
         });
         next_view += 1;
     }
@@ -6277,15 +6860,52 @@ fn submit_narrow(
         // two spellings of them.
         stage_buffers: stage_buffers.clone(),
     };
+    // R22: the pass this record states is a candidate production of the guest
+    // target it stores into, and a later record may sample it. The *copy* is
+    // paid here rather than after the completion because the trace takes the
+    // descriptor, and it is paid only for the shapes
+    // [`production_recordable`] admits — the record this rail can restate
+    // inside another record's trace. A shape that is not one keeps no copy.
+    let recordable_descriptor = production_recordable(req, pass).then(|| pass_descriptor.clone());
     let trace = ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
         device_epoch: provider.device_epoch(),
         operation_id: OperationId::new(NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed)),
-        pipelines: vec![declaring.clone(), render_pipeline.clone()],
+        // R22: one render pipeline per pass this trace states — the consumer's
+        // own, and the registered pipeline of every production it carries.
+        // Deduplicated by pipeline id, because two records of one module pair
+        // share the registration and a trace states each pipeline once.
+        pipelines: {
+            let mut pipelines = vec![declaring.clone(), render_pipeline.clone()];
+            for production in &pass.productions {
+                if !pipelines
+                    .iter()
+                    .any(|known| known.pipeline_id == production.pipeline.pipeline_id)
+                {
+                    pipelines.push(production.pipeline.clone());
+                }
+            }
+            pipelines
+        },
         encoder_dispatch_type: DispatchType::Serial,
         passes: {
             let mut passes =
                 declaring_passes_with(declaring.pipeline_id, declaration, &stage_buffers);
+            // The productions' own declarations and passes, in the order the
+            // textures named them: a trace-produced view has to be declared
+            // before a render pass stores into it (the trace's pool is what
+            // admission resolves an attachment view against), and the store
+            // has to precede the sampling pass — which is the same order
+            // `validate_serial_buffer_reuse` walks.
+            for production in &in_flight {
+                passes.push(declaring_pass(
+                    declaring.pipeline_id,
+                    vec![production_declaration(production)],
+                ));
+            }
+            for production in &in_flight {
+                passes.push(TracePass::Render(production.descriptor.clone()));
+            }
             passes.push(TracePass::Render(pass_descriptor));
             passes
         },
@@ -6420,6 +7040,28 @@ fn submit_narrow(
     // truncated into place. The bytes leave here for the caller, which owns the
     // guest destination (`StageBufferLanding`).
     let stage_writebacks = stage_buffer_writebacks(&stage_buffer_slots, &result.writebacks)?;
+    // R22: every production this trace carried has to have landed its bytes in
+    // the trace's own writeback channel, or the consuming declaration sampled a
+    // view the provider never produced. The contract refuses that shape at
+    // admission (`render_texture_source_unwritten`) and the producer's store is
+    // `StoreOp::Store`, so this is a check rather than an expectation: a
+    // submission whose trace states a production and no writeback for it is a
+    // wiring defect and a typed decline, never a frame.
+    for production in &in_flight {
+        let landed = result.writebacks.iter().any(|writeback| {
+            writeback.view_id == production.attachment
+                && writeback.allocation_id == production.allocation
+        });
+        if !landed {
+            return Err(ProviderRenderDecline::AttachmentWritebackMissing);
+        }
+    }
+    // A production is recorded only once it has actually run: the re-run the
+    // consuming trace states is the pass this submission sent, and the bytes a
+    // later consumer samples are the ones this completion published.
+    if let Some(descriptor) = recordable_descriptor.as_ref() {
+        record_production(req, pass, &render_pipeline, descriptor);
+    }
     // The resident arm's whole claim is that the frame stayed in the provider's
     // image. The one fact that would make that claim unreadable is a published
     // writeback for the same attachment, so it is checked rather than assumed —
@@ -6516,19 +7158,7 @@ fn declaring_passes_with(
     attachment: BufferView,
     stage_buffers: &[StageBufferView],
 ) -> Vec<TracePass> {
-    let declare_pass = |buffers: Vec<BufferView>| {
-        TracePass::Compute(ComputePass {
-            pipeline,
-            buffers,
-            textures: Vec::new(),
-            dispatch: Dispatch {
-                kind: DispatchKind::ThreadsExact,
-                grid: [1, 1, 1],
-                threads_per_threadgroup: [1, 1, 1],
-            },
-        })
-    };
-    let mut passes = vec![declare_pass(vec![attachment])];
+    let mut passes = vec![declaring_pass(pipeline, vec![attachment])];
     for buffer in stage_buffers
         .iter()
         .filter(|buffer| buffer.view.access.is_writable())
@@ -6537,9 +7167,138 @@ fn declaring_passes_with(
         // The declaring kernel's own interface: one buffer, read.
         pool.metal_binding = 0;
         pool.access = BufferAccess::Read;
-        passes.push(declare_pass(vec![pool]));
+        passes.push(declaring_pass(pipeline, vec![pool]));
     }
     passes
+}
+
+/// One declaring compute pass: the one-thread kernel that reads a view, which
+/// is how a trace declares the bytes a render attachment or a writable stage
+/// buffer lands in (`research/docs/23` §3.6).
+fn declaring_pass(
+    pipeline: metal_api_core::provider::PipelineId,
+    buffers: Vec<BufferView>,
+) -> TracePass {
+    TracePass::Compute(ComputePass {
+        pipeline,
+        buffers,
+        textures: Vec::new(),
+        dispatch: Dispatch {
+            kind: DispatchKind::ThreadsExact,
+            grid: [1, 1, 1],
+            threads_per_threadgroup: [1, 1, 1],
+        },
+    })
+}
+
+/// One recorded production restated inside a consuming trace (R22): the pass
+/// descriptor in this trace's own view namespace, the view its own production
+/// lands in, and the trace-owned allocations the rest of the trace has to
+/// declare.
+struct ProductionInFlight {
+    /// The identity's allocation, one per guest target (`resident_attachment`).
+    allocation: AllocationId,
+    /// The extent of the surface this production stores.
+    extent: u64,
+    /// The view this production's own pass stores into — minted here, and the
+    /// same view the consuming declaration of the identity names.
+    attachment: ViewId,
+    descriptor: RenderPassDescriptor,
+    allocations: Vec<(AllocationId, u64)>,
+}
+
+/// Restate one recorded production inside the consuming trace.
+///
+/// Three rewrites, each holding one invariant of the trace it lands in:
+///
+/// * every view moves into the production's own block of
+///   [`PRODUCTION_VIEW_BASE`], because the contract's view-id namespace is one
+///   per trace: the conflict and declaration walks are keyed by [`ViewId`]
+///   alone, so two productions — and a production beside the consuming pass's
+///   own views — have to be distinct ids and not merely distinct pairs. A
+///   *staged* view's allocation is re-derived from its minted view number,
+///   exactly as [`input_allocation`] derives the consuming pass's;
+/// * every bind is already the trace's own bytes ([`production_bytes`] read
+///   them when the production was recorded), so the consuming trace states no
+///   lease and needs no owner plan;
+/// * the colour attachment becomes the identity's allocation at this trace's
+///   view with [`StoreOp::Store`], which is what makes the frame land in the
+///   trace's writeback channel for the consumer to sample.
+fn production_in_flight(production: &RecordedProduction, index: usize) -> ProductionInFlight {
+    let mut descriptor = production.descriptor.clone();
+    let offset = PRODUCTION_VIEW_BASE + u64::try_from(index).unwrap_or(0) * PRODUCTION_VIEW_STRIDE;
+    let mint = |view: ViewId| ViewId::new(view.get() + offset);
+    let mut allocations = Vec::new();
+    for vertex in descriptor.vertex_buffers.iter_mut() {
+        vertex.view_id = mint(vertex.view_id);
+        if let BufferSource::OwnedBytes(bytes) = &vertex.source {
+            vertex.allocation_id = input_allocation(vertex.view_id.get());
+            allocations.push((
+                vertex.allocation_id,
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            ));
+        }
+    }
+    if let Some(indices) = descriptor.indices.as_mut() {
+        indices.view.view_id = mint(indices.view.view_id);
+        if let BufferSource::OwnedBytes(bytes) = &indices.view.source {
+            indices.view.allocation_id = input_allocation(indices.view.view_id.get());
+            allocations.push((
+                indices.view.allocation_id,
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            ));
+        }
+    }
+    for stage in descriptor.stage_buffers.iter_mut() {
+        stage.view.view_id = mint(stage.view.view_id);
+    }
+    for texture in descriptor.textures.iter_mut() {
+        texture.view_id = mint(texture.view_id);
+        if let TextureSource::OwnedBytes(bytes) = &texture.source {
+            texture.allocation_id = input_allocation(texture.view_id.get());
+            allocations.push((
+                texture.allocation_id,
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            ));
+        }
+    }
+    for color in descriptor.color_attachments.iter_mut() {
+        color.view_id = mint(color.view_id);
+        color.allocation_id = production.allocation;
+        color.store = StoreOp::Store;
+    }
+    let attachment = descriptor
+        .color_attachments
+        .first()
+        .map(|color| color.view_id)
+        .expect("a recorded production states its one colour attachment");
+    ProductionInFlight {
+        allocation: production.allocation,
+        extent: production.extent,
+        attachment,
+        descriptor,
+        allocations,
+    }
+}
+
+/// The declaration one production's view needs before a render pass can store
+/// into it: the same one-word read the consuming attachment's declaration is,
+/// at the identity's own extent and allocation (R22).
+fn production_declaration(production: &ProductionInFlight) -> BufferView {
+    BufferView {
+        view_id: production.attachment,
+        metal_binding: 0,
+        allocation_id: production.allocation,
+        offset: 0,
+        length: production.extent,
+        access: BufferAccess::Read,
+        attribute_stride: None,
+        source: BufferSource::OwnedBytes(vec![
+            0u8;
+            usize::try_from(production.extent)
+                .unwrap_or(usize::MAX)
+        ]),
+    }
 }
 
 /// One admitted stage buffer's view identity, kept from the trace construction
@@ -6643,10 +7402,17 @@ fn input_allocations(pass: &NarrowPass<'_>) -> Vec<(AllocationId, u64)> {
     // makes, one number at a time.
     let texture_base = next_view + 1 + u64::try_from(pass.stage_buffers.len()).unwrap_or(u64::MAX);
     for (index, texture) in pass.textures.iter().enumerate() {
+        // A trace-produced texture names the identity its production stored
+        // under (R22): the allocation is the production's, declared from that
+        // side of the trace, and re-declaring it here would be a second record
+        // for one view.
+        let NarrowTextureSource::Bytes(bytes) = &texture.source else {
+            continue;
+        };
         let view_number = texture_base + u64::try_from(index).unwrap_or(u64::MAX);
         out.push((
             input_allocation(view_number),
-            u64::try_from(texture.bytes.len()).unwrap_or(u64::MAX),
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         ));
     }
     out
