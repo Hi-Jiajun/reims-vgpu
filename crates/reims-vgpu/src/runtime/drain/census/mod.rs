@@ -455,6 +455,311 @@ pub(crate) fn note_display_present_signal(arm: usize) {
     ));
 }
 
+/// Which render path answered a draw the frame profile counted.
+///
+/// The two paths are the canonical provider (`feature = "provider-render"`)
+/// and the self-contained engine. A draw the gate refused before either ran is
+/// in neither count; `draws_per_present_*` counts every draw the drain phase
+/// saw, so the two rail counts are its execution split, not a second total.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FrameDrawRail {
+    /// The canonical provider (`feature = "provider-render"`).
+    Provider,
+    /// The self-contained engine.
+    Engine,
+}
+
+/// One `frame_profile` line per this many milliseconds of presents.
+///
+/// Its own constant rather than `DRAIN_DUTY_REPORT_MS`, even though both are
+/// one second: the two windows open on different events (a drain tranche
+/// against a present), and a reader pairing the lines by `t=` is comparing two
+/// clocks that were never the same one.
+const FRAME_PROFILE_REPORT_MS: u64 = 1_000;
+
+/// Present-interval histogram bucket width, in microseconds.
+const FRAME_INTERVAL_BUCKET_US: u64 = 1_000;
+/// Bucket count; the last bucket is the `>=` overflow.
+const FRAME_INTERVAL_BUCKETS: usize = 64;
+
+/// What one presented frame cost, closed at every present.
+///
+/// **What the window censuses cannot say.** `drain_duty` divides a whole
+/// second, and `present`/`display_present_signal` count presents without
+/// closing anything against them. A desktop that feels slow while every
+/// per-second number looks small is exactly the shape those two cannot
+/// express: the reading has to be *per frame* — the interval between presents,
+/// the draws that landed inside it, and the host span those draws took.
+///
+/// **The frame.** One call of
+/// [`crate::runtime::drain::signal_display_present_complete`], which runs once
+/// for every present after the `presentFrame` retain — the guest's own
+/// frame-done pacing edge. `not_enabled` is passed apart because a present the
+/// guest did not ask to be notified about is still a present, and folding it
+/// into the total would hide that the notification the guest paces on never
+/// arrived.
+///
+/// **The host span.** The sum of `drain_duty`'s per-draw `draw_us` banked
+/// between two presents, differenced from the cumulative counter so a window
+/// boundary cannot truncate a frame. That is the existing span the drain
+/// worker already takes around `encode_draw_chain`; nothing here reads a clock
+/// the draw path did not already read, and no admit/refuse/skip decision
+/// consults any of it.
+///
+/// **The median.** A mean cannot tell a steady 8.3 ms cadence apart from one
+/// stall in ten frames, so the interval is also bucketed at
+/// `FRAME_INTERVAL_BUCKET_US`. A p50 is the bucket's lower edge, which is the
+/// resolution the reading is honest at; the max is exact.
+pub(crate) struct FrameProfileCensus {
+    // Window counters, swapped out by `take`.
+    presents: std::sync::atomic::AtomicU64,
+    present_not_enabled: std::sync::atomic::AtomicU64,
+    provider_draws: std::sync::atomic::AtomicU64,
+    engine_draws: std::sync::atomic::AtomicU64,
+    frames: std::sync::atomic::AtomicU64,
+    interval_sum_us: std::sync::atomic::AtomicU64,
+    interval_max_us: std::sync::atomic::AtomicU64,
+    interval_hist: [std::sync::atomic::AtomicU64; FRAME_INTERVAL_BUCKETS],
+    draws_sum: std::sync::atomic::AtomicU64,
+    draws_max: std::sync::atomic::AtomicU64,
+    host_sum_us: std::sync::atomic::AtomicU64,
+    host_max_us: std::sync::atomic::AtomicU64,
+    // Cumulative, so a frame straddling a report boundary is still whole.
+    draws: std::sync::atomic::AtomicU64,
+    draw_us: std::sync::atomic::AtomicU64,
+    // The previous frame's close; 0 before the first present.
+    last_present_us: std::sync::atomic::AtomicU64,
+    last_present_draws: std::sync::atomic::AtomicU64,
+    last_present_draw_us: std::sync::atomic::AtomicU64,
+    // The window clock; 0 before the first present arms it.
+    last_report_ms: std::sync::atomic::AtomicU64,
+    /// The window length; production uses `FRAME_PROFILE_REPORT_MS`.
+    report_ms: u64,
+}
+
+impl FrameProfileCensus {
+    const fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
+        Self {
+            presents: AtomicU64::new(0),
+            present_not_enabled: AtomicU64::new(0),
+            provider_draws: AtomicU64::new(0),
+            engine_draws: AtomicU64::new(0),
+            frames: AtomicU64::new(0),
+            interval_sum_us: AtomicU64::new(0),
+            interval_max_us: AtomicU64::new(0),
+            interval_hist: [const { AtomicU64::new(0) }; FRAME_INTERVAL_BUCKETS],
+            draws_sum: AtomicU64::new(0),
+            draws_max: AtomicU64::new(0),
+            host_sum_us: AtomicU64::new(0),
+            host_max_us: AtomicU64::new(0),
+            draws: AtomicU64::new(0),
+            draw_us: AtomicU64::new(0),
+            last_present_us: AtomicU64::new(0),
+            last_present_draws: AtomicU64::new(0),
+            last_present_draw_us: AtomicU64::new(0),
+            last_report_ms: AtomicU64::new(0),
+            report_ms: FRAME_PROFILE_REPORT_MS,
+        }
+    }
+
+    /// A test-sized window, so a unit test can close one without presenting a
+    /// thousand frames.
+    #[cfg(test)]
+    pub(crate) fn with_report_ms(report_ms: u64) -> Self {
+        Self {
+            report_ms,
+            ..Self::new()
+        }
+    }
+
+    /// Bank one draw's existing host span into the open frame.
+    pub(crate) fn note_draw(&self, us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.draws.fetch_add(1, Relaxed);
+        self.draw_us.fetch_add(us, Relaxed);
+    }
+
+    /// Count a draw answered by one of the two render paths.
+    pub(crate) fn note_rail(&self, rail: FrameDrawRail) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match rail {
+            FrameDrawRail::Provider => self.provider_draws.fetch_add(1, Relaxed),
+            FrameDrawRail::Engine => self.engine_draws.fetch_add(1, Relaxed),
+        };
+    }
+
+    /// Close the frame a present ends, and report when the window fills.
+    ///
+    /// `not_enabled` names the arm
+    /// [`crate::runtime::drain::signal_display_present_complete`] took when the
+    /// guest had not armed the present-notification class; the present is
+    /// counted either way.
+    pub(crate) fn note_present(
+        &self,
+        now_us: u64,
+        now_ms: u64,
+        not_enabled: bool,
+    ) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.presents.fetch_add(1, Relaxed);
+        if not_enabled {
+            self.present_not_enabled.fetch_add(1, Relaxed);
+        }
+        self.close_frame(now_us);
+        let last = self.last_report_ms.load(Relaxed);
+        if last == 0 {
+            self.last_report_ms.store(now_ms, Relaxed);
+            return None;
+        }
+        let win_ms = now_ms.saturating_sub(last);
+        if win_ms < self.report_ms {
+            return None;
+        }
+        self.last_report_ms.store(now_ms, Relaxed);
+        Some(self.take(win_ms))
+    }
+
+    /// Difference the present just closed against the previous one.
+    ///
+    /// The first present only arms: it has no predecessor to measure against,
+    /// and counting its whole boot-to-first-present draw population as one
+    /// frame would make the first window's max meaningless.
+    fn close_frame(&self, now_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let prev_us = self.last_present_us.swap(now_us, Relaxed);
+        let draws = self.draws.load(Relaxed);
+        let draw_us = self.draw_us.load(Relaxed);
+        if prev_us == 0 {
+            self.last_present_draws.store(draws, Relaxed);
+            self.last_present_draw_us.store(draw_us, Relaxed);
+            return;
+        }
+        let interval = now_us.saturating_sub(prev_us);
+        self.frames.fetch_add(1, Relaxed);
+        self.interval_sum_us.fetch_add(interval, Relaxed);
+        self.interval_max_us.fetch_max(interval, Relaxed);
+        let bucket =
+            (interval / FRAME_INTERVAL_BUCKET_US).min((FRAME_INTERVAL_BUCKETS - 1) as u64) as usize;
+        self.interval_hist[bucket].fetch_add(1, Relaxed);
+        let prev_draws = self.last_present_draws.swap(draws, Relaxed);
+        let prev_draw_us = self.last_present_draw_us.swap(draw_us, Relaxed);
+        let frame_draws = draws.saturating_sub(prev_draws);
+        let frame_host_us = draw_us.saturating_sub(prev_draw_us);
+        self.draws_sum.fetch_add(frame_draws, Relaxed);
+        self.draws_max.fetch_max(frame_draws, Relaxed);
+        self.host_sum_us.fetch_add(frame_host_us, Relaxed);
+        self.host_max_us.fetch_max(frame_host_us, Relaxed);
+    }
+
+    /// Swap the window out and render it, clearing the histogram with it.
+    fn take(&self, win_ms: u64) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let presents = self.presents.swap(0, Relaxed);
+        let not_enabled = self.present_not_enabled.swap(0, Relaxed);
+        let provider = self.provider_draws.swap(0, Relaxed);
+        let engine = self.engine_draws.swap(0, Relaxed);
+        let frames = self.frames.swap(0, Relaxed);
+        let interval_sum = self.interval_sum_us.swap(0, Relaxed);
+        let interval_max = self.interval_max_us.swap(0, Relaxed);
+        let draws_sum = self.draws_sum.swap(0, Relaxed);
+        let draws_max = self.draws_max.swap(0, Relaxed);
+        let host_sum = self.host_sum_us.swap(0, Relaxed);
+        let host_max = self.host_max_us.swap(0, Relaxed);
+        let p50 = self.take_interval_p50();
+        // Emitted beside the mean it divides, so a reader can tell an empty
+        // numerator from an empty denominator.
+        let mean = |sum: u64| sum.checked_div(frames).unwrap_or(0);
+        format!(
+            "frame_profile win_ms={win_ms} presents={presents} \
+             present_not_enabled={not_enabled} frames={frames} \
+             interval_us_mean={} interval_us_p50={p50} interval_us_max={interval_max} \
+             draws_per_present_mean={} draws_per_present_max={draws_max} \
+             host_us_mean={} host_us_max={host_max} \
+             provider_draws={provider} engine_draws={engine}",
+            mean(interval_sum),
+            mean(draws_sum),
+            mean(host_sum),
+        )
+    }
+
+    /// The histogram's lower median, and the histogram is emptied by reading
+    /// it: the window resets with the line.
+    fn take_interval_p50(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut total = 0u64;
+        let mut hist = [0u64; FRAME_INTERVAL_BUCKETS];
+        for (i, slot) in self.interval_hist.iter().enumerate() {
+            hist[i] = slot.swap(0, Relaxed);
+            total = total.saturating_add(hist[i]);
+        }
+        if total == 0 {
+            return 0;
+        }
+        let target = total.div_ceil(2);
+        let mut seen = 0u64;
+        for (i, n) in hist.iter().enumerate() {
+            seen = seen.saturating_add(*n);
+            if seen >= target {
+                return i as u64 * FRAME_INTERVAL_BUCKET_US;
+            }
+        }
+        (FRAME_INTERVAL_BUCKETS as u64 - 1) * FRAME_INTERVAL_BUCKET_US
+    }
+}
+
+static FRAME_PROFILE: FrameProfileCensus = FrameProfileCensus::new();
+
+/// Whether the frame profile is on, read once like the draw sink's own switch.
+///
+/// Cached because the gate sits on the per-draw path: an environment read per
+/// draw would be a cost the instrument imposed on its own subject.
+fn frame_profile_on() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    static INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !INIT.swap(true, Relaxed) {
+        ON.store(
+            crate::config::switch(crate::config::FRAME_PROFILE) == crate::config::Switch::On,
+            Relaxed,
+        );
+    }
+    ON.load(Relaxed)
+}
+
+/// Bank one draw's existing host span into the open frame.
+///
+/// Called from [`note_drain_phase`], so the span is the same `draw_us`
+/// `drain_duty` already reports and no second clock is read.
+pub(crate) fn note_frame_draw_us(us: u64) {
+    if !frame_profile_on() {
+        return;
+    }
+    FRAME_PROFILE.note_draw(us);
+}
+
+/// Count a draw answered by one of the two render paths.
+pub(crate) fn note_frame_draw_rail(rail: FrameDrawRail) {
+    if !frame_profile_on() {
+        return;
+    }
+    FRAME_PROFILE.note_rail(rail);
+}
+
+/// Close one presented frame and emit the profile when the window fills.
+///
+/// Called once per completed present from
+/// [`crate::runtime::drain::signal_display_present_complete`].
+pub(crate) fn note_frame_present(not_enabled: bool) {
+    if !frame_profile_on() {
+        return;
+    }
+    let now_us = crate::observe::elapsed_us();
+    if let Some(line) = FRAME_PROFILE.note_present(now_us, now_us / 1_000, not_enabled) {
+        crate::observe::off(line);
+    }
+}
+
 /// Sentinel for "no enable word has been read yet".
 ///
 /// The mask is four meaningful bits, so any value with a high bit set is
@@ -3065,7 +3370,14 @@ pub fn note_drain_exit(busy_end_us: u64, skipped: bool) {
 
 /// Attribute elapsed time since `started` to one phase of the current tranche.
 pub fn note_drain_phase(phase: DrainPhase, started: std::time::Instant) {
-    DRAIN_DUTY.note_phase(phase, started.elapsed().as_micros() as u64);
+    let us = started.elapsed().as_micros() as u64;
+    DRAIN_DUTY.note_phase(phase, us);
+    // The draw phase's own span, banked into the frame the next present closes.
+    // Fed here so the frame profile rides the timing point `drain_duty` already
+    // takes instead of reading a clock of its own on the draw path.
+    if let DrainPhase::Draw = phase {
+        note_frame_draw_us(us);
+    }
 }
 
 /// Attribute one slice of a render-rail flush to the part of it that was spent.

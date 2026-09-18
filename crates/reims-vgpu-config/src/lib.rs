@@ -1223,6 +1223,24 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// pre-R4b device exactly; unset and an unrecognized value are `off` too, so an
 /// operator's typo cannot select a widening rail.
 pub const RENDER_PRESENT: &str = "REIMS_VGPU_RENDER_PRESENT";
+
+/// **Probe, default off.** `on` emits one `frame_profile` line per second
+/// closing the frames the guest presented in that second: the present interval
+/// (mean, median, max), the draws each present carried, the host draw span they
+/// cost, and how many draws each render path answered.
+///
+/// The per-second censuses this device already has divide a whole window, and
+/// an interactive desktop that feels slow while those numbers look small is
+/// exactly the reading a window aggregate cannot produce: the cost has to close
+/// at a present, not at a report boundary. This switch turns that reading on.
+///
+/// Observation only, like every entry in this file: it changes no
+/// admit/refuse/skip decision, no wire byte, and no frame. The counters it adds
+/// ride timing points the draw and present paths already take
+/// (`drain_duty`'s per-draw `draw_us` and the display-present completion called
+/// from `signal_display_present_complete`), so nothing new blocks or allocates
+/// per draw. Unset and an unrecognized value are `off`.
+pub const FRAME_PROFILE: &str = "REIMS_VGPU_FRAME_PROFILE";
 }
 
 counts! {
