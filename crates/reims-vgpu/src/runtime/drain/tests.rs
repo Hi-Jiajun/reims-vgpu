@@ -3171,7 +3171,7 @@ fn the_frame_profile_closes_a_frame_at_every_present() {
     let line = c
         .note_present(1_020_000, 1_016, false)
         .expect("a full window must report")
-        .to_string();
+        .profile;
 
     assert!(line.starts_with("frame_profile win_ms=16"), "{line}");
     assert!(line.contains("presents=3"), "{line}");
@@ -3195,6 +3195,110 @@ fn the_frame_profile_closes_a_frame_at_every_present() {
     assert!(c.note_present(1_030_000, 1_020, false).is_none());
 }
 
+#[test]
+fn every_chain_phase_has_a_bar_and_keeps_its_ordinal() {
+    use crate::runtime::chain_phase::Phase;
+    use crate::runtime::drain::FrameSpan;
+    // `chain_phase::enter` hands its bar over by ordinal, so the two tables
+    // have to agree field for field rather than in spirit: a phase with no arm
+    // in `FrameSpan::of_chain` is time the frame profile silently drops, and an
+    // arm wired to its neighbour's variant reports one phase's cost under
+    // another's name, which reads as an answer instead of as a bug.
+    let named = [
+        (Phase::Prep, FrameSpan::Prep),
+        (Phase::Pipeline, FrameSpan::Pipeline),
+        (Phase::Binds, FrameSpan::Binds),
+        (Phase::Sampled, FrameSpan::Sampled),
+        (Phase::Seed, FrameSpan::Seed),
+        (Phase::Assemble, FrameSpan::Assemble),
+        (Phase::Engine, FrameSpan::Engine),
+        (Phase::Store, FrameSpan::Store),
+        (Phase::PipelineGen, FrameSpan::PlGen),
+        (Phase::PipelineDesc, FrameSpan::PlDesc),
+        (Phase::PipelineMtlb, FrameSpan::PlMtlb),
+        (Phase::PipelineAir, FrameSpan::PlAir),
+        (Phase::PipelineXlate, FrameSpan::PlXlate),
+        (Phase::PrepPages, FrameSpan::PrepPages),
+        (Phase::AssembleTarget, FrameSpan::AsmTarget),
+        (Phase::AssembleDepth, FrameSpan::AsmDepth),
+        (Phase::AssembleTrail, FrameSpan::AsmTrail),
+    ];
+    assert_eq!(
+        named.len(),
+        Phase::AssembleTrail as usize + 1,
+        "every phase in the enum is named here, and nothing else is"
+    );
+    for (phase, bar) in named {
+        assert_eq!(FrameSpan::of_chain(phase as usize), Some(bar), "{phase:?}");
+        assert_eq!(bar.slot(), phase as usize, "{phase:?} keeps its ordinal");
+    }
+    // The rails start where the phases stop, so no chain ordinal can reach a
+    // rail bar and put a rail's time in a phase's name.
+    assert_eq!(
+        FrameSpan::RailProvider.slot(),
+        Phase::AssembleTrail as usize + 1
+    );
+    assert_eq!(FrameSpan::of_chain(FrameSpan::RailProvider.slot()), None);
+}
+
+/// The split closes on the frame, and every field is a mean over frames.
+///
+/// The two identities this line is read by are that each bar is smaller than
+/// its parent (`rail_provider` inside `engine`, the `prov_*` bars inside
+/// `rail_provider`) and that the seventeen `chain_phase` mirrors sum to the
+/// `host_us_mean` the profile line prints beside it. Both are asserted here on
+/// hand-charged numbers rather than left to a boot to reveal.
+#[test]
+fn the_frame_span_line_divides_the_same_frames_the_profile_closes() {
+    use crate::runtime::drain::{FrameProfileCensus, FrameSpan};
+    let c = FrameProfileCensus::with_report_ms(15);
+    assert!(
+        c.note_present(1_000_000, 1_000, false).is_none(),
+        "the first present arms the frame and has no split of its own"
+    );
+    // Frame one: 3 ms of chain, all of it the engine phase, half of that the
+    // provider rail and a third of the rail the submission.
+    c.note_draw(3_000);
+    c.note_span(FrameSpan::Engine as usize, 3_000_000);
+    c.note_span(FrameSpan::RailProvider as usize, 1_500_000);
+    c.note_span(FrameSpan::ProvSubmit as usize, 1_000_000);
+    assert!(c.note_present(1_010_000, 1_005, false).is_none());
+    // Frame two: 2 ms, all of it the Store phase.
+    c.note_draw(2_000);
+    c.note_span(FrameSpan::Store as usize, 2_000_000);
+    let lines = c
+        .note_present(1_020_000, 1_016, false)
+        .expect("a full window must report");
+    let span = lines.span.expect("a window with frames carries its split");
+
+    assert!(span.starts_with("frame_span win_ms=16 frames=2"), "{span}");
+    // Two draws over two frames, and 5 ms of host span over the same two.
+    assert!(span.contains(" draws=1"), "{span}");
+    // 3 ms of engine over two frames is 1500 us each, and the rail beneath it
+    // is a slice of the same 3 ms rather than a second charge.
+    assert!(span.contains(" engine_us_mean=1500"), "{span}");
+    assert!(span.contains(" rail_provider_us_mean=750"), "{span}");
+    assert!(span.contains(" prov_submit_us_mean=500"), "{span}");
+    assert!(span.contains(" store_us_mean=1000"), "{span}");
+    // A bar nothing charged stays at zero rather than being absent, so a
+    // reader can tell "not measured" from "measured at nothing".
+    assert!(span.contains(" prep_us_mean=0"), "{span}");
+    // The profile line is unchanged beside it, on the same window.
+    assert!(
+        lines.profile.starts_with("frame_profile win_ms=16"),
+        "{line}",
+        line = lines.profile
+    );
+    assert!(
+        lines.profile.contains("host_us_mean=2500"),
+        "{line}",
+        line = lines.profile
+    );
+
+    // The window resets with the lines.
+    assert!(c.note_present(1_030_000, 1_020, false).is_none());
+}
+
 /// The frame interval's tail is the hitch, and a mean hides it.
 ///
 /// Nine 120 Hz frames and one 100 ms stall average to 17.5 ms — healthy-looking
@@ -3215,7 +3319,7 @@ fn the_frame_profile_keeps_a_present_tail_apart_from_its_mean() {
     let line = c
         .note_present(t, 2_600, false)
         .expect("a full window must report")
-        .to_string();
+        .profile;
 
     assert!(line.contains("presents=11"), "{line}");
     assert!(line.contains("frames=10"), "{line}");

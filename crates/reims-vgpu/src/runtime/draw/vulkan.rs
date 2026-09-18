@@ -11336,7 +11336,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // a named mapping. `None` is the pre-R4b device.
                 present: render_present_request(state, req, &resources, writeback_guest),
             };
-            match provider_render::submit_render(&inputs, &resources) {
+            // The frame profile's split of `Phase::Engine` by rail, half one:
+            // the request's own input assembly above plus `submit_render`'s
+            // answer, and nothing else. The guard ends at the seam's return
+            // rather than at the arms below it, because those arms close
+            // `Phase::Engine` and open `Phase::Store` before they run — a rail
+            // that reached to the draw's return would charge Store work to the
+            // rail and read **larger than its own parent**, which is exactly
+            // what the first fp2 round measured (rails 985 751 us/frame against
+            // an `engine_us` of 977 914, the same sign in 113 of 115 windows).
+            // The self-contained engine call below is the other half; the two
+            // are disjoint regions of one draw, so their sum against
+            // `chain_phase`'s `engine_us` is an identity a reader can check.
+            // Nothing here is read by an admit/refuse/skip decision, and the
+            // guard is `None` while `REIMS_VGPU_FRAME_PROFILE` is off.
+            let outcome = {
+                let _provider_rail = crate::runtime::drain::frame_span(
+                    crate::runtime::drain::FrameSpan::RailProvider,
+                );
+                provider_render::submit_render(&inputs, &resources)
+            };
+            match outcome {
                 RenderRailOutcome::ProviderCompleted(out) => {
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
                     crate::runtime::drain::note_store_route("render_provider_canonical");
@@ -11611,7 +11631,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
+        // Half two of the same split: everything the self-contained engine does
+        // for this draw. `draw_phase` divides its interior on its own clock;
+        // this is the bar that says how much of the frame's host span reached
+        // this rail at all.
+        let out = {
+            let _engine_rail =
+                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::RailEngine);
+            crate::backend::vulkan::engine::execute_draw_request(state, &resources)?
+        };
         // The self-contained engine answered this draw. Counted here rather
         // than at the seam's return, because the seam's span also covers the
         // provider path above and cannot name which rail executed it.
