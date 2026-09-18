@@ -3685,6 +3685,161 @@ const WALK_SEED_TEXEL: [u8; 4] = [17, 34, 51, 255];
 /// previous contents: a middle keeps its frame in its resident on the engine,
 /// so the engine's frame is read back out of the identity the record names.
 #[test]
+fn a_guest_backed_chain_middle_leaves_for_the_provider_and_its_tail_does_not() {
+    // Census v21's `guest_backing`
+    // (`evidence/gate3-census-v21-2026-09-18`): 22 latched shapes, all
+    // `door=mapping` — the attachment's bytes are the guest's own pages — of
+    // which 21 are the *middle* of a multi-record packet (`wb=0
+    // continues=1 pass_cont=1`) and one is the packet's tail (`wb=1`).
+    //
+    // The two halves are one question: whose frame has to reach the guest's
+    // pages? The middle's frame is the chain value the exec walk hands the
+    // record after it, so the class answers it with the published frame — the
+    // same answer R25 gives the non-guest-backed middle. The tail's store *is*
+    // the guest writeback, and that landing is the arm this rail still does
+    // not carry, so its refusal and its sentence stay by name.
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let half = half_of(width);
+
+    let identity = scanout_surface_identity(0x7d_00_01);
+    let mut seed = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for _ in 0..(width * height) {
+        seed.extend_from_slice(&WALK_SEED_TEXEL);
+    }
+    // The record's own shape: a guest-backed attachment (the mapper-ref-texture
+    // surface's pages), the load the guest declared, the walk's chain value,
+    // the withheld readback a middle carries, and the partial scissor the
+    // census's shapes show.
+    let guest_backed = || {
+        let mut middle = request_with_streams(MTL_FORMAT_BGRA8_UNORM, &position_streams());
+        middle.target_identity = Some(identity.clone());
+        middle.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        middle.target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
+        middle.skip_readback = true;
+        middle.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        middle.continues_render_pass = true;
+        middle.render_pass_continues = true;
+        middle.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        middle.guest_target_memory = Some(guest_target_memory());
+        middle
+    };
+
+    // 1. The tail (`wb=1`, census group B): its frame is the one the guest's
+    //    pages are owed, and the refusal keeps its own slug and sentence. Its
+    //    own shape is the census's one non-`Load` row — a `Clear` that opens
+    //    the raster and hands it on — because a tail that stated the walk's
+    //    seed instead would be refused one gate earlier, under `load_seed`,
+    //    exactly as census v21 measures those shapes.
+    let tail = || {
+        let mut tail = request_with_streams(MTL_FORMAT_BGRA8_UNORM, &position_streams());
+        tail.target_identity = Some(identity.clone());
+        tail.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Clear);
+        tail.skip_readback = true;
+        tail.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        tail.guest_target_memory = Some(guest_target_memory());
+        tail
+    };
+    let bucket_before = route_count("render_provider_out_of_class_guest_backing");
+    let refusal = match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+        &tail(),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_guest_backing",
+                "the tail keeps the census's own bucket: {reason}"
+            );
+            reason.detail().to_owned()
+        }
+        other => panic!("a guest-backed tail is not the class's answer: {other:?}"),
+    };
+    assert_eq!(
+        route_count("render_provider_out_of_class_guest_backing") - bucket_before,
+        1,
+        "the refusal is counted under the census's own bucket vocabulary"
+    );
+    eprintln!("E-TX8 tail refusal, verbatim: {refusal}");
+    assert!(
+        refusal.contains(
+            "a record whose attachment is backed by the guest's own pages stays on the engine \
+             while its frame is the one the guest's pages are owed"
+        ),
+        "the sentence names the half the rail lacks: {refusal}"
+    );
+
+    // 2. The middle (`wb=0`, census group A) with the walk's frame handed over:
+    //    in class, answered by the provider, and published — the walk consumes
+    //    that frame as the next record's seed, and the packet's last record is
+    //    the one that lands the complete frame in the guest's pages.
+    let bucket_before = route_count("render_provider_out_of_class_guest_backing");
+    let handed = scanout_order(&seed);
+    match provider_render::submit_render(
+        &inputs_held_with_chain_value(&stages, RenderChainRole::Middle, &handed),
+        &guest_backed(),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => {
+            assert!(out.bgra, "a Bgra8Unorm attachment reads back in BGRA order");
+            let frame = semantic_rgba(out.bytes, out.bgra);
+            assert_texel_count("published guest-backed middle frame", &frame);
+            assert_texel_near(
+                "published guest-backed middle: the last texel inside the rectangle",
+                texel_at(&frame, half_of(half) - 1, height / 2),
+                FRAGMENT_TEXEL,
+            );
+            for x in half..width {
+                assert_eq!(
+                    texel_at(&frame, x, height / 2),
+                    WALK_SEED_TEXEL,
+                    "texel ({x}, {}) keeps the frame the walk handed over",
+                    height / 2,
+                );
+            }
+        }
+        other => {
+            panic!("a guest-backed middle whose frame the walk carries is in class: {other:?}")
+        }
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_guest_backing") - bucket_before,
+        0,
+        "the admitted middle charges no refusal: the bucket moved with the class"
+    );
+}
+
+/// The guest's own allocation behind a mapper-ref-texture surface: one host
+/// mapping and the page footprint that describes it, built the way the
+/// engine's own tests build it (`images_and_registry.rs`).
+fn guest_target_memory() -> reims_vgpu::backend::vulkan::engine::GuestTargetMemory {
+    reims_vgpu::backend::vulkan::engine::GuestTargetMemory {
+        backing: reims_vgpu::backend::vulkan::engine::GuestTargetBacking {
+            allocation_host_ptr: 0x1000,
+            allocation_len: 0x4000,
+            plane_offset: 0,
+            row_pitch: 64,
+        },
+        import: std::sync::Arc::new(
+            reims_vgpu::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                0x1000, 0x4000, 0x1000,
+            )
+            .expect("the host allocation is a valid import"),
+        ),
+        footprint: reims_vgpu::runtime::guest_ram::GuestPageFootprint::new(
+            std::sync::Arc::from([0x1000_u64]),
+            0x1000,
+        )
+        .expect("one page"),
+    }
+}
+
+#[test]
 fn the_chain_value_the_walk_carries_reaches_the_provider() {
     let _guard = engine_test_session();
     let stages = reviewed_stages();

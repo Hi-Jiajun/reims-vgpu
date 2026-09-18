@@ -6871,12 +6871,28 @@ fn narrow_class<'a>(
     // backing already took the resident arm above, and a record that would
     // render straight into the guest's memory is a landing this rail cannot
     // perform.
-    if req.guest_target_memory.is_some() && !req.load_from_target {
+    //
+    // E-TX8: what the rail cannot carry is the *landing*, and only the record
+    // whose frame the guest's pages are owed performs one — the packet's last
+    // record (or a lone record), which is exactly [`RenderChainRole::SoleOrTail`]
+    // and the census's `wb=1`. Every other position's frame goes back to the
+    // caller, and for a guest-backed attachment that frame is the chain value
+    // the exec walk hands the record after it (R25's arm, which the role gate
+    // above already admits): answering such a record with the *published* frame
+    // is what the walk consumes, and the packet's last record is the one that
+    // lands the complete frame in the guest's pages. Census v21 measured the
+    // split this gate leaves: 21 of the bucket's 22 latched shapes are those
+    // middles (`wb=0 continues=1 pass_cont=1`) and one is the tail.
+    if req.guest_target_memory.is_some()
+        && !req.load_from_target
+        && inputs.role == RenderChainRole::SoleOrTail
+    {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_guest_backing",
-            "a record whose attachment is backed by the guest's own pages stays on the engine: \
-             the class renders into a provider image, and writing the guest's pages from it is a \
-             landing this rail does not carry",
+            "a record whose attachment is backed by the guest's own pages stays on the engine \
+             while its frame is the one the guest's pages are owed: the class renders into a \
+             provider image, and writing the guest's pages from it is a landing this rail does \
+             not carry",
         ));
     }
     // W1 named the frame's *destination* for the record that opens a packet;
