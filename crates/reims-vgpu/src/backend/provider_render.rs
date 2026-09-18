@@ -306,6 +306,33 @@
 //!   colour, and a hand-over that is not the attachment's own extent keep the
 //!   engine under the names above.
 //!
+//!   # The surface's own resident, carried in (R26)
+//!
+//!   Census v19 (`evidence/gate3-census-v19-2026-09-18`, same rig) left
+//!   `resident_source` at 919 records (26.9 %), and 47.8 % of them are one
+//!   group the two rounds above do not touch: `fmt=0x50`, `load=Load`,
+//!   `door=mapping`, `skip=resident`, `store=1`, **`seed=none`**, `wb=1`,
+//!   `continues=0`, `pass_cont=0` — the mapper-ref-texture composite whose
+//!   previous contents the *engine's* registry already holds under the
+//!   surface's own identity. Its LOAD was elided by the engine
+//!   (`runtime::draw::vulkan`'s `mapper_ref_texture_load_currency_query`),
+//!   which is a *different naming of the same fact* R23's caller hands over:
+//!   the frame is readable by the caller that owns the registry
+//!   (`read_target`), and the class already carries the trace-owned load for
+//!   it. So this door gets its own input
+//!   ([`RenderRailInputs::surface_resident_source_bytes`]) rather than
+//!   borrowing R23's: the caller states a *different* obligation with it —
+//!   the landing that consumes this record's own frame must be one that
+//!   advances the surface's `surface_content_epoch`, so that the resident's
+//!   older stamp can no longer vouch for pixels the provider never wrote
+//!   (`mapper_ref_texture_load_resident_is_current` reads exactly that pair).
+//!   The two elisions this door does **not** carry keep their refusal by
+//!   name: the attachment's own GVA resident
+//!   (`honour_gva_load_elision`) is witnessed by `resident_content_ready` on
+//!   that identity and no in-tree API can un-ready a render resident, and a
+//!   mapper-ref-texture record *without* a guest writeback has no landing that
+//!   moves the epoch at all.
+//!
 //! Anything outside the class returns [`RenderRailOutcome::NotInNarrowClass`]
 //! and the caller runs the self-contained engine unchanged — the feature only
 //! narrows which submissions change rail. An in-class submission the provider
@@ -4257,6 +4284,29 @@ pub struct RenderRailInputs<'a> {
     /// under their own slug rather than being uploaded and rejected by the
     /// contract, because a decline is never a fallback.
     pub resident_source_bytes: Option<&'a [u8]>,
+    /// The frame of the surface the *LOAD elision* names, when the caller can
+    /// read it out of the registry that holds it (R26).
+    ///
+    /// This is R23's fact in another naming, and it is a separate input
+    /// because the caller states a different obligation with it. A
+    /// mapper-ref-texture composite's LOAD is elided when the engine's
+    /// registry already holds the surface's contents under
+    /// `mapper_ref_texture_render_identity` — the same identity this record's
+    /// own `target_identity` names — so the frame the pass must begin from is
+    /// readable (`read_target`), in the attachment's own texel order and at
+    /// its own tightly packed extent, exactly as R23's is.
+    ///
+    /// What the caller has to vouch for is the *currency witness*: the
+    /// elision's test compares the mapping's `surface_content_epoch` with the
+    /// epoch stamped on the resident, so a frame answered by this rail (which
+    /// writes no image into the engine's registry) must land through a Store
+    /// that advances the mapping's epoch — the guest writeback — or the
+    /// resident's old stamp would keep vouching for pixels no draw wrote here.
+    /// The caller states exactly that by handing the frame over only for a
+    /// record whose `writeback_guest` is set; every other record of the same
+    /// elision keeps the class's refusal by name, and so does the GVA
+    /// elision, whose witness is a readiness flag no in-tree API can clear.
+    pub surface_resident_source_bytes: Option<&'a [u8]>,
     /// The frame a middle record's previous contents are, when the caller
     /// hands it over (R25).
     ///
@@ -5603,6 +5653,14 @@ struct NarrowPass<'a> {
     /// numbers rather than one: R23 carries the frame the *engine's* registry
     /// holds, R25 the frame the *walk* holds.
     carried_chain_middle: bool,
+    /// Whether this pass's previous contents are the frame of the surface the
+    /// LOAD *elision* named, handed over by the caller that owns the registry
+    /// (R26). Counted as `render_provider_surface_resident_source_bytes`
+    /// beside the two arms above, for the same reason they are two numbers:
+    /// the census reads populations, and the obligation the caller states with
+    /// these bytes is not the one the other two state (see
+    /// [`RenderRailInputs::surface_resident_source_bytes`]).
+    carried_surface_resident: bool,
     /// Whether at least one of this pass's sampled textures is the frame the
     /// caller read out of the registry (R24's arm). Counted as
     /// `render_provider_sampled_target_frames` at the completion, beside R23's
@@ -5998,6 +6056,10 @@ fn narrow_class<'a>(
     // carry (one load op per attachment, and the rail cannot confirm a seed is
     // the live image), so it keeps the engine by name.
     let mut carried_chain_middle = false;
+    // R26: which of the two registry-byte doors this record came in through, so
+    // the completion counts the population under its own name. Set where the
+    // bytes are chosen below; false for every arm that carries none.
+    let mut carried_surface_resident = false;
     let load = if req.load_from_target {
         let Some(resident) = resident else {
             return Err(OutOfClass::new(
@@ -6035,18 +6097,37 @@ fn narrow_class<'a>(
             // enters the class with the identity it stated — the identity is
             // still required above, because the engine's own answer to this
             // record still names it.
-            let Some(bytes) = inputs.resident_source_bytes else {
-                return Err(OutOfClass::new(
-                    "render_provider_out_of_class_resident_source",
-                    "a record whose previous contents are the live GPU image stays on the engine \
-                     while the caller can neither read a frame this rail keeps nor hand the \
-                     frame over: the resident the chain names is the engine's own, and this rail \
-                     defines no image under it",
-                ));
+            // Two doors hand this frame over, and the two are kept apart
+            // because the callers' obligations differ (see the two inputs):
+            // R23's is the frame the record's own *chain* names, R26's is the
+            // frame of the surface the LOAD *elision* named. Either one is the
+            // same statement to this class — the caller's copy of the frame
+            // the pass begins from — so both select the contract's trace-owned
+            // load and only the population counters differ.
+            let (bytes, from_surface_resident) = match (
+                inputs.resident_source_bytes,
+                inputs.surface_resident_source_bytes,
+            ) {
+                (Some(bytes), _) => (bytes, false),
+                (None, Some(bytes)) => (bytes, true),
+                (None, None) => {
+                    return Err(OutOfClass::new(
+                        "render_provider_out_of_class_resident_source",
+                        "a record whose previous contents are the live GPU image stays on the \
+                         engine while the caller can neither read a frame this rail keeps nor \
+                         hand the frame over: the resident the chain names is the engine's own, \
+                         and this rail defines no image under it",
+                    ));
+                }
             };
+            carried_surface_resident = from_surface_resident;
             if u64::try_from(bytes.len()).ok() != Some(extent) {
                 return Err(OutOfClass::new(
-                    "render_provider_out_of_class_resident_source_shape",
+                    if from_surface_resident {
+                        "render_provider_out_of_class_surface_resident_shape"
+                    } else {
+                        "render_provider_out_of_class_resident_source_shape"
+                    },
                     "a record whose previous contents are handed over at a width or extent other \
                      than the attachment's own stays on the engine: the canonical attachment \
                      uploads exactly the view's declared bytes, so a shorter or longer buffer \
@@ -6616,6 +6697,7 @@ fn narrow_class<'a>(
         store,
         published_held_resident,
         carried_chain_middle,
+        carried_surface_resident,
         sampled_target_frames: sampling
             .textures
             .iter()
@@ -7530,15 +7612,19 @@ fn submit_narrow(
     if loads_resident {
         crate::runtime::drain::note_store_route("render_provider_resident_load");
     }
-    // The two byte arms' own populations, counted where the answer happens for
-    // the reason above: the frame was carried into the pass as bytes, so
-    // neither resident arm moved and these are the only names that say the
-    // record was answered this way. R23's is the frame the caller read out of
-    // the engine's registry; R25's is the packet's own chain value, handed on
-    // by the walk.
+    // The byte arms' own populations, counted where the answer happens for the
+    // reason above: the frame was carried into the pass as bytes, so neither
+    // resident arm moved and these are the only names that say the record was
+    // answered this way. R23's is the frame the caller read out of the
+    // engine's registry under the record's own chain, R25's is the packet's
+    // own chain value handed on by the walk, and R26's is the frame of the
+    // surface the LOAD elision named — three doors, three numbers, because the
+    // callers' obligations differ even though the load does not.
     if matches!(pass.load, NarrowLoad::Bytes(_)) {
         crate::runtime::drain::note_store_route(if pass.carried_chain_middle {
             "render_provider_chain_middle_source_bytes"
+        } else if pass.carried_surface_resident {
+            "render_provider_surface_resident_source_bytes"
         } else {
             "render_provider_resident_source_bytes"
         });

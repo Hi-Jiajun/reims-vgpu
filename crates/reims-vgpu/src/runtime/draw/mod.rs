@@ -652,6 +652,22 @@ pub struct DrawEncodeRequest {
     /// target (no CPU pixels, no guest Store). The exec chain loop arms
     /// `chain_from_resident` for the next record when set.
     pub chain_resident_established: bool,
+    /// Out-flag (R26): the canonical rail answered this record and published
+    /// its frame, so the engine's registry holds **no** image under this
+    /// record's identity for the pixels it produced — the frame travelled back
+    /// as bytes and lands through the caller's own Store.
+    ///
+    /// The Store route reads it for one decision: a mapper-ref-texture
+    /// composite that lands its frame in the mapping's guest pages stamps the
+    /// engine resident with the epoch it just advanced so the surface's next
+    /// LOAD can skip its CPU seed. That stamp says "the resident holds this
+    /// mapping's contents as of this epoch", which is true when the engine
+    /// drew the record (it rendered into the resident) and false when the
+    /// canonical rail did — so the stamp is skipped there, and the mapping's
+    /// own epoch advance is what keeps the older stamp from vouching for
+    /// pixels no draw here wrote. Vulkan rail only; the Metal arm never sets
+    /// it and never reads it.
+    pub resident_frame_published_by_provider: bool,
     /// Lifetime identity of the color0 GVA render resource.
     ///
     /// Resolved once per draw, before any GPU work, by
