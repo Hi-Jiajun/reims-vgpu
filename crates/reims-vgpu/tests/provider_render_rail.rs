@@ -4753,6 +4753,150 @@ fn a_stream_the_vertex_stage_does_not_read_stays_on_the_engine() {
     );
 }
 
+/// The census names the direction each `vertex_interface` refusal answers in,
+/// and the distance each direction states (R-VI1).
+///
+/// The direction is what this bucket's whole next step turns on: a declared
+/// superset is a shape Metal answers — `MTLVertexDescriptor` may name an
+/// attribute location the vertex function never reads, and the surplus stream
+/// is bound and ignored — so a contract can be widened onto it, while a
+/// reflected superset is a location Metal defines no value for and no widening
+/// can reach. Census v25b could read neither: every shape it latched for this
+/// slug read `attrs=4 streams=3`, and neither field says which side named more.
+/// This is the battery that proves the reading exists before a boot is spent on
+/// it, and it asserts the refusal *slug* at every arm beside the route — the
+/// direction is a counter, never a second refusal, so the population under
+/// `render_provider_out_of_class_vertex_interface` stays the same set of draws.
+#[test]
+fn the_vertex_interface_refusals_are_counted_by_direction() {
+    use reims_vgpu::backend::provider_render::{
+        vertex_interface_route, vertex_interface_route_distance, VertexInterfaceRoute,
+    };
+
+    let _guard = engine_test_session();
+    let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
+    let delivered = provider_render::provider_submissions();
+    let submit = |stages: &Stages, specs: &[StreamSpec]| {
+        let req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, specs);
+        match provider_render::submit_render(&inputs(stages, RenderChainRole::SoleOrTail), &req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_vertex_interface",
+                "the direction is a route beside the refusal and never a second slug: {reason}"
+            ),
+            other => panic!("a shape the interface refuses stays on the engine: {other:?}"),
+        }
+    };
+
+    // Declared ⊋ reflected: the reviewed one-attribute stage with a second
+    // stream the vertex function never reads — the shape a real pipeline
+    // descriptor is free to state.
+    let extra = count(vertex_interface_route(
+        VertexInterfaceRoute::DeclaredSuperset,
+    ));
+    let extra_locations = count(vertex_interface_route_distance(
+        VertexInterfaceRoute::DeclaredSuperset,
+    ));
+    let uncovered = count(vertex_interface_route(
+        VertexInterfaceRoute::ReflectedSuperset,
+    ));
+    submit(
+        &reviewed_stages(),
+        &[position_stream(), stream(1, &[(0.0, 0.0); 3])],
+    );
+    assert_eq!(
+        count(vertex_interface_route(
+            VertexInterfaceRoute::DeclaredSuperset
+        )),
+        extra + 1,
+        "a stream the stage does not read is the declared superset"
+    );
+    assert_eq!(
+        count(vertex_interface_route_distance(
+            VertexInterfaceRoute::DeclaredSuperset
+        )),
+        extra_locations + 1,
+        "one declared location the vertex stage does not read"
+    );
+    assert_eq!(
+        count(vertex_interface_route(
+            VertexInterfaceRoute::ReflectedSuperset
+        )),
+        uncovered,
+        "the direction this record is not does not move for it"
+    );
+
+    // Reflected ⊋ declared: the two-stream stage with one stream bound, which
+    // would leave the location the shader reads undefined.
+    let extra = count(vertex_interface_route(
+        VertexInterfaceRoute::DeclaredSuperset,
+    ));
+    let uncovered = count(vertex_interface_route(
+        VertexInterfaceRoute::ReflectedSuperset,
+    ));
+    let uncovered_locations = count(vertex_interface_route_distance(
+        VertexInterfaceRoute::ReflectedSuperset,
+    ));
+    submit(&two_stream_stages(), &[position_stream()]);
+    assert_eq!(
+        count(vertex_interface_route(
+            VertexInterfaceRoute::ReflectedSuperset
+        )),
+        uncovered + 1,
+        "a location the stage reads with no stream behind it is the reflected superset"
+    );
+    assert_eq!(
+        count(vertex_interface_route_distance(
+            VertexInterfaceRoute::ReflectedSuperset
+        )),
+        uncovered_locations + 1,
+        "one location the vertex stage reads that no declaration covers"
+    );
+    assert_eq!(
+        count(vertex_interface_route(
+            VertexInterfaceRoute::DeclaredSuperset
+        )),
+        extra,
+        "the direction this record is not does not move for it"
+    );
+
+    // Neither: the two-stream stage with a stream at a location it does not
+    // read standing where the one it does would go. Charged under its own name
+    // rather than folded into either direction, because filing it under one
+    // would make the census's own reading of `declared ⊋ reflected` a false
+    // statement instead of an incomplete one.
+    let mismatch = count(vertex_interface_route(
+        VertexInterfaceRoute::LocationMismatch,
+    ));
+    let unpaired = count(vertex_interface_route_distance(
+        VertexInterfaceRoute::LocationMismatch,
+    ));
+    submit(
+        &two_stream_stages(),
+        &[position_stream(), stream(2, &[(0.0, 0.0); 3])],
+    );
+    assert_eq!(
+        count(vertex_interface_route(
+            VertexInterfaceRoute::LocationMismatch
+        )),
+        mismatch + 1,
+        "a declared location swapped for a read one is neither direction"
+    );
+    assert_eq!(
+        count(vertex_interface_route_distance(
+            VertexInterfaceRoute::LocationMismatch
+        )),
+        unpaired + 2,
+        "both sides of the swap are unpaired: one declared location and one read one"
+    );
+
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "the three directions are one refusal, so not one of them reaches the provider"
+    );
+}
+
 /// The census names this increment's splits, and charges the band the vertex
 /// widening is sized on.
 #[test]

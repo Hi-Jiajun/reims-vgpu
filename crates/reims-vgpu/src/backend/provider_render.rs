@@ -2701,20 +2701,75 @@ fn viewport_admits(
     Ok([x, y, width_u32, height_u32])
 }
 
-/// Whether a request's declared attributes name exactly the locations the
-/// vertex stage's own translation reports.
+/// How a request's declared attributes and the vertex stage's own translation
+/// of them disagree, or `None` when they name the same locations (R-VI1).
 ///
 /// The request's attribute list is the engine's own shape — one entry per
 /// attribute *location* — and the reflection lists one input per location, so
-/// the comparison is a linear walk of one list against the other rather than a
-/// set. A request with two attributes at one location cannot pass it: the
-/// reflected locations are distinct, so a duplicate leaves one of them
-/// uncovered.
-fn attribute_locations_match(attributes: &[VertexAttributeResource], reflected: &[u32]) -> bool {
-    attributes.len() == reflected.len()
-        && attributes
-            .iter()
-            .all(|attribute| reflected.contains(&attribute.location))
+/// the comparison is a walk of one list against the other rather than a set
+/// against a set. Two counts decide it, both taken over the entries rather than
+/// over a de-duplicated view of them:
+///
+/// * the **surplus**: declared entries naming a location the vertex stage does
+///   not read;
+/// * the **uncovered**: locations the vertex stage reads that no declared entry
+///   names.
+///
+/// Refusal is `surplus > 0 || uncovered > 0 || attributes.len() != reflected.len()`,
+/// and the third term is not redundant: it is what catches one location
+/// declared twice, which the reflection cannot mirror because its own locations
+/// are distinct by translation. Every refusal is exactly one of the three
+/// directions [`VertexInterfaceRoute`] names, and which one it is decides
+/// whether the shape is a candidate for widening or a permanent boundary —
+/// which is why this answers with a route rather than the `bool` it used to,
+/// and why the walk is spelled out here rather than at the gate.
+fn vertex_interface_mismatch(
+    attributes: &[VertexAttributeResource],
+    reflected: &[u32],
+) -> Option<VertexInterfaceMismatch> {
+    let surplus = attributes
+        .iter()
+        .filter(|attribute| !reflected.contains(&attribute.location))
+        .count();
+    let uncovered = reflected
+        .iter()
+        .filter(|location| !attributes.iter().any(|a| a.location == **location))
+        .count();
+    let route = if surplus > 0 && uncovered == 0 {
+        VertexInterfaceRoute::DeclaredSuperset
+    } else if uncovered > 0 && surplus == 0 {
+        VertexInterfaceRoute::ReflectedSuperset
+    } else if surplus > 0 || uncovered > 0 || attributes.len() != reflected.len() {
+        VertexInterfaceRoute::LocationMismatch
+    } else {
+        return None;
+    };
+    let distance = match route {
+        VertexInterfaceRoute::DeclaredSuperset => surplus,
+        VertexInterfaceRoute::ReflectedSuperset => uncovered,
+        VertexInterfaceRoute::LocationMismatch => surplus + uncovered,
+    };
+    Some(VertexInterfaceMismatch {
+        route,
+        distance: u64::try_from(distance).unwrap_or(u64::MAX),
+    })
+}
+
+/// One `vertex_interface` disagreement: the direction it answers in, and the
+/// distance that direction states beside it.
+///
+/// The distance is the number of entries on the side that is wider, which is a
+/// different quantity per route and is why [`vertex_interface_route_distance`]
+/// names one counter per route rather than one total. Zero is a reading rather
+/// than a silence, and the only shape that charges the
+/// [`VertexInterfaceRoute::LocationMismatch`] route with nothing beside it is
+/// one location declared twice: [`vertex_interface_route`] says which direction
+/// answered, and a companion that did not fire beside the mismatch route says
+/// there was no wider side at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VertexInterfaceMismatch {
+    route: VertexInterfaceRoute,
+    distance: u64,
 }
 
 /// Whether two of a request's attributes read one vertex stream.
@@ -6708,6 +6763,124 @@ fn note_texture_extent(route: TextureExtentRoute) {
     crate::runtime::drain::note_store_route(texture_extent_route(route));
 }
 
+/// The census route of one `vertex_interface` refusal (R-VI1).
+///
+/// The refusal slug is one name three directions answer under, and until this
+/// increment the log could not say which. Census v25b
+/// (`evidence/gate3-census-v25b-2026-09-18`) counted 3 894 rows (12.8 % of that
+/// boot's seam rows) under the bare slug, and every one of the shapes it
+/// latched read `attrs=4 streams=3` — a field pair that says how many
+/// attributes a draw declared and how many fetch tables they read, and nothing
+/// at all about *which side* named a location the other does not. The recon
+/// that precedes this increment could not recover the direction from the
+/// evidence, so it could not say whether the bucket was winnable.
+///
+/// That question is the whole increment, because the two directions are priced
+/// completely differently:
+///
+/// * a **declared** superset is a shape Metal answers. `MTLVertexDescriptor` is
+///   free to name an attribute location the vertex function never reads; the
+///   canonical rail's own vertex input state is built from the declared layout
+///   (`metal_api_vulkan`'s `create_vertex_inputs` emits one
+///   `VkVertexInputAttributeDescription` per declared attribute) exactly as
+///   Metal's descriptor is, so the surplus stream is *bound and ignored*
+///   rather than undefined. Admitting it is a widening of one rule in two
+///   places — the canonical registration gate and this rail's mirror of it —
+///   and it needs no wire change, because the request's whole declared list
+///   already travels;
+/// * a **reflected** superset is a location the vertex stage *reads* that no
+///   declared entry covers. Metal defines no value for it, so no oracle can
+///   state what the frame should hold, and the refusal there is a permanent
+///   boundary rather than a backlog item.
+///
+/// The residual is named rather than folded into a neighbour for the reason
+/// [`ResidentSourceRoute::Undeclared`] is: a shape whose two sides disagree on
+/// both faces at once, and one location declared twice, are not either
+/// direction, and filing them under one would make the census's own reading of
+/// "declared ⊋ reflected" false rather than merely incomplete.
+///
+/// Each arm charges its own route beside the refusal, [`vertex_interface_route`]
+/// and [`vertex_interface_route_distance`] name the two keys,
+/// `note_store_route` counts them, and the sentence the refusal answers with is
+/// unchanged: this increment moves no admit/refuse edge.
+pub fn vertex_interface_route(route: VertexInterfaceRoute) -> &'static str {
+    match route {
+        VertexInterfaceRoute::DeclaredSuperset => "vertex_interface_declared_superset",
+        VertexInterfaceRoute::ReflectedSuperset => "vertex_interface_reflected_superset",
+        VertexInterfaceRoute::LocationMismatch => "vertex_interface_location_mismatch",
+    }
+}
+
+/// The distance one [`vertex_interface_route`] states beside it, charged as its
+/// own sum.
+///
+/// One name per route rather than one total, and a *number* rather than only a
+/// count, because the count alone cannot say how wide the disagreement was: a
+/// four-attribute draw that declares one location its stage never reads and a
+/// two-attribute draw that declares one are one record each and no distance at
+/// all. Dividing the sum by the count is what turns the census line into "how
+/// many locations per refused record", which is the number a widening order
+/// sizes on — and the two routes' numbers are not the same quantity, so they
+/// cannot share a counter.
+///
+/// The `_locations` suffix names the unit, as `_bytes` does for
+/// [`resident_source_route_bytes`]. A route the walk did not charge a distance
+/// for prints nothing, which [`VertexInterfaceMismatch`] states is itself a
+/// reading.
+pub fn vertex_interface_route_distance(route: VertexInterfaceRoute) -> &'static str {
+    match route {
+        VertexInterfaceRoute::DeclaredSuperset => {
+            "vertex_interface_declared_superset_extra_locations"
+        }
+        VertexInterfaceRoute::ReflectedSuperset => {
+            "vertex_interface_reflected_superset_uncovered_locations"
+        }
+        VertexInterfaceRoute::LocationMismatch => {
+            "vertex_interface_location_mismatch_unpaired_locations"
+        }
+    }
+}
+
+/// Which direction a request's declared attributes and the vertex stage's own
+/// reflection disagreed in.
+///
+/// An enum rather than a `&'static str` at the call site for the reason the
+/// routes themselves exist: directions that answer with different census names
+/// are different facts, and a typo in a bare string would file two of them
+/// under one name with nothing failing. The gate is the only constructor, one
+/// arm per direction, so a route can only be counted for a record this class
+/// actually refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VertexInterfaceRoute {
+    /// Every location the vertex stage reads is declared, and at least one
+    /// declared entry names a location it does not read — `declared ⊋
+    /// reflected`. Metal ignores the surplus, so this is the direction a
+    /// widening can admit.
+    DeclaredSuperset,
+    /// Every declared entry names a location the vertex stage reads, and the
+    /// stage reads at least one location no declared entry covers —
+    /// `reflected ⊋ declared`. Metal leaves such a location undefined, so this
+    /// is the direction no contract can admit.
+    ReflectedSuperset,
+    /// Neither: the two sides each name a location the other does not, or one
+    /// location is declared twice (which the length walk catches and the
+    /// reflection cannot mirror). Neither face is a widening candidate on its
+    /// own terms, and the distance beside this route is `0` for exactly the
+    /// duplicate shape.
+    LocationMismatch,
+}
+
+/// Charge one `vertex_interface` arm's route, and the distance it states,
+/// beside the refusal it answers.
+#[inline]
+fn note_vertex_interface(mismatch: VertexInterfaceMismatch) {
+    crate::runtime::drain::note_store_route(vertex_interface_route(mismatch.route));
+    crate::runtime::drain::note_store_route_n(
+        vertex_interface_route_distance(mismatch.route),
+        mismatch.distance,
+    );
+}
+
 /// Drop every render registration that belonged to a device incarnation.
 ///
 /// Called by [`super::provider_compute::recover_after_device_loss`]: the
@@ -7977,7 +8150,13 @@ fn narrow_class<'a>(
     // its own translation is a shape the provider always refuses, and a refusal
     // is a decline rather than a fallback. Answering it here is what keeps the
     // class's one promise: everything it admits is a shape the provider executes.
-    if !attribute_locations_match(&req.vertex_attributes, inputs.vertex_attribute_locations) {
+    if let Some(mismatch) =
+        vertex_interface_mismatch(&req.vertex_attributes, inputs.vertex_attribute_locations)
+    {
+        // R-VI1: the direction is a route beside the refusal, never a second
+        // slug — the census reads `render_provider_out_of_class_vertex_interface`
+        // as one population and this splits it without moving the edge.
+        note_vertex_interface(mismatch);
         return Err(OutOfClass::new(
             "render_provider_out_of_class_vertex_interface",
             "a request whose declared vertex attributes do not name exactly the locations the \
@@ -10399,5 +10578,139 @@ mod vertex_stream_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod vertex_interface_tests {
+    use super::*;
+    use crate::backend::vulkan::engine::VertexAttributeFormat;
+
+    /// One declared attribute at each of `locations`, built from the reviewed
+    /// `float2` storage. The classifier reads locations alone, so every other
+    /// field only has to be a value that builds.
+    fn declared(locations: &[u32]) -> Vec<VertexAttributeResource> {
+        locations
+            .iter()
+            .map(|location| VertexAttributeResource {
+                location: *location,
+                binding: *location,
+                format: VertexAttributeFormat::parse(29).expect("Float2 is a vertex format"),
+                offset: 0,
+                stride: 8,
+                step_function: VertexStepFunction::PerVertex,
+                step_rate: 1,
+                content: BufferContent::Bytes(Arc::new(vec![0_u8; 24])),
+            })
+            .collect()
+    }
+
+    /// One row of [`every_vertex_interface_disagreement_has_a_direction`]'s
+    /// table: the declared locations, the reflection's own, and the route the
+    /// pair has to answer in with the distance beside it — `None` for the pairs
+    /// the gate admits.
+    type Case = (
+        &'static [u32],
+        &'static [u32],
+        Option<(VertexInterfaceRoute, u64)>,
+    );
+
+    /// The classifier is *total*: every shape the gate refuses is exactly one of
+    /// the three routes, a shape it admits is none of them, and the distance
+    /// beside each route is the count that route's own definition names (R-VI1).
+    ///
+    /// The table is the whole truth table over the two counts, plus the two
+    /// shapes only the length walk catches: one location declared twice at a
+    /// location the stage reads, and a swap between two locations of one width.
+    /// The admit rows are the point of the first two entries — a route that
+    /// fired for a shape the old predicate passed would be a behaviour change,
+    /// not a reading.
+    #[test]
+    fn every_vertex_interface_disagreement_has_a_direction() {
+        use VertexInterfaceRoute as Route;
+        let cases: &[Case] = &[
+            // The two lists name the same location set: no route, and the gate
+            // admits — including the shape whose *order* differs, which the old
+            // predicate passed and this one must keep passing.
+            (&[0], &[0], None),
+            (&[0, 1], &[1, 0], None),
+            // Declared ⊋ reflected: the direction Metal answers, and the only
+            // one a widening can admit. The distance is the surplus.
+            (&[0, 1], &[0], Some((Route::DeclaredSuperset, 1))),
+            (&[0, 1, 2], &[0], Some((Route::DeclaredSuperset, 2))),
+            // Reflected ⊋ declared: the direction Metal leaves undefined. The
+            // distance is the uncovered location count.
+            (&[0], &[0, 1], Some((Route::ReflectedSuperset, 1))),
+            (&[], &[0], Some((Route::ReflectedSuperset, 1))),
+            // Neither: each side names a location the other does not.
+            (&[0, 2], &[0, 1], Some((Route::LocationMismatch, 2))),
+            // Neither: one location declared twice, which the length walk
+            // catches and the reflection cannot mirror. There is no wider side,
+            // so the route fires with no distance charged beside it.
+            (&[0, 0], &[0], Some((Route::LocationMismatch, 0))),
+        ];
+        for (declared_locations, reflected, expected) in cases {
+            match (
+                vertex_interface_mismatch(&declared(declared_locations), reflected),
+                expected,
+            ) {
+                (None, None) => (),
+                (Some(mismatch), Some((route, distance))) => {
+                    assert_eq!(
+                        mismatch.route, *route,
+                        "route for declared={declared_locations:?} reflected={reflected:?}"
+                    );
+                    assert_eq!(
+                        mismatch.distance, *distance,
+                        "distance for declared={declared_locations:?} reflected={reflected:?}"
+                    );
+                }
+                (answered, expected) => panic!(
+                    "declared={declared_locations:?} reflected={reflected:?}: {answered:?} \
+                     against {expected:?}"
+                ),
+            }
+        }
+    }
+
+    /// The three arms' routes and the three distances beside them are these six
+    /// names: the census reads those keys by hand, so a rename has to fail here
+    /// rather than silently re-file a population (R-VI1).
+    #[test]
+    fn the_vertex_interface_arms_charge_their_own_routes() {
+        let routes = [
+            vertex_interface_route(VertexInterfaceRoute::DeclaredSuperset),
+            vertex_interface_route(VertexInterfaceRoute::ReflectedSuperset),
+            vertex_interface_route(VertexInterfaceRoute::LocationMismatch),
+        ];
+        assert_eq!(
+            routes,
+            [
+                "vertex_interface_declared_superset",
+                "vertex_interface_reflected_superset",
+                "vertex_interface_location_mismatch",
+            ]
+        );
+        let distances = [
+            vertex_interface_route_distance(VertexInterfaceRoute::DeclaredSuperset),
+            vertex_interface_route_distance(VertexInterfaceRoute::ReflectedSuperset),
+            vertex_interface_route_distance(VertexInterfaceRoute::LocationMismatch),
+        ];
+        assert_eq!(
+            distances,
+            [
+                "vertex_interface_declared_superset_extra_locations",
+                "vertex_interface_reflected_superset_uncovered_locations",
+                "vertex_interface_location_mismatch_unpaired_locations",
+            ]
+        );
+        let mut distinct: Vec<&str> = routes.iter().chain(distances.iter()).copied().collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            6,
+            "one name per arm and one per distance: {routes:?} {distances:?}"
+        );
     }
 }
