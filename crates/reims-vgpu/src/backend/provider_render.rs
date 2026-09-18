@@ -80,14 +80,15 @@
 //!   render sampler uploads (a single-sample, non-arrayed, read-only 2D
 //!   surface whose texels are one of the two four-byte 8-bit UNORM byte orders
 //!   — `rgba8_unorm`/`bgra8_unorm`, the provider's whole `RENDER_SAMPLED`
-//!   window since E-TX1/§107 — at the render area's own extent) — beside
-//!   the draw's own bind, and requires the bind's sampler state to repeat the
-//!   module's. Every other shape is a named exit ([`sampled_textures`]): a
-//!   resource family the translated rail does not execute, a texture index at
-//!   or above the contract's own bound or a list that repeats an index or walks
-//!   backwards, a reflected shape or state outside the family, an unbound
-//!   declaration, a bind whose texels are a resident image, a texture of
-//!   another extent, and a draw whose sampler says another state;
+//!   window since E-TX1/§107 — at the render area's own extent unless the
+//!   device's frame declares the gather below, R37) — beside the draw's own
+//!   bind, and requires the bind's sampler state to repeat the module's. Every
+//!   other shape is a named exit ([`sampled_textures`]): a resource family the
+//!   translated rail does not execute, a texture index at or above the
+//!   contract's own bound or a list that repeats an index or walks backwards, a
+//!   reflected shape or state outside the family, an unbound declaration, a
+//!   bind whose texels are a resident image, a texture of another extent, and a
+//!   draw whose sampler says another state;
 //! - **a sampled texture whose texels are the guest's own pages** (R28): the
 //!   bind a real boot resolves through the zero-copy rail
 //!   (`SampledSource::GuestRuns`) leaves for the provider through the owner
@@ -586,6 +587,42 @@
 //! answer of no — every device that arranges nothing apart, and every frame
 //! written before the bit existed — keeps R31's refusal, its sentence and its
 //! own census route, byte for byte, at the same point in the same walk.
+//!
+//! # The sampled source of another extent (R35, R37)
+//!
+//! One extent rule answered this shape until R37: a draw whose sampled bind is
+//! not the pass's own extent stayed on the engine by name
+//! (`render_provider_out_of_class_texture_extent`), because the two rails E
+//! ships answer the shape differently and no capability bit told a frame's
+//! reader which of the two answers produced it. R35 split the *population* of
+//! that refusal into the two arms E's question turns on — `texture_extent_host_bytes`
+//! for every source a rail reads off the host, `texture_extent_borrowed_no_copy`
+//! for the owner's no-copy window — so the next census could size them instead
+//! of the bare slug: v26 read 5 679 host-bytes rows (93.2 %) beside 416
+//! borrowed ones (6.8 %).
+//!
+//! R37 retires the exit for the arm the Vulkan rail already executes. E-TX10
+//! (`metal-api-emulator`'s `render-texture-gathered-extent`) publishes the
+//! difference as the shape bit
+//! `ProviderCapabilities::supports_render_texture_gathered_extent` — `true` on
+//! the Vulkan snapshot, `false` on the native one and on any frame written
+//! before the bit existed, which decodes as `false` out of the escape family
+//! E-TX9 opened. This rail reads the bit out of the provider's own capability
+//! frame ([`provider_wire::render_texture_gathered_extent`]), asks it exactly
+//! when the request names a sampled bind of another extent
+//! ([`sampled_source_of_another_extent`]), and hands the host-bytes arm of the
+//! rule to the provider when the answer is yes. The arm is read where the rule
+//! is ([`texture_extent_arm`]), because one request may state both arms: the
+//! owner's no-copy window of another extent needs a host copy E's window rule
+//! has no channel for, so it keeps the refusal on every device, under its own
+//! route.
+//!
+//! Nothing about the admitted shape changes beside the verdict: the
+//! declaration already states the bind's own extent (the extent the module's
+//! own sample sites were lowered against, and the extent the Vulkan rail binds
+//! by), no copy is made, and the pass's trace is the trace it was. An answer of
+//! no — the native rail, and every frame written before the bit existed — keeps
+//! R35's refusal, sentence, route and gate position, byte for byte.
 //!
 //! # Error mapping
 //!
@@ -1793,6 +1830,12 @@ fn sampled_textures<'a>(
     // consuming pass the caller builds from this answer.
     inputs: &RenderRailInputs<'a>,
     req: &'a DrawRequest,
+    // The device's own answer to the extent rule's one question (R37), read by
+    // [`submit_render`] out of the provider's capability frame exactly when the
+    // request names a sampled bind of another extent
+    // ([`sampled_source_of_another_extent`]) — the gate below is pure and reads
+    // no device answer of its own.
+    render_texture_gathered_extent: bool,
 ) -> Result<NarrowSampling<'a>, OutOfClass> {
     if req.color_input {
         return Err(OutOfClass::new(
@@ -2377,36 +2420,53 @@ fn sampled_textures<'a>(
         };
         // The canonical render sampler of *this* class executes one texture
         // extent — the render area's own, so every fragment's sample stands on
-        // a texel centre of the surface it reads — and the two rails E ships
-        // answer the shape beside it in two different ways (R35). The sentence
-        // below states that disagreement rather than a provider rule that
-        // stopped being true at E-TX5: `research/docs/23` §111 widened the
-        // *Vulkan* rail, where a source of another extent is gathered into the
-        // render area's own grid and `render_texture_extent_unsupported` is
-        // kept for the owner's no-copy window alone, while the native rail's
-        // own extent rule answers *every* source of another extent with that
-        // same name — so no Apple-side frame exists to reconcile a widened
-        // answer against. The class keeps the draw because it reads no
-        // capability bit that could tell a frame's reader which of the two
-        // answers produced it, and the refusal is counted under the arm the
-        // bind would have stated ([`texture_extent_route`]).
+        // a texel centre of the surface it reads — unless the device's own frame
+        // declares that it gathers a source of another extent, and the two arms
+        // of that shape are the two rails' own disagreement (R35, R37).
+        // `research/docs/23` §111 widened the *Vulkan* rail at E-TX5: a source
+        // of another extent whose bytes the rail reads off the host is gathered
+        // into the render area's own grid, and
+        // `render_texture_extent_unsupported` is kept for the owner's no-copy
+        // window alone — the one arm with no host bytes to gather. The native
+        // rail's own extent rule answers *every* source of another extent with
+        // that same name, so no Apple-side frame exists to reconcile a widened
+        // answer against. E-TX10 publishes the difference as a shape bit
+        // (`ProviderCapabilities::supports_render_texture_gathered_extent`,
+        // false by default and false out of any frame that does not carry it),
+        // and [`submit_render`] hands this walk the frame's own reading of it.
+        //
+        // So the shape leaves for the provider only where both facts hold at
+        // once: the source carries bytes a rail can read
+        // ([`texture_extent_arm`]'s `HostBytes` arm — the request's own copy,
+        // the caller's frame, the trace's production, the window the class gate
+        // copies, and R36's repacked rows) *and* the frame declares the gather.
+        // The owner's no-copy window keeps this refusal on every device, and so
+        // does every source of another extent on a device whose frame does not
+        // declare the bit: R35's slug, sentence, gate and route, byte for byte.
+        // Nothing about the admitted arm changes shape, trace or copy — the
+        // declaration states the bind's own extent, which is what the Vulkan
+        // rail binds by — and the refusal is counted under the arm the bind
+        // would have stated ([`texture_extent_route`]).
         if image.width != req.width || image.height != req.height {
-            note_texture_extent(texture_extent_arm(&source));
-            return Err(OutOfClass::owned(
-                "render_provider_out_of_class_texture_extent",
-                format!(
-                    "a draw whose `[[texture({})]]` is {}x{} in a {}x{} pass stays on the engine: \
-                     the two rails E ships answer this shape differently and no capability this \
-                     class reads tells them apart — the Vulkan provider gathers a source of \
-                     another extent into the render area's own grid and keeps \
-                     `render_texture_extent_unsupported` for the owner's no-copy window alone \
-                     (`research/docs/23` §111, E-TX5), while the native rail answers *every* \
-                     other extent with that same name — so the draw goes to the engine, the rail \
-                     that runs the shape on both, rather than to a provider whose answer the \
-                     Apple-side oracle does not state",
-                    declaration.index, image.width, image.height, req.width, req.height,
-                ),
-            ));
+            let arm = texture_extent_arm(&source);
+            if arm == TextureExtentRoute::BorrowedNoCopy || !render_texture_gathered_extent {
+                note_texture_extent(arm);
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_texture_extent",
+                    format!(
+                        "a draw whose `[[texture({})]]` is {}x{} in a {}x{} pass stays on the \
+                         engine: the two rails E ships answer this shape differently and no \
+                         capability this class reads tells them apart — the Vulkan provider \
+                         gathers a source of another extent into the render area's own grid and \
+                         keeps `render_texture_extent_unsupported` for the owner's no-copy window \
+                         alone (`research/docs/23` §111, E-TX5), while the native rail answers \
+                         *every* other extent with that same name — so the draw goes to the \
+                         engine, the rail that runs the shape on both, rather than to a provider \
+                         whose answer the Apple-side oracle does not state",
+                        declaration.index, image.width, image.height, req.width, req.height,
+                    ),
+                ));
+            }
         }
         // The static half's own rule (R10): the draw's bound sampler at the
         // declaration's slot has to repeat the state the module was lowered
@@ -3951,6 +4011,99 @@ pub fn override_stage_buffer_namespace_split(
     }
 }
 
+/// The gathered-extent half of the same device answer (R37).
+///
+/// One snapshot, two readings, exactly as [`declared_stage_buffer_namespace_split`]:
+/// the bit the *frame* carries is the one the class gate gets. What it answers
+/// is whether this provider executes a sampled source of *another* extent whose
+/// bytes the rail reads off the host — the half of E's two rails' disagreement
+/// (R35) the Vulkan rail has had since E-TX5, where a source of another extent
+/// is gathered into the render area's own grid and
+/// `render_texture_extent_unsupported` is kept for the owner's no-copy window
+/// alone. `false` is the fail-closed answer *and* what a frame written before
+/// the bit existed decodes to (`provider_wire::render_texture_gathered_extent`,
+/// the second tag of the escape family E-TX9 opened), so this read can only
+/// ever widen the class by what the device states.
+///
+/// The bit is asked by arm and not by shape: the owner's no-copy window of
+/// another extent needs a host copy E's window rule has no channel for, so that
+/// arm keeps R35's refusal whatever this answers.
+fn declared_render_texture_gathered_extent() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match GATHERED_EXTENT_ANSWER.load(Ordering::Relaxed) {
+            GATHERED_EXTENT_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_texture_gathered_extent =
+                    answer == GATHERED_EXTENT_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::render_texture_gathered_extent(rail.provider.device_epoch(), &capabilities)
+        .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        })
+}
+
+/// The device's own answer for the gathered-extent capability (R37), and the
+/// states the test instrument below can put it in.
+const GATHERED_EXTENT_DEVICE: u8 = 0;
+const GATHERED_EXTENT_NOT_DECLARED: u8 = 1;
+const GATHERED_EXTENT_DECLARED: u8 = 2;
+
+/// Whether the gathered-extent capability is read from the device's own frame
+/// ([`GATHERED_EXTENT_DEVICE`], what production runs) or from an answer a test
+/// stated.
+static GATHERED_EXTENT_ANSWER: AtomicU8 = AtomicU8::new(GATHERED_EXTENT_DEVICE);
+
+/// A test's own answer for the gathered-extent capability, restored when it
+/// drops (R37).
+///
+/// The rail reads the bit out of the provider's capability frame, and a test
+/// that has to see the fail-closed arm cannot make an admitted device stop
+/// declaring the shape. While this guards an answer, the capability question is
+/// asked of a snapshot carrying it — written, encoded and decoded through the
+/// same frame — so the arm a test sees is the arm an old frame gives (`absent`
+/// reads as undeclared), and the reading is still the wire's.
+///
+/// A guard rather than a plain setter for the reason
+/// [`StageBufferNamespaceSplitOverride`] is one: this changes a *decision* and
+/// not an observation, so a test that unwound through a failed assertion would
+/// otherwise leave the next shape in the same binary answering from a device
+/// that is not its own.
+pub struct RenderTextureGatheredExtentOverride {
+    previous: u8,
+}
+
+impl Drop for RenderTextureGatheredExtentOverride {
+    fn drop(&mut self) {
+        GATHERED_EXTENT_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the gathered-extent capability as `declared` until the returned guard
+/// drops, or as the device's own answer for `None` (R37).
+pub fn override_render_texture_gathered_extent(
+    declared: Option<bool>,
+) -> RenderTextureGatheredExtentOverride {
+    let answer = match declared {
+        None => GATHERED_EXTENT_DEVICE,
+        Some(false) => GATHERED_EXTENT_NOT_DECLARED,
+        Some(true) => GATHERED_EXTENT_DECLARED,
+    };
+    RenderTextureGatheredExtentOverride {
+        previous: GATHERED_EXTENT_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
 /// The two invocation counts one draw's affine stage-buffer footprint is
 /// bounded by (`research/docs/23` §3.3, v86).
 ///
@@ -4191,6 +4344,38 @@ fn folded_stage_buffer_pair(
         stated.push((stage, declaration.index));
     }
     None
+}
+
+/// The sampled bind of another extent one request's declaration walk states, in
+/// the walk's own order (R35/R37).
+///
+/// The first declaration the fragment stage states (which is the walk's own
+/// order, and the order the extent rule reaches) whose bind — the view the
+/// request names at that declaration's device binding, the pairing the rule
+/// reads — is not the pass's own extent. The Metal index it returns is the one
+/// the extent rule's sentence names.
+///
+/// This is the extent rule's own test and nothing else: it decides nothing
+/// about the shape, and it is what lets the class ask the *device's* own answer
+/// (R37) before the pure gate runs — the rule sits inside the declaration walk,
+/// and a walk that ran first would have answered by name before the answer was
+/// in hand. Every other shape reaches the question no earlier than it did: a
+/// request whose sampled binds are all the pass's own extent never asks the
+/// rail anything.
+fn sampled_source_of_another_extent(
+    inputs: &RenderRailInputs<'_>,
+    req: &DrawRequest,
+) -> Option<u32> {
+    inputs
+        .fragment_texture_declarations
+        .iter()
+        .find_map(|declaration| {
+            let image = req
+                .sampled_images
+                .iter()
+                .find(|image| image.binding == declaration.binding)?;
+            (image.width != req.width || image.height != req.height).then_some(declaration.index)
+        })
 }
 
 /// The request's two stages' `[[buffer(N)]]` statement, every rule the class
@@ -6625,9 +6810,43 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // R37: the extent rule's own class condition, and the second device answer
+    // this rail asks *before* the gate. The rule it lifts sits inside the
+    // declaration walk — the walk states the module's textures one by one and
+    // weighs each bind against the pass's own extent — so an answer read after
+    // the walk would arrive after the walk had already answered by name. The
+    // ask is gated on the request's own statement naming a sampled bind of
+    // another extent ([`sampled_source_of_another_extent`], the same
+    // intersection the rule tests), so no other shape reaches the rail's
+    // provider any earlier than it did.
+    //
+    // A device (or a frame) that declares the gathered extent executes the
+    // host-bytes arm of the shape — the canonical Vulkan rail gathers such a
+    // source into the render area's own grid (`research/docs/23` §111, E-TX5)
+    // — and a device whose frame leaves the bit out, like the owner's no-copy
+    // window on any device, keeps R35's answer, by name, at the same point in
+    // the same order. The bit is asked for the *shape* here and read by arm
+    // inside the walk, because one request may state both arms.
+    let render_texture_gathered_extent = match sampled_source_of_another_extent(inputs, req) {
+        None => false,
+        Some(_) => match declared_render_texture_gathered_extent() {
+            Ok(declared) => declared,
+            // A provider that cannot be reached cannot answer the question the
+            // walk needs, and an unanswerable candidate is an in-class
+            // candidate: fail closed, exactly as `submit_narrow` does for the
+            // shapes it refuses, rather than running the shape on a rail the
+            // class never named.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
-    let pass = match narrow_class(inputs, req, stage_buffer_namespace_split) {
+    let pass = match narrow_class(
+        inputs,
+        req,
+        stage_buffer_namespace_split,
+        render_texture_gathered_extent,
+    ) {
         Err(reason) => {
             reason.note();
             return RenderRailOutcome::NotInNarrowClass(reason);
@@ -8160,11 +8379,12 @@ impl NarrowPass<'_> {
 /// from when it is.
 ///
 /// Pure over the request and this rail's own recorded state — plus the one
-/// device answer the caller hands it (`stage_buffer_namespace_split`, R33) — and
-/// ordered cheapest-first so a refused shape costs nothing: no provider call,
-/// no translation, and no registration. Every refusal names the condition that
-/// kept the shape on the engine, because that string is what the observer
-/// reports when a class boundary moves.
+/// device answers the caller hands it (`stage_buffer_namespace_split`, R33, and
+/// `render_texture_gathered_extent`, R37) — and ordered cheapest-first so a
+/// refused shape costs nothing: no provider call, no translation, and no
+/// registration. Every refusal names the condition that kept the shape on the
+/// engine, because that string is what the observer reports when a class
+/// boundary moves.
 ///
 /// Two facts this gate reads are not properties of the request. One is the
 /// attachment window, which belongs to the device's provider and is
@@ -8179,6 +8399,7 @@ fn narrow_class<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &'a DrawRequest,
     stage_buffer_namespace_split: bool,
+    render_texture_gathered_extent: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R25: the packet's own chain value, when the caller hands it over for the
     // record that continues the chain. Role-gated here so the class states the
@@ -8843,7 +9064,7 @@ fn narrow_class<'a>(
     // binds — the canonical pass carries both, and the wire carries the pass's
     // texture list like any other view — and every shape the provider or the
     // module refuses keeps the engine under its own name ([`sampled_textures`]).
-    let sampling = sampled_textures(inputs, req)?;
+    let sampling = sampled_textures(inputs, req, render_texture_gathered_extent)?;
     if req.occlusion_query.is_some() {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_visibility",
