@@ -115,6 +115,32 @@ pub struct Staged<'a> {
     pub bytes: &'a [u8],
 }
 
+/// One binding whose bytes are an ordered list of registered windows
+/// (`research/docs/23` §74/§113, E-TX6).
+///
+/// The list arm exists because the caller's real source is not always one
+/// window: a guest surface's bytes live in the pages the guest owns, and those
+/// pages are described as runs — a head, then a stretch of pages, then a tail —
+/// never as one pointer the owner may hand over. Each window here is one such
+/// run, in window order, and their concatenation *is* the binding's byte range.
+///
+/// The plan answers this request with the per-run coordinates of the contract's
+/// `BufferSource::GuestRuns` ([`Plan::guest_runs`]) over the same one-lease-per-
+/// registration grouping the single-window arm uses. Every window must name the
+/// same registration: the contract pairs each run's reservation with the
+/// declaring view's own allocation, so a list split across two is a shape it
+/// cannot state ([`Decline::RunsSpanRegistrations`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Runs<'a> {
+    /// Canonical binding index the bytes belong to.
+    pub binding: u32,
+    /// The binding's windows, in the order the bytes are read. Every window
+    /// carries its own `head`/`bytes_len`: the window is the page-aligned range
+    /// the registration derived, and the binding's bytes start `head` bytes into
+    /// it.
+    pub windows: &'a [Window],
+}
+
 /// What one narrow-class binding offers the owner rail.
 #[derive(Clone, Copy, Debug)]
 pub enum Request<'a> {
@@ -123,6 +149,10 @@ pub enum Request<'a> {
     Window(Window),
     /// The bytes are a staged copy the owner holds across the submission.
     Staged(Staged<'a>),
+    /// The bytes are an ordered list of registered windows (E-TX6): the plan
+    /// imports their registrations like any other window and states the
+    /// contract's guest-runs arm over them.
+    Runs(Runs<'a>),
 }
 
 /// Which owner channel one binding takes.
@@ -217,6 +247,18 @@ pub enum Decline {
     WindowRegistry { binding: u32, detail: String },
     /// A staged binding carried no bytes to import.
     StagedEmpty { binding: u32 },
+    /// A guest-runs request stated no windows at all: a list whose
+    /// concatenation is a byte range is never empty.
+    RunsEmpty { binding: u32 },
+    /// A guest-runs request's windows do not all live in one registration. The
+    /// contract keys a run list on the *declaring view's* own allocation, so a
+    /// list split across two registrations is a shape it cannot state
+    /// (`research/docs/23` §113).
+    RunsSpanRegistrations {
+        binding: u32,
+        first: u64,
+        second: u64,
+    },
 }
 
 impl ObserveDecline for Decline {
@@ -237,6 +279,8 @@ impl ObserveDecline for Decline {
             Self::Ledger { .. } => "owner_ledger",
             Self::WindowRegistry { .. } => "owner_window_registry",
             Self::StagedEmpty { .. } => "owner_staged_empty",
+            Self::RunsEmpty { .. } => "owner_runs_empty",
+            Self::RunsSpanRegistrations { .. } => "owner_runs_span_registrations",
         }
     }
 
@@ -282,7 +326,17 @@ impl ObserveDecline for Decline {
             Self::LeaseNotHeld { binding }
             | Self::CompletionNotRetiring { binding }
             | Self::CompletionWithoutToken { binding }
-            | Self::StagedEmpty { binding } => vec![("binding", binding.to_string())],
+            | Self::StagedEmpty { binding }
+            | Self::RunsEmpty { binding } => vec![("binding", binding.to_string())],
+            Self::RunsSpanRegistrations {
+                binding,
+                first,
+                second,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("first_import", first.to_string()),
+                ("second_import", second.to_string()),
+            ],
             Self::Ledger { binding, detail } | Self::WindowRegistry { binding, detail } => {
                 vec![("binding", binding.to_string()), ("detail", detail.clone())]
             }
@@ -699,6 +753,23 @@ struct Hold {
 pub struct Plan {
     holds: Vec<Hold>,
     views: Vec<View>,
+    /// One entry per [`Request::Runs`] the plan answered, in request order.
+    run_views: Vec<RunView>,
+}
+
+/// One binding's guest-runs list, with the lease identity the contract's
+/// per-run checks need (`research/docs/23` §74/§113, E-TX6).
+#[derive(Debug)]
+struct RunView {
+    binding: u32,
+    /// The lease's allocation: the registration the runs were cut from. The
+    /// contract pairs every run's reservation with the *declaring view's* own
+    /// allocation (`LeaseMismatch` otherwise), so this is also the allocation
+    /// the view that carries the list has to name.
+    allocation: AllocationId,
+    allocation_size: u64,
+    reservation: LeaseReservation,
+    runs: Vec<metal_api_core::provider::GuestRun>,
 }
 
 impl Plan {
@@ -710,6 +781,38 @@ impl Plan {
     /// The view for one canonical binding, if the plan imported a lease for it.
     pub fn view(&self, binding: u32) -> Option<&View> {
         self.views.iter().find(|view| view.binding == binding)
+    }
+
+    /// One binding's guest-runs list, in the order the request stated it, with
+    /// each run's coordinates inside the lease's own allocation
+    /// (`research/docs/23` §74/§113, E-TX6).
+    ///
+    /// `None` is a binding whose bytes the plan did not state as a list. The
+    /// runs are what a `BufferSource::GuestRuns` declaration carries; the
+    /// allocation they are stated inside is [`Self::run_allocation`].
+    pub fn guest_runs(&self, binding: u32) -> Option<&[metal_api_core::provider::GuestRun]> {
+        self.run_views
+            .iter()
+            .find(|view| view.binding == binding)
+            .map(|view| view.runs.as_slice())
+    }
+
+    /// The lease allocation one binding's guest-runs list lives in.
+    ///
+    /// The contract requires every run's reservation to name the declaring
+    /// view's own allocation, so the caller states its view over this pair
+    /// rather than over an identity it minted itself.
+    pub fn run_allocation(&self, binding: u32) -> Option<(AllocationId, u64, u64)> {
+        self.run_views
+            .iter()
+            .find(|view| view.binding == binding)
+            .map(|view| {
+                (
+                    view.allocation,
+                    view.allocation_size,
+                    view.reservation.offset,
+                )
+            })
     }
 
     /// How many leases the plan holds. One per registration touched, plus one
@@ -725,6 +828,18 @@ impl Plan {
     pub fn leases(&self) -> Vec<(AllocationId, u64, LeaseReservation)> {
         let mut out: Vec<(AllocationId, u64, LeaseReservation)> = Vec::new();
         for view in &self.views {
+            if out.iter().any(|(_, _, reservation)| {
+                reservation.lease.lease_id == view.reservation.lease.lease_id
+            }) {
+                continue;
+            }
+            out.push((view.allocation, view.allocation_size, view.reservation));
+        }
+        // A list-only binding has no `View` of its own — its lease is the one
+        // its windows' registration already group into — so a submission whose
+        // only owner-backed input is a run list would otherwise hand the trace
+        // no allocation record for the lease it names.
+        for view in &self.run_views {
             if out.iter().any(|(_, _, reservation)| {
                 reservation.lease.lease_id == view.reservation.lease.lease_id
             }) {
@@ -965,6 +1080,75 @@ pub fn plan<'a>(
     plan_with_epoch(provider, provider.device_epoch().get(), requests)
 }
 
+/// One window, checked against the registration it names: the byte range it
+/// covers inside that registration, as `(offset, end)`.
+///
+/// The single-window arm and the run-list arm ask exactly this question, and
+/// the answer is what both group by — so it is spelled once. A window that
+/// leaves its registration, one whose registration this rail does not hold or
+/// has retired, and one whose head plus bytes leave the window are all refused
+/// by the same names they always were.
+fn checked_window(state: &State, window: Window) -> Result<(u64, u64), Decline> {
+    let record = state
+        .regions
+        .get(&window.import)
+        .ok_or(Decline::UnregisteredRegion {
+            import: window.import,
+            binding: window.binding,
+        })?;
+    if state.retired.contains(&window.import) {
+        return Err(Decline::RegionRetired {
+            import: window.import,
+            binding: window.binding,
+        });
+    }
+    let region = record.region;
+    let offset = window
+        .host_va
+        .checked_sub(u64::try_from(region.host_pointer).unwrap_or(u64::MAX))
+        .ok_or(Decline::WindowOutsideRegion {
+            import: window.import,
+            binding: window.binding,
+            offset: 0,
+            length: window.length,
+            region_length: region.length,
+            detail: "window starts before the registration".into(),
+        })?;
+    let end = offset
+        .checked_add(window.length)
+        .ok_or(Decline::WindowOutsideRegion {
+            import: window.import,
+            binding: window.binding,
+            offset,
+            length: window.length,
+            region_length: region.length,
+            detail: "window end overflows".into(),
+        })?;
+    let touched =
+        window
+            .head
+            .checked_add(window.bytes_len)
+            .ok_or(Decline::WindowOutsideRegion {
+                import: window.import,
+                binding: window.binding,
+                offset,
+                length: window.length,
+                region_length: region.length,
+                detail: "view end overflows".into(),
+            })?;
+    if end > region.length || touched > window.length {
+        return Err(Decline::WindowOutsideRegion {
+            import: window.import,
+            binding: window.binding,
+            offset,
+            length: window.length,
+            region_length: region.length,
+            detail: format!("end={end} touched={touched}"),
+        });
+    }
+    Ok((offset, end))
+}
+
 /// [`plan`] with the lease epoch stated by the caller.
 ///
 /// Production passes the provider's own `device_epoch()` — that is what
@@ -982,72 +1166,22 @@ pub fn plan_with_epoch<'a>(
     let mut state = lock();
     let mut holds: Vec<Hold> = Vec::new();
     let mut views: Vec<View> = Vec::new();
+    let mut run_views: Vec<RunView> = Vec::new();
 
     // Window requests are grouped by registration first: one lease per
     // registration, covering the union of the windows this submission touches.
     let mut groups: BTreeMap<u64, (u64, u64, u32)> = BTreeMap::new();
     let mut staged: Vec<(u32, u64)> = Vec::new();
+    // The run-list requests, in request order, beside the windows they group
+    // into. A list is not a view of its own: its runs are stated inside the
+    // lease its registration already mints, which is why the grouping above and
+    // this list are one answer rather than two.
+    let mut run_requests: Vec<Runs<'_>> = Vec::new();
     for request in requests {
         match request {
             Request::Window(window) => {
                 channel(window.binding, true, alignment)?;
-                let record =
-                    state
-                        .regions
-                        .get(&window.import)
-                        .ok_or(Decline::UnregisteredRegion {
-                            import: window.import,
-                            binding: window.binding,
-                        })?;
-                if state.retired.contains(&window.import) {
-                    return Err(Decline::RegionRetired {
-                        import: window.import,
-                        binding: window.binding,
-                    });
-                }
-                let region = record.region;
-                let offset = window
-                    .host_va
-                    .checked_sub(u64::try_from(region.host_pointer).unwrap_or(u64::MAX))
-                    .ok_or(Decline::WindowOutsideRegion {
-                        import: window.import,
-                        binding: window.binding,
-                        offset: 0,
-                        length: window.length,
-                        region_length: region.length,
-                        detail: "window starts before the registration".into(),
-                    })?;
-                let end =
-                    offset
-                        .checked_add(window.length)
-                        .ok_or(Decline::WindowOutsideRegion {
-                            import: window.import,
-                            binding: window.binding,
-                            offset,
-                            length: window.length,
-                            region_length: region.length,
-                            detail: "window end overflows".into(),
-                        })?;
-                let touched = window.head.checked_add(window.bytes_len).ok_or(
-                    Decline::WindowOutsideRegion {
-                        import: window.import,
-                        binding: window.binding,
-                        offset,
-                        length: window.length,
-                        region_length: region.length,
-                        detail: "view end overflows".into(),
-                    },
-                )?;
-                if end > region.length || touched > window.length {
-                    return Err(Decline::WindowOutsideRegion {
-                        import: window.import,
-                        binding: window.binding,
-                        offset,
-                        length: window.length,
-                        region_length: region.length,
-                        detail: format!("end={end} touched={touched}"),
-                    });
-                }
+                let (offset, end) = checked_window(&state, *window)?;
                 let entry = groups
                     .entry(window.import)
                     .or_insert((offset, end, window.binding));
@@ -1062,6 +1196,50 @@ pub fn plan_with_epoch<'a>(
                     });
                 }
                 staged.push((staged_request.binding, staged_request.bytes.len() as u64));
+            }
+            // The list arm (`research/docs/23` §113, E-TX6). Every window is
+            // checked exactly as a single-window request's is, and the grouping
+            // is the same one: the runs of one registration share the one lease
+            // this request's registrations mint. What the arm adds is that the
+            // windows are also kept, in the order the request stated them, so
+            // the coordinates can be stated per run below.
+            //
+            // A list whose windows span two registrations is refused here: the
+            // contract pairs every run's reservation with the *declaring
+            // view's* own allocation, so no single declaration can state a list
+            // that lives in two. (The engine's own run walk does split at an
+            // import seam, so this is a real shape and not a hypothetical one —
+            // it keeps the engine by name rather than being stated as a list
+            // the provider would refuse.)
+            Request::Runs(run_request) => {
+                let Some((first, rest)) = run_request.windows.split_first() else {
+                    return Err(Decline::RunsEmpty {
+                        binding: run_request.binding,
+                    });
+                };
+                channel(run_request.binding, true, alignment)?;
+                let (offset, end) = checked_window(&state, *first)?;
+                let mut union = (offset, end);
+                for window in rest {
+                    if window.import != first.import {
+                        return Err(Decline::RunsSpanRegistrations {
+                            binding: run_request.binding,
+                            first: first.import,
+                            second: window.import,
+                        });
+                    }
+                    channel(window.binding, true, alignment)?;
+                    let (offset, end) = checked_window(&state, *window)?;
+                    union.0 = union.0.min(offset);
+                    union.1 = union.1.max(end);
+                }
+                let entry =
+                    groups
+                        .entry(first.import)
+                        .or_insert((union.0, union.1, run_request.binding));
+                entry.0 = entry.0.min(union.0);
+                entry.1 = entry.1.max(union.1);
+                run_requests.push(*run_request);
             }
         }
     }
@@ -1208,6 +1386,56 @@ pub fn plan_with_epoch<'a>(
                 view_length: request.bytes_len,
             });
         }
+        // The run lists that live in this registration, in the order the
+        // requests stated them. The coordinates are the contract's own
+        // (`research/docs/23` §113, E-TX6): each run names the lease that
+        // registration minted and its own `(offset, length)` inside the
+        // *allocation* — the same namespace the single-window views above state
+        // — so the provider's per-run bound check reads the reservation this
+        // loop just registered.
+        let region_pointer = u64::try_from(region.host_pointer).unwrap_or(u64::MAX);
+        for run_request in &run_requests {
+            if run_request.windows.first().map(|w| w.import) != Some(*import) {
+                continue;
+            }
+            let mut runs = Vec::with_capacity(run_request.windows.len());
+            for window in run_request.windows {
+                let Some(offset) = window
+                    .host_va
+                    .checked_sub(region_pointer)
+                    .and_then(|offset| offset.checked_add(window.head))
+                else {
+                    // Unreachable behind `checked_window`, and unwound anyway:
+                    // a plan that cannot build every run must not leave the
+                    // imports it already made behind.
+                    return Err(abort_with(
+                        provider,
+                        &mut state,
+                        holds,
+                        Decline::WindowOutsideRegion {
+                            import: *import,
+                            binding: run_request.binding,
+                            offset: 0,
+                            length: window.length,
+                            region_length: region.length,
+                            detail: "run offset overflows".into(),
+                        },
+                    ));
+                };
+                runs.push(metal_api_core::provider::GuestRun {
+                    lease_id: lease,
+                    offset,
+                    length: window.bytes_len,
+                });
+            }
+            run_views.push(RunView {
+                binding: run_request.binding,
+                allocation,
+                allocation_size: region.length,
+                reservation,
+                runs,
+            });
+        }
     }
 
     // The staged leases, one per binding that has no registered window.
@@ -1311,7 +1539,11 @@ pub fn plan_with_epoch<'a>(
         borrowed,
         holds.len() - borrowed,
     ));
-    Ok(Plan { holds, views })
+    Ok(Plan {
+        holds,
+        views,
+        run_views,
+    })
 }
 
 /// Unwind every lease imported so far and hand back the refusal that stopped
@@ -1325,6 +1557,7 @@ fn abort_with(
     let mut plan = Plan {
         holds,
         views: Vec::new(),
+        run_views: Vec::new(),
     };
     for hold in &mut plan.holds {
         abandon_hold(state, provider, hold);
@@ -1483,6 +1716,79 @@ mod tests {
         assert_eq!(channel(1, true, 4096), Ok(Channel::Borrowed));
         assert_eq!(channel(1, false, 0), Ok(Channel::Staged));
         assert_eq!(channel(1, false, 4096), Ok(Channel::Staged));
+    }
+
+    /// The list arm's own two shape refusals, by name and with the fields a
+    /// census line needs (`research/docs/23` §113, E-TX6): a request with no
+    /// windows at all, and one whose windows name two registrations — which no
+    /// single declaration can state, because the contract pairs every run's
+    /// reservation with the declaring view's own allocation.
+    #[test]
+    fn a_run_list_the_contract_cannot_state_is_refused_by_its_own_name() {
+        let empty = Decline::RunsEmpty { binding: 0x50000 };
+        assert_eq!(empty.slug(), "owner_runs_empty");
+        assert_eq!(empty.fields(), vec![("binding", "327680".to_string())]);
+
+        let split = Decline::RunsSpanRegistrations {
+            binding: 0x50000,
+            first: 9,
+            second: 11,
+        };
+        assert_eq!(split.slug(), "owner_runs_span_registrations");
+        assert_eq!(
+            split.fields(),
+            vec![
+                ("binding", "327680".to_string()),
+                ("first_import", "9".to_string()),
+                ("second_import", "11".to_string()),
+            ],
+            "the refusal names both registrations, so the log says which pair"
+        );
+    }
+
+    /// The window check the single-window and run-list arms share: the byte
+    /// range a window covers inside its registration, and the three refusals
+    /// that keep a window from being grouped at all.
+    #[test]
+    fn a_window_is_checked_against_the_registration_it_names() {
+        const PAGE: usize = 4096;
+        let mut state = State::new();
+        registered_window(&mut state, 21, Some(0x2_0000_0000));
+        let window = |host_va: u64, length: u64, head: u64, bytes_len: u64| Window {
+            binding: 0x50000,
+            import: 21,
+            host_va,
+            length,
+            head,
+            bytes_len,
+        };
+        // The registration's own first granule, read from 4 bytes in: the pair
+        // the run list states for its first run.
+        assert_eq!(
+            checked_window(&state, window(PAGE as u64, PAGE as u64, 4, 64)),
+            Ok((0, PAGE as u64)),
+            "an in-registration window answers its own range"
+        );
+        let past = checked_window(&state, window(PAGE as u64, 4 * PAGE as u64, 0, 64))
+            .expect_err("a window past the registration");
+        assert_eq!(past.slug(), "owner_window_outside_region");
+        let before = checked_window(&state, window(0, PAGE as u64, 0, 64))
+            .expect_err("a window before the registration");
+        assert_eq!(before.slug(), "owner_window_outside_region");
+        let unregistered = checked_window(
+            &state,
+            Window {
+                import: 22,
+                ..window(PAGE as u64, PAGE as u64, 0, 64)
+            },
+        )
+        .expect_err("a window naming a registration this rail does not hold");
+        assert_eq!(unregistered.slug(), "owner_unregistered_region");
+        // A view that reaches past its own window: the head plus the bytes the
+        // binding reads is the range the provider would bind.
+        let reaching = checked_window(&state, window(PAGE as u64, PAGE as u64, PAGE as u64, 64))
+            .expect_err("a view past its window");
+        assert_eq!(reaching.slug(), "owner_window_outside_region");
     }
 
     #[test]

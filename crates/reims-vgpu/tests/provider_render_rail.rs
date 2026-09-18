@@ -926,6 +926,11 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // bytes the walk carries — the shape
         // [`inputs_held_with_chain_value`] drives.
         chain_middle_source_bytes: None,
+        // R32: the seed door's own bytes are handed over only by the shape
+        // [`inputs_with_load_seed_bytes`] drives; every other test states the
+        // seam's answer, which is the class's own refusal for a seeded record
+        // nobody vouched for.
+        load_seed_source_bytes: None,
         // R24: no sampled GPU target's frame is handed over unless a test reads
         // one out of the engine's registry and states it — the shape
         // [`inputs_held_with_sampled_frames`] drives.
@@ -1001,6 +1006,25 @@ fn inputs_held_with_chain_value<'a>(
     RenderRailInputs {
         chain_middle_source_bytes: Some(value),
         ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs`] with the request's own seed-door bytes handed over (R32).
+///
+/// The seam's own statement of this door: the record's previous contents are
+/// the bytes the request builder resolved (`DrawRequest::target_rgba8`) rather
+/// than a frame a registry read or the exec walk produced, and the caller
+/// folded them out of `DrawRequest::target_seed_order` into the attachment's
+/// own order before handing them over. The class states them as the same
+/// trace-owned `Load` arm R23/R25 state and counts them under their own name.
+fn inputs_with_load_seed_bytes<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    bytes: &'a [u8],
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        load_seed_source_bytes: Some(bytes),
+        ..inputs(stages, role)
     }
 }
 
@@ -5372,7 +5396,9 @@ fn assert_frame_is_viewport(
 fn a_declared_viewport_lands_its_own_rect_and_agrees_with_the_engine() {
     let _guard = engine_test_session();
     let stages = reviewed_stages();
-    let (width, height) = (8u32, 4u32);
+    // Large enough that each run is more than one granule: the fixture splits
+    // the surface in half, so the seam between two windows is a real one.
+    let (width, height) = (64u32, 64u32);
     let rect = [1u32, 1, 3, 2];
     let request = |viewport: Option<[u32; 4]>| {
         let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
@@ -14889,5 +14915,745 @@ fn the_gathers_outside_one_registered_window_stay_on_the_engine_by_name() {
         provider_render::provider_submissions(),
         deliveries,
         "a gather outside one registered window never reaches the provider"
+    );
+}
+
+/// R32: the record whose previous contents the *seed door* resolved to bytes the
+/// caller holds — the linear GVA target's cached frame, or the
+/// mapper-ref-texture surface's host fallback — leaves for the canonical
+/// provider as the attachment's trace-owned `Load` arm.
+///
+/// The arm is R23's and R25's, one door over: the request states where its
+/// previous contents come from (`DrawRequest::target_rgba8`, in the order
+/// `DrawRequest::target_seed_order` names) and the caller — the seam, which
+/// reads both fields — hands the same bytes over folded into the attachment's
+/// own order. What makes the reading falsifiable is the frame: the half outside
+/// the scissor keeps the seed's own per-texel bytes, so a rail that dropped,
+/// re-strided or reordered them lands something else, and the drawn half is the
+/// fragment's colour on both rails.
+#[test]
+fn the_seed_doors_own_bytes_leave_for_the_provider_and_land_the_same_frame() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let half = width / 2;
+    // The fixture is smaller than the declared window, so its own geometry
+    // reads the frame rather than the file's full-window helpers.
+    let texel = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
+    };
+    // Per-texel bytes rather than one colour: the untouched half is what says
+    // which bytes the pass began from, texel by texel.
+    let seed = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+    let request = |bytes: Vec<u8>| {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req.target_rgba8 = Some(std::sync::Arc::new(bytes));
+        req
+    };
+    // The engine's own answer for the same request, before the class is asked.
+    let Some(engine) = engine_pixels("R32 seed bytes", &stages, request(seed(0))) else {
+        return;
+    };
+    let deliveries = provider_render::provider_submissions();
+    let refused_before = route_count("render_provider_out_of_class_load_seed");
+    let bytes_before = route_count("render_provider_load_seed_bytes");
+    let provider = match provider_render::submit_render(
+        &inputs_with_load_seed_bytes(&stages, RenderChainRole::SoleOrTail, &seed(0)),
+        &request(seed(0)),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!(
+            "a seeded record whose caller hands the bytes over leaves for the provider: {other:?}"
+        ),
+    };
+    assert!(
+        provider_render::provider_submissions() > deliveries,
+        "the seeded shape reached the canonical provider instead of the engine"
+    );
+    assert_frames_equal("R32 seed bytes, both rails", &provider, &engine);
+    assert_eq!(
+        provider.len(),
+        (width * height * 4) as usize,
+        "the whole attachment comes back"
+    );
+    // The scissored half is the fragment's own output on both rails; the other
+    // keeps the seed's texels, which is the half this arm is about.
+    for x in 0..half {
+        assert_texel_near(
+            &format!("R32 seed bytes: drawn texel ({x}, 0)"),
+            texel(&provider, x, 0),
+            FRAGMENT_TEXEL,
+        );
+    }
+    for y in 0..height {
+        for x in half..width {
+            let expected = seed(0)[((y * width + x) * 4) as usize..][..4].to_vec();
+            assert_eq!(
+                texel(&provider, x, y).to_vec(),
+                expected,
+                "texel ({x}, {y}) keeps the seed's own bytes: a rail that re-strided the \
+                 hand-over lands another texel's"
+            );
+        }
+    }
+    assert_eq!(
+        route_count("render_provider_load_seed_bytes") - bytes_before,
+        1,
+        "the arm has its own population in the census's vocabulary"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_seed") - refused_before,
+        0,
+        "an answered seed is no longer an out-of-class shape"
+    );
+
+    // The falsifiable half: another set of seed bytes moves the frame with them,
+    // and nothing else in the request changed.
+    let moved = match provider_render::submit_render(
+        &inputs_with_load_seed_bytes(&stages, RenderChainRole::SoleOrTail, &seed(0x11)),
+        &request(seed(0x11)),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the same shape with other seed bytes: {other:?}"),
+    };
+    assert_frames_differ("the seed's own bytes reach the frame", &provider, &moved);
+    for y in 0..height {
+        for x in half..width {
+            let expected = seed(0x11)[((y * width + x) * 4) as usize..][..4].to_vec();
+            assert_eq!(
+                texel(&moved, x, y).to_vec(),
+                expected,
+                "texel ({x}, {y}) follows the bytes it was handed"
+            );
+        }
+    }
+
+    // The two refusals beside the arm, by name: a caller that hands nothing
+    // over, and one whose hand-over is not the attachment's own extent.
+    let refused = |label: &str, inputs: &RenderRailInputs<'_>, req: &DrawRequest, slug: &str| {
+        match provider_render::submit_render(inputs, req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                eprintln!("door ({label}): {}", reason.slug());
+                assert_eq!(reason.slug(), slug, "{label}: the refusal's own name");
+            }
+            other => panic!("{label}: expected an out-of-class answer, got {other:?}"),
+        }
+    };
+    let seeded = request(seed(0));
+    refused(
+        "a seed nobody handed over",
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &seeded,
+        "render_provider_out_of_class_load_seed",
+    );
+    refused(
+        "a hand-over that is not the attachment's extent",
+        &inputs_with_load_seed_bytes(&stages, RenderChainRole::SoleOrTail, &seed(0)[..4]),
+        &seeded,
+        "render_provider_out_of_class_load_seed_shape",
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        deliveries + 2,
+        "no refusal among these reached the provider"
+    );
+    eprintln!(
+        "R32 seed bytes: {width}x{height} attachment, {} byte seed in the attachment's own RGBA \
+         order; provider frame == engine frame ({} bytes), the undrawn half keeps the seed's own \
+         texels and the drawn half is {:?}; route render_provider_load_seed_bytes +1 against \
+         render_provider_out_of_class_load_seed +0; a seed nobody handed over stays out under \
+         render_provider_out_of_class_load_seed and a hand-over of another extent under \
+         render_provider_out_of_class_load_seed_shape",
+        seed(0).len(),
+        provider.len(),
+        FRAGMENT_TEXEL,
+    );
+}
+
+/// R32: the mapper-ref-texture surface's own previous contents leave for the
+/// canonical provider as the contract's ordered run list (`BufferSource::
+/// GuestRuns`, `research/docs/23` §113 / E-TX6), gathered out of the owner's
+/// registered pages at resolution.
+///
+/// The fixture is the shapes a driven boot showed: the surface starts eight
+/// bytes into its granule (so the first run's provider window is not its own
+/// bytes' start) and its bytes are scattered over two windows of one
+/// registration (so no single window is the list). The readings are the arm's
+/// own claims, one at a time:
+///
+/// - the frame the provider lands is the bytes the *owner* holds, texel for
+///   texel, and the engine's own gather of the same runs lands the same frame;
+/// - rewriting the second run's bytes in the owner's mapping moves the frame
+///   with them, which is what makes the gather a read of the guest's live pages;
+/// - the submission states the list: its declaration crosses the wire as
+///   `guest_runs`, with every run's lease in the view's own allocation, which is
+///   the contract's own pairing rule.
+#[test]
+fn a_surfaces_own_pages_leave_as_the_run_list_the_provider_gathers() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    // Large enough that each run is more than one granule: the fixture splits
+    // the surface in half, so the seam between two windows is a real one.
+    let (width, height) = (64u32, 64u32);
+    let half = width / 2;
+    let extent_bytes = u64::from(width) * u64::from(height) * 4;
+    /// Bytes from the first run's window to the surface's first byte.
+    const HEAD: usize = 8;
+    // The fixture is smaller than the declared window, so its own geometry
+    // reads the frame rather than the file's full-window helpers.
+    let texel = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
+    };
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the run-list arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    assert!(
+        extent_bytes / 2 > page as u64,
+        "the fixture needs a run longer than one granule: extent {extent_bytes}, page {page}"
+    );
+    // The two runs: the first ends where the second begins, and the second is
+    // its own granule's worth of the surface. The seam between them is the
+    // shape a single window cannot name.
+    let first = (extent_bytes as usize) / 2;
+    let second = extent_bytes as usize - first;
+    // Six granules: the first run starts HEAD bytes into the second, and the
+    // second run is the third and fourth granules' own bytes.
+    let mut owner = AlignedHost::new(6 * page, page);
+    let seed = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 6 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let import_id = import.id().get();
+    let base = owner.pointer as usize;
+    // The surface's bytes, in the owner's own two windows: the first starts
+    // HEAD bytes into the second granule and its own window's granule-aligned
+    // end is the fourth, so the second run begins there. Nothing else in the
+    // allocation is the surface.
+    let write = |owner: &mut AlignedHost, bytes: &[u8]| {
+        let slice = owner.as_mut_slice();
+        slice[page + HEAD..page + HEAD + first].copy_from_slice(&bytes[..first]);
+        slice[4 * page..4 * page + second].copy_from_slice(&bytes[first..]);
+    };
+    write(&mut owner, &seed(0));
+    let guest = |offset: usize, len: usize| {
+        GuestRef::new(
+            std::sync::Arc::clone(&import),
+            import
+                .slice(offset as u64, len as u64)
+                .expect("the run is inside the import"),
+        )
+        .expect("the slice came from this import")
+    };
+    // The owner's own address, read once: the closure below must not borrow the
+    // allocation, because the falsifiable half rewrites it.
+    let window = |guest: &GuestRef| {
+        let bound = guest.bound().expect("the run's own bound");
+        RegisteredWindow {
+            import: import.id(),
+            base: base as u64 + bound.offset,
+            length: bound.len,
+            epoch: 1,
+        }
+    };
+    let first_guest = guest(page + HEAD, first);
+    let second_guest = guest(4 * page, second);
+    let runs = || engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![
+            engine::GuestRun::in_mapping(base, 6 * page as u64, (page + HEAD) as u64, first as u64)
+                .expect("the first run is inside the owner's mapping"),
+            engine::GuestRun::in_mapping(base, 6 * page as u64, (4 * page) as u64, second as u64)
+                .expect("the second run is inside the owner's mapping"),
+        ]),
+        source_offset: 0,
+        total_len: extent_bytes,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(vec![
+            GuestWindowRun {
+                window_offset: 0,
+                guest: first_guest.clone(),
+                window: Some(window(&first_guest)),
+            },
+            GuestWindowRun {
+                window_offset: first as u64,
+                guest: second_guest.clone(),
+                window: Some(window(&second_guest)),
+            },
+        ])),
+        direct_image: None,
+    };
+    let request = || {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req.target_guest_seed = Some(engine::GuestTargetSeed {
+            source: runs(),
+            format: ash::vk::Format::R8G8B8A8_UNORM,
+        });
+        req
+    };
+    // The engine's own answer first: its device context is created lazily on
+    // the first draw, and that creation resets the owner rail, so the
+    // registration below has to follow it.
+    let Some(engine_frame) = engine_pixels("R32 run list", &stages, request()) else {
+        return;
+    };
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: base,
+        length: 6 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x46_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let deliveries = provider_render::provider_submissions();
+    let refused_before = route_count("render_provider_out_of_class_load_seed");
+    let runs_before = route_count("render_provider_load_seed_runs");
+    let delivered = provider_render::provider_submissions();
+
+    use reims_vgpu::backend::provider_wire;
+    provider_wire::capture_submission_frames(true);
+    let provider = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &request(),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!(
+            "a surface whose previous contents are its own registered pages leaves for the \
+             provider as the run list: {other:?}"
+        ),
+    };
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the run-list shape reached the canonical provider instead of the engine"
+    );
+    assert_frames_equal("R32 run list, both rails", &provider, &engine_frame);
+    assert_eq!(
+        provider.len(),
+        extent_bytes as usize,
+        "the whole attachment comes back"
+    );
+    for x in 0..half {
+        assert_texel_near(
+            &format!("R32 run list: drawn texel ({x}, 0)"),
+            texel(&provider, x, 0),
+            FRAGMENT_TEXEL,
+        );
+    }
+    for y in 0..height {
+        for x in half..width {
+            let expected = seed(0)[((y * width + x) * 4) as usize..][..4].to_vec();
+            assert_eq!(
+                texel(&provider, x, y).to_vec(),
+                expected,
+                "texel ({x}, {y}) keeps the bytes the owner's own pages hold: a rail that \
+                 dropped, swapped or re-strided a run lands another texel's"
+            );
+        }
+    }
+    assert_eq!(
+        route_count("render_provider_load_seed_runs") - runs_before,
+        1,
+        "the list arm has its own population in the census's vocabulary"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_seed") - refused_before,
+        0,
+        "an answered run list is no longer an out-of-class shape"
+    );
+
+    // The wire: the attachment's own declaration is the list, and every run's
+    // lease is in the view's allocation — the contract's own pairing rule,
+    // which is why the pass's colour attachment has to name that allocation too.
+    assert_eq!(
+        frames.len(),
+        1,
+        "the seam produced exactly one submission frame"
+    );
+    let (wire_trace, wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let declared = wire_trace
+        .passes
+        .iter()
+        .filter_map(|pass| pass.as_compute())
+        .flat_map(|pass| pass.buffers.iter())
+        .find(|view| matches!(view.source, BufferSource::GuestRuns(_)))
+        .expect("the frame carries the attachment's own declaration");
+    let BufferSource::GuestRuns(wire_runs) = &declared.source else {
+        unreachable!("the view was found by its arm")
+    };
+    eprintln!(
+        "wire attachment view: allocation={} offset={} length={} source=guest_runs({})",
+        declared.allocation_id.get(),
+        declared.offset,
+        declared.length,
+        wire_runs.len(),
+    );
+    assert_eq!(wire_runs.len(), 2, "both runs crossed the wire, in order");
+    assert_eq!(
+        declared.length, extent_bytes,
+        "the view is the attachment's own tightly packed extent"
+    );
+    for run in wire_runs {
+        let reservation = wire_resources
+            .lease(run.lease_id)
+            .expect("every run's lease is admitted in the snapshot");
+        assert_eq!(
+            reservation.lease.allocation_id, declared.allocation_id,
+            "the contract pairs every run's reservation with the declaring view's own allocation"
+        );
+    }
+    // The first run's own coordinates: the surface starts HEAD bytes into the
+    // granule its window is cut from, so a rail that took the window's start
+    // would read the neighbouring bytes.
+    assert_eq!(
+        wire_runs[0].offset % alignment,
+        HEAD as u64,
+        "the first run names the surface's first byte inside its granule, not the granule's own"
+    );
+    assert_eq!(wire_runs[0].length, first as u64);
+    assert_eq!(wire_runs[1].length, second as u64);
+
+    // The falsifiable half: rewrite the *second* run's bytes in the owner's own
+    // mapping and the frame follows them. A rail that had copied the seed into
+    // its own trace would be unmoved.
+    let moved_seed = seed(0x5a);
+    let slice = owner.as_mut_slice();
+    slice[4 * page..4 * page + second].copy_from_slice(&moved_seed[first..]);
+    let moved = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &request(),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the same run list after the owner's own pages moved: {other:?}"),
+    };
+    assert_frames_differ("the owner's own bytes reach the frame", &provider, &moved);
+    for y in 0..height {
+        for x in half..width {
+            // Only the *second* run was rewritten, so the texels it carries
+            // follow and the first run's keep the bytes they always held —
+            // which is also what says the two runs were read from their own
+            // windows rather than from one concatenated copy.
+            let offset = ((y * width + x) * 4) as usize;
+            let expected = if offset < first {
+                &seed(0)[offset..][..4]
+            } else {
+                &moved_seed[offset..][..4]
+            };
+            assert_eq!(
+                texel(&moved, x, y).to_vec(),
+                expected.to_vec(),
+                "texel ({x}, {y}) follows the owner's pages rather than a copy"
+            );
+        }
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        deliveries + 2,
+        "the two answered submissions are the only provider deliveries here"
+    );
+    eprintln!(
+        "R32 run list: {width}x{height} attachment, {extent_bytes} byte extent over 2 windows of \
+         one registration (run 1 starts {HEAD} byte(s) into its granule and is {first} byte(s), \
+         run 2 is {second} byte(s) at the next window's own start); provider frame == engine \
+         frame, the undrawn half keeps the owner's own texels and the drawn half is {:?}; route \
+         render_provider_load_seed_runs +1 against render_provider_out_of_class_load_seed +0; \
+         rewriting the second window's bytes moved exactly its texels",
+        FRAGMENT_TEXEL,
+    );
+}
+
+/// R32: the seed shapes the run list cannot state keep the engine, each under
+/// its own name.
+///
+/// One fact per refusal, because the census reads which condition a shape is
+/// behind: padded rows (the contract's list names a tightly packed extent and
+/// carries no stride), a seed with no run list at all, a run whose bytes have no
+/// registered window, a span that is not the attachment's extent, a list split
+/// across two registrations (the contract pairs every run's reservation with the
+/// declaring view's own allocation, so no one declaration can state it), and
+/// the attachment's own guest backing — the seed shape whose *store* half this
+/// rail does not carry either.
+#[test]
+fn the_seed_run_shapes_beside_the_list_stay_on_the_engine_by_name() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let extent = u64::from(width) * u64::from(height) * 4;
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "the run-list arm needs host imports to exist"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+
+    // Two host allocations and two imports: a list that names both is the shape
+    // the contract's one-allocation rule cannot state.
+    let first_host = AlignedHost::new(4 * page, page);
+    let second_host = AlignedHost::new(page, page);
+    let first_import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(
+            first_host.pointer as usize,
+            4 * page as u64,
+            alignment,
+        )
+        .expect("a page-aligned synthetic host allocation"),
+    );
+    let second_import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(second_host.pointer as usize, page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let guest = |import: &std::sync::Arc<GuestRamImport>, len: u64| {
+        GuestRef::new(
+            std::sync::Arc::clone(import),
+            import.slice(0, len).expect("the run is inside its import"),
+        )
+        .expect("the slice came from its own import")
+    };
+    let first_guest = guest(&first_import, extent);
+    // The half of the first import the two-registration case's first run
+    // covers: the two runs have to *tile* the extent, so neither may claim it
+    // whole.
+    let first_half_guest = guest(&first_import, extent / 2);
+    let second_guest = guest(&second_import, extent / 2);
+    let window = |import: &std::sync::Arc<GuestRamImport>, guest: &GuestRef| {
+        let bound = guest.bound().expect("the run's own bound");
+        RegisteredWindow {
+            import: import.id(),
+            base: import.host_base() as u64 + bound.offset,
+            length: bound.len,
+            epoch: 1,
+        }
+    };
+    // The seeded request the refusals below are all one mutation of.
+    let request = |source: engine::GuestRunSource| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_guest_seed = Some(engine::GuestTargetSeed {
+            source,
+            format: ash::vk::Format::R8G8B8A8_UNORM,
+        });
+        req
+    };
+    // One registered run over the first import, tight rows: the shape every
+    // mutation below starts from.
+    let listed = |total: u64| engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            first_host.pointer as usize,
+            4 * page as u64,
+            0,
+            total,
+        )
+        .expect("the run is inside its own mapping")]),
+        source_offset: 0,
+        total_len: total,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+            window_offset: 0,
+            guest: first_guest.clone(),
+            window: Some(window(&first_import, &first_guest)),
+        }])),
+        direct_image: None,
+    };
+    // The engine's own device context is created lazily on its first draw and
+    // that creation resets the owner rail, so this arm goes first — exactly as
+    // the R28 tests order theirs.
+    let _ = engine_pixels("R32 seed refusal probe", &stages, request(listed(extent)));
+    provider_owner::register(Region {
+        import: first_import.id().get(),
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: first_host.pointer as usize,
+        length: 4 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x47_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    provider_owner::register(Region {
+        import: second_import.id().get(),
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: second_host.pointer as usize,
+        length: page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x48_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+
+    let deliveries = provider_render::provider_submissions();
+    let refused = |label: &str, source: engine::GuestRunSource, slug: &str| -> (String, String) {
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(source),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                eprintln!("door ({label}): {}\n  {}", reason.slug(), reason.detail());
+                assert_eq!(reason.slug(), slug, "{label}: the refusal's own name");
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: expected an out-of-class answer, got {other:?}"),
+        }
+    };
+
+    // Padded rows: the engine's own `bufferRowLength` copy serves this shape and
+    // the contract's list cannot state it.
+    let mut padded = listed(extent);
+    padded.row_length_texels = 8;
+    refused(
+        "padded rows",
+        padded,
+        "render_provider_out_of_class_load_seed_rows",
+    );
+    // No run list at all: the synthetic source, and the shape a host that
+    // cannot import the pages behind one leaves behind.
+    let mut unregistered = listed(extent);
+    unregistered.pages = None;
+    refused(
+        "no run list",
+        unregistered,
+        "render_provider_out_of_class_load_seed_runs",
+    );
+    // One run whose bytes have no registered window under this epoch.
+    let mut unwindowed = listed(extent);
+    // The window list is `Arc`-shared, so the mutation is a fresh list rather
+    // than an edit in place: one run, and no window the ledger derived for it.
+    unwindowed.pages = Some(std::sync::Arc::new(vec![GuestWindowRun {
+        window_offset: 0,
+        guest: first_guest.clone(),
+        window: None,
+    }]));
+    refused(
+        "an unwindowed run",
+        unwindowed,
+        "render_provider_out_of_class_load_seed_runs",
+    );
+    // A span that is not the attachment's own extent.
+    refused(
+        "a short span",
+        listed(extent - 4),
+        "render_provider_out_of_class_load_seed_extent",
+    );
+    // A list split across two registrations: one allocation, one view, so no
+    // declaration can state it.
+    let two_registrations = engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![
+            engine::GuestRun::in_mapping(
+                first_host.pointer as usize,
+                4 * page as u64,
+                0,
+                extent / 2,
+            )
+            .expect("the first run is inside its own mapping"),
+            engine::GuestRun::in_mapping(second_host.pointer as usize, page as u64, 0, extent / 2)
+                .expect("the second run is inside its own mapping"),
+        ]),
+        source_offset: 0,
+        total_len: extent,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(vec![
+            GuestWindowRun {
+                window_offset: 0,
+                guest: first_half_guest.clone(),
+                window: Some(window(&first_import, &first_half_guest)),
+            },
+            GuestWindowRun {
+                window_offset: extent / 2,
+                guest: second_guest.clone(),
+                window: Some(window(&second_import, &second_guest)),
+            },
+        ])),
+        direct_image: None,
+    };
+    let (slug, detail) = refused(
+        "two registrations",
+        two_registrations,
+        "render_provider_out_of_class_load_seed_registrations",
+    );
+    assert!(
+        slug.starts_with("render_provider_out_of_class_load_seed"),
+        "the refusal is the seed door's own: {slug}"
+    );
+    assert!(
+        detail.contains("two registrations"),
+        "the sentence names the fact: {detail}"
+    );
+    // The attachment's own guest backing: the store half this rail does not
+    // carry either, so the seed it would load keeps the engine by name.
+    let mut backing = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    backing.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+    backing.load_guest_target_backing = true;
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &backing) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("door (guest backing): {}", reason.slug());
+            assert_eq!(reason.slug(), "render_provider_out_of_class_load_seed");
+            assert!(
+                reason.detail().contains("guest backing"),
+                "the sentence names the backing: {}",
+                reason.detail()
+            );
+        }
+        other => panic!("a guest-backed seed: expected an out-of-class answer, got {other:?}"),
+    }
+    // Every refusal is a class answer: the provider was never asked.
+    assert_eq!(
+        provider_render::provider_submissions(),
+        deliveries,
+        "a seed the class cannot state never reaches the provider"
     );
 }
