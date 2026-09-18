@@ -86,8 +86,23 @@
 //!   resource family the translated rail does not execute, a texture index at
 //!   or above the contract's own bound or a list that repeats an index or walks
 //!   backwards, a reflected shape or state outside the family, an unbound
-//!   declaration, a bind whose texels are a guest gather or a resident image, a
-//!   texture of another extent, and a draw whose sampler says another state;
+//!   declaration, a bind whose texels are a resident image, a texture of
+//!   another extent, and a draw whose sampler says another state;
+//! - **a sampled texture whose texels are the guest's own pages** (R28): the
+//!   bind a real boot resolves through the zero-copy rail
+//!   (`SampledSource::GuestRuns`) leaves for the provider through the owner
+//!   rail's *window* arm, the sampled sibling of the vertex and index streams'
+//!   R9q/R11 — one page run whose registered window covers the texture's
+//!   tightly packed extent ([`sampled_gather_window`]), stated as the borrowed
+//!   no-copy window when the texture starts at the reservation's own first byte
+//!   and as the owner's staged copy of exactly the extent when it does not
+//!   ([`texture_window_arm`]). Everything else — a gather scattered over
+//!   stretches, one no registration covers, padded rows, a window that does not
+//!   reach the extent — keeps the draw on the engine under
+//!   `..._texture_source`, and a pass whose such bind crosses the
+//!   owner→provider frame also needs the frame to carry its declarations, which
+//!   the class reads out of the frame's own capability answer
+//!   (`..._texture_wire`);
 //! - **a sampled texture whose texels are the trace's own production** (R22,
 //!   E-TX3/`research/docs/23` §110): a request whose bind resolved to a GPU
 //!   target (`SampledSource::Target`) leaves for the provider once a pass of
@@ -98,11 +113,11 @@
 //!   target no pass here produced (`..._texture_source_undeclared`), a record
 //!   that samples the attachment it writes (`..._texture_source_order`), a
 //!   declaration that restates another shape than the production stored
-//!   (`..._texture_source_shape`) and a sampled pass whose binds the
-//!   owner→provider frame would have to carry (`..._texture_wire`, whose
-//!   contract still carries no texture declarations) all stay on the engine.
-//!   The zero-copy guest gather keeps its own exit
-//!   (`..._texture_source`) — that arm is the increment after this one;
+//!   (`..._texture_source_shape`) all stay on the engine. A sampled pass whose
+//!   binds cross the owner→provider frame stays on the engine exactly while the
+//!   frame's own capability answer does not carry the declarations
+//!   (`..._texture_wire`, which E-TX4's wire retires for the shapes it
+//!   carries);
 //!
 //!   # The frame the registry holds, carried in (R24)
 //!
@@ -640,6 +655,22 @@ const INDEX_STREAM_WINDOW: WindowShape = WindowShape {
     alignment_slug: "render_provider_out_of_class_index_alignment",
 };
 
+/// The sampled-texture half of the window-backed shapes (`R28`).
+///
+/// The fourth shape of the same rail, and the one whose second device answer
+/// is *not* an alignment: a lease window names a texture's extent at the
+/// reservation's own start, so what the device's granules turn away here is not
+/// an off-granule view pointer (E reads the reservation's own base) but the
+/// texture's first byte sitting anywhere but that base — the copy is the answer
+/// and this is its name. The import answer is the stream arms' own
+/// ([`window_binding_admits`]): a device that cannot import host pointers has
+/// no window arm at all, and the class refuses rather than silently copying.
+const TEXTURE_WINDOW: WindowShape = WindowShape {
+    name: "sampled texture",
+    import_slug: "render_provider_out_of_class_texture_import",
+    alignment_slug: "render_provider_out_of_class_texture_window",
+};
+
 /// The view's own host pointer of one window-backed binding: the window's base
 /// plus the bind's own head, when the two are addressable together.
 ///
@@ -757,17 +788,74 @@ fn window_arm(
     }
 }
 
-/// The bytes one pass copies out of its window-backed binds (`R18`), under the
-/// owner binding label the plan looks each view up by.
+/// The arm one sampled texture's registered window takes on this device (`R28`).
+///
+/// The sampled sibling of [`window_arm`], and deliberately not the same
+/// function: a lease window names a *texture's* bytes as its own tightly packed
+/// extent at the reservation's start, so the second answer here is not "is the
+/// view pointer a whole number of the device's granules" but "is the texture's
+/// first byte the reservation's own first byte". `head` is that distance
+/// ([`sampled_gather_window`]); zero means the borrowed arm states exactly the
+/// texture's bytes, and non-zero means the class copies the extent out of the
+/// registration ([`provider_owner::window_bytes`]) and states it as the owner's
+/// staged lease — the same two arms a buffer view takes, decided by the one
+/// fact a texture's window rule adds.
+///
+/// `reservation_starts_at_window` is the second condition, and it is about the
+/// *submission* rather than the bind: one registration's windows share one
+/// lease whose reservation covers their union
+/// ([`provider_owner::plan`]), and E reads a texture at the *reservation's*
+/// start — so a texture whose window is not the earliest window of its own
+/// registration in this pass would be read from another bind's bytes. That
+/// shape is the copy arm's, not the borrowed one's.
+///
+/// `Ok(None)` is the borrowed arm, `Ok(Some(bytes))` the staged copy, and `Err`
+/// the two answers this rail cannot state: a device that cannot import host
+/// pointers has no window arm at all ([`window_binding_admits`]'s own refusal,
+/// named for the sampled shape), and a window the owner rail cannot read out of
+/// its registration keeps the draw on the engine under its own name — a
+/// refusal, because a decline is not a fallback and there is no copy to state.
+fn texture_window_arm(
+    binding: u32,
+    window: StageBufferWindow,
+    alignment: u64,
+    reservation_starts_at_window: bool,
+) -> Result<Option<Vec<u8>>, OutOfClass> {
+    window_binding_admits(TEXTURE_WINDOW, window, alignment)?;
+    if window.head == 0 && reservation_starts_at_window {
+        return Ok(None);
+    }
+    match provider_owner::window_bytes(owner_window(binding, window)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(decline) => Err(OutOfClass::owned(
+            TEXTURE_WINDOW.alignment_slug,
+            format!(
+                "a draw whose sampled texture is covered by a registered guest RAM window stays \
+                 on the engine when the window's bytes cannot be copied out of the registration \
+                 that names it: the texture's extent starts {} byte(s) into the window (or that \
+                 window is not the first of its registration this pass binds), so the \
+                 canonical rail's no-copy arm — which reads a texture at the reservation's own \
+                 start — would name bytes another bind owns, and the owner rail refused the copy \
+                 this class states instead (`{}`)",
+                window.head,
+                decline.slug(),
+            ),
+        )),
+    }
+}
+
+/// The bytes one pass copies out of its window-backed binds (`R18`, `R28`),
+/// under the owner binding label the plan looks each view up by.
 ///
 /// The copy itself is made by the class gate, where the device's import
 /// alignment is read — before the pass is submitted and before any lease exists
 /// — and this is what carries it to [`plan_owner_leases`], which states those
 /// binds through the owner's staged arm instead of the borrowed one. Keyed by
-/// the owner label rather than by position because the three shapes' namespaces
+/// the owner label rather than by position because the shapes' namespaces
 /// overlap (`stage_buffer_owner_binding`'s two stages, a stream's index, the
-/// index stream's constant), and a copy read back under another namespace's
-/// label would be a wrong frame rather than a refusal.
+/// index stream's constant, and since R28 a sampled texture's Metal index), and
+/// a copy read back under another namespace's label would be a wrong frame
+/// rather than a refusal.
 #[derive(Default)]
 struct WindowCopies {
     entries: Vec<(u32, Vec<u8>)>,
@@ -2024,21 +2112,59 @@ fn sampled_textures<'a>(
                 }
             }
             // The zero-copy guest gather: the bytes are the guest's own pages,
-            // read inside the draw's command buffer, which is the increment
-            // after this one (`render_provider_out_of_class_texture_source`
-            // is how much of the census's stream is still behind it).
-            crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => {
-                return Err(OutOfClass::owned(
-                    "render_provider_out_of_class_texture_source",
-                    format!(
-                        "a draw whose `[[texture({})]]` texels are gathered from guest memory \
-                         rather than from a copy the request carries stays on the engine: this \
-                         class carries a sampled texture as trace-owned bytes or as the trace's \
-                         own production, the way the vertex streams' two arms do, and the \
-                         guest-gather arm is the increment after them",
-                        declaration.index,
-                    ),
-                ));
+            // read inside the draw's command buffer (R28): the texture sibling
+            // of the arms R9q/R11 state for the vertex and index streams, on
+            // the same fact — one page run whose registered window the
+            // registration ledger derived ([`sampled_gather_window`]).
+            //
+            // The contract's arm for a lease-backed texture is narrower than a
+            // buffer's: E's window rule names *the texture's tightly packed
+            // extent at the reservation's own start*, so a gather the window
+            // rail can state is one whose first byte is the window's own and
+            // whose rows are tight. The declaration states the no-copy window
+            // when the reservation starts there, and the owner's copy of
+            // exactly those bytes (`StagedLease`) when it does not — both
+            // decided where the device answer lives ([`texture_window_arm`]),
+            // because the second is what the device's import granules turn the
+            // first into. Every other gather keeps the engine under this
+            // bucket.
+            crate::backend::vulkan::engine::SampledSource::GuestRuns(source, _vouch) => {
+                // The texture's own tightly packed extent: the number the
+                // lease window reads and the copy reads, so one arithmetic
+                // feeds both arms.
+                let extent = u64::from(image.width)
+                    .checked_mul(u64::from(image.height))
+                    .and_then(|texels| texels.checked_mul(format.bytes_per_texel()));
+                let window = match extent {
+                    Some(extent) => sampled_gather_window(source, extent),
+                    None => Err(SampledGatherExit::Span {
+                        span: source.total_len,
+                        extent: 0,
+                    }),
+                };
+                let window = match window {
+                    Ok(window) => window,
+                    Err(exit) => {
+                        return Err(OutOfClass::owned(
+                            "render_provider_out_of_class_texture_source",
+                            format!(
+                                "a draw whose `[[texture({})]]` texels are gathered from guest \
+                                 memory stays on the engine when the gather is not one registered \
+                                 window covering the texture's own tightly packed extent: the \
+                                 canonical contract states a lease-backed sampled texture as the \
+                                 texture's extent at the reservation's own start \
+                                 (`TextureSource::BorrowedNoCopy`, or the owner's staged copy of \
+                                 exactly those bytes), and {}",
+                                declaration.index,
+                                exit.sentence(),
+                            ),
+                        ));
+                    }
+                };
+                NarrowTextureSource::Window {
+                    binding: texture_owner_binding(declaration.index),
+                    window,
+                }
             }
         };
         // The canonical render sampler executes one texture *extent*: the
@@ -2626,6 +2752,156 @@ fn gather_window(source: &GuestRunSource) -> Option<StageBufferWindow> {
     })
 }
 
+/// The registered window one sampled texture's zero-copy gather was cut from
+/// (`R28`).
+///
+/// The sampled sibling of [`gather_window`], on the same fact — one page run
+/// whose registered window covers the bind's bytes — read for the window rule
+/// the *contract* states for a texture. E's lease channel names a texture's
+/// bytes as "the texture's own tightly packed extent at the reservation's own
+/// start" (`TextureSource`'s doc, `research/docs/23` §75/R5c), and two
+/// conditions follow from that rule that a buffer's window does not have:
+///
+/// - **the rows have to be tight** (`row_length_texels == 0`). The extent the
+///   lease window names is `width * height * bytes_per_texel`; a window whose
+///   guest rows are padded is still a bind the engine gathers, but it is not
+///   one a lease can describe, because the reservation carries no stride;
+/// - **the window has to start at the texture's first byte**, which is what
+///   [`StageBufferWindow::head`] measures here: the distance from the window's
+///   base to the texture's first byte is the run's own in-granule head
+///   ([`GuestRef::head`], the bytes the ledger's page-aligned window is cut
+///   *below*) plus the source's own `source_offset` (a packed resource's plane
+///   or level offset inside the run). A caller that finds a non-zero head
+///   copies the extent out of the registration instead of binding it
+///   ([`texture_window_arm`]), because a borrowed reservation would name the
+///   window's own bytes as the texture's.
+///
+/// `extent` is the texture's tightly packed extent, so the returned window's
+/// `bytes_len` is that extent rather than the whole span the gather covers:
+/// the lease reads exactly the extent, and the class states the *same* byte
+/// count on the copy arm.
+///
+/// `Err` is every gather that is not one such window, and it names the fact
+/// that met it ([`SampledGatherExit`]) rather than one sentence for five
+/// shapes: the census reads the bucket, and a reader of the refusal reads which
+/// condition the stream is behind.
+fn sampled_gather_window(
+    source: &GuestRunSource,
+    extent: u64,
+) -> Result<StageBufferWindow, SampledGatherExit> {
+    if source.row_length_texels != 0 {
+        return Err(SampledGatherExit::PaddedRows {
+            row_length_texels: source.row_length_texels,
+        });
+    }
+    let Some(runs) = source.pages.as_ref() else {
+        return Err(SampledGatherExit::Unregistered);
+    };
+    let [only] = runs.as_slice() else {
+        return Err(SampledGatherExit::Scattered { runs: runs.len() });
+    };
+    // `single_stretch`'s own rule, one fact at a time: the window has to be the
+    // *first* run's bytes, which is what `window_offset == 0` names.
+    if only.window_offset != 0 {
+        return Err(SampledGatherExit::Scattered { runs: runs.len() });
+    }
+    let Some(window) = only.window else {
+        return Err(SampledGatherExit::Unregistered);
+    };
+    let span = source.total_len;
+    if span != extent
+        || source
+            .source_offset
+            .checked_add(span)
+            .is_none_or(|end| end > only.guest.requested())
+    {
+        return Err(SampledGatherExit::Span { span, extent });
+    }
+    // The run's first byte is the window the gather asked for; the texture's
+    // first byte is `source_offset` further in, and the *registration's* window
+    // is aligned below the run by the run's own head.
+    let head = only
+        .guest
+        .head()
+        .checked_add(source.source_offset)
+        .unwrap_or(u64::MAX);
+    if head
+        .checked_add(extent)
+        .is_none_or(|end| end > window.length)
+    {
+        return Err(SampledGatherExit::Window {
+            head,
+            extent,
+            window: window.length,
+        });
+    }
+    Ok(StageBufferWindow {
+        import: window.import.get(),
+        host_va: window.base,
+        length: window.length,
+        head,
+        bytes_len: extent,
+    })
+}
+
+/// Why one sampled texture's zero-copy gather is not a window this class can
+/// state (`R28`), the error half of [`sampled_gather_window`].
+///
+/// One variant per condition, because the refusal's own sentence is what a
+/// reader of a boot's fail log has: the bucket (`..._texture_source`) says the
+/// family, and this says which fact in it the stream is behind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SampledGatherExit {
+    /// The guest rows are padded (`bufferRowLength`): a lease window names a
+    /// tightly packed extent, and this class states no stride.
+    PaddedRows { row_length_texels: u32 },
+    /// More than one stretch tiles the bind (or the one run does not begin at
+    /// the gather's own first byte), so no single host range is its bytes.
+    Scattered { runs: usize },
+    /// No registration names these bytes under the current epoch: the run
+    /// carries no provider-shaped window, and the gather carries no runs at
+    /// all in the synthetic case.
+    Unregistered,
+    /// The gather's own span is not the texture's tightly packed extent (or
+    /// reaches past the run it names): the lease reads exactly the extent.
+    Span { span: u64, extent: u64 },
+    /// The window does not cover the extent from the texture's first byte.
+    Window { head: u64, extent: u64, window: u64 },
+}
+
+impl SampledGatherExit {
+    /// The fact, stated as the refusal's second half.
+    fn sentence(&self) -> String {
+        match self {
+            Self::PaddedRows { row_length_texels } => format!(
+                "the gather's rows are padded: its window carries \
+                 `row_length_texels`={row_length_texels}, while a lease window names a tightly \
+                 packed extent and no stride",
+            ),
+            Self::Scattered { runs } => format!(
+                "the gather is scattered over {runs} stretch(es), so no single registered window \
+                 is the texture's bytes",
+            ),
+            Self::Unregistered => String::from(
+                "the gather carries no registered window: its import has no registration under \
+                 the current epoch, so there is no provider-shaped window to cut a lease from",
+            ),
+            Self::Span { span, extent } => format!(
+                "the gather's own span is {span} byte(s) for a {extent} byte tightly packed \
+                 extent, and a lease reads exactly the extent",
+            ),
+            Self::Window {
+                head,
+                extent,
+                window,
+            } => format!(
+                "the texture starts {head} byte(s) into a {window} byte window, which does not \
+                 hold its {extent} byte extent from its own first byte",
+            ),
+        }
+    }
+}
+
 /// Where one admitted stream's bytes come from (`R9q`, `R11`).
 ///
 /// The same two arms one stage buffer has ([`NarrowStageBuffer`]), on the same
@@ -2797,6 +3073,30 @@ fn declared_stage_buffer_support(
         })
 }
 
+/// The render-texture half of the same device answer (R28).
+///
+/// One snapshot, two readings, exactly as [`declared_stage_buffer_support`]:
+/// the bits the *frame* carries are the ones the class gate gets, because a
+/// provider whose capability answer cannot hold them is a provider whose
+/// remote owner never sees them. What this answers is whether the provider
+/// declares the sampled-render-texture shape at all (and up to which count and
+/// in which formats); the frame's own carriage of *this pass's* declarations is
+/// read back from the produced frame before every lease-carrying submission
+/// (`note_wire_render_textures`), so the two halves of the question are two
+/// readings of the same bytes.
+fn declared_render_texture_support(
+) -> Result<provider_wire::RenderTextureSupport, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    provider_wire::render_texture_support(
+        rail.provider.device_epoch(),
+        &rail.provider.capabilities(),
+    )
+    .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+        step: decline.step,
+        detail: decline.detail,
+    })
+}
+
 /// The two invocation counts one draw's affine stage-buffer footprint is
 /// bounded by (`research/docs/23` §3.3, v86).
 ///
@@ -2905,6 +3205,78 @@ fn note_wire_stage_buffers(trace: &ComputeTrace) {
             view.map(|view| view.view.offset).unwrap_or(0),
             view.map(|view| view.view.length).unwrap_or(0),
         ));
+    }
+}
+
+/// What one frame carries of a pass's sampled textures (R28), printed from the
+/// *decoded* trace.
+///
+/// The render sibling of [`note_wire_stage_buffers`], and it exists for the
+/// same reason: the wire question the class asks ("does the frame carry this
+/// pass's texture declarations?") is a statement about bytes, and the only
+/// reading that can falsify it is the one taken from the frame this rail
+/// produced. One line per texture — the pipeline's own declaration (Metal
+/// index, access, sampler form) beside the pass's view (format, extent, source
+/// arm) — read back out of the decoded value rather than out of the values this
+/// rail built.
+///
+/// The source arm is the fact this increment turns on: a borrowed lease and a
+/// staged lease are the two arms [`texture_window_arm`] decides between, and
+/// `view=absent` is the shape the pre-E-TX4 frame would have decoded to — the
+/// declarations dropped, which is what the class's old pure-gate refusal named.
+fn note_wire_render_textures(trace: &ComputeTrace) {
+    let declarations = trace
+        .pipelines
+        .iter()
+        .find_map(|pipeline| pipeline.render.as_ref())
+        .map(|render| render.textures.as_slice())
+        .unwrap_or(&[]);
+    let views = trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .map(|pass| pass.textures.as_slice())
+        .unwrap_or(&[]);
+    for declaration in declarations {
+        let view = views
+            .iter()
+            .find(|view| view.metal_binding == declaration.metal_binding);
+        let source = match view.map(|view| &view.source) {
+            Some(TextureSource::OwnedBytes(bytes)) => format!("owned_bytes={}", bytes.len()),
+            Some(TextureSource::StagedLease(lease)) => format!("staged_lease={}", lease.get()),
+            Some(TextureSource::BorrowedNoCopy(lease)) => {
+                format!("borrowed_lease={}", lease.get())
+            }
+            Some(TextureSource::TraceView) => "trace_view".to_owned(),
+            None => "view=absent".to_owned(),
+        };
+        crate::observe::line(format!(
+            "render_provider_wire render_texture index={} access={} sampler={} {} \
+             view_format={} view_extent={}x{}",
+            declaration.metal_binding,
+            texture_access_name(declaration.access),
+            match (declaration.sampler, declaration.runtime_sampler) {
+                (Some(_), _) => "static".to_owned(),
+                (_, Some(index)) => format!("runtime={index}"),
+                (None, None) => "none".to_owned(),
+            },
+            source,
+            view.map(|view| format!("{:?}", view.format))
+                .unwrap_or_else(|| "none".to_owned()),
+            view.map(|view| view.width).unwrap_or(0),
+            view.map(|view| view.height).unwrap_or(0),
+        ));
+    }
+}
+
+/// The name one texture access is reported under, in the spelling the
+/// contract's own fields use.
+fn texture_access_name(access: TextureAccess) -> &'static str {
+    match access {
+        TextureAccess::Sampled => "sampled",
+        TextureAccess::Fetched => "fetched",
+        TextureAccess::Storage => "storage",
+        TextureAccess::Unused => "unused",
     }
 }
 
@@ -3583,6 +3955,19 @@ fn production_bytes(pass: &NarrowPass<'_>, descriptor: &mut RenderPassDescriptor
         };
         own(view, bytes);
     }
+    // R28: a sampled texture's window is a lease in both of its arms — the
+    // borrowed no-copy window and the owner's staged copy of the extent — and
+    // its bytes are exactly the extent starting at the window's own `head`. The
+    // consuming trace states them the way it states every other sampled
+    // texture this rail read out of a registry (R24's frame): as the trace's
+    // own bytes.
+    for (index, texture) in pass.textures.iter().enumerate() {
+        let NarrowTextureSource::Window { binding, window } = &texture.source else {
+            continue;
+        };
+        let bytes = provider_owner::window_bytes(owner_window(*binding, *window)).ok()?;
+        descriptor.textures[index].source = TextureSource::OwnedBytes(bytes);
+    }
     Some(())
 }
 
@@ -3621,10 +4006,16 @@ fn production_recordable(req: &DrawRequest, pass: &NarrowPass<'_>) -> bool {
     // pass in a later trace states the same inputs. A pass that itself samples
     // a *trace-produced* view is the one shape that would need its own
     // production restated recursively, and it is not recorded.
+    //
+    // R28's window arm joins them: its lease cannot cross submissions either,
+    // and [`production_bytes`] restates the extent out of the registration the
+    // window names — the same bytes the borrowed arm would have read.
     if pass.textures.iter().any(|texture| {
         !matches!(
             texture.source,
-            NarrowTextureSource::Bytes(_) | NarrowTextureSource::Frame(_)
+            NarrowTextureSource::Bytes(_)
+                | NarrowTextureSource::Frame(_)
+                | NarrowTextureSource::Window { .. }
         )
     }) {
         return false;
@@ -5123,6 +5514,49 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             return RenderRailOutcome::NotInNarrowClass(reason);
         }
     }
+    // R28: the pass's sampled textures under a frame. Until E-TX4 the frame's
+    // render contract carried no texture declarations — the codec had a kind
+    // for the compute half's and none for the render half's — so the pure gate
+    // kept every sampled pass that crossed the frame on the engine
+    // (`..._texture_wire`). The frame now carries them, and this asks the frame
+    // rather than assuming either answer: a provider whose capability answer
+    // does not hold the render-sampler section, or one whose section covers
+    // fewer textures (or other formats) than this pass declares, keeps the draw
+    // on the engine under the same bucket. Every texture this class admits is
+    // in the section's own format family (the two four-byte 8-bit UNORM byte
+    // orders, `RENDER_SAMPLED`), so the format half is a check and not a
+    // widening.
+    if !pass.textures.is_empty() && pass.crosses_the_frame() {
+        let support = match declared_render_texture_support() {
+            Ok(support) => support,
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        };
+        let declared = pass.textures.len();
+        let formats_covered = pass
+            .textures
+            .iter()
+            .all(|texture| support.formats.contains(&texture.format));
+        if !support.supported || declared > support.maximum as usize || !formats_covered {
+            let reason = OutOfClass::owned(
+                "render_provider_out_of_class_texture_wire",
+                format!(
+                    "a draw whose {declared} sampled texture(s) would travel the owner→provider \
+                     frame stays on the engine when the provider's own capability answer does not \
+                     carry the shape: the frame declares \
+                     supports_render_texture_sampling={} and max_render_textures={} over {} \
+                     format(s), and a pass above either bound — or one binding a format the \
+                     section does not list — is a declaration the provider admits no view for \
+                     (`render_texture_unsupported` / `render_texture_limit` / \
+                     `render_texture_format_unsupported`) rather than one this rail states",
+                    support.supported,
+                    support.maximum,
+                    support.formats.len(),
+                ),
+            );
+            reason.note();
+            return RenderRailOutcome::NotInNarrowClass(reason);
+        }
+    }
     // The third device answer (R9e/R9q/R11/R18): every window-backed binding
     // this pass states — a stage buffer's window, a vertex stream's since R9q,
     // and the index stream's since R11 — is imported by the owner rail unless
@@ -5186,6 +5620,71 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
                     copies.insert(binding, bytes);
                 }
                 Ok(None) => {}
+                Err(reason) => {
+                    reason.note();
+                    return RenderRailOutcome::NotInNarrowClass(reason);
+                }
+            }
+        }
+    }
+    // R28: the sampled textures' window arm, on the same device answer and in
+    // the same order — after the binds above, so a copy the granules forced on
+    // one of *them* is already in `copies` and cannot be read as a borrowed
+    // window below.
+    //
+    // The second question a texture's window asks is the reservation's own
+    // start. One registration's windows share one lease whose reservation
+    // covers their union (`provider_owner::plan`), and E reads a texture at
+    // that reservation's start, so a texture whose window is not the earliest
+    // window of its own registration in this pass is a copy rather than a
+    // borrow — the shape [`texture_window_arm`] states. The walk below keeps
+    // the same two arms and the same named refusals, and it is also what gives
+    // the census one reading per arm: a borrowed sampled window and a copied
+    // one are two routes, not one silent choice.
+    if pass.texture_windows().next().is_some() {
+        let alignment = match declared_host_import() {
+            Ok(alignment) => alignment,
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        };
+        // The earliest borrowed window of each registration this pass will
+        // state, read from the binds the walk above has already decided.
+        let mut reservation_starts: std::collections::BTreeMap<u64, u64> =
+            std::collections::BTreeMap::new();
+        for (_, binding, window) in window_backed() {
+            if copies.bytes(binding).is_some() {
+                continue;
+            }
+            let start = reservation_starts.entry(window.import).or_insert(u64::MAX);
+            *start = (*start).min(window.host_va);
+        }
+        for texture in &pass.textures {
+            let NarrowTextureSource::Window { binding, window } = &texture.source else {
+                continue;
+            };
+            let starts_at_window = reservation_starts
+                .get(&window.import)
+                .is_none_or(|start| *start >= window.host_va);
+            match texture_window_arm(*binding, *window, alignment, starts_at_window) {
+                Ok(Some(bytes)) => {
+                    crate::runtime::drain::note_store_route(
+                        "render_provider_sampled_window_staged",
+                    );
+                    crate::runtime::drain::note_store_route_n(
+                        "render_provider_sampled_window_bytes",
+                        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    );
+                    copies.insert(*binding, bytes);
+                }
+                Ok(None) => {
+                    crate::runtime::drain::note_store_route(
+                        "render_provider_sampled_window_borrowed",
+                    );
+                    // A borrowed texture is one more window of its
+                    // registration: the next texture of that import reads the
+                    // union this one just joined.
+                    let start = reservation_starts.entry(window.import).or_insert(u64::MAX);
+                    *start = (*start).min(window.host_va);
+                }
                 Err(reason) => {
                     reason.note();
                     return RenderRailOutcome::NotInNarrowClass(reason);
@@ -5501,6 +6000,23 @@ enum NarrowTextureSource<'a> {
     /// so a pass that samples one is still restatable as a production: its
     /// descriptor carries the bytes, not a lease.
     Frame(&'a [u8]),
+    /// The registered guest RAM window the bind's own zero-copy gather was cut
+    /// from (R28): the texels live in the guest's pages, and the run carries
+    /// the provider-shaped window the registration ledger derived for it — the
+    /// fact R9q/R11 read for a vertex and an index stream. How those bytes
+    /// travel is the *device's* answer and is decided in
+    /// [`texture_window_arm`]: the borrowed no-copy window when the texture's
+    /// extent starts at the reservation's own first byte, and the owner's
+    /// staged copy of exactly the extent otherwise. Both are leases, so a pass
+    /// that samples one crosses the owner→provider frame and its declaration
+    /// names the lease the plan minted for this label.
+    Window {
+        /// The label the owner plan states this texture's window under
+        /// ([`texture_owner_binding`]).
+        binding: u32,
+        /// The window, with the texture's own coordinates inside it.
+        window: StageBufferWindow,
+    },
 }
 
 /// One admitted texture: the canonical binding (the Metal index it states, in
@@ -5704,6 +6220,39 @@ impl NarrowPass<'_> {
             StreamSource::Window(window) => Some(*window),
             StreamSource::Staged(_) => None,
         }
+    }
+
+    /// The windows the pass's own sampled textures were cut from (`R28`), one
+    /// entry per texture that travels as a lease, under the owner label the
+    /// plan and the trace both key it by.
+    ///
+    /// The fourth namespace of [`Self::vertex_windows`] and
+    /// [`Self::index_window`]: the texture's Metal `[[texture(n)]]` index is
+    /// what the label carries ([`texture_owner_binding`]), because a pass's
+    /// sampled textures are arguments of their own rather than stage buffers.
+    fn texture_windows(&self) -> impl Iterator<Item = (u32, StageBufferWindow)> + '_ {
+        self.textures
+            .iter()
+            .filter_map(|texture| match &texture.source {
+                NarrowTextureSource::Window { binding, window } => Some((*binding, *window)),
+                _ => None,
+            })
+    }
+
+    /// Whether this pass's trace crosses the owner→provider frame at all.
+    ///
+    /// One condition, two readers: the class gate's wire questions (a pass that
+    /// stays in process has no frame to ask about) and `submit_render`'s
+    /// texture-declaration reading. It is exactly [`plan_owner_leases`]'s
+    /// "no binding travels as a lease" predicate — a declared stage buffer, a
+    /// window-backed stream or index stream, or a window-backed sampled texture
+    /// each make one — spelled from the pass rather than from the plan so the
+    /// pure gate can read it.
+    fn crosses_the_frame(&self) -> bool {
+        !self.stage_buffers.is_empty()
+            || self.vertex_windows().next().is_some()
+            || self.index_window().is_some()
+            || self.texture_windows().next().is_some()
     }
 
     /// The contract's vertex layout for the admitted streams.
@@ -6525,6 +7074,23 @@ fn narrow_class<'a>(
         }
     }
 
+    // Whether this pass's trace crosses the owner→provider frame at all: the
+    // exact condition [`plan_owner_leases`] answers with `None`
+    // ([`NarrowPass::crosses_the_frame`], spelled there so the device answers
+    // below read the same predicate). A declared stage buffer, a window-backed
+    // stream or index stream, and — since R28 — a window-backed sampled texture
+    // each make one lease, and one lease is one frame. The wire questions are
+    // moot while it is false: the trace is the in-process value every pre-R9j
+    // sampled pass is.
+    let crosses_the_frame = !stage_buffers.is_empty()
+        || vertex_streams
+            .iter()
+            .any(|stream| matches!(stream.source, StreamSource::Window(_)))
+        || matches!(index_source, StreamSource::Window(_))
+        || sampling
+            .textures
+            .iter()
+            .any(|texture| matches!(texture.source, NarrowTextureSource::Window { .. }));
     // R12: a pass whose runtime `[[sampler(n)]]` states the command channel
     // cannot carry stays on the engine by name. The frame format states the
     // pass's sampled *textures* (the v70 channel) but not its runtime sampler
@@ -6534,12 +7100,7 @@ fn narrow_class<'a>(
     // (`render_runtime_sampler_missing`) — a decline, not a fallback. The same
     // rule the v40 blend section's two shapes keep: the class answers the wire
     // question before the frame exists.
-    let wire_carries_samplers = stage_buffers.is_empty()
-        && vertex_streams
-            .iter()
-            .all(|stream| !matches!(stream.source, StreamSource::Window(_)))
-        && !matches!(index_source, StreamSource::Window(_));
-    if !sampling.runtime_samplers.is_empty() && !wire_carries_samplers {
+    if !sampling.runtime_samplers.is_empty() && crosses_the_frame {
         return Err(OutOfClass::owned(
             "render_provider_out_of_class_texture_sampler_wire",
             format!(
@@ -6554,33 +7115,13 @@ fn narrow_class<'a>(
             ),
         ));
     }
-    // The same wire question for the pass's sampled *textures* themselves
-    // (`research/docs/23` §101.5): the frame's pipeline entry carries a render
-    // contract with an **empty** texture list — the codec has a kind for the
-    // compute half's declarations (`PIPELINE_KIND_COMPUTE_TEXTURES`) and none
-    // for the render half's — so a sampled pass that crosses the frame reaches
-    // admission with its declarations dropped and is refused by name
-    // (`UndeclaredTextureBinding`, measured on this rail *before* this
-    // condition existed: `evidence/r22-reims-target-source-<sha>/`'s
-    // pre-guard reading). A decline is not a fallback, so the class answers
-    // the wire question before the frame exists, exactly as the runtime
-    // sampler condition above does — and the shapes this keeps on the engine
-    // are the ones whose binds the frame has to carry (a window-backed stream,
-    // the index stream, or a declared stage buffer of either arm).
-    if !sampling.textures.is_empty() && !wire_carries_samplers {
-        return Err(OutOfClass::owned(
-            "render_provider_out_of_class_texture_wire",
-            format!(
-                "a draw whose {} sampled texture(s) would travel the owner→provider frame stays \
-                 on the engine: the frame's render contract carries no texture declarations yet \
-                 (`research/docs/23` §101.5), so the decoded pass would bind views no contract \
-                 declares and admission would refuse it by name \
-                 (`UndeclaredTextureBinding`) — a decline, not a fallback, and the trace-produced \
-                 arm above is exactly the shape this increment adds to that population",
-                sampling.textures.len(),
-            ),
-        ));
-    }
+    // The pass's sampled *textures* under a frame are the third wire question,
+    // and it is the one R28 moves out of this pure gate: the frame's own
+    // capability answer decides it (`submit_render`'s
+    // `declared_render_texture_support`), because v102/v109's wire carries the
+    // render contract's texture declarations and the pass block that pairs them
+    // with the views — E-TX4's half of the frozen pair — and which of those
+    // sections a provider's frame actually carries is a fact about the frame.
     // R22: a record that carries productions spends the trace's serial pool on
     // *both* passes' views. The pool's own bound is the contract's
     // (`serial_resource_limit` at admission), and a shape above it is one the
@@ -7161,6 +7702,28 @@ fn submit_narrow(
                     TextureSource::TraceView,
                 )
             }
+            // R28: the lease the plan minted for this texture's window, under
+            // the label both halves key it by. Its *channel* is the device's
+            // answer ([`texture_window_arm`]): the borrowed no-copy window, or
+            // the owner-issued staged copy of the texture's own extent — the
+            // same two arms a window-backed stream states, and the reason this
+            // pass crosses the owner→provider frame at all.
+            NarrowTextureSource::Window { binding, .. } => {
+                let view = leases
+                    .as_ref()
+                    .and_then(|plan| plan.view(*binding))
+                    .expect("the owner plan covers every admitted sampled window");
+                (
+                    ViewId::new(next_view),
+                    view.allocation,
+                    match view.channel {
+                        provider_owner::Channel::Borrowed => {
+                            TextureSource::BorrowedNoCopy(view.lease)
+                        }
+                        provider_owner::Channel::Staged => TextureSource::StagedLease(view.lease),
+                    },
+                )
+            }
         };
         textures.push(TextureView {
             view_id,
@@ -7380,6 +7943,7 @@ fn submit_narrow(
         match provider_wire::carried_submission(&frame) {
             Ok((trace, resources)) => {
                 note_wire_stage_buffers(&trace);
+                note_wire_render_textures(&trace);
                 (trace, resources)
             }
             Err(decline) => {
@@ -7856,6 +8420,11 @@ fn input_allocations(pass: &NarrowPass<'_>) -> Vec<(AllocationId, u64)> {
         // under (R22): that allocation is declared from the production's side
         // of the trace, and re-declaring it here would be a second record for
         // one view.
+        // R28 adds the third arm to that rule: a window-backed texture's
+        // allocation is the one [`plan_owner_leases`] minted for its lease, so
+        // the trace's view names that allocation rather than one of this
+        // rail's own — its view *identity* below still advances, so a texture's
+        // identity never depends on which arm it took.
         let (NarrowTextureSource::Bytes(bytes) | NarrowTextureSource::Frame(bytes)) =
             &texture.source
         else {
@@ -7917,6 +8486,22 @@ fn vertex_stream_owner_binding(stream: usize) -> u32 {
 /// rather than a refusal.
 fn index_stream_owner_binding() -> u32 {
     0x0003 << 16
+}
+
+/// The label one sampled texture's window travels under in the owner rail
+/// (`R28`).
+///
+/// The fifth namespace of the same four: a sampled texture is a fragment
+/// stage's `[[texture(n)]]` argument, which is neither stage's `[[buffer(N)]]`
+/// namespace ([`stage_buffer_owner_binding`]), nor a vertex stream's
+/// ([`vertex_stream_owner_binding`]), nor the index stream's
+/// ([`index_stream_owner_binding`]) — and `MAX_RENDER_TEXTURE_INDEX` keeps the
+/// index small enough for the low half, so the whole `[[texture(n)]]` space has
+/// a namespace of its own. A lookup answered by another namespace's lease would
+/// be a wrong frame rather than a refusal, which is the rule every one of these
+/// labels is keyed for.
+fn texture_owner_binding(index: u32) -> u32 {
+    (0x0004 << 16) | index
 }
 
 /// One window-backed binding's coordinates in the owner rail's own shape, under
@@ -8008,6 +8593,7 @@ fn plan_owner_leases(
     if pass.stage_buffers.is_empty()
         && pass.vertex_windows().next().is_none()
         && pass.index_window().is_none()
+        && pass.texture_windows().next().is_none()
     {
         return Ok(None);
     }
@@ -8035,6 +8621,16 @@ fn plan_owner_leases(
     requests.extend(
         pass.index_window()
             .map(|window| window_arm_request(index_stream_owner_binding(), window, copies)),
+    );
+    // R28: the sampled textures' windows are the fourth shape of the same
+    // plan, under their own label namespace. Both of their arms are leases —
+    // the borrowed window, or the owner's staged copy of the extent
+    // ([`texture_window_arm`]) — so a sampled pass whose bind is a guest
+    // gather crosses the owner→provider frame exactly as a window-backed
+    // stream does, and its declaration names the lease this plan imports.
+    requests.extend(
+        pass.texture_windows()
+            .map(|(binding, window)| window_arm_request(binding, window, copies)),
     );
     let plan = provider_owner::plan(provider, &requests).map_err(ProviderRenderDecline::Owner)?;
     for (allocation, size, reservation) in plan.leases() {
