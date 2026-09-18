@@ -272,6 +272,43 @@ pub fn render_texture_gathered_extent(
     Ok(decoded.supports_render_texture_gathered_extent)
 }
 
+/// The declared-superset vertex interface's half of one provider capability
+/// snapshot, read back out of the response frame the provider would send
+/// (`research/docs/23` §3.3, E-TX11 / R-VI1).
+///
+/// The seventh reading of the same one-snapshot rule ([`stage_buffer_support`],
+/// [`compute_texture_support`], [`render_texture_support`],
+/// [`render_sampler_carriage`], [`stage_buffer_namespace_split`],
+/// [`render_texture_gathered_extent`]), and the one this rail's vertex-interface
+/// exit needs: a request whose declared attribute layout names a location the
+/// vertex stage never reads is a shape Metal answers — `MTLVertexDescriptor` is
+/// free to name such a location, and the surplus stream is *bound and ignored*
+/// — but it is also a shape one of the two rails E ships refuses by name
+/// (`metal-api-vulkan`'s `validate_translated_vertex_attributes`, R-VI1's
+/// `render_provider_out_of_class_vertex_interface`).
+///
+/// `true` is the Vulkan rail's own declaration that it executes that direction:
+/// its vertex input state is built from the *declared* layout (`create_pipeline`
+/// emits one `VkVertexInputAttributeDescription` per declared attribute), which
+/// is exactly Metal's descriptor. `false` is the fail-closed answer, and it is
+/// what a frame written before the bit existed decodes to (E-TX11 extends the
+/// escape family E-TX9 opened with its third in-family tag, `0x00 0x03 <bool>`,
+/// so its absence reads as undeclared), so the class gate that reads this
+/// reading keeps the draw on the engine under R-VI1's own name rather than
+/// handing the provider a shape the frame never carried.
+///
+/// The direction the bit deliberately does *not* cover is the reflected
+/// superset: a location the vertex stage reads that no declared entry covers is
+/// a value Metal leaves undefined, so that arm keeps its refusal on every
+/// per-snapshot answer and this reading is never asked for it.
+pub fn render_vertex_interface_superset(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_vertex_interface_superset)
+}
+
 /// The provider's own capability snapshot as it comes back out of the frame
 /// the owner would receive.
 ///

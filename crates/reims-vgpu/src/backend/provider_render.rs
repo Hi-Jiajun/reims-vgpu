@@ -56,7 +56,14 @@
 //!   table* with the attributes that read it (`research/docs/26` §31), and the
 //!   canonical binding index is the table's position in that list, which is why
 //!   the class renumbers rather than carrying the guest's binding numbers
-//!   across;
+//!   across. The declared layout may name attribute locations the vertex stage
+//!   never reads (R-VI1): the surplus entries are bound with their streams and
+//!   ignored, exactly as Metal's own descriptor binds and ignores them, while a
+//!   location the stage *reads* that no declared entry covers keeps the draw on
+//!   the engine by name. A surplus entry's own stream also has to cover the
+//!   draw's own span (`render_provider_out_of_class_vertex_span`), because
+//!   admission proves the surplus streams too and a declaration the stage never
+//!   reads may not be the reason a draw the class took is skipped;
 //! - **at most one scissor rectangle inside the attachment, and at most one
 //!   viewport of its own** (R10, `research/docs/23` §100): the canonical pass
 //!   carries the guest's own rectangle through the pass scissor
@@ -623,6 +630,71 @@
 //! by), no copy is made, and the pass's trace is the trace it was. An answer of
 //! no — the native rail, and every frame written before the bit existed — keeps
 //! R35's refusal, sentence, route and gate position, byte for byte.
+//!
+//! # The vertex interface, and the declared superset (R-VI1)
+//!
+//! One rule answered every disagreement between a request's declared vertex
+//! attributes and the vertex stage's own reflection until this increment:
+//! `render_provider_out_of_class_vertex_interface`. The two sides were compared
+//! field by field, because the canonical registration gate
+//! (`metal-api-vulkan`'s `validate_translated_vertex_attributes`) refuses a
+//! mismatch, and a refusal there is a decline rather than a fallback. The rule
+//! therefore had to answer it here first — but the two directions it answered
+//! are priced completely differently:
+//!
+//! * a **declared** superset — `declared ⊋ reflected`, every location the
+//!   vertex stage reads covered by a declared entry, and at least one declared
+//!   entry naming a location it does not read — is a shape Metal answers. A
+//!   `MTLVertexDescriptor` may name a location the vertex function never reads,
+//!   and the surplus stream is *bound and ignored*. The canonical Vulkan rail's
+//!   own vertex input state is built from the declared layout
+//!   (`create_pipeline` emits one `VkVertexInputAttributeDescription` per
+//!   declared attribute), so it executes the shape exactly as Metal does;
+//! * a **reflected** superset — a location the vertex stage *reads* that no
+//!   declared entry covers — is a value Metal defines nowhere, and a location
+//!   mismatch is neither direction. No device can admit either, so both keep
+//!   their refusal on every per-snapshot answer.
+//!
+//! R-VI1 split the bucket's *population* by direction, so the size of the
+//! winnable half could be read before anything was widened: census v27b
+//! (`evidence/gate3-census-v27b-2026-09-18`) counted 5 241 rows of
+//! `vertex_interface_declared_superset` against zero of
+//! `vertex_interface_reflected_superset` and zero of
+//! `vertex_interface_location_mismatch` — 100 % of the bucket, and the largest
+//! single bucket of that boot's seam failures (50.2 % of every refused draw).
+//!
+//! E-TX11 (`metal-api-emulator`'s `render-vertex-interface-superset`) makes the
+//! one rule directional and publishes the answer as the shape bit
+//! `ProviderCapabilities::supports_render_vertex_interface_superset` — `true`
+//! on the Vulkan snapshot, `false` on the native one and on any frame written
+//! before the bit existed, which decodes as `false` out of the escape family
+//! E-TX9 opened. This rail reads the bit out of the provider's own capability
+//! frame ([`provider_wire::render_vertex_interface_superset`]), asks it exactly
+//! when the request's own walk names the declared-superset direction
+//! ([`vertex_interface_declared_superset`]), and admits that arm — and only
+//! that arm — when the answer is yes.
+//!
+//! Nothing about the admitted shape changes beside the verdict: the request's
+//! whole declared list already travels to the provider, the surplus entry keeps
+//! the stream grouping, stride, offset and format the descriptor declared, no
+//! copy is made, and the pass's trace is the trace it was. An answer of no — the
+//! native rail, and every frame written before the bit existed — keeps R-VI1's
+//! refusal, sentence, route and gate position, byte for byte.
+//!
+//! The one thing the widening adds beside the bit is the span gate
+//! (`render_provider_out_of_class_vertex_span`): a declared attribute the vertex
+//! stage never reads may not be able to *refuse* the draw it is ignored by.
+//! Admission proves every declared stream against the draw's own span — the
+//! highest vertex the index stream names, over that stream's length divided by
+//! its stride (`render_vertex_buffer_footprint_unsupported`) — and it proves the
+//! surplus streams too, because they are bound with the rest of the layout. A
+//! refusal there is a decline, and a decline on an in-class draw is fail-closed:
+//! the draw is *skipped* rather than run on the engine. The same proof over a
+//! stream the module *does* read is the gap this class has always had for the
+//! shapes it has always carried, and this increment does not move it — closing
+//! it would answer shapes the widening never touches. The number needs the index
+//! *values*, so the gate runs on the staged index arm alone: a zero-copy index
+//! window (`R11`) is guest RAM this process has not read.
 //!
 //! # Error mapping
 //!
@@ -4210,6 +4282,142 @@ pub fn override_render_texture_gathered_extent(
     }
 }
 
+/// The declared-superset half of the same device answer (R-VI1).
+///
+/// One snapshot, two readings, exactly as [`declared_render_texture_gathered_extent`]:
+/// the bit the *frame* carries is the one the class gate gets, because a
+/// provider whose capability answer cannot hold it is a provider whose remote
+/// owner never sees it. What it answers is whether this provider executes a
+/// request whose declared attribute layout names a location the vertex stage
+/// never reads — the direction R-VI1 split out of the `vertex_interface`
+/// bucket, and the one the canonical Vulkan rail has always been able to
+/// execute (`create_pipeline` emits one `VkVertexInputAttributeDescription` per
+/// *declared* attribute, so the surplus stream is bound and ignored exactly as
+/// Metal's own descriptor binds and ignores it). `false` is the fail-closed
+/// answer *and* what a frame written before the bit existed decodes to
+/// (`provider_wire::render_vertex_interface_superset`, the third tag of the
+/// escape family E-TX9 opened), so this read can only ever widen the class by
+/// what the device states.
+///
+/// The direction it does *not* answer is R-VI1's reflected superset, which no
+/// contract can admit: a location the vertex stage reads that no declared entry
+/// covers has no defined value, so the walk keeps that refusal whatever this
+/// answers.
+fn declared_render_vertex_interface_superset() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match VERTEX_INTERFACE_SUPERSET_ANSWER.load(Ordering::Relaxed) {
+            VERTEX_INTERFACE_SUPERSET_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_vertex_interface_superset =
+                    answer == VERTEX_INTERFACE_SUPERSET_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::render_vertex_interface_superset(rail.provider.device_epoch(), &capabilities)
+        .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        })
+}
+
+/// The device's own answer for the declared-superset vertex interface (R-VI1),
+/// and the states the test instrument below can put it in.
+const VERTEX_INTERFACE_SUPERSET_DEVICE: u8 = 0;
+const VERTEX_INTERFACE_SUPERSET_NOT_DECLARED: u8 = 1;
+const VERTEX_INTERFACE_SUPERSET_DECLARED: u8 = 2;
+
+/// Whether the declared-superset capability is read from the device's own frame
+/// ([`VERTEX_INTERFACE_SUPERSET_DEVICE`], what production runs) or from an
+/// answer a test stated.
+static VERTEX_INTERFACE_SUPERSET_ANSWER: AtomicU8 = AtomicU8::new(VERTEX_INTERFACE_SUPERSET_DEVICE);
+
+/// A test's own answer for the declared-superset capability, restored when it
+/// drops (R-VI1).
+///
+/// The rail reads the bit out of the provider's capability frame, and a test
+/// that has to see the fail-closed arm cannot make an admitted device stop
+/// declaring the shape. While this guards an answer, the capability question is
+/// asked of a snapshot carrying it — written, encoded and decoded through the
+/// same frame — so the arm a test sees is the arm an old frame gives (`absent`
+/// reads as undeclared), and the reading is still the wire's.
+///
+/// A guard rather than a plain setter for the reason
+/// [`RenderTextureGatheredExtentOverride`] is one: this changes a *decision*
+/// and not an observation, so a test that unwound through a failed assertion
+/// would otherwise leave the next shape in the same binary answering from a
+/// device that is not its own.
+pub struct RenderVertexInterfaceSupersetOverride {
+    previous: u8,
+}
+
+impl Drop for RenderVertexInterfaceSupersetOverride {
+    fn drop(&mut self) {
+        VERTEX_INTERFACE_SUPERSET_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the declared-superset vertex interface as `declared` until the returned
+/// guard drops, or as the device's own answer for `None` (R-VI1).
+pub fn override_render_vertex_interface_superset(
+    declared: Option<bool>,
+) -> RenderVertexInterfaceSupersetOverride {
+    let answer = match declared {
+        None => VERTEX_INTERFACE_SUPERSET_DEVICE,
+        Some(false) => VERTEX_INTERFACE_SUPERSET_NOT_DECLARED,
+        Some(true) => VERTEX_INTERFACE_SUPERSET_DECLARED,
+    };
+    RenderVertexInterfaceSupersetOverride {
+        previous: VERTEX_INTERFACE_SUPERSET_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
+/// The highest vertex one indexed draw's own index bytes name, over the first
+/// `count` indices of the declared width, or `None` when the bytes stop short of
+/// them.
+///
+/// One reader for the two proofs that need it: the class's own span gate
+/// (`render_provider_out_of_class_vertex_span`) and the affine stage-buffer
+/// bound beside it ([`stage_buffer_affine_counts`]). Both read the *staged*
+/// arm's bytes, because the number is a value and not a length — a zero-copy
+/// index window is guest RAM this process has not read, and a caller that cannot
+/// read it gets `None` rather than a bound nothing states.
+#[inline]
+fn highest_index(
+    bytes: &[u8],
+    index_type: crate::backend::vulkan::engine::IndexType,
+    count: u32,
+) -> Option<u64> {
+    use crate::backend::vulkan::engine::IndexType;
+    let width = match index_type {
+        IndexType::U16 => 2,
+        IndexType::U32 => 4,
+    };
+    let count = usize::try_from(count).ok()?;
+    let readable = count.checked_mul(width)?;
+    if bytes.len() < readable {
+        return None;
+    }
+    let mut highest = 0u64;
+    for chunk in bytes.chunks_exact(width).take(count) {
+        let value = match index_type {
+            IndexType::U16 => u64::from(u16::from_ne_bytes([chunk[0], chunk[1]])),
+            IndexType::U32 => {
+                u64::from(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            }
+        };
+        highest = highest.max(value);
+    }
+    Some(highest)
+}
+
 /// The two invocation counts one draw's affine stage-buffer footprint is
 /// bounded by (`research/docs/23` §3.3, v86).
 ///
@@ -4223,28 +4431,12 @@ pub fn override_render_texture_gathered_extent(
 /// such a draw on the engine by name rather than inventing a bound over bytes
 /// this derivation cannot read.
 fn stage_buffer_affine_counts(req: &DrawRequest) -> Option<[u64; 2]> {
-    use crate::backend::vulkan::engine::IndexType;
     let index = req.indexed.as_ref()?;
     let bytes = staged_bytes(&index.content)?;
-    let width = match index.index_type {
-        IndexType::U16 => 2,
-        IndexType::U32 => 4,
-    };
-    let count = usize::try_from(index.index_count).ok()?;
-    let readable = count.checked_mul(width)?;
-    if bytes.len() < readable {
-        return None;
-    }
-    let mut highest = 0u64;
-    for chunk in bytes.chunks_exact(width).take(count) {
-        let value = match index.index_type {
-            IndexType::U16 => u64::from(u16::from_ne_bytes([chunk[0], chunk[1]])),
-            IndexType::U32 => {
-                u64::from(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            }
-        };
-        highest = highest.max(value);
-    }
+    // The same reader the class's own span gate uses, so the highest index an
+    // affine proof is evaluated over and the highest index that gate weighs a
+    // stream's capacity against cannot be two different numbers.
+    let highest = highest_index(bytes, index.index_type, index.index_count)?;
     let vertices = u64::try_from(index.vertex_offset)
         .ok()?
         .checked_add(highest)?
@@ -4482,6 +4674,35 @@ fn sampled_source_of_another_extent(
                 .find(|image| image.binding == declaration.binding)?;
             (image.width != req.width || image.height != req.height).then_some(declaration.index)
         })
+}
+
+/// The declared-superset direction one request's vertex interface states, in
+/// the rule's own terms (R-VI1).
+///
+/// The surplus [`vertex_interface_mismatch`] counts when the walk answers
+/// [`VertexInterfaceRoute::DeclaredSuperset`] — how many declared entries name
+/// a location the vertex stage never reads — and `None` for every other shape,
+/// including the two disagreements the walk refuses under routes of their own.
+///
+/// This is the vertex-interface rule's own test and nothing else: it decides
+/// nothing about the shape, and it is what lets the class ask the *device's*
+/// own answer (R-VI1) before the pure gate runs — the rule sits inside the
+/// gate, and a gate that ran first would have answered by name before the
+/// answer was in hand. Every other shape reaches the question no earlier than
+/// it did: a request whose declared layout and reflection name the same
+/// locations never asks the rail anything, and neither does one whose
+/// disagreement is a reflected superset or a location mismatch.
+fn vertex_interface_declared_superset(
+    inputs: &RenderRailInputs<'_>,
+    req: &DrawRequest,
+) -> Option<u32> {
+    match vertex_interface_mismatch(&req.vertex_attributes, inputs.vertex_attribute_locations) {
+        Some(VertexInterfaceMismatch {
+            route: VertexInterfaceRoute::DeclaredSuperset,
+            distance,
+        }) => Some(u32::try_from(distance).unwrap_or(u32::MAX)),
+        _ => None,
+    }
 }
 
 /// The request's two stages' `[[buffer(N)]]` statement, every rule the class
@@ -6974,6 +7195,34 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // R-VI1: the vertex interface's own class condition, and the third device
+    // answer this rail asks *before* the gate. The rule it lifts sits inside
+    // the gate itself, so an answer read after the gate would arrive after the
+    // gate had already answered by name. The ask is gated on the request's own
+    // statement being the direction a contract can widen onto
+    // ([`vertex_interface_declared_superset`], the same walk the rule runs), so
+    // no other shape reaches the rail's provider any earlier than it did.
+    //
+    // A device (or a frame) that declares the shape executes the declared
+    // superset — the canonical Vulkan rail's vertex input state is built from
+    // the declared layout (`create_pipeline` emits one
+    // `VkVertexInputAttributeDescription` per declared attribute), which is
+    // what makes the surplus stream bound and ignored rather than undefined —
+    // and a device whose frame leaves the bit out keeps R-VI1's answer, by
+    // name, at the same point in the same order. The two directions no
+    // declaration can admit never reach the question at all.
+    let render_vertex_interface_superset = match vertex_interface_declared_superset(inputs, req) {
+        None => false,
+        Some(_) => match declared_render_vertex_interface_superset() {
+            Ok(declared) => declared,
+            // A provider that cannot be reached cannot answer the question the
+            // gate needs, and an unanswerable candidate is an in-class
+            // candidate: fail closed, exactly as `submit_narrow` does for the
+            // shapes it refuses, rather than running the shape on a rail the
+            // class never named.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(
@@ -6981,6 +7230,7 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
         req,
         stage_buffer_namespace_split,
         render_texture_gathered_extent,
+        render_vertex_interface_superset,
     ) {
         Err(reason) => {
             reason.note();
@@ -8545,6 +8795,7 @@ fn narrow_class<'a>(
     req: &'a DrawRequest,
     stage_buffer_namespace_split: bool,
     render_texture_gathered_extent: bool,
+    render_vertex_interface_superset: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R25: the packet's own chain value, when the caller hands it over for the
     // record that continues the chain. Role-gated here so the class states the
@@ -9420,17 +9671,32 @@ fn narrow_class<'a>(
     if let Some(mismatch) =
         vertex_interface_mismatch(&req.vertex_attributes, inputs.vertex_attribute_locations)
     {
-        // R-VI1: the direction is a route beside the refusal, never a second
-        // slug — the census reads `render_provider_out_of_class_vertex_interface`
-        // as one population and this splits it without moving the edge.
-        note_vertex_interface(mismatch);
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_vertex_interface",
-            "a request whose declared vertex attributes do not name exactly the locations the \
-             vertex stage reads stays on the engine: the canonical registration gate compares \
-             the layout with the reflection field by field, so this is a shape the provider \
-             always refuses",
-        ));
+        // R-VI1: the direction the walk named decides whether the shape is one a
+        // contract can widen onto. The declared superset is — `MTLVertexDescriptor`
+        // may name a location the vertex function never reads, and the surplus
+        // stream is bound and ignored — so that arm, and only that arm, is
+        // answered by the device's own declaration. The other two are not
+        // candidates on any device: a reflected superset is a location Metal
+        // defines no value for, and a location mismatch is neither direction.
+        // The admitted arm charges no route and reaches the walk below with every
+        // declared entry stated, so the surplus stream is declared, bound and
+        // never read, exactly as Metal's own descriptor states it.
+        let admitted = mismatch.route == VertexInterfaceRoute::DeclaredSuperset
+            && render_vertex_interface_superset;
+        if !admitted {
+            // R-VI1: the direction is a route beside the refusal, never a
+            // second slug — the census reads
+            // `render_provider_out_of_class_vertex_interface` as one population
+            // and this splits it without moving the edge.
+            note_vertex_interface(mismatch);
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_vertex_interface",
+                "a request whose declared vertex attributes do not name exactly the locations the \
+                 vertex stage reads stays on the engine: the canonical registration gate compares \
+                 the layout with the reflection field by field, so this is a shape the provider \
+                 always refuses",
+            ));
+        }
     }
     let mut vertex_streams: Vec<NarrowVertexStream<'_>> =
         Vec::with_capacity(req.vertex_attributes.len());
@@ -9490,6 +9756,65 @@ fn narrow_class<'a>(
                 source,
                 attributes: vec![stated],
             }),
+        }
+    }
+
+    // R-VI1: a declared attribute the vertex stage never reads may not be able
+    // to *refuse* the draw it is ignored by. Admission proves every stream the
+    // pipeline declares against the draw's own span — the highest vertex the
+    // index stream names, over that stream's length divided by its stride
+    // (`render_vertex_buffer_footprint_unsupported`) — and it proves the
+    // *surplus* streams too, because they are bound with the rest of the layout
+    // even though the module never consumes them. So a surplus declaration whose
+    // stream stops short of the draw's span is a draw admission refuses, and a
+    // refusal there is a decline: the draw is *skipped* rather than run on the
+    // engine (`runtime/draw/vulkan.rs`), which is the one outcome this widening
+    // may not introduce. Answering it here keeps the class's promise for the
+    // population this increment admits.
+    //
+    // Scoped to the surplus streams on purpose. The same proof over a stream the
+    // module *does* read is a gap this class has always had, for every shape it
+    // has always admitted — the two-attribute twin of the fixture in
+    // `out_of_class_shapes_stay_on_the_self_contained_engine` reaches admission
+    // and is a typed `render_vertex_buffer_footprint_unsupported` decline there
+    // today, which the vertex-interface test pins — and closing it would move
+    // shapes this increment does not widen (it would answer the two
+    // `..._is_a_typed_decline` fixtures, which exist to read that very decline).
+    // What the widening owes is only that its own declarations cannot be the
+    // reason a draw the class took is thrown away.
+    //
+    // The number needs the index *values*, so it is available for the staged
+    // index arm alone: a zero-copy index window (`R11`) is guest RAM this process
+    // has not read, exactly as [`stage_buffer_affine_counts`] states for the proof
+    // it derives from the same bytes.
+    if let StreamSource::Staged(bytes) = &index_source {
+        if let Some(highest) = highest_index(bytes, index.index_type, index.index_count) {
+            for stream in &vertex_streams {
+                let ignored = stream.attributes.iter().all(|attribute| {
+                    !inputs
+                        .vertex_attribute_locations
+                        .contains(&attribute.location)
+                });
+                if !ignored {
+                    continue;
+                }
+                let capacity = stream.source.len() / stream.stride.max(1);
+                if highest >= capacity {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_vertex_span",
+                        format!(
+                            "a draw whose ignored vertex stream holds {capacity} record(s) of \
+                             {stride} bytes while its index stream names vertex {highest} stays \
+                             on the engine: the stream is declared, so admission proves it \
+                             against the draw's own span \
+                             (`render_vertex_buffer_footprint_unsupported`) and refuses the draw, \
+                             and an attribute the vertex stage never reads may not be the reason \
+                             a draw the class took is thrown away instead of drawn",
+                            stride = stream.stride,
+                        ),
+                    ));
+                }
+            }
         }
     }
 
