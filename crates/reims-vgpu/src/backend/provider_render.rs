@@ -3433,6 +3433,42 @@ fn stage_buffer_gate<'a>(
                 ),
             ));
         }
+        // The two stages' Metal buffer namespaces are independent — a
+        // `[[buffer(N)]]` at the vertex stage and one at the fragment stage are
+        // two arguments (`StageBufferDeclaration`'s own docs) — while the
+        // canonical rail's merged set 0 is not: `metal2vulkan`'s default
+        // resource layout binds either stage's `[[buffer(N)]]` at set 0's own
+        // binding `n`, so a pair that reads one index from both stages folds
+        // both writes onto one descriptor. The rail refuses that pair when the
+        // merged set is built (`render_stage_buffer_layout_unsupported`)
+        // instead of executing one stage under the other's declaration; a
+        // decline on an admitted draw is fail-closed, so the shape stays on the
+        // engine here by name (R31). Read inside the same canonical walk as the
+        // duplicate rule, so the two rules answer in one order whatever order
+        // the reflections stated their declarations in.
+        if let Some(other) = out
+            .iter()
+            .find(|stated| stated.stage != stage && stated.index == declaration.index)
+        {
+            // The folded-pair rule's own route (R31), beside the unchanged
+            // slug.
+            note_stage_buffer_shape(StageBufferShapeRoute::Folded);
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_stage_buffer_shape",
+                format!(
+                    "a draw whose {} and {} stages each read [[buffer({})]] stays on the engine: \
+                     the two stages' Metal buffer namespaces are independent, while the canonical \
+                     rail binds both at one descriptor — set 0's own binding for that index — and \
+                     refuses the pair when the merged set is built \
+                     (`render_stage_buffer_layout_unsupported`) rather than execute one stage \
+                     under the other's declaration. The engine, which keeps the two namespaces \
+                     apart, draws it",
+                    other.stage.name(),
+                    stage.name(),
+                    declaration.index,
+                ),
+            ));
+        }
         // A vertex stage buffer may not occupy an index the pipeline's vertex
         // layout already describes: this class states the request's streams as
         // canonical bindings `0..vertex_streams`, and one binding described
@@ -5907,10 +5943,12 @@ pub fn stage_buffer_unused_skip_route(skipped: usize) -> &'static str {
 /// The census route of one `stage_buffer_shape` refusal (R9o,
 /// `research/docs/26` §30).
 ///
-/// The refusal slug is one name three rules answer under — more declarations
+/// The refusal slug is one name four rules answer under — more declarations
 /// than the canonical contract states ([`MAX_RENDER_STAGE_BUFFERS`]), one
-/// `(stage, index)` declared twice, and a vertex declaration inside the
-/// canonical layout's own `0..vertex_streams` bindings — and until this
+/// `(stage, index)` declared twice, one index read from both stages (R31, the
+/// canonical rail's merged set 0 folds the two Metal namespaces onto one
+/// descriptor), and a vertex declaration inside the canonical layout's own
+/// `0..vertex_streams` bindings — and until this
 /// increment every one of them was counted as the bare slug: the
 /// 2026-09-17 census v5 read 88026 / 89277 first failures under
 /// `render_provider_out_of_class_stage_buffer_shape` and could not say which
@@ -5921,6 +5959,7 @@ pub fn stage_buffer_shape_route(stage_buffer_shape: StageBufferShapeRoute) -> &'
     match stage_buffer_shape {
         StageBufferShapeRoute::TooMany => "stage_buffer_shape_gt4",
         StageBufferShapeRoute::Duplicate => "stage_buffer_shape_duplicate",
+        StageBufferShapeRoute::Folded => "stage_buffer_shape_folded",
         StageBufferShapeRoute::VertexLayout => "stage_buffer_shape_vertex_layout",
     }
 }
@@ -5939,6 +5978,9 @@ pub enum StageBufferShapeRoute {
     TooMany,
     /// One `(stage, index)` is declared twice.
     Duplicate,
+    /// One index is read from both stages, which the canonical rail's merged
+    /// set 0 folds onto one descriptor slot (R31).
+    Folded,
     /// A vertex-stage declaration occupies an index the pipeline's own vertex
     /// layout already describes (`0..vertex_streams`, where the count is the
     /// request's own fetch tables — `research/docs/26` §31).
@@ -7251,55 +7293,38 @@ fn narrow_class<'a>(
         ));
     }
     // The pipeline-layout face of the interface the two doors above admitted
-    // one face at a time. The canonical rail builds one layout list for a pass:
-    // set 0 is the sampled pipeline's own — the layout
-    // `metal-api-vulkan`'s `create_render_textures` builds beside the texture
-    // binds — and the stage buffers' sets follow it positionally
+    // one face at a time is *in* the class since R31. The canonical rail builds
+    // one layout list for a pass: set 0 is the sampled pipeline's own — the
+    // layout `metal-api-vulkan`'s `create_render_textures` builds beside the
+    // texture binds — and the stage buffers' sets follow it positionally
     // (`create_stage_buffers`). A translated module reads each `[[buffer(n)]]`
-    // from a set of its own (the default resource layout puts them in set 0,
-    // `RESOURCE_DESCRIPTOR_SET`/`BUFFER_BINDING_RANGE`), so a pass that binds a
-    // sampled texture *and* states a stage buffer is a shape whose two faces
-    // both want a slot that list holds once: the rail answers it when the
-    // pipeline layout is built, by name
-    // (`render_texture_layout_unsupported`: "a stage buffer occupies descriptor
-    // set 0, which is where this pipeline's combined image samplers live; the
-    // two faces need different slots for one layout to hold both").
+    // from set 0 (`metal2vulkan`'s default resource layout binds it at
+    // `BUFFER_BINDING_BASE + n`), so a pass that binds a sampled texture *and*
+    // states a stage buffer used to be a shape whose two faces both wanted a
+    // slot that list held once: the rail answered it when the pipeline layout
+    // was built, by name (`render_texture_layout_unsupported`: "a stage buffer
+    // occupies descriptor set 0, which is where this pipeline's combined image
+    // samplers live; the two faces need different slots for one layout to hold
+    // both").
     //
     // That answer is a *decline*, and a decline on an in-class draw is
-    // fail-closed (`runtime/draw/vulkan.rs` does not re-run the engine), so a
-    // shape this class admits here and the provider then refuses loses the
-    // record's pixels — the guest draws neither. Census v20 measured exactly
-    // that: the R28/E-TX4/E-TX5/E-TX6 widening let the texture door admit a
-    // draw whose vertex stage also reads its `[[buffer(2)]]` from set 0, the
-    // provider declined the layout at submission, and all 388 of the round's
-    // `draws_skipped_after_engine_refusal` records were that one shape — which
-    // is the login window's own icon layers (64x64, 96x64, 144x64, 186x100)
-    // missing from the frame.
+    // fail-closed (`runtime/draw/vulkan.rs` does not re-run the engine), so the
+    // class kept the shape on the engine instead of handing admission a trace
+    // it could only lose. Census v22 read the population: 1,234
+    // `render_texture_layout_unsupported` rows, every one of them this class's
+    // own by-name exit, which is the login window's own icon layers (64x64,
+    // 96x64, 144x64, 186x100) missing from the frame.
     //
-    // Read last in the gate on purpose: the population this bucket gains is
-    // exactly the one the provider used to refuse at submission, and every
-    // earlier bucket keeps the shape it had. Widening it later means teaching
-    // the rail's layout to hold both faces, which is a provider increment and
-    // not a class preference.
-    if !sampling.textures.is_empty() {
-        if let Some(buffer) = stage_buffers.first() {
-            return Err(OutOfClass::owned(
-                "render_provider_out_of_class_texture_layout",
-                format!(
-                    "a draw whose {} stage reads a [[buffer({})]] argument beside {} sampled \
-                 texture(s) stays on the engine: the canonical rail's pipeline layout carries the \
-                 sampled pipeline's set 0 and the stage buffers' sets in one positional list, so \
-                 a pass that states both faces is refused when that layout is built \
-                 (`render_texture_layout_unsupported`) — and a decline on an in-class draw is \
-                 fail-closed rather than a re-run, so admitting it here is what loses the \
-                 record's pixels. The engine, which lays the two faces out itself, draws it",
-                    buffer.stage.name(),
-                    buffer.index,
-                    sampling.textures.len(),
-                ),
-            ));
-        }
-    }
+    // E-TX7 (`metal-api-emulator` `115f01f`, E main `ab21f10`) taught the rail
+    // to hold both faces — `create_stage_buffers` merges the sampled pipeline's
+    // own set-0 layout with the stage buffers a module reads there
+    // (`create_merged_set_zero`, the translator's bands disjoint by
+    // construction) — so the overlap crosses into the provider now. The one
+    // boundary that stays is the merge's own, and
+    // [`stage_buffer_statement`] answers it by name before the frame exists:
+    // two stages' buffers folding onto one set-0 slot (see the folded rule
+    // there), which `metal-api-emulator` refuses at submission
+    // (`render_stage_buffer_layout_unsupported`).
     Ok(NarrowPass {
         vertex_entry: vertex_entry.to_owned(),
         fragment_entry: fragment_entry.to_owned(),

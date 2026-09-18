@@ -9106,88 +9106,226 @@ fn the_stage_buffer_door_names_every_fact_between_a_declaration_and_the_provider
     }
 }
 
-/// The two doors' *overlap* is its own boundary, and it is the class's to
-/// answer rather than the provider's.
+/// The measured pair of R31's overlap test: [`shared_table_stages`]'s vertex
+/// half — four `[[stage_in]]` attributes beside the `[[buffer(2)]]` argument
+/// the entry reads — with [`sampled_stages`]'s sampling fragment half, so both
+/// faces meet in one pass.
+fn sampled_shared_table_stages() -> Stages {
+    let mut stages = sampled_stages();
+    stages.air.0 = fixture("reims_indexed_tri_two_stream_buffer2.air");
+    stages.vertex_entry = "reims_two_stream_buffer2_vertex";
+    stages.vertex_attribute_locations = vec![0, 1, 2, 3];
+    // The fragment half's own reflection is `sampled_stages`'s (the texture
+    // declarations and the sampler family); only the vertex half's moves.
+    stages.vertex_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.0, RenderStage::Vertex, stages.vertex_entry);
+    stages.fragment_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.1, RenderStage::Fragment, stages.fragment_entry);
+    stages
+}
+
+/// R31: the two doors' *overlap* is in the class since E-TX7 taught the rail
+/// to hold both faces.
 ///
 /// Each door above admits one face at a time: a sampled `[[texture(i)]]`
 /// declaration beside its bind, and a `[[buffer(n)]]` declaration beside its
-/// bind. A pass that states both is a shape the canonical rail's *pipeline
-/// layout* cannot hold — the rail's set 0 is the sampled pipeline's combined
-/// image samplers (`create_render_textures`), a translated module reads its
-/// `[[buffer(n)]]` arguments from the set its own reflection names (set 0 by
-/// the default resource layout), and `create_stage_buffers` lays the buffers'
-/// sets out positionally behind that same slot — so the provider answers it
-/// when the layout is built, by name (`render_texture_layout_unsupported`).
+/// bind. A pass that states both used to be a shape the canonical rail's
+/// *pipeline layout* could not hold — the rail's set 0 was the sampled
+/// pipeline's combined image samplers (`create_render_textures`), a translated
+/// module reads its `[[buffer(n)]]` arguments from set 0 (the default resource
+/// layout), and `create_stage_buffers` laid the buffers' sets out positionally
+/// behind that same slot — so the provider answered it when the layout was
+/// built, by name (`render_texture_layout_unsupported`). That answer is a
+/// *decline*, and a decline on an in-class draw is fail-closed
+/// (`runtime/draw/vulkan.rs` does not re-run the engine), so the class kept the
+/// shape on the engine instead: census v22 read 1,234 rows of exactly that
+/// exit, the login window's own icon layers (64x64, 96x64, 144x64, 186x100)
+/// missing from the frame.
 ///
-/// That answer is a *decline*, and a decline on an in-class draw is
-/// fail-closed: `runtime/draw/vulkan.rs` does not re-run the engine, so the
-/// record's pixels are lost rather than drawn by the other rail. Census v20
-/// measured the cost of leaving it outside the class — 388
-/// `draws_skipped_after_engine_refusal` records, every one of them pipe 157's
-/// vertex buffer beside its fragment texture (the window's own icon layers,
-/// missing from the frame). The gate states the boundary instead: this test
-/// pins the sentence, the bucket, and the control that the *each* face alone
-/// still crosses to the provider, so the boundary is the overlap and not
-/// either half.
+/// E-TX7 (`metal-api-emulator` `115f01f`, E main `ab21f10`) merges the two
+/// faces into one set 0 (`create_merged_set_zero`), so the overlap crosses to
+/// the provider now: this test pins that the measured shape completes on the
+/// provider rail, that the old bucket no longer charges, and that each face
+/// alone still crosses — what moved is the overlap and not either half.
+///
+/// The one boundary the merge still names — two stages reading one buffer
+/// index — is the class's own answer in
+/// `two_stages_reading_one_buffer_index_stay_on_the_engine_by_name`.
+///
 #[test]
-fn a_sampled_texture_beside_a_stage_buffer_stays_on_the_engine_by_name() {
+fn a_sampled_texture_beside_a_stage_buffer_crosses_to_the_provider() {
     let _guard = engine_test_session();
-    // The measured shape: the vertex stage reads `[[buffer(2)]]` while the
-    // fragment stage samples `[[texture(0)]]`.
-    let mut stages = sampled_stages();
-    stages.vertex_stage_buffer_declarations = vec![StageBufferDeclaration {
-        index: 2,
-        access: StageBufferAccess::Read,
-        footprint: StageBufferFootprint::Static { max_bytes: 8 },
-    }];
-    let content = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16]));
-    let bind = staged_bind(RenderPipelineStage::Vertex, 2, &content);
-    let (width, height) = (8u32, 4u32);
-    let req = sampled_request(&stages, sampled_texels(width, height), (width, height));
-
-    let bucket = route_count("render_provider_out_of_class_texture_layout");
-    match provider_render::submit_render(
-        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &[bind]),
-        &req,
-    ) {
-        RenderRailOutcome::NotInNarrowClass(reason) => {
-            eprintln!("overlap: {reason}");
-            assert_eq!(
-                reason.slug(),
-                "render_provider_out_of_class_texture_layout",
-                "the overlap is the layout's own bucket: {reason}"
-            );
-            let detail = reason.detail();
-            assert!(
-                detail.contains("[[buffer(2)]]") && detail.contains("1 sampled texture(s)"),
-                "the sentence names both faces and the bind's own slot: {detail}"
-            );
-            assert!(
-                detail.contains("render_texture_layout_unsupported"),
-                "the sentence names the provider answer it stands in front of: {detail}"
-            );
-        }
-        other => {
-            panic!("a sampled texture beside a stage buffer stays on the engine: {other:?}")
-        }
-    }
+    let stages = sampled_shared_table_stages();
+    assert_eq!(stages.vertex_attribute_locations, vec![0, 1, 2, 3]);
     assert_eq!(
-        route_count("render_provider_out_of_class_texture_layout"),
-        bucket + 1,
-        "the overlap charges its own bucket exactly once"
+        stages.vertex_stage_buffer_declarations,
+        vec![StageBufferDeclaration {
+            index: 2,
+            access: StageBufferAccess::Read,
+            footprint: StageBufferFootprint::Static { max_bytes: 8 },
+        }],
+        "the vertex half declares the one `[[buffer(2)]]` argument the entry reads"
+    );
+    assert!(
+        !stages.fragment_texture_declarations.is_empty(),
+        "the fragment half samples its own texture: {:#?}",
+        stages.fragment_texture_declarations
     );
 
+    // The census pair's own bytes: four attributes in two interleaved tables,
+    // and the `[[buffer(2)]]` argument as one `float2`.
+    let positions = [(-1.0_f32, -3.0_f32), (-1.0, 1.0), (3.0, 1.0)];
+    let offsets = |x: f32| [(x, 0.0_f32); 3];
+    let first = interleaved(positions, offsets(0.125));
+    let second = interleaved(offsets(0.0625), offsets(0.0625));
+    let still = std::sync::Arc::new(f32x2(&[(0.0, 0.0)]));
+    let moved = std::sync::Arc::new(f32x2(&[(-0.25, 0.0)]));
+    let (width, height) = (8u32, 4u32);
+    let request = |tail: &std::sync::Arc<Vec<u8>>| {
+        let mut req = sampled_request(&stages, sampled_texels(width, height), (width, height));
+        req.vertex_attributes = vec![
+            attribute_of(0, 0, 16, &first),
+            attribute_of(1, 8, 16, &first),
+            attribute_of(2, 0, 16, &second),
+            attribute_of(3, 8, 16, &second),
+        ];
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 2,
+            content: BufferContent::Bytes(std::sync::Arc::clone(tail)),
+        });
+        req
+    };
+    let frame = |label: &str, tail: &std::sync::Arc<Vec<u8>>| {
+        let content = BufferContent::Bytes(std::sync::Arc::clone(tail));
+        let binds = [staged_bind(RenderPipelineStage::Vertex, 2, &content)];
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &request(tail),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: a sampled texture beside a stage buffer is in class since E-TX7: \
+                 {other:?}"
+            ),
+        }
+    };
+
+    let bucket = route_count("render_provider_out_of_class_texture_layout");
+    let delivered = provider_render::provider_submissions();
+    let provider = frame("sampled beside a stage buffer", &still);
+    assert_eq!(
+        provider.len(),
+        (width as usize) * (height as usize) * 4,
+        "the provider answers the pass's whole attachment"
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the overlap reaches the canonical provider rather than the engine"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_layout"),
+        bucket,
+        "the overlap no longer has a bucket of its own"
+    );
+    // The merge binds both faces: the argument's own bytes move the frame.
+    assert_frames_differ(
+        "the merged set carries the stage buffer",
+        &provider,
+        &frame("moved argument", &moved),
+    );
+    let Some(engine) = engine_pixels("sampled beside a stage buffer", &stages, request(&still))
+    else {
+        return;
+    };
+    assert_frames_equal("sampled beside a stage buffer", &provider, &engine);
+
     // The control: the same draw with the fragment texture alone — the
-    // declaration removed — still crosses to the provider, so the boundary is
+    // declaration removed — still crosses to the provider, so what moved is
     // the *pair* of faces and not the texture half. (The stage-buffer half's
     // own control is `the_statement_and_the_wire_carry_the_one_slot_the_entry_dereferences`,
     // which admits the reviewed buffer fixture with no texture beside it.)
     let texture_only = sampled_stages();
-    match provider_render::submit_render(&inputs(&texture_only, RenderChainRole::SoleOrTail), &req)
-    {
+    let control = sampled_request(
+        &texture_only,
+        sampled_texels(width, height),
+        (width, height),
+    );
+    match provider_render::submit_render(
+        &inputs(&texture_only, RenderChainRole::SoleOrTail),
+        &control,
+    ) {
         RenderRailOutcome::ProviderCompleted(_) => (),
         other => panic!("the sampled texture alone is in class: {other:?}"),
     }
+}
+
+/// R31: the merge's own boundary stays, and the class states it by name.
+///
+/// The two stages' Metal buffer namespaces are independent — a vertex-stage
+/// `[[buffer(2)]]` and a fragment-stage one are two arguments — while the
+/// canonical rail's merged set 0 binds both at one descriptor
+/// (`metal2vulkan`'s default layout puts `[[buffer(n)]]` at set 0, binding
+/// `n`), so a pair that reads one index from both stages is refused when the
+/// merged set is built (`render_stage_buffer_layout_unsupported`). A decline on
+/// an admitted draw is fail-closed, so the class answers it here instead: this
+/// test pins the sentence, the slug and the rule's own counter, so the next
+/// census can size the population the merge would have lost.
+#[test]
+fn two_stages_reading_one_buffer_index_stay_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let mut stages = sampled_stages();
+    let declaration = StageBufferDeclaration {
+        index: 2,
+        access: StageBufferAccess::Read,
+        footprint: StageBufferFootprint::Static { max_bytes: 8 },
+    };
+    stages.vertex_stage_buffer_declarations = vec![declaration.clone()];
+    stages.fragment_stage_buffer_declarations = vec![declaration];
+    let content = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16]));
+    let binds = [
+        staged_bind(RenderPipelineStage::Vertex, 2, &content),
+        staged_bind(RenderPipelineStage::Fragment, 2, &content),
+    ];
+    let (width, height) = (8u32, 4u32);
+    let mut req = sampled_request(&stages, sampled_texels(width, height), (width, height));
+    req.storage_buffers.push(engine::StorageBufferResource {
+        binding: 2,
+        content: content.clone(),
+    });
+
+    let bucket = route_count("render_provider_out_of_class_stage_buffer_shape");
+    let folded = route_count("stage_buffer_shape_folded");
+    match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &req,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("folded stages: {reason}");
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_stage_buffer_shape",
+                "the folded pair answers under the shape slug: {reason}"
+            );
+            let detail = reason.detail();
+            assert!(
+                detail.contains("[[buffer(2)]]")
+                    && detail.contains("render_stage_buffer_layout_unsupported"),
+                "the sentence names the index and the provider answer it stands in front of: \
+                 {detail}"
+            );
+        }
+        other => panic!("two stages reading one buffer index stay on the engine: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_shape"),
+        bucket + 1,
+        "the folded pair charges the shape slug exactly once"
+    );
+    assert_eq!(
+        route_count("stage_buffer_shape_folded"),
+        folded + 1,
+        "and its own route sizes the rule for the next census"
+    );
 }
 
 /// R9o: the shape door's three rules, each charged under its own route.
