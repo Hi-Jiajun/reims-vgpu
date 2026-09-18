@@ -86,6 +86,18 @@ fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
         })
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The engine's driver evidence — the breadcrumb a crash leaves and the
+    // quarantine list that refuses the call next time — is named per process in
+    // a test run and after the product in a boot, because these paths are
+    // global to the machine and this file's runs sit beside live boots.
+    // Asserted rather than assumed: the split depends on how this binary was
+    // built (`cfg(test)` does not reach the lib), and a build that lost it
+    // would otherwise only say so by refusing a boot's call later — see
+    // `driver_breadcrumb::prefix_for`.
+    assert!(
+        reims_vgpu::observe::test_scoped(),
+        "a rail run must be test-scoped: its driver evidence may not be the product's files"
+    );
     engine::test_reset_engine(engine_device());
     guard
 }

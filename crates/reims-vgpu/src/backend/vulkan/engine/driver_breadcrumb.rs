@@ -85,7 +85,10 @@ use std::path::PathBuf;
 
 pub(crate) mod quarantine;
 
-/// The prefix every file here shares.
+/// The fixed name a boot's files carry.
+const PRODUCT_PREFIX: &str = "reims-vgpu-driver";
+
+/// The prefix every file here shares, given whether this run is test-scoped.
 ///
 /// Fixed in production, because the whole mechanism turns on the *next* process
 /// finding what this one left — a per-process name would make a crash
@@ -96,15 +99,29 @@ pub(crate) mod quarantine;
 /// beside a live VM would otherwise delete the boot's breadcrumb out from under
 /// it (observed: a test's `disarm` removed a wedged boot's 1 MB fragment module
 /// mid-wedge) and could write a quarantine entry a real boot would then obey.
-/// The sink's `redirect_logs_for_tests` splits the same way for the same reason.
-#[cfg(not(test))]
-fn prefix() -> String {
-    String::from("reims-vgpu-driver")
+///
+/// The second half of that sentence is not hypothetical, and it is why the
+/// scope is asked of [`crate::observe::test_scoped`] rather than checked with
+/// `cfg(test)`. `cfg(test)` is set on the *test target*; an integration-test
+/// binary links a lib built without it, so the rail suites — the ones that run
+/// the engine on this machine — never took this arm. Observed 2026-09-18: a
+/// rail probe's crash inside `create_graphics_pipelines` left a
+/// **product**-named breadcrumb, the machine's next rail run folded it into the
+/// product's quarantine list, and eight sampled-texture tests were refused by
+/// name (`driver_call_quarantined`) for a call a test process had made — out of
+/// the same list a live boot reads. `test_scoped` answers for unit tests,
+/// integration-test binaries and redirected ones alike; see its doc for which
+/// of the three each half of a build takes.
+fn prefix_for(test_scoped: bool) -> String {
+    if test_scoped {
+        format!("{PRODUCT_PREFIX}-test-{}", std::process::id())
+    } else {
+        PRODUCT_PREFIX.to_string()
+    }
 }
 
-#[cfg(test)]
 fn prefix() -> String {
-    format!("reims-vgpu-driver-test-{}", std::process::id())
+    prefix_for(crate::observe::test_scoped())
 }
 
 /// One path per stage. Fixed rather than per-pipeline so a crash leaves exactly
@@ -251,6 +268,54 @@ pub(crate) fn keep_rejected_module(digest: &str, spirv: &[u32]) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    /// These tests share one set of process-global files, because that is the
+    /// mechanism — and [`super::DriverBreadcrumb::clear`] takes the meta file
+    /// back whether or not its own call wrote the copy that is there. Two of
+    /// the tests below arm and disarm, so libtest's parallelism lets one remove
+    /// the other's meta file between its write and its read; observed once
+    /// (2026-09-18, `both_stages_...` failing on a missing meta line) while the
+    /// namespace change above was being validated. The mutex keeps that a
+    /// statement about the files rather than a coin flip on the suite.
+    static FILES: Mutex<()> = Mutex::new(());
+
+    /// A test-scoped run and a boot name different files, and a test build can
+    /// only ever take one of those two arms — so both are asserted here.
+    ///
+    /// This pins the split that a real incident on 2026-09-18 crossed: a rail
+    /// probe's crash inside `create_graphics_pipelines` wrote a **product**-
+    /// named breadcrumb, the machine's next rail run folded it into the
+    /// product's quarantine list, and eight sampled-texture tests were then
+    /// refused by name — out of the list the next VM boot would have obeyed.
+    /// The two names the incident turned on are checked path by path: the meta
+    /// file the fold reads, and the list it writes.
+    #[test]
+    fn a_scoped_run_names_files_no_boot_reads() {
+        assert_eq!(super::prefix_for(false), super::PRODUCT_PREFIX);
+        assert_eq!(
+            super::prefix_for(true),
+            format!("{}-test-{}", super::PRODUCT_PREFIX, std::process::id())
+        );
+        assert_eq!(
+            super::prefix(),
+            super::prefix_for(true),
+            "a cargo test process is test-scoped"
+        );
+
+        let temp = std::env::temp_dir();
+        assert_ne!(
+            super::meta_path(),
+            temp.join(format!("{}-breadcrumb.txt", super::PRODUCT_PREFIX)),
+            "the boot's breadcrumb is not the one this run would fold"
+        );
+        assert_ne!(
+            super::quarantine::list_path(),
+            temp.join(format!("{}-quarantine", super::PRODUCT_PREFIX)),
+            "and the boot's quarantine list is not the one this run would read"
+        );
+    }
+
     /// A graphics compile consumes two modules and both reach disk under their
     /// own stage names, then both go away when the call returns.
     ///
@@ -260,6 +325,7 @@ mod tests {
     /// explained.
     #[test]
     fn both_stages_of_a_graphics_compile_reach_disk_and_are_taken_back() {
+        let _files = FILES.lock().unwrap_or_else(|e| e.into_inner());
         let vert = [0x0723_0203u32, 0x0001_0000, 1];
         let frag = [0x0723_0203u32, 0x0001_0000, 2, 3];
         let crumb =
@@ -301,6 +367,7 @@ mod tests {
     /// the arming site knows where the call is.
     #[test]
     fn an_armed_breadcrumb_puts_the_call_under_the_clock_watch() {
+        let _files = FILES.lock().unwrap_or_else(|e| e.into_inner());
         crate::observe::driver_watch::leave();
         let words = [0x0723_0203u32, 0x0001_0000];
         let crumb = super::DriverBreadcrumb::arm("test_watched", &[("module", &words)])

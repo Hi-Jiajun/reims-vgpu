@@ -108,6 +108,11 @@ static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 static FAIL_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static DRAW_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Set by [`redirect_logs_for_tests`] and read by [`test_scoped`]: the explicit
+/// way a test binary that carries no other signal says which names its run
+/// owns.
+static TEST_SCOPE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 fn test_path(kind: &str) -> String {
     format!("/tmp/reims-vgpu-{kind}-test-{}.log", std::process::id())
 }
@@ -126,13 +131,33 @@ pub fn draw_log_path() -> &'static str {
     DRAW_PATH.get_or_init(|| "/tmp/reims-vgpu-draw.log".to_string())
 }
 
-/// Test-harness support: point the always-on sinks at per-process files so a
-/// test run never contaminates a concurrent live boot's logs. For integration
-/// test binaries, where `cfg(test)` does not apply to the lib; call once
-/// before anything logs. No effect on a sink that already resolved its path.
+/// Test-harness support: put this process in the test scope, so a test run
+/// never contaminates a concurrent live boot. Points the always-on sinks at
+/// per-process files, and is the explicit half of [`test_scoped`] — the
+/// driver breadcrumb asks the same question, because its file names are global
+/// to the machine for the same reason the log's is. For integration test
+/// binaries, where `cfg(test)` does not apply to the lib; call once before
+/// anything logs or drives the engine. No effect on a sink that already
+/// resolved its path.
 pub fn redirect_logs_for_tests() {
+    let _ = TEST_SCOPE.set(());
     let _ = FAIL_PATH.set(test_path("fail"));
     let _ = DRAW_PATH.set(test_path("draw"));
+}
+
+/// Whether this process's run is test-scoped: test runs keep per-process names
+/// for everything global to the machine, and a live boot keeps the product's.
+///
+/// The three ways to be a test run are the sink's own split, spelled out here
+/// because `cfg(test)` cannot reach across a crate boundary. A unit test is
+/// `cfg(test)` in this crate. An integration-test binary links a lib built
+/// *without* `cfg(test)`, so `testing` — turned on from the consumer's
+/// `[dev-dependencies]`, off in the staticlib QEMU links against — is how its
+/// lib half says so. A binary carrying neither asks with
+/// [`redirect_logs_for_tests`]. Everything else is a product process, and the
+/// boot that follows it has to find what it left.
+pub fn test_scoped() -> bool {
+    cfg!(any(test, feature = "testing")) || TEST_SCOPE.get().is_some()
 }
 
 /// Synchronous single-line append (unit-test builds only). Worker + MMIO proxy

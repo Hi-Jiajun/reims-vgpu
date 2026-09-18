@@ -100,7 +100,7 @@ pub use emit::{first_sight, state_changed, Emit};
 #[cfg(feature = "std")]
 pub use sink::{
     bgra_present_stats, bgra_rgb_stats, elapsed_ms, elapsed_us, fail, line, nonzero_stats, off,
-    redirect_logs_for_tests, rgba_rgb_stats, verbose, when_verbose, RgbaRgbStats,
+    redirect_logs_for_tests, rgba_rgb_stats, test_scoped, verbose, when_verbose, RgbaRgbStats,
 };
 
 // Path accessors and the line matcher exist so tests can assert against the

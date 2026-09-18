@@ -77,6 +77,10 @@ pub(crate) struct Quarantined {
 
 /// The persistent list. In the temp dir beside the breadcrumb it is derived
 /// from, so one `rm reims-vgpu-driver-*` clears the whole mechanism.
+///
+/// It shares [`super::prefix`] with the breadcrumb for the same reason: a test
+/// run folds a crash into a test run's list, under a name the boot's own
+/// processes never touch, and never the other way round.
 pub(crate) fn list_path() -> PathBuf {
     std::env::temp_dir().join(format!("{}-quarantine", super::prefix()))
 }

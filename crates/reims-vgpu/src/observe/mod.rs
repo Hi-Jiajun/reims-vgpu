@@ -51,7 +51,7 @@ pub(crate) use reims_vgpu_observe::{first_sight, state_changed, Emit};
 // rather than `observe::sink::fail(…)`.
 pub use reims_vgpu_observe::{
     bgra_present_stats, bgra_rgb_stats, fail, line, nonzero_stats, off, redirect_logs_for_tests,
-    rgba_rgb_stats, verbose, when_verbose, RgbaRgbStats,
+    rgba_rgb_stats, test_scoped, verbose, when_verbose, RgbaRgbStats,
 };
 pub(crate) use reims_vgpu_observe::{elapsed_ms, elapsed_us};
 
