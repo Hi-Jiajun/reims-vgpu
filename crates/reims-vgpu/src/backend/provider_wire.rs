@@ -236,6 +236,42 @@ pub fn stage_buffer_namespace_split(
     Ok(decoded.supports_render_stage_buffer_namespace_split)
 }
 
+/// The gathered-extent half of one provider capability snapshot, read back out
+/// of the response frame the provider would send (`research/docs/23` §3.3,
+/// E-TX10 / R37).
+///
+/// The sixth reading of the same one-snapshot rule ([`stage_buffer_support`],
+/// [`compute_texture_support`], [`render_texture_support`],
+/// [`render_sampler_carriage`], [`stage_buffer_namespace_split`]), and the one
+/// this rail's extent exit needs: a sampled texture whose bind is *another*
+/// extent than the pass it is read in is a shape the two rails E ships answer
+/// differently (R35) — the canonical Vulkan rail gathers a source of another
+/// extent into the render area's own grid and keeps
+/// `render_texture_extent_unsupported` for the owner's no-copy window alone
+/// (`research/docs/23` §111, E-TX5), while `metal-api-native` refuses every
+/// source of another extent under that same name.
+///
+/// `true` is the Vulkan rail's own declaration that it executes the host-bytes
+/// half of that split — the sources a rail reads off the host, the arm R35
+/// counts under `texture_extent_host_bytes`. `false` is the fail-closed answer,
+/// and it is what a frame written before the bit existed decodes to (the
+/// escape family E-TX9 opened carries this bit as its second in-family tag,
+/// `0x00 0x02 <bool>`, so its absence reads as undeclared), so the class gate
+/// that reads this reading keeps the draw on the engine under R35's own name
+/// rather than handing the provider a source of another extent.
+///
+/// The arm the bit deliberately does *not* cover is the owner's no-copy window:
+/// a borrowed window of another extent would need a host copy E's window rule
+/// has no channel for, so that shape keeps its refusal on both rails and this
+/// reading is never asked for it.
+pub fn render_texture_gathered_extent(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_texture_gathered_extent)
+}
+
 /// The provider's own capability snapshot as it comes back out of the frame
 /// the owner would receive.
 ///
