@@ -6435,6 +6435,13 @@ fn the_seed_backings_own_window_carries_the_pass_and_receives_its_frame() {
 #[test]
 fn a_guest_backed_tail_whose_load_is_the_chain_value_lands_in_the_window_a_second_view_names() {
     let _guard = engine_test_session();
+    // E-TX14 (disclosed pin): this case measures *E-TX13's* arm — the one that
+    // publishes the frame and lands it in the same completion — so the device is
+    // asked to answer without the landing-only entry the next increment added to
+    // the same window. That entry's own arm has its own case
+    // (`a_guest_backed_tail_the_provider_kept_lands_in_the_window_a_later_entry_delivers`),
+    // and the two devices are two readings of one door rather than two doors.
+    let _no_kept_frame = provider_render::override_kept_frame_landing(Some(false));
     let stages = reviewed_stages();
     let (width, height) = (8u32, 4u32);
     let half = width / 2;
@@ -6658,6 +6665,322 @@ fn a_guest_backed_tail_whose_load_is_the_chain_value_lands_in_the_window_a_secon
          render_provider_attachment_guest_window_bytes +0, \
          render_provider_out_of_class_guest_backing +0; the registered memory holds the \
          published frame byte for byte"
+    );
+}
+
+/// E-TX14 (RAIL-A): the same tail, the same window, and a device that delivers
+/// the kept frame through a landing-only entry instead of publishing it.
+///
+/// The reading fp3's two delayed Store families ask for: the record's frame
+/// stays in the provider's own image (`StoreOp::Resident`, no writeback for the
+/// attachment), a `TracePass::Landing` entry standing after the pass delivers it
+/// into the window the second declaration names, and the owner's pages hold the
+/// engine's frame for the same shape byte for byte — with nothing in this
+/// process ever holding it. What the case pins beyond the window's contents is
+/// the *shape* of the delivery: the entry's frame identity is the attachment's
+/// own (the identity a resident store keys its image on), the landing view is a
+/// second declaration that a compute pass binds (the trace's serial pool is
+/// what the provider resolves it against), and the two populations the census
+/// reads move apart — `render_provider_kept_frame_landing` up,
+/// `render_provider_borrowed_landing_view_bytes` unmoved.
+#[test]
+fn a_guest_backed_tail_the_provider_kept_lands_in_the_window_a_later_entry_delivers() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let half = width / 2;
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let pattern = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+
+    let import = 0x9e51_u64;
+    let gpa_base = 0x56_c000_u64;
+    let window_bytes = pattern(0x11);
+    let chain = pattern(0x5a);
+    let (mut owner, memory) = seed_backing_fixture(gpa_base, &window_bytes, 4 * u64::from(width));
+
+    let identity = surface_identity(0x7c_14_01);
+    let memory = std::sync::Arc::new(memory);
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some((*memory).clone());
+        req.load_guest_target_backing = false;
+        req.target_rgba8 = Some(std::sync::Arc::new(chain.clone()));
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req
+    };
+    let engine_request = {
+        let mut req = request();
+        req.guest_target_memory = None;
+        req.skip_readback = false;
+        req.readback_skip_reason = ReadbackSkipReason::None;
+        req
+    };
+    let Some(engine) = engine_pixels("E-TX14 kept frame landing", &stages, engine_request) else {
+        return;
+    };
+
+    owner.as_mut_slice()[..frame_len as usize].copy_from_slice(&window_bytes);
+    let window = register_seed_backing(&owner, import, gpa_base, frame_len);
+    let deliveries = provider_render::provider_submissions();
+    let kept_before = route_count("render_provider_kept_frame_landing");
+    let kept_bytes_before = route_count("render_provider_kept_frame_landing_bytes");
+    let landed_view_before = route_count("render_provider_borrowed_landing_view_bytes");
+    let resident_store_before = route_count("render_provider_resident_store");
+    provider_wire::capture_submission_frames(true);
+    let answer = {
+        let single = [window];
+        let mut inputs = inputs_with_landing_window(&stages, RenderChainRole::SoleOrTail, &single);
+        inputs.load_seed_source_bytes = Some(chain.as_slice());
+        provider_render::submit_render(&inputs, &request())
+    };
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+
+    let landed = match answer {
+        RenderRailOutcome::ProviderCompletedResident(frame) => {
+            assert!(
+                frame.landed,
+                "the answer names the entry that delivered the frame: a kept frame nothing \
+                 landed is the shape this arm exists to rule out"
+            );
+            frame
+        }
+        other => panic!(
+            "the guest-backed tail whose window the seam states is kept and landed once the \
+             device declares the entry: {other:?}"
+        ),
+    };
+    assert!(
+        provider_render::provider_submissions() > deliveries,
+        "the released shape reaches the canonical provider instead of the engine"
+    );
+    assert_eq!(
+        frames.len(),
+        1,
+        "the second declaration puts the submission on the owner wire: the frame is captured \
+         for the reading below"
+    );
+    let (wire_trace, _wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let wire_attachment = wire_trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .and_then(|pass| pass.color_attachments.first())
+        .expect("the frame carries the consuming pass's own attachment");
+    assert_eq!(
+        wire_attachment.store,
+        metal_api_core::provider::StoreOp::Resident,
+        "the frame stays in the provider's image: this is the arm whose whole claim is that the \
+         frame never enters this process"
+    );
+    assert_eq!(
+        (wire_attachment.allocation_id, wire_attachment.view_id),
+        (landed.attachment.allocation, landed.attachment.view),
+        "the kept frame's identity is the attachment's own — the same pair a resident store \
+         keys its image on"
+    );
+    let entries: Vec<_> = wire_trace.landings().collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "exactly one landing-only entry stands behind the pass that kept the frame"
+    );
+    let entry = entries[0];
+    assert_eq!(
+        (entry.frame.allocation_id, entry.frame.view_id),
+        (wire_attachment.allocation_id, wire_attachment.view_id),
+        "the entry delivers the image the pass left behind and not any other"
+    );
+    assert_eq!(
+        (entry.frame.width, entry.frame.height),
+        (u64::from(width), u64::from(height)),
+        "the entry states the frame's own extent, which is what the window is measured against"
+    );
+    let pool = wire_trace
+        .serial_resources()
+        .expect("the trace's pool resolves");
+    let landing_pool_view = pool
+        .iter()
+        .find(|view| {
+            view.view_id == entry.landing.view_id
+                && view.allocation_id == entry.landing.allocation_id
+        })
+        .expect(
+            "the landing view has to be in the trace's own pool — the views a *compute pass* \
+             binds — because that is the only list the provider resolves a landing against",
+        );
+    assert_eq!(
+        landing_pool_view.length, frame_len,
+        "the declaring view is stated at the attachment's own tightly packed extent, which is \
+         exactly the byte count the entry's window has to meet"
+    );
+    assert!(
+        matches!(landing_pool_view.source, BufferSource::GuestRuns(_)),
+        "the window travels as the owner's live runs, not as a copy of anything"
+    );
+    assert_ne!(
+        (entry.landing.allocation_id, entry.landing.view_id),
+        (entry.frame.allocation_id, entry.frame.view_id),
+        "the landing view is a declaration of its own: the attachment's own pair is what the \
+         pass rendered into, not the window it lands in"
+    );
+
+    // `INV-RETURN`: the delivery reached the *registered* window, and the frame
+    // it holds is the engine's own answer for the same shape — byte for byte,
+    // including the half the pass read from the walk's chain value.
+    let delivered = owner.as_mut_slice()[..frame_len as usize].to_vec();
+    assert_frames_equal("E-TX14 kept frame landing, both rails", &delivered, &engine);
+    assert_ne!(
+        delivered, window_bytes,
+        "the window's own bytes are a different picture: the equality above is a reading of the \
+         delivery and not a coincidence"
+    );
+
+    assert_eq!(
+        route_count("render_provider_kept_frame_landing") - kept_before,
+        1,
+        "the entry's own population is a number of its own"
+    );
+    assert_eq!(
+        route_count("render_provider_kept_frame_landing_bytes") - kept_bytes_before,
+        frame_len,
+        "the frame is priced at the extent it would have weighed in the writeback channel"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_view_bytes") - landed_view_before,
+        0,
+        "E-TX13's published arm did not move: this device answered the same window the other \
+         way round"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_store") - resident_store_before,
+        1,
+        "the arm is a resident store as well, and the census reads both numbers"
+    );
+    eprintln!(
+        "E-TX14 kept frame landing: {width}x{height} attachment, {frame_len} byte window in \
+         registration {import:#x}; the frame stayed in the provider's image (StoreOp::Resident, \
+         no writeback) and one landing-only entry delivered it — the window equals the engine's \
+         frame byte for byte; counters render_provider_kept_frame_landing +1, \
+         render_provider_kept_frame_landing_bytes +{frame_len}, \
+         render_provider_borrowed_landing_view_bytes +0, render_provider_resident_store +1"
+    );
+}
+
+/// E-TX14 (RAIL-B): the consumption rule's other half — a later record that
+/// keeps the same identity again re-arms it, so the frame it leaves behind can
+/// be delivered a second time.
+///
+/// [`KeptFrameLanding`]'s rule is "one delivery per kept frame, and a completed
+/// `StoreOp::Resident` pass re-arms the identity". This case drives both halves
+/// at the rail: the first record's frame lands, and the second record — the same
+/// shape, whose own keeping pass runs before its entry — lands *its own* frame
+/// in the same window. The refusal that belongs to the other direction (a second
+/// delivery with no keeping pass in between) is the provider's
+/// `kept_frame_already_landed`, which the canonical rail's own e2e covers
+/// (`crates/metal-api-vulkan/tests/render_kept_frame_landing_e2e.rs`) and which
+/// this owner counts by name where it arrives
+/// (`runtime::draw::vulkan::note_kept_frame_landing_refusal`) — the owner cannot
+/// build that trace, because the arm is elected only together with the pass that
+/// keeps the frame it names.
+#[test]
+fn a_second_record_that_keeps_the_same_identity_re_arms_the_landing() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let pattern = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+    let window_bytes: Vec<u8> = (0..frame_len).map(|byte| (byte as u8) ^ 0x71).collect();
+    let first_frame = pattern(0x21);
+    let second_frame = pattern(0x63);
+
+    let import = 0x9e52_u64;
+    let gpa_base = 0x56_d000_u64;
+    let (mut owner, memory) = seed_backing_fixture(gpa_base, &window_bytes, 4 * u64::from(width));
+    let identity = surface_identity(0x7c_14_02);
+    let memory = std::sync::Arc::new(memory);
+    let request = |previous: &[u8]| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some((*memory).clone());
+        req.load_guest_target_backing = false;
+        req.target_rgba8 = Some(std::sync::Arc::new(previous.to_vec()));
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req
+    };
+
+    owner.as_mut_slice()[..frame_len as usize].copy_from_slice(&window_bytes);
+    let window = register_seed_backing(&owner, import, gpa_base, frame_len);
+    let kept_before = route_count("render_provider_kept_frame_landing");
+    let submit = |previous: &[u8]| {
+        let single = [window];
+        let mut inputs = inputs_with_landing_window(&stages, RenderChainRole::SoleOrTail, &single);
+        // The walk's own frame for the record's previous contents, exactly as the
+        // positive case states it: the class carries a continuation as bytes.
+        inputs.load_seed_source_bytes = Some(previous);
+        provider_render::submit_render(&inputs, &request(previous))
+    };
+    let first = submit(first_frame.as_slice());
+    assert!(
+        matches!(first, RenderRailOutcome::ProviderCompletedResident(_)),
+        "the first landing has to reach the provider: {first:?}"
+    );
+    let delivered = owner.as_mut_slice()[..frame_len as usize].to_vec();
+    assert_ne!(
+        delivered, window_bytes,
+        "the first delivery put a frame in the window"
+    );
+
+    let second = submit(second_frame.as_slice());
+    match second {
+        RenderRailOutcome::ProviderCompletedResident(frame) => {
+            assert!(
+                frame.landed,
+                "the second record's own keeping pass re-armed the identity its entry delivers"
+            );
+        }
+        other => panic!(
+            "a record that keeps the identity again is deliverable again — the consumption rule \
+             is about frames, not identities: {other:?}"
+        ),
+    }
+    assert_eq!(
+        route_count("render_provider_kept_frame_landing") - kept_before,
+        2,
+        "both records' entries delivered: the second record's completed keeping pass re-armed the \
+         identity the first delivery had consumed"
     );
 }
 
@@ -6928,6 +7251,10 @@ fn a_landing_window_the_door_could_not_cut_keeps_the_refusal_and_names_the_fact(
 #[test]
 fn a_guest_backed_clear_tail_lands_in_the_window_the_elision_door_stated() {
     let _guard = engine_test_session();
+    // E-TX14 (disclosed pin): the same one-door-two-devices rule the chain-value
+    // case states above — this case's subject is E-TX13's arm, so the device
+    // answers without the landing-only entry.
+    let _no_kept_frame = provider_render::override_kept_frame_landing(Some(false));
     let stages = reviewed_stages();
     let (width, height) = (8u32, 4u32);
     let half = width / 2;

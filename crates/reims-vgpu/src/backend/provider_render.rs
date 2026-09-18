@@ -5140,6 +5140,104 @@ pub fn override_attachment_landing_view(declared: Option<bool>) -> AttachmentLan
     }
 }
 
+/// Whether this provider executes a **landing-only entry**: a frame a completed
+/// pass kept in the provider's image, delivered into the owner's registered
+/// window by an entry that draws nothing (E-TX14/R4b).
+///
+/// The sixth device answer this rail asks before the gate, on the same terms as
+/// the five above it, and the one the delayed Store tails need. Today those
+/// records are answered by *publishing* their withheld frames
+/// (`render_provider_publish_held_resident`): the caller asked to leave the
+/// frame in the provider's image, and the rail could only hand the bytes back —
+/// which is why fp3 measured the two tail families (42.15 % + 2.44 % of the
+/// round's withheld answers) as frames that crossed the host bus for no reader.
+/// With this bit the caller can instead state the owner window the frame is
+/// owed, and the entry's own delivery is what honours the withholding.
+///
+/// Read out of the capability frame rather than the in-process snapshot
+/// ([`provider_wire::render_kept_frame_landing`], the second family's
+/// `0x00 0x06 <bool>`), because a bit the owner→provider frame cannot carry is
+/// a bit no remote owner would ever see. A frame that leaves it out — every
+/// frame written before E-TX14 — reads as undeclared, so the class keeps the
+/// published path, byte for byte, and this read can only ever widen the class by
+/// what the device states.
+fn declared_kept_frame_landing() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written — the
+    // same rule E-TX13's reading keeps.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match KEPT_FRAME_LANDING_ANSWER.load(Ordering::Relaxed) {
+            KEPT_FRAME_LANDING_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_kept_frame_landing = answer == KEPT_FRAME_LANDING_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::render_kept_frame_landing(rail.provider.device_epoch(), &capabilities).map_err(
+        |decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        },
+    )
+}
+
+/// The same reading, for the **seam** (`runtime::draw::vulkan`): it is the
+/// caller that has to state the owner window the kept frame lands in, and a
+/// window cut for a device that executes no landing entry would be page-table
+/// work bought for nothing. One reading, two callers — a seam that states a
+/// window and a gate that elects the arm cannot disagree about the device.
+pub fn declares_kept_frame_landing() -> Result<bool, ProviderRenderDecline> {
+    declared_kept_frame_landing()
+}
+
+/// The device's own answer for the kept-frame-landing capability (E-TX14), and
+/// the states the test instrument below can put it in — the same three states,
+/// for the same reason, as [`ATTACHMENT_LANDING_VIEW_ANSWER`]'s.
+const KEPT_FRAME_LANDING_DEVICE: u8 = 0;
+const KEPT_FRAME_LANDING_NOT_DECLARED: u8 = 1;
+const KEPT_FRAME_LANDING_DECLARED: u8 = 2;
+
+/// Whether the kept-frame-landing capability is read from the device's own frame
+/// ([`KEPT_FRAME_LANDING_DEVICE`], what production runs) or from an answer a
+/// test stated.
+static KEPT_FRAME_LANDING_ANSWER: AtomicU8 = AtomicU8::new(KEPT_FRAME_LANDING_DEVICE);
+
+/// A test's own answer for the kept-frame-landing capability, restored when it
+/// drops (E-TX14).
+///
+/// The mirror of [`AttachmentLandingViewOverride`], and a guard for the same
+/// reason: this changes a *decision* rather than an observation, so a test that
+/// unwound through a failed assertion must not leave the next shape in the same
+/// binary answering from a device that is not its own. The answer travels
+/// through the capability frame — written, encoded and decoded — so the arm a
+/// test sees is the arm an old frame gives.
+pub struct KeptFrameLandingOverride {
+    previous: u8,
+}
+
+impl Drop for KeptFrameLandingOverride {
+    fn drop(&mut self) {
+        KEPT_FRAME_LANDING_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the kept-frame-landing capability as `declared` until the returned guard
+/// drops, or as the device's own answer for `None` (E-TX14).
+pub fn override_kept_frame_landing(declared: Option<bool>) -> KeptFrameLandingOverride {
+    let answer = match declared {
+        None => KEPT_FRAME_LANDING_DEVICE,
+        Some(false) => KEPT_FRAME_LANDING_NOT_DECLARED,
+        Some(true) => KEPT_FRAME_LANDING_DECLARED,
+    };
+    KeptFrameLandingOverride {
+        previous: KEPT_FRAME_LANDING_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
 /// The highest vertex one indexed draw's own index bytes name, over the first
 /// `count` indices of the declared width, or `None` when the bytes stop short of
 /// them.
@@ -6400,6 +6498,13 @@ fn record_production(
         // submission retires with it too, so nothing here is a view a later
         // trace could sample.
         NarrowStore::BorrowedLanding => return None,
+        // E-TX14: the kept-frame landing arm, for the same answer as the two
+        // arms above and one fact more: the frame is *kept* under the
+        // identity the attachment names, so the image outlives this submission
+        // — but the entry consumes it, and the window it lands in is a lease
+        // this submission retires, so there is still no view a later trace
+        // could sample the production through.
+        NarrowStore::KeptFrameLanding(_) => return None,
     }
     // The descriptor is kept as the producing submission built it, with one
     // rewrite: every bind that traveled as a lease becomes the trace's own
@@ -6703,6 +6808,39 @@ enum NarrowStore {
     /// ([`RenderAttachment::publishes_bytes`] stays true), so every reader of
     /// the completion sees what it saw for `StoreOp::Store`.
     BorrowedLanding,
+    /// The frame stays in the provider's image **and** lands in the owner
+    /// window a second view declaration names, delivered by a landing-only
+    /// entry that stands after this pass (`StoreOp::Resident` +
+    /// `TracePass::Landing`, E-TX14/R4b).
+    ///
+    /// [`Self::BorrowedLanding`]'s window and this one's are the same cut —
+    /// the seam's landing door is what states it for either arm — and the two
+    /// differ in exactly one fact, which is what the frames' readers cost:
+    /// that arm publishes the whole frame through the completion's writeback
+    /// channel, because a rail that cannot deliver a kept frame has no other
+    /// way to put it in the owner's pages, while this arm publishes nothing
+    /// (`StoreOp::Resident`'s own rule) and the entry's delivery is the
+    /// landing. The frame is therefore never materialized in this process, and
+    /// the seam's Store route owes the device the same account it owes for
+    /// [`Self::BorrowedLanding`] — the pages already hold the frame — with no
+    /// bytes to carry it.
+    ///
+    /// Elected only where the provider's own capability answer carries the
+    /// entry (`provider_wire`'s reading of `supports_render_kept_frame_landing`)
+    /// *and* the seam has stated the window ([`RenderRailInputs::
+    /// kept_frame_landing`]). A device that leaves the bit out keeps
+    /// [`Self::BorrowedLanding`]'s bytes on the same window, byte for byte.
+    KeptFrameLanding(ResidentAttachment),
+}
+
+impl NarrowStore {
+    /// Whether this arm leaves the frame in the provider's own image
+    /// (`StoreOp::Resident`, R7b) — the two resident arms of the enum are read
+    /// through this one question wherever the class asks "is there an image
+    /// this record's identity names?".
+    const fn keeps_frame(self) -> bool {
+        matches!(self, Self::Resident(_) | Self::KeptFrameLanding(_))
+    }
 }
 
 /// Where one record sits in the packet the exec loop walks.
@@ -7575,6 +7713,18 @@ pub enum WindowLanding {
     /// carries, while the attachment's own view keeps the load source it
     /// stated (E-TX13).
     LandingView,
+    /// `StoreOp::Resident` + a landing-only entry: the frame stayed in the
+    /// provider's image and the entry that followed the pass delivered it into
+    /// the window the second declaration names (E-TX14/R4b).
+    ///
+    /// The window is the same cut as [`Self::LandingView`]'s — that door states
+    /// it for either arm — and the account the Store route owes is the same one
+    /// with one fewer source: no bytes came back through the completion, so the
+    /// route must not write anything *and* has nothing to publish from. The two
+    /// are read apart because they are two populations with two names in the
+    /// census, and because the host-side copies the route keeps differ: this
+    /// arm can only retire them.
+    KeptFrame,
 }
 
 /// What one resident-class submission leaves behind.
@@ -7591,6 +7741,17 @@ pub struct ResidentFrame {
     /// `true` when the pass declared `LoadOp::Resident` as well, i.e. it read
     /// the image it then kept.
     pub loaded: bool,
+    /// `true` when this trace also carried the **landing-only entry** that
+    /// delivered the kept frame into the owner's registered window (E-TX14).
+    ///
+    /// A fact of the trace this rail built rather than of the provider's
+    /// answer: `StoreOp::Resident` publishes nothing by construction, so a
+    /// landing leaves no mark in the completion — what the owner reads is that
+    /// the submission *completed*, which is the contract's own proof that every
+    /// entry in it ran (a refused entry fails the call by name). The flag is
+    /// carried out here so the seam does not have to re-derive which arm it
+    /// elected, which is the derivation the 2026-09-17 probe had to unpick.
+    pub landed: bool,
 }
 
 /// Why one reims render request did not leave this rail for the engine.
@@ -8366,6 +8527,21 @@ fn submit_render_inner(
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // E-TX14: the sixth device answer, asked under the *same* candidate gate as
+    // the fifth and for the same reason — the shape it can move is the same
+    // guest-backed tail, and the only question left is whether the device
+    // delivers a frame it kept, rather than publishing it. The two bits are
+    // deliberately read apart and used apart: a device may execute the
+    // same-completion landing and no landing-only entry (the E-TX13 rail
+    // without R4b), which is exactly the shape this read has to leave on
+    // E-TX13's arm, byte for byte.
+    let kept_frame_landing = match guest_backing_landing_candidate(inputs, req) {
+        false => false,
+        true => match declared_kept_frame_landing() {
+            Ok(declared) => declared,
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(
@@ -8377,6 +8553,7 @@ fn submit_render_inner(
         render_vertex_interface_superset,
         render_texture_narrow_lanes,
         attachment_landing_view,
+        kept_frame_landing,
     ) {
         Err(reason) => {
             reason.note();
@@ -8948,7 +9125,13 @@ fn submit_render_inner(
     match submit_narrow(inputs, req, &pass, &copies, &texture_copies) {
         Ok(RenderCompletion::Writeback(output)) => RenderRailOutcome::ProviderCompleted(output),
         Ok(RenderCompletion::Resident(frame)) => {
-            RenderRailOutcome::ProviderCompletedResident(frame)
+            RenderRailOutcome::ProviderCompletedResident(ResidentFrame {
+                attachment: frame.attachment,
+                loaded: frame.loaded,
+                // E-TX14: the arm this submission elected, read off the trace
+                // this function just built rather than re-derived by the seam.
+                landed: matches!(pass.store, NarrowStore::KeptFrameLanding(_)),
+            })
         }
         Err(decline) => RenderRailOutcome::ProviderDeclined(decline),
     }
@@ -10221,7 +10404,13 @@ impl NarrowPass<'_> {
     /// somewhere the pass already named.
     fn landing_runs(&self) -> Option<&[StageBufferWindow]> {
         match self.store {
-            NarrowStore::BorrowedLanding => self.landing.as_deref(),
+            // E-TX14: the kept-frame landing entry names the same cut, so the
+            // arm that delivers the frame reads it here too — the plan mints
+            // one allocation for the window, and the declaring pass and the
+            // entry both resolve that one declaration.
+            NarrowStore::BorrowedLanding | NarrowStore::KeptFrameLanding(_) => {
+                self.landing.as_deref()
+            }
             NarrowStore::Writeback | NarrowStore::Resident(_) | NarrowStore::Borrowed => None,
         }
     }
@@ -10466,10 +10655,10 @@ fn nonindexed_vertex_span(
 // answer per rule the class lifts from this device — the folded stage-buffer
 // namespace (R33), the gathered extent's two arms (R37/R40), the declared
 // vertex-interface superset (R-VI1), the narrow sampled lanes (R39), and now
-// E-TX13's attachment landing view. Each is read in `submit_render` and consumed
-// here, and bundling them into a struct would move the same answers behind one
-// more name without shrinking the surface — the same call the emulator side makes
-// for its own gate entry.
+// E-TX13's attachment landing view beside E-TX14's kept-frame landing entry.
+// Each is read in `submit_render` and consumed here, and bundling them into a
+// struct would move the same answers behind one more name without shrinking the
+// surface — the same call the emulator side makes for its own gate entry.
 #[allow(clippy::too_many_arguments)]
 fn narrow_class<'a>(
     inputs: &'a RenderRailInputs<'a>,
@@ -10480,6 +10669,7 @@ fn narrow_class<'a>(
     render_vertex_interface_superset: bool,
     render_texture_narrow_lanes: NarrowLanes,
     attachment_landing_view: bool,
+    kept_frame_landing: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R42: whether this request's own target is a mapper-ref-texture **surface**
     // rather than a render-chain or GVA identity. The surface's identity carries
@@ -11208,7 +11398,7 @@ fn narrow_class<'a>(
     if (keeps_frame || inputs.chain_loads_resident)
         && resident.is_some()
         && !matches!(load, NarrowLoad::Resident(_))
-        && !matches!(store, NarrowStore::Resident(_))
+        && !store.keeps_frame()
     {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_target",
@@ -11241,7 +11431,7 @@ fn narrow_class<'a>(
     // resident) it is the frame both rails would land.
     if format.bytes_per_texel() > ClearColor::BYTES as u64
         && !matches!(load, NarrowLoad::Resident(_))
-        && !matches!(store, NarrowStore::Resident(_))
+        && !store.keeps_frame()
     {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_wide_pooled",
@@ -11317,14 +11507,35 @@ fn narrow_class<'a>(
         };
         if let Some(runs) = landing_window {
             landing = Some(runs.to_vec());
-            store = NarrowStore::BorrowedLanding;
+            // E-TX14: the same window, delivered the other way round. The
+            // caller states whether the device executes a landing-only entry
+            // (`RenderRailInputs::kept_frame_landing`, read out of the same
+            // capability frame E-TX13's bit comes from), and where it does the
+            // frame is *kept* (`StoreOp::Resident`) and delivered by an entry
+            // that stands after this pass — so the whole frame stays in the
+            // provider's image and never crosses the completion's writeback
+            // channel. Every other device keeps the E-TX13 arm below, byte for
+            // byte, which is what makes this read a widening rather than a
+            // replacement.
+            //
+            // A record whose own target identity is absent cannot name the
+            // image a kept frame would live in, so it keeps the refusal: the
+            // entry delivers a frame *by identity*, and an arm with no identity
+            // to keep it under would be a landing nothing could resolve.
+            store = match (kept_frame_landing, resident) {
+                (true, Some(resident)) => NarrowStore::KeptFrameLanding(resident),
+                _ => NarrowStore::BorrowedLanding,
+            };
             // The frame is *not* published-held: it lands in the owner's own
             // pages, which is the statement the arm above withheld the readback
             // for. Leaving the held flag set would charge the census's
             // `render_provider_publish_held_resident` for a frame that was
             // landed, which is the one reading that name must not carry.
             published_held_resident = false;
-            crate::runtime::drain::note_store_route("render_provider_guest_backing_landing_view");
+            crate::runtime::drain::note_store_route(match store {
+                NarrowStore::KeptFrameLanding(_) => "render_provider_guest_backing_kept_frame",
+                _ => "render_provider_guest_backing_landing_view",
+            });
         } else {
             // B3 probe: the window door's own state, charged beside the refusal and
             // not instead of it. The gate's judgement, slug, sentence and count are
@@ -12115,6 +12326,11 @@ fn attachment_identity(
     let resident = match (&pass.load, pass.store) {
         (NarrowLoad::Resident(resident), _) => *resident,
         (_, NarrowStore::Resident(resident)) => resident,
+        // E-TX14: the kept-frame landing arm names the same image the
+        // `Resident` store does — that is the whole reason the entry can
+        // deliver it — so the attachment's identity is the arm's own pair and
+        // not the pooled one.
+        (_, NarrowStore::KeptFrameLanding(resident)) => resident,
         (NarrowLoad::GuestRuns(_), _) => {
             let (allocation, _, _) = leases
                 .and_then(|plan| plan.run_allocation(load_seed_owner_binding()))
@@ -12665,6 +12881,12 @@ fn submit_narrow(
             store: match pass.store {
                 NarrowStore::Writeback => StoreOp::Store,
                 NarrowStore::Resident(_) => StoreOp::Resident,
+                // E-TX14: the frame stays in the provider's image, which is
+                // the load-bearing half of the pair — the landing entry that
+                // follows this pass is what delivers it, and the contract
+                // states that delivery as its own entry rather than as a store
+                // arm, because nothing is drawn by it.
+                NarrowStore::KeptFrameLanding(_) => StoreOp::Resident,
                 // B3 (E-TX8): the frame lands in the attachment view's own
                 // declared window. The writeback channel still carries the
                 // bytes (`store_publishes` keeps both arms publishing), so the
@@ -12810,6 +13032,35 @@ fn submit_narrow(
                 passes.push(TracePass::Render(production.descriptor.clone()));
             }
             passes.push(TracePass::Render(pass_descriptor));
+            // E-TX14: the kept frame's own delivery, in the one position the
+            // contract makes resolvable — *after* the pass that kept it, so the
+            // entry resolves an image a completed pass defined, and before the
+            // submission ends, so the owner's pages hold the frame by the time
+            // this trace's completion is handed back. The window's declaration
+            // rode the declaring compute pass above (the trace's serial pool is
+            // what a landing view is resolved against), and the frame's identity
+            // is the attachment's own — the same pair the resident store named,
+            // which is why the entry cannot deliver an image the pass did not
+            // leave behind.
+            if let (NarrowStore::KeptFrameLanding(_), Some(landing)) =
+                (pass.store, landing_view.as_ref())
+            {
+                passes.push(TracePass::Landing(
+                    metal_api_core::provider::KeptFrameLanding {
+                        frame: metal_api_core::provider::KeptFrame {
+                            allocation_id: attachment.allocation,
+                            view_id: attachment.view,
+                            format: pass.format,
+                            width: pass.width,
+                            height: pass.height,
+                        },
+                        landing: AttachmentLandingView {
+                            allocation_id: landing.allocation_id,
+                            view_id: landing.view_id,
+                        },
+                    },
+                ));
+            }
             passes
         },
         completion_policy: CompletionPolicy::HostReadback,
@@ -12993,7 +13244,7 @@ fn submit_narrow(
     let resident_writeback = result.writebacks.iter().any(|writeback| {
         writeback.view_id == attachment.view && writeback.allocation_id == attachment.allocation
     });
-    if let NarrowStore::Resident(_) = pass.store {
+    if pass.store.keeps_frame() {
         if resident_writeback {
             return Err(ProviderRenderDecline::ResidentWritebackPublished {
                 allocation: attachment.allocation,
@@ -13014,12 +13265,28 @@ fn submit_narrow(
         if loads_resident {
             crate::runtime::drain::note_store_route("render_provider_resident_load");
         }
+        // E-TX14: the kept frame's own delivery, counted where it happened. Two
+        // names rather than one, because the census has to be able to read the
+        // *movement* this increment is judged on: `…_kept_frame` is the
+        // population that left the published path, and the bytes beside it are
+        // what the frames would have weighed in the completion's writeback
+        // channel. The resident counters above are charged for this arm too —
+        // it *is* a resident store — so a round reads "resident stores held"
+        // and "of those, delivered by an entry" as two numbers rather than one.
+        if let NarrowStore::KeptFrameLanding(_) = pass.store {
+            crate::runtime::drain::note_store_route("render_provider_kept_frame_landing");
+            crate::runtime::drain::note_store_route_n(
+                "render_provider_kept_frame_landing_bytes",
+                pass.extent,
+            );
+        }
         return Ok(RenderCompletion::Resident(ResidentFrame {
             attachment: ResidentAttachment {
                 allocation: attachment.allocation,
                 view: attachment.view,
             },
             loaded: loads_resident,
+            landed: matches!(pass.store, NarrowStore::KeptFrameLanding(_)),
         }));
     }
     if loads_resident {
@@ -13141,7 +13408,15 @@ fn submit_narrow(
         landing: match pass.store {
             NarrowStore::Borrowed => Some(WindowLanding::OwnView),
             NarrowStore::BorrowedLanding => Some(WindowLanding::LandingView),
-            NarrowStore::Writeback | NarrowStore::Resident(_) => None,
+            // E-TX14: this arm has no writeback to attach the landing to — the
+            // frame is kept and the entry delivers it — so the seam reads the
+            // landing off the resident completion instead
+            // (`RenderRailOutcome::ProviderCompletedResident` and the trace's
+            // own store arm, which is where the seam states whether it elected
+            // one).
+            NarrowStore::Writeback
+            | NarrowStore::Resident(_)
+            | NarrowStore::KeptFrameLanding(_) => None,
         },
     }))
 }

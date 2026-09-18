@@ -434,6 +434,45 @@ pub fn render_attachment_landing_view(
     Ok(decoded.supports_render_attachment_landing_view)
 }
 
+/// The kept-frame-landing half of one provider capability snapshot, read back
+/// out of the response frame the provider would send (`research/docs/23`
+/// §115 之后的增量，E-TX14/R4b).
+///
+/// The tenth reading of the same one-snapshot rule
+/// ([`stage_buffer_support`], [`compute_texture_support`],
+/// [`render_texture_support`], [`render_sampler_carriage`],
+/// [`stage_buffer_namespace_split`], [`render_texture_gathered_extent`],
+/// [`render_vertex_interface_superset`],
+/// [`render_texture_gathered_extent_no_copy`],
+/// [`render_attachment_landing_view`]), and the one this rail's delayed Store
+/// tails need: a record whose frame the caller asked to keep
+/// (`StoreOp::Resident`) can be delivered by a **landing-only entry** that
+/// stands after the pass which kept it, so the frame reaches the owner's
+/// registered window without the provider ever publishing its bytes.
+///
+/// `true` is the provider's own declaration that it executes that entry: it
+/// resolves the kept identity out of its resident registry, the landing view
+/// out of the trace's serial view list, and copies the frame into the owner's
+/// pages (`metal-api-vulkan`'s `land_kept_frame_entry`). `false` is the
+/// fail-closed answer and it is what a frame written before the bit existed
+/// decodes to (the second family of capability tail carries this bit as
+/// `0x00 0x06 <bool>`, so its absence reads as undeclared), so a class gate
+/// that reads this reading keeps the tail on today's published path rather
+/// than handing the provider a frame with no way back.
+///
+/// The bit is deliberately **not** [`render_attachment_landing_view`]'s: that
+/// one answers whether a pass's own frame can land in a second declaration in
+/// the same completion, while this one answers whether a *later* entry can
+/// deliver a frame a completed pass kept. A rail can execute either without
+/// the other, so the two are read apart.
+pub fn render_kept_frame_landing(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_kept_frame_landing)
+}
+
 /// The provider's own capability snapshot as it comes back out of the frame
 /// the owner would receive.
 ///
