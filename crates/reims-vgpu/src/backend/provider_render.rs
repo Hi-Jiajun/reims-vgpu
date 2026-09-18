@@ -757,14 +757,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use metal_api_core::provider::{
     half_to_f32, AcquirePolicy, AffineAccess, AllocationId, AllocationRecord, AttachmentFormat,
-    BlendAttachment, BlendFactor, BlendFactorSlot, BlendOperation, BufferAccess, BufferSource,
-    BufferView, BufferWriteback, ClearColor, ColorWriteMask, CompiledComputePipeline,
-    CompletionDisposition, CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch,
-    DispatchKind, DispatchType, FootprintProof, IndexBufferBinding, IndexFormat, InitialState,
-    LoadOp, NoCopyLeaseImporter, OperationId, PresentDescriptor, PresentMode, PresentTarget,
-    RenderAttachment, RenderPassBlend, RenderPassDescriptor, RenderPipelineContract,
-    RenderPipelineStage, RenderSamplerBinding, ResourceTableSnapshot, SamplerPolicy,
-    SemanticDigest, StageBufferBinding, StageBufferView, StoreOp, TextureAccess,
+    AttachmentLandingView, BlendAttachment, BlendFactor, BlendFactorSlot, BlendOperation,
+    BufferAccess, BufferSource, BufferView, BufferWriteback, ClearColor, ColorWriteMask,
+    CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeProvider,
+    ComputeTrace, Dispatch, DispatchKind, DispatchType, FootprintProof, IndexBufferBinding,
+    IndexFormat, InitialState, LoadOp, NoCopyLeaseImporter, OperationId, PresentDescriptor,
+    PresentMode, PresentTarget, RenderAttachment, RenderPassBlend, RenderPassDescriptor,
+    RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding, ResourceTableSnapshot,
+    SamplerPolicy, SemanticDigest, StageBufferBinding, StageBufferView, StoreOp, TextureAccess,
     TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource, TextureType,
     TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
     VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES, MAX_RENDER_SAMPLERS,
@@ -5035,6 +5035,111 @@ pub fn override_render_texture_narrow_lanes(
     }
 }
 
+/// The attachment-landing-view half of the same device answer (E-TX13).
+///
+/// One snapshot, two readings, exactly as [`declared_render_texture_narrow_lanes`]:
+/// the bit the *frame* carries is the one the class gate gets, because a
+/// provider whose capability answer cannot hold it is a provider whose remote
+/// owner never sees it. What it answers is whether this provider executes a
+/// store that lands its frame in the owner window a **second** view declaration
+/// names (`StoreOp::BorrowedLanding`) while the pass begins from what the
+/// attachment's own declaration says — which is the one fact the guest-backed
+/// tail of the census needs: its load is the walk's chain value (or a `Clear`),
+/// and the pages it owes a frame are a destination rather than a source.
+///
+/// `false` is the fail-closed answer *and* what a frame written before the bit
+/// existed decodes to (`provider_wire::render_attachment_landing_view`, the
+/// second family E-TX13 opened at `0x00 0x05`), so this read can only ever
+/// widen the class by what the device states: a provider without it keeps every
+/// one of those records on the engine, under the refusal that already names
+/// them.
+fn declared_attachment_landing_view() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match ATTACHMENT_LANDING_VIEW_ANSWER.load(Ordering::Relaxed) {
+            ATTACHMENT_LANDING_VIEW_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_attachment_landing_view =
+                    answer == ATTACHMENT_LANDING_VIEW_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::render_attachment_landing_view(rail.provider.device_epoch(), &capabilities)
+        .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        })
+}
+
+/// The same reading, for the **seam** (`runtime::draw::vulkan`).
+///
+/// The seam has to know whether to cut the landing window at all: the cut walks
+/// the mapping's page table and checks the registration's host alias for a
+/// record the class would otherwise refuse, and on a provider that does not
+/// declare the arm that work buys nothing. The answer is the same one
+/// [`declared_attachment_landing_view`] gives the class gate — one reading, two
+/// callers — so a seam that cuts and a gate that elects cannot disagree about
+/// the device.
+pub fn declares_attachment_landing_view() -> Result<bool, ProviderRenderDecline> {
+    declared_attachment_landing_view()
+}
+
+/// The device's own answer for the attachment-landing-view capability (E-TX13),
+/// and the states the test instrument below can put it in.
+const ATTACHMENT_LANDING_VIEW_DEVICE: u8 = 0;
+const ATTACHMENT_LANDING_VIEW_NOT_DECLARED: u8 = 1;
+const ATTACHMENT_LANDING_VIEW_DECLARED: u8 = 2;
+
+/// Whether the attachment-landing-view capability is read from the device's own
+/// frame ([`ATTACHMENT_LANDING_VIEW_DEVICE`], what production runs) or from an
+/// answer a test stated.
+static ATTACHMENT_LANDING_VIEW_ANSWER: AtomicU8 = AtomicU8::new(ATTACHMENT_LANDING_VIEW_DEVICE);
+
+/// A test's own answer for the attachment-landing-view capability, restored when
+/// it drops (E-TX13).
+///
+/// The rail reads the bit out of the provider's capability frame, and a test
+/// that has to see the fail-closed arm cannot make an admitted device stop
+/// declaring the shape. While this guards an answer, the capability question is
+/// asked of a snapshot carrying it — written, encoded and decoded through the
+/// same frame — so the arm a test sees is the arm an old frame gives (`absent`
+/// reads as undeclared), and the reading is still the wire's.
+///
+/// A guard rather than a plain setter for the reason
+/// [`RenderTextureNarrowLanesOverride`] is one: this changes a *decision* and
+/// not an observation, so a test that unwound through a failed assertion would
+/// otherwise leave the next shape in the same binary answering from a device
+/// that is not its own.
+pub struct AttachmentLandingViewOverride {
+    previous: u8,
+}
+
+impl Drop for AttachmentLandingViewOverride {
+    fn drop(&mut self) {
+        ATTACHMENT_LANDING_VIEW_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the attachment-landing-view capability as `declared` until the returned
+/// guard drops, or as the device's own answer for `None` (E-TX13).
+pub fn override_attachment_landing_view(declared: Option<bool>) -> AttachmentLandingViewOverride {
+    let answer = match declared {
+        None => ATTACHMENT_LANDING_VIEW_DEVICE,
+        Some(false) => ATTACHMENT_LANDING_VIEW_NOT_DECLARED,
+        Some(true) => ATTACHMENT_LANDING_VIEW_DECLARED,
+    };
+    AttachmentLandingViewOverride {
+        previous: ATTACHMENT_LANDING_VIEW_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
 /// The highest vertex one indexed draw's own index bytes name, over the first
 /// `count` indices of the declared width, or `None` when the bytes stop short of
 /// them.
@@ -5392,6 +5497,44 @@ fn sampled_bind_of_a_narrow_lane(inputs: &RenderRailInputs<'_>, req: &DrawReques
             )
             .then_some(declaration.index)
         })
+}
+
+/// Whether this request's own statement is the shape E-TX13's arm can widen —
+/// the guest-backed tail whose landing a **second** view declaration names.
+///
+/// The pure half of that class condition, stated where the device answer is
+/// asked and read again by the gate itself (one spelling, two readers, exactly
+/// as [`sampled_bind_of_a_narrow_lane`] is for R39):
+///
+/// * the attachment is backed by the guest's own pages
+///   ([`DrawRequest::guest_target_memory`]) — the fact every arm of this
+///   refusal is about;
+/// * its load is *not* the live GPU image ([`DrawRequest::load_from_target`]),
+///   because a record whose previous contents are the pages themselves takes
+///   the E-TX8 arm instead and needs no second declaration;
+/// * its load is not the attachment's own guest backing
+///   ([`DrawRequest::load_guest_target_backing`], R38's seed door): that record
+///   *does* load the pages, so its landing is the declaration it already made;
+/// * this record is the one the guest's pages are owed a frame by
+///   ([`RenderChainRole::SoleOrTail`]);
+/// * and the seam cut a window for it — its own landing cut, or the elision
+///   door's list when that door stated one for the same pages.
+///
+/// A request that states the shape on a provider that declares no such arm
+/// keeps the refusal it has today: the bit is what turns this candidate into an
+/// election, and nothing else does.
+fn guest_backing_landing_candidate(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> bool {
+    req.guest_target_memory.is_some()
+        && !req.load_from_target
+        && !req.load_guest_target_backing
+        && inputs.role == RenderChainRole::SoleOrTail
+        && matches!(
+            inputs
+                .landing_guest_window
+                .as_ref()
+                .or(inputs.attachment_guest_window.as_ref()),
+            Some(AttachmentGuestWindow::Runs(_))
+        )
 }
 
 /// The request's two stages' `[[buffer(N)]]` statement, every rule the class
@@ -6224,6 +6367,11 @@ fn record_production(
         // which is where the seed ladder reads them); what is not recorded is a
         // production, exactly as for a frame the caller kept.
         NarrowStore::Borrowed => return None,
+        // E-TX13: the same answer for the same reason, one declaration further
+        // out. The window the second view names is an owner lease this
+        // submission retires with it too, so nothing here is a view a later
+        // trace could sample.
+        NarrowStore::BorrowedLanding => return None,
     }
     // The descriptor is kept as the producing submission built it, with one
     // rewrite: every bind that traveled as a lease becomes the trace's own
@@ -6502,6 +6650,31 @@ enum NarrowStore {
     /// that the owner's pages receive them from the provider, so the seam lands
     /// nothing a second time.
     Borrowed,
+    /// The frame lands in the owner window a **second** view declaration names
+    /// (`StoreOp::BorrowedLanding`, E-TX13).
+    ///
+    /// [`Self::Borrowed`]'s window *is* the declaration the pass begins from,
+    /// which is why that arm can only answer a record whose previous contents
+    /// those pages already are. The record this arm answers is the other half
+    /// of the same population: a guest-backed surface whose own load is some
+    /// other statement of its contents — the exec walk's chain value
+    /// ([`NarrowLoad::Bytes`]) or a `Clear` — and whose frame the guest's pages
+    /// are still owed. Converting such a record to [`Self::Borrowed`] would
+    /// replace its load source with those pages (a silently *different* frame
+    /// for every texel outside the scissor), which is why B3 refused it by
+    /// name; the second declaration separates the two facts instead: the pass
+    /// begins from what it declared, and the stored frame lands in the window
+    /// the store names.
+    ///
+    /// Elected only for the record whose frame the guest's pages are owed
+    /// ([`RenderChainRole::SoleOrTail`]), only when the seam cut that window
+    /// (`RenderRailInputs::landing_guest_window`), and only when the provider's
+    /// own capability answer carries the arm (`provider_wire`'s reading of
+    /// `supports_render_attachment_landing_view`). The bytes still come back
+    /// through the completion's writeback channel
+    /// ([`RenderAttachment::publishes_bytes`] stays true), so every reader of
+    /// the completion sees what it saw for `StoreOp::Store`.
+    BorrowedLanding,
 }
 
 /// Where one record sits in the packet the exec loop walks.
@@ -6995,6 +7168,38 @@ pub struct RenderRailInputs<'a> {
     /// serialized packet chain (R23's arm), a middle (R25's), a seed (R32's) —
     /// and every record that never named a chain at all.
     pub attachment_guest_window: Option<AttachmentGuestWindow<'a>>,
+    /// The attachment's own guest window as the **landing** of the record whose
+    /// frame the guest's pages are owed, when the seam cut one (E-TX13).
+    ///
+    /// This is the same declaration [`Self::attachment_guest_window`] states —
+    /// the surface's registered pages, cut into runs that concatenate to the
+    /// attachment's tightly packed extent — asked for a record the other door
+    /// cannot answer at all. The elision door states its window for a record it
+    /// *loads* the pages of (and refuses a record with a load source of its
+    /// own: two declarations of one attachment's contents is the disagreement
+    /// [`NarrowLoad`] may not silently prefer). This input is the other half:
+    /// the record has its own load source (the walk's chain value, or a
+    /// `Clear`) and still owes the guest's pages a frame, so the window it
+    /// states is a *destination* and not a source — the second declaration
+    /// `StoreOp::BorrowedLanding` carries.
+    ///
+    /// `Runs` is the seam's cut and admits the record's frame to land in those
+    /// pages while the pass begins from what it declared;
+    /// `Refused(route)` is the name of the fact that stopped the cut, charged
+    /// beside the class's own refusal exactly as the elision door's route is.
+    /// `None` is every record for which the seam cut nothing: one whose
+    /// attachment is not backed by the guest's pages, one that is not the
+    /// record owing them a frame, one whose window another door already stated
+    /// (`Self::attachment_guest_window`, `Self::seed_guest_window`), and every
+    /// record on a provider that does not declare the arm.
+    ///
+    /// The cut is deliberately *not* a payment: the elision and seed doors pay
+    /// the mapping's writeback debt before stating a window because their
+    /// declaration *reads* those pages, while this one only writes them — and
+    /// what supersedes an owed frame is the newer one this landing deposits,
+    /// which is the seam's own account to keep (`runtime::draw::vulkan`'s
+    /// `borrowed_landing_store`).
+    pub landing_guest_window: Option<AttachmentGuestWindow<'a>>,
     /// The attachment's own guest window the **seed door** cut for this record
     /// (R38), when the record's previous contents are the mapper-ref-texture
     /// surface's own guest backing (`DrawRequest::load_guest_target_backing`).
@@ -7309,18 +7514,39 @@ pub struct RenderRailOutput {
     /// admitted — so a caller that lands these bytes has nothing to do for the
     /// population that came before this increment.
     pub stage_writebacks: Vec<StageWriteback>,
-    /// Whether this pass's frame *already landed* in the attachment's own
-    /// guest window (`StoreOp::Borrowed`, E-TX8, B3).
+    /// Which declaration named the owner window this pass's frame **already
+    /// landed** in, if it landed in one (E-TX8 / E-TX13).
     ///
-    /// `true` is the one answer the seam's Store route has to read before it
+    /// `Some` is the one answer the seam's Store route has to read before it
     /// lands anything itself: the owner's pages hold the frame by construction
     /// (`resolve_attachment_landing` writes exactly the readback the bytes above
     /// are), so a second write is a copy of bytes that are already there — and
     /// the *account* that says the page changed (`mark_mapping_written` and its
     /// siblings) belongs to whoever knows the landing happened, which is the
-    /// seam. `false` is every other arm: the caller's store route lands the
+    /// seam. `None` is every other arm: the caller's store route lands the
     /// frame exactly as it always has.
-    pub landed_in_window: bool,
+    ///
+    /// The two arms are read apart because the seam owes them two different
+    /// accounts: [`WindowLanding::OwnView`] is the record whose *load* was those
+    /// pages (their owed frame was paid for and the window is the declaration
+    /// the pass began from), while [`WindowLanding::LandingView`] is the record
+    /// whose load was something else and whose landing the second declaration
+    /// names — the one arm whose window may still carry a pending writeback debt
+    /// the landing supersedes.
+    pub landing: Option<WindowLanding>,
+}
+
+/// Which view declaration named the owner window one pass's frame landed in
+/// (E-TX8 / E-TX13).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowLanding {
+    /// `StoreOp::Borrowed`: the attachment's **own** view declaration, which is
+    /// also where the pass's previous contents came from (E-TX8, B3).
+    OwnView,
+    /// `StoreOp::BorrowedLanding`: the **second** view declaration the store
+    /// carries, while the attachment's own view keeps the load source it
+    /// stated (E-TX13).
+    LandingView,
 }
 
 /// What one resident-class submission leaves behind.
@@ -8089,6 +8315,29 @@ fn submit_render_inner(
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // E-TX13: the fifth device answer this rail asks *before* the gate, on the
+    // same terms as the four above. The rule it lifts is the guest-backed tail's
+    // refusal: a record whose attachment is backed by the guest's own pages,
+    // whose load is some statement of its contents *other* than those pages, and
+    // whose frame those pages are owed, can state that frame's destination as a
+    // second view declaration — exactly when the device executes that arm. The
+    // ask is gated on the request's own statement being that shape
+    // ([`guest_backing_landing_candidate`], the same intersection the gate
+    // tests), so no other shape reaches the rail's provider any earlier than it
+    // did. A frame that leaves the bit out keeps the refusal, its slug and its
+    // sentence, at the same point in the same order.
+    let attachment_landing_view = match guest_backing_landing_candidate(inputs, req) {
+        false => false,
+        true => match declared_attachment_landing_view() {
+            Ok(declared) => declared,
+            // A provider that cannot be reached cannot answer the question the
+            // gate needs, and an unanswerable candidate is an in-class
+            // candidate: fail closed, exactly as `submit_narrow` does for the
+            // shapes it refuses, rather than running the shape on a rail the
+            // class never named.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(
@@ -8099,6 +8348,7 @@ fn submit_render_inner(
         render_texture_gathered_extent_no_copy,
         render_vertex_interface_superset,
         render_texture_narrow_lanes,
+        attachment_landing_view,
     ) {
         Err(reason) => {
             reason.note();
@@ -8146,6 +8396,30 @@ fn submit_render_inner(
                  engine on a device that cannot import host pointers: the canonical attachment \
                  states them as an ordered list of owner windows, and the owner rail refuses a \
                  lease-backed declaration on such a device rather than silently copying it",
+            );
+            reason.note();
+            return RenderRailOutcome::NotInNarrowClass(reason);
+        }
+    }
+    // E-TX13: the landing view's own list asks the same device question for the
+    // same reason — the list arm is the owner rail's no-copy channel, and a
+    // device without host-pointer import has none. Kept apart from R32's block
+    // above so the *population* the census reads is the arm that actually needs
+    // the answer: one record may state both lists, and a refusal charged to the
+    // wrong door would name a shape that never reached it.
+    if pass.landing_runs().is_some() {
+        let alignment = match declared_host_import() {
+            Ok(alignment) => alignment,
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        };
+        if alignment == 0 {
+            let reason = OutOfClass::new(
+                "render_provider_out_of_class_guest_backing_landing_import",
+                "a guest-backed record whose frame lands in the owner's window a second view \
+                 declaration names stays on the engine on a device that cannot import host \
+                 pointers: the landing is stated as an ordered list of owner windows, and the \
+                 owner rail refuses a lease-backed declaration on such a device rather than \
+                 silently copying it",
             );
             reason.note();
             return RenderRailOutcome::NotInNarrowClass(reason);
@@ -9750,6 +10024,20 @@ struct NarrowPass<'a> {
     /// elision door's population is a policy that already holds; the seed
     /// door's is the door the class had no arm for at all).
     carried_seed_guest_window: bool,
+    /// The guest window this pass's frame lands in, when the store arm carries
+    /// a **second** declaration ([`NarrowStore::BorrowedLanding`], E-TX13).
+    ///
+    /// The runs are the seam's own cut (`RenderRailInputs::landing_guest_window`
+    /// or, for a record whose elision door already stated them, the very same
+    /// list `RenderRailInputs::attachment_guest_window` carries), and the trace
+    /// states them as a view of their own: the store names that view's
+    /// `(allocation, view)` pair, and the pool receives it through a declaring
+    /// compute pass — a view no pass binds is a view the trace's pool never
+    /// carries ([`ComputeTrace::serial_resources`]), and a landing that names an
+    /// undeclared view is refused by the provider
+    /// (`landing_view_undeclared`) rather than answered by the attachment's own
+    /// declaration. `None` is every other arm.
+    landing: Option<Vec<StageBufferWindow>>,
     /// Whether at least one of this pass's sampled textures is the frame the
     /// caller read out of the registry (R24's arm). Counted as
     /// `render_provider_sampled_target_frames` at the completion, beside R23's
@@ -9895,6 +10183,21 @@ impl NarrowPass<'_> {
         }
     }
 
+    /// The runs of the second declaration this pass's store carries, when it
+    /// carries one ([`NarrowStore::BorrowedLanding`], E-TX13).
+    ///
+    /// Read by the owner plan (one `Request::Runs` under
+    /// [`landing_view_owner_binding`], which is what mints the allocation the
+    /// contract pairs every run with) and by the trace builder (the view that
+    /// declaration is stated as). `None` for every arm whose frame lands
+    /// somewhere the pass already named.
+    fn landing_runs(&self) -> Option<&[StageBufferWindow]> {
+        match self.store {
+            NarrowStore::BorrowedLanding => self.landing.as_deref(),
+            NarrowStore::Writeback | NarrowStore::Resident(_) | NarrowStore::Borrowed => None,
+        }
+    }
+
     /// The windows the pass's own sampled textures were cut from (`R28`), one
     /// entry per texture that travels as a lease, under the owner label the
     /// plan and the trace both key it by.
@@ -9934,9 +10237,10 @@ impl NarrowPass<'_> {
     /// i.e. whether [`plan_owner_leases`] will have a plan to build (R42).
     ///
     /// [`Self::crosses_the_frame`] answers the same question for every arm
-    /// *but* R32's attachment seed-runs list, which is a plan of its own
-    /// (`provider_owner::Request::Runs`) and therefore puts the submission on
-    /// the wire as well. The two are kept apart because they answer different
+    /// *but* the two run-list declarations, which are plans of their own
+    /// (`provider_owner::Request::Runs`) and therefore put the submission on
+    /// the wire as well: R32's attachment seed-runs list, and E-TX13's landing
+    /// view's list. The two are kept apart because they answer different
     /// callers: the texture-support ask wants "does a sampled bind travel",
     /// and the relay's boundary wants "does *anything*", which is exactly the
     /// guard `plan_owner_leases` runs.
@@ -9946,7 +10250,7 @@ impl NarrowPass<'_> {
     /// and nothing this rail minted for itself — a kept frame's allocation
     /// included.
     fn travels_the_owner_wire(&self) -> bool {
-        self.crosses_the_frame() || self.load_seed_runs().is_some()
+        self.crosses_the_frame() || self.load_seed_runs().is_some() || self.landing_runs().is_some()
     }
 
     /// The contract's vertex layout for the admitted streams.
@@ -10130,6 +10434,15 @@ fn nonindexed_vertex_span(
 /// production, which is the arm E-TX3's `TextureSource::TraceView` states — the
 /// registry read is a lock and a lookup, and it is the whole of what "the
 /// trace's own production" means on this side of the seam.
+// The parameter list is the gate's whole surface: the request's inputs, then one
+// answer per rule the class lifts from this device — the folded stage-buffer
+// namespace (R33), the gathered extent's two arms (R37/R40), the declared
+// vertex-interface superset (R-VI1), the narrow sampled lanes (R39), and now
+// E-TX13's attachment landing view. Each is read in `submit_render` and consumed
+// here, and bundling them into a struct would move the same answers behind one
+// more name without shrinking the surface — the same call the emulator side makes
+// for its own gate entry.
+#[allow(clippy::too_many_arguments)]
 fn narrow_class<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &'a DrawRequest,
@@ -10138,6 +10451,7 @@ fn narrow_class<'a>(
     render_texture_gathered_extent_no_copy: bool,
     render_vertex_interface_superset: bool,
     render_texture_narrow_lanes: NarrowLanes,
+    attachment_landing_view: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R42: whether this request's own target is a mapper-ref-texture **surface**
     // rather than a render-chain or GVA identity. The surface's identity carries
@@ -10363,6 +10677,12 @@ fn narrow_class<'a>(
     // runs — the two share one declaration shape and have two different
     // callers.
     let mut carried_attachment_guest_window = false;
+    // E-TX13: the runs of the **second** declaration this pass's store carries,
+    // when the guest-backed tail above is answered by the landing-view arm
+    // rather than refused. Its own local because the store election and the
+    // trace's view builder are two places, and the runs travel to both: the
+    // store names the view, and the view *is* these runs' declaration.
+    let mut landing: Option<Vec<StageBufferWindow>> = None;
     // R38: which of the two doors that declaration came from. The flag above is
     // what the store election and the completion key on, and it covers both
     // doors by construction — but a census has to be able to say whether the
@@ -10760,7 +11080,7 @@ fn narrow_class<'a>(
     //   resident, no reader, and no writeback the caller could land. It keeps
     //   the engine until its route is reviewed, exactly as before.
     let mut published_held_resident = false;
-    let store =
+    let mut store =
         if req.skip_readback {
             match req.readback_skip_reason {
                 ReadbackSkipReason::ResidentStore => {
@@ -10931,26 +11251,79 @@ fn narrow_class<'a>(
     // provider. Every other guest-backed tail keeps the refusal: a record whose
     // load is a `Clear` (or any other arm) states no window, and a landing with
     // no declaring view to land in is still a route this rail does not carry.
+    //
+    // E-TX13: the other half of that population leaves too, and by a *second*
+    // declaration rather than by rewriting its load. A record whose own load is
+    // the walk's chain value (or a `Clear`) cannot take [`NarrowStore::Borrowed`]
+    // — that arm's window is the attachment's own declaration, which is exactly
+    // where this record's previous contents did *not* come from — but it can
+    // still state where its frame lands, and the contract carries that
+    // statement in [`NarrowStore::BorrowedLanding`]: the attachment's own view
+    // keeps its source, and the store names the second view whose declaration
+    // is the surface's registered pages. The arm is elected only where all four
+    // facts are established: the seam cut the window
+    // ([`RenderRailInputs::landing_guest_window`], or the elision door's own
+    // list when that door already stated one for this record's pages), the
+    // provider's own capability answer carries the arm
+    // (`provider_wire::render_attachment_landing_view`), this record is the one
+    // the guest's pages are owed a frame by, and the class reached this point
+    // with the attachment's bytes still its own declaration (the flag above is
+    // false for every record the load gate converted). A record the seam states
+    // no window for keeps the refusal, its slug, its sentence and its probe.
     if req.guest_target_memory.is_some()
         && !req.load_from_target
         && !carried_attachment_guest_window
         && inputs.role == RenderChainRole::SoleOrTail
     {
-        // B3 probe: the window door's own state, charged beside the refusal and
-        // not instead of it. The gate's judgement, slug, sentence and count are
-        // untouched — the three families partition this bucket (`…_sum ==
-        // bucket delta`, pinned by the rail), and the census reads which of the
-        // three states the 690 records were in.
-        crate::runtime::drain::note_store_route(guest_backing_window_route_label(
-            inputs.attachment_guest_window.as_ref(),
-        ));
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_guest_backing",
-            "a record whose attachment is backed by the guest's own pages stays on the engine \
+        let landing_window = if attachment_landing_view {
+            match (
+                inputs.landing_guest_window.as_ref(),
+                inputs.attachment_guest_window.as_ref(),
+            ) {
+                (Some(AttachmentGuestWindow::Runs(runs)), _) => Some(*runs),
+                (_, Some(AttachmentGuestWindow::Runs(runs))) => Some(*runs),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(runs) = landing_window {
+            landing = Some(runs.to_vec());
+            store = NarrowStore::BorrowedLanding;
+            // The frame is *not* published-held: it lands in the owner's own
+            // pages, which is the statement the arm above withheld the readback
+            // for. Leaving the held flag set would charge the census's
+            // `render_provider_publish_held_resident` for a frame that was
+            // landed, which is the one reading that name must not carry.
+            published_held_resident = false;
+            crate::runtime::drain::note_store_route("render_provider_guest_backing_landing_view");
+        } else {
+            // B3 probe: the window door's own state, charged beside the refusal and
+            // not instead of it. The gate's judgement, slug, sentence and count are
+            // untouched — the three families partition this bucket (`…_sum ==
+            // bucket delta`, pinned by the rail), and the census reads which of the
+            // three states the 690 records were in.
+            //
+            // E-TX13 adds a second asker of the same question and not a second
+            // vocabulary: the landing door and the elision door state the same
+            // declaration, so the state charged here is the one of whichever door
+            // was asked for this record — the elision door first (it states runs
+            // for a record it can carry), the landing door for the record it did
+            // not apply to. A record neither door reached keeps `_window_none`,
+            // which is still the canary for "the shape was never asked about".
+            let window_state = inputs
+                .attachment_guest_window
+                .as_ref()
+                .or(inputs.landing_guest_window.as_ref());
+            crate::runtime::drain::note_store_route(guest_backing_window_route_label(window_state));
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_guest_backing",
+                "a record whose attachment is backed by the guest's own pages stays on the engine \
              while its frame is the one the guest's pages are owed: the class renders into a \
              provider image, and writing the guest's pages from it is a landing this rail does \
              not carry",
-        ));
+            ));
+        }
     }
     // W1 named the frame's *destination* for the record that opens a packet;
     // this is its source. A record that continues an encoder begins from the
@@ -11466,6 +11839,7 @@ fn narrow_class<'a>(
         carried_surface_resident,
         carried_attachment_guest_window,
         carried_seed_guest_window,
+        landing,
         sampled_target_frames: sampling
             .textures
             .iter()
@@ -11737,6 +12111,20 @@ fn attachment_identity(
         // (`render_attachment_landing_unsupported`) instead of writing
         // anywhere.
         (NarrowLoad::Clear(_) | NarrowLoad::Bytes(_), NarrowStore::Borrowed) => {
+            ResidentAttachment {
+                allocation: ATTACHMENT_ALLOCATION,
+                view: ATTACHMENT_VIEW,
+            }
+        }
+        // E-TX13: the attachment's own declaration is unchanged by the arm —
+        // its load is the caller's bytes or a `Clear`, so its identity is the
+        // pooled pair the trace states for it, and the *second* declaration the
+        // store carries is a different view under the plan's allocation by
+        // construction. Stated here rather than folded into the arm above
+        // because the two stores name their windows in two different places,
+        // and both keep the attachment's own identity exactly as `Writeback`
+        // does.
+        (NarrowLoad::Clear(_) | NarrowLoad::Bytes(_), NarrowStore::BorrowedLanding) => {
             ResidentAttachment {
                 allocation: ATTACHMENT_ALLOCATION,
                 view: ATTACHMENT_VIEW,
@@ -12172,6 +12560,49 @@ fn submit_narrow(
         next_view += 1;
     }
 
+    // E-TX13: the **second** declaration this record's store carries, when it
+    // carries one (`NarrowStore::BorrowedLanding`). Two facts are its own:
+    //
+    // * its identity is the owner plan's — the contract pairs every run's
+    //   reservation with the declaring view's own allocation
+    //   (`provider_owner::Plan::run_allocation`), exactly as R32's load arm
+    //   names the allocation its own `Request::Runs` minted, so this view's
+    //   `(allocation, view)` pair cannot be the attachment's own and the two
+    //   declarations cannot be confused for one;
+    // * it is declared to the trace by a **compute pass**, because the trace's
+    //   pool is what a landing view is resolved against
+    //   ([`ComputeTrace::serial_resources`] collects the views a compute pass
+    //   binds), and a landing that names a view no pass declared is refused by
+    //   the provider by name (`landing_view_undeclared`) rather than answered
+    //   from the attachment's own declaration.
+    //
+    // The view is stated at the attachment's own tightly packed extent with the
+    // source arm the plan minted — `BufferSource::GuestRuns`, the owner's live
+    // pages, which the landing writes and the pass never reads — so the length
+    // the contract checks, the runs' concatenation and the extent the landing
+    // is measured against are one number.
+    let landing_view = pass.landing_runs().map(|_| BufferView {
+        view_id: ViewId::new(next_view),
+        metal_binding: 0,
+        allocation_id: leases
+            .as_ref()
+            .and_then(|plan| plan.run_allocation(landing_view_owner_binding()))
+            .expect("the owner plan covers an admitted landing view's runs")
+            .0,
+        offset: 0,
+        length: pass.extent,
+        // The declaring kernel's own interface: one buffer, read.
+        access: BufferAccess::Read,
+        attribute_stride: None,
+        source: BufferSource::GuestRuns(
+            leases
+                .as_ref()
+                .and_then(|plan| plan.guest_runs(landing_view_owner_binding()))
+                .expect("the owner plan covers an admitted landing view's runs")
+                .to_vec(),
+        ),
+    });
+
     let pass_descriptor = RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
         // The runtime `[[sampler(n)]]` bindings the fragment stage executes
@@ -12212,6 +12643,20 @@ fn submit_narrow(
                 // seam's own Store route reads a completion exactly as it does
                 // for `Store` — it just has nothing left to land.
                 NarrowStore::Borrowed => StoreOp::Borrowed,
+                // E-TX13: the frame lands in the owner window the **second**
+                // declaration names while the attachment's own view keeps the
+                // load source it stated (the walk's chain value, or a `Clear`).
+                // The pair is the view built above, so the store and the
+                // declaration cannot name two different windows.
+                NarrowStore::BorrowedLanding => {
+                    let landing = landing_view
+                        .as_ref()
+                        .expect("an elected landing view is declared to the trace");
+                    StoreOp::BorrowedLanding(AttachmentLandingView {
+                        allocation_id: landing.allocation_id,
+                        view_id: landing.view_id,
+                    })
+                }
             },
         }],
         // The pass's own rect when the request bound one the contract can name
@@ -12315,8 +12760,12 @@ fn submit_narrow(
         },
         encoder_dispatch_type: DispatchType::Serial,
         passes: {
-            let mut passes =
-                declaring_passes_with(declaring.pipeline_id, declaration, &stage_buffers);
+            let mut passes = declaring_passes_with(
+                declaring.pipeline_id,
+                declaration,
+                &stage_buffers,
+                landing_view.as_ref(),
+            );
             // The productions' own declarations and passes, in the order the
             // textures named them: a trace-produced view has to be declared
             // before a render pass stores into it (the trace's pool is what
@@ -12610,6 +13059,17 @@ fn submit_narrow(
             pass.extent,
         );
     }
+    // E-TX13: the other half of that population, under its own name. The two
+    // arms land in the same kind of place (the owner's registered window) by two
+    // different declarations, and the census has to be able to read which one
+    // grew: this one's population is the guest-backed tail the class used to
+    // refuse, and it is the number this increment is judged on.
+    if matches!(pass.store, NarrowStore::BorrowedLanding) {
+        crate::runtime::drain::note_store_route_n(
+            "render_provider_borrowed_landing_view_bytes",
+            pass.extent,
+        );
+    }
     // R24's own population, counted where the answer happens for the same
     // reason as R23's above: the caller read a sampled GPU target's frame out
     // of the registry that holds it and this pass declared it as the trace's
@@ -12650,7 +13110,11 @@ fn submit_narrow(
         bgra: pass.bgra,
         present,
         stage_writebacks,
-        landed_in_window: matches!(pass.store, NarrowStore::Borrowed),
+        landing: match pass.store {
+            NarrowStore::Borrowed => Some(WindowLanding::OwnView),
+            NarrowStore::BorrowedLanding => Some(WindowLanding::LandingView),
+            NarrowStore::Writeback | NarrowStore::Resident(_) => None,
+        },
     }))
 }
 
@@ -12669,10 +13133,20 @@ fn submit_narrow(
 /// kernel declares one buffer.
 ///
 /// The render half follows, in the same order the render pass always had.
+///
+/// E-TX13 adds a **second** declare pass for the landing view, and for exactly
+/// the reason above: the trace's pool is the set of views a compute pass binds
+/// ([`ComputeTrace::serial_resources`]), and a `StoreOp::BorrowedLanding` store
+/// names its window by identity — a view no pass declared would be a landing
+/// the provider refuses by name. One pass of its own rather than a second
+/// binding beside the attachment's, because the declaring kernel declares one
+/// buffer and a pass's bound set has to be exactly what its pipeline declares
+/// (`UnknownBinding` / `MissingBinding` otherwise).
 fn declaring_passes_with(
     pipeline: metal_api_core::provider::PipelineId,
     attachment: BufferView,
     stage_buffers: &[StageBufferView],
+    landing: Option<&BufferView>,
 ) -> Vec<TracePass> {
     let mut passes = vec![declaring_pass(pipeline, vec![attachment])];
     for buffer in stage_buffers
@@ -12684,6 +13158,13 @@ fn declaring_passes_with(
         pool.metal_binding = 0;
         pool.access = BufferAccess::Read;
         passes.push(declaring_pass(pipeline, vec![pool]));
+    }
+    if let Some(landing) = landing {
+        // The view is already stated at the declaring kernel's own interface
+        // (one buffer, `metal_binding` zero, read) by the trace builder, so it
+        // travels into the pass unchanged: restating it here would be the
+        // second spelling of one declaration.
+        passes.push(declaring_pass(pipeline, vec![landing.clone()]));
     }
     passes
 }
@@ -13034,6 +13515,21 @@ fn load_seed_owner_binding() -> u32 {
     0x0005 << 16
 }
 
+/// The label one **landing view's** run list travels under in the owner rail
+/// (E-TX13).
+///
+/// The sixth namespace of the same five ([`stage_buffer_owner_binding`]'s two
+/// stages, then [`vertex_stream_owner_binding`], [`index_stream_owner_binding`],
+/// [`texture_window_owner_binding`] and [`load_seed_owner_binding`]): the window
+/// a landing names is no argument of the pass at all — it is where the frame
+/// goes rather than a bind the draw reads — so no `[[buffer(N)]]`,
+/// `[[texture(n)]]` or stream namespace can hold it, and the plan has to mint
+/// its allocation under a label of its own. A constant rather than a function
+/// of an index, because a pass carries at most one landing declaration.
+fn landing_view_owner_binding() -> u32 {
+    0x0006 << 16
+}
+
 /// One window-backed binding's coordinates in the owner rail's own shape, under
 /// the label the plan looks its view up by.
 ///
@@ -13188,6 +13684,29 @@ fn plan_owner_leases(
         requests.push(provider_owner::Request::Runs(provider_owner::Runs {
             binding: load_seed_owner_binding(),
             windows: &load_seed_windows,
+        }));
+    }
+    // E-TX13: the *landing view's* own list, as the same arm of the same plan
+    // — and for the same reason R32's is here: the contract pairs every run's
+    // reservation with the declaring view's own allocation, so the second view
+    // has to name the allocation this request mints for its windows rather than
+    // one the trace invented. The windows are the seam's own cut of the
+    // surface's registered pages (the runs a *load* declaration would have
+    // carried) and are read through the borrowed lease only: the provider
+    // gathers nothing for them (they are the frame's destination, written by
+    // `AttachmentLanding::land`), so no device import of their own is needed.
+    let landing_windows: Vec<provider_owner::Window> = pass
+        .landing_runs()
+        .map(|runs| {
+            runs.iter()
+                .map(|window| owner_window(landing_view_owner_binding(), *window))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !landing_windows.is_empty() {
+        requests.push(provider_owner::Request::Runs(provider_owner::Runs {
+            binding: landing_view_owner_binding(),
+            windows: &landing_windows,
         }));
     }
     let plan = provider_owner::plan(provider, &requests).map_err(ProviderRenderDecline::Owner)?;
