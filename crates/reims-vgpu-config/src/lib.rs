@@ -1227,7 +1227,8 @@ pub const RENDER_PRESENT: &str = "REIMS_VGPU_RENDER_PRESENT";
 /// **Probe, default off.** `on` emits one `frame_profile` line per second
 /// closing the frames the guest presented in that second: the present interval
 /// (mean, median, max), the draws each present carried, the host draw span they
-/// cost, and how many draws each render path answered.
+/// cost, and how many draws each render path answered — and, beside it, one
+/// `frame_span` line dividing that same host span over the same frames.
 ///
 /// The per-second censuses this device already has divide a whole window, and
 /// an interactive desktop that feels slow while those numbers look small is
@@ -1240,6 +1241,24 @@ pub const RENDER_PRESENT: &str = "REIMS_VGPU_RENDER_PRESENT";
 /// (`drain_duty`'s per-draw `draw_us` and the display-present completion called
 /// from `signal_display_present_complete`), so nothing new blocks or allocates
 /// per draw. Unset and an unrecognized value are `off`.
+///
+/// # What the second line divides, and why it is closed on a present
+///
+/// `chain_phase` already divides a draw, and it divides it on a second. The
+/// reading that could not be produced from any log was the two together: *which
+/// part of one frame's host span the frame went to*. So `frame_span` charges
+/// the very same bars (`chain_phase`'s seventeen, handed over by ordinal at the
+/// instant that module already read the clock) plus the bars that were missing
+/// — the draw span's split by rail, and the canonical provider rail's interior,
+/// which had no split at all while it answered most of a driven boot's draws.
+///
+/// Every field on that line is a per-frame mean and is divided by the same
+/// `frames` the `frame_profile` line prints, so the two are read against each
+/// other: a bar's share of the frame is itself over `host_us_mean`.
+///
+/// It costs no clock read while the switch is off, which is the default: each
+/// bracket is one relaxed load of a value decided at bootstrap, and the bars
+/// `chain_phase` already computed are handed over rather than re-measured.
 pub const FRAME_PROFILE: &str = "REIMS_VGPU_FRAME_PROFILE";
 }
 

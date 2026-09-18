@@ -469,6 +469,186 @@ pub(crate) enum FrameDrawRail {
     Engine,
 }
 
+/// One named span the frame profile closes at a present.
+///
+/// # Why this table exists at all
+///
+/// `frame_profile` closes the *whole* draw span at a present, and `chain_phase`
+/// divides that span into seventeen bars — but on a one-second window, on a
+/// different clock. The reading a frame profile has to produce is the two of
+/// them at once: the draws that landed inside one frame, divided the way
+/// `chain_phase` divides them, closed on the same edge `host_us` closes on.
+/// This is that accumulator, and it is the reason a boot can now say *which*
+/// part of a 927 ms frame's host span the 927 ms went to.
+///
+/// # The first seventeen variants are `chain_phase::Phase`'s ordinals
+///
+/// `chain_phase::enter` charges its own `ACC` slot and then hands the same
+/// nanosecond delta here by ordinal, so the two tables cannot disagree about
+/// which bar a span belongs to. The order below is therefore *not* a grouping
+/// — it is [`crate::runtime::chain_phase::Phase`]'s own declaration order, and
+/// the test `the_frame_span_table_mirrors_chain_phase` pins it to that enum
+/// rather than to a comment.
+///
+/// # What the rails name
+///
+/// The rest split the bar those seventeen leave as the whole device's largest
+/// cost. `engine_us` is a single bar over two rails with entirely different
+/// internals, and on the boot that motivated this it was **96.4%** of the draw
+/// span with only its self-contained half divided by anything (`draw_phase`
+/// brackets `execute_draw_request`; the canonical provider's own work had no
+/// split at all). So:
+///
+/// - [`Self::RailProvider`] / [`Self::RailEngine`] split that bar by rail, and
+///   the residue between the two and `engine_us` is the seam's own assembly.
+/// - The six `Prov*` bars divide the provider rail's interior at the calls
+///   that name different fixes, nested inside [`Self::RailProvider`] rather
+///   than beside it.
+///
+/// Nesting is deliberate and is the point: each bar is read against its parent,
+/// never against the chain. A bar that is not smaller than its parent is a bug
+/// in the bracket, not a finding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+pub(crate) enum FrameSpan {
+    // --- the seventeen `chain_phase::Phase` bars, in that enum's order ---
+    Prep = 0,
+    Pipeline = 1,
+    Binds = 2,
+    Sampled = 3,
+    Seed = 4,
+    Assemble = 5,
+    Engine = 6,
+    Store = 7,
+    PlGen = 8,
+    PlDesc = 9,
+    PlMtlb = 10,
+    PlAir = 11,
+    PlXlate = 12,
+    PrepPages = 13,
+    AsmTarget = 14,
+    AsmDepth = 15,
+    AsmTrail = 16,
+    /// The whole canonical-provider seam: the request's own input assembly
+    /// plus `provider_render::submit_render`'s answer, to the instant the seam
+    /// returns. Split out of [`Self::Engine`].
+    RailProvider = 17,
+    /// `backend::vulkan::engine::execute_draw_request`. The other half of
+    /// [`Self::Engine`].
+    RailEngine = 18,
+    /// `submit_render`'s class gate: the pure gate, every capability ask it
+    /// makes of the device, the unaligned-window staging copies and the
+    /// depadded sampled rows — everything before `submit_narrow` is called.
+    ///
+    /// This is the guest-content half of the provider rail: the copies the
+    /// device's own granules force, made on the CPU before any GPU work.
+    ProvGate = 19,
+    /// `declaring_pipeline` + `register_render_pipeline`: the declaring
+    /// kernel's lookup and the request's own translated pipeline pair. A
+    /// lookup priced like a compile shows up here and nowhere else.
+    ProvRegister = 20,
+    /// The resource table, the owner-lease plan: translation and
+    /// registration of every window-backed bind this pass states.
+    ProvPlan = 21,
+    /// The trace's own assembly — attachment identity, the vertex/index/stage
+    /// buffer views, the sampled declarations, the in-flight productions: the
+    /// canonical encoding of the record, before anything is admitted.
+    ProvTrace = 22,
+    /// `provider_wire::submit_frame` and `validate_trace`: the owner→provider
+    /// frame, then admission. The last pure-CPU region before the submission.
+    ProvAdmit = 23,
+    /// `provider.submit`: the queue submission and the completion this rail
+    /// blocks on. **The one bar that is GPU latency rather than CPU work.**
+    ProvSubmit = 24,
+    /// `plan.settle` (the lease retirement chain, in the owner rail's order)
+    /// and `stage_buffer_writebacks`: the writeback of this record's writable
+    /// views, after the completion.
+    ProvSettle = 25,
+}
+
+/// Number of [`FrameSpan`] slots, derived from the enum so a variant added
+/// without a name below cannot silently drop out of the line.
+const FRAME_SPANS: usize = FrameSpan::ProvSettle as usize + 1;
+
+impl FrameSpan {
+    /// The bar a [`crate::runtime::chain_phase::Phase`] ordinal names.
+    ///
+    /// This function **is** the coupling between the two tables, spelled once
+    /// and checked by the test below rather than left as an agreement between
+    /// two `as usize` casts in two files. `chain_phase::enter` hands over the
+    /// ordinal it just charged, and a bar that maps to nothing is time the
+    /// frame profile would silently drop — so a phase added there without an
+    /// arm here is caught by `every chain phase has a bar`, and a bar wired to
+    /// the wrong arm is caught by the ordinal equality in the same test.
+    ///
+    /// `None` for an ordinal past the last phase, which is what keeps a rail
+    /// bar from ever being reachable by a phase's number.
+    #[inline]
+    pub(crate) fn of_chain(ordinal: usize) -> Option<FrameSpan> {
+        use crate::runtime::chain_phase::Phase;
+        Some(match ordinal {
+            x if x == Phase::Prep as usize => FrameSpan::Prep,
+            x if x == Phase::Pipeline as usize => FrameSpan::Pipeline,
+            x if x == Phase::Binds as usize => FrameSpan::Binds,
+            x if x == Phase::Sampled as usize => FrameSpan::Sampled,
+            x if x == Phase::Seed as usize => FrameSpan::Seed,
+            x if x == Phase::Assemble as usize => FrameSpan::Assemble,
+            x if x == Phase::Engine as usize => FrameSpan::Engine,
+            x if x == Phase::Store as usize => FrameSpan::Store,
+            x if x == Phase::PipelineGen as usize => FrameSpan::PlGen,
+            x if x == Phase::PipelineDesc as usize => FrameSpan::PlDesc,
+            x if x == Phase::PipelineMtlb as usize => FrameSpan::PlMtlb,
+            x if x == Phase::PipelineAir as usize => FrameSpan::PlAir,
+            x if x == Phase::PipelineXlate as usize => FrameSpan::PlXlate,
+            x if x == Phase::PrepPages as usize => FrameSpan::PrepPages,
+            x if x == Phase::AssembleTarget as usize => FrameSpan::AsmTarget,
+            x if x == Phase::AssembleDepth as usize => FrameSpan::AsmDepth,
+            x if x == Phase::AssembleTrail as usize => FrameSpan::AsmTrail,
+            _ => return None,
+        })
+    }
+
+    /// This bar's slot in the accumulator, which is its own discriminant.
+    #[inline]
+    pub(crate) fn slot(self) -> usize {
+        self as usize
+    }
+}
+
+/// The emitted field name of each slot, in slot order.
+///
+/// Every value on the line is a **per-frame mean** rather than the window sum
+/// `chain_phase` prints, which is why every field carries `_mean`: the two
+/// lines are deliberately not readable as the same number.
+const SPAN_NAMES: [&str; FRAME_SPANS] = [
+    "prep_us_mean",
+    "pipeline_us_mean",
+    "binds_us_mean",
+    "sampled_us_mean",
+    "seed_us_mean",
+    "assemble_us_mean",
+    "engine_us_mean",
+    "store_us_mean",
+    "pl_gen_us_mean",
+    "pl_desc_us_mean",
+    "pl_mtlb_us_mean",
+    "pl_air_us_mean",
+    "pl_xlate_us_mean",
+    "prep_pages_us_mean",
+    "asm_target_us_mean",
+    "asm_depth_us_mean",
+    "asm_trail_us_mean",
+    "rail_provider_us_mean",
+    "rail_engine_us_mean",
+    "prov_gate_us_mean",
+    "prov_register_us_mean",
+    "prov_plan_us_mean",
+    "prov_trace_us_mean",
+    "prov_admit_us_mean",
+    "prov_submit_us_mean",
+    "prov_settle_us_mean",
+];
+
 /// One `frame_profile` line per this many milliseconds of presents.
 ///
 /// Its own constant rather than `DRAIN_DUTY_REPORT_MS`, even though both are
@@ -527,6 +707,13 @@ pub(crate) struct FrameProfileCensus {
     // Cumulative, so a frame straddling a report boundary is still whole.
     draws: std::sync::atomic::AtomicU64,
     draw_us: std::sync::atomic::AtomicU64,
+    // The sub-phase table, on the same terms: charged cumulatively in
+    // nanoseconds from the draw path (so a span shorter than a microsecond is
+    // worth something), differenced at every frame close.
+    span_ns: [std::sync::atomic::AtomicU64; FRAME_SPANS],
+    last_span_ns: [std::sync::atomic::AtomicU64; FRAME_SPANS],
+    // Window accumulators, filled by `close_frame` from the per-frame deltas.
+    span_sum_us: [std::sync::atomic::AtomicU64; FRAME_SPANS],
     // The previous frame's close; 0 before the first present.
     last_present_us: std::sync::atomic::AtomicU64,
     last_present_draws: std::sync::atomic::AtomicU64,
@@ -555,6 +742,9 @@ impl FrameProfileCensus {
             host_max_us: AtomicU64::new(0),
             draws: AtomicU64::new(0),
             draw_us: AtomicU64::new(0),
+            span_ns: [const { AtomicU64::new(0) }; FRAME_SPANS],
+            last_span_ns: [const { AtomicU64::new(0) }; FRAME_SPANS],
+            span_sum_us: [const { AtomicU64::new(0) }; FRAME_SPANS],
             last_present_us: AtomicU64::new(0),
             last_present_draws: AtomicU64::new(0),
             last_present_draw_us: AtomicU64::new(0),
@@ -580,6 +770,16 @@ impl FrameProfileCensus {
         self.draw_us.fetch_add(us, Relaxed);
     }
 
+    /// Bank one sub-phase span into the open frame, in nanoseconds.
+    ///
+    /// Called only through [`note_frame_span_ns`], which is where the switch
+    /// is read, so the draw path pays one relaxed load when the profile is off
+    /// and never a clock read.
+    pub(crate) fn note_span(&self, slot: usize, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.span_ns[slot].fetch_add(ns, Relaxed);
+    }
+
     /// Count a draw answered by one of the two render paths.
     pub(crate) fn note_rail(&self, rail: FrameDrawRail) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -600,7 +800,7 @@ impl FrameProfileCensus {
         now_us: u64,
         now_ms: u64,
         not_enabled: bool,
-    ) -> Option<String> {
+    ) -> Option<FrameProfileLines> {
         use std::sync::atomic::Ordering::Relaxed;
         self.presents.fetch_add(1, Relaxed);
         if not_enabled {
@@ -630,6 +830,19 @@ impl FrameProfileCensus {
         let prev_us = self.last_present_us.swap(now_us, Relaxed);
         let draws = self.draws.load(Relaxed);
         let draw_us = self.draw_us.load(Relaxed);
+        // The sub-phase table is differenced the same way and on the same
+        // terms, so a frame that straddles a report boundary stays whole.
+        let mut frame_spans = [0u64; FRAME_SPANS];
+        for ((acc, last), frame) in self
+            .span_ns
+            .iter()
+            .zip(self.last_span_ns.iter())
+            .zip(frame_spans.iter_mut())
+        {
+            let cur = acc.load(Relaxed);
+            let prev = last.swap(cur, Relaxed);
+            *frame = crate::observe::phase_clock::to_us(cur.saturating_sub(prev));
+        }
         if prev_us == 0 {
             self.last_present_draws.store(draws, Relaxed);
             self.last_present_draw_us.store(draw_us, Relaxed);
@@ -650,10 +863,13 @@ impl FrameProfileCensus {
         self.draws_max.fetch_max(frame_draws, Relaxed);
         self.host_sum_us.fetch_add(frame_host_us, Relaxed);
         self.host_max_us.fetch_max(frame_host_us, Relaxed);
+        for (acc, us) in self.span_sum_us.iter().zip(frame_spans.iter()) {
+            acc.fetch_add(*us, Relaxed);
+        }
     }
 
     /// Swap the window out and render it, clearing the histogram with it.
-    fn take(&self, win_ms: u64) -> String {
+    fn take(&self, win_ms: u64) -> FrameProfileLines {
         use std::sync::atomic::Ordering::Relaxed;
         let presents = self.presents.swap(0, Relaxed);
         let not_enabled = self.present_not_enabled.swap(0, Relaxed);
@@ -670,7 +886,7 @@ impl FrameProfileCensus {
         // Emitted beside the mean it divides, so a reader can tell an empty
         // numerator from an empty denominator.
         let mean = |sum: u64| sum.checked_div(frames).unwrap_or(0);
-        format!(
+        let profile = format!(
             "frame_profile win_ms={win_ms} presents={presents} \
              present_not_enabled={not_enabled} frames={frames} \
              interval_us_mean={} interval_us_p50={p50} interval_us_max={interval_max} \
@@ -680,7 +896,22 @@ impl FrameProfileCensus {
             mean(interval_sum),
             mean(draws_sum),
             mean(host_sum),
-        )
+        );
+        // The sub-phase table's own line, closed on the same presents and
+        // divided by the same `frames`, so every field on it is a share of the
+        // `host_us_mean` printed above and not a reading from another window.
+        let span = (frames > 0).then(|| {
+            let mut line = format!(
+                "frame_span win_ms={win_ms} frames={frames} draws={}",
+                mean(draws_sum)
+            );
+            for (name, acc) in SPAN_NAMES.iter().zip(self.span_sum_us.iter()) {
+                let sum = acc.swap(0, Relaxed);
+                line.push_str(&format!(" {name}={}", mean(sum)));
+            }
+            line
+        });
+        FrameProfileLines { profile, span }
     }
 
     /// The histogram's lower median, and the histogram is emptied by reading
@@ -710,14 +941,40 @@ impl FrameProfileCensus {
 
 static FRAME_PROFILE: FrameProfileCensus = FrameProfileCensus::new();
 
+/// The lines one full profile window closes.
+///
+/// Two rather than one because they answer two questions and a reader greps
+/// them apart: `profile` is the frame (interval, draws, the whole host span),
+/// `span` is that same span's composition. `span` is `None` when the window
+/// closed no frame, which is the only case where the composition has no
+/// denominator.
+pub(crate) struct FrameProfileLines {
+    pub(crate) profile: String,
+    pub(crate) span: Option<String>,
+}
+
 /// Whether the frame profile is on, read once like the draw sink's own switch.
 ///
 /// Cached because the gate sits on the per-draw path: an environment read per
 /// draw would be a cost the instrument imposed on its own subject.
+///
+/// The cached path is **two loads and no store**. It used to take an
+/// `AtomicBool::swap` on every call, which is a write to a shared line on the
+/// draw path; that was affordable at one call per draw and is not at one per
+/// phase boundary, and this increment added seventeen more call sites per draw
+/// (`chain_phase`'s bars) beside the spans it added. The answer cannot change
+/// after the first read, so `INIT` is read before it is written rather than by
+/// the write.
 fn frame_profile_on() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     static INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ON.load(Relaxed) {
+        return true;
+    }
+    if INIT.load(Relaxed) {
+        return false;
+    }
     if !INIT.swap(true, Relaxed) {
         ON.store(
             crate::config::switch(crate::config::FRAME_PROFILE) == crate::config::Switch::On,
@@ -746,6 +1003,58 @@ pub(crate) fn note_frame_draw_rail(rail: FrameDrawRail) {
     FRAME_PROFILE.note_rail(rail);
 }
 
+/// Bank one of [`crate::runtime::chain_phase`]'s bars, named by its ordinal.
+///
+/// That module charges its own table and hands over the delta it just added,
+/// so the two tables are charged the same nanoseconds rather than two spans
+/// that are merely adjacent — and the profile costs one relaxed load per phase
+/// boundary when it is off, which is the default.
+#[inline]
+pub(crate) fn note_frame_chain_ns(ordinal: usize, ns: u64) {
+    if !frame_profile_on() {
+        return;
+    }
+    if let Some(bar) = FrameSpan::of_chain(ordinal) {
+        FRAME_PROFILE.note_span(bar.slot(), ns);
+    }
+}
+
+/// A running sub-phase span, banked when it drops.
+///
+/// `None` when the profile is off, which is what makes every call site a
+/// `let _span = frame_span(..)` with no branch in it: the switch is read once
+/// here rather than at each of the eight brackets, and a profile that is off
+/// costs one relaxed load per bracket and no clock read at all.
+pub(crate) struct FrameSpanTimer {
+    slot: usize,
+    started: std::time::Instant,
+}
+
+impl Drop for FrameSpanTimer {
+    fn drop(&mut self) {
+        let ns = crate::observe::phase_clock::charge_ns(self.started.elapsed());
+        FRAME_PROFILE.note_span(self.slot, ns);
+    }
+}
+
+/// Start one named sub-phase span, or nothing when the profile is off.
+///
+/// Deliberately **not** an `enter`-style chain: the eight brackets it is used
+/// at are disjoint regions of one draw, so each is measured on its own and
+/// their sum against the parent bar is an identity a reader can check. A
+/// sequential chain would silently charge every gap to whichever region
+/// happened to be open.
+#[inline]
+pub(crate) fn frame_span(span: FrameSpan) -> Option<FrameSpanTimer> {
+    if !frame_profile_on() {
+        return None;
+    }
+    Some(FrameSpanTimer {
+        slot: span as usize,
+        started: std::time::Instant::now(),
+    })
+}
+
 /// Close one presented frame and emit the profile when the window fills.
 ///
 /// Called once per completed present from
@@ -755,8 +1064,11 @@ pub(crate) fn note_frame_present(not_enabled: bool) {
         return;
     }
     let now_us = crate::observe::elapsed_us();
-    if let Some(line) = FRAME_PROFILE.note_present(now_us, now_us / 1_000, not_enabled) {
-        crate::observe::off(line);
+    if let Some(lines) = FRAME_PROFILE.note_present(now_us, now_us / 1_000, not_enabled) {
+        crate::observe::off(lines.profile);
+        if let Some(span) = lines.span {
+            crate::observe::off(span);
+        }
     }
 }
 

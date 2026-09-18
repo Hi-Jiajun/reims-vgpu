@@ -7602,6 +7602,16 @@ fn contract_fingerprint(contract: &RenderPipelineContract) -> String {
 /// passes both is offered to the provider, and a refusal from there is a
 /// decline (never a fallback).
 pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> RenderRailOutcome {
+    // The frame profile's first bar inside the provider rail, and the only one
+    // on this side of `submit_narrow`: the pure class gate, every capability
+    // ask it makes of this device, and the copies the device's own granules
+    // force on a window-backed bind (`window_arm`, `texture_window_arm`) or a
+    // padded sampled row (`depad`). That last pair is the guest-content half
+    // of this rail — bytes read out of the guest and staged on the CPU before
+    // any GPU work — and until this bar existed the only reading of it was a
+    // route count. `None`, and therefore no clock read, when
+    // `REIMS_VGPU_FRAME_PROFILE` is off.
+    let _gate = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGate);
     // The band a widening order sizes the vertex axis on, charged for every
     // request the gate is handed and before any condition answers — so a shape
     // the gate refuses is still in the denominator, and the four arms sum to the
@@ -8177,6 +8187,7 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
         );
         rows.insert(texture.index, tight);
     }
+    drop(_gate);
     match submit_narrow(inputs, req, &pass, &copies, &rows) {
         Ok(RenderCompletion::Writeback(output)) => RenderRailOutcome::ProviderCompleted(output),
         Ok(RenderCompletion::Resident(frame)) => {
@@ -10934,8 +10945,20 @@ fn submit_narrow(
         return Err(decline.into_render());
     }
 
-    let declaring = declaring_pipeline(&rail.provider, &rail.device)?;
-    let render_pipeline = register_render_pipeline(&rail.provider, &rail.device, inputs, pass)?;
+    // The frame profile's pipeline bar: the declaring kernel's own lookup and
+    // this request's translated pair. Both are cache lookups on a warm boot —
+    // `shader_misses` and `pipeline_misses` are zero over a boot that runs
+    // this path tens of thousands of times — so a large bar here is a lookup
+    // priced like a compile rather than a compile, and the pair is the only
+    // candidate that spans it.
+    let (declaring, render_pipeline) = {
+        let _register =
+            crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvRegister);
+        (
+            declaring_pipeline(&rail.provider, &rail.device)?,
+            register_render_pipeline(&rail.provider, &rail.device, inputs, pass)?,
+        )
+    };
     let loads_resident = matches!(pass.load, NarrowLoad::Resident(_));
 
     let mut resources = ResourceTableSnapshot::new();
@@ -10961,7 +10984,19 @@ fn submit_narrow(
     // guest-runs seed's view has to name the *lease's* allocation (the contract
     // pairs every run's reservation with the declaring view's allocation), and
     // only the plan knows which allocation its registration minted.
-    let mut leases = plan_owner_leases(provider, pass, &mut resources, copies)?;
+    // The frame profile's plan bar: the resource table this submission states
+    // and the owner-lease plan every window-backed bind is imported through.
+    let mut leases = {
+        let _plan = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvPlan);
+        plan_owner_leases(provider, pass, &mut resources, copies)?
+    };
+    // The frame profile's trace bar opens here and closes at the wire frame
+    // below: the attachment's identity, the vertex/index/stage buffer views,
+    // the sampled declarations and the in-flight productions. This is the
+    // canonical encoding of the record — the descriptor and pool entries the
+    // provider is handed — and it is the largest region of `submit_narrow`
+    // that is pure assembly rather than a call into the provider.
+    let _trace = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvTrace);
     let attachment = attachment_identity(pass, leases.as_ref());
     // The trace's own declaration of the attachment view. `OwnedBytes` of the
     // packed extent is what the frozen contract asks a storing attachment to
@@ -11509,6 +11544,11 @@ fn submit_narrow(
     // in-process arm the class gate's declarations make exact. The two shapes
     // the v40 blend section cannot carry are answered by the class gate before
     // this point (`declared_blend`), not framed as another state here.
+    drop(_trace);
+    // The frame profile's admission bar: the owner→provider wire frame (only
+    // when this pass states leases) and the trace's admission. Both are
+    // CPU-side and both are on the path to every submission this rail makes.
+    let _admit = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvAdmit);
     let (trace, resources) = if leases.is_none() {
         (trace, resources)
     } else {
@@ -11544,6 +11584,7 @@ fn submit_narrow(
             });
         }
     };
+    drop(_admit);
     // Counted here, at the boundary: this is the point past which the draw is
     // the provider's work, so a request that stays on the engine must leave
     // the counter where it was.
@@ -11554,6 +11595,13 @@ fn submit_narrow(
     // the rail's callers submit from one worker, so the delta names this
     // submission's action rather than a neighbour's.
     let present_before = pass.present.map(|_| provider.present_counts());
+    // The frame profile's submission bar. This is the one bar on the provider
+    // rail that is GPU latency rather than CPU work: `provider.submit` submits
+    // and blocks on the completion, and the completion is what carries the
+    // readback this rail's callers read. A provider rail whose time is here is
+    // a latency problem and moving bytes faster buys nothing; the engine rail's
+    // own equivalent is `draw_phase`'s `submit_us`/`wait_us`/`readback_us`.
+    let _submit = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvSubmit);
     let result = match provider.submit(validated) {
         Ok(result) => result,
         Err(error) => {
@@ -11566,6 +11614,7 @@ fn submit_narrow(
             return Err(decline);
         }
     };
+    drop(_submit);
     if !matches!(
         result.completion,
         CompletionDisposition::CompletedVisible { .. }
@@ -11600,6 +11649,10 @@ fn submit_narrow(
     // provider's import. It runs before this rail reads the completion's
     // writebacks, exactly as the compute rail's does, so no provider-visible
     // byte reaches the caller while a lease that covers it is still held.
+    // The frame profile's settle bar: the retirement chain and the writeback
+    // of this record's writable views. This is the answer to "is the guest-page
+    // write per draw or per pass" — it is charged here, once per record.
+    let _settle = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvSettle);
     if let Some(plan) = leases.take() {
         plan.settle(provider, result.completion)
             .map_err(ProviderRenderDecline::Owner)?;
@@ -11612,6 +11665,7 @@ fn submit_narrow(
     // truncated into place. The bytes leave here for the caller, which owns the
     // guest destination (`StageBufferLanding`).
     let stage_writebacks = stage_buffer_writebacks(&stage_buffer_slots, &result.writebacks)?;
+    drop(_settle);
     // R22: every production this trace carried has to have landed its bytes in
     // the trace's own writeback channel, or the consuming declaration sampled a
     // view the provider never produced. The contract refuses that shape at

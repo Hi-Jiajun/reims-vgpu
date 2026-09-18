@@ -349,10 +349,14 @@ pub fn enter(next: Phase) {
     OPEN.with(|open| {
         let now = Instant::now();
         if let Some((phase, since)) = open.get() {
-            ACC[phase as usize].fetch_add(
-                charge_ns(now.saturating_duration_since(since)),
-                Ordering::Relaxed,
-            );
+            let ns = charge_ns(now.saturating_duration_since(since));
+            ACC[phase as usize].fetch_add(ns, Ordering::Relaxed);
+            // The same nanos, handed to the frame profile's own table so a
+            // present can close this split instead of a report boundary. The
+            // call is a gated relaxed load when that profile is off, which is
+            // the default; see `census::note_frame_chain_ns` for why the
+            // ordinal is shared rather than a second clock read here.
+            crate::runtime::drain::note_frame_chain_ns(phase as usize, ns);
             open.set(Some((next, now)));
         }
     });
@@ -391,10 +395,9 @@ impl Drop for ChainTimer {
         let now = Instant::now();
         OPEN.with(|open| {
             if let Some((phase, since)) = open.get() {
-                ACC[phase as usize].fetch_add(
-                    charge_ns(now.saturating_duration_since(since)),
-                    Ordering::Relaxed,
-                );
+                let ns = charge_ns(now.saturating_duration_since(since));
+                ACC[phase as usize].fetch_add(ns, Ordering::Relaxed);
+                crate::runtime::drain::note_frame_chain_ns(phase as usize, ns);
             }
             open.set(self.outer.map(|(phase, _)| (phase, now)));
         });
