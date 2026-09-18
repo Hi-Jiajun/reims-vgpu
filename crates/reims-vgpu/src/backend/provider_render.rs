@@ -27,8 +27,14 @@
 //!   target is its own four-byte image: a pooled wide attachment is a shape the
 //!   engine does not draw at all, and this class cannot answer for one
 //!   (`render_provider_out_of_class_wide_pooled`);
-//! - **one indexed draw**, `instance_count == 1`, `base_vertex == 0`, triangle
-//!   list, single-sample;
+//! - **one draw**, indexed or not, `instance_count == 1`, `base_vertex == 0`,
+//!   `first_vertex == 0`, triangle list, single-sample. The canonical contract
+//!   states one arm per shape — [`RenderPassDescriptor::indices`] is an
+//!   `Option`, and `None` reads as `0..vertices` — and both rails execute both
+//!   arms (Vulkan's `DrawShape::Vertices` beside `DrawShape::Indexed`, the
+//!   native rail's own `plan_vertex_input` arm), so a draw that names its
+//!   vertices directly is in class beside the one that indexes them (R39,
+//!   [`nonindexed_vertex_span`] is the span proof the second arm owes);
 //! - **the record that opens the packet** when the draw is one record of a
 //!   multi-record `exec` packet (W1). The packet's store plan grants the guest
 //!   writeback to its last record alone
@@ -41,7 +47,8 @@
 //!   pixels and `runtime::exec` hands them to the next record as its seed). A
 //!   record *with* a predecessor — the packet's middle, and its last record —
 //!   begins from a frame the class cannot name yet and keeps the engine;
-//! - **up to four vertex streams** and exactly one index stream, one canonical
+//! - **up to four vertex streams** and one index stream on the indexed arm —
+//!   none on the arm that names its vertices directly (R39) — one canonical
 //!   binding per stream. A stream the request holds as staged bytes is carried
 //!   into the trace as trace-owned bytes; a stream the draw path resolved
 //!   through the zero-copy rail is carried as the registered window its bind
@@ -652,8 +659,9 @@ use metal_api_core::provider::{
     SemanticDigest, StageBufferBinding, StageBufferView, StoreOp, TextureAccess,
     TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource, TextureType,
     TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
-    VertexStep, ViewId, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
-    MAX_RENDER_TEXTURE_INDEX, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES, MAX_RENDER_SAMPLERS,
+    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_RENDER_TEXTURE_INDEX, MAX_SERIAL_RESOURCES,
+    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::Device;
 use metal_api_vulkan::{RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage};
@@ -5179,8 +5187,12 @@ fn production_bytes(pass: &NarrowPass<'_>, descriptor: &mut RenderPassDescriptor
             }
         }
     }
-    if let Some(indices) = descriptor.indices.as_mut() {
-        if let StreamSource::Window(window) = &pass.index_stream.source {
+    // R39: both halves of this pair are absent on the non-indexed arm — the
+    // descriptor states no index view, and the pass has no index stream — so
+    // the arm needs no rule of its own here.
+    if let (Some(indices), Some(stream)) = (descriptor.indices.as_mut(), pass.index_stream.as_ref())
+    {
+        if let StreamSource::Window(window) = &stream.source {
             let bytes =
                 provider_owner::window_bytes(owner_window(index_stream_owner_binding(), *window))
                     .ok()?;
@@ -8306,7 +8318,12 @@ struct NarrowPass<'a> {
     width: u64,
     height: u64,
     extent: u64,
-    index_count: u32,
+    /// How many vertices' worth of primitives this draw names: the index count
+    /// on the indexed arm and the request's own `vertex_count` on the
+    /// non-indexed one (R39). One field rather than two, because the number
+    /// below the gate is one number: it is the descriptor's `vertices`, and the
+    /// pass's own shape, whichever arm named it.
+    draw_count: u32,
     /// The admitted streams, in the request's own attribute order: entry `i`
     /// becomes canonical binding `i`. One entry per fetch table, and one
     /// attribute per *location* inside it: the engine's request numbers one
@@ -8314,7 +8331,11 @@ struct NarrowPass<'a> {
     /// stream is several attributes off one table — which is the table entry `i`
     /// states here, with each attribute at its own offset.
     vertex_streams: Vec<NarrowVertexStream<'a>>,
-    index_stream: NarrowIndexStream<'a>,
+    /// The index stream, on the indexed arm alone: `None` is a draw that names
+    /// its vertices directly (R39), which is the contract's own `indices: None`
+    /// arm — read as `0..vertices`, with no index view, no index lease and no
+    /// `baseVertex` to add.
+    index_stream: Option<NarrowIndexStream<'a>>,
     /// The read-only stage buffers the request binds, in the contract's own
     /// canonical order (vertex bindings first by index, then fragment), empty
     /// for every request whose stages declare no `[[buffer(N)]]` argument.
@@ -8361,13 +8382,18 @@ struct NarrowPass<'a> {
 
 impl NarrowPass<'_> {
     /// The views this pass spends the trace's serial pool on: its attachment,
-    /// its vertex streams, its index stream, its stage buffers and its sampled
-    /// textures. The trace's own budget is
+    /// its vertex streams, its index stream *when it has one* (R39: a draw that
+    /// names its vertices directly declares no index view, so the pool is one
+    /// view cheaper), its stage buffers and its sampled textures. The trace's
+    /// own budget is
     /// [`MAX_SERIAL_RESOURCES`](metal_api_core::provider::MAX_SERIAL_RESOURCES)
     /// views, and a record that carries productions spends theirs beside this
     /// pass's — [`serial_views_admit`] is the one place that sum is compared.
     fn views(&self) -> usize {
-        1 + self.vertex_streams.len() + 1 + self.stage_buffers.len() + self.textures.len()
+        1 + self.vertex_streams.len()
+            + usize::from(self.index_stream.is_some())
+            + self.stage_buffers.len()
+            + self.textures.len()
     }
 
     /// Every vertex stream this pass states as a registered guest RAM window
@@ -8388,12 +8414,14 @@ impl NarrowPass<'_> {
     /// The window the draw's own index bind was cut from, when the index
     /// stream travels as the owner's mapping (`R11`).
     ///
-    /// One index stream per draw, so there is one window and no numbering: the
-    /// canonical binding is the contract's own zero
+    /// At most one index stream per draw, so there is one window and no
+    /// numbering: the canonical binding is the contract's own zero
     /// ([`IndexBufferBinding`]'s view is the pass's one index view), and the
-    /// owner label is the namespace below.
+    /// owner label is the namespace below. `None` covers both arms a window
+    /// cannot be cut from — a staged index stream, and the whole non-indexed
+    /// arm (R39), which has no index stream at all.
     fn index_window(&self) -> Option<StageBufferWindow> {
-        match &self.index_stream.source {
+        match &self.index_stream.as_ref()?.source {
             StreamSource::Window(window) => Some(*window),
             StreamSource::Staged(_) => None,
         }
@@ -8518,6 +8546,94 @@ impl NarrowPass<'_> {
             })
             .collect()
     }
+}
+
+/// The span proof the non-indexed arm owes, and the index arm does not (R39).
+///
+/// A draw that names its vertices directly reads `0..vertices`, so three facts
+/// about it are already stated somewhere outside this gate — and every one of
+/// them is a *refusal* rather than a fallback:
+///
+/// - a pipeline that declares a vertex layout names at least
+///   [`FULL_SCREEN_TRIANGLE_VERTICES`] vertices
+///   (`ContractError::DrawVertexCountBelowMinimum`);
+/// - a pipeline that declares none — the `vertex_id` shape, whose positions the
+///   module generates — names exactly that many
+///   (`ContractError::DrawVertexCountMismatch`);
+/// - every per-vertex stream covers `vertices * stride`
+///   (`render_vertex_buffer_footprint_unsupported` on the Vulkan rail,
+///   `render_vertex_footprint_unsupported` on the native one — one proof spelled
+///   twice, and the same proof the class's `index_staged` door already sends
+///   `vertex_short` shapes down a stricter form of).
+///
+/// The first two are the contract's own shape rules, so a draw outside them is
+/// one admission refuses; the third is the provider's own coverage proof, which
+/// the *indexed* arm does not owe in this form: an index names the vertex it
+/// reads, so that arm's proof is over `base_vertex + highest index + 1` rather
+/// than over the whole count. Answering all three here is what keeps the class's
+/// one promise — everything it admits is a shape the provider executes
+/// (`provider_render.rs`'s own words at the vertex-interface door above) —
+/// because an in-class refusal is a typed decline and never re-runs the engine
+/// (`runtime/draw/vulkan.rs`): a shape this gate let through and the provider
+/// refused would be a hard failure, not a fallback.
+///
+/// `None` is a shape the provider executes; `Some` is this class's own sentence
+/// for one it would decline, which keeps the draw on the engine instead.
+fn nonindexed_vertex_span(
+    vertex_streams: &[NarrowVertexStream<'_>],
+    draw_count: u32,
+) -> Option<OutOfClass> {
+    const ROUTE: &str = "render_provider_out_of_class_vertex_span";
+    if vertex_streams.is_empty() {
+        if draw_count == FULL_SCREEN_TRIANGLE_VERTICES {
+            return None;
+        }
+        return Some(OutOfClass::owned(
+            ROUTE,
+            format!(
+                "a non-indexed draw whose pipeline declares no vertex layout stays on the engine \
+                 unless it names exactly the {FULL_SCREEN_TRIANGLE_VERTICES} vertices the \
+                 canonical `vertex_id` shape carries: the contract refuses any other count by \
+                 name (`DrawVertexCountMismatch`), and a refusal is a decline rather than a \
+                 fallback, so this class does not hand admission a pass it can only lose (this \
+                 draw names {draw_count})",
+            ),
+        ));
+    }
+    if draw_count < FULL_SCREEN_TRIANGLE_VERTICES {
+        return Some(OutOfClass::owned(
+            ROUTE,
+            format!(
+                "a non-indexed draw with a vertex layout stays on the engine when it names fewer \
+                 than {FULL_SCREEN_TRIANGLE_VERTICES} vertices: the canonical contract refuses \
+                 such a pass by name (`DrawVertexCountBelowMinimum`), and a refusal is a decline \
+                 rather than a fallback (this draw names {draw_count})",
+            ),
+        ));
+    }
+    for (binding, stream) in vertex_streams.iter().enumerate() {
+        // Saturating, exactly as the native rail's own copy of this proof is: an
+        // unrepresentable product is by definition larger than any buffer this
+        // provider admits, so the comparison only has to decide coverage.
+        let required = u64::from(draw_count).saturating_mul(stream.stride);
+        let carried = stream.source.len();
+        if carried < required {
+            return Some(OutOfClass::owned(
+                ROUTE,
+                format!(
+                    "a non-indexed draw stays on the engine when a per-vertex stream does not \
+                     cover every vertex it names: the draw reads 0..{draw_count}, so the stream \
+                     at binding {binding} owes {required} bytes at stride {} and the bind \
+                     carries {carried}, which the provider proves before it executes the draw \
+                     (`render_vertex_buffer_footprint_unsupported` / \
+                     `render_vertex_footprint_unsupported`) — a proof this class answers here \
+                     because a decline on an in-class draw is fail-closed",
+                    stream.stride,
+                ),
+            ));
+        }
+    }
+    None
 }
 
 /// Whether one request is the narrow class, and the facts the trace is built
@@ -9349,41 +9465,63 @@ fn narrow_class<'a>(
             "only a triangle-list draw leaves for the canonical rail",
         ));
     }
-    let Some(index) = req.indexed.as_ref() else {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_nonindexed",
-            "the admitted shape is one indexed draw; a non-indexed draw stays on the engine",
-        ));
+    // The two arms the canonical contract's own `indices: Option` states (R39).
+    //
+    // The indexed arm keeps every door it had, in the order it had them: the
+    // zero-length draw first, then the `baseVertex` offset, then the index
+    // format and the stream's source and its length. Nothing about that arm
+    // moves, so every shape the class answered before answers the same way.
+    //
+    // The non-indexed arm has none of those doors to answer, and that is a fact
+    // about the shape rather than a relaxation: there is no index count to be
+    // zero, no `baseVertex` to add (the contract refuses that pairing by name,
+    // `BaseVertexRequiresIndices`), and no index format or index source to
+    // name. Its draw count is the request's own `vertex_count`, which the
+    // contract reads as `0..vertices` — and what it owes instead of those doors
+    // is the span proof [`nonindexed_vertex_span`] states, answered below
+    // because it is a statement about the vertex streams.
+    let (draw_count, index_stream) = match req.indexed.as_ref() {
+        Some(index) => {
+            if index.index_count == 0 {
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_index_count_zero",
+                    "a zero-length draw stays on the engine",
+                ));
+            }
+            if index.vertex_offset != 0 {
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_base_vertex",
+                    "a baseVertex offset stays on the engine",
+                ));
+            }
+            let index_format = match index.index_type {
+                crate::backend::vulkan::engine::IndexType::U16 => IndexFormat::Uint16,
+                crate::backend::vulkan::engine::IndexType::U32 => IndexFormat::Uint32,
+            };
+            // The index stream's source, arm by arm (R11), exactly as a vertex
+            // stream's (`R9q`): the request's own staged bytes, or the one
+            // registered window its zero-copy bind was cut from. The window arm
+            // is what the census read as `index_staging` on every draw whose
+            // index bind the draw path had already imported, and a gather this
+            // rail cannot state as one window keeps the engine under the same
+            // slug as before.
+            let index_source = index_stream_source(&index.content)?;
+            if index_source.len() == 0 {
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_index_empty",
+                    "an empty index stream stays on the engine",
+                ));
+            }
+            (
+                index.index_count,
+                Some(NarrowIndexStream {
+                    format: index_format,
+                    source: index_source,
+                }),
+            )
+        }
+        None => (req.vertex_count, None),
     };
-    if index.index_count == 0 {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_index_count_zero",
-            "a zero-length draw stays on the engine",
-        ));
-    }
-    if index.vertex_offset != 0 {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_base_vertex",
-            "a baseVertex offset stays on the engine",
-        ));
-    }
-    let index_format = match index.index_type {
-        crate::backend::vulkan::engine::IndexType::U16 => IndexFormat::Uint16,
-        crate::backend::vulkan::engine::IndexType::U32 => IndexFormat::Uint32,
-    };
-    // The index stream's source, arm by arm (R11), exactly as a vertex
-    // stream's (`R9q`): the request's own staged bytes, or the one registered
-    // window its zero-copy bind was cut from. The window arm is what the
-    // census read as `index_staging` on every draw whose index bind the draw
-    // path had already imported, and a gather this rail cannot state as one
-    // window keeps the engine under the same slug as before.
-    let index_source = index_stream_source(&index.content)?;
-    if index_source.len() == 0 {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_index_empty",
-            "an empty index stream stays on the engine",
-        ));
-    }
 
     // One canonical stream per *fetch table* the request's attributes read, and
     // one attribute per location inside it: the engine numbers one Vulkan
@@ -9493,6 +9631,22 @@ fn narrow_class<'a>(
         }
     }
 
+    // R39: the non-indexed arm's own span, answered here because it is a
+    // statement about the streams just built. The door is fail-closed by
+    // construction rather than by taste: an in-class draw the provider refuses
+    // ends as a typed decline (`runtime/draw/vulkan.rs` does not re-run the
+    // engine for one), so a shape this gate admits and the provider declines is
+    // a hard failure — and the provider's footprint proof is *stricter* on this
+    // arm than on the indexed one, which only owes coverage of the vertices its
+    // indices name. Every fact the door answers is one the canonical contract
+    // or one of the two rails states; [`nonindexed_vertex_span`] holds them and
+    // their names.
+    if req.indexed.is_none() {
+        if let Some(refusal) = nonindexed_vertex_span(&vertex_streams, draw_count) {
+            return Err(refusal);
+        }
+    }
+
     // R12's runtime-sampler wire question used to be answered here, as a fact
     // about the request: the frame format of that increment stated the pass's
     // sampled *textures* (the v70 channel) but not its runtime `[[sampler(n)]]`
@@ -9521,9 +9675,13 @@ fn narrow_class<'a>(
     // (`serial_resource_limit` at admission), and a shape above it is one the
     // provider always refuses — so the class answers it here, by name, rather
     // than handing admission a trace it can only decline.
+    // R39: the index view is one of the pool's views on the indexed arm and
+    // absent on the non-indexed one, so the sum this gate compares with the
+    // pool's own bound is the number of views the trace really declares —
+    // [`NarrowPass::views`] is the same sum read back at completion time.
     let views = 1
         + vertex_streams.len()
-        + 1
+        + usize::from(index_stream.is_some())
         + stage_buffers.len()
         + sampling.textures.len()
         + sampling
@@ -9596,12 +9754,9 @@ fn narrow_class<'a>(
         width: u64::from(req.width),
         height: u64::from(req.height),
         extent,
-        index_count: index.index_count,
+        draw_count,
         vertex_streams,
-        index_stream: NarrowIndexStream {
-            format: index_format,
-            source: index_source,
-        },
+        index_stream,
         stage_buffers,
         textures: sampling.textures,
         runtime_samplers: sampling.runtime_samplers,
@@ -10048,52 +10203,15 @@ fn submit_narrow(
         vertex_buffers.push(view);
         next_view += 1;
     }
-    let index_view = ViewId::new(next_view);
-    // R11: the index stream's own arm decides the view. Staged bytes stay
-    // trace-owned, exactly as before; a window-backed index bind names the
-    // lease the owner plan imported for it — the borrowed arm, or since R18 the
-    // staged lease over the copy the gate made — with the view offset and
-    // length the owner's own reservation covers. The same channel switch the
-    // vertex stream above keeps, for the same reason.
-    let (index_allocation, index_offset, index_length, index_source) = match &pass
-        .index_stream
-        .source
-    {
-        StreamSource::Staged(bytes) => (
-            input_allocation(next_view),
-            0,
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            BufferSource::OwnedBytes(bytes.to_vec()),
-        ),
-        StreamSource::Window(_) => {
-            let owner = leases
-                .as_ref()
-                .and_then(|plan| plan.view(index_stream_owner_binding()))
-                .expect("the owner plan covers every admitted index window");
-            (
-                owner.allocation,
-                owner.view_offset,
-                owner.view_length,
-                match owner.channel {
-                    provider_owner::Channel::Borrowed => BufferSource::BorrowedNoCopy(owner.lease),
-                    provider_owner::Channel::Staged => BufferSource::StagedLease(owner.lease),
-                },
-            )
-        }
-    };
-    let indices = IndexBufferBinding {
-        view: BufferView {
-            view_id: index_view,
-            metal_binding: 0,
-            allocation_id: index_allocation,
-            offset: index_offset,
-            length: index_length,
-            access: BufferAccess::Read,
-            attribute_stride: None,
-            source: index_source,
-        },
-        format: pass.index_stream.format,
-    };
+    let index_slot = next_view;
+    let index_view = ViewId::new(index_slot);
+    // R39: the index view's number is claimed whatever the arm is — the step is
+    // a property of the pass, not of the draw — so every view after this slot
+    // (the stage buffers' and the sampled textures') keeps the identity the
+    // indexed arm gives it. What the non-indexed arm does not do is *declare*
+    // anything there: the contract's `indices: None` arm reads `0..vertices`,
+    // and a view nothing names is not one the trace states.
+    //
     // The index view has an identity of its own: the two namespaces are the
     // same one (`ViewId`), and R9j made the collision visible — a stage
     // buffer's pool entry is keyed by this identity, and an index view that
@@ -10102,6 +10220,59 @@ fn submit_narrow(
     // buffer lived only in the render pass and nothing declared these views in
     // the pool; a landing declares them.
     next_view += 1;
+    let indices = match &pass.index_stream {
+        Some(stream) => {
+            // R11: the index stream's own arm decides the view. Staged bytes
+            // stay trace-owned, exactly as before; a window-backed index bind
+            // names the lease the owner plan imported for it — the borrowed
+            // arm, or since R18 the staged lease over the copy the gate made —
+            // with the view offset and length the owner's own reservation
+            // covers. The same channel switch the vertex stream above keeps,
+            // for the same reason.
+            let (index_allocation, index_offset, index_length, index_source) = match &stream.source
+            {
+                StreamSource::Staged(bytes) => (
+                    input_allocation(index_slot),
+                    0,
+                    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    BufferSource::OwnedBytes(bytes.to_vec()),
+                ),
+                StreamSource::Window(_) => {
+                    let owner = leases
+                        .as_ref()
+                        .and_then(|plan| plan.view(index_stream_owner_binding()))
+                        .expect("the owner plan covers every admitted index window");
+                    (
+                        owner.allocation,
+                        owner.view_offset,
+                        owner.view_length,
+                        match owner.channel {
+                            provider_owner::Channel::Borrowed => {
+                                BufferSource::BorrowedNoCopy(owner.lease)
+                            }
+                            provider_owner::Channel::Staged => {
+                                BufferSource::StagedLease(owner.lease)
+                            }
+                        },
+                    )
+                }
+            };
+            Some(IndexBufferBinding {
+                view: BufferView {
+                    view_id: index_view,
+                    metal_binding: 0,
+                    allocation_id: index_allocation,
+                    offset: index_offset,
+                    length: index_length,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: index_source,
+                },
+                format: stream.format,
+            })
+        }
+        None => None,
+    };
     // The v83 stage-buffer half, filled (R9d): one view per declaration, at the
     // view offset and length the owner's own lease covers — the pair the pass
     // has to state for the canonical registration to execute it. The leases
@@ -10307,9 +10478,12 @@ fn submit_narrow(
             u32::try_from(pass.height).unwrap_or(u32::MAX),
         ]),
         scissor: pass.scissor,
-        vertices: pass.index_count,
+        vertices: pass.draw_count,
         vertex_buffers,
-        indices: Some(indices),
+        // R39: `Some` on the indexed arm and `None` for a draw that names its
+        // vertices directly — the contract's own two arms, where `None` reads
+        // the count above as `0..vertices`.
+        indices,
         base_vertex: 0,
         cull: None,
         // The attachment's own blend state, stated since v100: `Some` exactly
@@ -10965,11 +11139,17 @@ fn input_allocations(pass: &NarrowPass<'_>, rows: &RowCopies) -> Vec<(Allocation
         }
         next_view += 1;
     }
-    if let StreamSource::Staged(bytes) = &pass.index_stream.source {
-        out.push((
-            input_allocation(next_view),
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        ));
+    // R39: the index slot is walked whether or not the arm states a stream, so
+    // the textures' own numbering below does not move with the draw's arm — and
+    // a non-indexed draw, which declares no index view, contributes no
+    // allocation to this list.
+    if let Some(stream) = &pass.index_stream {
+        if let StreamSource::Staged(bytes) = &stream.source {
+            out.push((
+                input_allocation(next_view),
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            ));
+        }
     }
     // The sampled textures' views are stated after the index view and the
     // stage buffers' (which claim a view number each but mint their allocation
@@ -12120,6 +12300,91 @@ mod vertex_interface_tests {
             distinct.len(),
             6,
             "one name per arm and one per distance: {routes:?} {distances:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nonindexed_span_tests {
+    use super::*;
+
+    /// One admitted stream over `bytes` at `stride`. The proof reads the source
+    /// and the stride alone, so the attributes are empty and the head is the
+    /// position this list states the table at.
+    fn stream(stride: u64, bytes: &[u8]) -> NarrowVertexStream<'_> {
+        NarrowVertexStream {
+            stride,
+            head: 0,
+            source: StreamSource::Staged(bytes),
+            attributes: Vec::new(),
+        }
+    }
+
+    /// The facts the non-indexed arm's span door answers (R39), one shape each:
+    /// the layout-bearing count, the layout-free shape's own count, and the
+    /// coverage proof both rails run over every per-vertex stream.
+    ///
+    /// The arm's rail case drives the third one end to end
+    /// (`provider_render_rail.rs::a_non_indexed_draw_the_provider_would_refuse_stays_on_the_engine_by_name`);
+    /// the first two are the contract's own shape rules, and the rail corpus
+    /// carries no module the layout-free arm can be reached with, so they are
+    /// pinned here, where the boundary values can be.
+    #[test]
+    fn the_span_door_answers_the_contracts_count_beside_the_streams_coverage() {
+        let bytes = [0u8; 24];
+        let slug = |draw_count: u32, streams: &[NarrowVertexStream<'_>]| {
+            nonindexed_vertex_span(streams, draw_count).map(|refusal| refusal.slug())
+        };
+        const SPAN: Option<&str> = Some("render_provider_out_of_class_vertex_span");
+
+        // A draw with a vertex layout owes at least the contract's own
+        // full-screen triangle (`DrawVertexCountBelowMinimum`); exactly the
+        // three the reviewed stream carries is the admitted shape.
+        assert_eq!(slug(3, &[stream(8, &bytes)]), None);
+        for too_few in [0, 1, 2] {
+            assert_eq!(
+                slug(too_few, &[stream(8, &bytes)]),
+                SPAN,
+                "a layout-bearing draw that names {too_few} vertices is one the contract \
+                 refuses, so it stays on the engine here"
+            );
+        }
+
+        // The layout-free `vertex_id` shape owes exactly that count
+        // (`DrawVertexCountMismatch`) — on both sides of it.
+        assert_eq!(slug(3, &[]), None);
+        for other in [0, 1, 2, 4, 6] {
+            assert_eq!(
+                slug(other, &[]),
+                SPAN,
+                "the layout-free shape names exactly {FULL_SCREEN_TRIANGLE_VERTICES} vertices, \
+                 and this one names {other}"
+            );
+        }
+
+        // Coverage, at the boundary and on both sides of it: `vertices * stride`
+        // bytes is covered, one byte less is not, and the stride is the stream's
+        // own rather than a constant of this module.
+        assert_eq!(slug(3, &[stream(8, &bytes[..24])]), None);
+        assert_eq!(slug(3, &[stream(8, &bytes[..23])]), SPAN);
+        assert_eq!(slug(3, &[stream(8, &bytes[..16])]), SPAN);
+        assert_eq!(
+            slug(3, &[stream(16, &bytes[..24])]),
+            SPAN,
+            "the same bytes cover fewer vertices at a wider stride"
+        );
+        assert_eq!(slug(4, &[stream(4, &bytes[..24])]), None);
+
+        // One short stream refuses the draw, and the sentence names which one —
+        // the census reads the shape, and the shape here is a position in the
+        // request's own fetch-table order.
+        let streams = [stream(8, &bytes[..24]), stream(8, &bytes[..16])];
+        let refusal = nonindexed_vertex_span(&streams, 3).expect("the second stream is short");
+        assert_eq!(refusal.slug(), "render_provider_out_of_class_vertex_span");
+        assert!(
+            refusal.detail().contains("binding 1"),
+            "the refusal names the stream it measured: {}",
+            refusal.detail()
         );
     }
 }
