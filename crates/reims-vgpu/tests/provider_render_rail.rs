@@ -5355,7 +5355,18 @@ fn the_sampled_texture_shapes_beside_the_entry_stay_on_the_engine_by_name() {
     });
     let (slug, detail) = answer("resident texture", &stages, &resident);
     eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_texture_source");
+    // R22 splits the arm this shape used to share with the guest gather: a
+    // GPU target is in class once a pass of this rail has declared its
+    // production, so the refusal is the *undeclared* half of it, named on its
+    // own. A target nothing produced is exactly this shape.
+    assert_eq!(
+        slug,
+        "render_provider_out_of_class_texture_source_undeclared"
+    );
+    assert!(
+        detail.contains("TextureSource::TraceView"),
+        "the sentence names the arm the rail would have to state: {detail}"
+    );
 
     // 6. The draw's sampler state: the bind has to repeat the module's own AIR
     //    state, and a state outside the family is answered under the same name.
@@ -12200,5 +12211,518 @@ fn a_vertex_stream_shared_by_two_attributes_leaves_room_for_its_stage_buffer() {
         provider_render::provider_submissions(),
         delivered,
         "and the draw never reaches the provider"
+    );
+}
+
+/// The extent a trace-production test draws at: the sampled fixture's own 8x4
+/// surface, whose fixed sample point ([`SAMPLED_TEXEL`]) exists only there, so
+/// the consumer's frame is one texel of the production on both rails.
+const PRODUCTION_EXTENT: (u32, u32) = (8, 4);
+
+/// The guest target a trace-production test renders into: the production
+/// extent's own geometry and the texel order the test's attachment declares.
+fn production_identity(id: u32, format: ash::vk::Format) -> engine::TargetIdentity {
+    engine::TargetIdentity::Surface {
+        id,
+        width: PRODUCTION_EXTENT.0,
+        height: PRODUCTION_EXTENT.1,
+        generation: 1,
+        format,
+    }
+}
+
+/// The producing record of a trace production: a byte-exact `Clear` whose draw
+/// covers nothing, under the request's own target identity, with the
+/// withheld-readback pair the seam states for a frame that lands in a resident.
+///
+/// Deliberately the *seam's* own shape rather than the test-only resident arm
+/// ([`resident_seed_request`]): the production this file's tests drive is the
+/// one the production seam actually states, which the R20 arm answers by
+/// publishing the frame.
+fn production_seed_request(
+    identity: &engine::TargetIdentity,
+    format: u16,
+    clear: [f64; 4],
+) -> DrawRequest {
+    let (width, height) = PRODUCTION_EXTENT;
+    let mut req = request_with_streams(format, &[degenerate_stream()]);
+    req.width = width;
+    req.height = height;
+    req.target_identity = Some(identity.clone());
+    req.skip_readback = true;
+    req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    req.color_attachment = Some(attachment_with_clear(format, clear));
+    req
+}
+
+/// The consuming record of a trace production (R22): the reviewed sampled
+/// fixture, whose one `[[texture(0)]]` bind is the GPU target `identity` rather
+/// than the request's own copy.
+///
+/// The bind states `format` — the *view's* own texel order, which the class gate
+/// compares against the surface the production stored (E-TX3's
+/// `RenderTextureSourceShapeMismatch`).
+fn produced_sample_request(
+    stages: &Stages,
+    identity: &engine::TargetIdentity,
+    format: ash::vk::Format,
+) -> DrawRequest {
+    let (width, height) = PRODUCTION_EXTENT;
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = width;
+    req.height = height;
+    let declaration = stages.fragment_texture_declarations[0];
+    let mut image = image_resource_in(declaration.binding, Vec::new(), (width, height), format);
+    image.source = SampledSource::Target(identity.clone());
+    req.sampled_images.push(image);
+    req.samplers
+        .push(sampled_sampler_resource(declaration.sampler_binding));
+    req
+}
+
+/// The frame the production seam hands back for a seed the class published
+/// (R20's held arm), in semantic RGBA8.
+fn published_seed(label: &str, stages: &Stages, req: &DrawRequest) -> Vec<u8> {
+    match provider_render::submit_render(&inputs_held(stages, RenderChainRole::SoleOrTail), req) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("{label}: the seam's own arm publishes the frame: {other:?}"),
+    }
+}
+
+/// R22: a sampled texture whose texels are a GPU target is executed by stating
+/// the trace's own production of that target (E-TX3's `TextureSource::TraceView`).
+///
+/// Three readings, all on one Lavapipe device:
+///
+/// * the arm **executes**: the producing record's pass rides the consuming
+///   record's own trace, the consumer samples the bytes that pass stored, and
+///   its frame is byte for byte the frame the engine's own two-record chain
+///   lands;
+/// * the frame **follows the production**: re-producing the same target with
+///   another clear moves the consumer's frame with it;
+/// * a consumer whose production the rail cannot name stays on the engine —
+///   see [`a_production_the_consumer_cannot_name_stays_on_the_engine_by_name`].
+#[test]
+fn a_sampled_gpu_target_rides_the_consuming_traces_own_production() {
+    let _guard = engine_test_session();
+    let producer_stages = reviewed_stages();
+    let consumer_stages = sampled_stages();
+    let (width, height) = PRODUCTION_EXTENT;
+    let identity = production_identity(0x7b_00_40, ash::vk::Format::R8G8B8A8_UNORM);
+    let green = [0.0, 1.0, 0.0, 1.0];
+    let red = [1.0, 0.0, 0.0, 1.0];
+
+    // 1. The production: the clear the degenerate draw never covers, under the
+    //    guest's own target identity. The class publishes the frame (R20) and
+    //    records the pass as the target's production (R22).
+    let seeded = published_seed(
+        "trace production",
+        &producer_stages,
+        &production_seed_request(&identity, MTL_FORMAT_RGBA8_UNORM, green),
+    );
+    assert_uniform_frame("trace production", &seeded, width, height, [0, 255, 0, 255]);
+
+    // 2. The consumer: the sampled texture's texels are that target, and the
+    //    submission reaches the provider — with no bytes of its own to carry.
+    let consumer =
+        || produced_sample_request(&consumer_stages, &identity, ash::vk::Format::R8G8B8A8_UNORM);
+    let delivered = provider_render::provider_submissions();
+    let sampled = provider_pixels("trace-produced sample", &consumer_stages, &consumer());
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered + 1,
+        "the trace-produced shape reached the canonical provider rather than staying on the \
+         engine"
+    );
+    assert_uniform_frame(
+        "trace-produced sample (provider)",
+        &sampled,
+        width,
+        height,
+        [0, 255, 0, 255],
+    );
+
+    // 3. The engine's own chain, from the same two requests: its first record
+    //    stores the resident, its second samples it — the comparison is a
+    //    statement about the two rails and not about one rail twice.
+    let Some(engine_seed) = engine_pixels(
+        "trace production (engine)",
+        &producer_stages,
+        production_seed_request(&identity, MTL_FORMAT_RGBA8_UNORM, green),
+    ) else {
+        return;
+    };
+    assert!(
+        engine_seed.is_empty(),
+        "a resident store's readback is withheld on the engine too"
+    );
+    let Some(engine_frame) = engine_pixels(
+        "trace-produced sample (engine)",
+        &consumer_stages,
+        consumer(),
+    ) else {
+        return;
+    };
+    assert_frames_equal(
+        "trace-produced sample vs the engine's own chain",
+        &sampled,
+        &engine_frame,
+    );
+
+    // 4. The frame follows the production: the same target re-produced with
+    //    another clear, and the consumer's frame moves with it — on both rails.
+    let reproduced = published_seed(
+        "re-produced target",
+        &producer_stages,
+        &production_seed_request(&identity, MTL_FORMAT_RGBA8_UNORM, red),
+    );
+    assert_uniform_frame(
+        "re-produced target",
+        &reproduced,
+        width,
+        height,
+        [255, 0, 0, 255],
+    );
+    let moved = provider_pixels("re-produced sample", &consumer_stages, &consumer());
+    assert_uniform_frame(
+        "re-produced sample (provider)",
+        &moved,
+        width,
+        height,
+        [255, 0, 0, 255],
+    );
+    assert_frames_differ("the production decides the sample", &moved, &sampled);
+    let _ = engine_pixels(
+        "re-produced target (engine)",
+        &producer_stages,
+        production_seed_request(&identity, MTL_FORMAT_RGBA8_UNORM, red),
+    );
+    let Some(engine_moved) =
+        engine_pixels("re-produced sample (engine)", &consumer_stages, consumer())
+    else {
+        return;
+    };
+    assert_frames_equal(
+        "re-produced sample vs the engine's own chain",
+        &moved,
+        &engine_moved,
+    );
+}
+
+/// R22's three refusals, each by its own name and each under its own census
+/// bucket: a target no pass of this rail declared a production for, a record
+/// that samples the attachment it writes (the production would have to follow
+/// the read), and a declaration that restates another shape than the
+/// production stored.
+#[test]
+fn a_production_the_consumer_cannot_name_stays_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let producer_stages = reviewed_stages();
+    let consumer_stages = sampled_stages();
+    let answer = |label: &str, req: &DrawRequest| -> (String, String) {
+        match provider_render::submit_render(
+            &inputs_held(&consumer_stages, RenderChainRole::SoleOrTail),
+            req,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the shape stays on the engine: {other:?}"),
+        }
+    };
+
+    // 1. Undeclared: the target exists as a GPU source (the request says so),
+    //    and no pass of this rail ever stated a production for it.
+    let unknown = production_identity(0x7b_00_41, ash::vk::Format::R8G8B8A8_UNORM);
+    let undeclared_before = route_count("render_provider_out_of_class_texture_source_undeclared");
+    let (slug, detail) = answer(
+        "undeclared production",
+        &produced_sample_request(&consumer_stages, &unknown, ash::vk::Format::R8G8B8A8_UNORM),
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(
+        slug,
+        "render_provider_out_of_class_texture_source_undeclared"
+    );
+    assert!(
+        detail.contains("TextureSource::TraceView"),
+        "the sentence names the arm the rail would have to state: {detail}"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source_undeclared") - undeclared_before,
+        1,
+        "the refused shape is counted under its own name"
+    );
+
+    // 2. Order: a record that samples the target it renders into. The target has
+    //    a production, so the refusal is the order and not the declaration.
+    let ordered = production_identity(0x7b_00_42, ash::vk::Format::R8G8B8A8_UNORM);
+    let _ = published_seed(
+        "ordered production",
+        &producer_stages,
+        &production_seed_request(&ordered, MTL_FORMAT_RGBA8_UNORM, [0.0, 1.0, 0.0, 1.0]),
+    );
+    let mut ill_ordered =
+        produced_sample_request(&consumer_stages, &ordered, ash::vk::Format::R8G8B8A8_UNORM);
+    ill_ordered.target_identity = Some(ordered.clone());
+    let order_before = route_count("render_provider_out_of_class_texture_source_order");
+    let (slug, detail) = answer("self-sampled production", &ill_ordered);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_source_order");
+    assert!(
+        detail.contains("RenderTextureAttachmentConflict"),
+        "the sentence names the contract's own refusal: {detail}"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source_order") - order_before,
+        1,
+        "the refused shape is counted under its own name"
+    );
+
+    // 3. Shape: the production stored another texel order than the declaration
+    //    restates. The wide target's own resident arm is the one the class
+    //    elects it by (`resident_frames_fetchable`), so this seed is driven
+    //    through the fetching caller's inputs.
+    let wide = production_identity(0x7b_00_43, ash::vk::Format::R16G16B16A16_SFLOAT);
+    let wide_seed = production_seed_request(&wide, MTL_FORMAT_RGBA16_FLOAT, [0.0, 1.0, 0.0, 1.0]);
+    match provider_render::submit_render(
+        &inputs(&producer_stages, RenderChainRole::SoleOrTail),
+        &wide_seed,
+    ) {
+        RenderRailOutcome::ProviderCompletedResident(_) => (),
+        other => panic!("a wide production's own store is the resident arm: {other:?}"),
+    }
+    let shape_before = route_count("render_provider_out_of_class_texture_source_shape");
+    let (slug, detail) = answer(
+        "mismatched production shape",
+        &produced_sample_request(&consumer_stages, &wide, ash::vk::Format::R8G8B8A8_UNORM),
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_source_shape");
+    assert!(
+        detail.contains("Rgba16Float") && detail.contains("R8G8B8A8_UNORM"),
+        "the sentence names both shapes: {detail}"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source_shape") - shape_before,
+        1,
+        "the refused shape is counted under its own name"
+    );
+}
+
+/// R22: a production's **window-backed** bind is re-imported into the consuming
+/// trace.
+///
+/// The producing record reads a registered guest window (R9e's no-copy arm);
+/// the consuming record samples that record's own production. The lease the
+/// producing submission imported is retired with its completion, so the
+/// production's pass has to import the same window again inside the consuming
+/// trace — and the reading that makes the re-import checkable is that the
+/// consumer's frame is byte for byte the frame the producing record published,
+/// both before and after the mapping's own bytes move.
+#[test]
+fn a_productions_window_backed_bind_is_re_imported_into_the_consuming_trace() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+
+    let _guard = engine_test_session();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the no-copy arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    owner.as_mut_slice()[..4].copy_from_slice(&[0, 0, 0x80, 0x3f]);
+    let import = 0x9e22_u64;
+    provider_owner::register(Region {
+        import,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x41_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let window = StageBufferWindow {
+        import,
+        host_va: owner.pointer as u64,
+        length: page as u64,
+        head: 0,
+        bytes_len: 16,
+    };
+    let staged = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16]));
+    let producer_stages = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
+    let consumer_stages = sampled_stages();
+    let (width, height) = PRODUCTION_EXTENT;
+    let identity = production_identity(0x7b_00_44, ash::vk::Format::R8G8B8A8_UNORM);
+
+    let mut seed = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    seed.width = width;
+    seed.height = height;
+    seed.target_identity = Some(identity.clone());
+    seed.skip_readback = true;
+    seed.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    seed.storage_buffers.push(engine::StorageBufferResource {
+        binding: 0,
+        content: staged.clone(),
+    });
+    let binds = [StageBufferBind {
+        stage: RenderPipelineStage::Fragment,
+        index: 0,
+        content: &staged,
+        window: Some(window),
+        landing: None,
+    }];
+    // The seam's own capability answer (R20): the record's frame comes back
+    // through the completion rather than staying in an image this caller cannot
+    // read, which is the arm the production seam states and the one a
+    // byte-for-byte comparison against the consumer's frame can be made on.
+    let held = RenderRailInputs {
+        resident_frames_fetchable: false,
+        ..inputs_with_binds(&producer_stages, RenderChainRole::SoleOrTail, &binds)
+    };
+    let publish = |label: &str| -> Vec<u8> {
+        match provider_render::submit_render(&held, &seed) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!("{label}: a window-backed production is in class: {other:?}"),
+        }
+    };
+    let consume = || {
+        provider_pixels(
+            "window-backed sample",
+            &consumer_stages,
+            &produced_sample_request(&consumer_stages, &identity, ash::vk::Format::R8G8B8A8_UNORM),
+        )
+    };
+
+    // The mapping holds the fragment's red; the sampled frame has to be that
+    // colour, and the consumer's frame has to be the producer's own frame.
+    let red = publish("red window");
+    assert_uniform_frame(
+        "window-backed production",
+        &red,
+        width,
+        height,
+        [255, 0, 0, 255],
+    );
+    let sampled = consume();
+    assert_frames_equal(
+        "the consumer samples the production's own frame",
+        &sampled,
+        &red,
+    );
+
+    // The falsifiable half: move the mapping's bytes, re-produce, and the
+    // consumer's frame follows — the re-import read the window, not a copy the
+    // producing submission left behind.
+    owner.as_mut_slice()[..4].copy_from_slice(&[0, 0, 0, 0]);
+    let black = publish("black window");
+    assert_uniform_frame(
+        "window-backed production (moved)",
+        &black,
+        width,
+        height,
+        [0, 0, 0, 255],
+    );
+    let moved = consume();
+    assert_frames_equal("the consumer samples the re-produced frame", &moved, &black);
+    assert_frames_differ(
+        "the production's own window decides the sample",
+        &moved,
+        &sampled,
+    );
+}
+
+/// R22: a sampled pass whose binds the owner→provider frame has to carry stays
+/// on the engine **by name**, rather than being admitted and then refused.
+///
+/// The frame's render contract carries no texture declarations yet
+/// (`research/docs/23` §101.5): the codec has a kind for the compute half's
+/// declarations and none for the render half's, so a sampled pass whose binds
+/// travel as leases reaches admission with its declarations dropped and is
+/// refused there (`UndeclaredTextureBinding`). That is a *decline*, not a
+/// fallback — and before this condition existed the rail answered exactly that
+/// way for this shape (the reading is archived in the R22 evidence directory).
+/// The class answers the wire question before the frame exists, so the shape
+/// falls back instead: the same two device answers the runtime sampler
+/// condition above keeps.
+#[test]
+fn a_sampled_pass_the_wire_would_strip_stays_on_the_engine_by_name() {
+    use reims_vgpu::backend::provider_compute::device_epoch;
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    let _guard = engine_test_session();
+    let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
+        .expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The reviewed full-screen triangle's own three `float2` positions, in the
+    // owner's mapping: the bind is a live guest stream, not a copy.
+    owner.as_mut_slice()[..24].copy_from_slice(&f32x2(&[(-1.0, -3.0), (-1.0, 1.0), (3.0, 1.0)]));
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let import_id = import.id().get();
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x42_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    let content = BufferContent::GuestRuns(engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            owner.pointer as usize,
+            2 * page as u64,
+            0,
+            24,
+        )
+        .expect("the bind's own bytes are inside the mapping")]),
+        source_offset: 0,
+        total_len: 24,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+            window_offset: 0,
+            guest,
+            window: Some(registered),
+        }])),
+        direct_image: None,
+    });
+    let stages = sampled_stages();
+    let mut request = sampled_request(&stages, sampled_texels(8, 4), (8, 4));
+    request.vertex_attributes[0].content = content;
+    let wire_before = route_count("render_provider_out_of_class_texture_wire");
+    let submissions = provider_render::provider_submissions();
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &request) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("door: {}\n  {}", reason.slug(), reason.detail());
+            assert_eq!(reason.slug(), "render_provider_out_of_class_texture_wire");
+        }
+        other => panic!("a sampled pass the wire would strip stays on the engine: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_wire") - wire_before,
+        1,
+        "the refused shape is counted under its own name"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions,
+        "the draw never reaches the provider — a fallback, not the decline the frame would earn"
     );
 }
