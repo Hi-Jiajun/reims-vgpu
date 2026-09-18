@@ -103,6 +103,36 @@
 //!   contract still carries no texture declarations) all stay on the engine.
 //!   The zero-copy guest gather keeps its own exit
 //!   (`..._texture_source`) — that arm is the increment after this one;
+//!
+//!   # The frame the registry holds, carried in (R24)
+//!
+//!   Census v18 (`evidence/gate3-census-v18-2026-09-18`) read R22's Target arm
+//!   split into two named refusals — `..._texture_source_undeclared` (893
+//!   records) and `..._texture_source_order` (618) — and they are two different
+//!   questions. A target no pass of this rail declared a production for is one
+//!   whose bytes *exist*: the engine's registry holds them (`SampledSource::
+//!   Target` is a resident bind), and the caller can read them out with the
+//!   same `read_target` R23's arm reads a chain frame with. The caller hands
+//!   that frame over ([`RenderRailInputs::sampled_target_frames`]) and the
+//!   declaration states the request's own copy (`TextureSource::OwnedBytes`),
+//!   exactly as every pre-R22 sampled texture does — so the arm is a transfer
+//!   of the *same* bytes, not a second reading of them. A frame the caller
+//!   never read, and a frame that is not the declaration's own extent, keep
+//!   the record on the engine under their own names
+//!   (`..._texture_source_undeclared`, `..._texture_source_frame_shape`).
+//!
+//!   The self-sampling record is *not* that question. Its read is the live
+//!   attachment — the arm the engine itself takes on a device with
+//!   `VK_EXT_attachment_feedback_loop_layout` (`sampled_self_feedback_loop` in
+//!   the census) — and every arm the canonical contract can state resolves
+//!   *before the pass opens*: a trace-produced view is an earlier pass's landed
+//!   store (`render_texture_source_order_unsupported` refuses the other order),
+//!   and a declaration that names the attachment's own view is
+//!   `RenderTextureAttachmentConflict`, "anything but a race". Answering that
+//!   read with pre-pass bytes would state the engine's *fallback* (its snapshot
+//!   arm), which differs from its answer wherever the shader reads a texel this
+//!   pass has already written, so the shape keeps its own name and its frame is
+//!   never read.
 //! - **the attachment's own blend state** (R10, `research/docs/23` §100): a
 //!   blend the canonical pass can state *and* the command channel's v40 section
 //!   carries (blending enabled, one operation for both channel pairs, every
@@ -1491,7 +1521,11 @@ fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
 /// same — the same rule the stage-buffer door states for a bind no stage
 /// declares.
 fn sampled_textures<'a>(
-    inputs: &RenderRailInputs<'_>,
+    // The inputs' *inner* lifetime, not only the borrow of them: R24's arm hands
+    // the caller's frame to the trace the same way the request's own bytes
+    // travel (`research/docs/26` §48), so the slice has to live as long as the
+    // consuming pass the caller builds from this answer.
+    inputs: &RenderRailInputs<'a>,
     req: &'a DrawRequest,
 ) -> Result<NarrowSampling<'a>, OutOfClass> {
     if req.color_input {
@@ -1858,71 +1892,135 @@ fn sampled_textures<'a>(
             }
             crate::backend::vulkan::engine::SampledSource::Target(identity) => {
                 // A record that samples the attachment it writes would need the
-                // production *after* the read: the canonical contract refuses a
-                // pass that samples an identity it stores as an attachment
-                // (`RenderTextureAttachmentConflict`), and the trace order this
-                // class states has no second reading for it either, so the
-                // shape is answered by name rather than reordered.
+                // production *after* the read, and this record's read is the
+                // live attachment: the engine states that read itself whenever
+                // the device carries `VK_EXT_attachment_feedback_loop_layout`
+                // (`sampled_self_feedback_loop` in the census), and every arm
+                // the canonical contract can state resolves *before* the pass
+                // opens — a trace-produced view is an earlier pass's landed
+                // store (`render_texture_source_order_unsupported` is the
+                // contract's name for the other order), and a declaration that
+                // names the pass's own attachment view is refused as
+                // `RenderTextureAttachmentConflict`, "anything but a race".
+                // Serving the read from bytes a copy captured before the pass
+                // would state the engine's *fallback* (its snapshot arm) rather
+                // than its answer, so the shape is answered by name rather than
+                // reordered — and its frame is not read at all (R24's caller
+                // skips it), because nothing would use it.
                 if req.writes_attachment(identity) {
                     return Err(OutOfClass::owned(
                         "render_provider_out_of_class_texture_source_order",
                         format!(
                             "a draw whose `[[texture({})]]` samples the very attachment it \
-                             renders into stays on the engine: the texels this class serves are \
-                             the trace's own earlier production of that identity, and a record \
-                             that writes the view it reads would put its own store after the \
-                             read — the contract refuses that shape by name \
-                             (`RenderTextureAttachmentConflict`)",
+                             renders into stays on the engine: the read this record states is the \
+                             live frame it is writing, while every arm this class can declare \
+                             resolves before the pass opens — the trace's own earlier production \
+                             of that identity would put its store after the read, which the \
+                             contract refuses by name (`RenderTextureAttachmentConflict`), and a \
+                             copy taken before the pass is the engine's fallback arm, not its \
+                             answer",
                             declaration.index,
                         ),
                     ));
                 }
-                let Some(production) = recorded_production(identity) else {
-                    return Err(OutOfClass::owned(
-                        "render_provider_out_of_class_texture_source_undeclared",
-                        format!(
-                            "a draw whose `[[texture({})]]` texels come from a GPU target stays on \
-                             the engine when no pass of this rail has declared that target's \
-                             production: the canonical rail samples a trace-produced view \
-                             (`TextureSource::TraceView`) by restating the pass that stored it, \
-                             and the resident and guest-gather arms are the increments after \
-                             this one — a production no record here stated is one this class \
-                             cannot restate either",
-                            declaration.index,
-                        ),
-                    ));
-                };
-                // The sampled declaration has to restate the stored surface's
-                // format and extent, exactly as the contract holds it
-                // (`RenderTextureSourceShapeMismatch`): the bytes the trace
-                // produces are the *stored* surface's, so a declaration that
-                // names another texel order or another extent would sample
-                // texels the production never wrote.
-                if production.format.as_texture_format() != format
-                    || [production.width, production.height]
-                        != [u64::from(image.width), u64::from(image.height)]
-                {
-                    return Err(OutOfClass::owned(
-                        "render_provider_out_of_class_texture_source_shape",
-                        format!(
-                            "a draw whose `[[texture({})]]` is {}x{} {:?} stays on the engine \
-                             when the target's own production stored {:?} at {}x{}: the \
-                             canonical rail pairs a trace-produced declaration with the store \
-                             that defines its bytes field by field and refuses a disagreement by \
-                             name (`render_texture_source_shape_mismatch`), and a declaration \
-                             that restates another shape is not one this class executes",
-                            declaration.index,
-                            image.width,
-                            image.height,
-                            image.format,
-                            production.format,
-                            production.width,
-                            production.height,
-                        ),
-                    ));
-                }
-                NarrowTextureSource::Produced {
-                    production: Arc::clone(&production),
+                match recorded_production(identity) {
+                    Some(production) => {
+                        // The sampled declaration has to restate the stored
+                        // surface's format and extent, exactly as the contract
+                        // holds it (`RenderTextureSourceShapeMismatch`): the
+                        // bytes the trace produces are the *stored* surface's,
+                        // so a declaration that names another texel order or
+                        // another extent would sample texels the production
+                        // never wrote.
+                        if production.format.as_texture_format() != format
+                            || [production.width, production.height]
+                                != [u64::from(image.width), u64::from(image.height)]
+                        {
+                            return Err(OutOfClass::owned(
+                                "render_provider_out_of_class_texture_source_shape",
+                                format!(
+                                    "a draw whose `[[texture({})]]` is {}x{} {:?} stays on the \
+                                     engine when the target's own production stored {:?} at {}x{}: \
+                                     the canonical rail pairs a trace-produced declaration with \
+                                     the store that defines its bytes field by field and refuses \
+                                     a disagreement by name \
+                                     (`render_texture_source_shape_mismatch`), and a declaration \
+                                     that restates another shape is not one this class executes",
+                                    declaration.index,
+                                    image.width,
+                                    image.height,
+                                    image.format,
+                                    production.format,
+                                    production.width,
+                                    production.height,
+                                ),
+                            ));
+                        }
+                        NarrowTextureSource::Produced {
+                            production: Arc::clone(&production),
+                        }
+                    }
+                    // R24: no pass of this rail ever stated that target's
+                    // production, but the *bytes* are not the caller's to
+                    // invent — the engine's registry holds them (`SampledSource::
+                    // Target` is a resident bind), and the caller that owns that
+                    // registry reads them out with the same `read_target` R23's
+                    // arm reads a chain frame with. The declaration then states
+                    // the request's own copy (`TextureSource::OwnedBytes`),
+                    // which is the arm every pre-R22 sampled texture takes, so
+                    // the two rails read one set of bytes through one view.
+                    None => {
+                        let Some(frame) = inputs.sampled_target_frame(identity) else {
+                            return Err(OutOfClass::owned(
+                                "render_provider_out_of_class_texture_source_undeclared",
+                                format!(
+                                    "a draw whose `[[texture({})]]` texels come from a GPU target \
+                                     stays on the engine when this rail has no production to \
+                                     restate for it and the caller hands no frame over: the \
+                                     canonical rail samples either a trace-produced view \
+                                     (`TextureSource::TraceView`, the pass that stored it restated \
+                                     in the same trace) or a copy the trace carries, and a target \
+                                     whose bytes neither of those names is one this class cannot \
+                                     state — the resident and guest-gather arms are the increments \
+                                     after this one",
+                                    declaration.index,
+                                ),
+                            ));
+                        };
+                        // The frame is the target's own tightly packed extent
+                        // read out of its image, and the declaration states the
+                        // *bind's* view over exactly those bytes (E-TX1/§107:
+                        // the byte order is the name's, not the memory's), so a
+                        // length that is not that extent is a caller wiring bug
+                        // and is refused under its own name rather than uploaded
+                        // and refused by the contract — a decline is never a
+                        // fallback.
+                        let expected = u64::from(image.width)
+                            .checked_mul(u64::from(image.height))
+                            .and_then(|texels| texels.checked_mul(format.bytes_per_texel()));
+                        if expected != u64::try_from(frame.len()).ok() {
+                            return Err(OutOfClass::owned(
+                                "render_provider_out_of_class_texture_source_frame_shape",
+                                format!(
+                                    "a draw whose `[[texture({})]]` view carries the caller's {} \
+                                     byte(s) frame for its {}x{} {:?} surface stays on the engine: \
+                                     the frame read out of the registry has to be the target's own \
+                                     tightly packed extent ({} byte(s)), the length the declaration \
+                                     states, or the two rails would read two different windows of \
+                                     one image",
+                                    declaration.index,
+                                    frame.len(),
+                                    image.width,
+                                    image.height,
+                                    image.format,
+                                    u64::from(image.width)
+                                        * u64::from(image.height)
+                                        * format.bytes_per_texel(),
+                                ),
+                            ));
+                        }
+                        NarrowTextureSource::Frame(frame)
+                    }
                 }
             }
             // The zero-copy guest gather: the bytes are the guest's own pages,
@@ -3402,6 +3500,21 @@ fn recorded_production(identity: &TargetIdentity) -> Option<Arc<RecordedProducti
     registry.by_identity.get(identity).cloned()
 }
 
+/// Whether this rail has a production a sampled GPU target could be served
+/// from (R22's arm) — the caller's own pre-check for R24's frame read.
+///
+/// The caller that owns the engine's registry reads a sampled target's frame
+/// out of it before every submission, and that read is a full image→host copy:
+/// asking for one under an identity this rail could have restated as
+/// `TextureSource::TraceView` would be a payment with no answer behind it. So
+/// the caller asks this first, and `false` is the only answer that leads to a
+/// read. The class re-checks the registry itself — this is a cost gate, not the
+/// authority — so a production that appears (or is evicted) between the two
+/// reads changes nothing about which arm answers.
+pub fn sampled_target_declared(identity: &TargetIdentity) -> bool {
+    recorded_production(identity).is_some()
+}
+
 /// Restate one producing pass's binds as the trace's own bytes, in place.
 ///
 /// The reason is the one thing a recorded pass cannot carry across
@@ -3502,11 +3615,18 @@ fn production_recordable(req: &DrawRequest, pass: &NarrowPass<'_>) -> bool {
     {
         return false;
     }
-    if pass
-        .textures
-        .iter()
-        .any(|texture| !matches!(texture.source, NarrowTextureSource::Bytes(_)))
-    {
+    // Both byte-bearing arms are restatable: the descriptor keeps the bytes
+    // themselves ([`NarrowTextureSource::Bytes`] from the request,
+    // [`NarrowTextureSource::Frame`] from the registry, R24), so re-running the
+    // pass in a later trace states the same inputs. A pass that itself samples
+    // a *trace-produced* view is the one shape that would need its own
+    // production restated recursively, and it is not recorded.
+    if pass.textures.iter().any(|texture| {
+        !matches!(
+            texture.source,
+            NarrowTextureSource::Bytes(_) | NarrowTextureSource::Frame(_)
+        )
+    }) {
         return false;
     }
     true
@@ -4033,6 +4153,33 @@ pub struct StageBufferBind<'a> {
     pub landing: Option<StageBufferLanding<'a>>,
 }
 
+/// One sampled GPU target's frame, as the caller read it out of the registry
+/// that holds it (R24).
+///
+/// Census v18 named these two populations apart: `..._texture_source_
+/// undeclared` (893 records) is a bind whose texels resolved to a guest target
+/// no pass of this rail recorded a production for, and the bytes of that target
+/// are not a mystery — [`crate::backend::vulkan::engine::SampledSource::Target`]
+/// is a resident bind, so the caller that owns the registry can read the image
+/// out (`engine::read_target_four_byte_color`) and hand it over here. The
+/// class then declares it exactly as a bind whose bytes the request carried
+/// (the pre-R22 arm), which is what makes the two rails read one set of bytes
+/// rather than two readings of one image.
+///
+/// The bytes travel in the *image's* own order and at its tightly packed
+/// extent, which is the readback's own shape; the *bind's* view format over
+/// them is a separate fact the declaration states (E-TX1, `research/docs/23`
+/// §107), so one frame serves every bind of that identity.
+#[derive(Clone, Debug)]
+pub struct SampledTargetFrame<'a> {
+    /// The guest target the frame belongs to — the identity the request's own
+    /// sampled bind states, not a second name for it.
+    pub identity: crate::backend::vulkan::engine::TargetIdentity,
+    /// The frame's bytes: the target image's level 0, four-byte colour, at the
+    /// image's own width.
+    pub bytes: &'a [u8],
+}
+
 /// What one render submission needs to leave this rail: the two stage
 /// modules' AIR, the entries the translation reports for them, and this
 /// record's place in the chain it belongs to.
@@ -4139,6 +4286,27 @@ pub struct RenderRailInputs<'a> {
     /// record that is not the packet's middle — and those records keep the
     /// class's refusal by name.
     pub chain_middle_source_bytes: Option<&'a [u8]>,
+    /// The frames the caller read out of the registry that holds them, for
+    /// sampled GPU targets this rail has no production to restate (R24).
+    ///
+    /// A bind whose texels resolved to a guest target (`SampledSource::Target`)
+    /// is a bind whose bytes *exist* somewhere: the engine's registry holds
+    /// them, because the resolution that produced that arm was a resident bind.
+    /// R22's arm serves the identities this rail's own passes recorded a
+    /// production for; for the rest, the caller that owns the registry can read
+    /// the target's frame out (`engine::read_target_four_byte_color`: the
+    /// image's own bytes, four-byte colour only) and hand it over here, and the
+    /// declaration then states the request's own copy — the arm every pre-R22
+    /// sampled texture takes.
+    ///
+    /// The frames are keyed by the identity the request's own bind states, not
+    /// by binding: the bytes are the image's, and the bind's view format over
+    /// them is a separate fact the declaration already states (E-TX1/§107), so
+    /// two binds of one target read one frame. A frame that is not the
+    /// declaration's own tightly packed extent is a caller wiring bug and keeps
+    /// its own slug ([`sampled_textures`]); a target the caller hands nothing
+    /// for keeps R22's own refusal by name. Neither is a fallback.
+    pub sampled_target_frames: &'a [SampledTargetFrame<'a>],
     /// The *vertex stage's own* attribute locations, as the translation that
     /// produced `vertex_air` reflected them
     /// (`CachedShader::reflection.vertex_attributes`), in the reflection's
@@ -4267,6 +4435,18 @@ impl StageBufferStatement<'_> {
 }
 
 impl<'a> RenderRailInputs<'a> {
+    /// The caller's frame for one sampled GPU target, when it handed one over
+    /// (R24's arm; see [`Self::sampled_target_frames`]).
+    pub fn sampled_target_frame(
+        &self,
+        identity: &crate::backend::vulkan::engine::TargetIdentity,
+    ) -> Option<&'a [u8]> {
+        self.sampled_target_frames
+            .iter()
+            .find(|frame| &frame.identity == identity)
+            .map(|frame| frame.bytes)
+    }
+
     /// The one statement this request's two stages make (R9m).
     ///
     /// A `[[buffer(N)]]` argument the translated entry point never reaches is
@@ -5299,7 +5479,7 @@ struct NarrowSampling<'a> {
     productions: Vec<Arc<RecordedProduction>>,
 }
 
-/// Where one admitted texture's texels come from (R10/R22).
+/// Where one admitted texture's texels come from (R10/R22/R24).
 #[derive(Clone)]
 enum NarrowTextureSource<'a> {
     /// The request's own tightly packed copy, the arm every earlier increment
@@ -5311,6 +5491,16 @@ enum NarrowTextureSource<'a> {
     /// trace runs, so the view travels as `TextureSource::TraceView` and the
     /// production rides the same trace ahead of this pass.
     Produced { production: Arc<RecordedProduction> },
+    /// The frame the caller read out of the registry that holds a sampled GPU
+    /// target (R24), declared in the same place in the trace as
+    /// [`Self::Bytes`]: the declaration states `TextureSource::OwnedBytes` over
+    /// exactly those bytes, because that is what they are — a copy the trace
+    /// carries, read out of the image the engine's own bind would have sampled.
+    /// The variant exists so the arm that answered is countable at the
+    /// completion (the census reads its own positive counter beside R23's), and
+    /// so a pass that samples one is still restatable as a production: its
+    /// descriptor carries the bytes, not a lease.
+    Frame(&'a [u8]),
 }
 
 /// One admitted texture: the canonical binding (the Metal index it states, in
@@ -5413,6 +5603,12 @@ struct NarrowPass<'a> {
     /// numbers rather than one: R23 carries the frame the *engine's* registry
     /// holds, R25 the frame the *walk* holds.
     carried_chain_middle: bool,
+    /// Whether at least one of this pass's sampled textures is the frame the
+    /// caller read out of the registry (R24's arm). Counted as
+    /// `render_provider_sampled_target_frames` at the completion, beside R23's
+    /// own counter, for the same reason: the population is what the census
+    /// reads, and a submission that never reached the caller is not an answer.
+    sampled_target_frames: bool,
     bgra: bool,
     width: u64,
     height: u64,
@@ -6420,6 +6616,10 @@ fn narrow_class<'a>(
         store,
         published_held_resident,
         carried_chain_middle,
+        sampled_target_frames: sampling
+            .textures
+            .iter()
+            .any(|texture| matches!(texture.source, NarrowTextureSource::Frame(_))),
         bgra: format == AttachmentFormat::Bgra8Unorm,
         width: u64::from(req.width),
         height: u64::from(req.height),
@@ -6940,7 +7140,10 @@ fn submit_narrow(
         // produced texture, so the numbering `input_allocations` derives stays
         // in lockstep with the views stated here.
         let (view_id, allocation_id, source) = match &texture.source {
-            NarrowTextureSource::Bytes(bytes) => (
+            // R24's frame is the same arm one step further in: the bytes are
+            // the caller's copy of the target image, declared for this view
+            // exactly as a request-carried copy is.
+            NarrowTextureSource::Bytes(bytes) | NarrowTextureSource::Frame(bytes) => (
                 ViewId::new(next_view),
                 input_allocation(next_view),
                 TextureSource::OwnedBytes(bytes.to_vec()),
@@ -7340,6 +7543,13 @@ fn submit_narrow(
             "render_provider_resident_source_bytes"
         });
     }
+    // R24's own population, counted where the answer happens for the same
+    // reason as R23's above: the caller read a sampled GPU target's frame out
+    // of the registry that holds it and this pass declared it as the trace's
+    // own bytes, so the record left the engine without a production to restate.
+    if pass.sampled_target_frames {
+        crate::runtime::drain::note_store_route("render_provider_sampled_target_frames");
+    }
     // The held arm's own population: a caller withheld its readback and this
     // rail published the frame because the caller cannot fetch a kept one.
     // Counted here rather than where the arm was elected, so a submission that
@@ -7640,11 +7850,15 @@ fn input_allocations(pass: &NarrowPass<'_>) -> Vec<(AllocationId, u64)> {
     // makes, one number at a time.
     let texture_base = next_view + 1 + u64::try_from(pass.stage_buffers.len()).unwrap_or(u64::MAX);
     for (index, texture) in pass.textures.iter().enumerate() {
-        // A trace-produced texture names the identity its production stored
-        // under (R22): the allocation is the production's, declared from that
-        // side of the trace, and re-declaring it here would be a second record
-        // for one view.
-        let NarrowTextureSource::Bytes(bytes) = &texture.source else {
+        // Both byte-bearing arms — the request's own copy and the caller's
+        // frame (R24) — mint their own view's allocation here. A
+        // trace-produced texture names the identity its production stored
+        // under (R22): that allocation is declared from the production's side
+        // of the trace, and re-declaring it here would be a second record for
+        // one view.
+        let (NarrowTextureSource::Bytes(bytes) | NarrowTextureSource::Frame(bytes)) =
+            &texture.source
+        else {
             continue;
         };
         let view_number = texture_base + u64::try_from(index).unwrap_or(u64::MAX);

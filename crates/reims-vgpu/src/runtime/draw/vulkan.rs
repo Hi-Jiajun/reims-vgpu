@@ -10355,6 +10355,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     None
                 };
+            // R24: the frames this caller can read out for the record's own
+            // sampled GPU targets — the same registry read R23's arm makes for
+            // the chain, one question over. Materialized before the submission
+            // for the same reason: the gate is pure over the request and the
+            // frames have to be part of what it answers, and only the caller
+            // that owns the registry can produce them.
+            #[cfg(feature = "provider-render")]
+            let mut sampled_target_frame_store = Vec::new();
+            #[cfg(feature = "provider-render")]
+            let sampled_target_frames =
+                sampled_target_frames(&resources, &mut sampled_target_frame_store);
             let inputs = RenderRailInputs {
                 vertex_air: resolved.vertex_air.as_ref(),
                 fragment_air: resolved.fragment_air.as_ref(),
@@ -10396,6 +10407,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // own — and the middle is the position that both takes and
                 // hands one on.
                 chain_middle_source_bytes: middle_source_frame.as_deref(),
+                // R24: the sampled GPU targets this caller read a frame out
+                // for, keyed by the identity the request's own bind states.
+                // Empty for every record whose sampled textures carry their own
+                // bytes, whose targets the rail can restate as a production,
+                // and whose reads the engine's own spelling declines — those
+                // stay on the engine by name.
+                sampled_target_frames: &sampled_target_frames,
                 // The stage's own attribute locations, so a request whose
                 // declared streams disagree with them stays on the engine
                 // instead of being answered by a provider that always refuses
@@ -11833,6 +11851,82 @@ fn chain_middle_source_frame(
         }
     }
     Some(bytes)
+}
+
+/// The frames this caller can hand the canonical rail for sampled GPU targets
+/// it has no production to restate (R24).
+///
+/// Census v18's two new Target refusals are two different questions, and this
+/// is the caller's half of the first one: `..._texture_source_undeclared` is a
+/// bind whose texels resolved to a guest target no pass of the rail recorded a
+/// production for — but the target's bytes *exist*, because that arm
+/// (`SampledSource::Target`) is a resident bind and the registry is this
+/// caller's own. `read_target_four_byte_color` reads them out — the image's own
+/// bytes, four-byte colour only, so a resident the rail's readback would
+/// quantize is not handed over as though it were the image — and the class
+/// declares them exactly as it declares a bind whose bytes the request carried.
+///
+/// Three shapes are deliberately *not* read:
+///
+/// - a record that samples the attachment it writes: that read is live (the
+///   engine's own `sampled_self_feedback_loop` arm), the class answers it by
+///   name (`..._texture_source_order`), and a frame nothing would use is a
+///   full image→host copy bought for nothing;
+/// - a target the rail *can* restate (`sampled_target_declared`): R22's arm
+///   replays the producing pass inside the consuming trace, which needs no
+///   round trip at all;
+/// - a target the engine samples through another view spelling than the bind
+///   states (`sample_view_format`): the canonical declaration can state the two
+///   eight-bit UNORM orders, and a resident whose transfer function changes the
+///   reading would have to be answered with an arm the class does not have.
+///
+/// A frame the read declines is not counted here: like R23's own read, this is
+/// a question rather than a payment, and a speculative read must not move a
+/// failure counter. The class keeps the record on the engine by name instead —
+/// `..._texture_source_undeclared`, or its own `..._texture_source_frame_shape`
+/// when the caller handed a frame that is not the declaration's extent.
+#[cfg(feature = "provider-render")]
+fn sampled_target_frames<'a>(
+    req: &crate::backend::vulkan::engine::DrawRequest,
+    frames: &'a mut Vec<(crate::backend::vulkan::engine::TargetIdentity, Vec<u8>)>,
+) -> Vec<crate::backend::provider_render::SampledTargetFrame<'a>> {
+    for image in &req.sampled_images {
+        let crate::backend::vulkan::engine::SampledSource::Target(identity) = &image.source else {
+            continue;
+        };
+        if req.writes_attachment(identity) {
+            continue;
+        }
+        if crate::backend::provider_render::sampled_target_declared(identity) {
+            continue;
+        }
+        if frames.iter().any(|(known, _)| known == identity) {
+            continue;
+        }
+        // The view the engine samples through is the bind's declared format
+        // with the resident's transfer function (`sample_view_format`). The
+        // canonical declaration states the bind's format alone, so a resident
+        // whose spelling would win over it is a reading the rail cannot state.
+        if image.format
+            != translate::pixel::sample_view_format(image.format, identity.resident_format())
+        {
+            continue;
+        }
+        let Ok(Some(frame)) = crate::backend::vulkan::engine::read_target_four_byte_color(identity)
+        else {
+            continue;
+        };
+        frames.push((identity.clone(), frame));
+    }
+    frames
+        .iter()
+        .map(
+            |(identity, bytes)| crate::backend::provider_render::SampledTargetFrame {
+                identity: identity.clone(),
+                bytes: bytes.as_slice(),
+            },
+        )
+        .collect()
 }
 
 /// Read a resident render-pass chain back to host memory so the exec loop can
