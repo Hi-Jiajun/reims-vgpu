@@ -76,9 +76,11 @@
 //!   list *is* the fragment stage's texture argument space, so the class states
 //!   one declaration per reflected `[[texture(n)]]` — the module's own AIR
 //!   sampler state, the Metal index the entry states (the two lists pair by
-//!   that index rather than by position since E-RS3, §104), and the one shape
-//!   the render sampler uploads (a single-sample, non-arrayed, read-only 2D
-//!   surface of `rgba8_unorm` texels at the render area's own extent) — beside
+//!   that index rather than by position since E-RS3, §104), and the shapes the
+//!   render sampler uploads (a single-sample, non-arrayed, read-only 2D
+//!   surface whose texels are one of the two four-byte 8-bit UNORM byte orders
+//!   — `rgba8_unorm`/`bgra8_unorm`, the provider's whole `RENDER_SAMPLED`
+//!   window since E-TX1/§107 — at the render area's own extent) — beside
 //!   the draw's own bind, and requires the bind's sampler state to repeat the
 //!   module's. Every other shape is a named exit ([`sampled_textures`]): a
 //!   resource family the translated rail does not execute, a texture index at
@@ -403,10 +405,10 @@ use metal_api_core::provider::{
     RenderAttachment, RenderPassBlend, RenderPassDescriptor, RenderPipelineContract,
     RenderPipelineStage, RenderSamplerBinding, ResourceTableSnapshot, SamplerPolicy,
     SemanticDigest, StageBufferBinding, StageBufferView, StoreOp, TextureAccess,
-    TextureBindingContract, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
-    MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_RENDER_TEXTURE_INDEX,
-    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource, TextureType,
+    TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
+    VertexStep, ViewId, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
+    MAX_RENDER_TEXTURE_INDEX, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::Device;
 use metal_api_vulkan::{RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage};
@@ -1362,8 +1364,9 @@ fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
 /// 2. **What the draw bound.** Declaration `i` pairs with the request's own
 ///    bind at the device binding the runtime resolved it at; a declaration
 ///    without one is `..._texture_unbound`, a bind whose shape the pass cannot
-///    state (dimensionality, layers, descriptor count, a non-RGBA8 texel, a
-///    view swizzle) is `..._texture_bind`, and a bind whose texels are a guest
+///    state (dimensionality, layers, descriptor count, a texel outside the two
+///    8-bit byte orders `rgba8_unorm`/`bgra8_unorm`, a view swizzle) is
+///    `..._texture_bind`, and a bind whose texels are a guest
 ///    gather or a resident image rather than the request's own copy is
 ///    `..._texture_source` — this increment carries text-owned bytes the way
 ///    the vertex streams' staged arm does.
@@ -1669,6 +1672,21 @@ fn sampled_textures<'a>(
                 ),
             ));
         };
+        // The texel the canonical render sampler uploads, named by the bind's
+        // own Vulkan view format (E-TX1, `research/docs/23` §107): the
+        // provider's whole `RENDER_SAMPLED` window is the two four-byte 8-bit
+        // UNORM byte orders, and the bytes travel verbatim into the image the
+        // *name* selects, so the fragment stage reads the channels the guest's
+        // own view states. Any other format — the narrow single- and
+        // dual-channel lanes and the wide half-float the census counts — is
+        // refused by the provider under `render_texture_format_unsupported`, so
+        // this class answers it here rather than handing the provider a draw
+        // the engine would have run.
+        let format = match image.format {
+            ash::vk::Format::R8G8B8A8_UNORM => Some(TextureFormat::Rgba8Unorm),
+            ash::vk::Format::B8G8R8A8_UNORM => Some(TextureFormat::Bgra8Unorm),
+            _ => None,
+        };
         let bindable = image.array_element == 0
             && image.descriptor_count == 1
             && image.layers == 1
@@ -1676,17 +1694,19 @@ fn sampled_textures<'a>(
             && !image.multisampled
             && image.width != 0
             && image.height != 0
-            && image.format == ash::vk::Format::R8G8B8A8_UNORM
             && crate::protocol::pixel_format::swizzle_is_identity(&image.swizzle);
-        if !bindable {
+        let Some(format) = format.filter(|_| bindable) else {
             return Err(OutOfClass::owned(
                 "render_provider_out_of_class_texture_bind",
                 format!(
                     "a draw that binds a texture of its own shape at `[[texture({})]]` stays on \
                      the engine: the canonical pass states one single-sample, non-arrayed 2D view \
-                     with one descriptor, `rgba8_unorm` texels and an identity channel mapping, \
-                     and the bind is {}x{} {:?} (kind {:?}, layers {}, descriptors {}, element \
-                     {}, multisampled {})",
+                     with one descriptor, `rgba8_unorm` or `bgra8_unorm` texels (the provider's \
+                     whole `RENDER_SAMPLED` window) and an identity channel mapping, and the bind \
+                     is {}x{} {:?} (kind {:?}, layers {}, descriptors {}, element {}, multisampled \
+                     {}) — a texel outside that window is refused by the provider by name \
+                     (`render_texture_format_unsupported`) rather than uploaded under another \
+                     format",
                     declaration.index,
                     image.width,
                     image.height,
@@ -1698,7 +1718,7 @@ fn sampled_textures<'a>(
                     image.multisampled,
                 ),
             ));
-        }
+        };
         let crate::backend::vulkan::engine::SampledSource::Bytes(bytes) = &image.source else {
             return Err(OutOfClass::owned(
                 "render_provider_out_of_class_texture_source",
@@ -1711,21 +1731,26 @@ fn sampled_textures<'a>(
                 ),
             ));
         };
+        // Both window formats are four-byte texels, and the count comes from
+        // the format the bind states rather than from a constant here, so a
+        // later widening of the provider's window has one place to answer for
+        // its own texel width.
         let expected = u64::from(image.width)
             .checked_mul(u64::from(image.height))
-            .and_then(|texels| texels.checked_mul(4));
+            .and_then(|texels| texels.checked_mul(format.bytes_per_texel()));
         if expected != u64::try_from(bytes.len()).ok() {
             return Err(OutOfClass::owned(
                 "render_provider_out_of_class_texture_bind",
                 format!(
-                    "a draw whose `[[texture({})]]` view carries {} byte(s) for a {}x{} rgba8 \
+                    "a draw whose `[[texture({})]]` view carries {} byte(s) for a {}x{} {:?} \
                      surface stays on the engine: the canonical view's byte source has to be the \
                      whole tightly packed extent ({} byte(s))",
                     declaration.index,
                     bytes.len(),
                     image.width,
                     image.height,
-                    u64::from(image.width) * u64::from(image.height) * 4,
+                    image.format,
+                    u64::from(image.width) * u64::from(image.height) * format.bytes_per_texel(),
                 ),
             ));
         }
@@ -1799,6 +1824,7 @@ fn sampled_textures<'a>(
             index: declaration.index,
             width: u64::from(image.width),
             height: u64::from(image.height),
+            format,
             sampler,
             bytes,
         });
@@ -4123,6 +4149,35 @@ fn contract_fingerprint(contract: &RenderPipelineContract) -> String {
             FootprintProof::Unbounded => out.push_str("unbounded;"),
         }
     }
+    // The sampled-texture face (R10/R19), for the reason above one face over.
+    // The declarations are part of the contract the canonical rail registers,
+    // so they are part of what the cache keys on — and since R19 the *format*
+    // is a fact two requests can differ in while agreeing on everything else:
+    // the provider's window states two byte orders, and a fingerprint that
+    // omitted the format would hand the second one the pipeline the first
+    // registered. That collision is answered by name rather than with a wrong
+    // frame (the trace's own view naming `Bgra8Unorm` beside a declaration that
+    // says `Rgba8Unorm` is the provider's `trace_contract_invalid`), but it is
+    // a decline of a shape this class admits, which is what makes it a defect
+    // in the key rather than a boundary.
+    for texture in &contract.textures {
+        // The format travels as the contract's own name rather than as a wire
+        // code: this key is an in-process string, and the name is the spelling
+        // the two rails' own refusals use (`trace_contract_invalid` names it
+        // too), so a reader of a cache miss sees the fact that moved.
+        out.push_str(&format!(
+            "t{}:{:?}:{:?}:{:?}:{:?}:",
+            texture.metal_binding,
+            texture.format,
+            texture.access,
+            texture.sampler,
+            texture.runtime_sampler,
+        ));
+        out.push_str(match texture.footprint {
+            TextureFootprintProof::WholeView => "whole;",
+            TextureFootprintProof::Unbounded => "unbounded;",
+        });
+    }
     out
 }
 
@@ -4597,10 +4652,17 @@ struct NarrowTexture<'a> {
     index: u32,
     width: u64,
     height: u64,
+    /// The texel the bind's own view names, resolved to the contract's format
+    /// (E-TX1, `research/docs/23` §107): one of the two four-byte 8-bit UNORM
+    /// byte orders, which is the provider's whole `RENDER_SAMPLED` window. The
+    /// declaration, the view and the byte count all read it, so the bytes and
+    /// the name they are uploaded under cannot drift apart.
+    format: TextureFormat,
     /// The sampler form the declaration states, or the sampler-free fetched
     /// arm (R15).
     sampler: NarrowSampler,
-    /// The texels, as the request's own tightly packed `rgba8_unorm` copy.
+    /// The texels, as the request's own tightly packed copy — four bytes per
+    /// texel, in the byte order [`Self::format`] names.
     bytes: &'a [u8],
 }
 
@@ -4800,22 +4862,18 @@ impl NarrowPass<'_> {
         self.textures
             .iter()
             .map(|texture| match texture.sampler {
-                NarrowSampler::Static(policy) => TextureBindingContract::sampled(
-                    texture.index,
-                    TextureFormat::Rgba8Unorm,
-                    policy,
-                ),
-                NarrowSampler::Runtime { index } => TextureBindingContract::sampled_runtime(
-                    texture.index,
-                    TextureFormat::Rgba8Unorm,
-                    index,
-                ),
+                NarrowSampler::Static(policy) => {
+                    TextureBindingContract::sampled(texture.index, texture.format, policy)
+                }
+                NarrowSampler::Runtime { index } => {
+                    TextureBindingContract::sampled_runtime(texture.index, texture.format, index)
+                }
                 // The sampler-free arm (R15): the declaration states the image
                 // alone, and the module's own `OpImageFetch` reads it — a rail
                 // that bound a sampler would be filling a descriptor nothing
                 // samples through.
                 NarrowSampler::Fetched => {
-                    TextureBindingContract::fetched(texture.index, TextureFormat::Rgba8Unorm)
+                    TextureBindingContract::fetched(texture.index, texture.format)
                 }
             })
             .collect()
@@ -5934,11 +5992,12 @@ fn submit_narrow(
 
     // The v101 sampled-texture half (R10): one view per admitted declaration,
     // in the contract's canonical order, each carrying the request's own
-    // tightly packed `rgba8_unorm` copy as a trace-owned source and stating the
-    // Metal index its declaration states (E-RS3). The sampler state is *not* a
-    // view field: the declaration states it, and the canonical rail creates its
-    // `VkSampler` from that state — which is why the class gate requires the
-    // draw's bind to repeat it rather than trusting either half.
+    // tightly packed copy as a trace-owned source, the byte order its own bind
+    // states (E-TX1, `research/docs/23` §107), and the Metal index its
+    // declaration states (E-RS3). The sampler state is *not* a view field: the
+    // declaration states it, and the canonical rail creates its `VkSampler`
+    // from that state — which is why the class gate requires the draw's bind to
+    // repeat it rather than trusting either half.
     let mut textures = Vec::with_capacity(pass.textures.len());
     for texture in &pass.textures {
         textures.push(TextureView {
@@ -5946,7 +6005,7 @@ fn submit_narrow(
             metal_binding: texture.index,
             allocation_id: input_allocation(next_view),
             texture_type: TextureType::D2,
-            format: TextureFormat::Rgba8Unorm,
+            format: texture.format,
             width: texture.width,
             height: texture.height,
             depth: 1,

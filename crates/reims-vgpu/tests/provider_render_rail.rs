@@ -360,12 +360,29 @@ fn sampled_sampler_resource(binding: u32) -> SamplerResource {
 /// texture at the device binding the fragment stage's declaration names, and
 /// the AIR static sampler resource that state derives.
 fn sampled_request(stages: &Stages, texels: Vec<Vec<u8>>, extent: (u32, u32)) -> DrawRequest {
+    sampled_request_in(stages, texels, extent, ash::vk::Format::R8G8B8A8_UNORM)
+}
+
+/// [`sampled_request`] with the *bind's own view format* stated (R19/E-TX1,
+/// `research/docs/23` §107): the same sampled pair whose texture view is the
+/// second four-byte 8-bit order, so its bytes carry the channels in the order
+/// the guest's own `B8G8R8A8_UNORM` view names them.
+fn sampled_request_in(
+    stages: &Stages,
+    texels: Vec<Vec<u8>>,
+    extent: (u32, u32),
+    format: ash::vk::Format,
+) -> DrawRequest {
     let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
     req.width = extent.0;
     req.height = extent.1;
     let declaration = stages.fragment_texture_declarations[0];
-    req.sampled_images
-        .push(image_resource(declaration.binding, texels, extent));
+    req.sampled_images.push(image_resource_in(
+        declaration.binding,
+        texels,
+        extent,
+        format,
+    ));
     req.samplers
         .push(sampled_sampler_resource(declaration.sampler_binding));
     req
@@ -379,6 +396,18 @@ fn sampled_request(stages: &Stages, texels: Vec<Vec<u8>>, extent: (u32, u32)) ->
 /// one and a texel-fetched one reach the pass as the same view, because what
 /// tells them apart is the declaration's sampler half and nothing in the view.
 fn image_resource(binding: u32, texels: Vec<Vec<u8>>, extent: (u32, u32)) -> SampledImageResource {
+    image_resource_in(binding, texels, extent, ash::vk::Format::R8G8B8A8_UNORM)
+}
+
+/// [`image_resource`] whose view format is the test's own (R19/E-TX1): the
+/// same tightly packed bytes, under the byte order the caller states — which is
+/// the fact the class gate resolves and the canonical view is created with.
+fn image_resource_in(
+    binding: u32,
+    texels: Vec<Vec<u8>>,
+    extent: (u32, u32),
+    format: ash::vk::Format,
+) -> SampledImageResource {
     let mut bytes = Vec::with_capacity(texels.len() * 4);
     for texel in texels {
         bytes.extend_from_slice(&texel);
@@ -394,7 +423,7 @@ fn image_resource(binding: u32, texels: Vec<Vec<u8>>, extent: (u32, u32)) -> Sam
         multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(bytes)),
         byte_origin: Default::default(),
-        format: ash::vk::Format::R8G8B8A8_UNORM,
+        format,
         identity: None,
         swizzle: Default::default(),
     }
@@ -4410,6 +4439,195 @@ fn a_declared_sampled_texture_lands_the_texel_it_reads_and_agrees_with_the_engin
     );
 }
 
+/// R19 (`research/docs/23` §107, E-TX1): the sampled texture's *second* 8-bit
+/// byte order.
+///
+/// The census's dominant bind is the guest's own `B8G8R8A8_UNORM` view —
+/// `evidence/gate3-census-v14-2026-09-17/` §4.4 reads 1718 of the boot's 1892
+/// `texture_bind` lines as that one 896x1024 shape. The provider's window has
+/// covered both 8-bit orders since E-TX1; this test is the class gate's own
+/// half of that widening, written so the byte order itself is falsifiable
+/// rather than assumed:
+///
+/// - one colour pattern is stated in both byte orders — `[R,G,B,A]` under
+///   `rgba8_unorm`, `[B,G,R,A]` under `bgra8_unorm` — and the two binds land
+///   the *same* frame, which only an upload that carries each under its own
+///   name can do: the two byte strings differ by the red/blue swap, and that
+///   swap is visible in the frame;
+/// - the frame *is* the colour the shader's channels name for that byte order
+///   (red is the third byte of a `bgra8_unorm` texel) and not the bytes read in
+///   memory order, so "the name was carried" is measured rather than implied;
+/// - moving the read texel's bytes moves the frame, so the reading measures the
+///   upload rather than the run;
+/// - the engine and the canonical provider land the frame byte for byte, which
+///   is what makes this a statement about both rails.
+#[test]
+fn a_bgra_sampled_texture_lands_the_byte_order_the_bind_states() {
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    // The colour pattern in the two byte orders of it: the same colours, two
+    // spellings, with the red and blue halves swapped between them.
+    let rgba_texels = sampled_texels(width, height);
+    let bgra_texels: Vec<Vec<u8>> = rgba_texels
+        .iter()
+        .map(|texel| vec![texel[2], texel[1], texel[0], texel[3]])
+        .collect();
+    let (read_x, read_y) = SAMPLED_TEXEL;
+    let read = read_y * width as usize + read_x;
+    let wanted: [u8; 4] = rgba_texels[read]
+        .clone()
+        .try_into()
+        .expect("a texel is four bytes");
+    let memory_order: [u8; 4] = bgra_texels[read]
+        .clone()
+        .try_into()
+        .expect("a texel is four bytes");
+    assert_ne!(
+        wanted, memory_order,
+        "the fixture's colour has to separate the two byte orders"
+    );
+    let bgra_request = |texels: Vec<Vec<u8>>| {
+        sampled_request_in(
+            &stages,
+            texels,
+            (width, height),
+            ash::vk::Format::B8G8R8A8_UNORM,
+        )
+    };
+
+    // The RGBA8 sibling: the same colours under the first byte order, which is
+    // the reading R10 already pins. Its frame is what "the same colours" means
+    // for the second one.
+    let rgba = provider_pixels(
+        "rgba8 sampled texture",
+        &stages,
+        &sampled_request(&stages, rgba_texels.clone(), (width, height)),
+    );
+    let bgra = provider_pixels(
+        "bgra8 sampled texture",
+        &stages,
+        &bgra_request(bgra_texels.clone()),
+    );
+    assert_uniform_frame(
+        "bgra8 sampled texture (provider)",
+        &bgra,
+        width,
+        height,
+        wanted,
+    );
+    assert_ne!(
+        &bgra[..4],
+        memory_order.as_slice(),
+        "the BGRA8 frame is the colour the shader's channels name, not the bytes read in \
+         memory order"
+    );
+    assert_frames_equal("the two byte orders of one colour pattern", &rgba, &bgra);
+
+    let Some(engine) = engine_pixels(
+        "bgra8 sampled texture",
+        &stages,
+        bgra_request(bgra_texels.clone()),
+    ) else {
+        return;
+    };
+    assert_uniform_frame(
+        "bgra8 sampled texture (engine)",
+        &engine,
+        width,
+        height,
+        wanted,
+    );
+    assert_frames_equal("bgra8 sampled texture", &bgra, &engine);
+
+    // The read texel's own bytes: another colour there is another frame, and
+    // the frame is that colour read through the bind's byte order — so the
+    // value the fragment stage returns follows the bytes *and* the name.
+    let mut moved = bgra_texels.clone();
+    moved[read] = vec![255, 0, 128, 255];
+    let moved_frame = provider_pixels("moved bgra8 texel", &stages, &bgra_request(moved));
+    assert_uniform_frame(
+        "moved bgra8 texel (provider)",
+        &moved_frame,
+        width,
+        height,
+        [128, 0, 255, 255],
+    );
+    assert_frames_differ(
+        "the read texel's bytes moved the frame",
+        &bgra,
+        &moved_frame,
+    );
+    eprintln!(
+        "R19 bgra8 sampled texture: attachment {width}x{height} ({} texels), sampled texel \
+         {SAMPLED_TEXEL:?} = {wanted:?} under `bgra8_unorm` (bytes {memory_order:?}); the rgba8 \
+         sibling's bytes land the same frame, the memory-order reading differs, engine equal, \
+         read-texel change moved the frame to [128, 0, 255, 255]",
+        width * height,
+    );
+}
+
+/// R19: the formats beside the widened window keep the class's own boundary.
+///
+/// The window the class now states is the provider's whole `RENDER_SAMPLED`
+/// list — the two four-byte 8-bit UNORM byte orders (E-TX1,
+/// `research/docs/23` §107) — and every other texel stays on the engine, which
+/// is the rail that can run it. The census's other `texture_bind` formats are
+/// walked here (`evidence/gate3-census-v14-2026-09-17/` §4.4: `R8_UNORM` 160,
+/// `R8G8_UNORM` 11, `R16G16B16A16_SFLOAT` 3), beside the two sRGB spellings of
+/// the same 8-bit orders: the provider's sampled window names linear byte
+/// orders, so an sRGB *view* is another name the class does not state.
+///
+/// Each refusal keeps the class's existing bucket, names the bind's own format
+/// and the provider's own refusal (`render_texture_format_unsupported`), and
+/// never reaches the provider — as it should not, because the engine is the
+/// rail that executes these binds.
+#[test]
+fn the_formats_beside_the_two_byte_orders_stay_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let delivered = provider_render::provider_submissions();
+    for format in [
+        ash::vk::Format::R8_UNORM,
+        ash::vk::Format::R8G8_UNORM,
+        ash::vk::Format::R16G16B16A16_SFLOAT,
+        ash::vk::Format::R8G8B8A8_SRGB,
+        ash::vk::Format::B8G8R8A8_SRGB,
+    ] {
+        let request = sampled_request_in(&stages, texels.clone(), (width, height), format);
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_texture_bind",
+                    "{format:?}: the bind's own bucket"
+                );
+                let detail = reason.detail();
+                assert!(
+                    detail.contains(&format!("{format:?}")),
+                    "{format:?}: the sentence names the bind's own format: {detail}"
+                );
+                assert!(
+                    detail.contains("render_texture_format_unsupported"),
+                    "{format:?}: the sentence names the provider's own refusal: {detail}"
+                );
+                eprintln!("format door: {format:?} -> {}\n  {detail}", reason.slug());
+            }
+            other => panic!("{format:?} is outside the widened window: {other:?}"),
+        }
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a bind outside the window stays on the engine without the provider seeing it"
+    );
+}
+
 /// R10: the sampled-texture shapes beside the admitted entry, each under its
 /// own name.
 ///
@@ -4553,10 +4771,21 @@ fn the_sampled_texture_shapes_beside_the_entry_stay_on_the_engine_by_name() {
         detail.contains("descriptors 2"),
         "the sentence names the bind's own shape: {detail}"
     );
+    // The second 8-bit byte order is *in* the class since R19 (E-TX1 widened
+    // the provider's window, and `a_bgra_sampled_texture_lands_the_byte_order_the_bind_states`
+    // reads it), so the bind this walk states is a texel outside the window —
+    // the census's narrow lane — answered under the same bucket with its own
+    // format in the sentence (`the_formats_beside_the_two_byte_orders_stay_on_the_engine_by_name`
+    // walks the rest).
     let mut wrong_format = sampled();
-    wrong_format.sampled_images[0].format = ash::vk::Format::B8G8R8A8_UNORM;
-    let (slug, _) = answer("bgra bind", &stages, &wrong_format);
+    wrong_format.sampled_images[0].format = ash::vk::Format::R8_UNORM;
+    let (slug, detail) = answer("narrow bind", &stages, &wrong_format);
+    eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_texture_bind");
+    assert!(
+        detail.contains("R8_UNORM"),
+        "the sentence names the bind's own format: {detail}"
+    );
 
     let mut wrong_extent = sampled();
     wrong_extent.sampled_images[0].width = width / 2;
