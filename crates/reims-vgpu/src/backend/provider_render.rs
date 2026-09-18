@@ -1180,10 +1180,13 @@ pub struct RenderRuntimeSampler {
 /// Two lists rather than one because the class asks two different questions of
 /// them: which runtime `[[sampler(n)]]` arguments the stage binds (each of which
 /// the canonical contract has to pair with a texture, or the provider refuses
-/// the registration by name), and whether the stage carries AIR static samplers
-/// at all — the two families do not mix in one stage the canonical rail can
-/// pair, because its static half pairs positionally and its runtime half by the
-/// declaration's own index.
+/// the registration by name), and how many AIR static samplers it carries
+/// (R37) — the canonical rail pairs those positionally, one per sampled texture
+/// that reads through one, while the runtime half pairs by the index a
+/// declaration names. One stage may carry both forms; each texture is declared
+/// in the form the module's own sample sites name, and a module whose sites name
+/// *two* samplers for one image — which no per-texture declaration can state —
+/// stays on the engine by name.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RenderSamplerFamily {
     pub runtime: Arc<[RenderRuntimeSampler]>,
@@ -1191,6 +1194,34 @@ pub struct RenderSamplerFamily {
     /// reflection's own order — the order the canonical rail's positional
     /// pairing counts against.
     pub statics: Arc<[u32]>,
+    /// What the module's own sample sites state (`R37`): the pairing the
+    /// runtime half of every declaration is read off, one texture at a time.
+    pub sample_sites: RenderSampleSites,
+}
+
+/// What one module's sample sites state about the sampler beside each of its
+/// textures (`R37`, `research/docs/23` §102).
+///
+/// The class gate's per-texture declarations are read off this walk
+/// (`runtime::spirv_bind::sampled_image_pairs`), so the one answer that leaves
+/// a texture with no single form is a stage-level fact of its own:
+/// [`Self::MultipleSamplers`] is a module whose own sites name two samplers for
+/// one image, which no declaration can state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RenderSampleSites {
+    /// Every sampled image reads through one sampler — or the module samples
+    /// nothing at all, which the empty pairing states the same way.
+    #[default]
+    Paired,
+    /// One image's sample sites name more than one sampler: the shape that has
+    /// no per-texture declaration.
+    MultipleSamplers,
+    /// A sample site's operand is not a descriptor the walk can follow, so the
+    /// pairing is not one this walk names. The declarations fall back to the
+    /// positional static rule, and a stage that also binds runtime
+    /// `[[sampler(n)]]` arguments stays on the engine through the unpaired
+    /// half of the class.
+    Unresolved,
 }
 
 /// One `[[texture(i)]]` argument the fragment stage's own translation declares
@@ -1364,9 +1395,10 @@ pub fn texture_declarations(
     }
 
     // The AIR static samplers first: the canonical rail pairs them with the
-    // *sampled* textures by position — a texel-fetched texture states no
-    // sampler, so it takes no position in that pairing (R15) — and so does the
-    // loop below.
+    // *sampled* textures that read through one by position — a texel-fetched
+    // texture states no sampler at all (R15) and a runtime-sampled one states
+    // the `[[sampler(n)]]` argument its own sample sites name (R37), so neither
+    // takes a position in that pairing — and so does the loop below.
     let samplers = reflection
         .bindings
         .iter()
@@ -1408,7 +1440,28 @@ pub fn texture_declarations(
             // the shape by name.
             let fetched = crate::runtime::spirv_bind::descriptor_image_use(words, binding)
                 == crate::runtime::spirv_bind::DescriptorImageUse::Fetched;
-            let paired = if fetched {
+            // The runtime `[[sampler(n)]]` argument the module's own sample
+            // sites pair this texture with, as `(metal index, device slot)`.
+            // Read *before* the static half, because the module's own pairing
+            // is the one statement that says which form this texture reads
+            // through (R37): a texture whose sites name a runtime argument is
+            // declared runtime however the AIR static samplers sit beside it,
+            // and it takes no position in the positional static pairing —
+            // which is the rule the canonical rail's own walk applies (its
+            // static counter advances only for the textures their declaration
+            // states static, `metal-api-vulkan/src/render.rs`).
+            let runtime_pair = pairing.sampler_of(binding).and_then(|slot| {
+                runtime_samplers
+                    .iter()
+                    .find(|(_, runtime_slot)| *runtime_slot == slot)
+                    .copied()
+            });
+            // The static half's positional pairing: the AIR static samplers, in
+            // the reflection's own order, against the sampled textures that do
+            // not read through a runtime argument — a texel-fetched texture
+            // states no sampler at all, so it takes no position in that pairing
+            // either (R15).
+            let paired = if fetched || runtime_pair.is_some() {
                 None
             } else {
                 let paired = samplers.get(static_read);
@@ -1429,19 +1482,16 @@ pub fn texture_declarations(
                     crate::runtime::spirv_bind::reflected_sampler_binding(sampler, false)
                 })
                 .unwrap_or(0);
-            // The runtime `[[sampler(n)]]` argument the module's own sample
-            // sites pair this texture with, as `(metal index, device slot)`.
-            let runtime_pair = pairing.sampler_of(binding).and_then(|slot| {
-                runtime_samplers
-                    .iter()
-                    .find(|(_, runtime_slot)| *runtime_slot == slot)
-                    .copied()
-            });
             // The sampler-free declaration states no slot: the canonical
             // contract's fetched arm carries no sampler, so a number here
             // would be a binding nothing reads.
             let (sampler_binding, sampler) = if fetched {
                 (0, RenderSamplerState::Fetched)
+            } else if let Some((index, slot)) = runtime_pair {
+                // The runtime half (R12): the pair the module's own sample
+                // sites name, which the declaration states and the pass fills
+                // with the request's own state.
+                (slot, RenderSamplerState::Runtime { index })
             } else {
                 match paired.and_then(|sampler| sampler.static_sampler.as_ref()) {
                     Some(state) => (
@@ -1451,22 +1501,20 @@ pub fn texture_declarations(
                             None => RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState),
                         },
                     ),
-                    // No decoded AIR state beside this texture: either the
-                    // AIR static sampler carries none the translator could
-                    // read (the provider refuses that by name), or the texture
-                    // reads through a runtime `[[sampler(n)]]` argument, whose
-                    // slot and index the module's own sample sites name.
-                    None => match runtime_pair {
-                        Some((index, slot)) => (slot, RenderSamplerState::Runtime { index }),
-                        None if paired.is_some() => (
-                            static_slot,
-                            RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState),
-                        ),
-                        None => (
-                            0,
-                            RenderSamplerState::Unsupported(RenderSamplerRefusal::SampleSite),
-                        ),
-                    },
+                    // No decoded AIR state beside this texture: the AIR static
+                    // sampler carries none the translator could read, which the
+                    // provider refuses by name.
+                    None if paired.is_some() => (
+                        static_slot,
+                        RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState),
+                    ),
+                    // No AIR static sampler left for this texture and no
+                    // runtime argument its sites name: the module samples
+                    // through a form neither half of the pairing states.
+                    None => (
+                        0,
+                        RenderSamplerState::Unsupported(RenderSamplerRefusal::SampleSite),
+                    ),
                 }
             };
             RenderTextureDeclaration {
@@ -1576,11 +1624,17 @@ pub fn texture_interface_refusals(
 /// per resolved pipeline from the same reflection they are: which runtime
 /// `[[sampler(n)]]` arguments the stage binds — each of which the canonical
 /// contract has to pair with a sampled texture, or the registration is refused
-/// by name — and whether the stage carries AIR static samplers at all, because
-/// the canonical rail pairs those positionally and one stage's two sampler
-/// forms are not a shape the class states.
+/// by name — and how many AIR static samplers it carries, because the canonical
+/// rail pairs those positionally (one per sampled texture that reads through
+/// one) while the runtime half pairs by the index a declaration names. A stage
+/// may carry both forms at once (R37); the pairing the module's own sample sites
+/// state is what the per-texture declarations are read off, and its one
+/// unstateable answer keeps the stage on the engine by name.
 #[cfg(feature = "provider-render")]
-pub fn sampler_family(fragment: &metal2vulkan::reflect::ShaderReflection) -> RenderSamplerFamily {
+pub fn sampler_family(
+    fragment: &metal2vulkan::reflect::ShaderReflection,
+    words: &[u32],
+) -> RenderSamplerFamily {
     use metal2vulkan::reflect::ResourceKind;
 
     let runtime = fragment
@@ -1604,6 +1658,16 @@ pub fn sampler_family(fragment: &metal2vulkan::reflect::ShaderReflection) -> Ren
     RenderSamplerFamily {
         runtime: runtime.into(),
         statics: statics.into(),
+        // The pairing the per-texture declarations are read off (`R12`), in
+        // its own three answers (R37): the class keeps the stage on the engine
+        // when it is not one sampler per image.
+        sample_sites: match crate::runtime::spirv_bind::sampled_image_pairs(words) {
+            crate::runtime::spirv_bind::SamplePairing::Paired(_) => RenderSampleSites::Paired,
+            crate::runtime::spirv_bind::SamplePairing::MultipleSamplers => {
+                RenderSampleSites::MultipleSamplers
+            }
+            crate::runtime::spirv_bind::SamplePairing::Unresolved => RenderSampleSites::Unresolved,
+        },
     }
 }
 /// One `MTLBlendFactor` ordinal in the canonical contract's own vocabulary
@@ -1687,8 +1751,9 @@ fn blend_operation(ordinal: u32) -> Option<BlendOperation> {
 ///    request states (R12, `research/docs/23` §102). That family is admitted
 ///    through the pairing the module's own sample sites name, and the
 ///    stage-level shapes it cannot be admitted through are answered under their
-///    own names: a stage that carries both sampler forms
-///    (`..._texture_sampler_family`), more runtime arguments than the Metal
+///    own names: a stage whose own sample sites name more than one sampler for
+///    one texture, which no per-texture declaration can state (R37,
+///    `..._texture_sampler_family`), more runtime arguments than the Metal
 ///    sampler table holds (`..._texture_sampler_count`), a runtime argument no
 ///    texture reads through (`..._texture_sampler_unpaired`), and a declaration
 ///    whose index, device slot or module the reflection does not back
@@ -1773,25 +1838,42 @@ fn sampled_textures<'a>(
             ),
         ));
     }
-    // The stage's sampler family (R12, `research/docs/23` §102), before any
-    // texture is weighed against its bind: a stage that carries both sampler
-    // forms, or more runtime `[[sampler(n)]]` arguments than Metal's own
-    // sampler table holds, is a shape the canonical rail's registration rules
-    // refuse by name, so the class answers it here instead of letting the
-    // provider decline a draw the engine could run.
+    // The stage's sampler family (R12, `research/docs/23` §102; R37), before
+    // any texture is weighed against its bind: more runtime `[[sampler(n)]]`
+    // arguments than Metal's own sampler table holds is a shape the canonical
+    // rail's registration refuses by name, so the class answers it here
+    // instead of letting the provider decline a draw the engine could run.
+    //
+    // The two forms in one stage are *not* that shape (R37). The canonical
+    // side falsified the rule this gate used to state — a stage carrying one
+    // AIR static sampler beside one runtime `[[sampler(n)]]` registers,
+    // submits and executes there, with each half reading its own way
+    // (`metal-api-emulator`'s `render_sampler_family_e2e.rs`, E `41308a1`) —
+    // so the stage is handed to the provider and the per-texture declarations
+    // below state the form each texture's own sample sites name.
     let family = inputs.sampler_family;
-    if !family.runtime.is_empty() && !family.statics.is_empty() {
+    // What stays out of class by name (R37): a stage whose own sample sites
+    // name *two* samplers for one image. A declaration names exactly one form
+    // per texture, so such a stage has no per-texture statement this class can
+    // make — and a walk that fell back to the positional pairing would declare
+    // the texture through a sampler state its own sample sites do not name,
+    // which the canonical rail then refuses at registration, leaving a draw
+    // the engine could run declined rather than drawn. The pairing walk's own
+    // answer is the fact, so the class reads it rather than re-deriving it.
+    if matches!(family.sample_sites, RenderSampleSites::MultipleSamplers) {
         return Err(OutOfClass::owned(
             "render_provider_out_of_class_texture_sampler_family",
-            format!(
-                "a fragment stage that carries both AIR static samplers and runtime \
-                 `[[sampler(n)]]` arguments stays on the engine: {} static sampler(s) and {} \
-                 runtime sampler(s) are two forms the canonical rail pairs by different rules — \
-                 the static half by position, the runtime half by the index a declaration names — \
-                 and one stage's textures do not state both",
-                family.statics.len(),
-                family.runtime.len(),
-            ),
+            "a fragment stage whose own sample sites name more than one sampler for one \
+             texture stays on the engine: a declaration names exactly one sampler form per \
+             texture — the AIR static state the module carries, or the runtime \
+             `[[sampler(n)]]` argument the texture reads through — so a texture the module \
+             samples two ways is not a per-texture statement this class can make. The \
+             canonical rail's registration looks for one sampler per texture and refuses the \
+             stage by name when its AIR static samplers and the declarations disagree \
+             (`render_stage_reflection_mismatch`) or when a runtime `[[sampler(n)]]` the \
+             module binds is paired with nothing (`render_runtime_sampler_undeclared`) rather \
+             than executing a sample through a state nothing declared"
+                .to_owned(),
         ));
     }
     if family.runtime.len() > MAX_RENDER_SAMPLERS {
