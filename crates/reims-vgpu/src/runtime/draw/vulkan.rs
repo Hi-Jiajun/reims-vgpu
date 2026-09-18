@@ -8786,6 +8786,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Records 2+ of a resident render-pass chain load the prior record's
         // content directly from the engine target (no CPU seed, no re-upload).
         let mut chain_load_from_target = false;
+        // R23: whether *this* record's chain is the engine's own registry
+        // resident. The packet-chain arm below is the one that says so, and
+        // while the canonical rail's resident arms are held the engine is the
+        // only rail that could have written this frame — so the caller that
+        // owns the registry can read it out and hand it over. The two Load
+        // elisions further down name the same shape (`chain_load_from_target`
+        // is theirs too), but they set it because the *engine* already holds a
+        // surface resident it can load in place; their frames stay where they
+        // are, and those records keep the class's refusal by name (a readback
+        // there would pay exactly the whole-frame copy those rails exist to
+        // avoid).
+        #[cfg(feature = "provider-render")]
+        let mut chain_source_is_engine_resident = false;
         // Resolved once and read by both the Load gate below and the
         // `target_identity` assignment further down, so the record that loads
         // from a resident is by construction the record that renders into it.
@@ -8805,6 +8818,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // A preparation-time query could only be a stale hint and cost
             // a second engine transaction for the same command.
             chain_load_from_target = true;
+            #[cfg(feature = "provider-render")]
+            {
+                chain_source_is_engine_resident = true;
+            }
         }
         // Colour0's LOAD seed was skipped by `mrt_draw_request` because the
         // engine still held what the render Store published into its guest
@@ -10284,6 +10301,28 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     statics: resolved.sampler_family.statics.clone(),
                 }
             };
+            // R23: the chain's own frame, materialized for the canonical rail's
+            // byte arm (`RenderRailInputs::resident_source_bytes`) when this
+            // record's previous contents are the engine's registry resident.
+            // `LoadOp::Resident` would be an image no provider pass ever wrote —
+            // this rail never stored anything under the chain's identity — and
+            // the frame itself is readable right here, because the seam owns the
+            // registry the chain names. `None` is the answer whenever the frame
+            // cannot travel as bytes (a wider-than-four-byte resident, an
+            // attachment view in the other order, a readback that is not ready);
+            // the class then keeps the record on the engine, which loads the
+            // image in place. Materialized before the submission because the
+            // gate is pure and these bytes have to be part of the request it
+            // answers.
+            #[cfg(feature = "provider-render")]
+            let resident_source_frame = if chain_source_is_engine_resident {
+                resources
+                    .target_identity
+                    .as_ref()
+                    .and_then(|identity| resident_chain_source_frame(&resources, identity))
+            } else {
+                None
+            };
             let inputs = RenderRailInputs {
                 vertex_air: resolved.vertex_air.as_ref(),
                 fragment_air: resolved.fragment_air.as_ref(),
@@ -10311,6 +10350,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // GVA. While this is `false` the rail publishes the frames it
                 // answers instead of keeping them.
                 resident_frames_fetchable: false,
+                // R23: the chain's own frame, when this record's previous
+                // contents are the engine's registry resident and the caller
+                // could read them out (`resident_chain_source_frame`). The
+                // class then states the contract's trace-owned `Load` arm
+                // instead of leaving the record on the engine — a packet whose
+                // chain begins on the engine can be answered from its second
+                // record on, and the frame's bytes are the one channel it
+                // travels through. `None` for every other record, including the
+                // two Load elisions, whose frames stay where they are.
+                resident_source_bytes: resident_source_frame.as_deref(),
                 // The stage's own attribute locations, so a request whose
                 // declared streams disagree with them stays on the engine
                 // instead of being answered by a provider that always refuses
@@ -11642,6 +11691,53 @@ pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
             allocation
         }
         _ => pixel::RESIDENT_RGBA_FORMAT,
+    }
+}
+
+/// The frame the engine's own chain resident holds, in the order the target's
+/// attachment declares, for the canonical rail's byte arm (R23).
+///
+/// This is a *question* rather than a payment, which is why it is not
+/// [`read_resident_chain`]: a caller asks whether the chain's frame can travel
+/// as bytes into the canonical rail, and `None` is the class's own answer — the
+/// record then stays on the engine, which loads the image in place. Nothing
+/// here reports `chain_resident_land_fail`, because that name belongs to the
+/// rails that *owed* a frame and could not produce one; census v15's 6 824 land
+/// failures are the population that rule exists for, and a speculative read
+/// must not move that number.
+///
+/// The order is the identity's own ([`TargetIdentity::is_bgra`]), which is what
+/// `DrawRequest::target_seed_order` documents as the attachment's order, and the
+/// readback narrows four-byte colour only: a resident wider than that (`Native`)
+/// answers `None` here and the class keeps its refusal by name. The bytes are
+/// the whole tightly packed extent, which is the length the canonical
+/// attachment's declaration has to carry.
+#[cfg(feature = "provider-render")]
+fn resident_chain_source_frame(
+    req: &crate::backend::vulkan::engine::DrawRequest,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> Option<Vec<u8>> {
+    // The bytes have to be the attachment's own texel at the attachment's own
+    // extent, because the canonical rail uploads them verbatim into the pass's
+    // image. The identity's order is the attachment's by the rule
+    // `DrawRequest::target_seed_order` states, and the two extents are one
+    // value here by construction — but a request whose attachment view names
+    // the other order, or another geometry, is a shape this arm does not carry,
+    // and `None` is the answer that keeps it on the engine.
+    let attachment_bgra = req
+        .color_attachment
+        .map(|state| translate::pixel::has_bgra_order(state.format()))?;
+    if attachment_bgra != identity.is_bgra()
+        || identity.width() != req.width
+        || identity.height() != req.height
+    {
+        return None;
+    }
+    let frame = crate::backend::vulkan::engine::read_target(identity).ok()?;
+    if identity.is_bgra() {
+        frame.into_bgra8()
+    } else {
+        frame.into_rgba8()
     }
 }
 

@@ -207,12 +207,37 @@
 //!   ([`RenderRailInputs::resident_frames_fetchable`]): a caller that cannot
 //!   fetch a kept frame gets the frame **published** instead (the pooled arm's
 //!   own answer, `render_provider_publish_held_resident`), and a record whose
-//!   previous contents are this rail's own image stays on the engine by name
-//!   (`render_provider_out_of_class_resident_source`). The production seam
-//!   states `false` until R4b's byte channel lands; this rail's own tests state
-//!   `true`, because the capability is what they drive. The packet-level
+//!   previous contents are an image this rail holds stays on the engine by
+//!   name (`render_provider_out_of_class_resident_source`). The production
+//!   seam states `false` until R4b's byte channel lands; this rail's own tests
+//!   state `true`, because the capability is what they drive. The packet-level
 //!   admission above remains the follow-up for the state where the arms are
 //!   live.
+//!
+//!   # The reverse direction: the frame the *engine* holds, carried in (R23)
+//!
+//!   Census v17 (`evidence/gate3-census-v17-2026-09-18`, same rig and log)
+//!   moved the boundary onto the other side of the same seam: its first
+//!   refusal is `resident_source` at 3 271 records (73.2 %), every one of them
+//!   a record whose previous contents are the live GPU image — `skip=resident`,
+//!   `store=1`, `seed=chain`, `load=Load` — in a packet whose *head* the class
+//!   refused for another reason (a guest seed, a guest-backed attachment), so
+//!   the engine owns the chain's frame from the first record on. `LoadOp::
+//!   Resident` cannot name it (this rail never stored an image under that
+//!   identity), and R20's answer for a frame the caller cannot fetch is not to
+//!   keep one — but the frame itself is readable *by the caller*: it lives in
+//!   the engine's own registry, whose reader is `read_target`. So the class
+//!   carries it the other way: the caller hands the frame over
+//!   ([`RenderRailInputs::resident_source_bytes`]) and the pass states the
+//!   canonical attachment's trace-owned load (`NarrowLoad::Bytes` →
+//!   `LoadOp::Load`), which uploads exactly those bytes into the pass's own
+//!   image before it opens (`research/docs/23` §3.3/§74, R5b). Its own frame is
+//!   then published (this rail still keeps nothing its caller cannot fetch),
+//!   and the exec walk hands those bytes to the record after it — so a chain
+//!   whose head stayed on the engine continues in the provider from the second
+//!   record on, with the frame's bytes the one channel it travels through.
+//!   Bytes that are not the attachment's own extent, and a record whose caller
+//!   hands nothing over, keep the engine under the names above.
 //!
 //! Anything outside the class returns [`RenderRailOutcome::NotInNarrowClass`]
 //! and the caller runs the self-contained engine unchanged — the feature only
@@ -3252,7 +3277,7 @@ pub fn present_attachment(
 
 /// How one admitted pass establishes the attachment's previous contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NarrowLoad {
+enum NarrowLoad<'a> {
     /// Fill every texel with the guest's byte-exact clear, carried as **one
     /// texel of the attachment's own format** ([`ClearColor`]): four bytes for
     /// the two 8-bit orders, four little-endian halves for `Rgba16Float`.
@@ -3263,6 +3288,22 @@ enum NarrowLoad {
     /// Keep the bytes the provider already holds under the attachment's own
     /// identity (`LoadOp::Resident`).
     Resident(ResidentAttachment),
+    /// Begin from the caller's own bytes, declared for the attachment's view
+    /// (`LoadOp::Load`, `research/docs/23` §3.3/§74, R5b).
+    ///
+    /// The contract's trace-owned load arm, and the only one that can state
+    /// contents the provider never stored: the bytes travel with the trace
+    /// exactly as a stream's do, and the rail uploads them into the pass's own
+    /// image before it opens. The class elects it for one shape only (R23): a
+    /// record whose previous contents are the live GPU image the caller's chain
+    /// names, on a caller that cannot hand this rail an image under that
+    /// identity ([`RenderRailInputs::resident_frames_fetchable`]) but *can*
+    /// hand over the frame itself — the engine's own registry holds it, and the
+    /// caller is the one that reads it out. Every other byte-bearing shape is
+    /// still refused by name: a guest seed is a source the class cannot confirm
+    /// is the live image, and an assertion this rail cannot check is not a load
+    /// arm it may state.
+    Bytes(&'a [u8]),
 }
 
 /// Where one admitted pass's frame goes.
@@ -3590,6 +3631,27 @@ pub struct RenderRailInputs<'a> {
     /// fetch a kept frame; R4b's byte channel is what makes the production seam
     /// state it, and until then the seam states `false`.
     pub resident_frames_fetchable: bool,
+    /// The frame the record's own chain names, when the caller can read it out
+    /// of the rail that holds it (R23).
+    ///
+    /// A record with `load_from_target` says its previous contents *are* the
+    /// live GPU image. While [`Self::resident_frames_fetchable`] is `false`
+    /// that image is not this rail's — it is the engine's registry resident,
+    /// written by the record before this one — so `LoadOp::Resident` would name
+    /// an image no provider pass ever stored. The caller that owns that
+    /// registry can hand the frame over instead, in the attachment's own texel
+    /// order and at the attachment's own tightly packed extent: the class then
+    /// states the contract's trace-owned `Load` arm
+    /// ([`NarrowLoad::Bytes`]), which is the one load the canonical attachment
+    /// can carry without the provider having stored anything.
+    ///
+    /// `None` is every caller that cannot or does not read the frame back —
+    /// and every record whose previous contents are not the live image — and
+    /// those records keep the class's own refusal by name. Bytes that are not
+    /// exactly the attachment's extent are a caller wiring bug and are refused
+    /// under their own slug rather than being uploaded and rejected by the
+    /// contract, because a decline is never a fallback.
+    pub resident_source_bytes: Option<&'a [u8]>,
     /// The *vertex stage's own* attribute locations, as the translation that
     /// produced `vertex_air` reflected them
     /// (`CachedShader::reflection.vertex_attributes`), in the reflection's
@@ -4824,7 +4886,7 @@ struct NarrowPass<'a> {
     fragment_entry: String,
     format: AttachmentFormat,
     /// The previous-contents arm this pass declares ([`NarrowLoad`]).
-    load: NarrowLoad,
+    load: NarrowLoad<'a>,
     /// Where this pass's frame goes ([`NarrowStore`]).
     store: NarrowStore,
     /// Whether the caller withheld its readback and this pass answered by
@@ -5166,11 +5228,13 @@ fn narrow_class<'a>(
     // action, read in the order `DrawRequest` documents: `load_from_target`
     // wins, else the declared action decides.
     //
-    // The two arms are the contract's two attachment loads: the *provider's*
-    // image under the attachment's own identity (`LoadOp::Resident`), or the
-    // guest's byte-exact clear. A record whose previous contents are guest bytes
-    // is a third shape the canonical attachment cannot state beside either (one
-    // load op per attachment), so it keeps the engine by name.
+    // Three arms, and each is one of the canonical attachment's own loads: the
+    // *provider's* image under the attachment's own identity
+    // (`LoadOp::Resident`), the caller's own bytes declared for that same view
+    // (`LoadOp::Load`, R23), or the guest's byte-exact clear. A record whose
+    // previous contents are guest bytes is still a shape the class does not
+    // carry (one load op per attachment, and the rail cannot confirm a seed is
+    // the live image), so it keeps the engine by name.
     let load = if req.load_from_target {
         let Some(resident) = resident else {
             return Err(OutOfClass::new(
@@ -5196,16 +5260,40 @@ fn narrow_class<'a>(
             // it — so `LoadOp::Resident` here would name an image no record
             // ever stored, which the contract refuses by name
             // (`resident_target_undeclared`) and which this rail must not turn
-            // into a dropped draw. The engine owns the frame and only the
-            // engine can load it.
-            return Err(OutOfClass::new(
-                "render_provider_out_of_class_resident_source",
-                "a record whose previous contents are the live GPU image stays on the engine \
-                 while the caller cannot read a frame this rail keeps: the resident the chain \
-                 names is the engine's own, and this rail defines no image under it",
-            ));
+            // into a dropped draw.
+            //
+            // R23: the caller that owns that registry can read the frame out
+            // and hand it over, and then the contents *are* nameable — by the
+            // trace's own view declaration, the `LoadOp::Load` arm the contract
+            // has carried since R5b. That is the same fact `target_rgba8`
+            // cannot express: a seed is bytes of unknown provenance, while this
+            // is the frame under the identity the request itself named, read by
+            // the caller from the registry that holds it. The record then
+            // enters the class with the identity it stated — the identity is
+            // still required above, because the engine's own answer to this
+            // record still names it.
+            let Some(bytes) = inputs.resident_source_bytes else {
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_resident_source",
+                    "a record whose previous contents are the live GPU image stays on the engine \
+                     while the caller can neither read a frame this rail keeps nor hand the \
+                     frame over: the resident the chain names is the engine's own, and this rail \
+                     defines no image under it",
+                ));
+            };
+            if u64::try_from(bytes.len()).ok() != Some(extent) {
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_resident_source_shape",
+                    "a record whose previous contents are handed over at a width or extent other \
+                     than the attachment's own stays on the engine: the canonical attachment \
+                     uploads exactly the view's declared bytes, so a shorter or longer buffer \
+                     would begin the pass from bytes no record wrote",
+                ));
+            }
+            NarrowLoad::Bytes(bytes)
+        } else {
+            NarrowLoad::Resident(resident)
         }
-        NarrowLoad::Resident(resident)
     } else {
         if req.target_rgba8.is_some()
             || req.target_guest_seed.is_some()
@@ -5356,7 +5444,8 @@ fn narrow_class<'a>(
              this class's pooled readback stays on the engine: the pooled offscreen target is \
              the engine's own four-byte image, so this is a shape the engine does not draw, and \
              the class may not answer for it. A wide attachment is in class where the frame \
-             comes from the provider's own image — the resident load and store arms",
+             comes from the provider's own image — the resident load and store arms; the R23 \
+             byte arm carries the caller's own four-byte frame, which no wide readback produces",
         ));
     }
     // A guest-backed attachment's home is the guest's own pages. The class
@@ -5375,15 +5464,19 @@ fn narrow_class<'a>(
     // W1 named the frame's *destination* for the record that opens a packet;
     // this is its source. A record that continues an encoder begins from the
     // frame the record before it produced, and the class can execute it exactly
-    // when that frame is the provider's own image — `LoadOp::Resident`, chosen
-    // above from the request's `load_from_target`. A continuing record that
-    // would begin from guest bytes, or from nothing at all, keeps the engine.
-    if req.continues_render_pass && !matches!(load, NarrowLoad::Resident(_)) {
+    // when that frame is one the class can name: the provider's own image
+    // (`LoadOp::Resident`), or the bytes the caller read out of the rail that
+    // holds it (R23's `LoadOp::Load`, elected above from `load_from_target`
+    // beside `resident_source_bytes`). A continuing record that would begin
+    // from guest bytes of unknown provenance, or from nothing at all, keeps the
+    // engine.
+    if req.continues_render_pass && !matches!(load, NarrowLoad::Resident(_) | NarrowLoad::Bytes(_))
+    {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_encoder",
             "a record that continues a multi-record encoder stays on the engine: it begins from \
              the frame the record before it produced, which this class can only name when that \
-             frame is the provider's own image",
+             frame is the provider's own image or the bytes the caller hands over for it",
         ));
     }
     if !req.secondary_targets.is_empty() {
@@ -5906,6 +5999,10 @@ impl From<PresentAttachment> for AttachmentIdentity {
 /// readback. The present arm is checked first because the class conditions make
 /// it exclusive: a presenting record is refused if it names a resident target,
 /// so no pass can state both routes' identities at once.
+///
+/// R23's byte arm rides the pooled pair with the other held record: it carries
+/// its own contents in and lands its own frame out, so it names no image of its
+/// own and must not touch the resident registry the chain's identity belongs to.
 fn attachment_identity(pass: &NarrowPass<'_>) -> AttachmentIdentity {
     if let Some(present) = pass.present {
         return present.into();
@@ -5913,10 +6010,12 @@ fn attachment_identity(pass: &NarrowPass<'_>) -> AttachmentIdentity {
     let resident = match (pass.load, pass.store) {
         (NarrowLoad::Resident(resident), _) => resident,
         (_, NarrowStore::Resident(resident)) => resident,
-        (NarrowLoad::Clear(_), NarrowStore::Writeback) => ResidentAttachment {
-            allocation: ATTACHMENT_ALLOCATION,
-            view: ATTACHMENT_VIEW,
-        },
+        (NarrowLoad::Clear(_) | NarrowLoad::Bytes(_), NarrowStore::Writeback) => {
+            ResidentAttachment {
+                allocation: ATTACHMENT_ALLOCATION,
+                view: ATTACHMENT_VIEW,
+            }
+        }
     };
     resident.into()
 }
@@ -5944,7 +6043,13 @@ fn submit_narrow(
     // packed extent is what the frozen contract asks a storing attachment to
     // land through; neither the clear nor either resident arm reads them, and
     // the byte-less declaration that would lift the copy is the named follow-up
-    // on the emulator side.
+    // on the emulator side. R23's byte arm is the exception the rule was always
+    // shaped for: it *is* a `LoadOp::Load` attachment, so these bytes are the
+    // frame the pass begins from and have to be the caller's own.
+    let attachment_source = match pass.load {
+        NarrowLoad::Bytes(bytes) => bytes.to_vec(),
+        _ => vec![0u8; usize::try_from(pass.extent).unwrap_or(0)],
+    };
     let declaration = BufferView {
         view_id: attachment.view,
         metal_binding: 0,
@@ -5953,7 +6058,7 @@ fn submit_narrow(
         length: pass.extent,
         access: BufferAccess::Read,
         attribute_stride: None,
-        source: BufferSource::OwnedBytes(vec![0u8; usize::try_from(pass.extent).unwrap_or(0)]),
+        source: BufferSource::OwnedBytes(attachment_source),
     };
     let mut resources = ResourceTableSnapshot::new();
     for allocation in input_allocations(pass) {
@@ -6202,6 +6307,10 @@ fn submit_narrow(
             load: match pass.load {
                 NarrowLoad::Clear(clear) => LoadOp::Clear(clear),
                 NarrowLoad::Resident(_) => LoadOp::Resident,
+                // R23: the previous contents are the caller's bytes, declared
+                // for this attachment's view in the trace above and uploaded by
+                // the rail before the pass opens (`LoadOp::Load`).
+                NarrowLoad::Bytes(_) => LoadOp::Load,
             },
             store: match pass.store {
                 NarrowStore::Writeback => StoreOp::Store,
@@ -6459,6 +6568,14 @@ fn submit_narrow(
     }
     if loads_resident {
         crate::runtime::drain::note_store_route("render_provider_resident_load");
+    }
+    // R23's own population, counted where the answer happens for the reason
+    // above: the chain's frame was carried into the pass as bytes (the caller
+    // read it out of the registry the chain names), so neither resident arm
+    // moved and this is the only name that says the record was answered this
+    // way.
+    if matches!(pass.load, NarrowLoad::Bytes(_)) {
+        crate::runtime::drain::note_store_route("render_provider_resident_source_bytes");
     }
     // The held arm's own population: a caller withheld its readback and this
     // rail published the frame because the caller cannot fetch a kept one.

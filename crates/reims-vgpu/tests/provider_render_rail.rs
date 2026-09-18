@@ -896,6 +896,10 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // 6 833 `load_target_content_not_ready`, one driven boot). A test that
         // wants the seam's own answer states it through [`inputs_held`].
         resident_frames_fetchable: true,
+        // R23: no previous contents are handed over unless a test reads them
+        // out of the engine's own registry and states them here — the shape
+        // [`inputs_held_with_source`] drives.
+        resident_source_bytes: None,
         vertex_attribute_locations: &stages.vertex_attribute_locations,
         vertex_stage_buffer_declarations: &stages.vertex_stage_buffer_declarations,
         fragment_stage_buffer_declarations: &stages.fragment_stage_buffer_declarations,
@@ -929,6 +933,25 @@ fn inputs_held<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInput
     RenderRailInputs {
         resident_frames_fetchable: false,
         ..inputs(stages, role)
+    }
+}
+
+/// [`inputs_held`] with the chain's own frame handed over as bytes (R23).
+///
+/// This is the production seam's other half: a caller that cannot fetch a frame
+/// this rail keeps can still read the frame the *engine* holds — the record's
+/// previous contents, named by the request's own `target_identity` — and hand
+/// it over. The class then states the contract's trace-owned `Load` arm
+/// (`LoadOp::Load`) instead of leaving the record on the engine, and publishes
+/// the record's own frame rather than keeping it.
+fn inputs_held_with_source<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    source: &'a [u8],
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        resident_source_bytes: Some(source),
+        ..inputs_held(stages, role)
     }
 }
 
@@ -3189,6 +3212,281 @@ fn a_frame_the_caller_cannot_fetch_is_published_and_never_kept() {
              instead of seeding lands another colour here",
             height / 2,
         );
+    }
+}
+
+/// The frame the engine's own chain resident holds, in the order the attachment
+/// declares — what the production seam hands the canonical rail as
+/// `resident_source_bytes` (R23).
+///
+/// This is the seam's own read (`runtime::draw::vulkan`'s
+/// `resident_chain_source_frame`): `TargetIdentity::is_bgra` is the attachment's
+/// order, and four-byte colour is the only width that readback narrows.
+fn engine_chain_source(identity: &engine::TargetIdentity) -> Vec<u8> {
+    let frame = engine::read_target(identity).expect("the chain's frame is readable");
+    if identity.is_bgra() {
+        frame.into_bgra8().expect("four-byte colour")
+    } else {
+        frame.into_rgba8().expect("four-byte colour")
+    }
+}
+
+/// [`engine_chain_source`] in semantic RGBA8, so a provider frame and an engine
+/// frame can be compared as colours rather than as two runs of one rail.
+fn engine_chain_semantic(identity: &engine::TargetIdentity) -> Vec<u8> {
+    semantic_rgba(engine_chain_source(identity), identity.is_bgra())
+}
+
+/// R23: the frame the *engine* holds, handed over as bytes.
+///
+/// Census v17's first refusal is this shape — 3 271 records (73.2 %) with
+/// `skip=resident store=1 seed=chain load=Load` — and every one of them belongs
+/// to a packet whose head the class refused for another reason: the engine drew
+/// that head, kept the chain's frame in its own registry, and the records after
+/// it name contents this rail never stored. `LoadOp::Resident` would be an image
+/// no provider pass wrote, so the class carries the frame the other way: the
+/// caller reads it out of the registry the chain names and hands it over, the
+/// pass states the contract's trace-owned load (`LoadOp::Load`), and the rail
+/// uploads exactly those bytes into the pass's own image before it opens.
+///
+/// The counterweight is R20's, unchanged: this caller cannot fetch a frame the
+/// rail keeps, so the record's *own* frame is published rather than kept. The
+/// comparison is the engine's own answer for the same record from the same
+/// previous contents — the engine's registry still holds them, because the
+/// provider never wrote there.
+#[test]
+fn the_chains_frame_the_engine_holds_carries_the_record_into_the_provider() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+
+    // 1. The packet's head: refused by the class (a resident store with a
+    //    withheld readback is the shape every other reason sends here), drawn
+    //    by the engine, and its frame kept in the engine's registry.
+    let head_identity = surface_identity(0x7b_00_08);
+    let Some(head) = engine_pixels("chain head", &stages, resident_seed_request(&head_identity))
+    else {
+        return;
+    };
+    assert!(
+        head.is_empty(),
+        "a resident store publishes nothing on the engine either"
+    );
+
+    // 2. The record that composites onto it, without the bytes: exactly what
+    //    census v17 counts under `resident_source`.
+    let chained = {
+        let mut chained = resident_load_request(&head_identity, false);
+        chained.continues_render_pass = true;
+        chained
+    };
+    let source_bucket_before = route_count("render_provider_out_of_class_resident_source");
+    match provider_render::submit_render(&inputs_held(&stages, RenderChainRole::Middle), &chained) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_resident_source",
+            "a chain whose frame is the engine's stays on the engine while nothing is handed \
+             over: {reason}"
+        ),
+        other => panic!("a source-less resident load is not the held class's: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_resident_source") - source_bucket_before,
+        1,
+        "the refusal is counted under the census's own bucket vocabulary"
+    );
+    // The sentence a census reader joins that bucket to, verbatim.
+    let refusal = match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::Middle),
+        &chained,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => reason.detail().to_owned(),
+        other => panic!("the source-less shape is refused twice the same way: {other:?}"),
+    };
+    eprintln!("R23 refusal, verbatim: {}", refusal);
+    assert!(
+        refusal.contains(
+            "a record whose previous contents are the live GPU image stays on the engine \
+             while the caller can neither read a frame this rail keeps nor hand the frame over"
+        ),
+        "the sentence names both halves the caller lacks: {refusal}"
+    );
+
+    // 3. The frame the chain names, read out of the engine by the caller.
+    let source = engine_chain_source(&head_identity);
+    assert_eq!(
+        source.len(),
+        (width as usize) * (height as usize) * 4,
+        "the caller hands over the attachment's whole packed extent"
+    );
+
+    // 4. The packet's *middle* record — the census's dominant shape (`wb=0`,
+    //    `skip=resident`, `continues=1`) — with the bytes handed over: in
+    //    class, answered by the provider, and **published**, because this
+    //    caller cannot fetch a frame the rail keeps (R20's arm, unchanged).
+    let published_before = route_count("render_provider_publish_held_resident");
+    let carried_before = route_count("render_provider_resident_source_bytes");
+    let stores_before = route_count("render_provider_resident_store");
+    let loads_before = route_count("render_provider_resident_load");
+    let provider_middle = match provider_render::submit_render(
+        &inputs_held_with_source(&stages, RenderChainRole::Middle, &source),
+        &chained,
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("a resident load whose frame the caller hands over is in class: {other:?}"),
+    };
+    assert_texel_count("published middle frame", &provider_middle);
+    assert_texel_near(
+        "published middle: the last texel inside the rectangle",
+        texel_at(&provider_middle, half_of(width) - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    for x in half_of(width)..width {
+        assert_eq!(
+            texel_at(&provider_middle, x, height / 2),
+            RESIDENT_SEED_TEXEL,
+            "texel ({x}, {}) keeps the frame that was handed over: a channel that uploaded the \
+             wrong bytes, or cleared instead of loading, lands another colour here",
+            height / 2,
+        );
+    }
+
+    // 5. The engine's own answer for the same middle record, from the same
+    //    frame (the provider wrote nothing into the engine's registry, so it is
+    //    still the head's). A middle record keeps its frame there, so the
+    //    engine's answer is read back out of the registry to compare.
+    let mut middle_control = resident_load_request(&head_identity, false);
+    middle_control.continues_render_pass = true;
+    let Some(engine_middle) = engine_pixels("engine middle", &stages, middle_control) else {
+        return;
+    };
+    assert!(
+        engine_middle.is_empty(),
+        "a resident middle publishes nothing on the engine either"
+    );
+    let engine_kept = engine_chain_semantic(&head_identity);
+    assert_texel_count("engine middle frame", &engine_kept);
+    eprintln!(
+        "R23 carried frame: identity={:?}; handed over {} bytes; provider published {} bytes; \
+         engine kept {} bytes; texel at the scissor edge [{},{},{}], outside [{},{},{}]; \
+         resident_source_bytes +{}; publish_held_resident +{}; resident_store +{}; \
+         resident_load +{}",
+        head_identity,
+        source.len(),
+        provider_middle.len(),
+        engine_kept.len(),
+        texel_at(&provider_middle, half_of(width) - 1, height / 2)[0],
+        texel_at(&provider_middle, half_of(width) - 1, height / 2)[1],
+        texel_at(&provider_middle, half_of(width) - 1, height / 2)[2],
+        texel_at(&provider_middle, width - 1, height / 2)[0],
+        texel_at(&provider_middle, width - 1, height / 2)[1],
+        texel_at(&provider_middle, width - 1, height / 2)[2],
+        route_count("render_provider_resident_source_bytes") - carried_before,
+        route_count("render_provider_publish_held_resident") - published_before,
+        route_count("render_provider_resident_store") - stores_before,
+        route_count("render_provider_resident_load") - loads_before,
+    );
+    assert_eq!(
+        provider_middle,
+        engine_kept,
+        "the frame the provider published from the handed-over bytes and the frame the engine \
+         kept after the same record are not two runs of one rail: provider {} bytes against the \
+         engine's {}",
+        provider_middle.len(),
+        engine_kept.len(),
+    );
+
+    assert_eq!(
+        route_count("render_provider_resident_source_bytes") - carried_before,
+        1,
+        "the carried population is counted where the answer happens"
+    );
+    assert_eq!(
+        route_count("render_provider_publish_held_resident") - published_before,
+        1,
+        "the record's own frame is published, never kept"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_store") - stores_before,
+        0,
+        "no frame stays in an image this caller cannot read"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_load") - loads_before,
+        0,
+        "the pass began from the caller's bytes, not from a resident load"
+    );
+
+    // 6. The packet's *last* record (`wb=1`, `continues=1`), starting from the
+    //    frame the middle record left in the engine's registry. Its store
+    //    publishes a writeback on both rails, so the comparison is again the
+    //    engine's own answer from the same previous contents.
+    let tail_source = engine_chain_source(&head_identity);
+    let tail = {
+        let mut tail = resident_load_request(&head_identity, true);
+        tail.continues_render_pass = true;
+        tail
+    };
+    let carried_before = route_count("render_provider_resident_source_bytes");
+    let published_before = route_count("render_provider_publish_held_resident");
+    let provider_tail = match provider_render::submit_render(
+        &inputs_held_with_source(&stages, RenderChainRole::SoleOrTail, &tail_source),
+        &tail,
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!(
+            "the packet's last resident record is in class with its chain's frame: {other:?}"
+        ),
+    };
+    let Some(engine_tail) = engine_pixels("engine tail", &stages, {
+        let mut tail = resident_load_request(&head_identity, true);
+        tail.continues_render_pass = true;
+        tail
+    }) else {
+        return;
+    };
+    assert_texel_count("engine tail frame", &engine_tail);
+    assert_eq!(
+        provider_tail,
+        engine_tail,
+        "the packet's last record lands the same frame on both rails: provider {} bytes against \
+         the engine's {}",
+        provider_tail.len(),
+        engine_tail.len(),
+    );
+    assert_eq!(
+        route_count("render_provider_resident_source_bytes") - carried_before,
+        1,
+        "the last record's chain frame is carried too"
+    );
+    assert_eq!(
+        route_count("render_provider_publish_held_resident") - published_before,
+        0,
+        "a record whose store publishes its own readback is not the held arm"
+    );
+
+    // 7. A caller that hands over bytes of the wrong extent is a wiring bug
+    //    named as one, not a provider decline: the class keeps the record on
+    //    the engine under its own slug.
+    let short = &source[..source.len() - 4];
+    let short_identity = surface_identity(0x7b_00_09);
+    let _ = engine_pixels(
+        "short chain head",
+        &stages,
+        resident_seed_request(&short_identity),
+    );
+    let mut short_chained = resident_load_request(&short_identity, true);
+    short_chained.continues_render_pass = true;
+    match provider_render::submit_render(
+        &inputs_held_with_source(&stages, RenderChainRole::SoleOrTail, short),
+        &short_chained,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_resident_source_shape",
+            "bytes that are not the attachment's extent keep the record on the engine: {reason}"
+        ),
+        other => panic!("a short carried frame is not the held class's: {other:?}"),
     }
 }
 

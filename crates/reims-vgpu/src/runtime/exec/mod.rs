@@ -5331,9 +5331,20 @@ fn finish_stream<M: HostMemory + HostOps>(
                 match encode {
                     (EncodeStatus::Ok, Some(rgba)) => {
                         out.metal_draws_ok += 1;
-                        if !resident_chain {
-                            chain_rgba = Some(rgba);
-                        }
+                        // R23: a frame that comes back while the chain is
+                        // resident is the chain moving back into bytes. The
+                        // record that produced it did *not* write the engine's
+                        // resident — the canonical rail's held arms never keep a
+                        // frame its caller cannot fetch, so it published this
+                        // one instead — which leaves that image holding the
+                        // *previous* record's frame. The next record therefore
+                        // has to start from these bytes, and the resident chain
+                        // is over: the `!resident_chain` guard that used to
+                        // drop the frame here would have chained the record
+                        // after it from a stale image, silently losing this
+                        // record's draw.
+                        resident_chain = false;
+                        chain_rgba = Some(rgba);
                     }
                     (EncodeStatus::Ok, None) if req.chain_resident_established => {
                         // Resident render-pass chain intermediate: content stays
