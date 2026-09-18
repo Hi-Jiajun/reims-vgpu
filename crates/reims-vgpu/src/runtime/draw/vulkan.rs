@@ -2865,16 +2865,203 @@ fn gva_attachment_window<M: HostMemory + HostOps>(
             WindowRefusal::Untileable => AttachmentWindowMiss::Untileable,
         })?;
     let page = state.page_size();
-    let source = GuestRunSource {
+    let pages = guest_page_window(host, gpas, page, c0.target_gva % page, span);
+    // B4: the projection above answers with the RAMBlock spans *this boot*
+    // imported, and a narrowed import (`crate::config::GUEST_IMPORT_ONLY`) is
+    // the ordinary case on a census rig. The resource's own registered import
+    // covers the same bytes whether or not any of those spans does, so it is
+    // asked when the projection stated no window — and only then, so every
+    // shape that already had one keeps the source it had.
+    let registered = if projection_states_a_window(&pages) {
+        None
+    } else {
+        gva_import_source(
+            state,
+            host,
+            task_id,
+            c0.texture_ref,
+            c0.target_gva,
+            span,
+            row_length_texels,
+        )
+    };
+    let source = registered.unwrap_or_else(|| GuestRunSource {
         runs: std::sync::Arc::new(runs),
         source_offset: 0,
         total_len: span,
         row_length_texels,
-        pages: guest_page_window(host, gpas, page, c0.target_gva % page, span),
+        pages,
         direct_image: None,
-    };
+    });
     crate::backend::provider_render::load_seed_run_windows(&source, extent)
         .map_err(AttachmentWindowMiss::Runs)
+}
+
+/// The attachment's own bytes as an ordered run list cut from **one registered
+/// import**, rather than from the RAMBlock projection (B4).
+///
+/// A window is a slice of one registration and a registration is cut from an
+/// import this process holds (`research/docs/20` §3.1–§3.2), and one guest
+/// surface can be covered by two different imports:
+///
+/// * the shim's RAMBlock spans, which a boot imports as a *set* and which
+///   [`crate::config::GUEST_IMPORT_ONLY`] may narrow to a subset — the
+///   projection [`crate::runtime::guest_ram_map::references_for_runs`] resolves
+///   a page list against;
+/// * the surface's own packed-alias allocation, built by `HostOps::map_pages`
+///   over the surface's own page list and registered by
+///   [`crate::runtime::guest_ram_map::register_alias`] at its one construction
+///   site — the import the sampled and buffer rails already read these same
+///   bytes through (`mapped_sampled_source`, `direct_linear_sample_from_packed`).
+///
+/// The two LOAD-elision doors asked only the first. A surface whose pages lie
+/// outside the imported spans therefore had no window at all and kept the
+/// engine by name (`resident_source_window_unregistered`) while those same
+/// bytes were already importable through the second — one registration, cut
+/// over the attachment's own bytes, which is the same statement
+/// [`crate::backend::provider_render::load_seed_run_windows`] cuts its runs
+/// from.
+///
+/// `None` when the import does not cover `offset + span`, or when the address
+/// space cannot name the slice: the caller then keeps whatever the projection
+/// said, so no shape loses an answer it already had.
+#[cfg(feature = "provider-render")]
+pub(super) fn registered_import_source(
+    import: &std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    offset: u64,
+    span: u64,
+    row_length_texels: u32,
+) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+    use crate::backend::vulkan::engine::{GuestRun, GuestRunSource};
+    use crate::runtime::guest_ram::GuestRef;
+
+    if span == 0 {
+        return None;
+    }
+    // The window is the attachment's own bytes widened to the import's
+    // granularity, which is `GuestRamImport::slice`'s contract: the bound is the
+    // page-aligned range a registration may name, and the widening it had to
+    // apply rides out as `GuestRef::head`, which is the coordinate the class
+    // reads the binding's own first byte through. That is the same split the
+    // RAMBlock projection builds (`Resolved::reference`), so a window cut from
+    // either import lands on the same byte of the same frame.
+    let slice = import.slice(offset, span).ok()?;
+    let guest = GuestRef::new(std::sync::Arc::clone(import), slice).ok()?;
+    // Registered at the allocation's own construction site, so the window is
+    // derived here and never re-cut; `None` when that registration was refused,
+    // which is the advisory reading the alias rails already keep rather than a
+    // second bind policy.
+    let window = crate::runtime::guest_ram_map::window_of(&guest);
+    Some(GuestRunSource {
+        // One run over exactly the attachment's bytes, so the CPU gather that
+        // walks `runs` reads the same slice the class states as the window and
+        // the run list still tiles `total_len` exactly — the invariant the
+        // seed's own consumers assert.
+        runs: std::sync::Arc::new(vec![GuestRun::in_mapping(
+            import.host_base(),
+            import.len(),
+            offset,
+            span,
+        )?]),
+        source_offset: 0,
+        total_len: span,
+        row_length_texels,
+        pages: Some(std::sync::Arc::new(vec![
+            crate::runtime::guest_ram_map::GuestWindowRun {
+                window_offset: 0,
+                guest,
+                window,
+            },
+        ])),
+        direct_image: None,
+    })
+}
+
+/// Whether the RAMBlock projection's run list states a **window for every
+/// stretch it covers**.
+///
+/// Its three answers that do not are the three facts
+/// [`crate::backend::provider_render::load_seed_run_windows`] names
+/// `Unregistered` / `Unwindowed`: no list at all (the pages are in no import
+/// this boot holds), an empty list, and a stretch whose import has no
+/// registration under the current epoch. Every one of them is a statement about
+/// the *projection* and not about the bytes, which is why a door that reads one
+/// asks [`registered_import_source`] for the second source before it answers.
+#[cfg(feature = "provider-render")]
+pub(super) fn projection_states_a_window(
+    pages: &Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>>,
+) -> bool {
+    pages
+        .as_ref()
+        .is_some_and(|runs| !runs.is_empty() && runs.iter().all(|run| run.window.is_some()))
+}
+
+/// One mapping's own registered import, cut for one attachment's span
+/// ([`registered_import_source`]'s mapper-ref-texture caller).
+///
+/// [`crate::runtime::mapper::ensure_contig_import_with_footprint`] is the
+/// mapping rail's one construction site, and it registers the allocation as it
+/// builds it; it is cached on the mapping, so a boot pays one `map_pages` and
+/// one import per mapping rather than one per record.
+#[cfg(feature = "provider-render")]
+pub(super) fn mapping_import_source<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    offset: u64,
+    span: u64,
+    row_length_texels: u32,
+) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+    let (import, _footprint) =
+        crate::runtime::mapper::ensure_contig_import_with_footprint(state, host, mapping_id)?;
+    registered_import_source(&import, offset, span, row_length_texels)
+}
+
+/// The same cut for one task texture resource's own registered import —
+/// [`ensure_packed_resource`]'s allocation, which is the import the sampled and
+/// buffer rails already read these bytes through.
+///
+/// The import is keyed and cached by `(task, resource_ref)` and its geometry, so
+/// a resource the sampled rail already packed answers this call with the
+/// allocation it built; a render target nothing samples builds one of its own,
+/// under the [`PackedResourceRail::ResidentSource`] counters.
+#[cfg(feature = "provider-render")]
+pub(super) fn gva_import_source<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    plane_gva: u64,
+    span: u64,
+    row_length_texels: u32,
+) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+    let (base, size) = {
+        let resource = state.constructed_object(task_id, texture_ref)?;
+        resource.backing_window(state.page_shift)?
+    };
+    let backing = BufferBacking { gva: base, size };
+    if !ensure_packed_resource(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        &backing,
+        PackedResourceRail::ResidentSource,
+    ) {
+        return None;
+    }
+    // `head` is where the resource's own first byte sits inside the page-aligned
+    // import, so the attachment's first byte is that plus the plane's own offset
+    // inside the allocation — the same two terms `sampled_backing_from_packed`
+    // adds for the sampled rail.
+    let packed =
+        state
+            .bound_buffers
+            .packed_available(task_id, texture_ref, backing.gva, backing.size)?;
+    let offset = packed
+        .head
+        .checked_add(plane_gva.checked_sub(packed.gva)?)?;
+    registered_import_source(&packed.import, offset, span, row_length_texels)
 }
 
 /// The window one elision door cut, as the class reads it.
@@ -2972,16 +3159,40 @@ fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
         return Err(AttachmentWindowMiss::Untileable);
     };
     let page = state.page_size();
+    let pages = guest_page_window(host, gpas, page, base_off % page, span);
+    // B4: the same second source as the GVA door's — the mapping's own
+    // registered import, which is the allocation `mapped_sampled_source` reads
+    // this very surface through. Asked only when the RAMBlock projection stated
+    // no window, so a shape that already had one keeps its own runs and its own
+    // registration. The shipping configuration (no `provider-render`) declares
+    // no window at all, so it keeps the projection's own source below.
+    #[cfg(feature = "provider-render")]
+    let registered = if projection_states_a_window(&pages) {
+        None
+    } else {
+        mapping_import_source(state, host, mapping_id, base_off, span, row_length_texels)
+    };
+    #[cfg(feature = "provider-render")]
+    let source = registered.unwrap_or_else(|| GuestRunSource {
+        runs: std::sync::Arc::new(runs),
+        source_offset: 0,
+        total_len: span,
+        row_length_texels,
+        pages,
+        direct_image: None,
+    });
+    #[cfg(not(feature = "provider-render"))]
+    let source = GuestRunSource {
+        runs: std::sync::Arc::new(runs),
+        source_offset: 0,
+        total_len: span,
+        row_length_texels,
+        pages,
+        direct_image: None,
+    };
     Ok((
         GuestTargetSeed {
-            source: GuestRunSource {
-                runs: std::sync::Arc::new(runs),
-                source_offset: 0,
-                total_len: span,
-                row_length_texels,
-                pages: guest_page_window(host, gpas, page, base_off % page, span),
-                direct_image: None,
-            },
+            source,
             format: source_format,
         },
         pay,
@@ -3744,6 +3955,12 @@ fn coalesce_pages_to_runs<M: HostOps>(
 pub(super) enum PackedResourceRail {
     Buffer,
     LinearSample,
+    /// The LOAD-elision doors' own ask (B4): the resource's registered import,
+    /// cut into the attachment's own window. It shares the cached allocation
+    /// with the two rails above — the cache is keyed by resource and geometry,
+    /// not by the asker — and keeps its own two counters only so a census can
+    /// say which rail's window the import was built for.
+    ResidentSource,
 }
 
 /// Band a scattered packed window by how many maximal GPA runs it is made of.
@@ -3936,6 +4153,12 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
         }
         (PackedResourceRail::LinearSample, PackedBufferResolution::Unavailable { .. }) => {
             "zc_lin_packed_unavailable"
+        }
+        (PackedResourceRail::ResidentSource, PackedBufferResolution::Available(_)) => {
+            "resident_source_packed_alias"
+        }
+        (PackedResourceRail::ResidentSource, PackedBufferResolution::Unavailable { .. }) => {
+            "resident_source_packed_unavailable"
         }
     });
     let available = matches!(made, PackedBufferResolution::Available(_));
