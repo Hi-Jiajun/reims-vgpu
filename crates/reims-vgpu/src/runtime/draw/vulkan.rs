@@ -11360,6 +11360,72 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 RenderRailOutcome::ProviderCompleted(out) => {
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
                     crate::runtime::drain::note_store_route("render_provider_canonical");
+                    // fp3 probe, pure observation: *which* caller rail withheld
+                    // this record's readback, and how many bytes the canonical
+                    // rail had to publish anyway because this seam cannot fetch
+                    // a frame it kept (`resident_frames_fetchable` is `false`
+                    // here — that flag is R4b's byte channel).
+                    //
+                    // Reaching this arm is the withheld case itself: the
+                    // provider answered with bytes, and the three flags below
+                    // are the three arms of `try_metal2vulkan_draw` that set
+                    // `skip_readback` with `ReadbackSkipReason::ResidentStore`.
+                    // The split is charged here rather than in
+                    // `provider_render` because the *reason* belongs to the
+                    // caller — which rail armed the withhold — while the rail
+                    // only sees the pair. The three names must therefore sum to
+                    // `render_provider_publish_held_resident`, the rail's own
+                    // count of the published-instead-of-kept answer: the two are
+                    // each other's identity check, and a mismatch is a wiring
+                    // finding rather than a reading.
+                    if resources.skip_readback
+                        && matches!(
+                            resources.readback_skip_reason,
+                            crate::backend::vulkan::engine::ReadbackSkipReason::ResidentStore
+                        )
+                    {
+                        let (route, byte_route) = if resident_render_chain {
+                            // The frame's only consumer is the next record of
+                            // this packet, which takes it as a CPU seed: the
+                            // bytes cross the host bus twice — the readback
+                            // below, then the seed upload — for a frame that
+                            // never had to leave the device. The resident chain
+                            // (R7b) is the arm that would have kept it, and it
+                            // is held by the same `resident_frames_fetchable`.
+                            (
+                                "provider_held_chain_middle",
+                                "provider_held_chain_middle_bytes",
+                            )
+                        } else if gva_resident_store.is_some() {
+                            // A deferred GVA Store: the plan was to leave the
+                            // frame in the registry resident and transfer it
+                            // when a reader asks. The published bytes defeat
+                            // that deferral — the Store route below lands them
+                            // synchronously — and honouring it instead needs
+                            // R4b's fetch channel.
+                            ("provider_held_store_gva", "provider_held_store_gva_bytes")
+                        } else if surface_resident_store.is_some() {
+                            // The same deferral on the mapper-ref-texture
+                            // composite rail, and the same missing channel.
+                            (
+                                "provider_held_store_surface",
+                                "provider_held_store_surface_bytes",
+                            )
+                        } else {
+                            // A withhold whose arming rail this seam cannot name
+                            // is a wiring finding, not a silence: it should read
+                            // 0 in every round.
+                            (
+                                "provider_held_unattributed",
+                                "provider_held_unattributed_bytes",
+                            )
+                        };
+                        crate::runtime::drain::note_store_route(route);
+                        crate::runtime::drain::note_store_route_n(
+                            byte_route,
+                            u64::try_from(out.bytes.len()).unwrap_or(u64::MAX),
+                        );
+                    }
                     // The frame profile's own two-path count: this draw was
                     // answered by the canonical provider, not the engine.
                     crate::runtime::drain::note_frame_draw_rail(
