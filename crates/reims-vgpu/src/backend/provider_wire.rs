@@ -174,6 +174,41 @@ pub fn render_texture_support(
     })
 }
 
+/// The runtime-sampler half of the same render-sampler section (R36).
+///
+/// The fifth reading of the one-snapshot rule ([`stage_buffer_support`],
+/// [`compute_texture_support`], [`render_texture_support`],
+/// [`stage_buffer_namespace_split`]), and the one R36 needs: a pass whose
+/// runtime `[[sampler(n)]]` states travel a frame is executed by the provider
+/// exactly when the provider's own capability frame declares the render-sampler
+/// shape at all (`supports_render_texture_sampling`, the section v70 gave the
+/// tail), because the states are the pass half of a pairing whose other half is
+/// that section's texture declarations — a module's texture sampled through a
+/// state nobody stated is refused at admission by name
+/// (`render_runtime_sampler_missing`), and a device that does not declare the
+/// section is a device whose admission never states it.
+///
+/// The carriage itself is the codec's side and is not assumed here: E-TX4's
+/// `PASS_KIND_RENDER_SAMPLERS` family (`0x15..=0x18`) writes the pass's sampler
+/// block and the provider's own decoder reads it back, which the rail's tests
+/// falsify by decoding a captured frame (`carried_submission`) and asserting the
+/// states and their texture pairings survived the round trip. What this
+/// function answers is whether the *device* declares the shape the block
+/// belongs to.
+///
+/// `false` is the fail-closed answer, and it is what a frame written before the
+/// section existed decodes to (the section is a presence tag: absent means the
+/// defaults), so a caller that reads this keeps the draw on the engine under its
+/// own name rather than handing the provider a pass whose states nothing
+/// executes.
+pub fn render_sampler_carriage(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_texture_sampling)
+}
+
 /// The folded-pair half of one provider capability snapshot, read back out of
 /// the response frame the provider would send (`research/docs/23` §3.3,
 /// E-TX9 / R33).

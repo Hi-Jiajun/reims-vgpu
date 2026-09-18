@@ -7007,8 +7007,12 @@ fn the_runtime_sampler_shapes_beside_the_entry_stay_on_the_engine_by_name() {
 
     // 7. The command channel: the very same shape beside one `[[buffer(0)]]`
     //    argument — a stated stage buffer is what makes the trace cross the
-    //    owner→provider wire, and the frame carries the pass's sampled textures
-    //    (v70) and not its runtime sampler list.
+    //    owner→provider wire. The frame carries the pass's runtime sampler list
+    //    since E-TX4, so the draw leaves for the provider on a device that
+    //    declares the render-sampler section (R36's own test below) and keeps
+    //    the engine, under this same bucket, on a device that does not — the
+    //    fail-closed arm, read here through the same one-frame override the
+    //    folded pair's own test holds.
     let wired = sampled_fragment_stages(
         "render_frag_runtime_sampler_buffer.air",
         "reims_runtime_sampled_buffer_frag",
@@ -7021,17 +7025,307 @@ fn the_runtime_sampler_shapes_beside_the_entry_stay_on_the_engine_by_name() {
     let wired_request = request(&wired);
     let content = BufferContent::from(vec![0u8; 4]);
     let binds = [staged_bind(RenderPipelineStage::Fragment, 0, &content)];
-    let (slug, detail) = answer(
-        "runtime sampler across the wire",
-        &wired,
-        &wired_request,
-        &binds,
-    );
-    eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_texture_sampler_wire");
+    {
+        let _undeclared = provider_render::override_render_sampler_carriage(Some(false));
+        let (slug, detail) = answer(
+            "runtime sampler across the wire, provider without the section",
+            &wired,
+            &wired_request,
+            &binds,
+        );
+        eprintln!("door: {slug}\n  {detail}");
+        assert_eq!(
+            slug, "render_provider_out_of_class_texture_sampler_wire",
+            "a device that does not declare the shape keeps R12's bucket: {detail}"
+        );
+        assert!(
+            detail.contains("runtime sampler list")
+                && detail.contains("render_runtime_sampler_missing"),
+            "the sentence names the list the frame cannot carry and the backstop's own name: \
+             {detail}"
+        );
+    }
+}
+
+/// The command frame's own header (R36): `MCC1`, the request tag, and the
+/// payload's `u32` big-endian length, exactly as `metal-api-ipc`'s `write_framed`
+/// writes them — so a byte a test reads out of the *payload* starts here, and
+/// the length field's low byte is at `FRAME_HEADER - 1`.
+const FRAME_HEADER: usize = 9;
+
+/// R36: the answer the class's runtime-sampler wire question reads comes out of
+/// the *frame*, and it is falsifiable in both directions.
+///
+/// The gate asks `render_sampler_carriage`, which encodes the provider's own
+/// capability snapshot, decodes it again with the provider's decoder and reads
+/// the render-sampler section back out. Two readings of one snapshot below: the
+/// device's own (the section is present) and the same snapshot with the
+/// section's bits cleared, which the codec keeps as the shorter frame and the
+/// decoder reads as the section's defaults — the answer that keeps a pass whose
+/// runtime `[[sampler(n)]]` states would travel a frame on the engine.
+#[test]
+fn the_runtime_sampler_carriage_the_class_reads_comes_out_of_the_frame() {
+    let _guard = engine_test_session();
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let provider =
+        VulkanComputeProvider::with_executor(executor).expect("the canonical provider builds");
+    let epoch = provider.device_epoch();
+    let declared = provider_wire::render_sampler_carriage(epoch, &provider.capabilities())
+        .expect("the capability frame round-trips");
     assert!(
-        detail.contains("runtime sampler list"),
-        "the sentence names what the frame does not carry: {detail}"
+        declared,
+        "the acceptance environment's provider declares the render-sampler section the pass's \
+         runtime states belong to"
+    );
+
+    let mut refused = provider.capabilities();
+    refused.supports_render_texture_sampling = false;
+    refused.max_render_textures = 0;
+    refused.supported_render_texture_formats.clear();
+    let silent = provider_wire::render_sampler_carriage(epoch, &refused)
+        .expect("the shorter frame still round-trips");
+    assert!(
+        !silent,
+        "a snapshot without the section reads as the refusal: {silent}"
+    );
+    eprintln!(
+        "R36 wire capability: the device's own frame declares the render-sampler section \
+         (carriage={declared}); the same snapshot without the section reads carriage={silent}"
+    );
+}
+
+/// R36: the runtime `[[sampler(n)]]` states cross the owner→provider wire, and
+/// the provider lands the frame the engine lands.
+///
+/// R12 kept every pass whose runtime sampler states would travel a frame on the
+/// engine, because the frame of that increment could not carry the list: the
+/// decoder stated an empty sampler list and admission would have refused the
+/// declaration by name (`render_runtime_sampler_missing`) instead of executing
+/// a pass that samples through a state nobody stated. The frame has carried the
+/// list since E-TX4 — the `PASS_KIND_RENDER_SAMPLERS` family, tags `0x15..=0x18`,
+/// which the pinned provider has carried since `7d544d4` — so the shape is in
+/// class on a device that declares the render-sampler section, and this test is
+/// the readings that say so, all taken from the frame the seam produced and
+/// from the bytes the two rails land:
+///
+/// - the frame's own pass tag is the sampler-bearing one, and the *same* pass
+///   without its states reads the tag that carries no sampler block — the first
+///   byte the sampler block moves, and the block's own size beside it;
+/// - the decoded pass states the runtime sampler list (count, Metal index and
+///   the state the request's bind carried), paired with the render contract's
+///   own texture declaration — the two halves admission walks;
+/// - the decoded frame re-encodes to the identical bytes, so the block the
+///   provider read is the block the owner wrote;
+/// - the provider's attachment is the engine's, byte for byte, and another
+///   address mode lands another frame — so the states are what both rails
+///   executed and not what either one assumed.
+#[test]
+fn the_runtime_sampler_states_cross_the_wire_and_the_provider_lands_the_frame() {
+    let _guard = engine_test_session();
+    let stages = sampled_fragment_stages(
+        "render_frag_runtime_sampler_buffer.air",
+        "reims_runtime_sampled_buffer_frag",
+    );
+    assert_eq!(
+        stages.fragment_stage_buffer_declarations.len(),
+        1,
+        "the fixture declares one fragment stage buffer beside its runtime sampler"
+    );
+    assert_eq!(
+        stages
+            .fragment_texture_declarations
+            .iter()
+            .filter(|declaration| matches!(declaration.sampler, RenderSamplerState::Runtime { .. }))
+            .count(),
+        1,
+        "and one sampled texture read through the runtime argument: {:#?}",
+        stages.fragment_texture_declarations
+    );
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let runtime = stages.sampler_family.runtime[0];
+    use reims_vgpu::protocol::sampler as mtl;
+    let nearest = mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+    let clamp = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    let repeat = mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT;
+    // The fixture also reads one `[[buffer(0)]]` word and stores it in red, so
+    // the same bind has to be stated to both rails for the comparison below to
+    // be one about the sampler states rather than about a dropped buffer.
+    let tint = BufferContent::Bytes(std::sync::Arc::new({
+        let mut bytes = 1.0f32.to_ne_bytes().to_vec();
+        bytes.resize(16, 0);
+        bytes
+    }));
+    let request = |address: u32| {
+        let mut req =
+            runtime_sampled_request(&stages, texels.clone(), (width, height), nearest, address);
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: tint.clone(),
+        });
+        req
+    };
+    let binds = [staged_bind(RenderPipelineStage::Fragment, 0, &tint)];
+    let provider_frame = |label: &str, address: u32| match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &request(address),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!(
+            "{label}: a runtime-sampled pass beside a declared stage buffer is in class on a \
+                 device that declares the render-sampler section: {other:?}"
+        ),
+    };
+
+    provider_wire::capture_submission_frames(true);
+    let delivered = provider_render::provider_submissions();
+    let clamp_frame = provider_frame("runtime sampler across the wire", clamp);
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    assert_eq!(
+        frames.len(),
+        1,
+        "the seam produced exactly one submission frame for the shape"
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the shape reached the canonical provider instead of the engine"
+    );
+
+    // The frame, decoded by the provider's own decoder. Two readings: the pass
+    // states the runtime sampler list, and the contract's own texture
+    // declaration names the same Metal index as the texture's runtime sampler.
+    let (wire_trace, wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let pass = wire_trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .expect("the frame carries a render pass");
+    eprintln!(
+        "wire runtime samplers: {:?} over {} sampled texture view(s)",
+        pass.samplers,
+        pass.textures.len(),
+    );
+    assert_eq!(
+        pass.samplers.len(),
+        1,
+        "the decoded pass states the one runtime sampler the request bound"
+    );
+    let sampler = &pass.samplers[0];
+    assert_eq!(
+        sampler.metal_binding, runtime.index,
+        "the state is stated at the Metal index the module's `[[sampler(n)]]` argument names"
+    );
+    assert_eq!(
+        (sampler.policy.filter, sampler.policy.address),
+        (
+            metal_api_core::provider::SamplerFilter::Nearest,
+            metal_api_core::provider::SamplerAddressMode::ClampToEdge,
+        ),
+        "and carries the state the request's own bind states"
+    );
+    let declaration = wire_trace
+        .pipelines
+        .iter()
+        .find_map(|pipeline| pipeline.render.as_ref())
+        .and_then(|render| render.textures.first())
+        .expect("the frame carries the render contract's texture declarations");
+    assert_eq!(
+        declaration.runtime_sampler,
+        Some(runtime.index),
+        "the declaration's half of the pairing crossed the wire too"
+    );
+    let reencoded = provider_wire::submit_frame(&wire_trace, &wire_resources).expect("re-encode");
+    assert_eq!(
+        reencoded, frames[0],
+        "the frame is a fixed point of the owner's encoder and the provider's decoder"
+    );
+
+    // The same pass without its states: the sampler block's own three readings,
+    // taken off the frames rather than off an offset this test spells by hand.
+    // A frame's first nine bytes are its magic, its request tag and the
+    // payload's `u32` length, so the block moves the payload's first differing
+    // byte — which is the pass tag: `0x18` is the sampled, stage-buffer *and*
+    // sampler tag, and the same pass without the states takes `0x14`, the tag
+    // that carries no sampler block.
+    let mut without = wire_trace.clone();
+    for entry in without.passes.iter_mut() {
+        if let TracePass::Render(pass) = entry {
+            pass.samplers.clear();
+        }
+    }
+    let without_bytes =
+        provider_wire::submit_frame(&without, &wire_resources).expect("the same trace encodes");
+    let block = 1 + 6 * pass.samplers.len();
+    let payload_length =
+        |frame: &[u8]| u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]) as usize;
+    assert_eq!(
+        payload_length(&frames[0]),
+        payload_length(&without_bytes) + block,
+        "the frame's own payload length counts the sampler block"
+    );
+    let tag = FRAME_HEADER
+        + frames[0][FRAME_HEADER..]
+            .iter()
+            .zip(without_bytes[FRAME_HEADER..].iter())
+            .position(|(with, without)| with != without)
+            .expect("the sampler block is the one difference between the two frames");
+    eprintln!(
+        "wire pass tags: with the states {:02x}, without them {:02x} at byte {tag}; frame \
+         lengths {} and {}, and the block is {block} bytes",
+        frames[0][tag],
+        without_bytes[tag],
+        frames[0].len(),
+        without_bytes.len(),
+    );
+    assert_eq!(
+        (frames[0][tag], without_bytes[tag]),
+        (0x18, 0x14),
+        "the tag that carries the runtime sampler list is the sampler-bearing one"
+    );
+    assert_eq!(
+        frames[0].len(),
+        without_bytes.len() + block,
+        "and the block is the count byte plus (Metal index, filter, address) per state"
+    );
+
+    // The two rails' own frames: the provider's is the engine's, byte for byte,
+    // and the address mode is the request's — it lands another frame.
+    let Some(engine_clamp) =
+        engine_pixels("runtime sampler across the wire", &stages, request(clamp))
+    else {
+        return;
+    };
+    assert_frames_equal(
+        "runtime sampler across the wire",
+        &clamp_frame,
+        &engine_clamp,
+    );
+    let repeat_frame = provider_frame("runtime sampler across the wire, repeat", repeat);
+    assert_frames_differ(
+        "the address mode the request states moves the frame",
+        &clamp_frame,
+        &repeat_frame,
+    );
+    let Some(engine_repeat) = engine_pixels(
+        "runtime sampler across the wire, repeat",
+        &stages,
+        request(repeat),
+    ) else {
+        return;
+    };
+    assert_frames_equal(
+        "runtime sampler across the wire, repeat",
+        &repeat_frame,
+        &engine_repeat,
+    );
+    eprintln!(
+        "R36 runtime sampler over the wire: {} sampler state(s) decoded at Metal index {}, the \
+         declaration pairs it, the frame is a codec fixed point, both rails agree byte for byte \
+         under clamp and repeat, and the two states land two frames",
+        pass.samplers.len(),
+        runtime.index,
     );
 }
 
