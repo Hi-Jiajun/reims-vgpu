@@ -5553,7 +5553,28 @@ fn readback_snapshot(
     Ok((snap, layout))
 }
 
-fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+/// One resident's level-0 texels, copied out at the image's own width and in
+/// the image's own format: the copy [`read_target`] and
+/// [`read_target_four_byte_color`] both stand on.
+///
+/// The width and the layout travel with the bytes because the two callers
+/// narrow differently — one to the eight-bit colour every drawn-pixel consumer
+/// speaks, the other to *nothing at all*: a caller that has to receive exactly
+/// the bytes the image holds must be able to see that the image's texel is not
+/// one it can pass through untouched.
+struct ResidentCopy {
+    /// The image's own Vulkan format, as the snapshot reports it.
+    format: ash::vk::Format,
+    layout: crate::protocol::pixel_format::TexelLayout,
+    /// The image's own channel order, from the snapshot: what the four
+    /// eight-bit bytes of a texel are.
+    bgra: bool,
+    /// The image's level-0 texel count, the factor of the copy's length.
+    pixels: u64,
+    bytes: Vec<u8>,
+}
+
+fn read_resident_copy(identity: &TargetIdentity) -> Result<ResidentCopy, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -5565,8 +5586,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     unsafe { pools.ensure_init(ctx, counters)? };
     let (snap, layout) = readback_snapshot(pools, identity)?;
     // Asked for at the resident's own width — the copy is a raw image→buffer
-    // move and reads the image format's texel — and narrowed below if that is
-    // not what the caller can read.
+    // move and reads the image format's texel.
     let pixels = (snap.width as u64) * (snap.height as u64);
     let rb_size = pixels * u64::from(layout.bytes_per_texel());
     let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
@@ -5586,17 +5606,52 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         )?;
         pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size, TargetReadDelivery::Host);
-        // A wide resident is quantized here rather than refused; see
-        // `narrow_readback_to_rgba8` for why that direction is the safe one.
-        let (pixels, texel) =
-            narrow_readback_to_rgba8(out, layout, snap.format, pixels, snap.bgra())?;
-        Ok(TargetReadback { pixels, texel })
+        Ok(ResidentCopy {
+            format: snap.format,
+            layout,
+            bgra: snap.bgra(),
+            pixels,
+            bytes: out,
+        })
     }
+}
+
+fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+    let copy = read_resident_copy(identity)?;
+    // A wide resident is quantized here rather than refused; see
+    // `narrow_readback_to_rgba8` for why that direction is the safe one.
+    let (pixels, texel) =
+        narrow_readback_to_rgba8(copy.bytes, copy.layout, copy.format, copy.pixels, copy.bgra)?;
+    Ok(TargetReadback { pixels, texel })
 }
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
 pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
     read_target_inner(identity)
+}
+
+/// Full-frame readback of a resident's **own** texels, for the one caller that
+/// may not receive a narrowed frame (R24).
+///
+/// [`read_target`] answers any resident a consumer of eight-bit colour can use,
+/// including a wide one it *quantizes* on the way out. That quantization is the
+/// safe direction for a frame on its way to guest memory, and the wrong one for
+/// a frame whose bytes the caller is about to hand a rail that declares the
+/// bind's own view over exactly them: the canonical render rail's sampled-target
+/// arm states `TextureSource::OwnedBytes`, so a frame this device quantized
+/// would be sampled as bytes the image never held.
+///
+/// `Ok(None)` is therefore a resident whose texel is not four-byte colour —
+/// `Rgba8`/`Bgra8`, the two layouts whose whole stored texel is the colour —
+/// and `Err` is every failure [`read_target`] also has (an absent identity, a
+/// resident that is not ready). The bytes are the image's own, in the image's
+/// own order: the caller states the view's format over them rather than
+/// exchanging channels here.
+pub fn read_target_four_byte_color(
+    identity: &TargetIdentity,
+) -> Result<Option<Vec<u8>>, DrawError> {
+    let copy = read_resident_copy(identity)?;
+    Ok(copy.layout.is_four_byte_color().then_some(copy.bytes))
 }
 
 /// Run bounded maintenance for dead resources and already-free pool entries.

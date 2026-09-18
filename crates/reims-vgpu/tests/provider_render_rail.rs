@@ -900,6 +900,10 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // out of the engine's own registry and states them here — the shape
         // [`inputs_held_with_source`] drives.
         resident_source_bytes: None,
+        // R24: no sampled GPU target's frame is handed over unless a test reads
+        // one out of the engine's registry and states it — the shape
+        // [`inputs_held_with_sampled_frames`] drives.
+        sampled_target_frames: &[],
         vertex_attribute_locations: &stages.vertex_attribute_locations,
         vertex_stage_buffer_declarations: &stages.vertex_stage_buffer_declarations,
         fragment_stage_buffer_declarations: &stages.fragment_stage_buffer_declarations,
@@ -951,6 +955,24 @@ fn inputs_held_with_source<'a>(
 ) -> RenderRailInputs<'a> {
     RenderRailInputs {
         resident_source_bytes: Some(source),
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_held`] with the frames the caller read out of the engine's registry
+/// for sampled GPU targets the rail has no production to restate (R24).
+///
+/// This is the production seam's third hand-over (after R23's chain frame): the
+/// same registry read, for the other kind of resident the census's Target arm
+/// refuses — the one a *sampled* bind names rather than the record's own
+/// attachment.
+fn inputs_held_with_sampled_frames<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    frames: &'a [provider_render::SampledTargetFrame<'a>],
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        sampled_target_frames: frames,
         ..inputs_held(stages, role)
     }
 }
@@ -12724,5 +12746,454 @@ fn a_sampled_pass_the_wire_would_strip_stays_on_the_engine_by_name() {
         provider_render::provider_submissions(),
         submissions,
         "the draw never reaches the provider — a fallback, not the decline the frame would earn"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R24: the frame the registry holds, carried into a sampled bind
+// ---------------------------------------------------------------------------
+
+/// The frame the production seam reads out of the engine's registry for a
+/// sampled GPU target (R24): `read_target`'s own-bytes sibling, so the bytes
+/// are the image's own — a resident the ordinary readback would *quantize* is
+/// refused instead of being mistaken for the image — and no channel exchange
+/// happens here, because the bind's own view format names the order the
+/// declaration states (E-TX1, `research/docs/23` §107).
+fn sampled_target_source(identity: &engine::TargetIdentity) -> Vec<u8> {
+    engine::read_target_four_byte_color(identity)
+        .expect("the sampled target's own bytes are readable")
+        .expect("four-byte colour")
+}
+
+/// One submission carrying the caller's sampled-target frames, answered by the
+/// provider (R24).
+fn sampled_frame_submission(
+    label: &str,
+    stages: &Stages,
+    frames: &[provider_render::SampledTargetFrame<'_>],
+    req: &DrawRequest,
+) -> Vec<u8> {
+    let delivered = provider_render::provider_submissions();
+    match provider_render::submit_render(
+        &inputs_held_with_sampled_frames(stages, RenderChainRole::SoleOrTail, frames),
+        req,
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => {
+            assert_eq!(
+                provider_render::provider_submissions(),
+                delivered + 1,
+                "{label}: the record reached the provider rather than the engine"
+            );
+            semantic_rgba(out.bytes, out.bgra)
+        }
+        other => {
+            panic!("{label}: the caller's frame is the arm that answers this shape: {other:?}")
+        }
+    }
+}
+
+/// One submission carrying the caller's sampled-target frames that the class
+/// answers by name (R24), returning the slug and the sentence.
+fn sampled_frame_refusal(
+    label: &str,
+    stages: &Stages,
+    frames: &[provider_render::SampledTargetFrame<'_>],
+    req: &DrawRequest,
+) -> (String, String) {
+    let delivered = provider_render::provider_submissions();
+    match provider_render::submit_render(
+        &inputs_held_with_sampled_frames(stages, RenderChainRole::SoleOrTail, frames),
+        req,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                provider_render::provider_submissions(),
+                delivered,
+                "{label}: the refused shape never reaches the provider"
+            );
+            (reason.slug().to_owned(), reason.detail().to_owned())
+        }
+        other => panic!("{label}: the shape stays on the engine: {other:?}"),
+    }
+}
+
+/// R24: a sampled GPU target the rail has no production for is answered from
+/// the frame the caller read out of the registry that holds it.
+///
+/// Census v18's third refusal is this shape — 893 records whose sampled bind
+/// resolved to a resident no pass of this rail recorded a production for
+/// (`..._texture_source_undeclared`, 10.8 % of the boot's refusals) — and its
+/// bytes are not a mystery: the resolution that produced the arm was a resident
+/// bind, so the caller that owns that registry can read the image out and hand
+/// it over, and the declaration states the request's own copy, which is the arm
+/// every pre-R22 sampled texture takes.
+///
+/// Four readings, on one Lavapipe device, in both 8-bit byte orders:
+///
+/// * the arm **executes**: the record reaches the provider instead of the
+///   engine, and its frame is byte for byte the engine's own answer from the
+///   same registry image;
+/// * the frame travels in the **image's** order and is read through the
+///   **bind's** name, so the bgra8 case (whose red is stored `[0, 0, 255, 255]`)
+///   would land the other colour if the frame were handed over in the other
+///   order;
+/// * the frame **follows the target**: re-seeding the registry image moves the
+///   provider's frame with it, on both rails;
+/// * the arm has its **own counter** (`render_provider_sampled_target_frames`),
+///   so the population it answers is a number rather than a silence.
+#[test]
+fn an_undeclared_targets_frame_carries_the_sample_into_the_provider() {
+    let _guard = engine_test_session();
+    let producer_stages = reviewed_stages();
+    let consumer_stages = sampled_stages();
+    let (width, height) = PRODUCTION_EXTENT;
+    let red = [1.0, 0.0, 0.0, 1.0];
+    let green = [0.0, 1.0, 0.0, 1.0];
+
+    for (label, seed_format, vk_format, id) in [
+        (
+            "rgba8 target",
+            MTL_FORMAT_RGBA8_UNORM,
+            ash::vk::Format::R8G8B8A8_UNORM,
+            0x7c_00_40,
+        ),
+        (
+            "bgra8 target",
+            MTL_FORMAT_BGRA8_UNORM,
+            ash::vk::Format::B8G8R8A8_UNORM,
+            0x7c_00_41,
+        ),
+    ] {
+        let identity = production_identity(id, vk_format);
+        // 1. The registry image. It is drawn by the *engine*, so no pass of
+        //    this rail ever stated a production for it — which is exactly the
+        //    census's shape: the head of a packet the class refused, kept in
+        //    the engine's own registry.
+        let Some(seed) = engine_pixels(
+            label,
+            &producer_stages,
+            production_seed_request(&identity, seed_format, red),
+        ) else {
+            return;
+        };
+        assert!(
+            seed.is_empty(),
+            "a resident store's readback is withheld on the engine too"
+        );
+        let frame = sampled_target_source(&identity);
+        let frames = [provider_render::SampledTargetFrame {
+            identity: identity.clone(),
+            bytes: &frame,
+        }];
+        let consumer = || produced_sample_request(&consumer_stages, &identity, vk_format);
+
+        // 2. The consumer reaches the provider and lands the image's colour.
+        let answered = route_count("render_provider_sampled_target_frames");
+        let sampled = sampled_frame_submission(label, &consumer_stages, &frames, &consumer());
+        assert_uniform_frame(
+            &format!("{label} (provider)"),
+            &sampled,
+            width,
+            height,
+            [255, 0, 0, 255],
+        );
+        assert_eq!(
+            route_count("render_provider_sampled_target_frames") - answered,
+            1,
+            "the arm that answered is counted under its own name"
+        );
+        eprintln!(
+            "{label}: registry frame texel (0, 0) {:?}, provider frame texel (0, 0) {:?}, \
+             render_provider_sampled_target_frames {answered} -> {}, submissions reached the \
+             provider",
+            texel_at(&frame, 0, 0),
+            texel_at(&sampled, 0, 0),
+            route_count("render_provider_sampled_target_frames"),
+        );
+
+        // 3. The engine's own answer from the same registry image: the
+        //    comparison is a statement about the two rails.
+        let Some(engine_frame) = engine_pixels(label, &consumer_stages, consumer()) else {
+            return;
+        };
+        assert_uniform_frame(
+            &format!("{label} (engine)"),
+            &engine_frame,
+            width,
+            height,
+            [255, 0, 0, 255],
+        );
+        assert_frames_equal(
+            &format!("{label}: the carried frame vs the engine's own answer"),
+            &sampled,
+            &engine_frame,
+        );
+        eprintln!(
+            "{label}: engine frame texel (0, 0) {:?} — equal to the provider's, byte for byte",
+            texel_at(&engine_frame, 0, 0)
+        );
+
+        // 4. The frame follows the image: the same target re-seeded on the
+        //    engine, and both rails move with it.
+        let _ = engine_pixels(
+            label,
+            &producer_stages,
+            production_seed_request(&identity, seed_format, green),
+        );
+        let moved = sampled_target_source(&identity);
+        let moved_frames = [provider_render::SampledTargetFrame {
+            identity: identity.clone(),
+            bytes: &moved,
+        }];
+        let sampled_moved = sampled_frame_submission(
+            &format!("{label}, re-seeded"),
+            &consumer_stages,
+            &moved_frames,
+            &consumer(),
+        );
+        assert_uniform_frame(
+            &format!("{label}: re-seeded (provider)"),
+            &sampled_moved,
+            width,
+            height,
+            [0, 255, 0, 255],
+        );
+        assert_frames_differ(
+            "the registry image decides the sample",
+            &sampled_moved,
+            &sampled,
+        );
+        let Some(engine_moved) = engine_pixels(label, &consumer_stages, consumer()) else {
+            return;
+        };
+        assert_frames_equal(
+            &format!("{label}: re-seeded, the engine's own answer"),
+            &sampled_moved,
+            &engine_moved,
+        );
+        eprintln!(
+            "{label}: re-seeded registry frame texel (0, 0) {:?}, provider frame texel (0, 0) \
+             {:?}, engine equal, and it differs from the first frame",
+            texel_at(&moved, 0, 0),
+            texel_at(&sampled_moved, 0, 0),
+        );
+    }
+}
+
+/// R24's refusals, each by its own name: the arm's absence (the record keeps
+/// R22's `undeclared`), a frame that is not the declaration's own extent (its
+/// own slug), and the record that samples the attachment it writes — which
+/// keeps `order` even with a correct frame in hand, because that read is live
+/// and no canonical arm can state it.
+#[test]
+fn a_targets_frame_keeps_the_class_own_refusals_by_name() {
+    let _guard = engine_test_session();
+    let producer_stages = reviewed_stages();
+    let consumer_stages = sampled_stages();
+    let identity = production_identity(0x7c_00_42, ash::vk::Format::R8G8B8A8_UNORM);
+    let Some(seed) = engine_pixels(
+        "refusal shapes",
+        &producer_stages,
+        production_seed_request(&identity, MTL_FORMAT_RGBA8_UNORM, [1.0, 0.0, 0.0, 1.0]),
+    ) else {
+        return;
+    };
+    assert!(
+        seed.is_empty(),
+        "the resident's readback is withheld on the engine too"
+    );
+    let frame = sampled_target_source(&identity);
+    let frames = [provider_render::SampledTargetFrame {
+        identity: identity.clone(),
+        bytes: &frame,
+    }];
+    let consumer =
+        || produced_sample_request(&consumer_stages, &identity, ash::vk::Format::R8G8B8A8_UNORM);
+
+    // 1. No frame: the declaration this rail cannot state, unchanged.
+    let before = route_count("render_provider_out_of_class_texture_source_undeclared");
+    let (slug, detail) = sampled_frame_refusal("no frame", &consumer_stages, &[], &consumer());
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(
+        slug,
+        "render_provider_out_of_class_texture_source_undeclared"
+    );
+    assert!(
+        detail.contains("TextureSource::TraceView") && detail.contains("hands no frame over"),
+        "the sentence names both arms that could have carried the bytes: {detail}"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source_undeclared") - before,
+        1,
+        "the refused shape is counted under its own name"
+    );
+
+    // 2. A frame that is not the declaration's extent is a caller wiring bug
+    //    under its own name, not an upload the contract would refuse.
+    let short = vec![0u8; 4];
+    let short_frames = [provider_render::SampledTargetFrame {
+        identity: identity.clone(),
+        bytes: &short,
+    }];
+    let before = route_count("render_provider_out_of_class_texture_source_frame_shape");
+    let (slug, detail) =
+        sampled_frame_refusal("short frame", &consumer_stages, &short_frames, &consumer());
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(
+        slug,
+        "render_provider_out_of_class_texture_source_frame_shape"
+    );
+    assert!(
+        detail.contains("caller's 4 byte(s) frame")
+            && detail.contains("its 8x4 R8G8B8A8_UNORM surface"),
+        "the sentence names the frame it was handed and the surface it has to fill: {detail}"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source_frame_shape") - before,
+        1,
+        "the refused shape is counted under its own name"
+    );
+
+    // 3. The record that samples its own attachment keeps `order`: its read is
+    //    the live frame the pass writes, which no canonical arm states — a
+    //    frame in hand does not change that.
+    let mut self_sampling = consumer();
+    self_sampling.target_identity = Some(identity.clone());
+    let before = route_count("render_provider_out_of_class_texture_source_order");
+    let (slug, detail) =
+        sampled_frame_refusal("self-sampling", &consumer_stages, &frames, &self_sampling);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_source_order");
+    assert!(
+        detail.contains("RenderTextureAttachmentConflict")
+            && detail.contains("fallback arm, not its answer"),
+        "the sentence names the contract's own refusal and why a copy is not the answer: \
+         {detail}"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source_order") - before,
+        1,
+        "the refused shape is counted under its own name"
+    );
+}
+
+/// R24 composes with R22: a record whose *sampled* target the caller carried in
+/// is itself restatable as a production.
+///
+/// The reach of the two arms is what this reads. A record that samples a
+/// registry image and keeps its own frame under a guest target is exactly the
+/// head of the census's chains (`skip=resident store=1`), and its pass
+/// descriptor carries the carried frame's bytes rather than a lease — so it is
+/// as restatable as any request-carried copy, and the *next* consumer of that
+/// target is answered by R22's trace-produced arm with no host round trip at
+/// all.
+#[test]
+fn a_carried_frames_own_record_is_restatable_as_a_production() {
+    let _guard = engine_test_session();
+    let producer_stages = reviewed_stages();
+    let consumer_stages = sampled_stages();
+    let (width, height) = PRODUCTION_EXTENT;
+    let source = production_identity(0x7c_00_43, ash::vk::Format::R8G8B8A8_UNORM);
+    let target = production_identity(0x7c_00_44, ash::vk::Format::R8G8B8A8_UNORM);
+
+    // 1. The engine's registry holds the sampled target's image.
+    let Some(seed) = engine_pixels(
+        "carried frame source",
+        &producer_stages,
+        production_seed_request(&source, MTL_FORMAT_RGBA8_UNORM, [1.0, 0.0, 0.0, 1.0]),
+    ) else {
+        return;
+    };
+    assert!(
+        seed.is_empty(),
+        "the resident's readback is withheld on the engine too"
+    );
+
+    // 2. The producer: a sampled bind on that image (carried in as its frame)
+    //    whose own frame stays under `target` — the seam's withheld-readback
+    //    shape, which records `target`'s production from the same submission.
+    let producer_request = || {
+        let mut req =
+            produced_sample_request(&consumer_stages, &source, ash::vk::Format::R8G8B8A8_UNORM);
+        req.target_identity = Some(target.clone());
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req
+    };
+    let frame = sampled_target_source(&source);
+    let frames = [provider_render::SampledTargetFrame {
+        identity: source.clone(),
+        bytes: &frame,
+    }];
+    let published = sampled_frame_submission(
+        "carried frame production",
+        &consumer_stages,
+        &frames,
+        &producer_request(),
+    );
+    assert_uniform_frame(
+        "the carried-frame record's own frame",
+        &published,
+        width,
+        height,
+        [255, 0, 0, 255],
+    );
+    eprintln!(
+        "carried frame record: its own published frame texel (0, 0) {:?} (the sampled frame's \
+         colour), so the submission that recorded `target`'s production is the one that read the \
+         registry image",
+        texel_at(&published, 0, 0),
+    );
+
+    // 3. The next record samples `target` through R22's arm: no frame is
+    //    handed over, and the producing pass rides the consumer's own trace.
+    let delivered = provider_render::provider_submissions();
+    let sampled = provider_pixels(
+        "the carried-frame record's consumer",
+        &consumer_stages,
+        &produced_sample_request(&consumer_stages, &target, ash::vk::Format::R8G8B8A8_UNORM),
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered + 1,
+        "the consumer of a recorded production reaches the provider"
+    );
+    assert_uniform_frame(
+        "the production's consumer (provider)",
+        &sampled,
+        width,
+        height,
+        [255, 0, 0, 255],
+    );
+
+    // 4. Both rails, from the same two records.
+    let Some(engine_published) = engine_pixels(
+        "carried frame production",
+        &consumer_stages,
+        producer_request(),
+    ) else {
+        return;
+    };
+    assert!(
+        engine_published.is_empty(),
+        "the producer's own readback is withheld on the engine too"
+    );
+    let Some(engine_sampled) = engine_pixels(
+        "the carried-frame record's consumer",
+        &consumer_stages,
+        produced_sample_request(&consumer_stages, &target, ash::vk::Format::R8G8B8A8_UNORM),
+    ) else {
+        return;
+    };
+    assert_frames_equal(
+        "the carried-frame chain vs the engine's own chain",
+        &sampled,
+        &engine_sampled,
+    );
+    eprintln!(
+        "the production's consumer: provider frame texel (0, 0) {:?}, engine frame texel (0, 0) \
+         {:?}, no frame handed to the consumer — R22's arm restated the producing pass",
+        texel_at(&sampled, 0, 0),
+        texel_at(&engine_sampled, 0, 0),
     );
 }
