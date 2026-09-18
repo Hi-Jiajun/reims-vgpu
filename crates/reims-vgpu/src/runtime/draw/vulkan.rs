@@ -15013,6 +15013,126 @@ mod vulkan_split_tests {
         );
     }
 
+    /// E-TX13's completion guard, asserted where the completion runs: the arm
+    /// whose window was cut **without** paying the surface's writeback debt
+    /// drops that debt once its landing has happened, and the arm whose cut
+    /// *did* pay it (E-TX8) leaves whatever it finds alone.
+    ///
+    /// This is the one place the two declarations differ in their *account*.
+    /// The debt is the frame a deferred Store left in a resident and still owes
+    /// the surface's pages; a landing that has just written those pages holds
+    /// the same surface's newer content at the same geometry, which is why the
+    /// CPU write route drops such a debt rather than paying it
+    /// (`writeback_debt::supersede_for_mapping`). Leaving it armed would let a
+    /// later reader pay it, and the payment would write the *older* frame over
+    /// this one.
+    ///
+    /// The other direction is the reason the guard is scoped to the arm instead
+    /// of being unconditional: E-TX8's cut pays the debt *before* it states the
+    /// window (`INV-LAND`), so a debt it sees at completion is one some other
+    /// reader is still owed a frame from — dropping that one would lose a frame
+    /// nothing else carries. The test arms the ledger by hand for both arms
+    /// because the seam's own cut needs a guest to mint (`runtime::draw`'s
+    /// page walk), and what is asserted here is the completion's half alone.
+    #[test]
+    fn a_landing_view_supersedes_the_mappings_owed_frame_and_the_own_view_leaves_it() {
+        use crate::backend::vulkan::engine::TargetIdentity;
+        use crate::runtime::drain::store_route_count;
+        use crate::runtime::resident_target::ResidentTarget;
+        const SUPERSEDED: &str = "wbdebt_superseded_by_provider_landing";
+
+        let mapping = 7;
+        let (width, height) = (8u32, 4u32);
+        let colors = vec![ColorRtRequest {
+            mapping_id: mapping,
+            width,
+            height,
+            format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            ..Default::default()
+        }];
+        let request = DrawEncodeRequest {
+            task_id: 1,
+            pipeline_ref: 1,
+            ..Default::default()
+        };
+        let bytes = vec![0x2bu8; (width * height * 4) as usize];
+        let arm = |state: &mut DeviceState| {
+            state
+                .pending_writebacks
+                .arm(
+                    mapping,
+                    ResidentTarget::new(TargetIdentity::Surface {
+                        id: mapping,
+                        width,
+                        height,
+                        generation: 1,
+                        format: ash::vk::Format::B8G8R8A8_UNORM,
+                    }),
+                    width,
+                    height,
+                    0x1e,
+                )
+                .is_none()
+                .then_some(())
+                .expect("the ledger starts empty for this mapping");
+        };
+
+        // 1. E-TX8's arm: the debt its cut would have paid is not the
+        //    completion's to drop.
+        {
+            let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            assert!(state.set_mapping_geom(mapping, width, height, 0x1e));
+            arm(&mut state);
+            let before = store_route_count(SUPERSEDED);
+            let status = borrowed_landing_store(
+                &mut state,
+                &mut host,
+                &request,
+                &colors,
+                &bytes,
+                true,
+                crate::backend::provider_render::WindowLanding::OwnView,
+            );
+            assert!(matches!(status, EncodeStatus::Ok));
+            assert!(
+                state.pending_writebacks.get(mapping).is_some(),
+                "the arm whose cut paid its debt leaves a debt it did not arm"
+            );
+            assert_eq!(store_route_count(SUPERSEDED) - before, 0);
+        }
+
+        // 2. E-TX13's arm: the frame it just landed is newer than the owed one,
+        //    so the debt is superseded — and the completion is the one point
+        //    that knows the landing happened.
+        {
+            let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            assert!(state.set_mapping_geom(mapping, width, height, 0x1e));
+            arm(&mut state);
+            let before = store_route_count(SUPERSEDED);
+            let status = borrowed_landing_store(
+                &mut state,
+                &mut host,
+                &request,
+                &colors,
+                &bytes,
+                true,
+                crate::backend::provider_render::WindowLanding::LandingView,
+            );
+            assert!(matches!(status, EncodeStatus::Ok));
+            assert!(
+                state.pending_writebacks.get(mapping).is_none(),
+                "the landing supersedes the frame the pages were still owed"
+            );
+            assert_eq!(
+                store_route_count(SUPERSEDED) - before,
+                1,
+                "the superseded debt is a reading of its own"
+            );
+        }
+    }
+
     /// Every guest-page writer in this crate goes through
     /// `mark_mapping_written`, so making that advance the surface epoch is what
     /// closes the writer set without enumerating it. A blit or a guest CPU
