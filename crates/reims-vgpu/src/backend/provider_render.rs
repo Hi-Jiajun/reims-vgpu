@@ -3388,6 +3388,104 @@ fn declared_render_texture_support(
     })
 }
 
+/// The runtime-sampler half of the same device answer (R36).
+///
+/// One snapshot, two readings, exactly as [`declared_render_texture_support`]:
+/// the bit the *frame* carries is the one the class gets, because a provider
+/// whose capability answer cannot hold it is a provider whose remote owner
+/// never sees it. What this answers is whether the device executes the
+/// render-sampler shape the pass's `[[sampler(n)]]` states belong to — the
+/// section v70 gave the capability tail and R28 already reads for sampled
+/// textures. A pass whose runtime states travel a frame declares at least one
+/// sampled texture (the pairing is the family's own rule), so the two R36
+/// readings of one snapshot — this one and R28's — are the two halves of one
+/// question: the device that states the section executes both, and one that
+/// does not keeps the draw on the engine under the name its own shape owns.
+///
+/// The one thing that ever replaces the device's own snapshot is the test
+/// instrument below, and it replaces it *before* the frame is written, so what
+/// this function answers is always the frame's own reading of a snapshot —
+/// never a second opinion read beside it.
+fn declared_render_sampler_carriage() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match RENDER_SAMPLER_CARRIAGE_ANSWER.load(Ordering::Relaxed) {
+            RENDER_SAMPLER_CARRIAGE_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                // The section is one presence-tagged block, so "not declared"
+                // is the *absent* section rather than a section carrying a
+                // false bit: the three fields go back to the defaults the codec
+                // writes the block for, so the reading below is the reading an
+                // old provider's frame gives.
+                let declared_now = answer == RENDER_SAMPLER_CARRIAGE_DECLARED;
+                declared.supports_render_texture_sampling = declared_now;
+                if !declared_now {
+                    declared.max_render_textures = 0;
+                    declared.supported_render_texture_formats.clear();
+                }
+                declared
+            }
+        }
+    };
+    provider_wire::render_sampler_carriage(rail.provider.device_epoch(), &capabilities).map_err(
+        |decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        },
+    )
+}
+
+/// The device's own answer for the render-sampler carriage (R36), and the
+/// states the test instrument below can put it in.
+const RENDER_SAMPLER_CARRIAGE_DEVICE: u8 = 0;
+const RENDER_SAMPLER_CARRIAGE_NOT_DECLARED: u8 = 1;
+const RENDER_SAMPLER_CARRIAGE_DECLARED: u8 = 2;
+
+/// Whether the render-sampler carriage is read from the device's own frame
+/// ([`RENDER_SAMPLER_CARRIAGE_DEVICE`], what production runs) or from an answer
+/// a test stated.
+static RENDER_SAMPLER_CARRIAGE_ANSWER: AtomicU8 = AtomicU8::new(RENDER_SAMPLER_CARRIAGE_DEVICE);
+
+/// A test's own answer for the render-sampler carriage, restored when it drops
+/// (R36).
+///
+/// The rail reads the bit out of the provider's capability frame, and a test
+/// that has to see the fail-closed arm cannot make an admitted device stop
+/// declaring the shape. While this guards an answer, the capability question is
+/// asked of a snapshot carrying it — written, encoded and decoded through the
+/// same frame — so the arm a test sees is the arm an old frame gives (`absent`
+/// reads as undeclared), and the reading is still the wire's.
+///
+/// A guard rather than a plain setter for the reason
+/// [`StageBufferNamespaceSplitOverride`] is one: this changes a *decision* and
+/// not an observation, so a test that unwound through a failed assertion would
+/// otherwise leave the next shape in the same binary answering from a device
+/// that is not its own.
+pub struct RenderSamplerCarriageOverride {
+    previous: u8,
+}
+
+impl Drop for RenderSamplerCarriageOverride {
+    fn drop(&mut self) {
+        RENDER_SAMPLER_CARRIAGE_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the render-sampler carriage as `declared` until the returned guard
+/// drops, or as the device's own answer for `None` (R36).
+pub fn override_render_sampler_carriage(declared: Option<bool>) -> RenderSamplerCarriageOverride {
+    let answer = match declared {
+        None => RENDER_SAMPLER_CARRIAGE_DEVICE,
+        Some(false) => RENDER_SAMPLER_CARRIAGE_NOT_DECLARED,
+        Some(true) => RENDER_SAMPLER_CARRIAGE_DECLARED,
+    };
+    RenderSamplerCarriageOverride {
+        previous: RENDER_SAMPLER_CARRIAGE_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
 /// The folded-pair half of the same device answer (R33).
 ///
 /// One snapshot, two readings, exactly as [`declared_stage_buffer_support`]:
@@ -6149,6 +6247,46 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             return RenderRailOutcome::NotInNarrowClass(reason);
         }
     }
+    // R36: the pass's runtime `[[sampler(n)]]` states under a frame. R12's
+    // accounting kept every such pass on the engine because the frame of that
+    // increment could not carry the list; E-TX4 taught the codec to carry it
+    // (`PASS_KIND_RENDER_SAMPLERS`'s four tags) and the pinned provider has
+    // carried it since `7d544d4`, so what is left is the device's own answer —
+    // asked here, out of the capability frame, rather than stated by the pure
+    // gate. The ask is the render-sampler section R28 reads too, because the
+    // pass's states are the half of a pairing whose other half is that
+    // section's texture declarations: a device that does not state the section
+    // executes neither, and keeping the draw under R12's own bucket is what
+    // makes the census count the population that moved rather than a new slug.
+    //
+    // The order matters: this answer is asked before the texture one below, so
+    // a shape that is both (every runtime-sampler pass is, by the family's own
+    // pairing rule) keeps the bucket its own fact owns.
+    if !pass.runtime_samplers.is_empty() && pass.crosses_the_frame() {
+        let carried = match declared_render_sampler_carriage() {
+            Ok(carried) => carried,
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        };
+        if !carried {
+            let states = pass.runtime_samplers.len();
+            let reason = OutOfClass::owned(
+                "render_provider_out_of_class_texture_sampler_wire",
+                format!(
+                    "a draw whose runtime `[[sampler(n)]]` states would travel the owner→provider \
+                     frame stays on the engine when the provider's own capability answer does not \
+                     carry the shape: the frame declares \
+                     supports_render_texture_sampling=false, so a frame that does not carry the \
+                     pass's runtime sampler list decodes to a pass that states no sampler — the \
+                     provider would refuse the declaration by name \
+                     (`render_runtime_sampler_missing`) rather than execute a pass that samples \
+                     through a state nobody stated — {states} runtime sampler state(s) beside a \
+                     declared stage buffer or a window-backed stream are that shape",
+                ),
+            );
+            reason.note();
+            return RenderRailOutcome::NotInNarrowClass(reason);
+        }
+    }
     // R28: the pass's sampled textures under a frame. Until E-TX4 the frame's
     // render contract carried no texture declarations — the codec had a kind
     // for the compute half's and none for the render half's — so the pure gate
@@ -7265,9 +7403,11 @@ impl NarrowPass<'_> {
 
     /// Whether this pass's trace crosses the owner→provider frame at all.
     ///
-    /// One condition, two readers: the class gate's wire questions (a pass that
-    /// stays in process has no frame to ask about) and `submit_render`'s
-    /// texture-declaration reading. It is exactly [`plan_owner_leases`]'s
+    /// One condition, three readers, all in `submit_render`: the frame's
+    /// texture-declaration reading (R28), the runtime-sampler carriage reading
+    /// (R36), and — through the plan — every "does this binding travel as a
+    /// lease" question below. A pass that stays in process has no frame to ask
+    /// about. It is exactly [`plan_owner_leases`]'s
     /// "no binding travels as a lease" predicate — a declared stage buffer, a
     /// window-backed stream or index stream, or a window-backed sampled texture
     /// each make one — spelled from the pass rather than from the plan so the
@@ -8226,47 +8366,22 @@ fn narrow_class<'a>(
         }
     }
 
-    // Whether this pass's trace crosses the owner→provider frame at all: the
-    // exact condition [`plan_owner_leases`] answers with `None`
-    // ([`NarrowPass::crosses_the_frame`], spelled there so the device answers
-    // below read the same predicate). A declared stage buffer, a window-backed
-    // stream or index stream, and — since R28 — a window-backed sampled texture
-    // each make one lease, and one lease is one frame. The wire questions are
-    // moot while it is false: the trace is the in-process value every pre-R9j
-    // sampled pass is.
-    let crosses_the_frame = !stage_buffers.is_empty()
-        || vertex_streams
-            .iter()
-            .any(|stream| matches!(stream.source, StreamSource::Window(_)))
-        || matches!(index_source, StreamSource::Window(_))
-        || sampling
-            .textures
-            .iter()
-            .any(|texture| matches!(texture.source, NarrowTextureSource::Window { .. }));
-    // R12: a pass whose runtime `[[sampler(n)]]` states the command channel
-    // cannot carry stays on the engine by name. The frame format states the
-    // pass's sampled *textures* (the v70 channel) but not its runtime sampler
-    // list yet (`research/docs/23` §3.3, v102: the decoder states an empty
-    // list), so a trace that crosses the owner→provider wire would reach
-    // admission with the states dropped and be refused there
-    // (`render_runtime_sampler_missing`) — a decline, not a fallback. The same
-    // rule the v40 blend section's two shapes keep: the class answers the wire
-    // question before the frame exists.
-    if !sampling.runtime_samplers.is_empty() && crosses_the_frame {
-        return Err(OutOfClass::owned(
-            "render_provider_out_of_class_texture_sampler_wire",
-            format!(
-                "a draw whose runtime `[[sampler(n)]]` states would travel the owner→provider \
-                 frame stays on the engine: the frame format does not carry the pass's runtime \
-                 sampler list yet (`research/docs/23` §3.3, v102), so the decoded pass would \
-                 state no sampler and the provider would refuse the declaration by name \
-                 (`render_runtime_sampler_missing`) rather than execute a pass that samples \
-                 through a state nobody stated — {} runtime sampler state(s) beside a declared \
-                 stage buffer or a window-backed stream are that shape",
-                sampling.runtime_samplers.len(),
-            ),
-        ));
-    }
+    // R12's runtime-sampler wire question used to be answered here, as a fact
+    // about the request: the frame format of that increment stated the pass's
+    // sampled *textures* (the v70 channel) but not its runtime `[[sampler(n)]]`
+    // list, so a trace that crossed the owner→provider wire would have reached
+    // admission with the states dropped and been refused there
+    // (`render_runtime_sampler_missing`) — a decline, not a fallback. The frame
+    // carries the list since E-TX4 (`research/docs/23` §3.3, v102/v111: the
+    // `PASS_KIND_RENDER_SAMPLERS` family, tags `0x15..=0x18`, which the pinned
+    // provider has carried since `7d544d4`), so what is left of the question is
+    // a fact about the *frame* and it moved to the one place that reads frames:
+    // `submit_render` asks the device's own capability answer
+    // (`declared_render_sampler_carriage`) and keeps the draw on the engine
+    // under this same bucket when the answer does not carry the shape. The
+    // "does this trace cross the frame at all" half of that reading is
+    // [`NarrowPass::crosses_the_frame`], the one predicate the plan and the
+    // device answers already share.
     // The pass's sampled *textures* under a frame are the third wire question,
     // and it is the one R28 moves out of this pure gate: the frame's own
     // capability answer decides it (`submit_render`'s

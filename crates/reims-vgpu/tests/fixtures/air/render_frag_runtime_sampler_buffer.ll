@@ -4,11 +4,13 @@
 ;
 ; The buffer is read, so the seam states its declaration, and a stated stage
 ; buffer is what makes the trace cross the owner→provider wire. The command
-; channel carries the pass's sampled textures (the v70 tag) but not the
-; runtime `[[sampler(n)]]` list yet (`research/docs/23` §3.3, v102), so this is
-; the shape `provider_render_rail.rs` pins under
-; `render_provider_out_of_class_texture_sampler_wire` rather than letting a
-; decoded frame drop the states.
+; channel carries the pass's sampled textures (the v70 tag) *and*, since E-TX4
+; (`research/docs/23` §3.3, v102/v111, tags `0x15..=0x18`), its runtime
+; `[[sampler(n)]]` list, so the shape leaves for the provider on a device that
+; declares the render-sampler section — `provider_render_rail.rs` pins both
+; arms of that answer, and the bucket R12 gave the shape
+; (`render_provider_out_of_class_texture_sampler_wire`) now counts the devices
+; that do not declare it rather than the shape itself.
 ;
 ; Re-assemble with `llvm-as` (22.1.8), never by editing the bitcode:
 ;
