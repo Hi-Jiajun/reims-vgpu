@@ -498,6 +498,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // pages by `store_surface_resident`, so this encode owes the caller nothing
     // further.
     let mut surface_store_armed = false;
+    // B3: the frame the *canonical provider* landed in the guest's own pages
+    // (`StoreOp::Borrowed`, E-TX8), carried out of the draw so the Store route
+    // below pays the account and no copy.
+    let mut borrowed_landing: Option<(Vec<u8>, bool)> = None;
     // GVA render Store: the frame remains authoritative in the resident and a
     // resource-scoped debt records the future transfer. The twin of
     // `surface_store_armed`, and it returns through the same door.
@@ -640,6 +644,23 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     req.pipeline_ref
                 ));
             }
+            Ok(M2vDrawSpan::BorrowedLanding { bytes, bgra }) => {
+                // B3: the provider's own write put the frame in the guest's
+                // pages. The bytes travel to the Store route anyway, because
+                // that route is what publishes the frame to the surface's own
+                // consumers (`publish_surface_store`, the guest-write witness,
+                // the surface cache) — it just must not land them a second
+                // time.
+                borrowed_landing = Some((bytes, bgra));
+                crate::observe::line(format!(
+                    "linux_m2v_draw ok borrowed_landing pipe={} {}x{} mid={} gva={:#x}",
+                    req.pipeline_ref,
+                    pass_w,
+                    pass_h,
+                    req.colors.first().map(|c0| c0.mapping_id).unwrap_or(0),
+                    req.colors.first().map(|c0| c0.target_gva).unwrap_or(0)
+                ));
+            }
             Err(e) => {
                 // Always-on + latched: a rejected engine draw falls to the
                 // clear-store fallback and surfaces as a bare `no_metal`
@@ -689,6 +710,17 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // to the last record of a packet, so there is no record N+1 to seed.
     if surface_store_armed || gva_store_armed {
         return (EncodeStatus::Ok, None);
+    }
+
+    // B3: the canonical provider landed this record's frame in the attachment's
+    // own guest window (`StoreOp::Borrowed`, E-TX8). Every Store route below
+    // exists to get a frame *into* those pages; they already hold this one, so
+    // what runs is the account alone.
+    if let Some((bytes, bgra)) = borrowed_landing {
+        return (
+            borrowed_landing_store(state, host, req, &colors, &bytes, bgra),
+            None,
+        );
     }
 
     // A mapper-ref-texture composite Store reaches the guest only through the CPU writeback
@@ -2669,6 +2701,203 @@ fn stage_uses_sampled_band(textures: &[TextureBind], samplers: &[SamplerBind]) -
     textures.iter().any(|t| t.texture_ref != 0) || samplers.iter().any(|s| s.sampler_ref != 0)
 }
 
+/// Why the guest window one LOAD-elision record's door cut could not be
+/// declared (`research/docs/26` §Rn, B1).
+///
+/// One name per fact, and every one of them is a *route* the class charges
+/// beside its one `resident_source` refusal
+/// (`provider_render::ResidentSourceRoute::Window*`). The window is the one
+/// declaration that carries both halves of such a record's obligation, so a
+/// shape that cannot state it is a shape this rail answers by name: the engine
+/// keeps the draw, and the census says which fact held it — the discipline the
+/// R34 routes already keep for the three doors.
+#[cfg(feature = "provider-render")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AttachmentWindowMiss {
+    /// The mapping's or the plane's geometry (or its texel format) is not the
+    /// attachment's own, so the pages the window would name are not this
+    /// record's previous contents.
+    Geometry,
+    /// A page of the task GVA span is unmapped.
+    SpanUnmapped,
+    /// The frame the window rests on could not be landed: the guest wrote over
+    /// it, or the rail refused the Store. The pages do **not** hold the content
+    /// the elision's currency test read, so they may not be declared
+    /// (`INV-LAND`).
+    LandingRefused,
+    /// The debt's identity moved (`map_generation`, or the GVA plane's own
+    /// generation) between the declaration and the submission.
+    IdentityMoved,
+    /// The run list is one the contract cannot state: the named exits
+    /// [`crate::backend::provider_render::load_seed_run_windows`] answers a
+    /// window with.
+    Runs(crate::backend::provider_render::LoadSeedRunExit),
+    /// The host will not promise a stable page alias, so there is no owner
+    /// window to read or land through.
+    NoAlias,
+    /// Every page resolved, but they would not cut into runs the owner rail can
+    /// import: the window exists as pages and not as a declaration.
+    Untileable,
+}
+
+#[cfg(feature = "provider-render")]
+impl AttachmentWindowMiss {
+    /// The census route the class charges for this answer.
+    fn route(self) -> crate::backend::provider_render::ResidentSourceRoute {
+        use crate::backend::provider_render::ResidentSourceRoute;
+        match self {
+            Self::Geometry => ResidentSourceRoute::WindowGeometry,
+            Self::SpanUnmapped => ResidentSourceRoute::WindowSpanUnmapped,
+            Self::LandingRefused => ResidentSourceRoute::WindowLandingRefused,
+            Self::IdentityMoved => ResidentSourceRoute::WindowIdentityMoved,
+            Self::Runs(exit) => exit.window_route(),
+            Self::NoAlias => ResidentSourceRoute::WindowUnregistered,
+            // A window that would not cut is the same fact the *unwindowed*
+            // exit states for a list that did cut: the bytes are not nameable
+            // as an owner window, whether the refusal is one page or all of
+            // them.
+            Self::Untileable => ResidentSourceRoute::WindowUnwindowed,
+        }
+    }
+}
+
+/// The attachment's own guest window for one **mapper-ref-texture** LOAD
+/// elision (B1).
+///
+/// The three rules, in the order they have to happen:
+///
+/// 1. **land** — the geometry and the texel format are checked against the
+///    mapping's own declaration, and the debt the surface's last Store armed is
+///    paid *before* the pages are named (`INV-LAND`: the payment is the copy the
+///    deferred rail already owed, not a new one);
+/// 2. **borrow** — the same page walk the R32 seed door performs
+///    ([`mapping_window_guest_runs`] + [`guest_page_window`]) turns those pages
+///    into the ordered run list the contract's `BufferSource::GuestRuns` states;
+/// 3. **declare** — [`crate::backend::provider_render::load_seed_run_windows`]
+///    cuts the list into the provider-shaped windows the class states under the
+///    attachment's own view, or names the shape it cannot state.
+#[cfg(feature = "provider-render")]
+fn mapper_ref_attachment_window<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    w: u32,
+    h: u32,
+    target_format: ash::vk::Format,
+    extent: u64,
+) -> Result<Vec<crate::backend::provider_render::StageBufferWindow>, AttachmentWindowMiss> {
+    let (seed, pay) =
+        try_mapper_ref_texture_target_guest_seed(state, host, mapping_id, w, h, target_format)?;
+    if !pay.landed_or_current() {
+        return Err(if pay.identity_moved() {
+            AttachmentWindowMiss::IdentityMoved
+        } else {
+            AttachmentWindowMiss::LandingRefused
+        });
+    }
+    crate::backend::provider_render::load_seed_run_windows(&seed.source, extent)
+        .map_err(AttachmentWindowMiss::Runs)
+}
+
+/// The attachment's own guest window for one **GVA** LOAD elision (B1).
+///
+/// The GVA sibling of [`mapper_ref_attachment_window`] on the same three rules:
+/// the plane's geometry is checked against the attachment (a padded row stride
+/// is a shape the contract's run list cannot state and is refused by name rather
+/// than truncated), the one plane the record's own address names is paid
+/// ([`crate::runtime::writeback_debt::pay_gva_plane`] — the key `arm_gva`
+/// minted), and the pages are cut into runs through
+/// [`task_gva_guest_run_window`], the walk the sampled and buffer zero-copy rails
+/// already use.
+#[cfg(feature = "provider-render")]
+fn gva_attachment_window<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c0: &crate::runtime::draw::ColorRtRequest,
+    extent: u64,
+) -> Result<Vec<crate::backend::provider_render::StageBufferWindow>, AttachmentWindowMiss> {
+    use crate::backend::vulkan::engine::GuestRunSource;
+
+    if c0.texture_ref == 0 || c0.target_gva == 0 || c0.width == 0 || c0.height == 0 {
+        return Err(AttachmentWindowMiss::Geometry);
+    }
+    let Some(bpp) = pixel_format::bytes_per_pixel(c0.format) else {
+        return Err(AttachmentWindowMiss::Geometry);
+    };
+    let tight_row = u64::from(c0.width) * u64::from(bpp);
+    let row = u64::from(c0.row_stride);
+    if row < tight_row {
+        // A stride narrower than the row's own texels cannot tile the
+        // attachment at all: this plane is not that attachment's storage.
+        return Err(AttachmentWindowMiss::Geometry);
+    }
+    let span = row
+        .checked_mul(u64::from(c0.height))
+        .ok_or(AttachmentWindowMiss::Geometry)?;
+    // The contract's run list carries no stride, so a padded row is stated for
+    // the class's own `PaddedRows` sentence rather than for a declaration.
+    let row_length_texels = if row == tight_row {
+        0
+    } else {
+        u32::try_from(row / u64::from(bpp)).unwrap_or(u32::MAX)
+    };
+    // INV-LAND: the plane's owed frame is landed, or was already there, before
+    // its pages may be read as the attachment's own contents.
+    let pay = crate::runtime::writeback_debt::pay_gva_plane(
+        state,
+        host,
+        task_id,
+        c0.texture_ref,
+        c0.target_gva,
+    );
+    if !pay.landed_or_current() {
+        return Err(if pay.identity_moved() {
+            AttachmentWindowMiss::IdentityMoved
+        } else {
+            AttachmentWindowMiss::LandingRefused
+        });
+    }
+    let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, c0.target_gva, span)
+        .map_err(|refusal| match refusal {
+            WindowRefusal::NoAlias => AttachmentWindowMiss::NoAlias,
+            WindowRefusal::SpanUnmapped => AttachmentWindowMiss::SpanUnmapped,
+            WindowRefusal::Untileable => AttachmentWindowMiss::Untileable,
+        })?;
+    let page = state.page_size();
+    let source = GuestRunSource {
+        runs: std::sync::Arc::new(runs),
+        source_offset: 0,
+        total_len: span,
+        row_length_texels,
+        pages: guest_page_window(host, gpas, page, c0.target_gva % page, span),
+        direct_image: None,
+    };
+    crate::backend::provider_render::load_seed_run_windows(&source, extent)
+        .map_err(AttachmentWindowMiss::Runs)
+}
+
+/// The window one elision door cut, as the class reads it.
+///
+/// Two locals rather than one `Result` because the door's answers are two
+/// different statements to the census: the runs it may state, or the name of the
+/// fact that stopped it — and only the second is a route.
+#[cfg(feature = "provider-render")]
+fn attachment_window_input(
+    runs: &Option<Vec<crate::backend::provider_render::StageBufferWindow>>,
+    miss: Option<AttachmentWindowMiss>,
+) -> Option<crate::backend::provider_render::AttachmentGuestWindow<'_>> {
+    match (runs, miss) {
+        (Some(runs), _) => {
+            Some(crate::backend::provider_render::AttachmentGuestWindow::Runs(runs.as_slice()))
+        }
+        (None, Some(miss)) => {
+            Some(crate::backend::provider_render::AttachmentGuestWindow::Refused(miss.route()))
+        }
+        (None, None) => None,
+    }
+}
+
 fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2676,56 +2905,87 @@ fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
     w: u32,
     h: u32,
     target_format: ash::vk::Format,
-) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
+) -> Result<
+    (
+        crate::backend::vulkan::engine::GuestTargetSeed,
+        crate::runtime::writeback_debt::MappingPayOutcome,
+    ),
+    AttachmentWindowMiss,
+> {
     use crate::backend::vulkan::engine::{GuestRunSource, GuestTargetSeed};
     use crate::runtime::mapping_write::mapper_ref_texture_sample_window;
 
     if w == 0 || h == 0 || !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
-        return None;
+        return Err(AttachmentWindowMiss::Geometry);
     }
     let (base_off, bpr, layout) = {
-        let mapping = state.mappings.get(&mapping_id)?;
+        let Some(mapping) = state.mappings.get(&mapping_id) else {
+            return Err(AttachmentWindowMiss::Geometry);
+        };
         if !mapping.mapped
             || mapping.page_entries.is_empty()
             || !mapping.has_geom
             || mapping.width != w
             || mapping.height != h
         {
-            return None;
+            return Err(AttachmentWindowMiss::Geometry);
         }
         let format = if mapping.format == 0 {
             pixel_format::MTL_FORMAT_BGRA8_UNORM
         } else {
             mapping.format
         };
-        let layout = pixel_format::store_texel_order(format)?;
-        let (base_off, bpr, _) = mapper_ref_texture_sample_window(mapping, w, h, format)?;
+        let Some(layout) = pixel_format::store_texel_order(format) else {
+            return Err(AttachmentWindowMiss::Geometry);
+        };
+        let Some((base_off, bpr, _)) = mapper_ref_texture_sample_window(mapping, w, h, format)
+        else {
+            return Err(AttachmentWindowMiss::Geometry);
+        };
         (base_off, u64::from(bpr), layout)
     };
     let source_format = translate::pixel::vk_texel_layout(layout);
     if source_format != target_format {
-        return None;
+        return Err(AttachmentWindowMiss::Geometry);
     }
-    let (span, row_length_texels) =
-        strided_window_extent(w, h, u64::from(layout.bytes_per_texel()), bpr)?;
+    let Some((span, row_length_texels)) =
+        strided_window_extent(w, h, u64::from(layout.bytes_per_texel()), bpr)
+    else {
+        return Err(AttachmentWindowMiss::Geometry);
+    };
 
     // A debt is not submitted work, so queue order cannot put it before the
     // seed read until this call turns it into work. A submitted payment and the
     // draw use the same queue; no CPU settle is needed between them.
-    crate::runtime::writeback_debt::pay_for_mapping(state, host, mapping_id);
-    let (gpas, runs) = mapping_window_guest_runs(state, host, mapping_id, base_off, span)?;
+    //
+    // B1: the answer travels out with the seed. The seed door reads the pages
+    // either way (its caller has already decided the pages are the surface), and
+    // the elision door is the one that has to *state* those pages as the
+    // attachment's own window — so it is the caller that reads the outcome and
+    // refuses by name when the frame could not be landed.
+    let pay = crate::runtime::writeback_debt::pay_for_mapping(state, host, mapping_id);
+    if !guest_run_alias_available(host) {
+        return Err(AttachmentWindowMiss::NoAlias);
+    }
+    let Some((gpas, runs)) = mapping_window_guest_runs(state, host, mapping_id, base_off, span)
+    else {
+        return Err(AttachmentWindowMiss::Untileable);
+    };
     let page = state.page_size();
-    Some(GuestTargetSeed {
-        source: GuestRunSource {
-            runs: std::sync::Arc::new(runs),
-            source_offset: 0,
-            total_len: span,
-            row_length_texels,
-            pages: guest_page_window(host, gpas, page, base_off % page, span),
-            direct_image: None,
+    Ok((
+        GuestTargetSeed {
+            source: GuestRunSource {
+                runs: std::sync::Arc::new(runs),
+                source_offset: 0,
+                total_len: span,
+                row_length_texels,
+                pages: guest_page_window(host, gpas, page, base_off % page, span),
+                direct_image: None,
+            },
+            format: source_format,
         },
-        format: source_format,
-    })
+        pay,
+    ))
 }
 
 fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
@@ -2771,6 +3031,8 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
         ))
     } else {
         try_mapper_ref_texture_target_guest_seed(state, host, mapping_id, w, h, target_format)
+            .ok()
+            .map(|(seed, _)| seed)
             .map(|seed| {
                 (
                     MapperRefTextureLoadSeed::Guest(seed),
@@ -6806,6 +7068,22 @@ enum M2vDrawSpan {
         identity: crate::backend::vulkan::engine::TargetIdentity,
         guest_store: GuestStoreStatus,
     },
+    /// B3: the canonical provider landed this record's frame in the *guest's own
+    /// pages* — the attachment's own declared window (`StoreOp::Borrowed`,
+    /// E-TX8) — so this encode owes them no copy at all and owes the rest of the
+    /// device the account that says the pages changed.
+    ///
+    /// Distinct from [`Self::ResidentSurfaceStore`] because that arm's frame is
+    /// still only in the engine's image (the caller lands it later, or defers
+    /// the landing as a debt), while this one's frame is already in the pages
+    /// the guest reads. Distinct from [`Self::Pixels`] because the bytes must
+    /// not be written a second time: they *are* what the window holds.
+    BorrowedLanding {
+        /// The frame the provider published, in `bgra`'s order — the same bytes
+        /// `resolve_attachment_landing` wrote into the window.
+        bytes: Vec<u8>,
+        bgra: bool,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -8863,6 +9141,34 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             mapper_ref_texture_guest_target_backing(state, host, req);
         let mapper_ref_texture_resident_target =
             mapper_ref_texture_store_identity(state, req, writeback_guest);
+        // B1: the attachment's own tightly packed extent, computed where the two
+        // elision doors need it and from the same two facts the class reads
+        // (`req.width`/`req.height` and the colour attachment's format) — the
+        // window each door states has to be *that* byte range, and a window cut
+        // against another extent is a declaration about bytes no record wrote.
+        #[cfg(feature = "provider-render")]
+        let attachment_window_extent = req
+            .colors
+            .first()
+            .and_then(|c0| {
+                translate::pixel::color_attachment(c0.format)
+                    .ok()
+                    .map(|(attachment, _)| attachment.vk)
+            })
+            .and_then(translate::pixel::bytes_per_texel)
+            .zip(req.colors.first())
+            .map(|(bytes, c0)| u64::from(bytes) * u64::from(c0.width) * u64::from(c0.height));
+        // B1-B3: the window the record's elision door cut, and the name of the
+        // fact that stopped it when it could not declare one. At most one of the
+        // two is `Some`, and neither is set by a door that did not apply (the
+        // serialized chain door, a middle record, a record with no chain at
+        // all).
+        #[cfg(feature = "provider-render")]
+        let mut attachment_window_runs: Option<
+            Vec<crate::backend::provider_render::StageBufferWindow>,
+        > = None;
+        #[cfg(feature = "provider-render")]
+        let mut attachment_window_miss: Option<AttachmentWindowMiss> = None;
         if req.chain_from_resident && render_chain_identity(state, req).is_some() {
             // The serialized chain names the resident it intends to load;
             // existence and readiness are engine state and are validated
@@ -8886,6 +9192,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // leaves a chain the class can refuse under this route.
         #[cfg(feature = "provider-render")]
         let gva_load_elided = gva_load_identity.is_some();
+        // B1-B3: the same window question for the GVA door, on the same rule —
+        // the plane the elision named is paid, its pages are cut into runs, and
+        // the class states them as the attachment's own declaration. A record
+        // that continues the encoder is not asked, for the reason the
+        // mapper-ref door states: its previous contents are the walk's chain
+        // value (R25), not this plane's stored pages.
+        #[cfg(feature = "provider-render")]
+        if gva_load_elided && !req.continues_render_pass {
+            if let (Some(c0), Some(extent)) = (req.colors.first(), attachment_window_extent) {
+                match gva_attachment_window(state, host, req.task_id, c0, extent) {
+                    Ok(runs) => attachment_window_runs = Some(runs),
+                    Err(miss) => attachment_window_miss = Some(miss),
+                }
+            }
+        }
         // Mapper-ref-texture composite Load. A retained guest-allocation target is the
         // guest's texture resource itself, so its LOAD is authoritative without
         // comparing two copies. A device-allocation target is a mirror: only
@@ -9014,6 +9335,41 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     #[cfg(feature = "provider-render")]
                     {
                         mapper_ref_load_elided = true;
+                        // B1-B3: the window this record's own attachment names.
+                        // Asked here, where the elision's own answer is known and
+                        // where the payment can be made before anything reads
+                        // the pages — and asked *before* the byte hand-over
+                        // below, because a declared window is the whole point:
+                        // the readback R26 materializes is the copy this arm
+                        // exists to stop paying.
+                        //
+                        // A record that continues the encoder is not asked: it
+                        // begins from the frame its predecessor produced, which
+                        // reaches it through the walk's own chain value (R25)
+                        // and not through the surface's stored pages, so those
+                        // pages are not the contents it may load.
+                        if !req.continues_render_pass {
+                            if let (Some(c0), Some(extent)) =
+                                (req.colors.first(), attachment_window_extent)
+                            {
+                                let format = mapper_ref_texture_render_identity(state, req)
+                                    .as_ref()
+                                    .map(|identity| identity.resident_format())
+                                    .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
+                                match mapper_ref_attachment_window(
+                                    state,
+                                    host,
+                                    c0.mapping_id,
+                                    w,
+                                    h,
+                                    format,
+                                    extent,
+                                ) {
+                                    Ok(runs) => attachment_window_runs = Some(runs),
+                                    Err(miss) => attachment_window_miss = Some(miss),
+                                }
+                            }
+                        }
                     }
                     // R26: this record's own frame is the one that lands in the
                     // mapping's guest pages, so this is the record whose frame
@@ -9021,10 +9377,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // moves the epoch the elision reads. A record without the
                     // guest writeback has no such landing and keeps its bytes
                     // to itself (the class then refuses it by name, as before).
+                    // A record B's window already answered is handed nothing:
+                    // its previous contents travel as the guest's own pages, and
+                    // the readback this would materialize is the double copy the
+                    // arm exists to remove.
                     #[cfg(feature = "provider-render")]
                     {
-                        mapper_ref_load_handover =
-                            mapper_ref_texture_resident_handover(writeback_guest, Some(&identity));
+                        mapper_ref_load_handover = if attachment_window_runs.is_some() {
+                            None
+                        } else {
+                            mapper_ref_texture_resident_handover(writeback_guest, Some(&identity))
+                        };
                     }
                     if backing
                         == Some(
@@ -10558,6 +10921,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 mapper_ref_elided: mapper_ref_load_elided,
                 chain_miss: chain_source_miss,
                 mapper_ref_miss: mapper_ref_source_miss,
+                window: attachment_window_miss,
             }
             .route();
             let inputs = RenderRailInputs {
@@ -10610,6 +10974,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // the GVA elision, the mapper-ref-texture elision — produced
                 // it, together with what the read declined on.
                 resident_source_route,
+                // B1-B3: the window this record's elision door cut, as the
+                // class reads it — either the runs it states as the
+                // attachment's own declaration, or the name of the fact that
+                // stopped the door from cutting one. The class asks it *before*
+                // the byte arms below, and a record it answers never reaches
+                // them.
+                attachment_guest_window: attachment_window_input(
+                    &attachment_window_runs,
+                    attachment_window_miss,
+                ),
                 // R25: the frame the record *before* this one produced, when
                 // this record is the packet's middle and the caller holds that
                 // frame as the walk's own chain value
@@ -10760,6 +11134,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // route publishes). The counters are read before the frame
                     // is moved out of `out`.
                     let present = out.present;
+                    // B3: whether the provider's own write put this frame in
+                    // the guest's pages (`StoreOp::Borrowed`, E-TX8). Read
+                    // before the completion is consumed, and acted on below
+                    // where this rail's Store routes already live.
+                    let landed_in_window = out.landed_in_window;
                     // The completion lands at the attachment's own texel width;
                     // the span's consumers read eight-bit colour, so a wide
                     // frame is narrowed here (`provider_span_pixels`) rather
@@ -10788,6 +11167,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             ),
                         },
                     ));
+                    if landed_in_window {
+                        // B3: the frame is already in the guest's pages — the
+                        // provider wrote them from the same readback these bytes
+                        // are — so the Store route below must not write them
+                        // again. It still owes the device the account that says
+                        // the pages changed, which is why the span carries the
+                        // bytes rather than being an empty one.
+                        crate::runtime::drain::note_store_route("render_provider_borrowed_landing");
+                        return Ok(M2vDrawSpan::BorrowedLanding { bytes, bgra });
+                    }
                     return Ok(M2vDrawSpan::Pixels { bytes, bgra });
                 }
                 RenderRailOutcome::ProviderCompletedResident(frame) => {
@@ -12189,6 +12578,12 @@ struct ResidentSourceDoors {
     chain_miss: Option<ChainFrameMiss>,
     /// What the mapper-ref door's hand-over declined on, when that door opened.
     mapper_ref_miss: Option<MapperRefFrameMiss>,
+    /// B1: the window this record's elision door cut and could not declare,
+    /// when the door applied. Exactly one of this and the door's own miss is
+    /// `Some`, and this one wins: the fact that held the *window* is what the
+    /// census has to read, because the window is the declaration that would have
+    /// answered the record.
+    window: Option<AttachmentWindowMiss>,
 }
 
 #[cfg(feature = "provider-render")]
@@ -12214,9 +12609,15 @@ impl ResidentSourceDoors {
             return self.chain_miss.map(ChainFrameMiss::chain_route);
         }
         if self.gva_elided {
-            return Some(ResidentSourceRoute::GvaElision);
+            return self
+                .window
+                .map(AttachmentWindowMiss::route)
+                .or(Some(ResidentSourceRoute::GvaElision));
         }
         if self.mapper_ref_elided {
+            if let Some(window) = self.window {
+                return Some(window.route());
+            }
             return self.mapper_ref_miss.map(MapperRefFrameMiss::route);
         }
         Some(ResidentSourceRoute::Undeclared)
@@ -12479,6 +12880,141 @@ fn surface_store_plan(lazy_enabled: bool, guest_backed: bool) -> SurfaceStorePla
     } else {
         SurfaceStorePlan::CopyNow
     }
+}
+
+/// The account one provider-landed frame owes the device (B3).
+///
+/// `StoreOp::Borrowed` (E-TX8) writes the pass's frame into the attachment
+/// view's own declared window, so by the time this rail sees the completion the
+/// guest's pages already hold that frame: the copy the CPU Store route performs
+/// would be a second write of bytes that are already there, and the readback it
+/// would need has already happened inside the provider.
+///
+/// What is *not* already done is everything this device says about the write,
+/// and each step is one an existing arm already runs for the same statement:
+///
+/// * the mapping's own `mark_mapping_written` — the guest's pages hold
+///   something new, which is what the CPU portability route's `write_bgra8` tail
+///   does (`mapping_write::write_bgra8_inner`);
+/// * `stamp_guest_write_gen` — the writer is this device and not the guest, the
+///   same handover `store_surface_resident` performs after its own copy;
+/// * the storage-residency window the compute rail reads, and the surface cache
+///   the seed ladder serves from, both of which must stop naming the frame the
+///   *payment* landed (`arm_surface_writeback_debt` invalidates the first, the
+///   CPU route republishes the second);
+/// * `publish_surface_store` — the surface composite, dense frame and
+///   front-buffer writeback every display consumer reads;
+/// * on a task GVA plane instead of a mapping, that plane's own witnesses:
+///   `invalidate_object_host_copies`, `forget_gva_copies`, the pages recorded as
+///   host-written, and the GVA store witness — the list
+///   `render_writeback::vulkan::copy_resident_into_gva_plane` runs after its own
+///   copy.
+///
+/// The one step that deliberately does **not** run is
+/// `stamp_mapper_ref_texture_resident`: the frame the provider landed is not the
+/// engine's registry resident's content, so stamping that image with the new
+/// epoch would vouch for pixels it never held (R26's rule, direction unchanged;
+/// `DrawEncodeRequest::resident_frame_published_by_provider` is already set on
+/// this path, and the skip is counted under its own name).
+fn borrowed_landing_store<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &crate::runtime::draw::DrawEncodeRequest,
+    colors: &[crate::runtime::draw::ColorRtRequest],
+    bytes: &[u8],
+    bgra: bool,
+) -> EncodeStatus {
+    let Some(c0) = colors.first() else {
+        return EncodeStatus::Ok;
+    };
+    crate::runtime::drain::note_store_route("mapper_ref_texture_resident_stamp_skipped");
+    if c0.mapping_id != 0 {
+        let (mid, cw, ch, fmt) = (c0.mapping_id, c0.width, c0.height, c0.format);
+        if let Some(m) = state.mappings.get(&mid) {
+            let format = if m.format != 0 {
+                m.format
+            } else {
+                pixel_format::MTL_FORMAT_BGRA8_UNORM
+            };
+            if let Some((base_off, _bpr, span_end)) =
+                crate::runtime::mapping_write::mapper_ref_texture_sample_window(m, cw, ch, format)
+            {
+                state.invalidate_storage_residency_window(mid, base_off, span_end);
+            }
+        }
+        let _ = state.mark_mapping_written(mid);
+        crate::runtime::mapper::stamp_guest_write_gen(state, host, mid);
+        // The frame the pages now hold is this device's, so the host-side copy
+        // is republished from it rather than retired — the choice `write_bgra8`'s
+        // tail makes — and a frame that cannot travel as the cache's own tight
+        // BGRA8 is retired instead, which costs a later guest-page read and can
+        // never serve a stale frame.
+        let tight = (cw as usize)
+            .saturating_mul(ch as usize)
+            .saturating_mul(RGBA8_BPP as usize);
+        if bgra && bytes.len() >= tight {
+            crate::runtime::surface_cache::store_rows(
+                state,
+                mid,
+                cw,
+                ch,
+                bytes,
+                cw.saturating_mul(RGBA8_BPP),
+            );
+        } else {
+            crate::runtime::surface_cache::forget(state, mid);
+        }
+        {
+            let _span = crate::runtime::chain_phase::CostSpan::new("t11_publish_us");
+            publish_surface_store(state, host, mid, cw, ch, fmt);
+        }
+        crate::runtime::drain::note_store_route("render_provider_borrowed_landing_mapper");
+        crate::observe::line(format!(
+            "linux_m2v_store mid={mid} {cw}x{ch} pipe={} reason=provider_borrowed_landing",
+            req.pipeline_ref
+        ));
+        return EncodeStatus::Ok;
+    }
+    if c0.target_gva != 0 {
+        let (task_id, gva, texture_ref, cw, ch) = (
+            req.task_id,
+            c0.target_gva,
+            c0.texture_ref,
+            c0.width,
+            c0.height,
+        );
+        let span = u64::from(c0.row_stride).saturating_mul(u64::from(ch));
+        let pages = crate::runtime::gva_mem::task_gva_page_gpas(
+            host,
+            &state.tasks,
+            task_id,
+            gva,
+            span,
+            state.page_shift,
+        );
+        state.invalidate_object_host_copies(task_id, texture_ref);
+        crate::runtime::surface_cache::forget_gva_copies(state, task_id, gva, texture_ref);
+        if !pages.is_empty() {
+            let pages = pages.clone();
+            state.note_host_wrote_pages(pages.clone());
+            if let Some(identity) = gva_chain_identity(req) {
+                if let Some(key) = crate::backend::vulkan::gva_witness_key(&identity) {
+                    crate::runtime::gva_store_witness::note_store(state, host, key, &pages);
+                }
+            }
+        }
+        crate::runtime::drain::note_store_route("render_provider_borrowed_landing_gva");
+        crate::observe::line(format!(
+            "linux_m2v_store gva={gva:#x} {cw}x{ch} pipe={} reason=provider_borrowed_landing",
+            req.pipeline_ref
+        ));
+        return EncodeStatus::Ok;
+    }
+    // A landed window with neither a mapping nor a task GVA is not a shape the
+    // class admits; counted rather than dropped in silence, because it would
+    // mean a landing with no account at all.
+    crate::runtime::drain::note_store_route("render_provider_borrowed_landing_unplaced");
+    EncodeStatus::Ok
 }
 
 fn store_surface_resident<M: HostMemory + HostOps>(
@@ -16744,6 +17280,7 @@ mod provider_span_pixels_tests {
                     bgra,
                     present: None,
                     stage_writebacks: Vec::new(),
+                    landed_in_window: false,
                 },
             )
             .expect("an eight-bit frame is already what the span speaks");
@@ -16768,6 +17305,7 @@ mod provider_span_pixels_tests {
                 bgra: false,
                 present: None,
                 stage_writebacks: Vec::new(),
+                landed_in_window: false,
             },
         )
         .expect("four half channels narrow to four bytes");
@@ -16808,6 +17346,7 @@ mod provider_span_pixels_tests {
                     bgra: false,
                     present: None,
                     stage_writebacks: Vec::new(),
+                    landed_in_window: false,
                 },
             )
             .expect_err(label);
@@ -17077,7 +17616,7 @@ mod mapper_ref_handover_tests {
 /// driven in `tests/provider_render_rail.rs`.
 #[cfg(all(test, feature = "provider-render"))]
 mod resident_source_doors_tests {
-    use super::{ChainFrameMiss, MapperRefFrameMiss, ResidentSourceDoors};
+    use super::{AttachmentWindowMiss, ChainFrameMiss, MapperRefFrameMiss, ResidentSourceDoors};
     use crate::backend::provider_render::ResidentSourceRoute;
 
     /// A record whose `load_from_target` came through the serialized chain and
@@ -17091,6 +17630,7 @@ mod resident_source_doors_tests {
             mapper_ref_elided: false,
             chain_miss: None,
             mapper_ref_miss: None,
+            window: None,
         }
     }
 
@@ -17136,6 +17676,111 @@ mod resident_source_doors_tests {
                 "the mapper-ref-texture elision's own three answers are three routes: {miss:?}"
             );
         }
+    }
+
+    /// B1: the window one elision door cut is what the census reads when the
+    /// record is refused under it.
+    ///
+    /// The nine R34 routes name the *door*; these name the *window* the door
+    /// tried to declare, and the window wins where both are known: "the door
+    /// applied and the window could not be cut" is the fact that held the shape,
+    /// and pricing it is the whole point of the nine new names (the two shapes
+    /// behind them are the two follow-up OpenSpec changes). A door that never
+    /// had a window to state — a middle record, or a chain whose elision fired
+    /// but whose attachment pages are not its predecessor's frame — keeps its
+    /// own route unchanged.
+    #[test]
+    fn a_window_the_door_cut_answers_in_front_of_the_doors_own_route() {
+        for (miss, route) in [
+            (
+                AttachmentWindowMiss::Geometry,
+                ResidentSourceRoute::WindowGeometry,
+            ),
+            (
+                AttachmentWindowMiss::SpanUnmapped,
+                ResidentSourceRoute::WindowSpanUnmapped,
+            ),
+            (
+                AttachmentWindowMiss::LandingRefused,
+                ResidentSourceRoute::WindowLandingRefused,
+            ),
+            (
+                AttachmentWindowMiss::IdentityMoved,
+                ResidentSourceRoute::WindowIdentityMoved,
+            ),
+            (
+                AttachmentWindowMiss::NoAlias,
+                ResidentSourceRoute::WindowUnregistered,
+            ),
+            (
+                AttachmentWindowMiss::Untileable,
+                ResidentSourceRoute::WindowUnwindowed,
+            ),
+            (
+                AttachmentWindowMiss::Runs(
+                    crate::backend::provider_render::LoadSeedRunExit::PaddedRows {
+                        row_length_texels: 1920,
+                    },
+                ),
+                ResidentSourceRoute::WindowPaddedRows,
+            ),
+            (
+                AttachmentWindowMiss::Runs(
+                    crate::backend::provider_render::LoadSeedRunExit::Registrations {
+                        first: 1,
+                        second: 2,
+                    },
+                ),
+                ResidentSourceRoute::WindowRegistrations,
+            ),
+            (
+                AttachmentWindowMiss::Runs(
+                    crate::backend::provider_render::LoadSeedRunExit::Extent {
+                        span: 4096,
+                        extent: 1024,
+                    },
+                ),
+                ResidentSourceRoute::WindowExtent,
+            ),
+        ] {
+            assert_eq!(
+                ResidentSourceDoors {
+                    chain_elided: false,
+                    gva_elided: true,
+                    window: Some(miss),
+                    ..doors()
+                }
+                .route(),
+                Some(route),
+                "the GVA elision's own window answers for the shape it could not cut: {miss:?}"
+            );
+            assert_eq!(
+                ResidentSourceDoors {
+                    chain_elided: false,
+                    mapper_ref_elided: true,
+                    mapper_ref_miss: Some(MapperRefFrameMiss::NoLanding),
+                    window: Some(miss),
+                    ..doors()
+                }
+                .route(),
+                Some(route),
+                "and the mapper-ref door's window answers in front of its own miss: {miss:?}"
+            );
+        }
+        // A door that never stated a window keeps its own route: the middle
+        // record and the chain the elision named but whose pages are not this
+        // record's previous contents.
+        assert_eq!(
+            ResidentSourceDoors {
+                chain_elided: false,
+                mapper_ref_elided: true,
+                mapper_ref_miss: Some(MapperRefFrameMiss::NoLanding),
+                ..doors()
+            }
+            .route(),
+            Some(ResidentSourceRoute::MapperRefNoLanding),
+            "a door with no window to state answers exactly as it did before B"
+        );
     }
 
     /// The serialized chain's four read-side misses, each its own route: the

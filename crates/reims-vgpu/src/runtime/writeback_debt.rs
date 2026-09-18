@@ -721,18 +721,70 @@ pub fn lazy_writeback_enabled() -> bool {
 /// The one call a reader of a named mapping's guest bytes makes before it reads
 /// them. Free when nothing is owed — one `BTreeMap` emptiness check, which is
 /// the answer on nearly every call.
+///
+/// The answer is a value and not a side effect because one of this function's
+/// callers has to *state* what the pages now hold (B1's attachment window,
+/// [`MappingPayOutcome::landed_or_current`]): a reader that declares the
+/// mapping's pages as its source is claiming those bytes are the surface's
+/// content, and a payment that abandoned the frame to a guest write or lost it
+/// to a refused Store is the one answer that claim cannot be made under. Every
+/// pre-B1 caller reads the pages either way and keeps ignoring the answer.
 pub fn pay_for_mapping<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-) {
+) -> MappingPayOutcome {
     if state.pending_writebacks.is_empty() {
-        return;
+        return MappingPayOutcome::NothingOwed;
     }
     let Some(debt) = state.pending_writebacks.take(mapping_id) else {
-        return;
+        return MappingPayOutcome::NothingOwed;
     };
-    pay(state, host, mapping_id, debt, "wbdebt_paid_named");
+    pay(state, host, mapping_id, debt, "wbdebt_paid_named")
+}
+
+/// What one mapping's payment did (B1).
+///
+/// The frame a deferred Store left in a resident reaches the guest's pages
+/// through exactly one of these answers, and the reader that is about to
+/// declare those pages as its source (the attachment window B1 materializes)
+/// can only state the window when the pages are the surface's content:
+/// [`Self::NothingOwed`] (the pages were already current) and [`Self::Paid`]
+/// (the owed frame just landed) are the two that say so. Both of the other two
+/// mean the pages are *not* what the elision's currency test read — one because
+/// the guest's own bytes superseded the frame, one because the rail refused the
+/// Store — and both keep the record on the engine by name
+/// (`resident_source_window_landing_refused`) rather than declaring bytes
+/// nothing vouches for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingPayOutcome {
+    /// Nothing was owed: the pages already held the mapping's content.
+    NothingOwed,
+    /// The owed frame was landed in the mapping's guest pages.
+    Paid,
+    /// The guest wrote these pages after the Store, so the resident's frame was
+    /// dropped rather than written over the guest's own bytes.
+    AbandonedGuestWrote,
+    /// The mapping's generation moved past the debt's: the identity the debt
+    /// named is an orphan and the pages belong to something else now.
+    GenerationMoved,
+    /// The rail refused the Store (its own fail line names the reason), so the
+    /// frame never reached the pages.
+    StoreRefused,
+}
+
+impl MappingPayOutcome {
+    /// Whether the mapping's pages hold its content *after* this payment — the
+    /// one question a caller about to declare them as a source asks.
+    pub fn landed_or_current(self) -> bool {
+        matches!(self, Self::NothingOwed | Self::Paid)
+    }
+
+    /// Whether the answer is one of the two the *identity* moved on, which is
+    /// the route name the census separates from a refused landing.
+    pub fn identity_moved(self) -> bool {
+        matches!(self, Self::GenerationMoved)
+    }
 }
 
 /// Pay every owed frame.
@@ -1659,15 +1711,15 @@ fn pay<M: HostMemory + HostOps>(
     mapping_id: u32,
     debt: WritebackDebt,
     route: &'static str,
-) {
+) -> MappingPayOutcome {
     let Some(entry) = state.mappings.get(&mapping_id) else {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
-        return;
+        return MappingPayOutcome::GenerationMoved;
     };
     let (map_generation, validity) = (entry.map_generation, entry.validity);
     if map_generation != debt.map_generation {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
-        return;
+        return MappingPayOutcome::GenerationMoved;
     }
     // The resident the draw registered, not the one a fresh derivation would
     // name today. See `WritebackDebt::target`.
@@ -1677,17 +1729,18 @@ fn pay<M: HostMemory + HostOps>(
     {
         crate::runtime::drain::note_store_route("wbdebt_abandoned_guest_wrote");
         rail.abandon_resident(&debt.target);
-        return;
+        return MappingPayOutcome::AbandonedGuestWrote;
     }
     crate::runtime::drain::note_store_route(route);
-    if !rail.pay_surface_writeback(
+    let landed = rail.pay_surface_writeback(
         state,
         host,
         mapping_id,
         &debt.target,
         debt.width,
         debt.height,
-    ) {
+    );
+    if !landed {
         // The rail reports its own loss on the failure channel; this names the
         // rail that owed it, because a debt paid late and refused is a different
         // investigation from a Store refused where it was issued.
@@ -1697,6 +1750,11 @@ fn pay<M: HostMemory + HostOps>(
         ));
     }
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    if landed {
+        MappingPayOutcome::Paid
+    } else {
+        MappingPayOutcome::StoreRefused
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1801,7 +1859,7 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
     plane: GvaPlaneKey,
     debt: GvaWritebackDebt,
     site: GvaPaySite,
-) -> bool {
+) -> GvaPayOutcome {
     let key = plane.resource;
     // A rail that keeps no GVA resident arms no GVA debt, so this ledger is
     // empty on that arm and the arrival is the statement of that rule rather
@@ -1809,7 +1867,7 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
     // read would otherwise sit in the ledger forever.
     let Some(target) = rail.gva_resident(&debt) else {
         crate::runtime::drain::note_store_route("gvadebt_no_rail_resident");
-        return true;
+        return GvaPayOutcome::NoRailResident;
     };
     // Whether the guest has declared a CPU write to this resource since the
     // Store. It is not yet a verdict: the declaration is one resource-wide bit
@@ -1827,7 +1885,7 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
             key.task_id, key.texture_ref
         ));
         rail.abandon_resident(&target);
-        return true;
+        return GvaPayOutcome::ResourceRetired;
     };
     // The resource's own declaration decides whether its pages come back, not
     // this debt's — see [`reback_gva_resource`]. A debt whose resource is gone
@@ -1837,7 +1895,7 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
     if !reback_gva_resource(state, host, plane) {
         crate::runtime::drain::note_store_route("gvadebt_resource_retired");
         rail.abandon_resident(&target);
-        return true;
+        return GvaPayOutcome::ResourceRetired;
     }
     let Some((backing_generation, backing_span, ordered)) =
         state.pending_writebacks.gva_resource_backing(plane)
@@ -1853,14 +1911,14 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
                 key.task_id, key.texture_ref
             ));
         }
-        return false;
+        return GvaPayOutcome::Unresolved;
     };
     // The plane key already carries the address, so a mismatched one cannot
     // reach here: it would have found no plane at all above.
     if backing_generation != debt.generation || backing_span != span {
         crate::runtime::drain::note_store_route("gvadebt_generation_moved");
         rail.abandon_resident(&target);
-        return true;
+        return GvaPayOutcome::GenerationMoved;
     }
     // The third answer. Writing the whole frame over a plane the guest CPU wrote
     // part of loses the guest's stores; dropping the frame loses everything the
@@ -1877,7 +1935,7 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
             None => {
                 crate::runtime::drain::note_store_route("gvadebt_abandoned_guest_wrote");
                 rail.abandon_resident(&target);
-                return true;
+                return GvaPayOutcome::AbandonedGuestWrote;
             }
         }
     } else {
@@ -1905,7 +1963,82 @@ fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
         &pages,
         &skip,
     );
-    true
+    GvaPayOutcome::Paid
+}
+
+/// What one GVA plane's payment did (B1).
+///
+/// The GVA sibling of [`MappingPayOutcome`], with one arm the mapping ledger
+/// has no equivalent of: a debt whose pages cannot be resolved *right now* is
+/// put back in the ledger ([`Self::Unresolved`]) rather than discharged, so a
+/// reader that saw this answer knows the pages are not the plane's content and
+/// that the debt is still owed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GvaPayOutcome {
+    /// Nothing was owed for this plane: its pages already held the content.
+    NothingOwed,
+    /// The plane's frame was landed (whole, or around the pages the guest had
+    /// written — the merge that landed is its own counter).
+    Paid,
+    /// The guest's own writes are the plane's content, so the frame was dropped
+    /// rather than written over them.
+    AbandonedGuestWrote,
+    /// The plane's declaration moved under the debt.
+    GenerationMoved,
+    /// The resource's plane is retired: no reader can name its pages again.
+    ResourceRetired,
+    /// The rail keeps no GVA resident, so nothing was ever owed here.
+    NoRailResident,
+    /// The plane's pages could not be resolved; the debt was put back.
+    Unresolved,
+}
+
+impl GvaPayOutcome {
+    /// Whether the plane's pages hold its content *after* this payment.
+    pub fn landed_or_current(self) -> bool {
+        matches!(self, Self::NothingOwed | Self::Paid)
+    }
+
+    /// Whether the answer is the one the *identity* moved on.
+    pub fn identity_moved(self) -> bool {
+        matches!(self, Self::GenerationMoved)
+    }
+}
+
+/// Pay the one plane a **named reader** is about to read, and say what happened
+/// (B1).
+///
+/// [`pay_for_texture`] pays every plane a *resource* owes, because a sampled
+/// read names a resource; this pays the one plane a reader's own address names
+/// (`GvaPlaneKey::plane` — the same key `arm_gva` mints), because a render
+/// attachment's previous contents are one plane of one resource and the answer
+/// is used to decide whether *those* pages may be declared.
+pub fn pay_gva_plane<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+) -> GvaPayOutcome {
+    if state.pending_writebacks.is_empty() {
+        return GvaPayOutcome::NothingOwed;
+    }
+    let plane = GvaResourceKey {
+        task_id,
+        texture_ref,
+    }
+    .plane(gva);
+    let Some(debt) = state.pending_writebacks.take_gva_plane(plane) else {
+        return GvaPayOutcome::NothingOwed;
+    };
+    pay_gva(
+        crate::backend::selected(),
+        state,
+        host,
+        plane,
+        debt,
+        GvaPaySite::Named,
+    )
 }
 
 #[cfg(test)]
@@ -1916,6 +2049,74 @@ mod tests {
     /// are what the ledger keys on; the rest is only carried.
     use super::test_resident_identity as ident;
     use super::*;
+
+    /// B1 (`INV-LAND`): the payment's answer is the licence a *reader* needs
+    /// before it declares the surface's own pages as the source of its pass.
+    ///
+    /// The two elision doors cut their window out of those pages and state them
+    /// to the provider, so "the pages hold this surface's content" is not a
+    /// detail of the payment — it is the claim the window makes. The arms that
+    /// cannot make it (the guest superseded the frame; the rail refused the
+    /// Store; the mapping's generation moved) are exactly the ones the class
+    /// answers by name (`resident_source_window_landing_refused` /
+    /// `_identity_moved`), and this pins the mapping from the answer to the
+    /// claim so a future arm cannot silently declare pages nothing vouches for.
+    #[test]
+    fn a_mapping_payment_says_whether_its_pages_may_be_declared() {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let mut host = crate::runtime::FakeHost::new();
+        // Nothing owed: the pages are already the surface's content — the one
+        // answer a reader may declare a window under *without* a copy.
+        assert_eq!(
+            pay_for_mapping(&mut state, &mut host, 7),
+            MappingPayOutcome::NothingOwed
+        );
+        // An identity that moved: the debt names a mapping this device no longer
+        // holds, so the pages the debt would be landed into belong to something
+        // else.
+        let resident = ident(7, 8, 4, 8);
+        assert_eq!(state.pending_writebacks.arm(7, resident, 8, 4, 9), None);
+        assert_eq!(
+            pay_for_mapping(&mut state, &mut host, 7),
+            MappingPayOutcome::GenerationMoved
+        );
+        // The GVA sibling, on the same ledger: a plane nothing owes is current.
+        assert_eq!(
+            pay_gva_plane(&mut state, &mut host, 1, 21, 0x40_0000),
+            GvaPayOutcome::NothingOwed
+        );
+        // The whole table, so a new arm cannot land on the licence by accident.
+        for (outcome, declare, moved) in [
+            (MappingPayOutcome::NothingOwed, true, false),
+            (MappingPayOutcome::Paid, true, false),
+            (MappingPayOutcome::AbandonedGuestWrote, false, false),
+            (MappingPayOutcome::GenerationMoved, false, true),
+            (MappingPayOutcome::StoreRefused, false, false),
+        ] {
+            assert_eq!(
+                outcome.landed_or_current(),
+                declare,
+                "a window may be declared only where the pages hold the content: {outcome:?}"
+            );
+            assert_eq!(
+                outcome.identity_moved(),
+                moved,
+                "the identity's own route is one arm: {outcome:?}"
+            );
+        }
+        for (outcome, declare, moved) in [
+            (GvaPayOutcome::NothingOwed, true, false),
+            (GvaPayOutcome::Paid, true, false),
+            (GvaPayOutcome::AbandonedGuestWrote, false, false),
+            (GvaPayOutcome::GenerationMoved, false, true),
+            (GvaPayOutcome::ResourceRetired, false, false),
+            (GvaPayOutcome::NoRailResident, false, false),
+            (GvaPayOutcome::Unresolved, false, false),
+        ] {
+            assert_eq!(outcome.landed_or_current(), declare, "{outcome:?}");
+            assert_eq!(outcome.identity_moved(), moved, "{outcome:?}");
+        }
+    }
 
     /// The coalescing the rail exists for, at the container: a second arm into
     /// one mapping replaces the first rather than queueing beside it, so N
