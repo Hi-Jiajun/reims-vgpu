@@ -6958,6 +6958,7 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
 ) {
     let gpa = state.display.shared_gpa;
     if gpa == 0 {
+        note_frame_present(false);
         note_display_present_signal(DISPLAY_PRESENT_NO_GPA);
         return;
     }
@@ -6966,9 +6967,14 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     // the class and could therefore never clear it — see
     // [`display_event_enabled`] for why that residue is not inert.
     if !display_event_enabled(host, gpa, DISPLAY_PRESENT_EVENT_MASK) {
+        note_frame_present(true);
         note_display_present_signal(DISPLAY_PRESENT_NOT_ENABLED);
         return;
     }
+    // A completed present, whatever its notification arm: this is the frame the
+    // frame profile closes. Switch-gated, so a default boot pays one relaxed
+    // load on the present path and nothing else.
+    note_frame_present(false);
     note_display_present_signal(DISPLAY_PRESENT_DELIVERED);
     // Pending word is atomic read-and-clear (ldclral) on the guest side; OR
     // the present bit so a not-yet-consumed ONLINE event is preserved.

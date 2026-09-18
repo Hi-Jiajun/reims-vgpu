@@ -11340,6 +11340,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 RenderRailOutcome::ProviderCompleted(out) => {
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
                     crate::runtime::drain::note_store_route("render_provider_canonical");
+                    // The frame profile's own two-path count: this draw was
+                    // answered by the canonical provider, not the engine.
+                    crate::runtime::drain::note_frame_draw_rail(
+                        crate::runtime::drain::FrameDrawRail::Provider,
+                    );
                     // R26: out-flag for the Store route below. This frame was
                     // rendered by the canonical rail, so the engine's registry
                     // holds no image under this record's identity for it — and
@@ -11486,6 +11491,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // the two namespaces cannot drift apart.
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
                     crate::runtime::drain::note_store_route("render_provider_canonical");
+                    crate::runtime::drain::note_frame_draw_rail(
+                        crate::runtime::drain::FrameDrawRail::Provider,
+                    );
                     let c0 = req.colors.first();
                     crate::observe::line(format!(
                         "linux_render_provider ok resident pipe={} {}x{} alloc={:#x} view={} \
@@ -11604,6 +11612,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
         let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
+        // The self-contained engine answered this draw. Counted here rather
+        // than at the seam's return, because the seam's span also covers the
+        // provider path above and cannot name which rail executed it.
+        crate::runtime::drain::note_frame_draw_rail(crate::runtime::drain::FrameDrawRail::Engine);
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a
         // Metal pass whose counter spans several draws is several Vulkan

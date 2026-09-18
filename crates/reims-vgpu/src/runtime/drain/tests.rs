@@ -3141,6 +3141,90 @@ fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
     assert!(c.take_readback_split().is_none(), "the window must reset");
 }
 
+/// A census window can say the worker was busy; it cannot say what one frame
+/// cost.
+///
+/// `drain_duty` divides a whole second, and a desktop that feels slow while
+/// its numbers look small is exactly the reading that shape cannot produce:
+/// the per-frame interval, the draws that landed inside it, and the host span
+/// they took have to close at a present, not at a report boundary.
+#[test]
+fn the_frame_profile_closes_a_frame_at_every_present() {
+    use crate::runtime::drain::{FrameDrawRail, FrameProfileCensus};
+    let c = FrameProfileCensus::with_report_ms(15);
+    assert!(
+        c.note_present(1_000_000, 1_000, true).is_none(),
+        "the first present arms the frame; it has no interval yet"
+    );
+    // Three provider draws at 1 ms each are the first frame's whole host cost.
+    for _ in 0..3 {
+        c.note_draw(1_000);
+        c.note_rail(FrameDrawRail::Provider);
+    }
+    assert!(
+        c.note_present(1_010_000, 1_005, false).is_none(),
+        "the window is not full yet"
+    );
+    // One engine draw in the next frame.
+    c.note_draw(2_000);
+    c.note_rail(FrameDrawRail::Engine);
+    let line = c
+        .note_present(1_020_000, 1_016, false)
+        .expect("a full window must report")
+        .to_string();
+
+    assert!(line.starts_with("frame_profile win_ms=16"), "{line}");
+    assert!(line.contains("presents=3"), "{line}");
+    // The guest had not armed the present class on the first one, which is a
+    // different reading from "no present arrived" and is counted apart.
+    assert!(line.contains("present_not_enabled=1"), "{line}");
+    assert!(line.contains("frames=2"), "{line}");
+    assert!(line.contains("interval_us_mean=10000"), "{line}");
+    assert!(line.contains("interval_us_p50=10000"), "{line}");
+    assert!(line.contains("interval_us_max=10000"), "{line}");
+    // Three draws in the first frame, one in the second.
+    assert!(line.contains("draws_per_present_mean=2"), "{line}");
+    assert!(line.contains("draws_per_present_max=3"), "{line}");
+    // 3 ms then 2 ms of host draw span.
+    assert!(line.contains("host_us_mean=2500"), "{line}");
+    assert!(line.contains("host_us_max=3000"), "{line}");
+    assert!(line.contains("provider_draws=3"), "{line}");
+    assert!(line.contains("engine_draws=1"), "{line}");
+
+    // The window resets with the line, so the next one cannot inherit it.
+    assert!(c.note_present(1_030_000, 1_020, false).is_none());
+}
+
+/// The frame interval's tail is the hitch, and a mean hides it.
+///
+/// Nine 120 Hz frames and one 100 ms stall average to 17.5 ms — healthy-looking
+/// for two frames in three and no frame at all for the one the user saw stop.
+/// The max names the stall; the p50 names the cadence it interrupted.
+#[test]
+fn the_frame_profile_keeps_a_present_tail_apart_from_its_mean() {
+    use crate::runtime::drain::FrameProfileCensus;
+    let c = FrameProfileCensus::with_report_ms(1_000);
+    assert!(c.note_present(1_000_000, 1_000, false).is_none());
+    let mut t = 1_000_000u64;
+    for _ in 0..9 {
+        t += 8_333;
+        assert!(c.note_present(t, 1_500, false).is_none());
+    }
+    // One stall, then the window closes on the present that ends it.
+    t += 100_000;
+    let line = c
+        .note_present(t, 2_600, false)
+        .expect("a full window must report")
+        .to_string();
+
+    assert!(line.contains("presents=11"), "{line}");
+    assert!(line.contains("frames=10"), "{line}");
+    assert!(line.contains("interval_us_mean=17499"), "{line}");
+    assert!(line.contains("interval_us_max=100000"), "{line}");
+    // 8 333 us lands in the 8 ms bucket; the median is the bucket's edge.
+    assert!(line.contains("interval_us_p50=8000"), "{line}");
+}
+
 /// The offer side of the window cadence needs its own census, because the
 /// present side cannot see a frame that never arrived.
 ///
