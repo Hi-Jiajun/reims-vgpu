@@ -409,6 +409,40 @@ fn note_out_of_class_shape(shape: &OutOfClassShape) {
 /// encode** and return color0 for chaining — returning `NoMetal` when
 /// `!writeback_guest` aborted every multi-draw stream after the first
 /// record (live `draw_fail_clear_fallback nometal=1` on clear+draw packets).
+/// R42: the *class-only* probe the chain-middle handoff's admission reads.
+///
+/// It runs the same resolution, the same request assembly and the same
+/// canonical class gate `encode_draw_chain` runs, and stops where a submission
+/// would leave the gate — so no provider pass, no engine draw and no guest
+/// write happens, and the verdict cannot drift from the one the record will
+/// meet when it is encoded for real. `req` is a throwaway the caller built for
+/// this question: the probe leaves its out-flags as it found them and the walk
+/// builds the record's own request separately.
+pub fn probe_draw_chain<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &mut DrawEncodeRequest,
+    writeback_guest: bool,
+) -> ChainProbe {
+    let mut probe = ChainProbe::Unavailable;
+    // The same three out-flags `encode_draw_chain` clears, cleared for the same
+    // reason: the seam's answer travels on them, and a stale one would let the
+    // probe's caller read the previous record's answer as this one's.
+    req.chain_resident_established = false;
+    req.resident_frame_published_by_provider = false;
+    req.chain_resident_held_by_provider = false;
+    match try_metal2vulkan_draw(state, host, req, writeback_guest, Some(&mut probe)) {
+        // The seam returns `Probed` on this path and never any other span; a
+        // different arm would mean the probe asked for a real encode, which is
+        // the one thing its sink exists to prevent.
+        Ok(M2vDrawSpan::Probed) => probe,
+        // A record the seam cannot even prepare (a bind past its table, a chain
+        // identity it cannot resolve) is not one the walk may keep a frame for.
+        Err(_) => ChainProbe::Unavailable,
+        Ok(_) => ChainProbe::Unavailable,
+    }
+}
+
 pub fn encode_draw_chain<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -510,7 +544,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         record_plane_draw(req);
         req.chain_resident_established = false;
         req.resident_frame_published_by_provider = false;
-        let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
+        req.chain_resident_held_by_provider = false;
+        let engine = try_metal2vulkan_draw(state, host, req, writeback_guest, None);
         // Set from the result itself rather than inside the arms, because the
         // arms are where this went wrong: the refusal slug was assigned only in
         // `Err`, every `Ok` arm left it `None`, and the tail spelled `None`
@@ -643,6 +678,16 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     "linux_m2v_draw skip pipe={} (no color0 geom)",
                     req.pipeline_ref
                 ));
+            }
+            // R42: unreachable by construction — the probe is a different
+            // entry (`probe_draw_chain`) whose sink is the only thing that may
+            // read this arm — and answered as a wiring fault rather than as a
+            // record that produced nothing.
+            Ok(M2vDrawSpan::Probed) => {
+                return (
+                    EncodeStatus::BadArgs("draw_vk_probe_reached_the_encoder"),
+                    None,
+                );
             }
             Ok(M2vDrawSpan::BorrowedLanding { bytes, bgra }) => {
                 // B3: the provider's own write put the frame in the guest's
@@ -7236,6 +7281,10 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
 }
 
 /// Result of a Linux metal2vulkan draw.
+/// The class-only answer, defined on the always-compiled draw module so the
+/// backend trait can name it on a host with no Vulkan rail at all (R42).
+pub use super::ChainProbe;
+
 enum M2vDrawSpan {
     /// No drawable color0 geom.
     None,
@@ -7307,6 +7356,15 @@ enum M2vDrawSpan {
         bytes: Vec<u8>,
         bgra: bool,
     },
+    /// The class-only probe's answer (R42): nothing was encoded, nothing was
+    /// drawn and nothing was written — the seam stopped where a submission
+    /// would have left the gate, and the verdict travelled out through the
+    /// probe's own sink.
+    ///
+    /// Only [`probe_draw_chain`] asks for this arm, and only it may read one:
+    /// `encode_draw_chain` treats an answer here as a wiring fault rather than
+    /// as "the record produced nothing".
+    Probed,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -7939,6 +7997,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     host: &mut M,
     req: &mut DrawEncodeRequest,
     writeback_guest: bool,
+    // R42: the class-only probe's sink. `Some` asks the canonical class the
+    // question this record's predecessor needs answered before it keeps a
+    // frame — "would you answer this record?" — and returns before either rail
+    // runs. `None` is every real encode, and the two paths share every line of
+    // the class above the submission by construction.
+    probe: Option<&mut ChainProbe>,
 ) -> Result<M2vDrawSpan, DrawError> {
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
@@ -11231,6 +11295,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // GVA. While this is `false` the rail publishes the frames it
                 // answers instead of keeping them.
                 resident_frames_fetchable: false,
+                // R42: the in-packet half of that capability, which is the one
+                // the walk can prove without R4b. `chain_keeps_frame` is the
+                // walk's promise that *this* record's frame has a reader in the
+                // next record of its packet (the walk probed that record's own
+                // class before this one was submitted), and
+                // `chain_loads_resident` says the frame this record begins from
+                // is the provider's own image, kept by the record before it.
+                // Both are per record and both are `false` for every packet the
+                // walk did not admit, so a shape outside the relay answers
+                // exactly as it did before this increment.
+                chain_keeps_frame: req.chain_keeps_frame,
+                chain_loads_resident: req.chain_loads_resident,
                 // R23: the chain's own frame, when this record's previous
                 // contents are the engine's registry resident and the caller
                 // could read them out (`resident_chain_source_frame`). The
@@ -11350,6 +11426,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // `chain_phase`'s `engine_us` is an identity a reader can check.
             // Nothing here is read by an admit/refuse/skip decision, and the
             // guard is `None` while `REIMS_VGPU_FRAME_PROFILE` is off.
+            // R42: the class-only probe answers here and returns before either
+            // rail runs. It is the *same* inputs and the same gate the
+            // submission below would use, reached through the same function
+            // (`provider_render::submit_render` with its class-only mode), so
+            // the verdict the walk admits a record on is the verdict that
+            // record will meet.
+            // Moved, not borrowed through a deref: `probe` is used once and the
+            // seam returns on this arm.
+            if let Some(sink) = probe {
+                *sink = match provider_render::render_class_probe(&inputs, &resources) {
+                    provider_render::RenderClassProbe::InClass => ChainProbe::Admitted,
+                    provider_render::RenderClassProbe::OutOfClass => ChainProbe::Refused,
+                    provider_render::RenderClassProbe::Unavailable => ChainProbe::Unavailable,
+                };
+                return Ok(M2vDrawSpan::Probed);
+            }
             let outcome = {
                 let _provider_rail = crate::runtime::drain::frame_span(
                     crate::runtime::drain::FrameSpan::RailProvider,
@@ -11569,6 +11661,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     return Ok(M2vDrawSpan::Pixels { bytes, bgra });
                 }
                 RenderRailOutcome::ProviderCompletedResident(frame) => {
+                    // R42: this frame is the provider's own image, and it is the
+                    // only arm that may say so — the engine's resident chain
+                    // returns the same span one layer down, which is why the
+                    // exec loop reads this flag rather than the span.
+                    req.chain_resident_held_by_provider = true;
                     // The frame stayed in the provider's image under this
                     // record's own attachment identity — the resident arm of
                     // R7b. Nothing comes back through the completion, so the
@@ -11692,6 +11789,28 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         pass_continues: resources.render_pass_continues,
                         pipeline_ref: req.pipeline_ref,
                     });
+                    // R42's fail-closed boundary, inside the one arm that
+                    // reaches it. A record whose caller has said its previous
+                    // contents are the *provider's* own image is one the
+                    // self-contained engine cannot draw: its registry holds no
+                    // frame under this attachment's identity — and may hold a
+                    // stale one from an earlier packet, which is worse, because
+                    // the engine's LOAD gate would take the old contents and
+                    // this device would land a frame no record of this packet
+                    // drew (census v15's garbled desktop, one layer down). So
+                    // the seam refuses the record by name instead of asking the
+                    // engine, and the walk abandons the packet's chain. The
+                    // class's own slug travels with the refusal, so the one fail
+                    // line says which boundary the chain met.
+                    if req.chain_loads_resident {
+                        return Err(DrawError::DrawPreparation(
+                            crate::backend::vulkan::engine::DrawPreparationDecline::ChainResidentFrameUnavailable {
+                                class: reason.slug().to_owned(),
+                                width: w,
+                                height: h,
+                            },
+                        ));
+                    }
                 }
                 RenderRailOutcome::ProviderDeclined(decline) => {
                     crate::observe::Emit::decline("render_provider", &decline)
@@ -15343,7 +15462,7 @@ mod vulkan_split_tests {
             ..DrawEncodeRequest::default()
         };
 
-        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
+        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true, None) {
             Err(err) => err,
             Ok(_) => panic!("an empty state cannot resolve pipeline 41"),
         };
@@ -15384,7 +15503,7 @@ mod vulkan_split_tests {
             ..DrawEncodeRequest::default()
         };
 
-        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
+        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true, None) {
             Err(err) => err,
             Ok(_) => panic!("a texture bind past the table cannot encode"),
         };
@@ -15405,7 +15524,7 @@ mod vulkan_split_tests {
         // which is what says the refusal is about live guest work and not about
         // the index alone.
         std::sync::Arc::make_mut(&mut req.fragment_textures)[0].texture_ref = 0;
-        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
+        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true, None) {
             Err(err) => err,
             Ok(_) => panic!("an empty state cannot resolve pipeline 41"),
         };

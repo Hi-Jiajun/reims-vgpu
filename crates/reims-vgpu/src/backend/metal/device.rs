@@ -120,6 +120,21 @@ impl Backend for MetalBackend {
         draw::metal::encode_draw_chain(state, host, req, writeback_guest, force_full_store)
     }
 
+    fn probe_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _req: &mut DrawEncodeRequest,
+        _writeback_guest: bool,
+    ) -> crate::runtime::draw::ChainProbe {
+        // The Apple rail *is* the canonical rail's counterpart on that host —
+        // there is no separate provider to ask, and this device's own chain
+        // already keeps its frames where its own LOAD gate can read them. The
+        // handoff is a Vulkan-rail question, and the fail-closed answer here is
+        // the one that keeps every packet on the path it ran before R42.
+        crate::runtime::draw::ChainProbe::Unavailable
+    }
+
     fn execute_dispatch<M: HostMemory + HostOps>(
         &self,
         state: &mut DeviceState,

@@ -5190,6 +5190,13 @@ fn finish_stream<M: HostMemory + HostOps>(
         // Resident render-pass chain: intermediate records keep their content
         // on the engine target (no CPU chain buffer); records 2+ LoadFromTarget.
         let mut resident_chain = false;
+        // R42: the same chain, held by the *provider* instead of the engine.
+        // Both rails answer `chain_resident_established`, and only that flag
+        // plus this one can say which registry the frame is in — which is what
+        // the next record's load arm depends on: `chain_loads_resident` names
+        // the provider's own image, and stating it for a frame the engine holds
+        // would name an image no pass ever stored.
+        let mut provider_resident_chain = false;
         let mut saw_nometal = false;
         let first_draw = draw_list.first().copied();
         let mut first_req = first_draw.and_then(|pd| {
@@ -5220,6 +5227,12 @@ fn finish_stream<M: HostMemory + HostOps>(
             out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
+        // R42: every record's request, built once in packet order, and the
+        // walk's own answer to "does this record's frame have a reader in this
+        // packet?" — filled by the probes below and read by the loop under
+        // them.
+        let mut requests: Vec<draw::DrawEncodeRequest> = Vec::with_capacity(draw_list.len());
+        let mut keep_frame = vec![false; draw_list.len()];
         for (di, pd) in draw_list.iter().enumerate() {
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let mut req = if di == 0 {
@@ -5238,6 +5251,104 @@ fn finish_stream<M: HostMemory + HostOps>(
                 fill_draw_binds_from_pending(&mut req, pd);
                 (req.continues_render_pass, req.render_pass_continues) =
                     render_pass_chain_position(di, draw_list.len());
+                // Records 2+ of a chain composite over the prior record: force
+                // loadAction=Load on every color. Leaving the pass action alone
+                // on a mapper-ref-texture target let a CLEAR re-run before each
+                // record, wiping the full composite drawn by record 1 (live
+                // poison=1: mid peak 10.9M native → 2.5M after later records).
+                if di > 0 {
+                    for c in &mut req.colors {
+                        c.load_action = MTL_LOAD_ACTION_LOAD;
+                    }
+                }
+                requests.push(req);
+            }
+        }
+        // R42 — the chain-middle handoff's admission, and the only thing this
+        // increment changes about *which* answers a packet gets.
+        //
+        // Every record of a serialized packet produces a frame, and today the
+        // frame of every non-final record travels back to the host as bytes and
+        // is uploaded again by the record that consumes it (fp3: 55.41 % of the
+        // provider's answers, 8.93 GiB of readback plus the same again uploaded
+        // per 300 s round). The canonical rail can keep that frame in its own
+        // image instead — `StoreOp::Resident`, R7b — and the next record then
+        // begins from `LoadOp::Resident` with no bytes crossing the bus. What
+        // the rail may *not* do is keep a frame nobody can reach: its caller
+        // cannot fetch a kept frame for the guest's readers (R4b's byte channel
+        // is still missing), and census v15 measured the cost of getting that
+        // wrong — 11 892 kept frames, 6 824 `chain_resident_land_fail` and a
+        // garbled desktop.
+        //
+        // So the walk proves the reader *before* it keeps anything, and the
+        // proof is the next record's own class answer, asked through the same
+        // gate the record will meet with exactly the shape it will run with.
+        // The probes run from the tail backwards, which is what makes the
+        // assumption sound: a probe of record `di + 1` states
+        // `chain_loads_resident`, i.e. it asks the class the question "would you
+        // answer this record if the frame it begins from were your own kept
+        // image?" — and that is precisely the shape the record runs with when
+        // `di` kept its frame, which the probe's own answer decides.
+        //
+        //   * the last record keeps nothing: the packet's own guest Store is
+        //     its reader, and it publishes;
+        //   * every record before it is kept exactly when the probe of the
+        //     record after it admitted that shape;
+        //   * the head is probed with its *own* keep stated as well, because
+        //     nothing precedes it to ask on its behalf — a head the class will
+        //     not answer with a kept frame must not leave the walk promising
+        //     one to the record after it.
+        //
+        // A refusal anywhere leaves the records it concerns on today's path:
+        // the ones whose successor was refused publish their frames, and every
+        // record whose predecessor did not keep runs on the byte arm it always
+        // ran on. Nothing here can lose a frame — the walk only ever keeps one
+        // it has been told the next record will take, and the one case that
+        // escapes that proof (a record that answers `NotInNarrowClass` *after*
+        // its predecessor kept) is refused by name in the seam and counted as
+        // `provider_chain_middle_handoff_lost`.
+        for di in (0..requests.len()).rev() {
+            // Charged to `Retarget`, which is what the probes do: they assemble
+            // the record's own shape (the same request the encode will be handed
+            // and the same resolution it will use) and ask the class about it.
+            // Left uncharged they would land in whatever phase the build loop
+            // above left open — `fin_binds`, which is the per-record request
+            // fixup this is not.
+            fin.enter(crate::runtime::drain::FinishPhase::Retarget);
+            let ask_the_head = di == 0;
+            if ask_the_head && !keep_frame[0] {
+                // Nothing to narrow: the head is publishing under today's
+                // answer already, and its own class verdict is not this
+                // increment's question.
+                continue;
+            }
+            let load_resident = di > 0;
+            let mut probe = requests[di].clone();
+            probe.chain_from_resident = load_resident;
+            probe.chain_loads_resident = load_resident;
+            probe.chain_keeps_frame = keep_frame[di];
+            let admitted = crate::backend::selected().probe_draw_chain(
+                state,
+                host,
+                &mut probe,
+                di + 1 == draw_list.len(),
+            ) == draw::ChainProbe::Admitted;
+            crate::runtime::drain::note_store_route("provider_chain_middle_probed");
+            if di > 0 {
+                keep_frame[di - 1] = admitted;
+            } else {
+                keep_frame[0] = admitted;
+            }
+        }
+        for (di, pd) in draw_list.iter().enumerate() {
+            fin.enter(crate::runtime::drain::FinishPhase::Retarget);
+            let Some(req) = requests.get_mut(di) else {
+                break;
+            };
+            req.chain_keeps_frame = keep_frame[di];
+            req.chain_loads_resident = provider_resident_chain;
+            {
+                fin.enter(crate::runtime::drain::FinishPhase::Binds);
                 // A resident mapper-ref-texture target carries attachment contents between
                 // records without a CPU chain buffer. Like a native Metal render
                 // pass, only the final record performs the guest-visible Store;
@@ -5254,9 +5365,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                 // wiping the full composite drawn by record 1 (live poison=1:
                 // mid peak 10.9M native → 2.5M after later records).
                 if di > 0 {
-                    for c in &mut req.colors {
-                        c.load_action = MTL_LOAD_ACTION_LOAD;
-                    }
                     // Chain from the engine resident when available; otherwise
                     // seed from the prior encode output (archive "thread each
                     // record's output as next initial content"). MoltenVK's
@@ -5310,7 +5418,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 let encode = crate::backend::selected().encode_draw_chain(
                     state,
                     host,
-                    &mut req,
+                    req,
                     do_writeback,
                     force_full_store,
                 );
@@ -5371,6 +5479,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // after it from a stale image, silently losing this
                         // record's draw.
                         resident_chain = false;
+                        provider_resident_chain = false;
                         // fp3 probe: the frame's provenance travels with it, so
                         // the consumption below can say whether the bytes the
                         // canonical rail published were read by anyone.
@@ -5382,6 +5491,14 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // on the engine target; the next record loads it there.
                         out.metal_draws_ok += 1;
                         resident_chain = true;
+                        // R42: which registry holds it. A frame the provider kept
+                        // is one the next record reads with `LoadOp::Resident`;
+                        // a frame the engine kept is read through the caller's
+                        // own bytes, exactly as before this increment.
+                        provider_resident_chain = req.chain_resident_held_by_provider;
+                        if provider_resident_chain {
+                            crate::runtime::drain::note_store_route("provider_chain_middle_kept");
+                        }
                     }
                     (EncodeStatus::Ok, None) => {
                         // Intermediate must return color0 for chaining; treat as
@@ -5412,11 +5529,12 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 host,
                                 task_id,
                                 acc,
-                                &req,
+                                req,
                                 &mut chain_rgba,
                                 ChainEnd {
                                     cause: draw::ChainAbandonCause::NoColor0,
                                     resident: resident_chain,
+                                    provider_held: provider_resident_chain,
                                 },
                             );
                             break;
@@ -5431,11 +5549,12 @@ fn finish_stream<M: HostMemory + HostOps>(
                             host,
                             task_id,
                             acc,
-                            &req,
+                            req,
                             &mut chain_rgba,
                             ChainEnd {
                                 cause: draw::ChainAbandonCause::NoMetal,
                                 resident: resident_chain,
+                                provider_held: provider_resident_chain,
                             },
                         );
                         break;
@@ -5456,11 +5575,12 @@ fn finish_stream<M: HostMemory + HostOps>(
                             host,
                             task_id,
                             acc,
-                            &req,
+                            req,
                             &mut chain_rgba,
                             ChainEnd {
                                 cause: draw::ChainAbandonCause::TerminalRefusal,
                                 resident: resident_chain,
+                                provider_held: provider_resident_chain,
                             },
                         );
                         break;
@@ -5960,6 +6080,14 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
 struct ChainEnd {
     cause: draw::ChainAbandonCause,
     resident: bool,
+    /// R42: the frame that would be landed is in the **canonical provider's**
+    /// image, which this caller cannot fetch (R4b's byte channel is the missing
+    /// half). The engine's registry has nothing under that identity, so asking
+    /// it — `read_abandoned_chain_rgba` — could only produce the v15 failure
+    /// (a `chain_resident_land_fail` per record) and, worse, might answer with
+    /// a *stale* image under the same identity. The frame is therefore not
+    /// landed at all, under its own name.
+    provider_held: bool,
 }
 
 /// Land the chain image this packet has produced before abandoning it.
@@ -5990,7 +6118,11 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     // `draw::M2vDrawSpan::ResidentSurfaceStore` for what sharing that
     // derivation with the callers that *do* hold a key once cost.
     if end.resident && chain_rgba.is_none() {
-        *chain_rgba = crate::backend::selected().read_abandoned_chain_rgba(state, req);
+        if end.provider_held {
+            crate::runtime::drain::note_store_route("provider_chain_middle_handoff_lost");
+        } else {
+            *chain_rgba = crate::backend::selected().read_abandoned_chain_rgba(state, req);
+        }
     }
     if let Some(rgba) = chain_rgba.take() {
         let _ =

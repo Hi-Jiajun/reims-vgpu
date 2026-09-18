@@ -6876,6 +6876,45 @@ pub struct RenderRailInputs<'a> {
     /// fetch a kept frame; R4b's byte channel is what makes the production seam
     /// state it, and until then the seam states `false`.
     pub resident_frames_fetchable: bool,
+    /// Whether the frame this record's pass produces is consumed **inside its
+    /// own packet** by the very next record, which will begin from this rail's
+    /// own image (R42).
+    ///
+    /// This is the second half of the capability above, and the two are kept
+    /// apart because the obligations differ. `resident_frames_fetchable` says
+    /// the caller can read a kept frame back for *every* reader of the
+    /// attachment — the deferred GVA debt, the mapper-ref-texture Store, a
+    /// later record that lands back on the engine — and R4b's byte channel is
+    /// what would make that true. This says only what a chain needs: the
+    /// caller has *proved*, before this record was submitted, that the next
+    /// record of the same packet will be answered by this rail with a
+    /// `LoadOp::Resident` for the same identity (the walk probes the next
+    /// record's own class with [`RenderRailInputs::chain_loads_resident`]
+    /// stated, and keeps this record's frame only when that probe admitted
+    /// it).
+    ///
+    /// With this stated, a record that withheld its readback keeps its frame
+    /// (`StoreOp::Resident`) instead of publishing it, and the class's own
+    /// `resident_target_undeclared` protection still holds: the record is
+    /// refused by name unless it names the identity the image is keyed on. A
+    /// frame kept under this promise has exactly one reader — the next record
+    /// of the packet — which is why the walk may state it while no guest-side
+    /// reader can fetch anything.
+    pub chain_keeps_frame: bool,
+    /// Whether the frame this record's pass begins from is this rail's own
+    /// image, kept by the record before it under
+    /// [`RenderRailInputs::chain_keeps_frame`] (R42).
+    ///
+    /// The walk states it for a record whose predecessor's answer was
+    /// `ProviderCompletedResident` — the frame is in the provider's image under
+    /// the identity the request names, and the class may therefore state the
+    /// contract's `LoadOp::Resident` arm for it instead of asking the caller
+    /// for bytes (`resident_frames_fetchable`'s doors). The two facts travel
+    /// separately because a chain *ends* as well as starts: the last record of
+    /// a resident chain states this one without
+    /// [`Self::chain_keeps_frame`], and a record whose predecessor published
+    /// its frame states neither.
+    pub chain_loads_resident: bool,
     /// The frame the record's own chain names, when the caller can read it out
     /// of the rail that holds it (R23).
     ///
@@ -7436,6 +7475,14 @@ pub enum ProviderRenderDecline {
     },
     /// The canonical admission refused the trace this rail built.
     TraceAdmission { detail: String },
+    /// The class-only probe's answer reached a submission (R42).
+    ///
+    /// Unreachable by construction: [`render_class_probe`] stops the shared
+    /// function at the point where a submission would leave the gate, and the
+    /// seam returns before it reads a submission's answer. Named rather than
+    /// panicked, because a panic on the drain worker costs the guest the whole
+    /// device and this answer costs one refused draw.
+    ClassProbeRouted,
     /// The completion was not host-visible, so there are no bytes to write
     /// back.
     CompletionNotVisible,
@@ -7515,6 +7562,7 @@ impl Decline for ProviderRenderDecline {
             Self::ProviderRefused { class, .. } => class.slug(),
             Self::ProviderDeviceLost { .. } => ProviderRefusalClass::DeviceLost.slug(),
             Self::TraceAdmission { .. } => "trace_admission",
+            Self::ClassProbeRouted => "class_probe_routed",
             Self::CompletionNotVisible => "completion_not_visible",
             Self::AttachmentWritebackMissing => "attachment_writeback_missing",
             Self::AttachmentWritebackShape { .. } => "attachment_writeback_shape",
@@ -7573,6 +7621,13 @@ impl Decline for ProviderRenderDecline {
                 ("teardown_windows", teardown.windows.to_string()),
             ],
             Self::TraceAdmission { detail } => vec![("detail", detail.clone())],
+            Self::ClassProbeRouted => vec![(
+                "detail",
+                String::from(
+                    "the class-only probe answer reached a submission; the probe entry \
+                     returns before the submission and no real caller can see this arm",
+                ),
+            )],
             Self::CompletionNotVisible => Vec::new(),
             Self::AttachmentWritebackMissing => Vec::new(),
             Self::AttachmentWritebackShape {
@@ -7797,7 +7852,51 @@ fn contract_fingerprint(contract: &RenderPipelineContract) -> String {
 /// class and the caller runs the self-contained engine; only a shape that
 /// passes both is offered to the provider, and a refusal from there is a
 /// decline (never a fallback).
+/// What the class answers for a record the caller is thinking about handing
+/// over, with nothing submitted (R42).
+///
+/// The chain-middle handoff has to know whether the *next* record of a packet
+/// will consume the frame this one keeps **before** it keeps it, and the only
+/// answer that cannot drift from the real one is the class gate's own. This is
+/// that gate, reached through the same function [`submit_render`] uses —
+/// `class_only` stops it at the point where a submission would leave — so a
+/// probe and a submission can never disagree about a shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderClassProbe {
+    /// The record would be answered by the canonical provider.
+    InClass,
+    /// The record stays on the engine, by the class's own name for the shape.
+    OutOfClass,
+    /// The device could not be asked (a provider capability answer declined).
+    /// Fail-closed: a caller treats this exactly as `OutOfClass`.
+    Unavailable,
+}
+
+/// The class-only half of [`submit_render`], for one record.
+pub fn render_class_probe(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> RenderClassProbe {
+    // `ClassProbeRouted` is this entry's own answer to "the class admitted it":
+    // the shared function returns it at the one point only a class-only call
+    // can reach, and no other caller can produce it. Every other arm keeps its
+    // own meaning, and anything this match does not recognise is fail-closed —
+    // a successor the walk could not classify is one it keeps no frame for.
+    match submit_render_inner(inputs, req, true) {
+        RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted) => {
+            RenderClassProbe::InClass
+        }
+        RenderRailOutcome::NotInNarrowClass(_) => RenderClassProbe::OutOfClass,
+        _ => RenderClassProbe::Unavailable,
+    }
+}
+
 pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> RenderRailOutcome {
+    submit_render_inner(inputs, req, false)
+}
+
+fn submit_render_inner(
+    inputs: &RenderRailInputs<'_>,
+    req: &DrawRequest,
+    class_only: bool,
+) -> RenderRailOutcome {
     // The frame profile's first bar inside the provider rail, and the only one
     // on this side of `submit_narrow`: the pure class gate, every capability
     // ask it makes of this device, and the copies the device's own granules
@@ -8476,6 +8575,14 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
         texture_copies.insert(texture.index, written);
     }
     drop(_gate);
+    // R42's probe ends here: every class answer above — the pure gate, the
+    // four capability asks, the attachment window, the two copy-forced arms —
+    // has been given for this request, and a record that reaches this line is
+    // in class. Nothing below it runs, so a probe costs the class and no
+    // submission, and the class cannot answer the two callers differently.
+    if class_only {
+        return RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted);
+    }
     match submit_narrow(inputs, req, &pass, &copies, &texture_copies) {
         Ok(RenderCompletion::Writeback(output)) => RenderRailOutcome::ProviderCompleted(output),
         Ok(RenderCompletion::Resident(frame)) => {
@@ -10072,7 +10179,11 @@ fn narrow_class<'a>(
                  disagree about which bytes the pass begins from",
             ));
         }
-        if !inputs.resident_frames_fetchable {
+        // R42: the same arm serves the in-packet relay. A caller that cannot
+        // fetch a kept frame for the *guest's* readers can still consume one
+        // the packet itself produced, and `chain_loads_resident` is the walk
+        // saying exactly that about this record's predecessor.
+        if !inputs.resident_frames_fetchable && !inputs.chain_loads_resident {
             // The resident the caller's own chain names lives in the *engine*'s
             // registry (`render_chain_identity`, `gva_chain_identity`), and
             // while the arms are held this rail writes no image of its own for
@@ -10349,7 +10460,12 @@ fn narrow_class<'a>(
                          would be an image no record ever stored",
                         ));
                     };
-                    if inputs.resident_frames_fetchable {
+                    // R42: the in-packet relay's own store arm. The frame
+                    // stays in this rail's image only when the caller can name
+                    // its reader — the guest-side capability, or the walk's
+                    // proof that the next record of this packet loads it from
+                    // there. Everything else keeps the published answer above.
+                    if inputs.resident_frames_fetchable || inputs.chain_keeps_frame {
                         NarrowStore::Resident(resident)
                     } else if carried_attachment_guest_window
                         && inputs.role == RenderChainRole::SoleOrTail
@@ -10408,7 +10524,7 @@ fn narrow_class<'a>(
     // the very shapes census v15 measured it must answer (the head record of
     // every split packet is a named identity with a `Clear` load and a withheld
     // readback).
-    if inputs.resident_frames_fetchable
+    if (inputs.resident_frames_fetchable || inputs.chain_keeps_frame || inputs.chain_loads_resident)
         && resident.is_some()
         && !matches!(load, NarrowLoad::Resident(_))
         && !matches!(store, NarrowStore::Resident(_))

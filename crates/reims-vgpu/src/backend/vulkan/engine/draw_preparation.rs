@@ -161,6 +161,21 @@ pub enum DrawPreparationDecline {
         width: u32,
         height: u32,
     },
+    /// R42: this record's previous contents are the **provider's** own image —
+    /// the frame the record before it kept under this attachment's identity
+    /// (`chain_loads_resident`) — and the canonical rail did not answer it. The
+    /// self-contained engine holds no frame under that identity (and might hold
+    /// a stale one from another packet, which is worse: its LOAD gate would take
+    /// the old contents and this device would land a frame no record of this
+    /// packet drew). The seam therefore refuses the record by name instead of
+    /// asking the engine, and the packet's chain is abandoned.
+    ChainResidentFrameUnavailable {
+        /// The class's own slug for why the provider could not answer, so the
+        /// one fail line says which boundary the chain met.
+        class: String,
+        width: u32,
+        height: u32,
+    },
     SamplerEntryMissing {
         sampler_ref: u32,
         binding: u32,
@@ -313,6 +328,9 @@ impl Decline for DrawPreparationDecline {
             Self::IndexLoad { reason } => reason.slug(),
             Self::ChainResidentIdentityMissing { .. } => {
                 "draw_prepare_chain_resident_identity_missing"
+            }
+            Self::ChainResidentFrameUnavailable { .. } => {
+                "draw_prepare_chain_resident_frame_unavailable"
             }
             Self::SamplerEntryMissing { .. } => {
                 crate::observe::ladder_slug!("draw_prepare_sampler", no_list_entry)
@@ -567,6 +585,15 @@ impl Decline for DrawPreparationDecline {
                 height,
             } => vec![
                 ("target_gva", format!("{target_gva:#x}")),
+                ("width", width.to_string()),
+                ("height", height.to_string()),
+            ],
+            Self::ChainResidentFrameUnavailable {
+                class,
+                width,
+                height,
+            } => vec![
+                ("class", class.clone()),
                 ("width", width.to_string()),
                 ("height", height.to_string()),
             ],
