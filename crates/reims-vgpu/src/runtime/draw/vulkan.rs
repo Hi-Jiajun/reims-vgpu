@@ -10431,6 +10431,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     None
                 };
+            // R32: the seed door's own bytes, for the records the door resolved
+            // and the walk did not hand a chain value for — the packet's head,
+            // and a tail whose `continues_render_pass` says a record precedes it
+            // without this one continuing that frame.
+            //
+            // The same request field carries both facts: the GVA target's cached
+            // frame (`seed_color_load`) and the mapper-ref-texture surface's host
+            // fallback are what `target_rgba8` is on a record no predecessor
+            // seeded, exactly as the walk's chain value is what it is on a
+            // record that continues one. So this is [`chain_middle_source_frame`]
+            // — one derivation of "the request's own bytes, folded out of
+            // `target_seed_order` into the attachment's own order, or nothing
+            // when they are not four-byte colour at the attachment's extent" —
+            // stated for the other position, and the middle is deliberately left
+            // to R25's arm so the two populations keep two counters. `None` is
+            // then every record whose previous contents the class still has to
+            // refuse by name: one that loads from the chain's own resident, one
+            // whose seed is wider than four-byte colour, one whose seed is not
+            // the attachment's extent, and every record the door left empty.
+            let load_seed_source_frame =
+                if role != RenderChainRole::Middle && !resources.load_from_target {
+                    chain_middle_source_frame(&resources)
+                } else {
+                    None
+                };
             // R24: the frames this caller can read out for the record's own
             // sampled GPU targets — the same registry read R23's arm makes for
             // the chain, one question over. Materialized before the submission
@@ -10495,6 +10520,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // own — and the middle is the position that both takes and
                 // hands one on.
                 chain_middle_source_bytes: middle_source_frame.as_deref(),
+                // R32: the same bytes for the records the *seed door* resolved
+                // rather than the walk — a head, or a tail whose chain the walk
+                // did not carry. The class states them as the same trace-owned
+                // `Load` arm and counts them under their own name, because the
+                // caller's obligation is a different one: nothing handed these
+                // bytes on, the request builder read them for this record's own
+                // previous contents.
+                load_seed_source_bytes: load_seed_source_frame.as_deref(),
                 // R24: the sampled GPU targets this caller read a frame out
                 // for, keyed by the identity the request's own bind states.
                 // Empty for every record whose sampled textures carry their own

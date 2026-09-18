@@ -533,9 +533,17 @@
 //!   `render_provider_out_of_class_index_alignment`, and a device without
 //!   host-pointer import answers `render_provider_out_of_class_index_import`.
 //!
-//! The attachment declaration keeps the third arm: trace-owned bytes
-//! (`BufferSource::OwnedBytes`), since an attachment's load seed is not a bind
-//! of the guest's buffer.
+//! R32 puts the attachment's own load seed in the same channel. The two shapes
+//! that carry one are the two the request's seed door resolves: the surface's
+//! own guest pages, stated as the contract's ordered run list
+//! (`BufferSource::GuestRuns`, `research/docs/23` §113 / E-TX6) under
+//! [`load_seed_owner_binding`] — a list arm rather than a view arm, because
+//! what the list names is one lease per registration and many runs inside it —
+//! and the seed door's own bytes, which stay trace-owned
+//! (`BufferSource::OwnedBytes`) exactly as R23/R25's hand-overs do. Everything
+//! the class cannot state keeps the engine by name: padded rows, a list that is
+//! not the attachment's extent, one split across two registrations, and a seed
+//! the caller does not hand over.
 //!
 //! # Error mapping
 //!
@@ -2779,6 +2787,158 @@ fn gather_window(source: &GuestRunSource) -> Option<StageBufferWindow> {
     })
 }
 
+/// The attachment's own previous contents as the ordered list of owner windows
+/// the contract's `BufferSource::GuestRuns` arm states (`R32`,
+/// `research/docs/23` §113 / E-TX6).
+///
+/// The request's seed is a [`GuestRunSource`] — the engine's own carrier for a
+/// mapper-ref-texture surface's prior contents — and this is the one place the
+/// class turns it into provider-shaped windows: one per maximal
+/// import-contiguous stretch of the surface's registered pages, in window
+/// order, each carrying the provider window the registration ledger derived for
+/// that stretch and the binding's own first byte inside it.
+///
+/// The `head` a run needs is *not* [`WindowStretch::skip`] alone: the window is
+/// the page-aligned range the ledger cut, so the byte the surface starts at is
+/// `GuestRef::head` bytes into it as well — the first run of a window that does
+/// not begin on a granule boundary is the one that shows it. Both coordinates
+/// are the ledger's own, which is why they are added here rather than being
+/// re-derived from an address.
+///
+/// Every shape this arm cannot state is a named exit rather than a partial
+/// list: the contract's run list *is* the view's byte range, so a list that is
+/// short, padded or unwindowed would be a declaration about bytes no record
+/// wrote.
+fn load_seed_run_windows(
+    source: &GuestRunSource,
+    extent: u64,
+) -> Result<Vec<StageBufferWindow>, LoadSeedRunExit> {
+    // Padded rows first, because the byte count check below would also catch
+    // most of them and would name the wrong fact: a padded window's span is
+    // larger than the extent, and what the contract lacks is the stride.
+    if source.row_length_texels != 0 {
+        return Err(LoadSeedRunExit::PaddedRows {
+            row_length_texels: source.row_length_texels,
+        });
+    }
+    if source.total_len != extent {
+        return Err(LoadSeedRunExit::Extent {
+            span: source.total_len,
+            extent,
+        });
+    }
+    let stretches = source
+        .window_stretches()
+        .ok_or(LoadSeedRunExit::Unregistered)?;
+    let mut windows: Vec<StageBufferWindow> = Vec::new();
+    let mut total = 0_u64;
+    for stretch in stretches {
+        let Some(window) = stretch.window else {
+            return Err(LoadSeedRunExit::Unwindowed);
+        };
+        let Some(head) = stretch.guest.head().checked_add(stretch.skip) else {
+            return Err(LoadSeedRunExit::Unwindowed);
+        };
+        windows.push(StageBufferWindow {
+            import: window.import.get(),
+            host_va: window.base,
+            length: window.length,
+            head,
+            bytes_len: stretch.len,
+        });
+        total = total.saturating_add(stretch.len);
+    }
+    if windows.is_empty() {
+        return Err(LoadSeedRunExit::Unregistered);
+    }
+    if total != extent {
+        return Err(LoadSeedRunExit::Total { total, extent });
+    }
+    // One registration per list: the contract pairs every run's reservation
+    // with the declaring view's own allocation, so a list that lives in two
+    // registrations is a shape no single declaration can state. The engine's
+    // run walk does split at an import seam, so this is a real shape rather than
+    // a hypothetical one.
+    let first = windows[0].import;
+    if let Some(second) = windows.iter().find(|window| window.import != first) {
+        return Err(LoadSeedRunExit::Registrations {
+            first,
+            second: second.import,
+        });
+    }
+    Ok(windows)
+}
+
+/// Why an attachment's own guest seed is not a run list this class can state
+/// (`R32`).
+///
+/// One variant per distinct fact, so the census reads which condition a shape
+/// is behind rather than one sentence for five of them — the rule
+/// [`SampledGatherExit`] follows for the sampled sibling of this arm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadSeedRunExit {
+    /// The surface's rows are padded (`bufferRowLength`): the byte span the
+    /// runs tile is not the attachment's tightly packed extent, and the
+    /// contract's list carries no stride.
+    PaddedRows { row_length_texels: u32 },
+    /// The seed's own span is not the attachment's tightly packed extent.
+    Extent { span: u64, extent: u64 },
+    /// The seed carries no run list at all: a synthetic source, or a host that
+    /// cannot import the pages behind it.
+    Unregistered,
+    /// One run's bytes have no registered window: the registration ledger does
+    /// not hold that import under the current epoch.
+    Unwindowed,
+    /// The list's runs do not add up to the attachment's extent.
+    Total { total: u64, extent: u64 },
+    /// The runs live in more than one registration.
+    Registrations { first: u64, second: u64 },
+}
+
+impl LoadSeedRunExit {
+    /// The census bucket this exit keeps its shape on.
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Registrations { .. } => "render_provider_out_of_class_load_seed_registrations",
+            Self::PaddedRows { .. } => "render_provider_out_of_class_load_seed_rows",
+            Self::Extent { .. } | Self::Total { .. } => {
+                "render_provider_out_of_class_load_seed_extent"
+            }
+            Self::Unregistered | Self::Unwindowed => "render_provider_out_of_class_load_seed_runs",
+        }
+    }
+
+    /// The fact, stated as the refusal's second half.
+    fn sentence(&self) -> String {
+        match self {
+            Self::PaddedRows { row_length_texels } => format!(
+                "the surface's rows are padded (`row_length_texels`={row_length_texels}), while a \
+                 run list names a tightly packed extent and carries no stride",
+            ),
+            Self::Extent { span, extent } => format!(
+                "the seed's own span is {span} byte(s) for a {extent} byte tightly packed extent",
+            ),
+            Self::Unregistered => String::from(
+                "the seed carries no run list: its pages have no registration under the current \
+                 epoch, so there is no owner window to read them through",
+            ),
+            Self::Unwindowed => String::from(
+                "one of the seed's runs has no registered window under the current epoch, so that \
+                 stretch of the surface's bytes cannot be named",
+            ),
+            Self::Total { total, extent } => format!(
+                "the seed's runs add up to {total} byte(s) rather than the attachment's {extent} \
+                 byte extent",
+            ),
+            Self::Registrations { first, second } => format!(
+                "the seed's runs live in two registrations (imports {first} and {second}), and \
+                 the contract pairs every run's reservation with the declaring view's own \
+                 allocation",
+            ),
+        }
+    }
+}
+
 /// The registered window one sampled texture's zero-copy gather was cut from
 /// (`R28`).
 ///
@@ -4302,7 +4462,7 @@ pub fn present_attachment(
 }
 
 /// How one admitted pass establishes the attachment's previous contents.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum NarrowLoad<'a> {
     /// Fill every texel with the guest's byte-exact clear, carried as **one
     /// texel of the attachment's own format** ([`ClearColor`]): four bytes for
@@ -4335,11 +4495,38 @@ enum NarrowLoad<'a> {
     ///   the record before it produced. That frame is the exec walk's own chain
     ///   value, and the walk — the caller — hands it over
     ///   ([`RenderRailInputs::chain_middle_source_bytes`]).
+    /// * R32: a record whose previous contents the *seed door* resolved to
+    ///   bytes the caller holds — the linear GVA target's cached frame, or the
+    ///   mapper-ref-texture surface's host fallback. Both are the engine's own
+    ///   seed (`DrawRequest::target_rgba8`, in the order
+    ///   `DrawRequest::target_seed_order` states), and the caller that built
+    ///   the request hands them over folded into the attachment's own order
+    ///   ([`RenderRailInputs::load_seed_source_bytes`]).
     ///
-    /// Every other byte-bearing shape is still refused by name: a guest seed is
-    /// a source the class cannot confirm is the live image, and an assertion
+    /// Every other byte-bearing shape is still refused by name: a record whose
+    /// previous contents are its own guest backing, and a GVA seed wider than
+    /// four bytes per texel, are two the class cannot state, and an assertion
     /// this rail cannot check is not a load arm it may state.
     Bytes(&'a [u8]),
+    /// Begin from the guest's own pages, declared as the contract's ordered run
+    /// list (`BufferSource::GuestRuns`, `research/docs/23` §113, E-TX6).
+    ///
+    /// This is the mapper-ref-texture surface's seed door: the request carries
+    /// the surface's bytes as a run list ([`GuestRunSource`]) rather than as a
+    /// host copy, which is what the engine's own `GuestTargetSeed` arm draws
+    /// from. The class states the list as the attachment's own view — the runs
+    /// concatenate to the attachment's tightly packed extent — and the owner
+    /// rail imports each run's registration so the provider can gather the
+    /// bytes out of the guest's live pages at resolution
+    /// ([`plan_owner_leases`], [`load_seed_owner_binding`]).
+    ///
+    /// A seed that is not one such list keeps the engine by name: padded rows
+    /// (`row_length_texels`), a run whose bytes the registration ledger does
+    /// not hold, a list whose total is not the attachment's extent, and a list
+    /// split across two registrations are four different facts and four
+    /// different sentences (the contract keys a list on the declaring view's
+    /// own allocation, so the fourth is a shape it cannot state at all).
+    GuestRuns(Vec<StageBufferWindow>),
 }
 
 /// Where one admitted pass's frame goes.
@@ -4767,6 +4954,33 @@ pub struct RenderRailInputs<'a> {
     /// record that is not the packet's middle — and those records keep the
     /// class's refusal by name.
     pub chain_middle_source_bytes: Option<&'a [u8]>,
+    /// The bytes the request's own **seed door** resolved, when the caller
+    /// hands them over (R32).
+    ///
+    /// A record whose attachment loads (`MTLLoadActionLoad` /
+    /// `DontCare`) and whose previous contents are not the live GPU image
+    /// arrives with `DrawRequest::target_rgba8` set: the linear GVA target's
+    /// cached frame (`seed_color_load`), or the mapper-ref-texture surface's
+    /// host fallback. Those bytes are the engine's own seed and they are in the
+    /// order `DrawRequest::target_seed_order` states, so the *caller* — the
+    /// seam, which reads both fields — folds them into the attachment's own
+    /// texel order and hands them over here, exactly as it does for R25's chain
+    /// value and for the same reason: the canonical attachment uploads the
+    /// bytes verbatim into the pass's own image, and an image is the
+    /// attachment's own view.
+    ///
+    /// What the caller has to vouch for is the same pair R23/R25's callers
+    /// vouch for: these *are* the record's previous contents, at the
+    /// attachment's own tightly packed extent, in the attachment's own order.
+    /// The class refuses a hand-over that is not that extent under
+    /// `render_provider_out_of_class_load_seed_shape` rather than uploading it
+    /// and letting the contract answer `render_attachment_initial_mismatch`,
+    /// because a decline is never a fallback.
+    ///
+    /// `None` is every caller that does not hand the bytes over — including the
+    /// one whose seed is wider than four-byte colour, which this arm cannot
+    /// fold — and those records keep the class's refusal by name.
+    pub load_seed_source_bytes: Option<&'a [u8]>,
     /// The frames the caller read out of the registry that holds them, for
     /// sampled GPU targets this rail has no production to restate (R24).
     ///
@@ -5570,6 +5784,30 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
         reason.note();
         return RenderRailOutcome::NotInNarrowClass(reason);
     }
+    // R32: the attachment's own guest-run seed is read through the owner's
+    // imported mappings, so a device that cannot import host pointers has no
+    // list arm at all — the same capability the window-backed binds ask, read
+    // here for the same reason (a class answer, not a decline: the engine
+    // gathers these runs on its own). The runs themselves carry no alignment
+    // rule — the provider gathers them with the host, so a run's own offset
+    // never becomes a view pointer a driver has to accept.
+    if pass.load_seed_runs().is_some() {
+        let alignment = match declared_host_import() {
+            Ok(alignment) => alignment,
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        };
+        if alignment == 0 {
+            let reason = OutOfClass::new(
+                "render_provider_out_of_class_load_seed_import",
+                "a record whose previous contents are the surface's own guest bytes stays on the \
+                 engine on a device that cannot import host pointers: the canonical attachment \
+                 states them as an ordered list of owner windows, and the owner rail refuses a \
+                 lease-backed declaration on such a device rather than silently copying it",
+            );
+            reason.note();
+            return RenderRailOutcome::NotInNarrowClass(reason);
+        }
+    }
     // The second device answer the class needs (R9d): a stage buffer the seam
     // cut out of a registered guest RAM window leaves through the owner rail's
     // no-copy arm, which a device without host-pointer import refuses by name.
@@ -6215,6 +6453,12 @@ struct NarrowPass<'a> {
     /// numbers rather than one: R23 carries the frame the *engine's* registry
     /// holds, R25 the frame the *walk* holds.
     carried_chain_middle: bool,
+    /// Whether this pass's previous contents are the seed door's own bytes,
+    /// handed over by the caller (R32). Counted as
+    /// `render_provider_load_seed_bytes` beside the three arms above, for the
+    /// same reason they are three numbers: the census reads populations, and
+    /// this door's caller is the request builder rather than a registry read.
+    carried_load_seed_bytes: bool,
     /// Whether this pass's previous contents are the frame of the surface the
     /// LOAD *elision* named, handed over by the caller that owns the registry
     /// (R26). Counted as `render_provider_surface_resident_source_bytes`
@@ -6323,6 +6567,20 @@ impl NarrowPass<'_> {
         match &self.index_stream.source {
             StreamSource::Window(window) => Some(*window),
             StreamSource::Staged(_) => None,
+        }
+    }
+
+    /// The attachment's own previous contents as the owner windows they live in
+    /// (`R32`, E-TX6), for a pass whose load is the guest-runs seed.
+    ///
+    /// The list is stated under one label ([`load_seed_owner_binding`]), so a
+    /// registration that backs both this seed and a stream is still one lease —
+    /// the ordering, the per-run coordinates and the one-registration rule are
+    /// all [`load_seed_run_windows`]'s.
+    fn load_seed_runs(&self) -> Option<&[StageBufferWindow]> {
+        match &self.load {
+            NarrowLoad::GuestRuns(runs) => Some(runs.as_slice()),
+            NarrowLoad::Clear(_) | NarrowLoad::Resident(_) | NarrowLoad::Bytes(_) => None,
         }
     }
 
@@ -6643,14 +6901,17 @@ fn narrow_class<'a>(
     // action, read in the order `DrawRequest` documents: `load_from_target`
     // wins, else the declared action decides.
     //
-    // Three arms, and each is one of the canonical attachment's own loads: the
+    // Four arms, and each is one of the canonical attachment's own loads: the
     // *provider's* image under the attachment's own identity
     // (`LoadOp::Resident`), the caller's own bytes declared for that same view
-    // (`LoadOp::Load`, R23), or the guest's byte-exact clear. A record whose
-    // previous contents are guest bytes is still a shape the class does not
-    // carry (one load op per attachment, and the rail cannot confirm a seed is
-    // the live image), so it keeps the engine by name.
+    // (`LoadOp::Load`, R23/R25/R32), the guest's own pages declared as an
+    // ordered window list (R32, E-TX6), or the guest's byte-exact clear. What
+    // is left — a record whose previous contents are the attachment's own guest
+    // backing — keeps the engine by name.
     let mut carried_chain_middle = false;
+    // R32: the two seed doors, counted where the bytes are chosen so the census
+    // reads one positive number per arm rather than only the bucket that moved.
+    let mut carried_load_seed_bytes = false;
     // R26: which of the two registry-byte doors this record came in through, so
     // the completion counts the population under its own name. Set where the
     // bytes are chosen below; false for every arm that carries none.
@@ -6755,27 +7016,91 @@ fn narrow_class<'a>(
         carried_chain_middle = true;
         NarrowLoad::Bytes(bytes)
     } else {
-        if req.target_rgba8.is_some()
-            || req.target_guest_seed.is_some()
-            || req.load_guest_target_backing
-        {
+        // R32: the two seed doors, in the order the two statements differ.
+        //
+        // A record whose previous contents are its own **guest backing** keeps
+        // the engine: the class renders into the provider's own image, the
+        // backing is the guest's pages, and the frame such a record owes them
+        // is a landing this rail does not carry (E-TX8's `StoreOp::Borrowed` is
+        // the E side of it; the reims landing is not wired). It is the same
+        // door the store gate below answers, which is why the sentence names
+        // the backing rather than a seed.
+        if req.load_guest_target_backing {
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_load_seed",
-                "a record whose previous contents are guest bytes stays on the engine: stating \
-                 them would be the canonical attachment's trace-owned `Load` arm, which this \
-                 class does not carry (its streams travel as bytes, its previous contents do \
-                 not)",
+                "a record whose previous contents are the attachment's own guest backing stays \
+                 on the engine: the class renders into the provider's own image, and the half \
+                 that would make that legitimate — landing the frame back in the guest's pages \
+                 — is a store arm this rail does not carry",
             ));
         }
-        if req.color0_declared != Some(crate::protocol::pass_action::LoadAction::Clear) {
-            return Err(OutOfClass::new(
+        // The mapper-ref-texture surface's seed: the request carries the
+        // bytes themselves, as the ordered list of windows inside the surface's
+        // registered pages (`research/docs/23` §113, E-TX6). The class states
+        // the list as the attachment's own view — its runs concatenate to the
+        // attachment's tightly packed extent — and the owner rail imports their
+        // registrations so the provider gathers the bytes out of the guest's
+        // live pages (this is what the engine's own `GuestTargetSeed` arm
+        // reads). Every shape the list cannot describe keeps the engine by name
+        // rather than being restated as a copy of bytes nothing vouched for.
+        if let Some(seed) = req.target_guest_seed.as_ref() {
+            let runs = match load_seed_run_windows(&seed.source, extent) {
+                Ok(runs) => runs,
+                Err(exit) => {
+                    return Err(OutOfClass::owned(
+                        exit.slug(),
+                        format!(
+                            "a record whose previous contents are the mapper-ref-texture \
+                             surface's own guest bytes stays on the engine: the canonical \
+                             attachment states them as an ordered list of owner windows whose \
+                             concatenation is the attachment's tightly packed extent \
+                             (`BufferSource::GuestRuns`), and {}",
+                            exit.sentence()
+                        ),
+                    ));
+                }
+            };
+            NarrowLoad::GuestRuns(runs)
+        } else if req.target_rgba8.is_some() {
+            // The other seed door: the bytes are the caller's own
+            // (`DrawRequest::target_rgba8`), already folded into the
+            // attachment's order by the seam that read `target_seed_order`
+            // beside them ([`RenderRailInputs::load_seed_source_bytes`]). The
+            // class states the same trace-owned load R23/R25 state, so the
+            // extension, the format and the upload path are the ones already
+            // measured for those arms.
+            let Some(bytes) = inputs.load_seed_source_bytes else {
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_load_seed",
+                    "a record whose previous contents are the seed door's own bytes stays on the \
+                     engine while the caller hands no bytes over: the class states them as the \
+                     canonical attachment's trace-owned `Load` arm, which needs the caller's \
+                     own copy at the attachment's tightly packed extent and in the attachment's \
+                     own texel order",
+                ));
+            };
+            if u64::try_from(bytes.len()).ok() != Some(extent) {
+                return Err(OutOfClass::new(
+                    "render_provider_out_of_class_load_seed_shape",
+                    "a record whose seed the caller hands over at a width or extent other than \
+                     the attachment's own stays on the engine: the canonical attachment uploads \
+                     exactly the view's declared bytes, so a shorter or longer buffer would \
+                     begin the pass from bytes no record wrote",
+                ));
+            }
+            carried_load_seed_bytes = true;
+            NarrowLoad::Bytes(bytes)
+        } else {
+            if req.color0_declared != Some(crate::protocol::pass_action::LoadAction::Clear) {
+                return Err(OutOfClass::new(
                 "render_provider_out_of_class_load_action",
                 "the canonical class loads by `Clear` or from the provider's own image; a Load \
                  or DontCare record whose previous contents this rail cannot name stays on the \
                  engine",
             ));
+            }
+            NarrowLoad::Clear(clear)
         }
-        NarrowLoad::Clear(clear)
     };
     // Where this record's frame goes. A record that skipped its readback is one
     // of two rails, and the flag's recorded reason is what tells them apart —
@@ -7333,6 +7658,7 @@ fn narrow_class<'a>(
         store,
         published_held_resident,
         carried_chain_middle,
+        carried_load_seed_bytes,
         carried_surface_resident,
         sampled_target_frames: sampling
             .textures
@@ -7565,13 +7891,33 @@ impl From<PresentAttachment> for AttachmentIdentity {
 /// R23's byte arm rides the pooled pair with the other held record: it carries
 /// its own contents in and lands its own frame out, so it names no image of its
 /// own and must not touch the resident registry the chain's identity belongs to.
-fn attachment_identity(pass: &NarrowPass<'_>) -> AttachmentIdentity {
+///
+/// R32's run-list arm is the one route whose pair is not this rail's to choose:
+/// the contract pairs every run's reservation with the *declaring view's* own
+/// allocation, so the view — and with it the pass's colour attachment — has to
+/// name the lease allocation the owner plan minted for the seed's registration
+/// (`provider_owner::Plan::run_allocation`). The view identity is still this
+/// rail's own constant, so a seed's attachment is the same view in every arm
+/// and only the allocation moves.
+fn attachment_identity(
+    pass: &NarrowPass<'_>,
+    leases: Option<&provider_owner::Plan>,
+) -> AttachmentIdentity {
     if let Some(present) = pass.present {
         return present.into();
     }
-    let resident = match (pass.load, pass.store) {
-        (NarrowLoad::Resident(resident), _) => resident,
+    let resident = match (&pass.load, pass.store) {
+        (NarrowLoad::Resident(resident), _) => *resident,
         (_, NarrowStore::Resident(resident)) => resident,
+        (NarrowLoad::GuestRuns(_), _) => {
+            let (allocation, _, _) = leases
+                .and_then(|plan| plan.run_allocation(load_seed_owner_binding()))
+                .expect("the owner plan covers an admitted guest-runs seed");
+            ResidentAttachment {
+                allocation,
+                view: ATTACHMENT_VIEW,
+            }
+        }
         (NarrowLoad::Clear(_) | NarrowLoad::Bytes(_), NarrowStore::Writeback) => {
             ResidentAttachment {
                 allocation: ATTACHMENT_ALLOCATION,
@@ -7599,30 +7945,8 @@ fn submit_narrow(
 
     let declaring = declaring_pipeline(&rail.provider, &rail.device)?;
     let render_pipeline = register_render_pipeline(&rail.provider, &rail.device, inputs, pass)?;
-    let attachment = attachment_identity(pass);
     let loads_resident = matches!(pass.load, NarrowLoad::Resident(_));
 
-    // The trace's own declaration of the attachment view. `OwnedBytes` of the
-    // packed extent is what the frozen contract asks a storing attachment to
-    // land through; neither the clear nor either resident arm reads them, and
-    // the byte-less declaration that would lift the copy is the named follow-up
-    // on the emulator side. R23's byte arm is the exception the rule was always
-    // shaped for: it *is* a `LoadOp::Load` attachment, so these bytes are the
-    // frame the pass begins from and have to be the caller's own.
-    let attachment_source = match pass.load {
-        NarrowLoad::Bytes(bytes) => bytes.to_vec(),
-        _ => vec![0u8; usize::try_from(pass.extent).unwrap_or(0)],
-    };
-    let declaration = BufferView {
-        view_id: attachment.view,
-        metal_binding: 0,
-        allocation_id: attachment.allocation,
-        offset: 0,
-        length: pass.extent,
-        access: BufferAccess::Read,
-        attribute_stride: None,
-        source: BufferSource::OwnedBytes(attachment_source),
-    };
     let mut resources = ResourceTableSnapshot::new();
     for allocation in input_allocations(pass) {
         let (allocation_id, size) = allocation;
@@ -7636,21 +7960,65 @@ fn submit_narrow(
                 detail: error.to_string(),
             })?;
     }
-    resources
-        .insert_allocation(AllocationRecord {
-            allocation_id: attachment.allocation,
-            owner_epoch: provider.device_epoch(),
-            size: pass.extent,
-        })
-        .map_err(|error| ProviderRenderDecline::TraceAdmission {
-            detail: error.to_string(),
-        })?;
     // The owner's leases first (R9d/R9q): every window-backed binding this
     // pass states — a stage buffer's, and a vertex stream's since R9q — is
     // imported here, and the trace's views below name the allocation and lease
     // the plan minted for each. Importing before the trace exists is the same
     // order the compute rail keeps: a refused import never reaches admission.
+    //
+    // R32 puts this call ahead of the attachment's own declaration: a
+    // guest-runs seed's view has to name the *lease's* allocation (the contract
+    // pairs every run's reservation with the declaring view's allocation), and
+    // only the plan knows which allocation its registration minted.
     let mut leases = plan_owner_leases(provider, pass, &mut resources, copies)?;
+    let attachment = attachment_identity(pass, leases.as_ref());
+    // The trace's own declaration of the attachment view. `OwnedBytes` of the
+    // packed extent is what the frozen contract asks a storing attachment to
+    // land through; neither the clear nor either resident arm reads them, and
+    // the byte-less declaration that would lift the copy is the named follow-up
+    // on the emulator side. R23's byte arm is the exception the rule was always
+    // shaped for: it *is* a `LoadOp::Load` attachment, so these bytes are the
+    // frame the pass begins from and have to be the caller's own — and R32's
+    // run list is the second: its bytes are the guest's own pages, read through
+    // the lease the plan just imported.
+    let attachment_source = match &pass.load {
+        NarrowLoad::Bytes(bytes) => BufferSource::OwnedBytes(bytes.to_vec()),
+        NarrowLoad::GuestRuns(_) => BufferSource::GuestRuns(
+            leases
+                .as_ref()
+                .and_then(|plan| plan.guest_runs(load_seed_owner_binding()))
+                .expect("the owner plan covers an admitted guest-runs seed")
+                .to_vec(),
+        ),
+        NarrowLoad::Clear(_) | NarrowLoad::Resident(_) => {
+            BufferSource::OwnedBytes(vec![0u8; usize::try_from(pass.extent).unwrap_or(0)])
+        }
+    };
+    let declaration = BufferView {
+        view_id: attachment.view,
+        metal_binding: 0,
+        allocation_id: attachment.allocation,
+        offset: 0,
+        length: pass.extent,
+        access: BufferAccess::Read,
+        attribute_stride: None,
+        source: attachment_source,
+    };
+    // The attachment's own allocation record. A guest-runs seed's attachment
+    // *is* the registration the plan just recorded — same allocation, and its
+    // size is the registration's, not the extent's — so only the pooled and
+    // resident arms mint their own here.
+    if pass.load_seed_runs().is_none() {
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: attachment.allocation,
+                owner_epoch: provider.device_epoch(),
+                size: pass.extent,
+            })
+            .map_err(|error| ProviderRenderDecline::TraceAdmission {
+                detail: error.to_string(),
+            })?;
+    }
     // R22: the productions this record's trace carries, restated in this
     // trace's own view namespace. Built before the views below because the
     // consuming declarations name the very views these passes store.
@@ -7952,7 +8320,10 @@ fn submit_narrow(
                 // R23: the previous contents are the caller's bytes, declared
                 // for this attachment's view in the trace above and uploaded by
                 // the rail before the pass opens (`LoadOp::Load`).
-                NarrowLoad::Bytes(_) => LoadOp::Load,
+                // R32 adds the guest-runs arm to the same load op: the bytes
+                // come from the owner's pages rather than from the caller, and
+                // only the provider's own resolution differs.
+                NarrowLoad::Bytes(_) | NarrowLoad::GuestRuns(_) => LoadOp::Load,
             },
             store: match pass.store {
                 NarrowStore::Writeback => StoreOp::Store,
@@ -8279,7 +8650,12 @@ fn submit_narrow(
     // own chain value handed on by the walk, and R26's is the frame of the
     // surface the LOAD elision named — three doors, three numbers, because the
     // callers' obligations differ even though the load does not.
-    if matches!(pass.load, NarrowLoad::Bytes(_)) {
+    if matches!(pass.load, NarrowLoad::Bytes(_)) && pass.carried_load_seed_bytes {
+        // R32: the one byte arm whose caller is not a registry read — the
+        // seed door's own bytes, folded into the attachment's order by the
+        // seam. Its own name, for the same reason the three above have theirs.
+        crate::runtime::drain::note_store_route("render_provider_load_seed_bytes");
+    } else if matches!(pass.load, NarrowLoad::Bytes(_)) {
         crate::runtime::drain::note_store_route(if pass.carried_chain_middle {
             "render_provider_chain_middle_source_bytes"
         } else if pass.carried_surface_resident {
@@ -8287,6 +8663,12 @@ fn submit_narrow(
         } else {
             "render_provider_resident_source_bytes"
         });
+    }
+    // R32's other arm: the attachment's previous contents are the surface's own
+    // guest pages, declared as the contract's ordered run list and gathered by
+    // the provider. Counted where the answer happens, like every arm above.
+    if matches!(pass.load, NarrowLoad::GuestRuns(_)) {
+        crate::runtime::drain::note_store_route("render_provider_load_seed_runs");
     }
     // R24's own population, counted where the answer happens for the same
     // reason as R23's above: the caller read a sampled GPU target's frame out
@@ -8685,6 +9067,24 @@ fn texture_owner_binding(index: u32) -> u32 {
     (0x0004 << 16) | index
 }
 
+/// The label one attachment's own guest-run seed travels under in the owner
+/// rail (`R32`).
+///
+/// The sixth namespace of the same five ([`stage_buffer_owner_binding`]'s two
+/// stages, then the vertex stream's, the index stream's and the sampled
+/// texture's): an attachment's previous contents are no stage's argument at
+/// all, so the namespace is the whole label. A lookup answered by another
+/// namespace's lease would be a wrong frame rather than a refusal, which is the
+/// rule every one of these labels is keyed for.
+///
+/// The label grants nothing on its own: [`provider_owner::plan`] mints one
+/// lease per registration for whichever label asks, so a pass that states this
+/// seed beside a vertex stream of the same registration shares that stream's
+/// lease, exactly as two streams of one registration do.
+fn load_seed_owner_binding() -> u32 {
+    0x0005 << 16
+}
+
 /// One window-backed binding's coordinates in the owner rail's own shape, under
 /// the label the plan looks its view up by.
 ///
@@ -8765,6 +9165,14 @@ fn window_arm_request<'a>(
 /// minted before the trace is validated against it — the same order the compute
 /// rail uses, for the same reason: an allocation the trace names must be in the
 /// snapshot admission checks.
+///
+/// R32 puts the attachment's own guest-run seed in the same plan, under
+/// [`load_seed_owner_binding`]. The seed is not a view of its own: its runs are
+/// stated *inside* the registration's lease, so the request is the list arm
+/// ([`provider_owner::Request::Runs`]) and what comes back is the ordered
+/// per-run coordinates the contract's `BufferSource::GuestRuns` declaration
+/// carries. A registration that backs both this seed and a stream is still one
+/// lease and one import.
 fn plan_owner_leases(
     provider: &metal_api_vulkan::VulkanComputeProvider,
     pass: &NarrowPass<'_>,
@@ -8775,6 +9183,7 @@ fn plan_owner_leases(
         && pass.vertex_windows().next().is_none()
         && pass.index_window().is_none()
         && pass.texture_windows().next().is_none()
+        && pass.load_seed_runs().is_none()
     {
         return Ok(None);
     }
@@ -8813,6 +9222,26 @@ fn plan_owner_leases(
         pass.texture_windows()
             .map(|(binding, window)| window_arm_request(binding, window, copies)),
     );
+    // R32: the attachment's own guest-run seed, as the list arm of the same
+    // plan. Its windows are read through the borrowed lease only: the provider
+    // gathers the runs with the host at resolution (`research/docs/23` §113), so
+    // a run needs no device import of its own and the class does not copy one —
+    // the device answer this arm does ask is the registration's own import,
+    // which the gate asks before the plan is reached.
+    let load_seed_windows: Vec<provider_owner::Window> = pass
+        .load_seed_runs()
+        .map(|runs| {
+            runs.iter()
+                .map(|window| owner_window(load_seed_owner_binding(), *window))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !load_seed_windows.is_empty() {
+        requests.push(provider_owner::Request::Runs(provider_owner::Runs {
+            binding: load_seed_owner_binding(),
+            windows: &load_seed_windows,
+        }));
+    }
     let plan = provider_owner::plan(provider, &requests).map_err(ProviderRenderDecline::Owner)?;
     for (allocation, size, reservation) in plan.leases() {
         if let Err(error) = resources.insert_allocation(AllocationRecord {
