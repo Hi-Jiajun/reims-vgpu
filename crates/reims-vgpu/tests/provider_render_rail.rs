@@ -8342,7 +8342,7 @@ fn the_formats_beyond_the_widened_window_stay_on_the_engine_by_name() {
 /// control that says so — with an identity mapping the same bind is *in* class —
 /// and the other two differ from it in the plan alone.
 #[test]
-fn the_folded_channel_plan_charges_the_counter_of_the_half_it_came_from() {
+fn the_folded_channel_plan_names_the_half_the_class_folds() {
     let _guard = engine_test_session();
     let stages = sampled_stages();
     let (width, height) = (8u32, 4u32);
@@ -8355,7 +8355,6 @@ fn the_folded_channel_plan_charges_the_counter_of_the_half_it_came_from() {
         reims_vgpu::protocol::pixel_format::swizzle_plan(&selectors)
             .expect("the fixture's selectors are the decoder's own alphabet")
     };
-    let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
     let bind = |plan: reims_vgpu::protocol::pixel_format::SwizzlePlan| -> DrawRequest {
         let mut req = sampled_narrow_request(
             &stages,
@@ -8371,13 +8370,13 @@ fn the_folded_channel_plan_charges_the_counter_of_the_half_it_came_from() {
             RenderRailOutcome::NotInNarrowClass(reason) => {
                 (reason.slug().to_owned(), reason.detail().to_owned())
             }
-            other => panic!("{label}: the bind's mapping is not the identity: {other:?}"),
+            other => panic!("{label}: this mapping is not the one the class refuses: {other:?}"),
         }
     };
 
     // The control: one byte per texel under the lane the frame lists, with the
-    // identity mapping, is the shape this class states. So the two refusals
-    // below fail on the mapping and on nothing else.
+    // identity mapping, is the shape this class has always stated. So the two
+    // answers below turn on the mapping and on nothing else.
     match provider_render::submit_render(
         &inputs(&stages, RenderChainRole::SoleOrTail),
         &bind(plan([2, 3, 4, 5])),
@@ -8389,46 +8388,63 @@ fn the_folded_channel_plan_charges_the_counter_of_the_half_it_came_from() {
         ),
     }
 
-    let bucket = count("render_provider_out_of_class_texture_bind");
-    let view = count("render_provider_texture_bind_swizzled_view");
-    let format = count("render_provider_texture_bind_swizzled_format");
+    let bucket = route_count("render_provider_out_of_class_texture_bind");
+    let view = route_count("render_provider_texture_bind_swizzled_view");
+    let format = route_count("render_provider_texture_bind_swizzled_format");
+    let folded = route_count("render_provider_texture_bind_swizzled_format_folded");
+    let delivered = provider_render::provider_submissions();
 
     // (A) The view's own swizzle: what a guest texture view states — here the
     //     lane read into all four channels, the shape a mask or coverage view
-    //     takes. The format contributes nothing to this plan.
+    //     takes. The format contributes nothing to this plan, and R41 does not
+    //     fold it: it stays on the engine under the sentence this door has
+    //     always written.
     let (view_slug, view_detail) = answer("a view's own swizzle", &bind(plan([2, 2, 2, 2])));
+    // A second view plan of another shape, so "the sentence is unchanged" is
+    // said against this increment's own code rather than against a golden text:
+    // the plan never reaches the sentence, and two view plans have to answer one
+    // sentence byte for byte.
+    let (sibling_slug, sibling_detail) = answer("another view swizzle", &bind(plan([4, 4, 4, 4])));
     // (B) The format's own plan: `A8Unorm` presents `(0,0,0,a)` while it rides
     //     in `R8_UNORM`, so its plan alone is exactly the plan bound here — the
-    //     one plan this gate can attribute to the format rather than the view.
-    let (format_slug, format_detail) = answer(
-        "a format's own plan",
-        &bind(reims_vgpu::backend::vulkan::translate::pixel::ALPHA_IN_RED),
-    );
+    //     one plan this gate can attribute to the format rather than the view,
+    //     and the one R41 folds into the bytes it uploads.
+    let format_plan = reims_vgpu::backend::vulkan::translate::pixel::ALPHA_IN_RED;
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &bind(format_plan),
+    ) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!(
+            "R41 folds the format's own plan into the bytes, so this bind is in class: {other:?}"
+        ),
+    }
 
     // The reading, printed before it is asserted: a reader comparing this
-    // increment's log to the one the same fixture gave before the counter
-    // existed has the sentence in front of them either way.
+    // increment's log to the probe's own (`r_swizzle_probe`, census v31) has the
+    // sentence in front of them either way.
     eprintln!(
         "folded channel plan: `r8_unorm` {width}x{height} with an identity mapping is in class; a \
          view swizzle (r,r,r,r) -> {view_slug} and charges \
-         `render_provider_texture_bind_swizzled_view`; `A8Unorm`'s own plan -> {format_slug} and \
-         charges `render_provider_texture_bind_swizzled_format`; both sentences are byte for byte \
-         the one this door wrote before the counter existed:\n  {view_detail}"
+         `render_provider_texture_bind_swizzled_view`; `A8Unorm`'s own plan is folded into the \
+         bytes and reaches the provider; the view's sentence is byte for byte the one this door \
+         wrote before R41:\n  {view_detail}"
     );
 
-    // The class's answer is unchanged by any of it: one slug, and one sentence
-    // for both plans, because the sentence has never named the plan. A plan that
-    // had leaked into the sentence would make these two differ.
+    // The class's answer to a view swizzle is unchanged by any of it: one slug,
+    // and one sentence for every view plan, because the sentence has never named
+    // the plan. A plan that had leaked into the sentence would make these two
+    // differ.
     assert_eq!(view_slug, "render_provider_out_of_class_texture_bind");
     assert_eq!(
-        view_slug, format_slug,
-        "the plan does not move the bucket: {view_slug} vs {format_slug}"
+        view_slug, sibling_slug,
+        "the plan does not move the bucket: {view_slug} vs {sibling_slug}"
     );
     assert_eq!(
-        view_detail, format_detail,
+        view_detail, sibling_detail,
         "the plan does not move the sentence: a bind's answer is its format and its shape axes"
     );
-    for detail in [&view_detail, &format_detail] {
+    for detail in [&view_detail, &sibling_detail] {
         assert!(
             detail.contains("an identity channel mapping"),
             "the criterion the sentence states is the one this door always stated: {detail}"
@@ -8439,22 +8455,563 @@ fn the_folded_channel_plan_charges_the_counter_of_the_half_it_came_from() {
         );
     }
 
-    // The reading itself: the two plans split the door's records, and neither
-    // charges the other's counter. The identity control above charged neither.
+    // The reading itself: the view's half still charges its own counter, the
+    // format's half is no longer refused at all, and the fold's own positive
+    // counter is the one that moved.
     assert_eq!(
-        count("render_provider_texture_bind_swizzled_view"),
-        view + 1,
+        route_count("render_provider_texture_bind_swizzled_view"),
+        view + 2,
         "the view's own swizzle is counted as the view's"
     );
     assert_eq!(
-        count("render_provider_texture_bind_swizzled_format"),
-        format + 1,
-        "the format's own plan is counted as the format's"
+        route_count("render_provider_texture_bind_swizzled_format"),
+        format,
+        "the format's own plan no longer reaches this door: it is folded, not refused"
     );
     assert_eq!(
-        count("render_provider_out_of_class_texture_bind"),
+        route_count("render_provider_texture_bind_swizzled_format_folded"),
+        folded + 1,
+        "the fold is the reading the census takes of the arm that took it"
+    );
+    assert_eq!(
+        provider_render::provider_submissions() - delivered,
+        1,
+        "and the folded bind is the one that reached the provider"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_bind"),
         bucket + 2,
-        "and both are still this door's records: the two counts split the bucket"
+        "both view plans are still this door's records, and the folded bind is not"
+    );
+}
+
+/// R41: the one channel plan a *texel format* contributes, folded into the
+/// bytes this rail uploads — and the two rails landing one frame for it.
+///
+/// Census v31 (`evidence/gate3-census-v31-2026-09-18/`) closed the question the
+/// probe left open: 1332 of the `texture_bind` bucket's 1333 records were the
+/// binds whose *only* failing condition was a channel mapping, and the counter
+/// that split the door's records said the plan was the format's own — `A8Unorm`,
+/// whose byte rides in the `R8_UNORM` lane R39 already admitted, and whose plan
+/// (`ALPHA_IN_RED`) is the only one this device's table attributes to a format.
+///
+/// The readings below are the whole claim, on the arm a Lavapipe fixture can
+/// sign (the request's own copy; the gathered arms are the census's and the
+/// sibling test's):
+///
+/// - **the bind reaches the provider** rather than the engine, and the door's
+///   own bucket does not move for it;
+/// - **the widened frame is the plan's answer**: `(0,0,0,a)` for a byte the
+///   fixture knows, where the same bytes under the identity plan read
+///   `(r,0,0,1)`;
+/// - **the engine and the provider land the same bytes**, which is what makes
+///   this a statement about the two rails rather than about one frame;
+/// - **moving the read texel's byte moves the frame**, in alpha;
+/// - **the extent rule did not move**: the same bind handed four bytes per texel
+///   is refused by name, so "the class widened the bytes it uploads" does not
+///   mean "the window the view states widened".
+#[test]
+fn the_formats_own_channel_plan_is_folded_into_the_bytes_it_uploads() {
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = (width * height) as usize;
+    let read = SAMPLED_TEXEL.1 * width as usize + SAMPLED_TEXEL.0;
+    // One byte per texel, chosen so the read texel's alpha (its only channel) is
+    // neither of the plan's two constants: a frame that read the byte as red, or
+    // that read a constant instead of the bytes, could not land it.
+    let byte = |index: usize| ((index as u32 * 7 + 0x1f) & 0xff) as u8;
+    let bytes: Vec<u8> = (0..texels).map(byte).collect();
+    let value = bytes[read];
+    assert!(
+        value != 0 && value != 0xff,
+        "the fixture's read byte has to be neither zero nor one: {value:#04x}"
+    );
+    let plan = reims_vgpu::backend::vulkan::translate::pixel::ALPHA_IN_RED;
+    let request = |bytes: Vec<u8>, plan: reims_vgpu::protocol::pixel_format::SwizzlePlan| {
+        let mut req =
+            sampled_narrow_request(&stages, bytes, (width, height), ash::vk::Format::R8_UNORM);
+        req.sampled_images[0].swizzle = plan;
+        req
+    };
+    let identity = reims_vgpu::protocol::pixel_format::swizzle_identity();
+
+    let bucket_before = route_count("render_provider_out_of_class_texture_bind");
+    let folded_before = route_count("render_provider_texture_bind_swizzled_format_folded");
+    let submissions_before = provider_render::provider_submissions();
+    let framed = provider_pixels(
+        "A8Unorm's own plan (provider)",
+        &stages,
+        &request(bytes.clone(), plan),
+    );
+    assert_eq!(
+        provider_render::provider_submissions() - submissions_before,
+        1,
+        "the bind whose only obstacle was the format's plan reaches the provider"
+    );
+    assert_eq!(
+        route_count("render_provider_texture_bind_swizzled_format_folded") - folded_before,
+        1,
+        "the bind's answer is the fold"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_bind") - bucket_before,
+        0,
+        "and it is not this door's record any more"
+    );
+    assert_uniform_frame(
+        "A8Unorm's own plan (provider)",
+        &framed,
+        width,
+        height,
+        [0, 0, 0, value],
+    );
+
+    // The control: the same bytes under the identity plan are in class either
+    // way, and they read the lane's own channels — so the frame above is the
+    // *plan's* answer and not a different way of reading the same byte.
+    let lane = provider_pixels(
+        "r8_unorm, identity plan",
+        &stages,
+        &request(bytes.clone(), identity),
+    );
+    assert_uniform_frame(
+        "r8_unorm, identity plan",
+        &lane,
+        width,
+        height,
+        [value, 0, 0, 0xff],
+    );
+    assert_frames_differ("the format's own plan moved the frame", &framed, &lane);
+
+    // Both rails, one plan: the engine applies the same plan as a component
+    // mapping on the image view, so this is the reading that says the fold is
+    // the *same* remap rather than a plausible one.
+    let Some(engine) = engine_pixels("A8Unorm's own plan", &stages, request(bytes.clone(), plan))
+    else {
+        return;
+    };
+    assert_uniform_frame(
+        "A8Unorm's own plan (engine)",
+        &engine,
+        width,
+        height,
+        [0, 0, 0, value],
+    );
+    assert_frames_equal("the two rails fold the same plan", &framed, &engine);
+
+    // The read texel's own byte, moved: another value there is another frame,
+    // and it lands in alpha — the channel the plan puts the lane's byte in.
+    let moved_value = value ^ 0x5a;
+    assert!(
+        moved_value != value,
+        "the fixture's moved byte differs from the read byte: {moved_value:#04x}"
+    );
+    let mut moved = bytes.clone();
+    moved[read] = moved_value;
+    let moved_frame = provider_pixels(
+        "A8Unorm's own plan (byte moved)",
+        &stages,
+        &request(moved, plan),
+    );
+    assert_uniform_frame(
+        "A8Unorm's own plan (byte moved)",
+        &moved_frame,
+        width,
+        height,
+        [0, 0, 0, moved_value],
+    );
+    assert_frames_differ("the read byte moved the frame", &framed, &moved_frame);
+
+    // The extent rule, which the fold does not touch: the bind's byte source is
+    // still the lane's own tightly packed extent, so the four-byte copy every
+    // other texture in this file carries is refused by the same door, by name.
+    let bucket_before = route_count("render_provider_out_of_class_texture_bind");
+    let folded_before = route_count("render_provider_texture_bind_swizzled_format_folded");
+    let (slug, detail) = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &request(vec![0x40; texels * 4], plan),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            (reason.slug().to_owned(), reason.detail().to_owned())
+        }
+        other => panic!("a four-byte copy for a one-byte lane is refused by name: {other:?}"),
+    };
+    assert_eq!(slug, "render_provider_out_of_class_texture_bind");
+    assert!(
+        detail.contains("has to be the whole tightly packed extent"),
+        "and the sentence is the extent rule's: {detail}"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_bind") - bucket_before,
+        1,
+        "the fat copy is this door's record"
+    );
+    assert_eq!(
+        route_count("render_provider_texture_bind_swizzled_format_folded") - folded_before,
+        0,
+        "and a copy the class never made is not charged to the fold"
+    );
+
+    eprintln!(
+        "R41 folded plan (request's own copy): `r8_unorm` {width}x{height}, read byte {value:#04x} \
+         -> provider frame == engine frame == [0, 0, 0, {value:#04x}] under the format's own \
+         plan, [value, 0, 0, 0xff] under the identity plan; four bytes per texel is still refused \
+         by name ({slug})"
+    );
+}
+
+/// R41 on the arm the census's own binds take: a gathered guest window.
+///
+/// Census v31's 1332 folded binds are not request-carried copies — the plan
+/// `A8Unorm` contributes reaches a bind only through the source resolver's
+/// guest-runs arm (`runtime/draw/vulkan.rs` assigns the format's own plan
+/// there and nowhere else), so the shape this increment is *for* is the one
+/// where the texels live in the guest's pages and the window arm would have
+/// bound them in place.
+///
+/// Folding therefore has to change the arm as well as the bytes: the class
+/// reads the window out of the registration, widens it, and declares the
+/// trace's own copy — so the readings below are the inverse of the lease test's
+/// (`a_sampled_texture_in_a_registered_window_leaves_without_a_copy`): the fold
+/// is charged, **neither lease arm is**, and the two rails still land one frame
+/// over the guest's own bytes.
+///
+/// The moved-byte half is the one the census cannot see: the window's own bytes
+/// reach the frame's alpha, so a class that folded a constant, or that read the
+/// registration at another offset, moves nothing here.
+#[test]
+fn a_gathered_window_folds_the_format_plan_into_the_bytes_it_uploads() {
+    use reims_vgpu::backend::provider_compute::device_epoch;
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = (width * height) as usize;
+    let read = SAMPLED_TEXEL.1 * width as usize + SAMPLED_TEXEL.0;
+    // One byte per texel, chosen so the read texel's byte is neither of the
+    // plan's two constants and no other texel shares it.
+    let byte = |index: usize| ((index as u32 * 11 + 5) & 0xff) as u8;
+    let guest_bytes: Vec<u8> = (0..texels).map(byte).collect();
+    let value = guest_bytes[read];
+    assert!(
+        value != 0 && value != 0xff && guest_bytes.iter().filter(|b| **b == value).count() == 1,
+        "the fixture's read byte has to be neither zero nor one, and unique: {value:#04x}"
+    );
+    let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
+        .expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the window to be read"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let span = texels;
+    let mut owner = AlignedHost::new(2 * page, page);
+    assert!(
+        span <= 2 * page,
+        "the fixture's texels fit the mapping: {span} against {}",
+        2 * page
+    );
+    owner.as_mut_slice()[..span].copy_from_slice(&guest_bytes);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, page as u64)
+        .expect("the mapping is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let import_id = import.id().get();
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: 2 * page as u64,
+        epoch: 1,
+    };
+    let base = owner.pointer as usize;
+    let plan = reims_vgpu::backend::vulkan::translate::pixel::ALPHA_IN_RED;
+    // The request as the zero-copy rail builds it — one registered run, the
+    // ledger's window, a compact row (`bufferRowLength` zero) — with the bind's
+    // view carrying the format's own plan, which is the shape the census counts.
+    let request = || {
+        let mut req = sampled_narrow_request(
+            &stages,
+            Vec::new(),
+            (width, height),
+            ash::vk::Format::R8_UNORM,
+        );
+        req.sampled_images[0].swizzle = plan;
+        req.sampled_images[0].source = padded_window_source(
+            base,
+            2 * page as u64,
+            guest.clone(),
+            registered,
+            0,
+            span as u64,
+            0,
+        );
+        req
+    };
+    // The engine arm first: its device context is created lazily on the first
+    // draw, and that creation resets the owner rail.
+    let engine = engine_pixels("R41 gathered window", &stages, request())
+        .expect("the engine gathers this shape");
+    assert_uniform_frame(
+        "R41 gathered window (engine)",
+        &engine,
+        width,
+        height,
+        [0, 0, 0, value],
+    );
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: base,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x47_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let borrowed_before = route_count("render_provider_sampled_window_borrowed");
+    let staged_before = route_count("render_provider_sampled_window_staged");
+    let folded_before = route_count("render_provider_texture_bind_swizzled_format_folded");
+    let bucket_before = route_count("render_provider_out_of_class_texture_bind");
+    let submissions_before = provider_render::provider_submissions();
+    let provider = provider_pixels("R41 gathered window", &stages, &request());
+    assert_uniform_frame(
+        "R41 gathered window (provider)",
+        &provider,
+        width,
+        height,
+        [0, 0, 0, value],
+    );
+    assert_frames_equal(
+        "the two rails fold the same plan over the guest's own bytes",
+        &provider,
+        &engine,
+    );
+    assert_eq!(
+        provider_render::provider_submissions() - submissions_before,
+        1,
+        "the gathered shape reaches the provider instead of the engine"
+    );
+    assert_eq!(
+        route_count("render_provider_texture_bind_swizzled_format_folded") - folded_before,
+        1,
+        "the arm the class took is the fold"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_bind") - bucket_before,
+        0,
+        "and the bind is not this door's record"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_window_borrowed") - borrowed_before,
+        0,
+        "a folded bind binds no window: its bytes are the class's own copy"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_window_staged") - staged_before,
+        0,
+        "and it mints no lease either, so neither lease arm is charged"
+    );
+
+    // Moving the window's own byte moves the frame, in alpha: the widened copy
+    // is made out of *these* bytes, at the offset the gather stated.
+    let moved_value = value ^ 0x36;
+    assert_ne!(moved_value, value);
+    let mut moved = guest_bytes.clone();
+    moved[read] = moved_value;
+    owner.as_mut_slice()[..span].copy_from_slice(&moved);
+    let after = provider_pixels("R41 gathered window (byte moved)", &stages, &request());
+    assert_uniform_frame(
+        "R41 gathered window (byte moved)",
+        &after,
+        width,
+        height,
+        [0, 0, 0, moved_value],
+    );
+    assert_frames_differ("the guest's own byte reaches the frame", &provider, &after);
+    eprintln!(
+        "R41 folded plan (gathered window): {width}x{height} one-byte texels in a {span}-byte \
+         registered window, read byte {value:#04x} -> provider frame == engine frame == \
+         [0, 0, 0, {value:#04x}]; routes: folded=1, borrowed=0, staged=0, \
+         out_of_class_texture_bind=0"
+    );
+}
+
+/// R41's third arm: a gathered window whose guest rows are padded.
+///
+/// The padded shape is R36's, one byte per texel wide, and R41 takes it the
+/// same way: the class reads the guest's padded span out of the registration,
+/// repacks the rows into the texture's own extent (the same `depad` R36 uses),
+/// and then folds the format's plan into that tightly packed copy. The two
+/// readings that separate the arms are the routes: R36's repack counters stay
+/// where they were — the fold is one copy, not two — and the fold's own counter
+/// moves.
+#[test]
+fn a_padded_gather_folds_the_format_plan_into_its_repacked_rows() {
+    use reims_vgpu::backend::provider_compute::device_epoch;
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    /// The guest's own row, in texels: the texture's eight, then eight more of
+    /// padding.
+    const ROW_TEXELS: u32 = 16;
+    /// The byte the guest's padding carries, so a copy that read the window
+    /// loosely would land it in alpha.
+    const PADDING: u8 = 0xa5;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let read = SAMPLED_TEXEL.1 * width as usize + SAMPLED_TEXEL.0;
+    let byte = |index: usize| ((index as u32 * 13 + 9) & 0xff) as u8;
+    let tight_bytes: Vec<u8> = (0..(width * height) as usize).map(byte).collect();
+    let value = tight_bytes[read];
+    assert!(
+        value != 0 && value != 0xff && value != PADDING,
+        "the fixture's read byte has to be neither zero nor one: {value:#04x}"
+    );
+    let tight_row = width as usize;
+    let stride = ROW_TEXELS as usize;
+    let tight = tight_row * height as usize;
+    let span = stride * (height as usize - 1) + tight_row;
+    let padded = |bytes: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(stride * height as usize);
+        for row in 0..height as usize {
+            out.extend_from_slice(&bytes[row * tight_row..(row + 1) * tight_row]);
+            out.extend(std::iter::repeat_n(
+                PADDING,
+                ROW_TEXELS as usize - tight_row,
+            ));
+        }
+        out
+    };
+    let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
+        .expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the window to be read"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(4 * page, page);
+    assert!(
+        span <= 4 * page,
+        "the fixture's padded span fits the mapping: {span} against {}",
+        4 * page
+    );
+    owner.as_mut_slice()[..padded(&tight_bytes).len()].copy_from_slice(&padded(&tight_bytes));
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 4 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, 4 * page as u64)
+        .expect("the mapping is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let import_id = import.id().get();
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: 4 * page as u64,
+        epoch: 1,
+    };
+    let base = owner.pointer as usize;
+    let plan = reims_vgpu::backend::vulkan::translate::pixel::ALPHA_IN_RED;
+    let request = || {
+        let mut req = sampled_narrow_request(
+            &stages,
+            Vec::new(),
+            (width, height),
+            ash::vk::Format::R8_UNORM,
+        );
+        req.sampled_images[0].swizzle = plan;
+        req.sampled_images[0].source = padded_window_source(
+            base,
+            4 * page as u64,
+            guest.clone(),
+            registered,
+            0,
+            span as u64,
+            ROW_TEXELS,
+        );
+        req
+    };
+    let engine = engine_pixels("R41 padded rows", &stages, request())
+        .expect("the engine gathers this shape");
+    assert_uniform_frame(
+        "R41 padded rows (engine)",
+        &engine,
+        width,
+        height,
+        [0, 0, 0, value],
+    );
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: base,
+        length: 4 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x48_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let depadded_before = route_count("render_provider_sampled_rows_depadded");
+    let folded_before = route_count("render_provider_texture_bind_swizzled_format_folded");
+    let provider = provider_pixels("R41 padded rows", &stages, &request());
+    assert_uniform_frame(
+        "R41 padded rows (provider)",
+        &provider,
+        width,
+        height,
+        [0, 0, 0, value],
+    );
+    assert_frames_equal(
+        "the two rails fold the same plan over the repacked rows",
+        &provider,
+        &engine,
+    );
+    assert_eq!(
+        route_count("render_provider_texture_bind_swizzled_format_folded") - folded_before,
+        1,
+        "the arm the class took is the fold"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_rows_depadded") - depadded_before,
+        0,
+        "the fold's copy is its own arm rather than R36's repack"
+    );
+
+    // The padding is not read, and the texture's own texels are.
+    let mut moved_padding = padded(&tight_bytes);
+    moved_padding[0] = PADDING ^ 0xff;
+    owner.as_mut_slice()[..moved_padding.len()].copy_from_slice(&moved_padding);
+    let after_padding = provider_pixels("R41 padded rows (padding moved)", &stages, &request());
+    assert_frames_equal(
+        "the guest's padding never reaches the frame",
+        &after_padding,
+        &provider,
+    );
+    let mut moved = tight_bytes.clone();
+    moved[read] = value ^ 0x29;
+    let moved_bytes = padded(&moved);
+    owner.as_mut_slice()[..moved_bytes.len()].copy_from_slice(&moved_bytes);
+    let after = provider_pixels("R41 padded rows (texel moved)", &stages, &request());
+    assert_uniform_frame(
+        "R41 padded rows (texel moved)",
+        &after,
+        width,
+        height,
+        [0, 0, 0, moved[read]],
+    );
+    assert_frames_differ("the guest's own texel reaches the frame", &provider, &after);
+    eprintln!(
+        "R41 folded plan (padded rows): {width}x{height} one-byte texels at a guest stride of \
+         {ROW_TEXELS} texels ({stride} byte(s) per row over {height} row(s) = {span} byte(s)), \
+         repacked into {tight} byte(s) and widened; provider frame == engine frame == \
+         [0, 0, 0, {value:#04x}]; routes: folded=1, rows_depadded=0"
     );
 }
 

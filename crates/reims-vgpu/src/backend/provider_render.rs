@@ -123,7 +123,7 @@
 //!   one shape the two window arms cannot state — a lease names a tightly
 //!   packed extent, and the reservation holds the guest's rows with their
 //!   padding — so the class repacks the texture's own extent out of the
-//!   registration ([`PaddedRows::depad`], [`RowCopies`]) and states it as the
+//!   registration ([`PaddedRows::depad`], [`TextureCopies`]) and states it as the
 //!   trace's own bytes (`TextureSource::OwnedBytes`), the arm the request's own
 //!   copy and R24's frame already take; a padded stride narrower than the
 //!   texture's own row and a padded span the stated row count cannot tile are
@@ -1074,6 +1074,40 @@ fn texture_window_arm(
     }
 }
 
+/// One reader for the two window arms that read a sampled texture's bytes in
+/// the class gate (`R36`, `R41`), beside the window arms that *bind* them
+/// ([`texture_window_arm`]): a shape whose texels the class has to make — the
+/// padded rows R36 repacks, and the folded plan R41 widens — reads them out of
+/// the registration the window names, and a registration that cannot hand them
+/// back keeps the draw on the engine by name rather than in a shorter copy.
+///
+/// Distinct from [`texture_window_arm`] because it answers a different
+/// question: that function decides between the owner's two *lease* arms (bind
+/// the window, or bind the owner's staged copy of it), while this one is asked
+/// only where no lease is minted at all — the bytes are read, not bound.
+///
+/// The caller owns the shape checks: a padded gather's span against its stride
+/// and row count, a tight window's read against the extent the gather stated.
+fn read_gathered_window(index: u32, window: StageBufferWindow) -> Result<Vec<u8>, OutOfClass> {
+    provider_owner::window_bytes(owner_window(texture_owner_binding(index), window)).map_err(
+        |decline| {
+            OutOfClass::owned(
+                "render_provider_out_of_class_texture_source",
+                format!(
+                    "a draw whose `[[texture({})]]` texels are gathered from a guest window stays \
+                     on the engine when the window's bytes cannot be copied out of the \
+                     registration that names it: the class states the texture's tightly packed \
+                     extent as the trace's own bytes — the texels a padded gather's rows or a \
+                     folded channel plan are made from — and those bytes are the registration's \
+                     own (`{}`)",
+                    index,
+                    decline.slug(),
+                ),
+            )
+        },
+    )
+}
+
 /// The bytes one pass copies out of its window-backed binds (`R18`, `R28`),
 /// under the owner binding label the plan looks each view up by.
 ///
@@ -1105,34 +1139,37 @@ impl WindowCopies {
     }
 }
 
-/// The bytes one pass repacked out of a padded-row gather (`R36`), under the
-/// Metal `[[texture(n)]]` index the declaration is keyed by.
+/// The class's own copy of one sampled texture's tightly packed extent, under
+/// the Metal `[[texture(n)]]` index the declaration is keyed by — the bytes
+/// R36 repacks out of a padded-row gather, and the bytes R41 widens a texel
+/// format's own channel plan into.
 ///
 /// The sibling of [`WindowCopies`], with the same division of labour and for
 /// the same reason: the copy is made in the class gate, where the bytes behind
 /// a registered window are readable and where the device answers live, and
 /// [`submit_narrow`] states them. It is a second carrier rather than a second
 /// use of the first because the bytes are not a window's own range — they are
-/// the texture's tightly packed extent, assembled one row at a time — and
-/// because nothing about them is imported by the owner plan: a padded gather's
-/// declaration is the trace's own bytes (`TextureSource::OwnedBytes`), so no
-/// lease is minted and the owner binding label a [`WindowCopies`] entry travels
-/// under has no reader.
+/// the texture's tightly packed extent, assembled one row at a time (R36) or one
+/// texel at a time (R41) — and because nothing about them is imported by the
+/// owner plan: both arms' declarations are the trace's own bytes
+/// (`TextureSource::OwnedBytes`), so no lease is minted and the owner binding
+/// label a [`WindowCopies`] entry travels under has no reader.
 ///
 /// The key is the texture's own Metal index — the fact the contract pairs a
 /// declaration and a view by — rather than the entry's position, exactly as
 /// [`NarrowTexture::index`] is.
 #[derive(Default)]
-struct RowCopies {
+struct TextureCopies {
     entries: Vec<(u32, Vec<u8>)>,
 }
 
-impl RowCopies {
+impl TextureCopies {
     fn insert(&mut self, index: u32, bytes: Vec<u8>) {
         self.entries.push((index, bytes));
     }
 
-    /// The repacked bytes for one sampled texture, when this pass padded one.
+    /// The copy this pass made for one sampled texture — its repacked rows
+    /// (R36) or its folded, widened texels (R41) — when it made one.
     fn bytes(&self, index: u32) -> Option<&[u8]> {
         self.entries
             .iter()
@@ -1958,11 +1995,11 @@ fn sampled_bind_window(lanes: NarrowLanes) -> &'static str {
 /// # What this is not
 ///
 /// Not a verdict: `bindable`, the slug and every word of the sentence are the
-/// ones this gate shipped, and the plan is still refused by name rather than
-/// folded into bytes — the fold (widening the bind to `rgba8_unorm` and
-/// applying the plan to the texels) is the increment after this one, and it is
-/// the reading below that says which half of the plan that fold has to answer
-/// for.
+/// ones this gate shipped. What the reading decided, and what R41 then did with
+/// it, is in [`folded_channel_plan`]: the half this function attributes to the
+/// *format* is the half that increment folds into the bytes, so this function's
+/// first branch is now the watchdog for a bind the fold could not take rather
+/// than the door the census's 1332 records leave through.
 fn swizzled_bind_route(
     image: &crate::backend::vulkan::engine::SampledImageResource,
 ) -> &'static str {
@@ -1977,6 +2014,96 @@ fn swizzled_bind_route(
     } else {
         "render_provider_texture_bind_swizzled_view"
     }
+}
+
+/// The channel plan a bind's own *texel format* contributes, when this class
+/// folds it into the bytes it uploads (R41).
+///
+/// This is the answer to the reading R40's probe left: census v31 counted 1332
+/// of the `texture_bind` bucket's 1333 records under
+/// `render_provider_texture_bind_swizzled_format` and none under
+/// `..._swizzled_view` (`evidence/gate3-census-v31-2026-09-18/`), so the binds
+/// that bucket holds are the one shape whose plan no guest view had to ask for:
+/// `A8Unorm`. Its byte rides in the same `R8_UNORM` its neighbour `R8Unorm`
+/// uses, and the plan `(0,0,0,a)` — [`ALPHA_IN_RED`] — is the *only* thing that
+/// tells the two apart ([`pixel_format::SwizzlePlan::after`]'s standing case).
+/// The gate can name it from the bind alone, so it can answer it without the
+/// engine.
+///
+/// # Why this shape and not the other half of the plan
+///
+/// A guest **texture view**'s swizzle is not folded, and stays where it was: it
+/// is the guest asking the *bind* to read channels in another order, the
+/// measured census says no boot reached it (v31: zero records), and every plan
+/// that is not this one keeps the draw on the engine by name. The line between
+/// the two halves is the probe's own convention, one rule named in two places
+/// ([`swizzled_bind_route`] charges the refusal, this function admits the
+/// fold), with the shape they cannot separate — a guest view that spells
+/// `ALPHA_IN_RED` over an `R8_UNORM` bind — landing on the format's side, as it
+/// did in the census.
+///
+/// # Why only these two source arms
+///
+/// The fold rewrites the texels this class *uploads*: the request's own copy
+/// ([`NarrowTextureSource::Bytes`]) and the guest's own gathered texels
+/// ([`NarrowTextureSource::Window`]/[`NarrowTextureSource::Depadded`]). A
+/// resident bind ([`SampledSource::Target`]) is the one arm left out, and its
+/// bytes are the reason rather than its plan: a resident declaration restates
+/// the *stored* surface (the gate requires a produced view's format to be the
+/// stored one, and R24's caller reads the frame out of that same image), while
+/// the stored formats are the colour attachments' — `r8_unorm` is none of them.
+/// So a resident bind carrying this plan would have to be a guest view that
+/// spelled it, which is the half this increment does not fold either way.
+///
+/// [`ALPHA_IN_RED`]: crate::backend::vulkan::translate::pixel::ALPHA_IN_RED
+/// [`SampledSource::Target`]: crate::backend::vulkan::engine::SampledSource::Target
+fn folded_channel_plan(
+    image: &crate::backend::vulkan::engine::SampledImageResource,
+) -> Option<crate::protocol::pixel_format::SwizzlePlan> {
+    let plan = crate::backend::vulkan::translate::pixel::ALPHA_IN_RED;
+    if image.format != ash::vk::Format::R8_UNORM || image.swizzle != plan {
+        return None;
+    }
+    match &image.source {
+        crate::backend::vulkan::engine::SampledSource::Bytes(_)
+        | crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => Some(plan),
+        crate::backend::vulkan::engine::SampledSource::Target(_) => None,
+    }
+}
+
+/// One sampled texture's tightly packed extent with a *format's* channel plan
+/// folded into it (R41).
+///
+/// The bind's bytes are the lane's own: one byte per texel of `r8_unorm`, which
+/// the provider's view of that lane presents as `(r,0,0,1)` — red the byte,
+/// green and blue zero, alpha one. The plan is applied to that presentation
+/// ([`pixel_format::apply_swizzle_rgba8`], the same function the request's own
+/// copies go through), and the result is the four bytes the declaration states
+/// under `rgba8_unorm` with an identity view. So the fragment stage reads
+/// exactly the channels the engine's component mapping would have read out of
+/// the same bytes, and the two rails land one frame.
+///
+/// The width is the *declaration's*, which is the one place this widening is
+/// spelled: `4` bytes per texel here, because the only plan this class folds is
+/// the one-byte lane's.
+fn fold_channel_plan(plan: &crate::protocol::pixel_format::SwizzlePlan, texels: &[u8]) -> Vec<u8> {
+    // The one-byte lane's own presentation, in the unorm8 the plan is written
+    // in: red is the texel, green and blue are the channels the lane does not
+    // carry, and alpha is one — `0xff` is that one's unorm8 spelling.
+    const LANE_PRESENTATION: [u8; 3] = [0x00, 0x00, 0xff];
+    let mut widened = Vec::with_capacity(texels.len().saturating_mul(4));
+    for byte in texels {
+        widened.extend_from_slice(&crate::protocol::pixel_format::apply_swizzle_rgba8(
+            plan,
+            [
+                *byte,
+                LANE_PRESENTATION[0],
+                LANE_PRESENTATION[1],
+                LANE_PRESENTATION[2],
+            ],
+        ));
+    }
+    widened
 }
 
 /// The sampled textures one request's fragment stage declares, weighed against
@@ -2020,11 +2147,17 @@ fn swizzled_bind_route(
 ///    state (dimensionality, layers, descriptor count, a texel outside the
 ///    lanes the device's own frame lists — the two 8-bit byte orders
 ///    `rgba8_unorm`/`bgra8_unorm`, and since R39 the one- and two-byte UNORM
-///    lanes beside them — a view swizzle) is
+///    lanes beside them — a *view* swizzle) is
 ///    `..._texture_bind`, and a bind whose texels are a guest
 ///    gather or a resident image rather than the request's own copy is
 ///    `..._texture_source` — this increment carries text-owned bytes the way
 ///    the vertex streams' staged arm does.
+///
+///    The one plan a **texel format** contributes stood on that list too until
+///    R41 folded it into the bytes the class uploads ([`folded_channel_plan`]):
+///    a bind whose only obstacle is that plan leaves for the provider now, and
+///    the door above keeps the rest — every plan a guest view spelled, and the
+///    few format-plan binds whose bytes this class cannot re-express.
 /// 3. **What the sampler state is.** The draw's bound sampler at the
 ///    declaration's slot has to repeat the state the module's AIR carries
 ///    (`..._texture_state`), field by field in the two fields the policy has:
@@ -2382,7 +2515,7 @@ fn sampled_textures<'a>(
         // lanes the census counts — is refused by the provider under
         // `render_texture_format_unsupported`, so this class answers it here
         // rather than handing the provider a draw the engine would have run.
-        let format = match image.format {
+        let lane = match image.format {
             ash::vk::Format::R8G8B8A8_UNORM => Some(TextureFormat::Rgba8Unorm),
             ash::vk::Format::B8G8R8A8_UNORM => Some(TextureFormat::Bgra8Unorm),
             // The two lanes E appended to `RENDER_SAMPLED`, each admitted only
@@ -2391,6 +2524,11 @@ fn sampled_textures<'a>(
             // carry a lane leaves this arm's `None` exactly where it was.
             narrow => render_texture_narrow_lanes.admits(narrow),
         };
+        // The plan the bind's *texel format* contributes, when the class folds
+        // it into the bytes below (R41, [`folded_channel_plan`]): the one shape
+        // census v31's `texture_bind` bucket was made of, and the one plan this
+        // gate can attribute to a format rather than to the guest's view.
+        let fold = folded_channel_plan(image);
         let bindable = image.array_element == 0
             && image.descriptor_count == 1
             && image.layers == 1
@@ -2398,8 +2536,9 @@ fn sampled_textures<'a>(
             && !image.multisampled
             && image.width != 0
             && image.height != 0
-            && crate::protocol::pixel_format::swizzle_is_identity(&image.swizzle);
-        let Some(format) = format.filter(|_| bindable) else {
+            && (crate::protocol::pixel_format::swizzle_is_identity(&image.swizzle)
+                || fold.is_some());
+        let Some(lane) = lane.filter(|_| bindable) else {
             // One read-only probe beside the refusal (2026-09-19, census v29's
             // `texture_bind` bucket): which half of the folded channel mapping
             // kept this bind on the engine — the view's own swizzle or the
@@ -2407,6 +2546,13 @@ fn sampled_textures<'a>(
             // built, so the two counts split exactly this door's records, and
             // only for a plan that is not the unit: an identity mapping is not
             // this door's answer and is charged to whatever condition did fire.
+            //
+            // R41 moved every record that has *only* the format's plan to fail
+            // on onto the fold below, so this first count now reads as a
+            // watchdog: it is charged for the binds the fold could not take
+            // (a plan of another shape, or one of the two shapes the fold's own
+            // doc names), and a boot that charges it is a shape this increment
+            // left where it found it.
             if !crate::protocol::pixel_format::swizzle_is_identity(&image.swizzle) {
                 crate::runtime::drain::note_store_route(swizzled_bind_route(image));
             }
@@ -2433,6 +2579,14 @@ fn sampled_textures<'a>(
                 ),
             ));
         };
+        // The name the declaration states: the lane the bind's own view names,
+        // or — when a format's plan was folded into the bytes — the four-byte
+        // lane those bytes are widened into, with the identity view the class
+        // declares ([`fold_channel_plan`]).
+        let format = match fold {
+            Some(_) => TextureFormat::Rgba8Unorm,
+            None => lane,
+        };
         // Where the texels come from (E-TX3/R22): the request's own copy, or —
         // the arm this increment opens — the trace's own production of a guest
         // target, which the trace carries ahead of this pass and samples
@@ -2443,10 +2597,14 @@ fn sampled_textures<'a>(
                 // from a constant here — four bytes per texel for the two
                 // original orders, one or two for the narrow lanes R39
                 // admitted — so a widening of the provider's window has one
-                // place to answer for its own texel width.
+                // place to answer for its own texel width. It is the *lane's*
+                // width rather than the declaration's (R41): a folded bind's
+                // bytes are the one-byte texels the plan is folded into, and
+                // the four-byte copy the declaration states is assembled after
+                // this check, not carried by the request.
                 let expected = u64::from(image.width)
                     .checked_mul(u64::from(image.height))
-                    .and_then(|texels| texels.checked_mul(format.bytes_per_texel()));
+                    .and_then(|texels| texels.checked_mul(lane.bytes_per_texel()));
                 if expected != u64::try_from(bytes.len()).ok() {
                     return Err(OutOfClass::owned(
                         "render_provider_out_of_class_texture_bind",
@@ -2461,11 +2619,17 @@ fn sampled_textures<'a>(
                             image.format,
                             u64::from(image.width)
                                 * u64::from(image.height)
-                                * format.bytes_per_texel(),
+                                * lane.bytes_per_texel(),
                         ),
                     ));
                 }
-                NarrowTextureSource::Bytes(bytes)
+                match fold {
+                    Some(plan) => NarrowTextureSource::Folded {
+                        plan,
+                        texels: FoldedTexels::Bytes(bytes),
+                    },
+                    None => NarrowTextureSource::Bytes(bytes),
+                }
             }
             crate::backend::vulkan::engine::SampledSource::Target(identity) => {
                 // A record that samples the attachment it writes would need the
@@ -2629,7 +2793,10 @@ fn sampled_textures<'a>(
                     TextureExtent {
                         width: image.width,
                         height: image.height,
-                        bytes_per_texel: format.bytes_per_texel(),
+                        // The lane's width, as everywhere the bytes on hand are
+                        // measured: a folded bind gathers the one-byte texels the
+                        // plan is folded into (R41).
+                        bytes_per_texel: lane.bytes_per_texel(),
                     },
                 );
                 let gather = match gather {
@@ -2658,13 +2825,37 @@ fn sampled_textures<'a>(
                     // this rail can cut names the reservation's own bytes —
                     // which for a padded gather are the rows *with* their
                     // padding.
-                    Some(rows) => NarrowTextureSource::Depadded {
-                        window: gather.window,
-                        rows,
+                    //
+                    // R41's fold takes the same two shapes and adds one step:
+                    // the class gate reads the guest's rows out of the
+                    // registration, folds the format's own channel plan into
+                    // them and declares the four-byte lane — so no lease is
+                    // minted for either arm and the window is read for its
+                    // bytes rather than bound ([`FoldedTexels`]).
+                    Some(rows) => match fold {
+                        Some(plan) => NarrowTextureSource::Folded {
+                            plan,
+                            texels: FoldedTexels::Rows {
+                                window: gather.window,
+                                rows,
+                            },
+                        },
+                        None => NarrowTextureSource::Depadded {
+                            window: gather.window,
+                            rows,
+                        },
                     },
-                    None => NarrowTextureSource::Window {
-                        binding: texture_owner_binding(declaration.index),
-                        window: gather.window,
+                    None => match fold {
+                        Some(plan) => NarrowTextureSource::Folded {
+                            plan,
+                            texels: FoldedTexels::Window {
+                                window: gather.window,
+                            },
+                        },
+                        None => NarrowTextureSource::Window {
+                            binding: texture_owner_binding(declaration.index),
+                            window: gather.window,
+                        },
                     },
                 }
             }
@@ -3772,7 +3963,7 @@ struct SampledGather {
 ///   reservation carries no stride. R36 answers that shape with the trace's own
 ///   bytes instead of a lease: the class gate copies the guest's padded rows
 ///   into the texture's tightly packed extent ([`PaddedRows::depad`],
-///   [`RowCopies`]) and the declaration states `TextureSource::OwnedBytes`, the
+///   [`TextureCopies`]) and the declaration states `TextureSource::OwnedBytes`, the
 ///   arm the request's own copy and R24's frame already take. The
 ///   stride-carrying *zero-copy* window — E's `BorrowedNoCopy` rule read for a
 ///   padded source — is a contract-level increment and not one this rail can
@@ -5985,6 +6176,10 @@ fn production_recordable(req: &DrawRequest, pass: &NarrowPass<'_>) -> bool {
     // that is the arm the padded gather left through — so re-running the pass
     // in a later trace states exactly the bytes this one sampled, with no
     // window left to re-read.
+    //
+    // R41's folded texels join them on exactly that fact: the descriptor carries
+    // the widened copy as `TextureSource::OwnedBytes` too, so a re-run states the
+    // same bytes and never re-reads the window the fold was made from.
     if pass.textures.iter().any(|texture| {
         !matches!(
             texture.source,
@@ -5992,6 +6187,7 @@ fn production_recordable(req: &DrawRequest, pass: &NarrowPass<'_>) -> bool {
                 | NarrowTextureSource::Frame(_)
                 | NarrowTextureSource::Window { .. }
                 | NarrowTextureSource::Depadded { .. }
+                | NarrowTextureSource::Folded { .. }
         )
     }) {
         return false;
@@ -8094,68 +8290,68 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
             }
         }
     }
-    // R36: the sampled gathers whose guest rows are padded. The one arm the
-    // class states for those bytes is a copy — the contract's window arms name
-    // a *tightly packed* extent at the reservation's own start, and what the
-    // reservation holds here is the guest's rows with their padding — so the
-    // class makes it here, where the bytes behind a registered window are
-    // readable, and states the texture's own extent through the same trace-owned
-    // arm every other copy this rail read out of a registry takes
-    // (`TextureSource::OwnedBytes`).
+    // R36 and R41: the two shapes whose texels this class has to *make* rather
+    // than state where they lie, in the one place where the bytes behind a
+    // registered window are readable — the padded-row gather R36 repacks into
+    // the texture's own extent, and R41's folded channel plan, which widens the
+    // lane's one byte per texel into the four the declaration states. Both
+    // leave through the same trace-owned arm every other copy this rail read out
+    // of a registry takes (`TextureSource::OwnedBytes`), and both are made here,
+    // before the submission that names them.
     //
-    // The read goes through the owner rail's registration rather than the
+    // The reads go through the owner rail's registration rather than the
     // gather's own host runs, for the reason the R18/R28 staging copies do:
     // `provider_owner::window_bytes` is the one reader that answers whether
     // these bytes are still this process's to read (the import's registration
-    // under the current epoch), and the copy is made before the submission that
-    // names it. No device *capability* is asked, because no lease is minted for
-    // this arm: a device that cannot import host pointers executes it exactly
-    // as this one does.
-    let mut rows = RowCopies::default();
+    // under the current epoch). No device *capability* is asked, because no
+    // lease is minted for either arm: a device that cannot import host pointers
+    // executes them exactly as this one does.
+    let mut texture_copies = TextureCopies::default();
     for texture in &pass.textures {
-        let NarrowTextureSource::Depadded {
-            window,
-            rows: layout,
-        } = &texture.source
-        else {
-            continue;
-        };
-        // The padded span, read out of the registration the window names. A
-        // window this rail cannot read keeps the draw on the engine *by name* —
-        // a decline is not a fallback, and a shape the class cannot state is
-        // not one the engine's own answer may be inferred from.
-        let padded = match provider_owner::window_bytes(owner_window(
-            texture_owner_binding(texture.index),
-            *window,
-        )) {
-            Ok(bytes) => bytes,
-            Err(decline) => {
-                let reason = OutOfClass::owned(
-                    "render_provider_out_of_class_texture_source",
-                    format!(
-                        "a draw whose `[[texture({})]]` texels are gathered from a guest \
+        let written = match &texture.source {
+            // R36's own arm, unchanged: the padded rows are read out of the
+            // registration and repacked into the texture's tightly packed
+            // extent, and the declaration states that copy.
+            NarrowTextureSource::Depadded {
+                window,
+                rows: layout,
+            } => {
+                // The padded span, read out of the registration the window names. A
+                // window this rail cannot read keeps the draw on the engine *by name* —
+                // a decline is not a fallback, and a shape the class cannot state is
+                // not one the engine's own answer may be inferred from.
+                let padded = match provider_owner::window_bytes(owner_window(
+                    texture_owner_binding(texture.index),
+                    *window,
+                )) {
+                    Ok(bytes) => bytes,
+                    Err(decline) => {
+                        let reason = OutOfClass::owned(
+                            "render_provider_out_of_class_texture_source",
+                            format!(
+                                "a draw whose `[[texture({})]]` texels are gathered from a guest \
                              window with padded rows stays on the engine when the window's bytes \
                              cannot be copied out of the registration that names it: the class \
                              states the texture's tightly packed extent as the trace's own bytes, \
                              and the rows this rail repacks it from are the registration's own \
                              (`{}`)",
-                        texture.index,
-                        decline.slug(),
-                    ),
-                );
-                reason.note();
-                return RenderRailOutcome::NotInNarrowClass(reason);
-            }
-        };
-        // The repack's own shape check: the registration read has to be the
-        // span the guest's stride and row count tile, or the window this
-        // declaration names is not the one the gather measured. A refusal here
-        // is the same answer as the pure gate's — the shape is not this class's
-        // — and it is never a shorter copy.
-        let Some(tight) = layout.depad(&padded) else {
-            let reason = OutOfClass::owned(
-                "render_provider_out_of_class_texture_source",
-                format!(
+                                texture.index,
+                                decline.slug(),
+                            ),
+                        );
+                        reason.note();
+                        return RenderRailOutcome::NotInNarrowClass(reason);
+                    }
+                };
+                // The repack's own shape check: the registration read has to be the
+                // span the guest's stride and row count tile, or the window this
+                // declaration names is not the one the gather measured. A refusal here
+                // is the same answer as the pure gate's — the shape is not this class's
+                // — and it is never a shorter copy.
+                let Some(tight) = layout.depad(&padded) else {
+                    let reason = OutOfClass::owned(
+                        "render_provider_out_of_class_texture_source",
+                        format!(
                     "a draw whose `[[texture({})]]` texels are gathered from a guest window with \
                      padded rows stays on the engine when the window does not hold the span the \
                      guest's own stride and row count tile: the gather states {} byte(s) of \
@@ -8168,27 +8364,119 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
                     layout.span(),
                     padded.len(),
                 ),
-            );
-            reason.note();
-            return RenderRailOutcome::NotInNarrowClass(reason);
+                    );
+                    reason.note();
+                    return RenderRailOutcome::NotInNarrowClass(reason);
+                };
+                // The reading a boot's census takes: one route per repacked texture,
+                // the bytes the copy kept beside the bytes it dropped, so the two halves
+                // of the arm are countable from the log rather than inferred from a
+                // frame that looks right.
+                crate::runtime::drain::note_store_route("render_provider_sampled_rows_depadded");
+                crate::runtime::drain::note_store_route_n(
+                    "render_provider_sampled_rows_bytes",
+                    u64::try_from(tight.len()).unwrap_or(u64::MAX),
+                );
+                crate::runtime::drain::note_store_route_n(
+                    "render_provider_sampled_rows_padding",
+                    layout.padding(),
+                );
+                tight
+            }
+            // R41: the binds whose texel *format* carries the channel plan the
+            // guest's own frame never asked for — the shape census v31's
+            // `texture_bind` bucket was made of. The lane's one byte per texel is
+            // read the same way the two arms above read it (the request already
+            // holds it, or the registration hands it back), the plan is folded
+            // into the four bytes the declaration states
+            // ([`fold_channel_plan`]), and the copy joins the same carrier: the
+            // declaration states it as the trace's own bytes, so no lease is
+            // minted and no window is bound.
+            NarrowTextureSource::Folded { plan, texels } => {
+                let widened = match texels {
+                    // The request's own copy: the bytes are already in hand, so
+                    // the fold is the whole step.
+                    FoldedTexels::Bytes(bytes) => fold_channel_plan(plan, bytes),
+                    FoldedTexels::Rows {
+                        window,
+                        rows: layout,
+                    } => {
+                        let padded = match read_gathered_window(texture.index, *window) {
+                            Ok(bytes) => bytes,
+                            Err(reason) => return RenderRailOutcome::NotInNarrowClass(reason),
+                        };
+                        let Some(tight) = layout.depad(&padded) else {
+                            let reason = OutOfClass::owned(
+                                "render_provider_out_of_class_texture_source",
+                                format!(
+                                    "a draw whose `[[texture({})]]` texels are gathered from a \
+                                     guest window with padded rows stays on the engine when the \
+                                     window does not hold the span the guest's own stride and row \
+                                     count tile: the gather states {} byte(s) of stride over {} \
+                                     row(s) ending in a {} byte tight row ({} byte(s)), while the \
+                                     registration handed back {} byte(s), and the format's own \
+                                     channel plan is folded into exactly those rows",
+                                    texture.index,
+                                    layout.stride,
+                                    layout.rows,
+                                    layout.tight_row,
+                                    layout.span(),
+                                    padded.len(),
+                                ),
+                            );
+                            reason.note();
+                            return RenderRailOutcome::NotInNarrowClass(reason);
+                        };
+                        fold_channel_plan(plan, &tight)
+                    }
+                    FoldedTexels::Window { window } => {
+                        let bytes = match read_gathered_window(texture.index, *window) {
+                            Ok(bytes) => bytes,
+                            Err(reason) => return RenderRailOutcome::NotInNarrowClass(reason),
+                        };
+                        // The tight arm's own shape check, the padded arm's
+                        // sibling: the registration read has to be the extent
+                        // the gather measured, or the window this declaration
+                        // names is not the one the guest's own view stated. A
+                        // refusal is the same answer as the pure gate's, and it
+                        // is never a shorter copy.
+                        if u64::try_from(bytes.len()).ok() != Some(window.bytes_len) {
+                            let reason = OutOfClass::owned(
+                                "render_provider_out_of_class_texture_source",
+                                format!(
+                                    "a draw whose `[[texture({})]]` texels are gathered from a \
+                                     guest window stays on the engine when the window does not \
+                                     hold the texture's own tightly packed extent: the gather \
+                                     states {} byte(s) and the registration handed back {} \
+                                     byte(s), while the format's own channel plan is folded into \
+                                     exactly those bytes",
+                                    texture.index,
+                                    window.bytes_len,
+                                    bytes.len(),
+                                ),
+                            );
+                            reason.note();
+                            return RenderRailOutcome::NotInNarrowClass(reason);
+                        }
+                        fold_channel_plan(plan, &bytes)
+                    }
+                };
+                // The reading a boot's census takes: one route per folded bind,
+                // charged where the widening happens rather than where the bind
+                // was admitted, so the count stands for the binds that reached
+                // the provider with the plan folded rather than for the binds
+                // the gate let through.
+                crate::runtime::drain::note_store_route(
+                    "render_provider_texture_bind_swizzled_format_folded",
+                );
+                widened
+            }
+            _ => continue,
         };
-        // The reading a boot's census takes: one route per repacked texture,
-        // the bytes the copy kept beside the bytes it dropped, so the two halves
-        // of the arm are countable from the log rather than inferred from a
-        // frame that looks right.
-        crate::runtime::drain::note_store_route("render_provider_sampled_rows_depadded");
-        crate::runtime::drain::note_store_route_n(
-            "render_provider_sampled_rows_bytes",
-            u64::try_from(tight.len()).unwrap_or(u64::MAX),
-        );
-        crate::runtime::drain::note_store_route_n(
-            "render_provider_sampled_rows_padding",
-            layout.padding(),
-        );
-        rows.insert(texture.index, tight);
+        texture_copies.insert(texture.index, written);
     }
     drop(_gate);
-    match submit_narrow(inputs, req, &pass, &copies, &rows) {
+    match submit_narrow(inputs, req, &pass, &copies, &texture_copies) {
         Ok(RenderCompletion::Writeback(output)) => RenderRailOutcome::ProviderCompleted(output),
         Ok(RenderCompletion::Resident(frame)) => {
             RenderRailOutcome::ProviderCompletedResident(frame)
@@ -8671,8 +8959,10 @@ fn texture_extent_arm(source: &NarrowTextureSource<'_>) -> TextureExtentRoute {
         }
         // Everything else carries bytes a rail can read: the request's own
         // copy, the caller's frame out of the engine's registry (R24), the
-        // trace's own production (R22), and every window the class gate copies
-        // because the texture's extent does not start at its first byte.
+        // trace's own production (R22), every window the class gate copies
+        // because the texture's extent does not start at its first byte, and
+        // R41's folded texels — which are the class gate's own widened copy
+        // whatever arm the guest's bytes arrived in.
         _ => TextureExtentRoute::HostBytes,
     }
 }
@@ -8931,7 +9221,7 @@ enum NarrowTextureSource<'a> {
     /// what the reservation holds here is the guest's rows with their padding.
     /// The class gate therefore repacks the rows into the texture's own extent
     /// — one row at a time, out of the registration the window names
-    /// ([`RowCopies`]) — and the declaration states those bytes the way it
+    /// ([`TextureCopies`]) — and the declaration states those bytes the way it
     /// states every other copy this rail read out of a registry (the request's
     /// own copy, R24's frame): as the trace's own bytes
     /// (`TextureSource::OwnedBytes`). No lease is minted for this arm, so a
@@ -8945,7 +9235,68 @@ enum NarrowTextureSource<'a> {
     Depadded {
         /// The window the rows live in, with the texture's own coordinates
         /// inside it. Its `bytes_len` is the guest's padded span, the number of
-        /// bytes [`RowCopies`] read out of the registration.
+        /// bytes [`TextureCopies`] read out of the registration.
+        window: StageBufferWindow,
+        /// The guest stride, the tight row and the row count.
+        rows: PaddedRows,
+    },
+    /// The one-byte texels a *texel format's own* channel plan moves, before
+    /// anything is declared (R41).
+    ///
+    /// This is the arm census v31's `texture_bind` bucket turned into: 1332 of
+    /// its 1333 records carried every shape axis inside the window and the
+    /// `r8_unorm` lane the device's own frame lists, and the one condition they
+    /// failed was the channel mapping — `A8Unorm`'s `ALPHA_IN_RED`, the plan
+    /// that one format contributes on its own
+    /// ([`folded_channel_plan`]).
+    ///
+    /// The lane's bytes are gathered the way every other arm gathers them — the
+    /// request's own copy, the guest's padded rows, the guest's window — and
+    /// then the plan is folded into them ([`fold_channel_plan`]): one byte per
+    /// texel becomes the four the declaration states under `rgba8_unorm` with
+    /// the identity view the class declares. The bytes are the class gate's own
+    /// copy, so the declaration states them through `TextureSource::OwnedBytes`
+    /// exactly as the request's copy and R36's repacked rows do — and no lease
+    /// is minted, whatever shape the guest's own bytes arrived in.
+    Folded {
+        /// The plan the bind's texel format contributes — the one this class
+        /// folds ([`folded_channel_plan`]), carried as a value so the widening
+        /// below reads it here rather than naming a constant a second time.
+        plan: crate::protocol::pixel_format::SwizzlePlan,
+        /// Where the one-byte texels come from, at the lane's own width.
+        texels: FoldedTexels<'a>,
+    },
+}
+
+/// Where the one-byte texels of a folded bind come from (R41).
+///
+/// The three shapes cover exactly the source arms [`folded_channel_plan`] lets
+/// through: the request's own copy, and the two spellings of a zero-copy
+/// gather. (R24's frame is absent for the reason that function's own doc names:
+/// it is only ever reached through a resident bind, whose lane cannot be this
+/// one.) The carrier is the difference, not the shape — a window or a padded
+/// window's rows are read out of the registration in the class gate, and the
+/// request's own copy is already in hand — and the one thing the three share is
+/// that the texels are read before the plan is folded, so a shape this class
+/// states cannot reach the declaration unfolded.
+#[derive(Clone)]
+enum FoldedTexels<'a> {
+    /// The request's own tightly packed copy, one byte per texel.
+    Bytes(&'a [u8]),
+    /// The registered guest RAM window the bind's gather was cut from, with the
+    /// texture's own tightly packed extent inside it (R28's tight shape). No
+    /// lease is minted for it — the read below is what the window is for — so
+    /// the label the registration is read by is the texture's own
+    /// ([`texture_owner_binding`]) rather than one carried here.
+    Window {
+        /// The window, with the texture's own coordinates inside it.
+        window: StageBufferWindow,
+    },
+    /// The registered guest RAM window whose guest rows are padded, with the
+    /// stride the class repacks them by (R36's shape).
+    Rows {
+        /// The window the rows live in, with the texture's own coordinates
+        /// inside it.
         window: StageBufferWindow,
         /// The guest stride, the tight row and the row count.
         rows: PaddedRows,
@@ -8954,18 +9305,23 @@ enum NarrowTextureSource<'a> {
 
 impl NarrowTextureSource<'_> {
     /// The bytes this source carries when it is one of the trace-owned arms
-    /// (R36): the request's own copy, the caller's frame out of the engine's
-    /// registry, or the tightly packed rows the class gate repacked out of a
-    /// padded gather.
+    /// (R36/R41): the request's own copy, the caller's frame out of the engine's
+    /// registry, or a copy the class gate made out of a guest window — the
+    /// tightly packed rows it repacked for a padded gather, or the folded,
+    /// widened texels of a bind whose format carried a channel plan.
     ///
     /// One function for the two readers that have to agree about a texture's
     /// byte count — [`input_allocations`] when the view's allocation is minted
     /// and the declaration when the bytes are stated — so a padded gather's
     /// copy cannot be sized by one and stated by the other.
-    fn owned_bytes<'a>(&'a self, rows: &'a RowCopies, index: u32) -> Option<&'a [u8]> {
+    fn owned_bytes<'a>(
+        &'a self,
+        texture_copies: &'a TextureCopies,
+        index: u32,
+    ) -> Option<&'a [u8]> {
         match self {
             Self::Bytes(bytes) | Self::Frame(bytes) => Some(bytes),
-            Self::Depadded { .. } => rows.bytes(index),
+            Self::Depadded { .. } | Self::Folded { .. } => texture_copies.bytes(index),
             Self::Produced { .. } | Self::Window { .. } => None,
         }
     }
@@ -8981,12 +9337,16 @@ struct NarrowTexture<'a> {
     index: u32,
     width: u64,
     height: u64,
-    /// The texel the bind's own view names, resolved to the contract's format
-    /// (E-TX1, `research/docs/23` §107; the narrow lanes since R39): one of the
-    /// two four-byte 8-bit UNORM byte orders, or one of the one- and two-byte
-    /// lanes the device's own frame lists beside them. The declaration, the
-    /// view and the byte count all read it, so the bytes and the name they are
-    /// uploaded under cannot drift apart.
+    /// The texel the *declaration* states, resolved to the contract's format
+    /// (E-TX1, `research/docs/23` §107; the narrow lanes since R39; R41's fold):
+    /// one of the two four-byte 8-bit UNORM byte orders, or one of the one- and
+    /// two-byte lanes the device's own frame lists beside them — or, for a bind
+    /// whose texel format's own channel plan the class folds into the bytes, the
+    /// four-byte lane those bytes are widened into. The view and the byte count
+    /// both read it, so the bytes and the name they are uploaded under cannot
+    /// drift apart; the *source* bytes' own width is the bind's lane
+    /// ([`sampled_textures`]'s `lane`), which is what the gate measures them at
+    /// before the fold.
     format: TextureFormat,
     /// The sampler form the declaration states, or the sampler-free fetched
     /// arm (R15).
@@ -10934,7 +11294,7 @@ fn submit_narrow(
     req: &DrawRequest,
     pass: &NarrowPass<'_>,
     copies: &WindowCopies,
-    rows: &RowCopies,
+    texture_copies: &TextureCopies,
 ) -> Result<RenderCompletion, ProviderRenderDecline> {
     let rail = rail().map_err(IntoRender::into_render)?;
     let provider = &rail.provider;
@@ -10962,7 +11322,7 @@ fn submit_narrow(
     let loads_resident = matches!(pass.load, NarrowLoad::Resident(_));
 
     let mut resources = ResourceTableSnapshot::new();
-    for allocation in input_allocations(pass, rows) {
+    for allocation in input_allocations(pass, texture_copies) {
         let (allocation_id, size) = allocation;
         resources
             .insert_allocation(AllocationRecord {
@@ -11272,22 +11632,25 @@ fn submit_narrow(
             // the caller's copy of the target image, declared for this view
             // exactly as a request-carried copy is.
             //
-            // R36's repacked rows are the third spelling of that one arm: the
-            // bytes are the class gate's own copy of the texture's tightly
-            // packed extent, assembled row by row out of the guest's padded
-            // window ([`RowCopies`]), so they are stated exactly as the other
-            // two are. Its byte count comes from the one accessor the
-            // allocation above reads, so the view and its allocation are sized
-            // by one number.
+            // R36's repacked rows are the third spelling of that one arm, and
+            // R41's folded plan the fourth: the bytes are the class gate's own
+            // copy of the texture's tightly packed extent — assembled row by row
+            // out of the guest's padded window, or widened out of the lane's one
+            // byte per texel with the format's channel plan folded in
+            // ([`TextureCopies`]) — so they are stated exactly as the other two
+            // are. Its byte count comes from the one accessor the allocation
+            // above reads, so the view and its allocation are sized by one
+            // number.
             NarrowTextureSource::Bytes(_)
             | NarrowTextureSource::Frame(_)
-            | NarrowTextureSource::Depadded { .. } => (
+            | NarrowTextureSource::Depadded { .. }
+            | NarrowTextureSource::Folded { .. } => (
                 ViewId::new(next_view),
                 input_allocation(next_view),
                 TextureSource::OwnedBytes(
                     texture
                         .source
-                        .owned_bytes(rows, texture.index)
+                        .owned_bytes(texture_copies, texture.index)
                         .expect("an admitted byte-bearing texture carries its bytes")
                         .to_vec(),
                 ),
@@ -12073,7 +12436,10 @@ fn stage_buffer_writebacks(
 /// allocation rather than one of this rail's own. The view *identities* below
 /// still advance once per stream, so a stream's identity never depends on
 /// which arm it took.
-fn input_allocations(pass: &NarrowPass<'_>, rows: &RowCopies) -> Vec<(AllocationId, u64)> {
+fn input_allocations(
+    pass: &NarrowPass<'_>,
+    texture_copies: &TextureCopies,
+) -> Vec<(AllocationId, u64)> {
     let mut out = Vec::with_capacity(pass.vertex_streams.len() + 1 + pass.textures.len());
     let mut next_view = FIRST_INPUT_VIEW;
     for stream in &pass.vertex_streams {
@@ -12116,7 +12482,7 @@ fn input_allocations(pass: &NarrowPass<'_>, rows: &RowCopies) -> Vec<(Allocation
         // the trace's view names that allocation rather than one of this
         // rail's own — its view *identity* below still advances, so a texture's
         // identity never depends on which arm it took.
-        let Some(bytes) = texture.source.owned_bytes(rows, texture.index) else {
+        let Some(bytes) = texture.source.owned_bytes(texture_copies, texture.index) else {
             continue;
         };
         let view_number = texture_base + u64::try_from(index).unwrap_or(u64::MAX);
