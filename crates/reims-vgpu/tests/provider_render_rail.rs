@@ -6422,6 +6422,15 @@ fn the_sampled_texture_shapes_beside_the_entry_stay_on_the_engine_by_name() {
         detail.contains("4x4") && detail.contains("8x4"),
         "the sentence names both extents: {detail}"
     );
+    // R35: the sentence states what the *two rails* answer rather than a
+    // provider rule the Vulkan rail stopped having at E-TX5 — the Vulkan rail
+    // gathers a source of another extent, and the native rail is the one that
+    // still refuses every other extent by name.
+    assert!(
+        detail.contains("gathers a source of another extent")
+            && detail.contains("the native rail answers"),
+        "the sentence states the two rails' disagreement: {detail}"
+    );
 
     let mut resident = sampled();
     resident.sampled_images[0].source = SampledSource::Target(engine::TargetIdentity::Surface {
@@ -14794,6 +14803,209 @@ fn a_sampled_texture_whose_window_starts_inside_the_granule_is_copied() {
         read_bytes(&texels),
         texture_source_arm(&views[0].source),
     );
+}
+
+/// R35: the extent refusal is counted under the arm the bind's source would
+/// state, and that arm is the one E's own question turns on.
+///
+/// Census v25b (`evidence/gate3-census-v25b-2026-09-18`) reads 10 368 of that
+/// boot's 30 373 seam first-failures (34.1 %) under
+/// `render_provider_out_of_class_texture_extent` — the biggest bucket of the
+/// load round — and the log cannot say which source those records named. That
+/// is exactly the question the bucket's next decision turns on, because E's two
+/// rails disagree about the shape: the Vulkan rail gathers a source of another
+/// extent into the render area's own grid and refuses only the owner's no-copy
+/// window (`research/docs/23` §111, E-TX5), while the native rail refuses every
+/// source of another extent by that same name. A bucket of host bytes is a
+/// widening the Vulkan rail can already execute; a bucket of no-copy windows is
+/// a shape the fork's refusal already agrees with the provider about.
+///
+/// Three shapes, one per arm beside the control the request-carried copy is:
+/// the request's own copy of another extent, the zero-copy window whose first
+/// byte *is* the texture's (`head == 0` — the arm `texture_window_arm` leaves
+/// at the owner's own mapping), and the same window four bytes in, which the
+/// class gate copies and which therefore has to read as host bytes. Every shape
+/// keeps its slug, its sentence and its gate, and none of them reaches the
+/// provider: a route is a census reading, not a widening.
+#[test]
+fn the_extent_refusal_counts_the_arm_the_source_would_state() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    // The sampled surface is half the pass's width: one extent disparity, and
+    // the shape every source below is stated at.
+    let (texture_width, texture_height) = (width / 2, height);
+    let texture_bytes = u64::from(texture_width) * u64::from(texture_height) * 4;
+
+    let host_before = route_count("texture_extent_host_bytes");
+    let borrowed_before = route_count("texture_extent_borrowed_no_copy");
+    let delivered = provider_render::provider_submissions();
+    let answer = |label: &str, request: &DrawRequest| -> (String, String) {
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), request)
+        {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the shape is out of class: {other:?}"),
+        }
+    };
+    let extent_refusal = |label: &str, request: &DrawRequest| -> String {
+        let (slug, detail) = answer(label, request);
+        eprintln!("extent door reading: {label}\n  slug={slug}\n  detail={detail}");
+        assert_eq!(
+            slug, "render_provider_out_of_class_texture_extent",
+            "{label}: the refusal slug is unchanged"
+        );
+        assert!(
+            detail.contains("4x4") && detail.contains("8x4"),
+            "{label}: the sentence names both extents: {detail}"
+        );
+        assert!(
+            detail.contains("gathers a source of another extent")
+                && detail.contains("the native rail answers"),
+            "{label}: the sentence states the two rails' disagreement: {detail}"
+        );
+        detail
+    };
+
+    // 1. The request's own copy: the arm every earlier increment carried, and
+    //    the one the Vulkan rail's gather answers.
+    let mut copied = sampled_request(&stages, texels.clone(), (width, height));
+    copied.sampled_images[0].width = texture_width;
+    copied.sampled_images[0].source = SampledSource::Bytes(std::sync::Arc::new(vec![
+        0u8;
+        (texture_width * texture_height * 4)
+            as usize
+    ]));
+    extent_refusal("request copy, other extent", &copied);
+    assert_eq!(
+        route_count("texture_extent_host_bytes") - host_before,
+        1,
+        "the request's own copy is the host-bytes arm"
+    );
+    assert_eq!(
+        route_count("texture_extent_borrowed_no_copy") - borrowed_before,
+        0,
+        "and it is not the owner's no-copy window"
+    );
+
+    // 2. The zero-copy window, at the same disparity. The registration is
+    //    real, because the shape is: the request states no bytes for the bind
+    //    and one run over the owner's own mapping, and the window is the one
+    //    the ledger derived for it — the texture's extent at the window's own
+    //    first byte, which is the borrowed arm's condition.
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the no-copy arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let bytes = vec![7u8; texture_bytes as usize];
+    owner.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    let windowed = |head: u64| {
+        let mut request = sampled_request(&stages, texels.clone(), (width, height));
+        request.sampled_images[0].width = texture_width;
+        request.sampled_images[0].source = sampled_window_source(
+            owner.pointer as usize,
+            2 * page as u64,
+            guest.clone(),
+            registered,
+            head,
+            texture_bytes,
+        );
+        request
+    };
+    extent_refusal("zero-copy window, other extent", &windowed(0));
+    assert_eq!(
+        route_count("texture_extent_borrowed_no_copy") - borrowed_before,
+        1,
+        "a window whose first byte is the texture's is the no-copy arm"
+    );
+    assert_eq!(
+        route_count("texture_extent_host_bytes") - host_before,
+        1,
+        "and the copied arm's count is untouched by it"
+    );
+
+    // 3. The same window four bytes in: `texture_window_arm` copies this one,
+    //    so its declaration would be the owner's staged lease and E's Vulkan
+    //    rail would gather it. The split has to follow the head, not the source
+    //    variant — a counter keyed on "the source is a window" would file both
+    //    of these under one name.
+    extent_refusal("copied window, other extent", &windowed(4));
+    assert_eq!(
+        route_count("texture_extent_borrowed_no_copy") - borrowed_before,
+        1,
+        "a window the class gate copies is not the no-copy arm"
+    );
+    assert_eq!(
+        route_count("texture_extent_host_bytes") - host_before,
+        2,
+        "it is the host-bytes arm, beside the request's own copy"
+    );
+    eprintln!(
+        "texture extent routes over three shapes: borrowed={} host_bytes={} (each route moved \
+         once per shape of its own arm, and no shape moved both)",
+        route_count("texture_extent_borrowed_no_copy") - borrowed_before,
+        route_count("texture_extent_host_bytes") - host_before,
+    );
+
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "every shape stays on the engine without the provider seeing it"
+    );
+}
+
+/// R35: the two arms are two names, and each one reads as its own arm.
+///
+/// The reason [`texture_extent_route`](provider_render::texture_extent_route)
+/// is an enum rather than a `&'static str` at the call site: arms that answer
+/// with different census names are different facts, and a typo in a bare string
+/// would file two of them under one name with nothing failing.
+/// `evidence/gate3-census-v25b-2026-09-18` is the reading this split exists for.
+#[test]
+fn each_texture_extent_arm_has_its_own_route_name() {
+    let routes = [
+        provider_render::TextureExtentRoute::BorrowedNoCopy,
+        provider_render::TextureExtentRoute::HostBytes,
+    ];
+    let names = routes.map(provider_render::texture_extent_route);
+    assert_eq!(
+        names,
+        [
+            "texture_extent_borrowed_no_copy",
+            "texture_extent_host_bytes"
+        ],
+        "the two arms are the two names the census reads"
+    );
+    let mut distinct = names.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), names.len(), "one name per arm");
+    for name in names {
+        eprintln!("texture extent route: {name}={}", route_count(name));
+    }
 }
 
 /// R28: the answer the class's texture-wire question reads comes out of the
