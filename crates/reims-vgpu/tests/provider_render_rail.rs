@@ -1928,10 +1928,23 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     req.indexed = None;
     class(&req);
 
-    // A second stream the vertex stage does not read: several streams are in
-    // class now, but only the ones the shader's own reflection names — the
-    // canonical registration gate compares the two and refuses a stream nothing
-    // reads, which is a decline rather than a fallback.
+    // A second stream the vertex stage does not read, whose own bytes also stop
+    // short of the vertices the index stream names. Two rules answer this
+    // fixture, and which one answers is a fact about the device:
+    //
+    // * a device whose capability frame carries no declared-superset bit — every
+    //   frame written before E-TX11, and the native rail — keeps the interface
+    //   refusal it has always answered with, verbatim;
+    // * a declaring device admits the superset and then weighs the draw's own
+    //   span: this stream is 24 bytes at a stride of 16 while the indices name
+    //   vertex 2, so `render_provider_out_of_class_vertex_span` keeps the draw
+    //   here. Without that gate the shape would reach admission, be refused
+    //   there (`render_vertex_buffer_footprint_unsupported`) and be *skipped*,
+    //   because a decline is fail-closed and never re-runs the engine.
+    //
+    // Both answers are the class boundary, which is what this test reads; the
+    // declaring arm of the interface rule's own shape is
+    // `a_declared_superset_vertex_layout_leaves_for_the_provider_and_lands_the_read_streams_frame`.
     let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
     let format = req.vertex_attributes[0].format;
     req.vertex_attributes.push(VertexAttributeResource {
@@ -5934,12 +5947,21 @@ fn the_shapes_beside_the_resident_arms_stay_on_the_engine_by_name() {
 /// The vertex-interface half of the class: one stream per attribute the vertex
 /// stage *reads*, and nothing else.
 ///
-/// Both directions are refused, because both are shapes the canonical
-/// registration gate refuses — and a refusal there is a decline, not a fallback,
-/// so the class has to answer them before the provider is asked.
+/// The shape below is R-VI1's declared superset — a descriptor that names a
+/// location the vertex function never reads — and this test pins the *old
+/// frame's* arm of it: a device whose capability answer does not carry
+/// `supports_render_vertex_interface_superset` refuses it, exactly as every
+/// device did before the bit existed. The arm a declaring device takes is
+/// `a_declared_superset_vertex_layout_leaves_for_the_provider_and_lands_the_read_streams_frame`;
+/// the reflected-superset arm beside it has no declaring arm at all, because a
+/// location the vertex stage reads that no declared entry covers has no defined
+/// value on any device.
 #[test]
 fn a_stream_the_vertex_stage_does_not_read_stays_on_the_engine() {
     let _guard = engine_test_session();
+    // The "old frame" arm: a snapshot that carries no superset-interface bit,
+    // which is what a capability frame written before E-TX11 decodes to.
+    let _undeclared = provider_render::override_render_vertex_interface_superset(Some(false));
     let delivered = provider_render::provider_submissions();
     let refused = |stages: &Stages, specs: &[StreamSpec]| {
         let req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, specs);
@@ -5991,6 +6013,11 @@ fn the_vertex_interface_refusals_are_counted_by_direction() {
     };
 
     let _guard = engine_test_session();
+    // The declared-superset arm below is a refusal only on a device whose frame
+    // does not declare the superset interface, so this battery reads it through
+    // the old-frame arm. R-VI1's declaring arm is
+    // `a_declared_superset_vertex_layout_leaves_for_the_provider_and_lands_the_read_streams_frame`.
+    let _undeclared = provider_render::override_render_vertex_interface_superset(Some(false));
     let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
     let delivered = provider_render::provider_submissions();
     let submit = |stages: &Stages, specs: &[StreamSpec]| {
@@ -6111,6 +6138,376 @@ fn the_vertex_interface_refusals_are_counted_by_direction() {
         provider_render::provider_submissions(),
         delivered,
         "the three directions are one refusal, so not one of them reaches the provider"
+    );
+}
+
+/// R-VI1: the declared-superset arm of the vertex interface leaves for a device
+/// whose frame declares it — the 5 241 rows census v27b read under
+/// `vertex_interface_declared_superset`, which was 50.2 % of that boot's refused
+/// draws and *all* of the `vertex_interface` bucket.
+///
+/// E-TX11 (`metal-api-emulator`'s `render-vertex-interface-superset`) makes the
+/// one rule directional: a vertex layout is free to name a location the
+/// translated module never reads (`MTLVertexDescriptor` is a descriptor, not a
+/// list of the function's arguments), and the surplus stream is *bound and
+/// ignored* — the canonical rail's own vertex input state is built from the
+/// declared layout, one `VkVertexInputAttributeDescription` per declared
+/// attribute. The provider publishes that as
+/// `ProviderCapabilities::supports_render_vertex_interface_superset` (`true` on
+/// the Vulkan snapshot, `false` on the native one and on every frame written
+/// before the bit existed), this rail reads it out of the provider's own
+/// capability frame (`provider_wire::render_vertex_interface_superset`), and the
+/// class gate admits the direction the device answers for.
+///
+/// The readings are frames and buckets rather than verdicts only:
+///
+/// * the superset draw lands the frame its two-attribute *control* — the same
+///   read streams, the same bytes, nothing else declared — lands, byte for byte;
+/// * the surplus streams' own bytes do not reach the frame, and one of the
+///   streams the module *does* read moves it;
+/// * both rails agree on the frame, and neither the interface bucket nor the
+///   direction's route moves for an admitted draw (the routes are the
+///   *refusal's* readings, exactly as R37's extent routes are);
+/// * the surplus entry is walked like every other declared attribute: a surplus
+///   stream shorter than one record still answers with the class's short-stream
+///   name, so the entry is stated rather than dropped.
+#[test]
+fn a_declared_superset_vertex_layout_leaves_for_the_provider_and_lands_the_read_streams_frame() {
+    let _guard = engine_test_session();
+    // The two-stream module reads locations 0 and 1; the descriptor below
+    // declares four.
+    let stages = two_stream_stages();
+    let _declared = provider_render::override_render_vertex_interface_superset(Some(true));
+
+    let superset = |read: f32, ignored: [f32; 2]| {
+        request_with_streams(
+            MTL_FORMAT_RGBA8_UNORM,
+            &[
+                position_stream(),
+                stream(1, &[(read, 0.0); 3]),
+                stream(2, &[(ignored[0], 0.0); 3]),
+                stream(3, &[(ignored[1], 0.0); 3]),
+            ],
+        )
+    };
+    let control = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[position_stream(), stream(1, &[(0.25, 0.0); 3])],
+    );
+
+    let delivered = provider_render::provider_submissions();
+    let interface_before = route_count("render_provider_out_of_class_vertex_interface");
+    let route_before = route_count("vertex_interface_declared_superset");
+
+    let (width, _) = extent();
+    let declared = provider_pixels("declared superset", &stages, &superset(0.25, [0.5, 0.75]));
+    let control_frame = provider_pixels("two-attribute control", &stages, &control);
+    eprintln!(
+        "declared superset: 4 declared attributes over a module that reads 2; frame {} bytes, \
+         texel(0, 0)={:?}, texel({}, 0)={:?}, identical to the two-attribute control={}",
+        declared.len(),
+        texel_at(&declared, 0, 0),
+        width - 1,
+        texel_at(&declared, width - 1, 0),
+        declared == control_frame,
+    );
+    assert_frames_equal(
+        "a declared attribute the module ignores does not reach the frame",
+        &declared,
+        &control_frame,
+    );
+    assert_eq!(
+        provider_render::provider_submissions() - delivered,
+        2,
+        "both the superset and its two-attribute control reach the canonical provider"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_vertex_interface"),
+        interface_before,
+        "an admitted declared superset charges no vertex-interface bucket"
+    );
+    assert_eq!(
+        route_count("vertex_interface_declared_superset"),
+        route_before,
+        "and the direction's own route is the *refusal's*, not the population's: the admitted \
+         draw charges none"
+    );
+
+    // The engine's own frame for the same draw: the shape is one both rails
+    // execute, which is what the class gate promises and what this comparison
+    // reads.
+    let Some(engine) = engine_pixels("declared superset", &stages, superset(0.25, [0.5, 0.75]))
+    else {
+        return;
+    };
+    assert_frames_equal(
+        "the two rails agree on the declared superset",
+        &declared,
+        &engine,
+    );
+
+    // The surplus streams' bytes, three ways: none of them reaches the frame,
+    // because the module reads neither location. That is what "bound and
+    // ignored" means, and it is the reading a rail that quietly *dropped* the
+    // extra declarations (landing a different layout) could not produce.
+    for (label, ignored) in [
+        ("both ignored streams zeroed", [0.0, 0.0]),
+        ("the first ignored stream moved", [0.5, 0.0]),
+        ("the second ignored stream moved", [0.0, -0.5]),
+    ] {
+        let moved = provider_pixels(label, &stages, &superset(0.25, ignored));
+        assert_frames_equal(label, &declared, &moved);
+    }
+    // A stream the module *does* read: moving it moves the frame.
+    let moved_read = provider_pixels(
+        "the read offset moved",
+        &stages,
+        &superset(0.0, [0.5, 0.75]),
+    );
+    assert_frames_differ(
+        "a stream the vertex stage reads moves the frame",
+        &declared,
+        &moved_read,
+    );
+
+    // The surplus entry is *walked* and not dropped: the gate weighs every
+    // declared attribute's own source, so a surplus stream shorter than one
+    // record answers with the class's short-stream name.
+    let mut short = superset(0.25, [0.5, 0.75]);
+    short.vertex_attributes[2].content = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 4]));
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &short) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_vertex_short",
+            "the surplus entry is declared and weighed like every other attribute: {reason}"
+        ),
+        other => {
+            panic!("a surplus stream shorter than one record stays on the engine: {other:?}")
+        }
+    }
+
+    // The span rule this increment adds, and its scope, read both ways on a
+    // declaring device.
+    //
+    // A stream that carries *only* ignored attributes may not be the reason a
+    // draw the class took is thrown away: admission proves every declared stream
+    // against the highest vertex the index stream names and refuses the draw when
+    // one stops short, and that refusal is a decline, which is a skipped draw
+    // rather than a fallback. So the shortfall is answered here first.
+    let mut short_ignored = superset(0.25, [0.5, 0.75]);
+    short_ignored.vertex_attributes[2].stride = 16;
+    short_ignored.vertex_attributes[2].offset = 8;
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &short_ignored,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_vertex_span",
+            "an ignored stream that stops short of the draw's own span keeps the draw on the \
+             engine: {reason}"
+        ),
+        other => {
+            panic!("an ignored stream admission would refuse must not be handed over: {other:?}")
+        }
+    }
+
+    // The same shortfall on a stream the module *reads* is the gap this class has
+    // always had for the shapes it has always carried: it reaches admission and
+    // is a typed decline there. This increment does not move it (closing it would
+    // answer the two `..._is_a_typed_decline` fixtures, which exist to read that
+    // very decline), and pinning it here is what makes the scope a reading rather
+    // than a claim.
+    let mut short_read = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[position_stream(), stream(1, &[(0.25, 0.0); 3])],
+    );
+    short_read.vertex_attributes[1].stride = 16;
+    short_read.vertex_attributes[1].offset = 8;
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &short_read)
+    {
+        RenderRailOutcome::ProviderDeclined(decline) => {
+            eprintln!("a read stream short of the span: {decline:?}");
+            assert!(
+                format!("{decline:?}").contains("render_vertex_buffer_footprint_unsupported"),
+                "the pre-existing gap is admission's own footprint proof: {decline:?}"
+            );
+        }
+        other => panic!("the pre-existing span gap is unchanged by this increment: {other:?}"),
+    }
+}
+
+/// R-VI1's reverse arms on a **declaring** device: the bit answers one
+/// direction, and the two disagreements no contract can admit keep their names,
+/// their routes and their place in the walk even when it is set.
+///
+/// The bit is a statement about the declared superset alone. A location the
+/// vertex stage reads that no declared entry covers has no value Metal defines —
+/// the pipeline's vertex input state would leave it undefined — so no device
+/// answer can widen onto it; and one location declared twice, or a declared
+/// location standing where a read one would go, is neither direction. Both keep
+/// `render_provider_out_of_class_vertex_interface`, both keep charging the route
+/// beside it, and neither reaches the provider.
+#[test]
+fn the_reflected_arms_keep_their_names_on_a_declaring_device() {
+    use reims_vgpu::backend::provider_render::{
+        vertex_interface_route, vertex_interface_route_distance, VertexInterfaceRoute,
+    };
+
+    let _guard = engine_test_session();
+    // The arm the bit *does* answer is set, so a shape it does not answer can
+    // only be refused by the rule itself.
+    let _declared = provider_render::override_render_vertex_interface_superset(Some(true));
+    let delivered = provider_render::provider_submissions();
+    let refused =
+        |label: &str, stage: &Stages, specs: &[StreamSpec], route: VertexInterfaceRoute| {
+            let before = route_count(vertex_interface_route(route));
+            let before_locations = route_count(vertex_interface_route_distance(route));
+            let req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, specs);
+            match provider_render::submit_render(&inputs(stage, RenderChainRole::SoleOrTail), &req)
+            {
+                RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_vertex_interface",
+                    "{label}: the direction is a route beside the refusal, never a second slug: \
+                 {reason}"
+                ),
+                other => panic!(
+                    "{label}: a shape the bit does not answer stays on the engine: {other:?}"
+                ),
+            }
+            assert_eq!(
+                route_count(vertex_interface_route(route)),
+                before + 1,
+                "{label}: the direction's own route counted it"
+            );
+            assert!(
+                route_count(vertex_interface_route_distance(route)) > before_locations,
+                "{label}: and the distance beside it states how wide the disagreement was"
+            );
+        };
+
+    // Reflected ⊋ declared: the two-stream stage with one stream bound.
+    refused(
+        "reflected superset",
+        &two_stream_stages(),
+        &[position_stream()],
+        VertexInterfaceRoute::ReflectedSuperset,
+    );
+    // Neither: a stream at a location the stage does not read standing where the
+    // one it does read would go.
+    refused(
+        "location mismatch",
+        &two_stream_stages(),
+        &[position_stream(), stream(2, &[(0.0, 0.0); 3])],
+        VertexInterfaceRoute::LocationMismatch,
+    );
+
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "neither direction the bit does not answer reaches the provider"
+    );
+}
+
+/// R-VI1, the provider's own registration arm: the canonical registration
+/// admits a layout that declares more than the module reads, and still refuses
+/// a location the module reads that the layout does not declare.
+///
+/// This is the arm the class gate's promise rests on — "everything it admits is
+/// a shape the provider executes" — read through the provider's own entry point
+/// rather than inferred from this rail's verdict, exactly as the R9p test reads
+/// the vertex-layout conflict. E-TX11 is what moved it:
+/// `validate_translated_vertex_attributes` used to compare the two sides
+/// attribute for attribute, and now walks the *reflection* asking the layout for
+/// a covering entry of the same component shape.
+///
+/// Note on the vocabulary: E's `render_vertex_superset_e2e.rs` pairs this frame
+/// with an "object rail" frame, because E ships an object API
+/// (`metal_api_core::provider_api`) beside its trace API. This rail has one
+/// execution path — the owner builds a `ComputeTrace` and submits it — so the
+/// second arm here is the provider's registration entry, which is the
+/// object-side call `submit_narrow` itself makes.
+#[test]
+fn the_canonical_registration_admits_a_superset_layout_and_refuses_an_uncovered_location() {
+    let _guard = engine_test_session();
+    let stages = two_stream_stages();
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let provider = VulkanComputeProvider::with_executor(std::sync::Arc::clone(&executor))
+        .expect("the canonical provider builds");
+    let device =
+        Device::new(std::sync::Arc::clone(&executor) as std::sync::Arc<dyn ComputeExecutor>);
+    let policy = provider.spirv_feature_policy();
+    let translate = |air: &[u8], stage: RenderStage, entry: &str| {
+        let function = device
+            .new_library_with_binary_air(air.to_vec())
+            .expect("the fixture is a binary AIR module")
+            .function(entry)
+            .expect("the fixture's entry exists");
+        TranslatedRenderStage::translate_with_policy(stage, &function, policy)
+            .expect("the fixture translates under this device's policy")
+    };
+    let register = |label: &str, layout: VertexLayout| {
+        provider.register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: stages.vertex_entry.to_owned(),
+                fragment_entry: stages.fragment_entry.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: layout,
+                stage_buffers: Vec::new(),
+                textures: Vec::new(),
+            },
+            vertex: translate(&stages.air.0, RenderStage::Vertex, stages.vertex_entry),
+            fragment: translate(&stages.air.1, RenderStage::Fragment, stages.fragment_entry),
+            logical_digest: SemanticDigest::new(
+                "reims-provider-render-rail-vertex-superset",
+                label.as_bytes().to_vec(),
+            )
+            .expect("the digest names a case"),
+        })
+    };
+    let stream = |locations: &[u32]| {
+        VertexLayout::Buffers(
+            locations
+                .iter()
+                .map(|location| VertexBufferLayout {
+                    stride: 8,
+                    step: VertexStep::PerVertex,
+                    attributes: vec![VertexAttribute {
+                        location: *location,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                })
+                .collect(),
+        )
+    };
+
+    // Declared ⊋ reflected: four declared locations over a module that reads
+    // two. The two surplus entries are bound with their streams and ignored.
+    let registered = register("declared-superset", stream(&[0, 1, 2, 3]))
+        .expect("the declared superset registers against a module that reads two of its four");
+    eprintln!(
+        "declared superset registration: pipeline={:?}",
+        registered.pipeline_id
+    );
+
+    // Reflected ⊋ declared: location 1 is read and no declared entry covers it,
+    // so the pipeline's vertex input state would leave it undefined. The refusal
+    // is the contract's own, with the location in its fields, and no pipeline
+    // identity is consumed.
+    let refused = register("uncovered-location", stream(&[0]))
+        .expect_err("the module reads location 1 and the layout does not declare it");
+    eprintln!("uncovered location: {refused:?}");
+    assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+    assert_eq!(
+        refused.fields.get("field"),
+        Some(&FieldValue::Text("vertex_attributes".to_owned()))
+    );
+    assert_eq!(
+        refused.fields.get("location"),
+        Some(&FieldValue::Unsigned(1)),
+        "the refusal names the location the layout does not declare"
     );
 }
 
@@ -14853,6 +15250,36 @@ fn the_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
         !undeclared,
         "a snapshot that does not declare the shape reads as undeclared, which is the answer the \
          extent exit keeps R35's own refusing arm — and the borrowed arm — on"
+    );
+
+    // R-VI1's bit, read the same way and out of the same frame: the direction
+    // this rail's vertex-interface exit asks about. The declared arm is the
+    // device's own answer; the undeclared arm is a snapshot whose frame leaves
+    // the bit out entirely — the escape family E-TX9 opened, whose third
+    // in-family tag E-TX11 is (`metal-api-ipc`'s
+    // `CAPABILITY_RENDER_VERTEX_INTERFACE_SUPERSET_TAIL`, `0x00 0x03 <bool>`) —
+    // which is also what every frame written before the bit existed decodes as.
+    let superset = provider_wire::render_vertex_interface_superset(
+        probe.device_epoch(),
+        &probe.capabilities(),
+    )
+    .expect("the capability answer encodes and decodes");
+    eprintln!("wire capability answer: supports_render_vertex_interface_superset={superset}");
+    assert!(
+        superset,
+        "this device declares the declared-superset shape: the canonical Vulkan rail builds its \
+         vertex input state from the contract's declared layout, one \
+         VkVertexInputAttributeDescription per declared attribute, since E-TX11"
+    );
+    let mut undeclaring = probe.capabilities();
+    undeclaring.supports_render_vertex_interface_superset = false;
+    let undeclared =
+        provider_wire::render_vertex_interface_superset(probe.device_epoch(), &undeclaring)
+            .expect("decode");
+    assert!(
+        !undeclared,
+        "a snapshot that does not declare the shape reads as undeclared, which is the answer the \
+         vertex-interface exit keeps R-VI1's own refusing arm on"
     );
 
     // The population this increment does not touch: no declaration, no frame —
