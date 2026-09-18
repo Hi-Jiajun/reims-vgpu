@@ -217,6 +217,23 @@ fn runtime_sampled_stages() -> Stages {
     )
 }
 
+/// The runtime-sampled shape's negative-side sibling (R21,
+/// `research/docs/26` §44): the R12 module with its one fixed sample point
+/// moved from `(1.375, 0.875)` to `(-0.375, 0.875)`, on the side of the
+/// surface where the two mirroring address modes part from the two modes they
+/// sit beside.
+///
+/// One sample point cannot state the whole address-mode rule: at `u = 1.375`
+/// mirror-clamp-to-edge clamps, so it lands what clamp-to-edge lands; at
+/// `u = -0.375` it mirrors, so it lands what mirror-repeat lands there. The
+/// pair is what makes each added mode's frame falsifiable.
+fn mirror_runtime_sampled_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_runtime_sampler_mirror.air",
+        "reims_runtime_sampled_mirror_frag",
+    )
+}
+
 /// The texel-fetched shape (R15): the reviewed vertex stage beside a fragment
 /// stage that reads one `[[texture(0)]]` with `texture.read()` — Metal's
 /// `access::read` qualifier.
@@ -499,6 +516,22 @@ fn family_sampler_resource(
     }
 }
 
+/// [`family_sampler_resource`] with the mip filter stated as its own fact
+/// (R21, `research/docs/26` §44): the widened family's third enumeration, which
+/// every pre-R21 arm of these tests leaves at `not_mipmapped` through the
+/// helper above.
+fn widened_sampler_resource(
+    binding: u32,
+    min_mag_filter: u32,
+    mip_filter: u32,
+    address_mode: u32,
+) -> SamplerResource {
+    SamplerResource {
+        mip_filter,
+        ..family_sampler_resource(binding, min_mag_filter, address_mode)
+    }
+}
+
 /// The attachment-covering draw with the runtime-sampled pair bound (R12): one
 /// 8x4 `rgba8_unorm` texture at the declaration's device binding, and one
 /// sampler state at the runtime `[[sampler(0)]]` argument's own device binding.
@@ -514,6 +547,28 @@ fn runtime_sampled_request(
     min_mag_filter: u32,
     address_mode: u32,
 ) -> DrawRequest {
+    widened_runtime_sampled_request(
+        stages,
+        texels,
+        extent,
+        min_mag_filter,
+        reims_vgpu::protocol::sampler::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        address_mode,
+    )
+}
+
+/// [`runtime_sampled_request`] with the *widened* state family stated (R21,
+/// `research/docs/26` §44): min/mag filter, mip filter and address mode are
+/// three independent facts of the request's own bind, exactly as the guest's
+/// `MTLSamplerState` carries them.
+fn widened_runtime_sampled_request(
+    stages: &Stages,
+    texels: Vec<Vec<u8>>,
+    extent: (u32, u32),
+    min_mag_filter: u32,
+    mip_filter: u32,
+    address_mode: u32,
+) -> DrawRequest {
     let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
     req.width = extent.0;
     req.height = extent.1;
@@ -521,9 +576,10 @@ fn runtime_sampled_request(
     let runtime = stages.sampler_family.runtime[0];
     req.sampled_images
         .push(image_resource(declaration.binding, texels, extent));
-    req.samplers.push(family_sampler_resource(
+    req.samplers.push(widened_sampler_resource(
         runtime.binding,
         min_mag_filter,
+        mip_filter,
         address_mode,
     ));
     req
@@ -5437,6 +5493,430 @@ fn the_runtime_sampler_shapes_beside_the_entry_stay_on_the_engine_by_name() {
         detail.contains("runtime sampler list"),
         "the sentence names what the frame does not carry: {detail}"
     );
+}
+
+/// One frame's colour when every texel agrees, or how many texels it carries —
+/// what the R21 readings print, so a reader can see which states landed one
+/// texel and which did not.
+fn frame_colour(frame: &[u8]) -> String {
+    let distinct: std::collections::BTreeSet<[u8; 4]> = frame
+        .chunks_exact(4)
+        .map(|texel| [texel[0], texel[1], texel[2], texel[3]])
+        .collect();
+    if distinct.len() == 1 {
+        format!("{:?}", distinct.iter().next().expect("one distinct texel"))
+    } else {
+        format!("{} distinct texels", distinct.len())
+    }
+}
+
+/// R21: the widened runtime-sampler state family (`research/docs/26` §44) —
+/// the states v109 opened on the canonical side, executed from the *request's*
+/// own bind and landed by both rails.
+///
+/// Two fixtures carry the reading, because one sample point cannot state the
+/// whole address-mode rule: the R12 fixture samples at `(1.375, 0.875)` of the
+/// 8x4 surface — outside the texture in `u` — and its negative-side sibling at
+/// `(-0.375, 0.875)`. Between them every added mode lands a frame the modules
+/// could not carry before, and their pair states the one thing neither states
+/// alone: mirror-clamp-to-edge *is* mirror-repeat inside `[-1, 1]` and clamps
+/// (rather than mirrors) outside it, so it lands mirror-repeat's own `(3, 3)`
+/// on the negative-side fixture and clamp-to-edge's own `(7, 3)` on the
+/// positive-side one.
+///
+/// Four falsifiable halves, all read off the attachment's bytes:
+///
+/// - the three added address modes are executions and not fallbacks: each lands
+///   the texel its own rule names, and each differs from what the two
+///   pre-existing modes land at the same coordinate;
+/// - the added min/mag and mip filter names are the *mode* a sample is selected
+///   under, not a second state: every canonical view here carries one mip
+///   level, so all three mip filters land the frame their own min/mag half
+///   lands under the same address mode;
+/// - the border mode reads the family's own transparent black and not the
+///   descriptor's colour field, which the family does not name;
+/// - the engine and the canonical provider agree byte for byte, so the states
+///   are what the two rails executed and not what one of them assumed.
+#[test]
+fn the_widened_runtime_sampler_family_lands_its_states_and_agrees_with_the_engine() {
+    let _guard = engine_test_session();
+    let stages = runtime_sampled_stages();
+    let mirror_stages = mirror_runtime_sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let texel = |x: usize, y: usize| -> [u8; 4] {
+        let texel = &texels[y * width as usize + x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    use reims_vgpu::protocol::sampler as mtl;
+    let filters = [
+        ("nearest", mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST),
+        ("linear", mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR),
+    ];
+    let mips = [
+        ("not-mipmapped", mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED),
+        ("mip-nearest", mtl::MTL_SAMPLER_MIP_FILTER_NEAREST),
+        ("mip-linear", mtl::MTL_SAMPLER_MIP_FILTER_LINEAR),
+    ];
+    let addresses = [
+        ("clamp-to-edge", mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
+        (
+            "mirror-clamp-to-edge",
+            mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
+        ),
+        ("repeat", mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT),
+        ("mirror-repeat", mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT),
+        ("clamp-to-zero", mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO),
+    ];
+    let (nearest, linear) = (0usize, 1usize);
+    let (clamp, mirror_clamp, repeat, mirror_repeat, clamp_zero) =
+        (0usize, 1usize, 2usize, 3usize, 4usize);
+
+    // Reading 1: the family's whole product on the positive-side fixture — two
+    // min/mag filters crossed with three mip filters crossed with five address
+    // modes — executed by the canonical provider and by the engine, which have
+    // to land the same bytes for every one of the thirty states.
+    let mut frames: std::collections::BTreeMap<(usize, usize, usize), Vec<u8>> =
+        std::collections::BTreeMap::new();
+    for (fi, (filter_name, filter)) in filters.iter().enumerate() {
+        for (mi, (mip_name, mip)) in mips.iter().enumerate() {
+            for (ai, (address_name, address)) in addresses.iter().enumerate() {
+                let what = format!("runtime sampler {filter_name} + {mip_name} + {address_name}");
+                let request = widened_runtime_sampled_request(
+                    &stages,
+                    texels.clone(),
+                    (width, height),
+                    *filter,
+                    *mip,
+                    *address,
+                );
+                let provider = provider_pixels(&what, &stages, &request);
+                let Some(engine) = engine_pixels(&what, &stages, request) else {
+                    return;
+                };
+                assert_frames_equal(&what, &provider, &engine);
+                frames.insert((fi, mi, ai), provider);
+            }
+        }
+    }
+    let positive = |filter: usize, address: usize| -> &Vec<u8> { &frames[&(filter, 0, address)] };
+    for ((fi, mi, ai), frame) in &frames {
+        eprintln!(
+            "R21 reading 1: {} + {} + {} = {}",
+            filters[*fi].0,
+            mips[*mi].0,
+            addresses[*ai].0,
+            frame_colour(frame),
+        );
+    }
+
+    // Reading 2: the mip filter is the mode a sample is selected under. Every
+    // canonical view carries one mip level, so the three mip filters land the
+    // one level their min/mag half lands — the mip half is carried, and carried
+    // *by name*: the same function refuses the ordinals the enumerations do not
+    // have (`the_states_beside_the_widened_runtime_sampler_family_stay_on_the_engine_by_name`),
+    // so a class that dropped the state would not answer this frame for it.
+    for (fi, (filter_name, _)) in filters.iter().enumerate() {
+        for (ai, (address_name, _)) in addresses.iter().enumerate() {
+            for (mi, (mip_name, _)) in mips.iter().enumerate().skip(1) {
+                assert_frames_equal(
+                    &format!("{filter_name} + {mip_name} + {address_name}"),
+                    &frames[&(fi, mi, ai)],
+                    &frames[&(fi, 0, ai)],
+                );
+            }
+        }
+    }
+
+    // Reading 3: the address modes, read off the texels each rule names at this
+    // coordinate. `u = 1.375` is above the surface, so clamp-to-edge and
+    // mirror-clamp-to-edge clamp to texel 7, repeat wraps to texel 3 and
+    // mirror-repeat mirrors to texel 5 — three different frames from one
+    // coordinate, which is what makes each an execution rather than a fallback.
+    assert_uniform_frame(
+        "nearest + clamp-to-edge",
+        positive(nearest, clamp),
+        width,
+        height,
+        texel(7, 3),
+    );
+    assert_uniform_frame(
+        "nearest + mirror-clamp-to-edge (u above 1 clamps)",
+        positive(nearest, mirror_clamp),
+        width,
+        height,
+        texel(7, 3),
+    );
+    assert_uniform_frame(
+        "nearest + repeat",
+        positive(nearest, repeat),
+        width,
+        height,
+        texel(3, 3),
+    );
+    assert_uniform_frame(
+        "nearest + mirror-repeat",
+        positive(nearest, mirror_repeat),
+        width,
+        height,
+        texel(5, 3),
+    );
+    assert_uniform_frame(
+        "linear + repeat",
+        positive(linear, repeat),
+        width,
+        height,
+        half_blend(texel(2, 3), texel(3, 3)),
+    );
+    assert_uniform_frame(
+        "linear + mirror-repeat",
+        positive(linear, mirror_repeat),
+        width,
+        height,
+        half_blend(texel(4, 3), texel(5, 3)),
+    );
+    assert_frames_differ(
+        "mirror-repeat moved the frame off repeat",
+        positive(nearest, mirror_repeat),
+        positive(nearest, repeat),
+    );
+    assert_frames_differ(
+        "clamp-to-zero moved the frame off clamp-to-edge",
+        positive(nearest, clamp_zero),
+        positive(nearest, clamp),
+    );
+    assert_frames_differ(
+        "clamp-to-zero moved the frame off mirror-repeat",
+        positive(nearest, clamp_zero),
+        positive(nearest, mirror_repeat),
+    );
+
+    // The border mode reads the one border the family states: transparent
+    // black, whatever the descriptor's own colour field carries — the
+    // clamp-to-border-colour mode whose colour *would* be read is the one the
+    // family refuses by name.
+    let mut opaque_border = widened_runtime_sampled_request(
+        &stages,
+        texels.clone(),
+        (width, height),
+        mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+        mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO,
+    );
+    opaque_border.samplers[0].border_color = mtl::MTL_SAMPLER_BORDER_COLOR_OPAQUE_WHITE;
+    let declared = provider_pixels(
+        "clamp-to-zero + declared opaque white",
+        &stages,
+        &opaque_border,
+    );
+    let Some(declared_engine) = engine_pixels(
+        "clamp-to-zero + declared opaque white",
+        &stages,
+        opaque_border,
+    ) else {
+        return;
+    };
+    assert_frames_equal(
+        "clamp-to-zero + declared opaque white",
+        &declared,
+        &declared_engine,
+    );
+    assert_frames_equal(
+        "the family reads its own transparent border, not the declared colour",
+        &declared,
+        positive(nearest, clamp_zero),
+    );
+    eprintln!(
+        "R21 reading 3: positive-side frames — clamp-to-edge and mirror-clamp-to-edge {:?}, \
+         repeat {:?}, mirror-repeat {:?}, clamp-to-zero {}; a declared opaque-white border \
+         lands the same frame as the family's own transparent black",
+        texel(7, 3),
+        texel(3, 3),
+        texel(5, 3),
+        frame_colour(positive(nearest, clamp_zero)),
+    );
+
+    // Reading 4: the mirroring modes' whole rule needs both coordinates. On the
+    // negative side of the surface mirror-clamp-to-edge mirrors — landing what
+    // mirror-repeat lands — while clamp-to-edge clamps and repeat wraps the
+    // other way; with the positive-side frames above that states the rule the
+    // two fixtures cannot state alone.
+    let mirror_arms: [(usize, usize, [u8; 4]); 8] = [
+        (nearest, clamp, texel(0, 3)),
+        (nearest, mirror_clamp, texel(3, 3)),
+        (nearest, mirror_repeat, texel(3, 3)),
+        (nearest, repeat, texel(5, 3)),
+        (linear, clamp, texel(0, 3)),
+        (linear, mirror_clamp, half_blend(texel(2, 3), texel(3, 3))),
+        (linear, mirror_repeat, half_blend(texel(2, 3), texel(3, 3))),
+        (linear, repeat, half_blend(texel(4, 3), texel(5, 3))),
+    ];
+    for (filter, address, want) in mirror_arms {
+        let what = format!(
+            "mirror-side runtime sampler {} + {}",
+            filters[filter].0, addresses[address].0,
+        );
+        let request = widened_runtime_sampled_request(
+            &mirror_stages,
+            texels.clone(),
+            (width, height),
+            filters[filter].1,
+            mips[0].1,
+            addresses[address].1,
+        );
+        let provider = provider_pixels(&what, &mirror_stages, &request);
+        assert_uniform_frame(&what, &provider, width, height, want);
+        let Some(engine) = engine_pixels(&what, &mirror_stages, request) else {
+            return;
+        };
+        assert_uniform_frame(&format!("{what} (engine)"), &engine, width, height, want);
+        assert_frames_equal(&what, &provider, &engine);
+        eprintln!("R21 reading 4: {what} = {want:?}");
+    }
+}
+
+/// R21: the states beside the widened family, each still under its own name.
+///
+/// The family is the two min/mag filters crossed with the three mip filters
+/// and the five address modes (`research/docs/26` §44); every state outside it
+/// keeps the draw on the engine under
+/// `render_provider_out_of_class_texture_state`, exactly as before the
+/// widening. The doors below walk the refusals E-TX2's own canonical rail
+/// answers for the same reasons — the address mode whose border colour the
+/// family does not name, and every ordinal the three enumerations do not have —
+/// beside the shapes the family never admitted.
+#[test]
+fn the_states_beside_the_widened_runtime_sampler_family_stay_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = runtime_sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    use reims_vgpu::protocol::sampler as mtl;
+    let nearest = mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+    let linear = mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR;
+    let not_mipmapped = mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED;
+    let mirror_repeat = mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT;
+    let state = |filter: u32, mip: u32, address: u32| {
+        widened_runtime_sampled_request(
+            &stages,
+            texels.clone(),
+            (width, height),
+            filter,
+            mip,
+            address,
+        )
+    };
+    let in_class = |label: &str, req: &DrawRequest| match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        req,
+    ) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("{label}: the shape is in the class: {other:?}"),
+    };
+    let refusal = |label: &str, req: &DrawRequest| -> (String, String) {
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the shape is out of class: {other:?}"),
+        }
+    };
+
+    // The positive control: the widest states the class now states, at the end
+    // of the address table and the mip table alike.
+    in_class(
+        "linear + mip-linear + mirror-repeat",
+        &state(linear, mtl::MTL_SAMPLER_MIP_FILTER_LINEAR, mirror_repeat),
+    );
+    in_class(
+        "nearest + mip-nearest + clamp-to-zero",
+        &state(
+            nearest,
+            mtl::MTL_SAMPLER_MIP_FILTER_NEAREST,
+            mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO,
+        ),
+    );
+
+    // 1. The one address mode the family refuses by name on both rails: its
+    //    border colour is a state of its own, so a sampler created for it would
+    //    answer with a colour the request never stated.
+    let (slug, detail) = refusal(
+        "clamp-to-border-colour",
+        &state(
+            nearest,
+            not_mipmapped,
+            mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR,
+        ),
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_state");
+    assert!(
+        detail.contains("mirror-clamped") && detail.contains("clamped to zero"),
+        "the sentence states the widened family the bind is outside: {detail}"
+    );
+
+    // 2. The ordinals none of the three enumerations has — on the address half,
+    //    the min/mag half and the mip half of the same state.
+    for (label, filter, mip, address) in [
+        (
+            "an address ordinal past the enumeration",
+            nearest,
+            not_mipmapped,
+            6,
+        ),
+        (
+            "a min/mag ordinal past the enumeration",
+            2,
+            not_mipmapped,
+            mirror_repeat,
+        ),
+        (
+            "a mip ordinal past the enumeration",
+            nearest,
+            3,
+            mirror_repeat,
+        ),
+    ] {
+        let (slug, detail) = refusal(label, &state(filter, mip, address));
+        eprintln!("door: {label} -> {slug}\n  {detail}");
+        assert_eq!(
+            slug, "render_provider_out_of_class_texture_state",
+            "{label}"
+        );
+    }
+
+    // 3. The shapes the family never admitted, every one of them still by name:
+    //    a min/mag pair that disagrees, axes that address differently, an
+    //    unnormalized declaration, a comparison function, and anisotropy.
+    let mut disagreeing = state(nearest, not_mipmapped, mirror_repeat);
+    disagreeing.samplers[0].mag_filter = linear;
+    let (slug, detail) = refusal("a min/mag pair that disagrees", &disagreeing);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_state");
+
+    let mut axes = state(nearest, not_mipmapped, mirror_repeat);
+    axes.samplers[0].address_mode_v = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    let (slug, detail) = refusal("axes that address differently", &axes);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_state");
+
+    let mut unnormalized = state(nearest, not_mipmapped, mirror_repeat);
+    unnormalized.samplers[0].unnormalized_coordinates = true;
+    let (slug, detail) = refusal("an unnormalized declaration", &unnormalized);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_state");
+
+    let mut comparing = state(nearest, not_mipmapped, mirror_repeat);
+    comparing.samplers[0].compare_function = engine::SamplerCompareFunction::Less;
+    let (slug, detail) = refusal("a comparison function", &comparing);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_state");
+
+    let mut anisotropic = state(nearest, not_mipmapped, mirror_repeat);
+    anisotropic.samplers[0].max_anisotropy = 4;
+    let (slug, detail) = refusal("anisotropy", &anisotropic);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_state");
 }
 
 /// R15: the fetch-only declarations, read back off the fixture's own

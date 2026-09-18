@@ -840,9 +840,10 @@ pub enum RenderSamplerState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderSamplerRefusal {
     /// The AIR `constexpr sampler`'s state is outside the family the canonical
-    /// rail creates (R10): a differing min/mag filter, a mip filter,
-    /// non-normalized coordinates, a compare function, anisotropy, or a
-    /// reduction.
+    /// rail creates (R10, widened to the six-filter/five-mode family by R21):
+    /// a differing min/mag filter, a bicubic filter, axes that address
+    /// differently, a `clampToBorderColor`, non-normalized coordinates, a
+    /// compare function, anisotropy, or a reduction.
     AirState,
     /// The module's own sample sites do not name a runtime `[[sampler(n)]]`
     /// argument the reflection binds for this texture (R12): no sample site
@@ -856,9 +857,11 @@ impl RenderSamplerRefusal {
     pub const fn name(self) -> &'static str {
         match self {
             Self::AirState => {
-                "the AIR state is outside the family the canonical rail creates — nearest or \
-                 linear filtering with clamped or repeating addressing, one mip level, \
-                 normalized coordinates, no comparison, no anisotropy"
+                "the AIR state is outside the family the canonical rail creates — a min/mag \
+                 filter of nearest or linear crossed with the not-mipmapped, nearest or linear \
+                 mip filter; one address mode for all three axes, of clamp-to-edge, \
+                 mirror-clamp-to-edge, repeat, mirror-repeat or clamp-to-zero; normalized \
+                 coordinates, no comparison, no anisotropy and weighted-average reduction"
             }
             Self::SampleSite => {
                 "the module's own sample sites name no runtime `[[sampler(n)]]` argument the \
@@ -965,10 +968,12 @@ pub struct RenderInterfaceRefusal {
 /// The state is mapped into the canonical policy family here, once per resolved
 /// pipeline, because that is the question the class gate asks on every draw:
 /// `Some` exactly for the states the canonical rail creates a `VkSampler` from
-/// — nearest or linear min/mag filtering, identical on all three axes, one mip
-/// level, normalized coordinates, no comparison, no anisotropy, weighted-average
-/// reduction — and the refusals the gate answers with otherwise. The refusals'
-/// *names* live in the rail (`RenderSamplerState`), the facts live here.
+/// — nearest or linear min/mag filtering crossed with the three `MTLSamplerMipFilter`
+/// values, one address mode on all three axes (clamped, mirror-clamped,
+/// repeated, mirror-repeated or clamped to zero), normalized coordinates, no
+/// comparison, no anisotropy, weighted-average reduction — and the refusals
+/// the gate answers with otherwise. The refusals' *names* live in the rail
+/// (`RenderSamplerState`), the facts live here.
 ///
 /// A texture with no AIR static sampler beside it reads through the *other*
 /// Metal sampler family: a runtime `[[sampler(n)]]` argument, whose state the
@@ -995,16 +1000,20 @@ pub fn texture_declarations(
     /// when the state is outside the family the canonical rail creates.
     ///
     /// This is the same rule `metal-api-vulkan`'s `static_sampler_policy`
-    /// applies to the very same reflection — the two rails translate one AIR
-    /// with one translator, so this is one measurement restated, not a second
-    /// opinion.
+    /// applies to the very same reflection, at the widened family E-TX2 landed
+    /// there (R21, `research/docs/26` §44): the six filters the two
+    /// `MTLSamplerMinMagFilter` values and three `MTLSamplerMipFilter` values
+    /// cross into, and the four address modes the translator's own vocabulary
+    /// can name. The two rails translate one AIR with one translator, so this
+    /// is one measurement restated, not a second opinion — including its two
+    /// by-name refusals (`bicubic`, whose four taps the family cannot state,
+    /// and `clampToBorderColor`, whose border colour is a state of its own).
     fn air_sampler_policy(
         state: &metal2vulkan::reflect::StaticSamplerState,
     ) -> Option<SamplerPolicy> {
         if state.min_filter != state.mag_filter
             || state.address_mode_s != state.address_mode_t
             || state.address_mode_s != state.address_mode_r
-            || state.mip_filter != SamplerMipFilter::None
             || state.coordinates != SamplerCoordinates::Normalized
             || state.compare_function != SamplerCompareFunction::Never
             || state.reduction != SamplerReduction::WeightedAverage
@@ -1012,15 +1021,21 @@ pub fn texture_declarations(
         {
             return None;
         }
-        let filter = match state.min_filter {
-            AirFilter::Nearest => SamplerFilter::Nearest,
-            AirFilter::Linear => SamplerFilter::Linear,
-            AirFilter::Bicubic => return None,
+        let filter = match (state.min_filter, state.mip_filter) {
+            (AirFilter::Nearest, SamplerMipFilter::None) => SamplerFilter::Nearest,
+            (AirFilter::Linear, SamplerMipFilter::None) => SamplerFilter::Linear,
+            (AirFilter::Nearest, SamplerMipFilter::Nearest) => SamplerFilter::NearestMipNearest,
+            (AirFilter::Nearest, SamplerMipFilter::Linear) => SamplerFilter::NearestMipLinear,
+            (AirFilter::Linear, SamplerMipFilter::Nearest) => SamplerFilter::LinearMipNearest,
+            (AirFilter::Linear, SamplerMipFilter::Linear) => SamplerFilter::LinearMipLinear,
+            (AirFilter::Bicubic, _) => return None,
         };
         let address = match state.address_mode_s {
             AirAddress::ClampToEdge => SamplerAddressMode::ClampToEdge,
             AirAddress::Repeat => SamplerAddressMode::Repeat,
-            _ => return None,
+            AirAddress::MirroredRepeat => SamplerAddressMode::MirrorRepeat,
+            AirAddress::ClampToZero => SamplerAddressMode::ClampToZero,
+            AirAddress::ClampToBorder => return None,
         };
         Some(SamplerPolicy { filter, address })
     }
@@ -1629,10 +1644,12 @@ fn sampled_textures<'a>(
                             "a draw whose runtime sampler at `[[sampler({index})]]` is outside \
                              the family the canonical rail creates stays on the engine: the \
                              canonical `VkSampler` is created from nearest or linear filtering \
-                             with clamped or repeating addressing, one mip level, normalized \
-                             coordinates, no comparison and no anisotropy, and the bind at device \
-                             binding {} states another filter, another address mode, a mip \
-                             filter, unnormalized coordinates, a comparison or anisotropy",
+                             under one of the three mip filters, with one address mode on all \
+                             three axes (clamped, mirror-clamped, repeated, mirror-repeated or \
+                             clamped to zero), normalized coordinates, no comparison and no \
+                             anisotropy, and the bind at device binding {} states another \
+                             filter, another mip filter, another address mode, unnormalized \
+                             coordinates, a comparison or anisotropy",
                             runtime.binding,
                         ),
                     )
@@ -1656,10 +1673,11 @@ fn sampled_textures<'a>(
                         "a fragment stage whose `[[texture({})]]` samples through a sampler form \
                          this class cannot name stays on the engine: {}. The canonical render \
                          sampler executes the module's own AIR static state — nearest or linear \
-                         filtering with clamped or repeating addressing, one mip level, \
-                         normalized coordinates, no comparison, no anisotropy — or the runtime \
-                         `[[sampler(n)]]` argument the module's own sample sites name, one per \
-                         sampled texture",
+                         filtering under one of the three mip filters, one address mode on all \
+                         three axes (clamped, mirror-clamped, repeated, mirror-repeated or \
+                         clamped to zero), normalized coordinates, no comparison, no anisotropy \
+                         — or the runtime `[[sampler(n)]]` argument the module's own sample sites \
+                         name, one per sampled texture",
                         declaration.index,
                         reason.name(),
                     ),
@@ -1823,9 +1841,9 @@ fn sampled_textures<'a>(
                     format!(
                         "a draw whose sampler at `[[texture({})]]`'s slot is outside the family \
                          the canonical rail creates stays on the engine: the bind states a state \
-                         the declaration could not repeat (nearest or linear filtering, clamped or \
-                         repeating addressing, one mip level, normalized coordinates, no \
-                         comparison, no anisotropy)",
+                         the declaration could not repeat (nearest or linear filtering under one \
+                         of the three mip filters, one address mode on all three axes, normalized \
+                         coordinates, no comparison, no anisotropy)",
                         declaration.index,
                     ),
                 )
@@ -1893,18 +1911,31 @@ fn sampled_textures<'a>(
 /// `None` when the state is outside the family the canonical rail creates.
 ///
 /// This is the request-side half of the rule E-RS1 landed on the canonical
-/// side (`static_sampler_policy`): the two enumerations are the same family —
+/// side (`static_sampler_policy`), at the widened family E-TX2 landed there
+/// (R21, `research/docs/26` §44): the two enumerations are the same family —
 /// `MTLSamplerMinMagFilter`, `MTLSamplerMipFilter` and `MTLSamplerAddressMode`
 /// as the runtime resolved them — and a state the canonical rail cannot create
 /// is answered here rather than executed under another state.
+///
+/// The family is the two min/mag filters crossed with the three mip filters —
+/// six names, because the mip filter is the mode the filter is selected under
+/// and not a filter of its own — beside the five address modes
+/// `clampToEdge`, `mirrorClampToEdge`, `repeat`, `mirrorRepeat` and
+/// `clampToZero`. `clampToBorderColor` stays outside by name on both rails:
+/// its border colour is a state of its own (`MTLSamplerBorderColor`) that the
+/// family does not name, so a sampler created for it would answer with a
+/// colour the request never stated.
 fn request_sampler_policy(
     sampler: &crate::backend::vulkan::engine::SamplerResource,
 ) -> Option<SamplerPolicy> {
     use crate::protocol::sampler::{
-        MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, MTL_SAMPLER_ADDRESS_MODE_REPEAT,
-        MTL_SAMPLER_MIN_MAG_FILTER_LINEAR, MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
-        MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO,
+        MTL_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT,
+        MTL_SAMPLER_ADDRESS_MODE_REPEAT, MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+        MTL_SAMPLER_MIN_MAG_FILTER_NEAREST, MTL_SAMPLER_MIP_FILTER_LINEAR,
+        MTL_SAMPLER_MIP_FILTER_NEAREST, MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
     };
+    use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
     if sampler.min_filter != sampler.mag_filter {
         return None;
     }
@@ -1913,25 +1944,39 @@ fn request_sampler_policy(
     {
         return None;
     }
-    if sampler.mip_filter != MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED {
-        return None;
-    }
     if sampler.unnormalized_coordinates
         || sampler.compare_function != crate::backend::vulkan::engine::SamplerCompareFunction::Never
         || sampler.max_anisotropy != 1
     {
         return None;
     }
-    let filter = match sampler.min_filter {
-        MTL_SAMPLER_MIN_MAG_FILTER_NEAREST => metal_api_core::provider::SamplerFilter::Nearest,
-        MTL_SAMPLER_MIN_MAG_FILTER_LINEAR => metal_api_core::provider::SamplerFilter::Linear,
+    let filter = match (sampler.min_filter, sampler.mip_filter) {
+        (MTL_SAMPLER_MIN_MAG_FILTER_NEAREST, MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED) => {
+            SamplerFilter::Nearest
+        }
+        (MTL_SAMPLER_MIN_MAG_FILTER_LINEAR, MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED) => {
+            SamplerFilter::Linear
+        }
+        (MTL_SAMPLER_MIN_MAG_FILTER_NEAREST, MTL_SAMPLER_MIP_FILTER_NEAREST) => {
+            SamplerFilter::NearestMipNearest
+        }
+        (MTL_SAMPLER_MIN_MAG_FILTER_NEAREST, MTL_SAMPLER_MIP_FILTER_LINEAR) => {
+            SamplerFilter::NearestMipLinear
+        }
+        (MTL_SAMPLER_MIN_MAG_FILTER_LINEAR, MTL_SAMPLER_MIP_FILTER_NEAREST) => {
+            SamplerFilter::LinearMipNearest
+        }
+        (MTL_SAMPLER_MIN_MAG_FILTER_LINEAR, MTL_SAMPLER_MIP_FILTER_LINEAR) => {
+            SamplerFilter::LinearMipLinear
+        }
         _ => return None,
     };
     let address = match sampler.address_mode_u {
-        MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE => {
-            metal_api_core::provider::SamplerAddressMode::ClampToEdge
-        }
-        MTL_SAMPLER_ADDRESS_MODE_REPEAT => metal_api_core::provider::SamplerAddressMode::Repeat,
+        MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE => SamplerAddressMode::ClampToEdge,
+        MTL_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE => SamplerAddressMode::MirrorClampToEdge,
+        MTL_SAMPLER_ADDRESS_MODE_REPEAT => SamplerAddressMode::Repeat,
+        MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT => SamplerAddressMode::MirrorRepeat,
+        MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO => SamplerAddressMode::ClampToZero,
         _ => return None,
     };
     Some(SamplerPolicy { filter, address })
