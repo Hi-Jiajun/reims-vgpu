@@ -10546,10 +10546,23 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 && !resources.load_guest_target_backing
                 && attachment_window_runs.is_none()
                 && seed_window_runs.is_none()
-                && matches!(
+                && (matches!(
                     crate::backend::provider_render::declares_attachment_landing_view(),
                     Ok(true)
-                )
+                ) || matches!(
+                    // E-TX14: the same door, cut for the device that delivers
+                    // the frame through a landing-only entry instead of
+                    // publishing it. The window is one cut for two arms — the
+                    // class elects between them — so a device that declares
+                    // *either* arm is a device whose window is worth cutting:
+                    // asking only E-TX13's bit would leave the kept-frame
+                    // device's tail on the refusal, and asking only E-TX14's
+                    // would move every E-TX13 shape to the reference arm's own
+                    // reading. `Err` is `false` on this side, exactly as it is
+                    // above: an unanswerable device keeps the refusal.
+                    crate::backend::provider_render::declares_kept_frame_landing(),
+                    Ok(true)
+                ))
             {
                 if let (Some(c0), Some(extent)) = (req.colors.first(), attachment_window_extent) {
                     let format = resources
@@ -11923,6 +11936,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             crate::backend::provider_render::WindowLanding::LandingView => {
                                 "render_provider_borrowed_landing_view"
                             }
+                            // E-TX14: unreachable by construction — the
+                            // kept-frame arm's store is `StoreOp::Resident`, so
+                            // its completion carries no writeback and it is
+                            // answered in the resident arm above. Named rather
+                            // than folded in because a landing that *did*
+                            // publish bytes would be a submission whose frame
+                            // crossed the bus twice, which is the one thing
+                            // this arm states it does not do; a round reads this
+                            // name at zero or the wiring is wrong.
+                            crate::backend::provider_render::WindowLanding::KeptFrame => {
+                                "render_provider_kept_frame_landing_published"
+                            }
                         });
                         return Ok(M2vDrawSpan::BorrowedLanding {
                             bytes,
@@ -11933,6 +11958,52 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     return Ok(M2vDrawSpan::Pixels { bytes, bgra });
                 }
                 RenderRailOutcome::ProviderCompletedResident(frame) => {
+                    // E-TX14: the third arm — the frame was kept *and*
+                    // delivered. Its pages are the owner's, not the provider's
+                    // image's, so this is not a frame the rest of the packet or
+                    // a deferred debt may read out of the registry later: the
+                    // landing entry *consumed* the identity. The span carries
+                    // the landing so the Store route writes nothing a second
+                    // time and still publishes the account that says the pages
+                    // changed (`borrowed_landing_store`), which is the one fact
+                    // the provider's own answer cannot state —
+                    // `StoreOp::Resident` publishes nothing, so a completed
+                    // submission is the landing's whole proof.
+                    //
+                    // Read before the two flags below, because those flags are
+                    // the *walk's* promise that a later record of this packet
+                    // loads the image this record stored (R42), and a consumed
+                    // identity has no image to load: setting them here would
+                    // promise the next record a frame the provider no longer
+                    // holds (`kept_frame_not_held`, or worse, a stale one).
+                    if frame.landed {
+                        crate::runtime::chain_phase::enter(
+                            crate::runtime::chain_phase::Phase::Store,
+                        );
+                        crate::runtime::drain::note_store_route("render_provider_canonical");
+                        crate::runtime::drain::note_frame_draw_rail(
+                            crate::runtime::drain::FrameDrawRail::Provider,
+                        );
+                        crate::runtime::drain::note_store_route(
+                            "render_provider_kept_frame_landing_store",
+                        );
+                        crate::observe::line(format!(
+                            "linux_render_provider ok kept_frame_landing pipe={} {}x{} alloc={:#x} \
+                             view={} mid={} gva={:#x}",
+                            req.pipeline_ref,
+                            w,
+                            h,
+                            frame.attachment.allocation.get(),
+                            frame.attachment.view.get(),
+                            req.colors.first().map(|c| c.mapping_id).unwrap_or(0),
+                            req.colors.first().map(|c| c.target_gva).unwrap_or(0),
+                        ));
+                        return Ok(M2vDrawSpan::BorrowedLanding {
+                            bytes: Vec::new(),
+                            bgra: false,
+                            landing: crate::backend::provider_render::WindowLanding::KeptFrame,
+                        });
+                    }
                     // R42: this frame is the provider's own image, and it is the
                     // only arm that may say so — the engine's resident chain
                     // returns the same span one layer down, which is why the
@@ -12093,6 +12164,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }
                 }
                 RenderRailOutcome::ProviderDeclined(decline) => {
+                    // E-TX14: the landing entry's fail-closed answers, counted
+                    // by name where the refusal arrives. The three names are the
+                    // identity semantics this device cannot prove — a frame
+                    // nothing kept, one a landing already consumed, one whose
+                    // epoch moved out from under it — and a healthy round reads
+                    // all three at zero. They are charged here rather than left
+                    // to the provider's own fail line because the census's
+                    // store-route windows are what the round is read on, and a
+                    // refusal that only reached a log line would make the
+                    // landing's own boundary invisible.
+                    note_kept_frame_landing_refusal(&decline);
                     crate::observe::Emit::decline("render_provider", &decline)
                         .field("pipe", req.pipeline_ref)
                         .fail_once(u64::from(req.pipeline_ref));
@@ -13685,6 +13767,49 @@ fn surface_store_plan(lazy_enabled: bool, guest_backed: bool) -> SurfaceStorePla
     }
 }
 
+/// Count one provider-side landing refusal under the name the provider gave it
+/// (E-TX14/R4b).
+///
+/// The landing entry's fail-closed answers are per-name facts — a frame nothing
+/// kept, one a landing already consumed, one whose epoch moved out from under
+/// it, a window whose bytes are not the frame's extent — and the census reads
+/// them as names or not at all. The provider's own slug leads the decline's
+/// `detail` (`provider_compute::provider_error_detail`), so this is the one
+/// point where the refusal the owner read and the counter the round is judged
+/// on meet; the table is explicit rather than prefix-matched so a provider name
+/// this rail has not reviewed cannot arrive as a counter with no boundary
+/// behind it.
+pub(crate) fn note_kept_frame_landing_refusal(
+    decline: &crate::backend::provider_render::ProviderRenderDecline,
+) {
+    use crate::backend::provider_render::ProviderRenderDecline;
+    let ProviderRenderDecline::ProviderRefused { detail, .. } = decline else {
+        return;
+    };
+    const NAMES: [&str; 10] = [
+        "kept_frame_not_held",
+        "kept_frame_already_landed",
+        "kept_frame_stale",
+        "kept_frame_evicted",
+        "kept_frame_released",
+        "kept_frame_undefined",
+        "kept_frame_shape_changed",
+        "kept_frame_landing_undeclared",
+        "kept_frame_landing_mismatch",
+        "kept_frame_landing_unsupported",
+    ];
+    for name in NAMES {
+        if detail == name
+            || detail
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with(':'))
+        {
+            crate::runtime::drain::note_store_route(name);
+            return;
+        }
+    }
+}
+
 /// The account one provider-landed frame owes the device (B3).
 ///
 /// `StoreOp::Borrowed` (E-TX8) writes the pass's frame into the attachment
@@ -13753,8 +13878,14 @@ fn borrowed_landing_store<M: HostMemory + HostOps>(
         // The GVA destination below is not this arm's either — E-TX13's cut is
         // the mapper mapping's own window, so a GVA plane keeps whatever its own
         // debt ledger says.
-        if landing == crate::backend::provider_render::WindowLanding::LandingView
-            && state.pending_writebacks.take(mid).is_some()
+        // E-TX14: the kept-frame arm's window is the same cut and its delivery
+        // is the same "newer content at the same geometry" statement, so it
+        // supersedes the debt for the same reason and at the same point.
+        if matches!(
+            landing,
+            crate::backend::provider_render::WindowLanding::LandingView
+                | crate::backend::provider_render::WindowLanding::KeptFrame
+        ) && state.pending_writebacks.take(mid).is_some()
         {
             crate::runtime::drain::note_store_route("wbdebt_superseded_by_provider_landing");
         }
@@ -13811,6 +13942,27 @@ fn borrowed_landing_store<M: HostMemory + HostOps>(
             c0.width,
             c0.height,
         );
+        // E-TX14: the kept-frame arm's GVA half. The records it elects are the
+        // mapper-ref surface's (that is the window the door cuts), so this is
+        // the defensive arm rather than the live one — stated rather than left
+        // out because a landing that wrote newer bytes over a plane the ledger
+        // still owes an older frame would let the payment replay that older
+        // frame over this one. Dropping the debt here is the same statement
+        // `supersede_for_mapping` makes one line up, for the same reason.
+        if matches!(
+            landing,
+            crate::backend::provider_render::WindowLanding::KeptFrame
+        ) {
+            let key = crate::runtime::writeback_debt::GvaResourceKey {
+                task_id,
+                texture_ref,
+            };
+            if !state.pending_writebacks.take_gva(key).is_empty() {
+                crate::runtime::drain::note_store_route(
+                    "wbdebt_gva_superseded_by_provider_landing",
+                );
+            }
+        }
         let span = u64::from(c0.row_stride).saturating_mul(u64::from(ch));
         let pages = crate::runtime::gva_mem::task_gva_page_gpas(
             host,
