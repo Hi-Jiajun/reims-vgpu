@@ -900,6 +900,10 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // out of the engine's own registry and states them here — the shape
         // [`inputs_held_with_source`] drives.
         resident_source_bytes: None,
+        // R25: no predecessor's frame is handed over unless a test states the
+        // bytes the walk carries — the shape
+        // [`inputs_held_with_chain_value`] drives.
+        chain_middle_source_bytes: None,
         vertex_attribute_locations: &stages.vertex_attribute_locations,
         vertex_stage_buffer_declarations: &stages.vertex_stage_buffer_declarations,
         fragment_stage_buffer_declarations: &stages.fragment_stage_buffer_declarations,
@@ -951,6 +955,25 @@ fn inputs_held_with_source<'a>(
 ) -> RenderRailInputs<'a> {
     RenderRailInputs {
         resident_source_bytes: Some(source),
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_held`] with the frame the record *before* this one produced handed
+/// over as bytes (R25).
+///
+/// The other half of the production seam's answer: the exec walk carries each
+/// record's frame to the record after it, and a middle's previous contents are
+/// that frame. The class states the contract's trace-owned `Load` arm for it
+/// (`LoadOp::Load`), exactly as it does for the frame R23's caller reads out of
+/// the engine's registry.
+fn inputs_held_with_chain_value<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    value: &'a [u8],
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        chain_middle_source_bytes: Some(value),
         ..inputs_held(stages, role)
     }
 }
@@ -1136,6 +1159,58 @@ fn assert_texel_count(label: &str, pixels: &[u8]) {
         (width * height * 4) as usize,
         "{label}: the attachment's whole extent has to come back"
     );
+}
+
+/// One texel as each rail's frame carried it, as the comparison helpers report
+/// a disagreement.
+type TexelPair = ([u8; 4], [u8; 4]);
+
+/// Two rails' *drawn* texels, compared within the one rounding step the eight
+/// bit conversion carries (`assert_texel_near`'s tolerance, with a message that
+/// names the first offending texel rather than printing two whole buffers).
+///
+/// The step is not slack: a fragment output of `0.5` is a tie in the eight-bit
+/// conversion and Vulkan leaves that last bit to the implementation, so the two
+/// rails' pipelines may round it either way. Every byte a record did *not* draw
+/// is asserted byte-exact instead.
+fn assert_frames_within_a_step(label: &str, provider: &[u8], engine: &[u8]) {
+    assert_eq!(
+        provider.len(),
+        engine.len(),
+        "{label}: the two frames are the attachment's whole extent"
+    );
+    let (width, _) = extent();
+    assert_eq!(provider.len() % 4, 0);
+    let mut differing = 0usize;
+    let mut first: Option<((u32, u32), TexelPair)> = None;
+    for (index, (out, kept)) in provider
+        .chunks_exact(4)
+        .zip(engine.chunks_exact(4))
+        .enumerate()
+    {
+        let within_a_step =
+            (0..4).all(|channel| (i32::from(out[channel]) - i32::from(kept[channel])).abs() <= 1);
+        if within_a_step {
+            continue;
+        }
+        differing += 1;
+        if first.is_none() {
+            first = Some((
+                (index as u32 % width, index as u32 / width),
+                (
+                    [out[0], out[1], out[2], out[3]],
+                    [kept[0], kept[1], kept[2], kept[3]],
+                ),
+            ));
+        }
+    }
+    if let Some((texel, (out, kept))) = first {
+        panic!(
+            "{label}: {differing} of {} texels differ by more than a rounding step; the first \
+             is at {texel:?}: provider {out:?} against the engine's {kept:?}",
+            provider.len() / 4,
+        );
+    }
 }
 
 /// One texel of a readback, in the attachment's own physical order.
@@ -2761,6 +2836,35 @@ fn surface_identity(id: u32) -> engine::TargetIdentity {
     }
 }
 
+/// [`surface_identity`] at the format census v18's `chain_middle` shapes state:
+/// every one of the 657 records is `fmt=0x50`, the guest's scanout order.
+fn scanout_surface_identity(id: u32) -> engine::TargetIdentity {
+    let (width, height) = extent();
+    engine::TargetIdentity::Surface {
+        id,
+        width,
+        height,
+        generation: 1,
+        format: ash::vk::Format::B8G8R8A8_UNORM,
+    }
+}
+
+/// The walk's chain value in the attachment's own order — what the seam's
+/// `chain_middle_source_frame` hands the class for a scanout-order attachment
+/// (R25).
+///
+/// `encode_draw_chain` hands the walk every chain value in `SeedOrder::Rgba8`,
+/// and the canonical attachment uploads the caller's bytes verbatim into the
+/// view its pass declares, so the frame crosses that order boundary in the one
+/// place the engine crosses it too (`write_staging_swap_rb`).
+fn scanout_order(seed: &[u8]) -> Vec<u8> {
+    let mut bytes = seed.to_vec();
+    for texel in bytes.chunks_exact_mut(4) {
+        texel.swap(0, 2);
+    }
+    bytes
+}
+
 /// The same identity at the **wide** attachment's format.
 ///
 /// The engine's resident image is created from the request's attachment, while
@@ -3487,6 +3591,317 @@ fn the_chains_frame_the_engine_holds_carries_the_record_into_the_provider() {
             "bytes that are not the attachment's extent keep the record on the engine: {reason}"
         ),
         other => panic!("a short carried frame is not the held class's: {other:?}"),
+    }
+}
+
+/// R25's own seed colour: an eight-bit colour whose first and third channels
+/// differ, so a rail that handed the pass the walk's bytes in the wrong order
+/// lands a *different* texel. The fragment's own texel and a colour like green
+/// are symmetric under that exchange and would read the same either way.
+const WALK_SEED_TEXEL: [u8; 4] = [17, 34, 51, 255];
+
+/// R25: the frame the *walk* carries, handed over as bytes.
+///
+/// Census v18's fourth bucket is this shape — `chain_middle`, 657 records
+/// (8.0 %), every one of them `fmt=0x50 load=Load wb=0 skip=resident store=1
+/// seed=bytes continues=1`. The record is the packet's *middle*: it begins from
+/// the frame the record before it produced, and that frame is the exec walk's
+/// own chain value — `encode_draw_chain` normalizes both rails' chain values to
+/// `SeedOrder::Rgba8` and the walk hands them on as the request's
+/// `target_rgba8`. R7b's arm cannot name it (no provider pass stored an image
+/// under the attachment's identity), so the class carries it the same way R23
+/// carries the engine's: the caller — the walk — hands the frame over, and the
+/// pass states the contract's trace-owned `Load`.
+///
+/// The comparison is the engine's own answer for the same record from the same
+/// previous contents: a middle keeps its frame in its resident on the engine,
+/// so the engine's frame is read back out of the identity the record names.
+#[test]
+fn the_chain_value_the_walk_carries_reaches_the_provider() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let half = half_of(width);
+
+    // The census's own shape: the scanout-order attachment (`fmt=0x50`), the
+    // identity the record names, and the resident-store pair a record whose
+    // readback is withheld carries.
+    let identity = scanout_surface_identity(0x7c_00_01);
+    // The frame the record before this one produced, as the walk holds it:
+    // semantic RGBA8, in one colour the fragment stage never draws and whose
+    // channels are not symmetric under the order exchange, so neither "the pass
+    // cleared instead" nor "the bytes went in un-exchanged" can pass as "the
+    // walk's bytes were carried".
+    let mut seed = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for _ in 0..(width * height) {
+        seed.extend_from_slice(&WALK_SEED_TEXEL);
+    }
+    let middle_request = || {
+        let mut middle = request_with_streams(MTL_FORMAT_BGRA8_UNORM, &position_streams());
+        middle.target_identity = Some(identity.clone());
+        middle.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        middle.target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
+        middle.skip_readback = true;
+        middle.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        middle.continues_render_pass = true;
+        middle.render_pass_continues = true;
+        middle.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        middle
+    };
+
+    // 1. Without the hand-over: exactly what census v18 counts under
+    //    `chain_middle`.
+    let bucket_before = route_count("render_provider_out_of_class_chain_middle");
+    match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::Middle),
+        &middle_request(),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_chain_middle",
+            "a middle the caller hands nothing to stays on the engine: {reason}"
+        ),
+        other => panic!("a source-less chain middle is not the class's: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_chain_middle") - bucket_before,
+        1,
+        "the refusal is counted under the census's own bucket vocabulary"
+    );
+    // The sentence a census reader joins that bucket to, verbatim.
+    let refusal = match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::Middle),
+        &middle_request(),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => reason.detail().to_owned(),
+        other => panic!("the source-less middle is refused twice the same way: {other:?}"),
+    };
+    eprintln!("R25 refusal, verbatim: {refusal}");
+    assert!(
+        refusal.contains(
+            "a record in the middle of a multi-record packet stays on the engine while the \
+             caller does not hand it the frame the record before it produced"
+        ),
+        "the sentence names the half the caller lacks: {refusal}"
+    );
+
+    // 2. The bytes the seam hands over: the walk's chain value in the
+    //    attachment's own order (`chain_middle_source_frame` folds the
+    //    `SeedOrder::Rgba8` seed into the view the pass declares).
+    let handed = scanout_order(&seed);
+    assert_eq!(handed.len(), seed.len());
+
+    // 3. The middle, with the frame handed over: in class, answered by the
+    //    provider, and published — this caller cannot fetch a frame the rail
+    //    keeps (R20's arm, unchanged) — while the pass begins from the
+    //    caller's bytes. The four names R20/R23 must leave at zero are read
+    //    off the fail log's own new tail, the way the census reads them.
+    let log_before = std::fs::read_to_string(reims_vgpu_observe::fail_log_path())
+        .unwrap_or_default()
+        .len();
+    let published_before = route_count("render_provider_publish_held_resident");
+    let carried_before = route_count("render_provider_chain_middle_source_bytes");
+    let source_before = route_count("render_provider_resident_source_bytes");
+    let stores_before = route_count("render_provider_resident_store");
+    let loads_before = route_count("render_provider_resident_load");
+    let provider_middle = match provider_render::submit_render(
+        &inputs_held_with_chain_value(&stages, RenderChainRole::Middle, &handed),
+        &middle_request(),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => {
+            assert!(out.bgra, "a Bgra8Unorm attachment reads back in BGRA order");
+            semantic_rgba(out.bytes, out.bgra)
+        }
+        other => panic!("a middle whose frame the walk carries is in class: {other:?}"),
+    };
+    assert_texel_count("published middle frame", &provider_middle);
+    assert_texel_near(
+        "published middle: the last texel inside the rectangle",
+        texel_at(&provider_middle, half_of(half) - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    for x in half..width {
+        assert_eq!(
+            texel_at(&provider_middle, x, height / 2),
+            WALK_SEED_TEXEL,
+            "texel ({x}, {}) keeps the frame the walk handed over: a channel that uploaded the \
+             wrong bytes, cleared, or seeded from the free-running order would land another \
+             colour here",
+            height / 2,
+        );
+    }
+
+    // 4. The engine's own answer for the same middle record from the same
+    //    previous contents. A middle keeps its frame in the resident the record
+    //    names, so the engine's frame is read back out of that resident; the
+    //    provider wrote nothing into it (the class's byte arms ride the pooled
+    //    pair), so the two frames are two rails' answers to one record.
+    let Some(engine_middle) = engine_pixels("engine middle", &stages, middle_request()) else {
+        return;
+    };
+    assert!(
+        engine_middle.is_empty(),
+        "a resident middle publishes nothing on the engine either"
+    );
+    let engine_kept = engine_chain_semantic(&identity);
+    assert_texel_count("engine middle frame", &engine_kept);
+    eprintln!(
+        "R25 carried chain value: identity={:?}; handed over {} bytes; provider published {} \
+         bytes; engine kept {} bytes; texel at the scissor edge [{},{},{}], outside [{},{},{}]; \
+         chain_middle_source_bytes +{}; publish_held_resident +{}; resident_source_bytes +{}; \
+         resident_store +{}; resident_load +{}",
+        identity,
+        handed.len(),
+        provider_middle.len(),
+        engine_kept.len(),
+        texel_at(&provider_middle, half_of(half) - 1, height / 2)[0],
+        texel_at(&provider_middle, half_of(half) - 1, height / 2)[1],
+        texel_at(&provider_middle, half_of(half) - 1, height / 2)[2],
+        texel_at(&provider_middle, width - 1, height / 2)[0],
+        texel_at(&provider_middle, width - 1, height / 2)[1],
+        texel_at(&provider_middle, width - 1, height / 2)[2],
+        route_count("render_provider_chain_middle_source_bytes") - carried_before,
+        route_count("render_provider_publish_held_resident") - published_before,
+        route_count("render_provider_resident_source_bytes") - source_before,
+        route_count("render_provider_resident_store") - stores_before,
+        route_count("render_provider_resident_load") - loads_before,
+    );
+    // The half the record did not draw is byte-exact on both rails: the pass
+    // began from the walk's bytes and neither rail converts them. The drawn
+    // half is compared within the eight-bit rounding step instead — the
+    // fragment's `0.5` is a tie in that conversion and Vulkan leaves its last
+    // bit to the implementation, which the two rails' pipelines state
+    // differently on this attachment. The whole-frame byte-exact reading is the
+    // no-draw control below, where the carried frame *is* the whole frame.
+    let (row_bytes, drawn_bytes) = ((width * 4) as usize, (half * 4) as usize);
+    for y in 0..height {
+        let row = row_bytes * y as usize;
+        assert_frames_equal(
+            &format!("the walk's frame in row {y}"),
+            &provider_middle[row + drawn_bytes..row + row_bytes],
+            &engine_kept[row + drawn_bytes..row + row_bytes],
+        );
+    }
+    assert_frames_within_a_step(
+        "the middle's drawn texels beside the frame it kept",
+        &provider_middle,
+        &engine_kept,
+    );
+    assert_eq!(
+        route_count("render_provider_chain_middle_source_bytes") - carried_before,
+        1,
+        "the middle's carried frame is counted under its own arm"
+    );
+    assert_eq!(
+        route_count("render_provider_publish_held_resident") - published_before,
+        1,
+        "the record's own frame is published, never kept"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_source_bytes") - source_before,
+        0,
+        "R23's counter names the frame the engine's registry holds, and this record's frame is \
+         the walk's — the two arms are two numbers"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_store") - stores_before,
+        0,
+        "no frame stays in an image this caller cannot read"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_load") - loads_before,
+        0,
+        "the pass began from the caller's bytes, not from a resident load"
+    );
+    // The four names census v18 read as zero on both sinks stay quiet here.
+    let log = std::fs::read_to_string(reims_vgpu_observe::fail_log_path()).expect("fail log");
+    let fresh = &log[log_before.min(log.len())..];
+    for name in [
+        "chain_resident_land_fail",
+        "load_target_content_not_ready",
+        "draws_skipped_after_engine_refusal",
+        "vk_engine_target_read",
+    ] {
+        assert!(
+            !fresh.contains(name),
+            "the middle's answer must leave `{name}` at zero — the frame travels as the \
+             caller's bytes and nothing is kept: {fresh}"
+        );
+    }
+
+    // 5. A middle whose stream rasterizes nothing: the whole frame *is* the
+    //    frame the walk carried, so the two rails' frames are byte-exact over
+    //    the whole attachment — the arm's own claim with no rendering step in
+    //    between, and the literal reading of "both rails' frames agree byte for
+    //    byte".
+    let still_identity = scanout_surface_identity(0x7c_00_02);
+    let still_request = || {
+        let mut still = request_with_streams(MTL_FORMAT_BGRA8_UNORM, &[degenerate_stream()]);
+        still.target_identity = Some(still_identity.clone());
+        still.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        still.target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
+        still.skip_readback = true;
+        still.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        still.continues_render_pass = true;
+        still
+    };
+    let provider_still = match provider_render::submit_render(
+        &inputs_held_with_chain_value(&stages, RenderChainRole::Middle, &handed),
+        &still_request(),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("a middle that draws nothing is in class: {other:?}"),
+    };
+    let Some(engine_still) = engine_pixels("engine still middle", &stages, still_request()) else {
+        return;
+    };
+    assert!(
+        engine_still.is_empty(),
+        "a resident middle publishes nothing on the engine either"
+    );
+    let engine_still_kept = engine_chain_semantic(&still_identity);
+    eprintln!(
+        "R25 carried chain value, whole frame: provider {} bytes, engine {} bytes, the walk's \
+         frame {} bytes",
+        provider_still.len(),
+        engine_still_kept.len(),
+        seed.len(),
+    );
+    assert_frames_equal(
+        "the frame the provider published from the walk's bytes and the frame the engine kept \
+         after the same record",
+        &provider_still,
+        &engine_still_kept,
+    );
+    assert_frames_equal(
+        "the whole frame a record that draws nothing publishes is the frame the walk carried",
+        &provider_still,
+        &seed,
+    );
+
+    // 6. A caller that hands over bytes of the wrong extent is a wiring bug
+    //    named as one, not a provider decline: the class keeps the record on
+    //    the engine under its own slug.
+    let short = &handed[..handed.len() - 4];
+    match provider_render::submit_render(
+        &inputs_held_with_chain_value(&stages, RenderChainRole::Middle, short),
+        &middle_request(),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("R25 short hand-over, verbatim: {}", reason.detail());
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_chain_middle_shape",
+                "bytes that are not the attachment's extent keep the record on the engine: \
+                 {reason}"
+            );
+        }
+        other => panic!("a short carried chain value is not the class's: {other:?}"),
     }
 }
 
