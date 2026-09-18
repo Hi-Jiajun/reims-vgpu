@@ -179,6 +179,7 @@
 //!   arm), which differs from its answer wherever the shader reads a texel this
 //!   pass has already written, so the shape keeps its own name and its frame is
 //!   never read.
+//!   Frozen boundary (census v29: 550 records; engine arm: sampled_self_feedback_loop). Reopen only with a native oracle.
 //! - **the attachment's own blend state** (R10, `research/docs/23` §100): a
 //!   blend the canonical pass can state *and* the command channel's v40 section
 //!   carries (blending enabled, one operation for both channel pairs, every
