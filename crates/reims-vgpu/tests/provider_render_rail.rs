@@ -12971,6 +12971,225 @@ fn the_states_beside_the_widened_runtime_sampler_family_stay_on_the_engine_by_na
     assert_eq!(slug, "render_provider_out_of_class_texture_state");
 }
 
+/// R43: which axis of the runtime sampler's state a refusal is charged to.
+///
+/// Census v36's `texture_state` bucket (356 records, 178 seam events, every one
+/// of them `[[sampler(0)]]` at device binding 160) is refused by a sentence
+/// that cannot name the axis it read: `request_sampler_policy` loses the value
+/// it refused on before the words are built. This walk is what makes the
+/// reading `r_texture_state_recon` asked for
+/// (`.agents/tasks/root/r_texture_state_recon-report.md` §5) a reading rather
+/// than a claim:
+///
+/// - **one negative per axis**: that axis' count moves by exactly one, the
+///   other five do not, and *the sentence is the same one for all of them* —
+///   the sentence does not carry the answer, which is the reason this probe
+///   exists at all;
+/// - **one positive inside the family**: the widest state the class states
+///   charges none of the counts;
+/// - **the three axes the seam log cannot print** (`address_mode_w`, the
+///   comparison, the anisotropy) charge their raw value beside the axis, so
+///   this walk reads those too;
+/// - **the seventh reading's two shapes**: a value past the family's table
+///   (`MTLSamplerAddressMode` 6, `MTLSamplerMinMagFilter` 2) and the one member
+///   the family refuses by name (`clampToBorderColor`, whose border colour is a
+///   state of its own), each charged to the field it was read out of.
+///
+/// The sentence is pinned here byte for byte. That is the probe's contract
+/// with the gate it reads: slug, family and short-circuit order are the ones
+/// the class shipped, and the only thing that moves is a count.
+#[test]
+fn the_runtime_sampler_state_refusals_are_counted_by_the_axis_that_read_them() {
+    let _guard = engine_test_session();
+    let stages = runtime_sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    use reims_vgpu::protocol::sampler as mtl;
+    let nearest = mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+    let linear = mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR;
+    let not_mipmapped = mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED;
+    let mirror_repeat = mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT;
+    let clamp_to_edge = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    let area = |filter: u32, mip: u32, address: u32| {
+        widened_runtime_sampled_request(
+            &stages,
+            texels.clone(),
+            (width, height),
+            filter,
+            mip,
+            address,
+        )
+    };
+
+    /// The sentence this door answers with, as `request_sampler_policy`'s
+    /// caller builds it for the runtime half at device binding 160. The axis
+    /// that refused is deliberately absent from it.
+    const SENTENCE: &str = "a draw whose runtime sampler at `[[sampler(0)]]` is outside the \
+                            family the canonical rail creates stays on the engine: the canonical \
+                            `VkSampler` is created from nearest or linear filtering under one of \
+                            the three mip filters, with one address mode on all three axes \
+                            (clamped, mirror-clamped, repeated, mirror-repeated or clamped to \
+                            zero), normalized coordinates, no comparison and no anisotropy, and \
+                            the bind at device binding 160 states another filter, another mip \
+                            filter, another address mode, unnormalized coordinates, a comparison \
+                            or anisotropy";
+
+    /// The six axes in the order `sampler_state_route` names them; the index is
+    /// what each case below asserts moves.
+    const AXES: [&str; 6] = [
+        "render_provider_texture_state_min_mag",
+        "render_provider_texture_state_address",
+        "render_provider_texture_state_mip",
+        "render_provider_texture_state_coordinates",
+        "render_provider_texture_state_compare",
+        "render_provider_texture_state_anisotropy",
+    ];
+    /// The raw values of the three axes the seam log never prints, in the order
+    /// the value counts are read below.
+    const VALUES: [&str; 4] = [
+        "render_provider_texture_state_address_w_records",
+        "render_provider_texture_state_address_w_value",
+        "render_provider_texture_state_compare_value",
+        "render_provider_texture_state_anisotropy_value",
+    ];
+    let axis_counts = || AXES.map(route_count);
+    let value_counts = || VALUES.map(route_count);
+
+    let mut disagreeing = area(nearest, not_mipmapped, mirror_repeat);
+    disagreeing.samplers[0].mag_filter = linear;
+    let mut split_axes = area(nearest, not_mipmapped, mirror_repeat);
+    split_axes.samplers[0].address_mode_v = clamp_to_edge;
+    let mut unnormalized = area(nearest, not_mipmapped, mirror_repeat);
+    unnormalized.samplers[0].unnormalized_coordinates = true;
+    let mut comparing = area(nearest, not_mipmapped, mirror_repeat);
+    comparing.samplers[0].compare_function = engine::SamplerCompareFunction::Less;
+    let mut anisotropic = area(nearest, not_mipmapped, mirror_repeat);
+    anisotropic.samplers[0].max_anisotropy = 4;
+
+    // (label, the axis index that moves, the value-count deltas, the request)
+    let cases: [(&str, usize, [u64; 4], DrawRequest); 9] = [
+        ("min_mag", 0, [0, 0, 0, 0], disagreeing),
+        (
+            "address",
+            1,
+            // `address_mode_w` is the shared mirror-repeat (3), and one record
+            // contributes it: the sum is the raw value, the companion is the
+            // divisor that keeps a clamp-to-edge (0) contributor visible.
+            [1, u64::from(mirror_repeat), 0, 0],
+            split_axes,
+        ),
+        // The mip filter names no mip mode the family creates: with `min ==
+        // mag` read first this is the mip axis and not an ordinal.
+        ("mip", 2, [0, 0, 0, 0], area(nearest, 5, mirror_repeat)),
+        ("coordinates", 3, [0, 0, 0, 0], unnormalized),
+        (
+            "compare",
+            4,
+            // `MTLCompareFunction::less` is ordinal 1.
+            [0, 0, 1, 0],
+            comparing,
+        ),
+        ("anisotropy", 5, [0, 0, 0, 4], anisotropic),
+        // The two ordinals that name no member of their own enumeration: a
+        // min/mag filter past `linear` (0/1) and an `MTLSamplerAddressMode`
+        // past `clampToZero` (4). Both are charged to the field they were read
+        // out of, since an ordinal is the absence of a member and not an axis.
+        (
+            "ordinal(min_mag)",
+            0,
+            [0, 0, 0, 0],
+            area(2, not_mipmapped, mirror_repeat),
+        ),
+        (
+            "ordinal(address)",
+            1,
+            // The same six, read as the W axis' own raw value.
+            [1, 6, 0, 0],
+            area(nearest, not_mipmapped, 6),
+        ),
+        // The one member of `MTLSamplerAddressMode` the family refuses *by
+        // name* (`clampToBorderColor`, ordinal 5): its border colour is a state
+        // of its own, so the field it was read out of is the address axis all
+        // the same, and the raw value travels beside it.
+        (
+            "clamp-to-border-colour",
+            1,
+            [1, 5, 0, 0],
+            area(
+                nearest,
+                not_mipmapped,
+                mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR,
+            ),
+        ),
+    ];
+
+    for (label, axis, value_deltas, request) in cases {
+        let before = axis_counts();
+        let values_before = value_counts();
+        let sentence = match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_texture_state",
+                    "{label}: the state is refused at the sampler's own door"
+                );
+                reason.detail().to_owned()
+            }
+            other => panic!("{label}: the state is out of class: {other:?}"),
+        };
+        let after = axis_counts();
+        eprintln!("axis {label} -> {sentence}");
+        assert_eq!(
+            sentence, SENTENCE,
+            "{label}: the sentence does not carry the axis, byte for byte"
+        );
+        for (index, name) in AXES.iter().enumerate() {
+            assert_eq!(
+                after[index] - before[index],
+                u64::from(index == axis),
+                "{label}: {name} is the count that answers this axis"
+            );
+        }
+        let values_after = value_counts();
+        for (index, name) in VALUES.iter().enumerate() {
+            assert_eq!(
+                values_after[index] - values_before[index],
+                value_deltas[index],
+                "{label}: {name} carries the raw value beside the axis"
+            );
+        }
+    }
+
+    // The positive control: the widest state the class states — linear under
+    // the linear mip filter, clamped to zero on all three axes — is answered by
+    // the provider and charges none of the eight counts. Without it, "the axis
+    // moved" would be indistinguishable from "this door charges on every draw".
+    let in_class = area(
+        linear,
+        mtl::MTL_SAMPLER_MIP_FILTER_LINEAR,
+        mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO,
+    );
+    let axes_before = axis_counts();
+    let values_before = value_counts();
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &in_class) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("the widest state the class states is in the class: {other:?}"),
+    }
+    assert_eq!(
+        axis_counts(),
+        axes_before,
+        "a state inside the family charges no axis"
+    );
+    assert_eq!(
+        value_counts(),
+        values_before,
+        "a state inside the family charges no value"
+    );
+}
+
 /// R15: the fetch-only declarations, read back off the fixture's own
 /// translation (`research/docs/23` §3.3, v105).
 ///

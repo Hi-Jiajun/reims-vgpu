@@ -2424,7 +2424,12 @@ fn sampled_textures<'a>(
                         ),
                     ));
                 };
-                let policy = request_sampler_policy(bound).ok_or_else(|| {
+                let policy = request_sampler_policy(bound).map_err(|axis| {
+                    // The one reading this refusal cannot carry in its own
+                    // words: which axis read it (`note_sampler_state_refusal`).
+                    // Charged here, beside a sentence and a slug that do not
+                    // move.
+                    note_sampler_state_refusal(bound, axis);
                     OutOfClass::owned(
                         "render_provider_out_of_class_texture_state",
                         format!(
@@ -2957,7 +2962,13 @@ fn sampled_textures<'a>(
                     ),
                 ));
             };
-            let bound = request_sampler_policy(bound).ok_or_else(|| {
+            let bound = request_sampler_policy(bound).map_err(|axis| {
+                // The static half of the same door reads the same six axes off
+                // the same function, and charges them the same way: the two
+                // sites share a slug and a sentence, so their readings have to
+                // be one set of counts (census v36 has never seen this half
+                // answer — the runtime half is the sentence that fires).
+                note_sampler_state_refusal(bound, axis);
                 OutOfClass::owned(
                     "render_provider_out_of_class_texture_state",
                     format!(
@@ -3046,8 +3057,177 @@ fn sampled_textures<'a>(
     })
 }
 
-/// One bound sampler resource in the canonical policy's own two fields, or
-/// `None` when the state is outside the family the canonical rail creates.
+/// Which axis of a runtime sampler's state keeps a draw on the engine.
+///
+/// The words [`request_sampler_policy`] refuses under are the same for every
+/// axis — that is the whole of the reading census v36's `texture_state` bucket
+/// leaves open: 178 seam records name `[[sampler(0)]]` at device binding 160
+/// and the sentence cannot say which field put them outside the family, so a
+/// widening has no way to tell "answer this axis" from "answer this axis and
+/// be refused by the next one". The axis is therefore read where the values
+/// are still in hand, and charged beside the refusal as a `store_routes` count
+/// ([`sampler_state_route`]) rather than written into the sentence: the
+/// sentence stays byte-for-byte the one this gate shipped.
+///
+/// The first six names are the six fields the family reads, in the order the
+/// function reads them. [`SamplerStateAxis::Ordinal`] is the seventh reading —
+/// a value that names no state the family's own table creates — and it has no
+/// count of its own: it is charged to the field it was read out of
+/// ([`sampler_state_route`]), so the six counts still tile this door.
+///
+/// # What each axis is
+///
+/// - [`SamplerStateAxis::MinMag`] — `min_filter != mag_filter`;
+/// - [`SamplerStateAxis::Address`] — the three address axes do not state one
+///   mode (`address_mode_u`, `_v` and `_w` disagree);
+/// - [`SamplerStateAxis::Mip`] — the mip filter names no mip mode the family
+///   creates (with `min == mag` already read, that is the only way the
+///   `(min, mip)` table can miss for a member's ordinal — a min/mag ordinal
+///   off its table lands on [`SamplerOrdinal::MinMag`] instead);
+/// - [`SamplerStateAxis::Coordinates`] — `unnormalizedCoordinates`, the axis
+///   census v36's bucket is expected to be made of;
+/// - [`SamplerStateAxis::Compare`] — a comparison function the family's state
+///   does not name;
+/// - [`SamplerStateAxis::Anisotropy`] — `maxAnisotropy != 1`;
+/// - [`SamplerStateAxis::Ordinal`] — a value that names no state the family's
+///   own table creates, which has two shapes: a member the family refuses by
+///   name (`MTLSamplerAddressMode::clampToBorderColor`, whose border colour is
+///   a state of its own) and a value past the enumeration altogether (an
+///   `MTLSamplerAddressMode` past `clampToZero`, or a min/mag filter past
+///   `linear`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SamplerStateAxis {
+    MinMag,
+    Address,
+    Mip,
+    Coordinates,
+    Compare,
+    Anisotropy,
+    Ordinal(SamplerOrdinal),
+}
+
+/// The field a [`SamplerStateAxis::Ordinal`] refusal was read out of: which of
+/// the six counts beside the refusal it is charged to.
+///
+/// A value outside the family's own table is the *absence* of a state rather
+/// than an axis of the state, so it has no count of its own and is attributed
+/// to the field it was read out of. The mip filter is not a field here: its
+/// own axis ([`SamplerStateAxis::Mip`]) already means "this value names no mip
+/// mode".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SamplerOrdinal {
+    /// `MTLSamplerMinMagFilter` (`min_filter`, which equals `mag_filter`).
+    MinMag,
+    /// `MTLSamplerAddressMode` (`address_mode_u`) — either the one member the
+    /// family refuses by name, or a value past the enumeration.
+    Address,
+}
+
+impl SamplerStateAxis {
+    /// The axis a `(min, mip)` pair that names no filter the family creates is
+    /// charged to.
+    ///
+    /// `min == mag` has already been read when this is asked, so the pair can
+    /// only miss for two reasons: the shared min/mag ordinal names no member
+    /// of `MTLSamplerMinMagFilter`, or the mip ordinal names none of the three
+    /// mip modes. The first is an ordinal and the second is the mip axis, and
+    /// the shared ordinal is the one the table below cannot see — one lookup
+    /// against the two members of the min/mag enumeration tells them apart.
+    fn filter_ordinal(min_filter: u32) -> Self {
+        use crate::protocol::sampler::{
+            MTL_SAMPLER_MIN_MAG_FILTER_LINEAR, MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+        };
+        match min_filter {
+            MTL_SAMPLER_MIN_MAG_FILTER_NEAREST | MTL_SAMPLER_MIN_MAG_FILTER_LINEAR => Self::Mip,
+            _ => Self::Ordinal(SamplerOrdinal::MinMag),
+        }
+    }
+}
+
+/// The `store_routes` name one refusal on `axis` is charged to.
+///
+/// Six names, one per field the family reads; the seventh axis
+/// ([`SamplerStateAxis::Ordinal`]) is charged to the field it was read out of,
+/// so `min_mag + address + mip + coordinates + compare + anisotropy` is
+/// exactly the records this door refuses — the reading the bucket's next
+/// census is waiting for.
+///
+/// The names are the bucket's own (`render_provider_out_of_class_texture_state`)
+/// without the `out_of_class` marker, as R39's and R41's probes named theirs: a
+/// count named under that prefix would be read back as a class-exit bucket of
+/// its own (`tools/census/py/census_summary.py`, `class_exit_buckets`), and a
+/// probe is not a boundary the census's coverage counts.
+fn sampler_state_route(axis: SamplerStateAxis) -> &'static str {
+    match axis {
+        SamplerStateAxis::MinMag | SamplerStateAxis::Ordinal(SamplerOrdinal::MinMag) => {
+            "render_provider_texture_state_min_mag"
+        }
+        SamplerStateAxis::Address | SamplerStateAxis::Ordinal(SamplerOrdinal::Address) => {
+            "render_provider_texture_state_address"
+        }
+        SamplerStateAxis::Mip => "render_provider_texture_state_mip",
+        SamplerStateAxis::Coordinates => "render_provider_texture_state_coordinates",
+        SamplerStateAxis::Compare => "render_provider_texture_state_compare",
+        SamplerStateAxis::Anisotropy => "render_provider_texture_state_anisotropy",
+    }
+}
+
+/// Charge one refusal of [`request_sampler_policy`]: the axis' own count, and
+/// the raw values of the three axes the census's sentence never prints.
+///
+/// `address_mode_w`, `compare_function` and `max_anisotropy` are the fields the
+/// 2026-09-19 recon could not read out of the seam log at all — the engine's
+/// own `sampler_unnormalized` line carries `address_u` and `address_v`, the
+/// third axis and the two comparison fields do not. The sentence cannot carry
+/// them (it is byte-for-byte the one the gate shipped, which is exactly why
+/// this probe exists), so they travel as counts beside the axis:
+///
+/// - `..._state_address_w_value` is the **sum** of `address_mode_w` over the
+///   refusals charged to the address axis, and `..._state_address_w_records`
+///   counts those refusals, so the mean is the first divided by the second.
+///   The companion is needed because a sum cannot tell a `clampToEdge`
+///   (`MTLSamplerAddressMode` 0) contributor from a missing one:
+///   [`note_store_route_n`] skips a zero increment, the same way
+///   `..._load_seed_bytes` is read beside `..._load_seed_runs`;
+/// - `..._state_compare_value` and `..._state_anisotropy_value` are the sums
+///   of the comparison ordinal and of `maxAnisotropy`; their counts are the
+///   axis counts themselves, since neither axis answers below 1.
+///
+/// The values are charged *beside* the axis count and never instead of it: the
+/// six axis counts stay a tile of this door on their own.
+///
+/// [`note_store_route_n`]: crate::runtime::drain::note_store_route_n
+fn note_sampler_state_refusal(
+    sampler: &crate::backend::vulkan::engine::SamplerResource,
+    axis: SamplerStateAxis,
+) {
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
+    note_store_route(sampler_state_route(axis));
+    match axis {
+        SamplerStateAxis::Address | SamplerStateAxis::Ordinal(SamplerOrdinal::Address) => {
+            note_store_route("render_provider_texture_state_address_w_records");
+            note_store_route_n(
+                "render_provider_texture_state_address_w_value",
+                u64::from(sampler.address_mode_w),
+            );
+        }
+        SamplerStateAxis::Compare => note_store_route_n(
+            "render_provider_texture_state_compare_value",
+            u64::from(sampler.compare_function.mtl_ordinal()),
+        ),
+        SamplerStateAxis::Anisotropy => note_store_route_n(
+            "render_provider_texture_state_anisotropy_value",
+            u64::from(sampler.max_anisotropy),
+        ),
+        SamplerStateAxis::MinMag
+        | SamplerStateAxis::Mip
+        | SamplerStateAxis::Coordinates
+        | SamplerStateAxis::Ordinal(SamplerOrdinal::MinMag) => {}
+    }
+}
+
+/// One bound sampler resource in the canonical policy's own two fields, or the
+/// axis the state is outside the family the canonical rail creates on.
 ///
 /// This is the request-side half of the rule E-RS1 landed on the canonical
 /// side (`static_sampler_policy`), at the widened family E-TX2 landed there
@@ -3066,7 +3246,7 @@ fn sampled_textures<'a>(
 /// colour the request never stated.
 fn request_sampler_policy(
     sampler: &crate::backend::vulkan::engine::SamplerResource,
-) -> Option<SamplerPolicy> {
+) -> Result<SamplerPolicy, SamplerStateAxis> {
     use crate::protocol::sampler::{
         MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO,
         MTL_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT,
@@ -3075,19 +3255,26 @@ fn request_sampler_policy(
         MTL_SAMPLER_MIP_FILTER_NEAREST, MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
     };
     use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
+    // The five conditions below are read in the order this gate has always
+    // read them, one `if` per axis so the refusal names the axis it read rather
+    // than only the family. The states they answer, the order they are asked
+    // in and the sentence a `Err` becomes are unchanged.
     if sampler.min_filter != sampler.mag_filter {
-        return None;
+        return Err(SamplerStateAxis::MinMag);
     }
     if sampler.address_mode_u != sampler.address_mode_v
         || sampler.address_mode_u != sampler.address_mode_w
     {
-        return None;
+        return Err(SamplerStateAxis::Address);
     }
-    if sampler.unnormalized_coordinates
-        || sampler.compare_function != crate::backend::vulkan::engine::SamplerCompareFunction::Never
-        || sampler.max_anisotropy != 1
-    {
-        return None;
+    if sampler.unnormalized_coordinates {
+        return Err(SamplerStateAxis::Coordinates);
+    }
+    if sampler.compare_function != crate::backend::vulkan::engine::SamplerCompareFunction::Never {
+        return Err(SamplerStateAxis::Compare);
+    }
+    if sampler.max_anisotropy != 1 {
+        return Err(SamplerStateAxis::Anisotropy);
     }
     let filter = match (sampler.min_filter, sampler.mip_filter) {
         (MTL_SAMPLER_MIN_MAG_FILTER_NEAREST, MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED) => {
@@ -3108,7 +3295,7 @@ fn request_sampler_policy(
         (MTL_SAMPLER_MIN_MAG_FILTER_LINEAR, MTL_SAMPLER_MIP_FILTER_LINEAR) => {
             SamplerFilter::LinearMipLinear
         }
-        _ => return None,
+        _ => return Err(SamplerStateAxis::filter_ordinal(sampler.min_filter)),
     };
     let address = match sampler.address_mode_u {
         MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE => SamplerAddressMode::ClampToEdge,
@@ -3116,9 +3303,9 @@ fn request_sampler_policy(
         MTL_SAMPLER_ADDRESS_MODE_REPEAT => SamplerAddressMode::Repeat,
         MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT => SamplerAddressMode::MirrorRepeat,
         MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO => SamplerAddressMode::ClampToZero,
-        _ => return None,
+        _ => return Err(SamplerStateAxis::Ordinal(SamplerOrdinal::Address)),
     };
-    Some(SamplerPolicy { filter, address })
+    Ok(SamplerPolicy { filter, address })
 }
 
 /// The blend state one request states as the canonical pass's own
