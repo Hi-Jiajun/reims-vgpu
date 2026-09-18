@@ -30,8 +30,8 @@ use metal_api_core::provider::{
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
-    RenderStage, SpirvFeaturePolicy, TranslatedRenderPipelineRequest, TranslatedRenderStage,
-    VulkanComputeProvider, VulkanExecutor,
+    RenderPipelineRequest, RenderStage, SpirvFeaturePolicy, TranslatedRenderPipelineRequest,
+    TranslatedRenderStage, VulkanComputeProvider, VulkanExecutor,
 };
 use reims_vgpu::backend::provider_owner::{self, Region};
 use reims_vgpu::backend::provider_render::{
@@ -16291,6 +16291,53 @@ fn the_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
          vertex-interface exit keeps R-VI1's own refusing arm on"
     );
 
+    // R40's bit, read the same way and out of the same frame: the extent rule's
+    // *other* arm. The declared arm is the device's own answer; the undeclared
+    // arm is a snapshot whose frame leaves the bit out entirely — the escape
+    // family E-TX9 opened, whose fourth in-family tag E-TX12 is
+    // (`metal-api-ipc`'s `CAPABILITY_RENDER_TEXTURE_GATHERED_EXTENT_NO_COPY_TAIL`,
+    // `0x00 0x04 <bool>`) — which is also what every frame written before the bit
+    // existed decodes as.
+    let no_copy = provider_wire::render_texture_gathered_extent_no_copy(
+        probe.device_epoch(),
+        &probe.capabilities(),
+    )
+    .expect("the capability answer encodes and decodes");
+    eprintln!("wire capability answer: supports_render_texture_gathered_extent_no_copy={no_copy}");
+    assert!(
+        no_copy,
+        "this device declares the owner's no-copy window of another extent: the canonical Vulkan \
+         rail reads it in place since E-TX12, without a host copy of the owner's mapping"
+    );
+    let mut unfetched = probe.capabilities();
+    unfetched.supports_render_texture_gathered_extent_no_copy = false;
+    let undeclared =
+        provider_wire::render_texture_gathered_extent_no_copy(probe.device_epoch(), &unfetched)
+            .expect("decode");
+    assert!(
+        !undeclared,
+        "a snapshot that does not declare the arm reads as undeclared, which is the answer the \
+         extent exit keeps R35's own refusing arm — and its sentence — on"
+    );
+    // The two arms are two declarations, not one read twice: clearing this bit
+    // leaves E-TX10's own reading exactly where it was, and clearing E-TX10's
+    // leaves this one alone. A consumer that read one bit for both would land
+    // one of the two shapes wrong on a device that states only one of them.
+    let mut only_no_copy = probe.capabilities();
+    only_no_copy.supports_render_texture_gathered_extent = false;
+    assert!(
+        provider_wire::render_texture_gathered_extent_no_copy(probe.device_epoch(), &only_no_copy)
+            .expect("decode"),
+        "the no-copy arm's declaration is its own"
+    );
+    let mut only_gathered = probe.capabilities();
+    only_gathered.supports_render_texture_gathered_extent_no_copy = false;
+    assert!(
+        provider_wire::render_texture_gathered_extent(probe.device_epoch(), &only_gathered)
+            .expect("decode"),
+        "and the host-gather arm's declaration is the other one's neighbour, not its shadow"
+    );
+
     // The population this increment does not touch: no declaration, no frame —
     // so those shapes keep the bytes (and the path) they had.
     let clean = reviewed_stages();
@@ -18677,8 +18724,11 @@ fn a_padded_gather_of_another_extent_is_answered_by_the_extent_rule() {
 /// as (`provider_render::override_render_texture_gathered_extent`). The
 /// declared arm on the same two host-bytes shapes is
 /// `a_host_bytes_source_of_another_extent_leaves_for_the_provider_when_the_device_declares_the_gather`,
-/// and the no-copy arm's own declared-device reading is
-/// `a_borrowed_source_of_another_extent_keeps_its_name_on_a_declaring_device`.
+/// and R40 gave the no-copy arm a bit of its own, so this reading leaves *both*
+/// arms undeclared: the borrow-shaped source keeps R35's answer, which is what
+/// a frame that states neither arm gives
+/// (`a_borrowed_source_of_another_extent_keeps_its_name_when_the_no_copy_bit_is_undeclared`
+/// is that arm against a frame that states the host gather alone).
 #[test]
 fn the_extent_refusal_counts_the_arm_the_source_would_state() {
     use reims_vgpu::backend::provider_compute::host_import_alignment;
@@ -18686,6 +18736,8 @@ fn the_extent_refusal_counts_the_arm_the_source_would_state() {
 
     let _guard = engine_test_session();
     let _undeclared = provider_render::override_render_texture_gathered_extent(Some(false));
+    let _no_copy_undeclared =
+        provider_render::override_render_texture_gathered_extent_no_copy(Some(false));
     let stages = sampled_stages();
     let (width, height) = (8u32, 4u32);
     let texels = sampled_texels(width, height);
@@ -19092,18 +19144,34 @@ fn a_host_bytes_source_of_another_extent_leaves_for_the_provider_when_the_device
     );
 }
 
-/// R37: the arm the bit does *not* cover keeps its refusal on the very device
-/// whose frame declares the gather.
+/// R40: the arm R37 left behind leaves for the provider on a device whose frame
+/// declares that it reads the owner's window in place.
 ///
-/// The one source the Vulkan rail cannot gather into the render area's own grid
-/// is the owner's no-copy window: E's window rule reads a texture at the
-/// reservation's own start, and a source of another extent would need a host
-/// copy that arm has no channel for. The bit is therefore asked by *arm* inside
-/// the walk and not by shape: on the same declaring device that admits the two
-/// host-bytes shapes above, this one keeps R35's slug, sentence, route and gate
-/// position, with nothing submitted.
+/// R35 split the extent refusal in two and R37 retired the half a rail gathers
+/// off the host. The other half is the owner's no-copy window — the one source
+/// E's window rule reads *without* host bytes — and E-TX10's bit deliberately
+/// does not cover it: that bit's own sentence says the host gather's bit must
+/// not be read as "the snapshot executes the owner's no-copy window". E-TX12
+/// answers the arm with code of its own and publishes it as a second bit,
+/// `ProviderCapabilities::supports_render_texture_gathered_extent_no_copy`,
+/// which this rail reads out of the provider's capability frame
+/// ([`provider_wire::render_texture_gathered_extent_no_copy`]) under the same
+/// shape test as R37's bit and weighs the no-copy arm against.
+///
+/// The reading is the frame, not the verdict: the fixture samples one fixed
+/// point of the 8x4 surface its module was lowered against — the centre of
+/// texel `(6, 3)` — and a 4x4 source answers its own texel `(3, 3)` through the
+/// sampler's nearest/clamp pair, because the canonical rail binds the window at
+/// the source's own extent exactly as it binds the trace's own bytes. The frame
+/// is therefore the frame R37's request-copy arm lands for the same texels, the
+/// two rails agree on it byte for byte, moving the source's own read texel moves
+/// it, and *nothing* is copied: the bind carries no host bytes for this arm, so
+/// a rail that gathered it to the host would be executing a shape the bit does
+/// not state.
 #[test]
-fn a_borrowed_source_of_another_extent_keeps_its_name_on_a_declaring_device() {
+fn a_borrowed_source_of_another_extent_leaves_for_the_provider_when_the_device_declares_the_no_copy_gather(
+) {
+    use reims_vgpu::backend::provider_compute::device_epoch;
     use reims_vgpu::backend::provider_compute::host_import_alignment;
     use reims_vgpu::runtime::guest_ram::GuestRamImport;
 
@@ -19111,12 +19179,222 @@ fn a_borrowed_source_of_another_extent_keeps_its_name_on_a_declaring_device() {
     let stages = sampled_stages();
     let (pass_width, pass_height) = (8u32, 4u32);
     let (view_width, view_height) = (4u32, 4u32);
-    let texels = sampled_texels(pass_width, pass_height);
+    let texels = sampled_texels(view_width, view_height);
+    // The texel the fixture's own fixed sample point reads of *this* source:
+    // the point is the centre of texel (6, 3) of the 8x4 surface the module was
+    // lowered against — `u = 6.5 / 8`, `v = 3.5 / 4` — and the sampler the
+    // module carries is nearest with clamp-to-edge addressing, so a 4x4 source
+    // answers its own texel (3, 3).
+    let (read_x, read_y) = (3usize, 3usize);
+    let read_bytes = |texels: &[Vec<u8>]| {
+        let texel = &texels[read_y * view_width as usize + read_x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    assert_eq!(
+        read_bytes(&texels),
+        [48, 192, 48, 255],
+        "the source's own texel (3, 3) is a colour the fixture's neighbours do not share"
+    );
     let texture_bytes = u64::from(view_width) * u64::from(view_height) * 4;
     // The registration is real, because the shape is: the request states no
     // bytes for the bind and one run over the owner's own mapping, and the
     // window is the one the ledger derives for it — the texture's extent at the
     // window's own first byte, which is the borrowed arm's condition.
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the no-copy arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let bytes: Vec<u8> = texels.iter().flatten().copied().collect();
+    assert_eq!(bytes.len() as u64, texture_bytes);
+    owner.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let import_id = import.id().get();
+    let anchor = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // The mapping's own address, read once: the closure below must not borrow
+    // the owner itself, because the falsifiable half moves its bytes.
+    let base = owner.pointer as usize;
+    let request = || {
+        let mut request = sampled_request(&stages, texels.clone(), (pass_width, pass_height));
+        request.sampled_images[0].width = view_width;
+        request.sampled_images[0].source = sampled_window_source(
+            base,
+            2 * page as u64,
+            guest.clone(),
+            registered,
+            0,
+            texture_bytes,
+        );
+        request
+    };
+    // The engine arm first: its device context is created lazily on the first
+    // draw, and that creation resets the owner rail.
+    let engine = engine_pixels(
+        "R40 borrowed other-extent window (engine)",
+        &stages,
+        request(),
+    )
+    .expect("the engine reads this shape");
+    assert_uniform_frame(
+        "R40 borrowed other-extent window (engine)",
+        &engine,
+        pass_width,
+        pass_height,
+        read_bytes(&texels),
+    );
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x44_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let slug_before = route_count("render_provider_out_of_class_texture_extent");
+    let host_before = route_count("texture_extent_host_bytes");
+    let borrowed_before = route_count("texture_extent_borrowed_no_copy");
+    let borrowed_window_before = route_count("render_provider_sampled_window_borrowed");
+    let staged_window_before = route_count("render_provider_sampled_window_staged");
+    let depadded_before = route_count("render_provider_sampled_rows_depadded");
+    let delivered = provider_render::provider_submissions();
+    let (declarations, views, provider) =
+        wire_textures_of_one_submission("R40 borrowed other-extent window", || {
+            provider_pixels(
+                "R40 borrowed other-extent window (provider)",
+                &stages,
+                &request(),
+            )
+        });
+    assert_uniform_frame(
+        "R40 borrowed other-extent window (provider)",
+        &provider,
+        pass_width,
+        pass_height,
+        read_bytes(&texels),
+    );
+    assert_frames_equal(
+        "the two rails agree on the borrowed other-extent window",
+        &provider,
+        &engine,
+    );
+    assert_eq!(
+        provider_render::provider_submissions() - delivered,
+        1,
+        "the draw reaches the canonical provider rather than the engine"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_extent"),
+        slug_before,
+        "an admitted no-copy window of another extent charges no extent bucket"
+    );
+    assert_eq!(
+        route_count("texture_extent_host_bytes"),
+        host_before,
+        "the arm beside it does not move: no host bytes were gathered for this bind"
+    );
+    assert_eq!(
+        route_count("texture_extent_borrowed_no_copy"),
+        borrowed_before,
+        "and the arm's own route is the refusal's, not the population's"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_window_borrowed") - borrowed_window_before,
+        1,
+        "the arm the device took is the borrowed window"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_window_staged") - staged_window_before,
+        0,
+        "nothing was copied out of the registration for this bind"
+    );
+    assert_eq!(
+        route_count("render_provider_sampled_rows_depadded") - depadded_before,
+        0,
+        "and no host gather ran for it"
+    );
+    assert_eq!(declarations.len(), 1, "the frame carries the declaration");
+    assert_eq!(views.len(), 1, "the frame carries the pass's own view");
+    assert!(
+        matches!(views[0].source, TextureSource::BorrowedNoCopy(_)),
+        "the declaration names the owner's no-copy window: {:?}",
+        texture_source_arm(&views[0].source)
+    );
+    // The host copy the arm does not have: the class gate's repack loop is not
+    // reached for this bind, and the declaration names the bind at its own
+    // extent rather than at the destination grid's.
+    assert_eq!(
+        declarations[0].metal_binding, 0,
+        "the declaration is the sampled texture at Metal index 0"
+    );
+    // The falsifiable half: move the texel the fragment reads in the owner's own
+    // mapping, re-submit, and the provider's frame follows — the bytes came from
+    // the mapping, not from a copy this rail took anywhere else.
+    let mut moved = texels.clone();
+    moved[read_y * view_width as usize + read_x] = vec![255, 0, 128, 255];
+    owner.as_mut_slice()[..bytes.len()]
+        .copy_from_slice(&moved.iter().flatten().copied().collect::<Vec<u8>>());
+    let after = provider_pixels(
+        "R40 borrowed other-extent window (moved)",
+        &stages,
+        &request(),
+    );
+    assert_uniform_frame(
+        "R40 borrowed other-extent window (moved)",
+        &after,
+        pass_width,
+        pass_height,
+        read_bytes(&moved),
+    );
+    assert_frames_differ("the mapping's own bytes reach the frame", &provider, &after);
+    eprintln!(
+        "R40 gathered extent, no-copy arm: pass {pass_width}x{pass_height}, window \
+         {view_width}x{view_height} at the registration's own start; frame = the window's own \
+         texel ({read_x}, {read_y}) = {:?}, provider = engine byte for byte, the moved texel moved \
+         it, and no host bytes were gathered",
+        read_bytes(&texels),
+    );
+}
+
+/// R40, fail-closed: an arm whose bit the frame does not declare keeps R35's
+/// refusal, byte for byte, beside the arm the same frame *does* declare.
+///
+/// The two arms of R35's split are answered by different code on the canonical
+/// side, so a frame states them separately — and a device that declares one is
+/// not a device that declares the other. This reading is the fail-closed half:
+/// the E-TX12 bit is left undeclared while E-TX10's own reading stays as the
+/// device answers it, so the no-copy window keeps its refusal *and* the
+/// host-bytes shape beside it is still admitted. What the refusal answers with
+/// is R35's sentence, pinned here word for word: the arm moved no clause of it,
+/// which is what a widening looks like when the widening is a new declaration
+/// rather than an edit to an old refusal.
+#[test]
+fn a_borrowed_source_of_another_extent_keeps_its_name_when_the_no_copy_bit_is_undeclared() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    let _guard = engine_test_session();
+    let _undeclared = provider_render::override_render_texture_gathered_extent_no_copy(Some(false));
+    let stages = sampled_stages();
+    let (pass_width, pass_height) = (8u32, 4u32);
+    let (view_width, view_height) = (4u32, 4u32);
+    let texels = sampled_texels(view_width, view_height);
+    let texture_bytes = u64::from(view_width) * u64::from(view_height) * 4;
     let alignment = host_import_alignment().expect("the owner rail's provider answers");
     assert!(
         alignment > 0,
@@ -19141,44 +19419,57 @@ fn a_borrowed_source_of_another_extent_keeps_its_name_on_a_declaring_device() {
         length: page as u64,
         epoch: 1,
     };
-    let mut request = sampled_request(&stages, texels, (pass_width, pass_height));
-    request.sampled_images[0].width = view_width;
-    request.sampled_images[0].source = sampled_window_source(
-        owner.pointer as usize,
-        2 * page as u64,
-        guest,
-        registered,
-        0,
-        texture_bytes,
-    );
+    let borrowed_request = |head: u64| {
+        let mut request = sampled_request(&stages, texels.clone(), (pass_width, pass_height));
+        request.sampled_images[0].width = view_width;
+        request.sampled_images[0].source = sampled_window_source(
+            owner.pointer as usize,
+            2 * page as u64,
+            guest.clone(),
+            registered,
+            head,
+            texture_bytes,
+        );
+        request
+    };
     let slug_before = route_count("render_provider_out_of_class_texture_extent");
     let host_before = route_count("texture_extent_host_bytes");
     let borrowed_before = route_count("texture_extent_borrowed_no_copy");
     let delivered = provider_render::provider_submissions();
-    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &request) {
+    let detail = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &borrowed_request(0),
+    ) {
         RenderRailOutcome::NotInNarrowClass(reason) => {
-            eprintln!("R37 gathered extent, borrowed arm: {reason}");
             assert_eq!(
                 reason.slug(),
                 "render_provider_out_of_class_texture_extent",
                 "the no-copy arm keeps R35's slug: {reason}"
             );
-            let detail = reason.detail();
-            assert!(
-                detail.contains("4x4") && detail.contains("8x4"),
-                "and R35's sentence, which names both extents: {detail}"
-            );
-            assert!(
-                detail.contains("gathers a source of another extent")
-                    && detail.contains("the native rail answers"),
-                "and its statement of the two rails' disagreement: {detail}"
-            );
+            reason.detail().to_owned()
         }
         other => panic!(
-            "the owner's no-copy window stays on the engine even where the frame \
-                         declares the gather: {other:?}"
+            "the owner's no-copy window stays on the engine while the frame does not declare \
+             that it reads one: {other:?}"
         ),
-    }
+    };
+    // R35's sentence, verbatim: this increment moved none of its words, which is
+    // what "the arm keeps its name" means at the seam. The literal is the string
+    // `f867e6a` answered this shape with.
+    let expected = format!(
+        "a draw whose `[[texture(0)]]` is {view_width}x{view_height} in a {pass_width}x{pass_height} \
+         pass stays on the engine: the two rails E ships answer this shape differently and no \
+         capability this class reads tells them apart — the Vulkan provider gathers a source of \
+         another extent into the render area's own grid and keeps \
+         `render_texture_extent_unsupported` for the owner's no-copy window alone \
+         (`research/docs/23` §111, E-TX5), while the native rail answers *every* other extent with \
+         that same name — so the draw goes to the engine, the rail that runs the shape on both, \
+         rather than to a provider whose answer the Apple-side oracle does not state"
+    );
+    assert_eq!(
+        detail, expected,
+        "the refusal is R35's sentence, byte for byte"
+    );
     assert_eq!(
         route_count("render_provider_out_of_class_texture_extent"),
         slug_before + 1,
@@ -19198,6 +19489,278 @@ fn a_borrowed_source_of_another_extent_keeps_its_name_on_a_declaring_device() {
         provider_render::provider_submissions(),
         delivered,
         "with nothing submitted: the bit widens one arm, not the shape"
+    );
+    // The other direction, in the same reading: the *host-bytes* arm of the very
+    // same shape is still what E-TX10's bit states, so the device's own answer
+    // for it admits the draw — the two arms are declared separately, and a
+    // consumer that read one bit for both would land one of these two verdicts
+    // wrong.
+    let mut copy = sampled_request(&stages, texels.clone(), (pass_width, pass_height));
+    copy.sampled_images[0].width = view_width;
+    copy.sampled_images[0].source = SampledSource::Bytes(std::sync::Arc::new(
+        texels.iter().flatten().copied().collect(),
+    ));
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &copy) {
+        RenderRailOutcome::ProviderCompleted(_) => {}
+        other => panic!(
+            "the host-bytes arm of the same shape is admitted by E-TX10's own bit: {other:?}"
+        ),
+    }
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "and it is the provider that ran it"
+    );
+    eprintln!(
+        "R40 fail-closed arm: the no-copy window answers {detail:?} while the host-bytes arm of \
+         the same shape still leaves for the provider"
+    );
+}
+
+/// R40: the name the canonical rail answers a *miswired* gathered sibling with
+/// is the provider's own, and it is read by that name rather than folded into
+/// an arm of this rail's.
+///
+/// The gathered sibling is a *registration's* declaration
+/// (`metal-api-vulkan`'s `declares_gathered_fetch`), and this rail never makes
+/// one: every render pair it registers goes through the canonical translator's
+/// entry point (`register_translated_render_pipeline`, called from this rail's
+/// own `register_render_pipeline`), whose modules state their own sample
+/// coordinates — the path E-TX12 binds at the source's own extent. So the one
+/// shape that reaches the reviewed sibling's own refusal from *this* repository
+/// is a registration that declares it over any other source, and the canonical
+/// provider is where that is answered. This reading measures it there, on the
+/// provider's public entry points and with the reviewed pair's own two modules,
+/// because the name is what the next census has to read when it appears: not an
+/// arm of R35's split, not a bucket of this rail's, and not a shape this rail
+/// can produce.
+///
+/// Falsifiability: the trace binds the *request's own bytes*, so a rail that
+/// admitted them through the gathered sibling would land a frame; the provider
+/// refuses by name instead, and the two arm names this rail owns stay the two
+/// names R35 gave them.
+#[test]
+fn the_gathered_siblings_wrong_source_is_the_providers_own_name() {
+    /// The reviewed sampling pair's modules, which live in the canonical
+    /// provider's own tree (`metal-api-emulator`'s `render_spv/`): the
+    /// full-screen triangle the pair is keyed by, and the gathered sibling that
+    /// states the owner's no-copy window of another extent (E-TX12).
+    const SAMPLED_QUAD_VERT_SPV: &[u8] = include_bytes!(
+        "../../../../../metal-api-emulator/crates/metal-api-vulkan/src/render_spv/sampled_quad.vert.spv"
+    );
+    const GATHERED_FETCH_FRAG_SPV: &[u8] = include_bytes!(
+        "../../../../../metal-api-emulator/crates/metal-api-vulkan/src/render_spv/gathered_fetch.frag.spv"
+    );
+    /// The declaring kernel the sampled pass reads its attachment's bytes
+    /// through, from the canonical project's own fixture set
+    /// (`examples/metal-smoke/shaders`), exactly as
+    /// `canonical_provider_compute.rs` reads it.
+    const COPY_WORD_AIR: &str = include_str!(
+        "../../../../../metal-api-emulator/examples/metal-smoke/shaders/kernel_copy_word.ll"
+    );
+
+    use metal_api_core::provider::{
+        AllocationId, AllocationRecord, BufferView, ClearColor, CompletionPolicy, ComputePass,
+        ComputeTrace, Dispatch, DispatchKind, DispatchType, LoadOp, NoCopyLeaseImporter,
+        OperationId, RenderAttachment, RenderPassDescriptor, StoreOp, TextureAccess, TextureFormat,
+        TextureType, ViewId, PROVIDER_SCHEMA_VERSION,
+    };
+
+    const ATTACHMENT_VIEW: ViewId = ViewId::new(971);
+    const ATTACHMENT_ALLOCATION: AllocationId = AllocationId::new(972);
+    const SCRATCH_VIEW: ViewId = ViewId::new(973);
+    const SCRATCH_ALLOCATION: AllocationId = AllocationId::new(974);
+    const TEXTURE_VIEW: ViewId = ViewId::new(975);
+    const TEXTURE_ALLOCATION: AllocationId = AllocationId::new(976);
+    const NEAREST_CLAMP: SamplerPolicy = SamplerPolicy {
+        filter: SamplerFilter::Nearest,
+        address: SamplerAddressMode::ClampToEdge,
+    };
+
+    let _guard = engine_test_session();
+    let executor = VulkanExecutor::new().expect("the acceptance environment has a Vulkan device");
+    let provider = VulkanComputeProvider::with_executor(std::sync::Arc::clone(&executor))
+        .expect("the canonical provider builds");
+    if provider.no_copy_alignment() == 0 {
+        eprintln!("SKIP: this device does not import host memory");
+        return;
+    }
+    let device =
+        Device::new(std::sync::Arc::clone(&executor) as std::sync::Arc<dyn ComputeExecutor>);
+    let digest = |name: &str| {
+        SemanticDigest::new("reims-provider-render-rail-v1", name.as_bytes().to_vec())
+            .expect("the digest names a case")
+    };
+    let function = device
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the declaring-kernel fixture loads")
+        .function("copy_word")
+        .expect("the fixture's entry exists");
+    let compute = provider
+        .compile_pipeline(&function, digest("gathered-sibling-wrong-source-declare"))
+        .expect("the declaring kernel compiles");
+    // The registration itself: the reviewed sampling pair's *gathered* sibling,
+    // under the contract E reviews it with — one `sampled(0, rgba8_unorm,
+    // nearest+clamp)` texture the module reads at `DescriptorSet 0 / Binding 0`.
+    let gathered = provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
+                vertex_entry: "vertex_main".to_owned(),
+                fragment_entry: "fragment_main".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                textures: vec![TextureBindingContract::sampled(
+                    0,
+                    TextureFormat::Rgba8Unorm,
+                    NEAREST_CLAMP,
+                )],
+            },
+            vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
+            fragment_spirv: GATHERED_FETCH_FRAG_SPV.to_vec(),
+            logical_digest: digest("gathered-sibling-wrong-source"),
+        })
+        .expect("the reviewed gathered pair registers");
+    let (source_width, source_height) = (6u32, 4u32);
+    let (destination_width, destination_height) = (4u32, 4u32);
+    let attachment_bytes = u64::from(destination_width) * u64::from(destination_height) * 4;
+    let texture_bytes = u64::from(source_width) * u64::from(source_height) * 4;
+    // The trace one reading submits: a declaring compute pass over the
+    // attachment — which is what makes the attachment view a view of this
+    // trace — beside the gathered sibling's pass, whose one texture is the
+    // *request's own bytes* rather than the owner's no-copy window.
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(63),
+        pipelines: vec![compute.clone(), gathered.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![
+            TracePass::Compute(ComputePass {
+                pipeline: compute.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ATTACHMENT_VIEW,
+                        metal_binding: 0,
+                        allocation_id: ATTACHMENT_ALLOCATION,
+                        offset: 0,
+                        length: attachment_bytes,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0; attachment_bytes as usize]),
+                    },
+                    BufferView {
+                        view_id: SCRATCH_VIEW,
+                        metal_binding: 1,
+                        allocation_id: SCRATCH_ALLOCATION,
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                    },
+                ],
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }),
+            TracePass::Render(RenderPassDescriptor {
+                samplers: Vec::new(),
+                stage_buffers: Vec::new(),
+                blend: None,
+                cull: None,
+                depth: None,
+                depth_test: None,
+                depth_resolve: None,
+                multisample: None,
+                stencil: None,
+                stencil_test: None,
+                stencil_resolve: None,
+                base_vertex: 0,
+                pipeline: gathered.pipeline_id,
+                color_attachments: vec![RenderAttachment {
+                    view_id: ATTACHMENT_VIEW,
+                    allocation_id: ATTACHMENT_ALLOCATION,
+                    format: AttachmentFormat::Rgba8Unorm,
+                    width: u64::from(destination_width),
+                    height: u64::from(destination_height),
+                    load: LoadOp::Clear(ClearColor::new([0xfe, 0xfe, 0xfe, 0xfe])),
+                    store: StoreOp::Store,
+                }],
+                viewport: [0, 0, destination_width, destination_height],
+                scissor: None,
+                vertices: 3,
+                vertex_buffers: Vec::new(),
+                indices: None,
+                instance_count: 1,
+                textures: vec![TextureView {
+                    view_id: TEXTURE_VIEW,
+                    metal_binding: 0,
+                    allocation_id: TEXTURE_ALLOCATION,
+                    texture_type: TextureType::D2,
+                    format: TextureFormat::Rgba8Unorm,
+                    width: u64::from(source_width),
+                    height: u64::from(source_height),
+                    depth: 1,
+                    array_length: 1,
+                    sample_count: 1,
+                    access: TextureAccess::Sampled,
+                    source: TextureSource::OwnedBytes(vec![0x11; texture_bytes as usize]),
+                }],
+                present: None,
+            }),
+        ],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    };
+    let mut resources = metal_api_core::provider::ResourceTableSnapshot::new();
+    for (allocation, size) in [
+        (ATTACHMENT_ALLOCATION, attachment_bytes),
+        (SCRATCH_ALLOCATION, 8),
+        (TEXTURE_ALLOCATION, texture_bytes),
+    ] {
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+                size,
+            })
+            .expect("fixture allocation");
+    }
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .expect("the snapshot's admission holds the format and the count, not the arm");
+    let refused = match provider.submit(admitted) {
+        Err(error) => error,
+        Ok(_) => panic!("the gathered sibling states one arm and only one"),
+    };
+    eprintln!("gathered sibling over the trace's own bytes: {refused:?}");
+    // Read by name: the refusal is the canonical rail's own
+    // (`render_texture_gathered_fetch_arm_unsupported`), and it is *not* one of
+    // the two arm names this rail's extent rule answers refusals with — a
+    // census that folded it into `texture_extent_borrowed_no_copy` would be
+    // counting a shape this fork never submits.
+    assert_eq!(
+        refused.slug, "render_texture_gathered_fetch_arm_unsupported",
+        "the gathered sibling answers a miswired source by its own name"
+    );
+    let arms = [
+        provider_render::TextureExtentRoute::BorrowedNoCopy,
+        provider_render::TextureExtentRoute::HostBytes,
+    ]
+    .map(provider_render::texture_extent_route);
+    assert!(
+        !arms.contains(&refused.slug.as_str()),
+        "and the name is not an arm of R35's split: {arms:?}"
+    );
+    eprintln!(
+        "R40 gathered sibling, wrong source: the canonical rail answers {} beside this rail's own \
+         arms {arms:?}",
+        refused.slug
     );
 }
 
