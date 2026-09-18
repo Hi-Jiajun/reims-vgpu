@@ -176,7 +176,7 @@ impl Backend for VulkanBackend {
         host: &mut M,
         req: &mut DrawEncodeRequest,
         writeback_guest: bool,
-    ) -> crate::runtime::draw::ChainProbe {
+    ) -> crate::runtime::draw::ChainHandoffProbe {
         draw::vulkan::probe_draw_chain(state, host, req, writeback_guest)
     }
 

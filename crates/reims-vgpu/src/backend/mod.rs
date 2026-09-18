@@ -317,7 +317,7 @@ pub(crate) trait Backend: Copy {
         host: &mut M,
         req: &mut DrawEncodeRequest,
         writeback_guest: bool,
-    ) -> crate::runtime::draw::ChainProbe;
+    ) -> crate::runtime::draw::ChainHandoffProbe;
 
     /// Execute a range of an indirect command buffer the guest has filled.
     ///
@@ -1323,7 +1323,7 @@ impl Backend for SelectedBackend {
         host: &mut M,
         req: &mut DrawEncodeRequest,
         writeback_guest: bool,
-    ) -> crate::runtime::draw::ChainProbe {
+    ) -> crate::runtime::draw::ChainHandoffProbe {
         match self {
             #[cfg(feature = "backend-metal")]
             Self::Metal(b) => b.probe_draw_chain(state, host, req, writeback_guest),

@@ -3631,6 +3631,26 @@ fn route_count(route: &str) -> u64 {
     reims_vgpu::runtime::drain::store_route_count_for_test(route)
 }
 
+/// The identity R42's relay is elected for: a **linear GVA** target, whose
+/// identity stands still for a packet's length.
+///
+/// The relay's promise is written against the identity the record before it
+/// resolved, so the class refuses it for a mapper-ref-texture *surface* — whose
+/// generation the guest may advance mid-packet (fp4, fp6: three to four records
+/// per boot, each refused by the canonical admission after its packet's
+/// remaining draws were committed). A GVA target has no such door, which is
+/// what makes it the shape these tests drive.
+fn gva_identity(gva: u64, format: ash::vk::Format) -> engine::TargetIdentity {
+    let (width, height) = extent();
+    engine::TargetIdentity::Gva {
+        gva,
+        width,
+        height,
+        generation: 1,
+        format,
+    }
+}
+
 /// The rail's answer for one resident-shaped request the class admitted.
 fn declined(label: &str, stages: &Stages, req: &DrawRequest) -> ProviderRenderDecline {
     match provider_render::submit_render(&inputs(stages, RenderChainRole::SoleOrTail), req) {
@@ -3817,7 +3837,7 @@ fn the_in_packet_relay_keeps_the_frame_the_next_record_loads() {
     let _guard = engine_test_session();
     let stages = reviewed_stages();
     let (width, height) = extent();
-    let identity = surface_identity(0x42_00_01);
+    let identity = gva_identity(0x42_00_01, ash::vk::Format::R8G8B8A8_UNORM);
     let attachment = provider_render::resident_attachment(&identity);
     let stores_before = route_count("render_provider_resident_store");
     let loads_before = route_count("render_provider_resident_load");
@@ -3924,7 +3944,7 @@ fn the_in_packet_relay_starts_from_the_walks_bytes_and_keeps_its_own() {
     let stages = reviewed_stages();
     let (width, height) = extent();
     let half = half_of(width);
-    let identity = scanout_surface_identity(0x42_00_02);
+    let identity = gva_identity(0x42_00_02, ash::vk::Format::B8G8R8A8_UNORM);
     let mut seed = Vec::with_capacity((width as usize) * (height as usize) * 4);
     for _ in 0..(width * height) {
         seed.extend_from_slice(&WALK_SEED_TEXEL);
@@ -4021,7 +4041,7 @@ fn the_in_packet_relay_starts_from_the_walks_bytes_and_keeps_its_own() {
 fn the_class_probe_answers_without_submitting_anything() {
     let _guard = engine_test_session();
     let stages = reviewed_stages();
-    let identity = surface_identity(0x42_00_03);
+    let identity = gva_identity(0x42_00_03, ash::vk::Format::R8G8B8A8_UNORM);
 
     // A shape the class answers: the relay's head, whose promise is the only
     // reason this rail keeps a frame its caller cannot fetch.

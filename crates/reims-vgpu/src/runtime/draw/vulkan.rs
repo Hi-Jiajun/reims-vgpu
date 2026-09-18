@@ -423,14 +423,18 @@ pub fn probe_draw_chain<M: HostMemory + HostOps>(
     host: &mut M,
     req: &mut DrawEncodeRequest,
     writeback_guest: bool,
-) -> ChainProbe {
-    let mut probe = ChainProbe::Unavailable;
+) -> super::ChainHandoffProbe {
+    let mut probe = super::ChainHandoffProbe {
+        verdict: ChainProbe::Unavailable,
+        attachment: None,
+    };
     // The same three out-flags `encode_draw_chain` clears, cleared for the same
     // reason: the seam's answer travels on them, and a stale one would let the
     // probe's caller read the previous record's answer as this one's.
     req.chain_resident_established = false;
     req.resident_frame_published_by_provider = false;
     req.chain_resident_held_by_provider = false;
+    req.chain_resident_kept_attachment = None;
     match try_metal2vulkan_draw(state, host, req, writeback_guest, Some(&mut probe)) {
         // The seam returns `Probed` on this path and never any other span; a
         // different arm would mean the probe asked for a real encode, which is
@@ -438,8 +442,10 @@ pub fn probe_draw_chain<M: HostMemory + HostOps>(
         Ok(M2vDrawSpan::Probed) => probe,
         // A record the seam cannot even prepare (a bind past its table, a chain
         // identity it cannot resolve) is not one the walk may keep a frame for.
-        Err(_) => ChainProbe::Unavailable,
-        Ok(_) => ChainProbe::Unavailable,
+        Err(_) | Ok(_) => super::ChainHandoffProbe {
+            verdict: ChainProbe::Unavailable,
+            attachment: None,
+        },
     }
 }
 
@@ -545,6 +551,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         req.chain_resident_established = false;
         req.resident_frame_published_by_provider = false;
         req.chain_resident_held_by_provider = false;
+        req.chain_resident_kept_attachment = None;
         let engine = try_metal2vulkan_draw(state, host, req, writeback_guest, None);
         // Set from the result itself rather than inside the arms, because the
         // arms are where this went wrong: the refusal slug was assigned only in
@@ -8002,7 +8009,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // frame — "would you answer this record?" — and returns before either rail
     // runs. `None` is every real encode, and the two paths share every line of
     // the class above the submission by construction.
-    probe: Option<&mut ChainProbe>,
+    probe: Option<&mut super::ChainHandoffProbe>,
 ) -> Result<M2vDrawSpan, DrawError> {
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
@@ -10278,6 +10285,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             resources.load_from_target = true;
             resources.target_rgba8 = None;
+            // R42's own guard, and the one case the walk's probe cannot cover:
+            // the walk probes a record before its predecessor has answered, so
+            // the pair it compares there is a *prediction*. Here the caller
+            // states the pair its predecessor's answer actually carried, and a
+            // record whose own identity mints to a different one would load an
+            // image no submission of this rail ever stored — refused by the
+            // canonical admission (fp4: `resource_contract_invalid: unknown
+            // allocation`) after the packet's remaining records were already
+            // committed. Skipped while probing: a probe has no predecessor
+            // answer yet, and its verdict is the class's own.
+            #[cfg(feature = "provider-render")]
+            if probe.is_none() && req.chain_loads_resident {
+                let current = resources.target_identity.as_ref().map(|identity| {
+                    let attachment = crate::backend::provider_render::resident_attachment(identity);
+                    (attachment.allocation.get(), attachment.view.get())
+                });
+                if current != req.chain_resident_attachment {
+                    return Err(DrawError::DrawPreparation(
+                        crate::backend::vulkan::engine::DrawPreparationDecline::ChainResidentFrameUnavailable {
+                            class: String::from("chain_resident_identity_skew"),
+                            width: w,
+                            height: h,
+                        },
+                    ));
+                }
+            }
         }
         // The backing belongs only to the mapper-ref-texture surface identity it was
         // resolved from. A GVA or render-chain namespace may legitimately own
@@ -11435,11 +11468,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // Moved, not borrowed through a deref: `probe` is used once and the
             // seam returns on this arm.
             if let Some(sink) = probe {
-                *sink = match provider_render::render_class_probe(&inputs, &resources) {
+                sink.verdict = match provider_render::render_class_probe(&inputs, &resources) {
                     provider_render::RenderClassProbe::InClass => ChainProbe::Admitted,
                     provider_render::RenderClassProbe::OutOfClass => ChainProbe::Refused,
                     provider_render::RenderClassProbe::Unavailable => ChainProbe::Unavailable,
                 };
+                // R42: the pair this record's own identity names, which is the
+                // half the walk compares across a packet's records. Read from
+                // the same mint the submission would use, so a probe and the
+                // encode it stands for cannot name two different images.
+                sink.attachment = resources.target_identity.as_ref().map(|identity| {
+                    let attachment = provider_render::resident_attachment(identity);
+                    (attachment.allocation.get(), attachment.view.get())
+                });
                 return Ok(M2vDrawSpan::Probed);
             }
             let outcome = {
@@ -11666,6 +11707,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // returns the same span one layer down, which is why the
                     // exec loop reads this flag rather than the span.
                     req.chain_resident_held_by_provider = true;
+                    // …and the pair it is kept under, read from the answer
+                    // itself: the walk carries it to the next record, which is
+                    // what keeps a chained load naming this image even if the
+                    // surface's own identity has moved in between.
+                    req.chain_resident_kept_attachment = Some((
+                        frame.attachment.allocation.get(),
+                        frame.attachment.view.get(),
+                    ));
                     // The frame stayed in the provider's image under this
                     // record's own attachment identity — the resident arm of
                     // R7b. Nothing comes back through the completion, so the

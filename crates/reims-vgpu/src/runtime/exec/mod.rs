@@ -5197,6 +5197,10 @@ fn finish_stream<M: HostMemory + HostOps>(
         // the provider's own image, and stating it for a frame the engine holds
         // would name an image no pass ever stored.
         let mut provider_resident_chain = false;
+        // R42: the pair the provider kept the chain's current frame under, as
+        // the provider itself reported it. Carried to the next record so its
+        // load names that image and not whatever its own identity resolves to.
+        let mut provider_resident_attachment: Option<(u64, u64)> = None;
         let mut saw_nometal = false;
         let first_draw = draw_list.first().copied();
         let mut first_req = first_draw.and_then(|pd| {
@@ -5233,6 +5237,9 @@ fn finish_stream<M: HostMemory + HostOps>(
         // them.
         let mut requests: Vec<draw::DrawEncodeRequest> = Vec::with_capacity(draw_list.len());
         let mut keep_frame = vec![false; draw_list.len()];
+        // What each record's own probe answered, and the pair of numbers that
+        // stands for the image that record's pass would keep or load (R42).
+        let mut probes: Vec<draw::ChainHandoffProbe> = vec![Default::default(); draw_list.len()];
         for (di, pd) in draw_list.iter().enumerate() {
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let mut req = if di == 0 {
@@ -5315,31 +5322,21 @@ fn finish_stream<M: HostMemory + HostOps>(
             // above left open — `fin_binds`, which is the per-record request
             // fixup this is not.
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
-            let ask_the_head = di == 0;
-            if ask_the_head && !keep_frame[0] {
-                // Nothing to narrow: the head is publishing under today's
-                // answer already, and its own class verdict is not this
-                // increment's question.
-                continue;
-            }
             let load_resident = di > 0;
             let mut probe = requests[di].clone();
             probe.chain_from_resident = load_resident;
             probe.chain_loads_resident = load_resident;
             probe.chain_keeps_frame = keep_frame[di];
-            let admitted = crate::backend::selected().probe_draw_chain(
+            let answer = crate::backend::selected().probe_draw_chain(
                 state,
                 host,
                 &mut probe,
                 di + 1 == draw_list.len(),
-            ) == draw::ChainProbe::Admitted;
+            );
+            probes[di] = answer;
             crate::runtime::drain::note_store_route("provider_chain_middle_probed");
-            if di > 0 {
-                keep_frame[di - 1] = admitted;
-            } else {
-                keep_frame[0] = admitted;
-            }
         }
+        keep_frame = chain_relay_keep_plan(&probes);
         for (di, pd) in draw_list.iter().enumerate() {
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let Some(req) = requests.get_mut(di) else {
@@ -5347,6 +5344,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             };
             req.chain_keeps_frame = keep_frame[di];
             req.chain_loads_resident = provider_resident_chain;
+            req.chain_resident_attachment = provider_resident_attachment;
             {
                 fin.enter(crate::runtime::drain::FinishPhase::Binds);
                 // A resident mapper-ref-texture target carries attachment contents between
@@ -5480,6 +5478,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // record's draw.
                         resident_chain = false;
                         provider_resident_chain = false;
+                        provider_resident_attachment = None;
                         // fp3 probe: the frame's provenance travels with it, so
                         // the consumption below can say whether the bytes the
                         // canonical rail published were read by anyone.
@@ -5496,6 +5495,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // a frame the engine kept is read through the caller's
                         // own bytes, exactly as before this increment.
                         provider_resident_chain = req.chain_resident_held_by_provider;
+                        provider_resident_attachment = req.chain_resident_kept_attachment;
                         if provider_resident_chain {
                             crate::runtime::drain::note_store_route("provider_chain_middle_kept");
                         }
@@ -6013,6 +6013,37 @@ fn color_slots_loading(slots: &[(u32, ColorAttachment)]) -> Vec<(u32, ColorAttac
             )
         })
         .collect()
+}
+
+/// Which records of one packet may keep their frame for the record after them
+/// (R42).
+///
+/// Two halves of the same proof, both read from the probes: the successor must
+/// admit a load from this rail's own image, and it must name the **same** image
+/// this record's pass would store into. The pair a probe reports is the rail's
+/// own `(allocation, view)` mint — one allocation per identity, never reused —
+/// so equal pairs mean one image and a load that finds it. A surface whose
+/// identity moves between two records of one packet (a mapping generation, a
+/// GVA re-resolution) is the shape fp4 measured: four records, each loading an
+/// image no submission ever stored, 1 668 `draws_skipped_after_engine_refusal`
+/// against a same-caliber base round's zero. Here those records publish
+/// instead, before anything is kept.
+///
+/// Pure, so the rule is driven by a test rather than by a boot: the walk hands
+/// it the probes it took and reads back one bit per record. The last record
+/// never keeps — the packet's own guest Store is its reader.
+fn chain_relay_keep_plan(probes: &[draw::ChainHandoffProbe]) -> Vec<bool> {
+    let mut keep = vec![false; probes.len()];
+    for (di, answer) in probes.iter().enumerate() {
+        let Some(successor) = probes.get(di + 1) else {
+            continue;
+        };
+        keep[di] = answer.verdict == draw::ChainProbe::Admitted
+            && successor.verdict == draw::ChainProbe::Admitted
+            && answer.attachment.is_some()
+            && answer.attachment == successor.attachment;
+    }
+    keep
 }
 
 fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> MultiDrawChainSource {

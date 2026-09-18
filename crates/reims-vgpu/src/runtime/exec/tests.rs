@@ -16,6 +16,62 @@ use crate::runtime::render_pass::{
 };
 use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 
+/// R42's admission rule, driven by the probes instead of by a boot.
+///
+/// The pair a probe reports is the rail's own `(allocation, view)` mint, so the
+/// rule's whole question — "will the record after this one load the image this
+/// one stores?" — reduces to two admitted verdicts and one equal pair. The
+/// shapes below are the ones a round can produce: a clean chain, a successor
+/// the class refuses, a successor whose identity moved (fp4's four records),
+/// and a probe that resolved no identity at all.
+#[test]
+fn the_relay_keeps_a_frame_only_for_the_image_its_successor_resolves() {
+    let admitted = |attachment: Option<(u64, u64)>| draw::ChainHandoffProbe {
+        verdict: draw::ChainProbe::Admitted,
+        attachment,
+    };
+    let refused = |attachment: Option<(u64, u64)>| draw::ChainHandoffProbe {
+        verdict: draw::ChainProbe::Refused,
+        attachment,
+    };
+    let same = Some((0x7265_7369_0000_0007, 1));
+    let moved = Some((0x7265_7369_0000_0008, 1));
+
+    // A clean three-record chain: the first two keep, the last one publishes.
+    assert_eq!(
+        chain_relay_keep_plan(&[admitted(same), admitted(same), admitted(same)]),
+        vec![true, true, false],
+        "every record whose successor resolves the same image keeps its frame"
+    );
+    // The successor the class refuses: its predecessor may not keep a frame
+    // nobody would load.
+    assert_eq!(
+        chain_relay_keep_plan(&[admitted(same), refused(same)]),
+        vec![false, false],
+        "a refused successor keeps no frame for the record before it"
+    );
+    // The successor whose own identity moved between the two resolutions: the
+    // load would name an image no submission stored (fp4's failure), so the
+    // predecessor publishes.
+    assert_eq!(
+        chain_relay_keep_plan(&[admitted(same), admitted(moved)]),
+        vec![false, false],
+        "a successor that resolves another image publishes its predecessor's frame"
+    );
+    // No identity at all on either side: nothing to keep under.
+    assert_eq!(
+        chain_relay_keep_plan(&[admitted(None), admitted(None)]),
+        vec![false, false],
+        "a chain whose records name no image keeps nothing"
+    );
+    // A single-record packet has no reader inside it.
+    assert_eq!(
+        chain_relay_keep_plan(&[admitted(same)]),
+        vec![false],
+        "the packet's own Store is the last record's reader"
+    );
+}
+
 #[test]
 fn render_pass_chain_edges_follow_the_decoded_encoder() {
     assert_eq!(render_pass_chain_position(0, 1), (false, false));

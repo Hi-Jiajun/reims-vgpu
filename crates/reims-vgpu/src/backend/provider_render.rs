@@ -7879,13 +7879,28 @@ pub fn render_class_probe(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> R
     // can reach, and no other caller can produce it. Every other arm keeps its
     // own meaning, and anything this match does not recognise is fail-closed —
     // a successor the walk could not classify is one it keeps no frame for.
-    match submit_render_inner(inputs, req, true) {
+    let answer = match submit_render_inner(inputs, req, true) {
         RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted) => {
             RenderClassProbe::InClass
         }
         RenderRailOutcome::NotInNarrowClass(_) => RenderClassProbe::OutOfClass,
         _ => RenderClassProbe::Unavailable,
+    };
+    // The probes' own two readings, beside the class's: a probe that is
+    // refused notes the class's bucket **as the class does** — the refusal is
+    // the same answer, asked by another caller — so without a name of its own
+    // the census could not subtract the askers from the records that actually
+    // fell to the engine. `provider_chain_middle_probed` is the denominator.
+    match answer {
+        RenderClassProbe::InClass => {}
+        RenderClassProbe::OutOfClass => {
+            crate::runtime::drain::note_store_route("provider_chain_middle_probe_refused");
+        }
+        RenderClassProbe::Unavailable => {
+            crate::runtime::drain::note_store_route("provider_chain_middle_probe_unavailable");
+        }
     }
+    answer
 }
 
 pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> RenderRailOutcome {
@@ -8575,6 +8590,51 @@ fn submit_render_inner(
         texture_copies.insert(texture.index, written);
     }
     drop(_gate);
+    // R42: a kept frame is a *provider* image, and the provider retires them —
+    // an eviction, a teardown, a lost device. A load from one that is no longer
+    // live names an allocation this rail holds no image under, and the
+    // canonical admission refuses that trace by name
+    // (`resource_contract_invalid: unknown allocation`) after the packet's
+    // remaining records are already committed to it: fp4 measured 4 such
+    // records and fp6 (with the identity token below already in place) 3, each
+    // one abandoning the rest of its packet.
+    //
+    // The provider is the only thing that knows, and asking it here costs one
+    // table lookup. A record it answers "not live" for keeps no frame, which is
+    // what makes the record before it publish instead — the pre-R42 answer —
+    // and a *submission* that reaches this refusal means the probe and the
+    // submission disagreed, so the walk abandons that packet's chain under
+    // `provider_chain_middle_handoff_lost`.
+    // Asked for the relay's own loads (`chain_loads_resident`), which is the
+    // population this increment moved: a caller that states the guest-side
+    // capability (`resident_frames_fetchable`) keeps the provider's own
+    // lifecycle names, which is what
+    // `resident_lifecycle_failures_are_the_providers_own_names` pins.
+    if inputs.chain_loads_resident && !class_only {
+        if let NarrowLoad::Resident(resident) = pass.load {
+            let live = match rail() {
+                Ok(rail) => rail
+                    .provider
+                    .resident_target_is_live(resident.allocation, resident.view),
+                // No provider is no live image: fail closed, exactly as the
+                // class's capability asks do.
+                Err(_) => false,
+            };
+            if !live {
+                let reason = OutOfClass::new(
+                    "render_provider_out_of_class_resident_retired",
+                    "a record whose previous contents are the provider's own kept frame stays on \
+                     the engine while that provider image is not live: the frame is a resident \
+                     the provider may have retired since the record that stored it, and a load \
+                     naming a retired allocation is refused by the canonical admission \
+                     (`resource_contract_invalid: unknown allocation`) rather than reading an \
+                     image no submission of this rail holds",
+                );
+                reason.note();
+                return RenderRailOutcome::NotInNarrowClass(reason);
+            }
+        }
+    }
     // R42's probe ends here: every class answer above — the pure gate, the
     // four capability asks, the attachment window, the two copy-forced arms —
     // has been given for this request, and a record that reaches this line is
@@ -9752,6 +9812,25 @@ impl NarrowPass<'_> {
             || self.texture_windows().next().is_some()
     }
 
+    /// Whether this pass's submission travels the owner→provider **wire** —
+    /// i.e. whether [`plan_owner_leases`] will have a plan to build (R42).
+    ///
+    /// [`Self::crosses_the_frame`] answers the same question for every arm
+    /// *but* R32's attachment seed-runs list, which is a plan of its own
+    /// (`provider_owner::Request::Runs`) and therefore puts the submission on
+    /// the wire as well. The two are kept apart because they answer different
+    /// callers: the texture-support ask wants "does a sampled bind travel",
+    /// and the relay's boundary wants "does *anything*", which is exactly the
+    /// guard `plan_owner_leases` runs.
+    ///
+    /// The distinction is load-bearing since R42: a wire frame carries the
+    /// *owner plan's* resource table, and that table holds the owner's leases
+    /// and nothing this rail minted for itself — a kept frame's allocation
+    /// included.
+    fn travels_the_owner_wire(&self) -> bool {
+        self.crosses_the_frame() || self.load_seed_runs().is_some()
+    }
+
     /// The contract's vertex layout for the admitted streams.
     ///
     /// One entry per admitted fetch table, with the attributes that read it at
@@ -9942,6 +10021,18 @@ fn narrow_class<'a>(
     render_vertex_interface_superset: bool,
     render_texture_narrow_lanes: NarrowLanes,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
+    // R42: whether this request's own target is a mapper-ref-texture **surface**
+    // rather than a render-chain or GVA identity. The surface's identity carries
+    // the mapping's generation, which the guest may advance between two records
+    // of one packet; the relay's promise (the next record loads the image this
+    // one stored) is written against the identity the *predecessor* resolved, so
+    // a surface that moves under the packet is a shape the relay may not keep
+    // for. See the load gate below and the store election for what fp4 and fp6
+    // measured there.
+    let relay_surface_target = matches!(
+        req.target_identity,
+        Some(crate::backend::vulkan::engine::TargetIdentity::Surface { .. })
+    );
     // R25: the packet's own chain value, when the caller hands it over for the
     // record that continues the chain. Role-gated here so the class states the
     // election once: only a middle has a predecessor whose frame the walk
@@ -10161,6 +10252,31 @@ fn narrow_class<'a>(
     // travels beside it and is counted under its own byte name rather than
     // inside the elision door's.
     let mut carried_seed_guest_window = false;
+    // R42: the relay's promise is about the image the record before it stored,
+    // and it holds only while the target's identity stands still for the
+    // packet's length. A mapper-ref-texture surface's identity carries the
+    // mapping's own *generation*, and the guest re-maps those surfaces while a
+    // packet's records are still to come: fp4 and fp6 both met that shape — the
+    // compositor's surface, at the boot's own mapping regeneration — three to
+    // four records whose trace the canonical admission refused
+    // (`resource_contract_invalid: unknown allocation`) and whose packets then
+    // lost their remaining draws (1 402 and 1 668
+    // `draws_skipped_after_engine_refusal`, against zero on the base round).
+    // A relayed *load* has no published form to fall back on, so the record is
+    // refused by name; the walk's own probe reads that as "keep nothing for
+    // this record", and the record before it publishes instead.
+    if inputs.chain_loads_resident && relay_surface_target {
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_relay_surface",
+            "a relayed load from a mapper-ref-texture surface stays on the engine when the \
+             surface's own identity generation can move under the packet: the walk's promise is \
+             about the image the record before it stored, while a surface the guest re-maps \
+             between two records of one packet mints another identity — and so another image — \
+             under the load, which the canonical admission refuses by name \
+             (`resource_contract_invalid: unknown allocation`) after the packet's remaining \
+             records are already committed",
+        ));
+    }
     let load = if req.load_from_target {
         let Some(resident) = resident else {
             return Err(OutOfClass::new(
@@ -10465,7 +10581,24 @@ fn narrow_class<'a>(
                     // its reader — the guest-side capability, or the walk's
                     // proof that the next record of this packet loads it from
                     // there. Everything else keeps the published answer above.
-                    if inputs.resident_frames_fetchable || inputs.chain_keeps_frame {
+                    // R42: the relay's promise holds for a target whose
+                    // identity stands still for the packet's length. A
+                    // mapper-ref-texture surface's identity carries the
+                    // mapping's own *generation*, and the guest re-maps those
+                    // surfaces while a packet's records are still to come:
+                    // fp4 and fp6 both met that shape, both on the compositor's
+                    // surface and both at the boot's own mapping regeneration —
+                    // three to four records whose trace the admission refused
+                    // (`resource_contract_invalid: unknown allocation`) and
+                    // whose packets then lost their remaining draws (1 402 and
+                    // 1 668 `draws_skipped_after_engine_refusal`, against zero
+                    // on the base round). The capability path
+                    // (`resident_frames_fetchable`) is unchanged: a caller that
+                    // can fetch a kept frame is the one that owns that
+                    // generation and lands the frame itself.
+                    if inputs.resident_frames_fetchable
+                        || (inputs.chain_keeps_frame && !relay_surface_target)
+                    {
                         NarrowStore::Resident(resident)
                     } else if carried_attachment_guest_window
                         && inputs.role == RenderChainRole::SoleOrTail
@@ -12787,12 +12920,11 @@ fn plan_owner_leases(
     resources: &mut ResourceTableSnapshot,
     copies: &WindowCopies,
 ) -> Result<Option<provider_owner::Plan>, ProviderRenderDecline> {
-    if pass.stage_buffers.is_empty()
-        && pass.vertex_windows().next().is_none()
-        && pass.index_window().is_none()
-        && pass.texture_windows().next().is_none()
-        && pass.load_seed_runs().is_none()
-    {
+    // One source of truth with the relay's boundary (R42): a pass that does not
+    // travel the wire has no plan, and a pass that does has one. The predicate
+    // is on `NarrowPass` rather than spelled here so the class gate can read it
+    // before this function exists for the record.
+    if !pass.travels_the_owner_wire() {
         return Ok(None);
     }
     let mut requests: Vec<provider_owner::Request<'_>> = pass
