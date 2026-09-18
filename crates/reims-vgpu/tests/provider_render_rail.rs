@@ -12114,6 +12114,267 @@ fn a_read_only_stage_buffer_leaves_for_the_provider_and_agrees_with_the_engine()
     );
 }
 
+/// The widened ceiling's own span, end to end (R9q): a fragment stage that
+/// declares five, six, seven or eight `[[buffer(k)]]` arguments leaves for the
+/// provider, lands the bytes *every* declaration states, and answers with the
+/// engine's own frame byte for byte.
+///
+/// The census tail is what this battery pins. Census v29 read
+/// `render_provider_out_of_class_stage_buffer_shape` 184 times, every one of them
+/// charged to the `gt4` route, and every one of those refusals was a translation
+/// whose stages declare *thirteen* buffers — a list the canonical contract
+/// refuses because it states at most [`MAX_RENDER_STAGE_BUFFERS`] (= eight, the
+/// widening E-SB1 landed, `research/docs/23` §108). The shape span between the
+/// first ceiling (four) and the contract's own is the population whose answer
+/// changed, and this rail's gate reads that ceiling as the contract's constant
+/// rather than as a number of its own, so the span has to *land* — which is what
+/// this test drives from four real translations rather than from a seam-level
+/// declaration list.
+///
+/// Every fixture sums all of its arguments into the attachment, and each shape
+/// is drawn twice per mutant slot: the ordinary draw (every slot holds
+/// `20/255`) and a mutant draw (that one slot holds `40/255`). A seam that
+/// stated four declarations and dropped the rest — or one that filled the
+/// widened slots from the wrong buffers — cannot land the colours both rails
+/// state, and the frames are compared byte for byte on top of that.
+#[test]
+fn a_widened_stage_buffer_declaration_leaves_for_the_provider_and_agrees_with_the_engine() {
+    let _guard = engine_test_session();
+    let ceiling = metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS;
+    assert_eq!(
+        ceiling, 8,
+        "the fixtures below are the span between the first ceiling (four) and the contract's \
+         own; a contract that widens again needs its own fixtures"
+    );
+    // The four shapes: the list's length, the fixture that declares it, its
+    // entry point.
+    let shapes = [
+        (
+            5,
+            "render_frag_stage_buffers_five.air",
+            "reims_stage_buffers_five_frag",
+        ),
+        (
+            6,
+            "render_frag_stage_buffers_six.air",
+            "reims_stage_buffers_six_frag",
+        ),
+        (
+            7,
+            "render_frag_stage_buffers_seven.air",
+            "reims_stage_buffers_seven_frag",
+        ),
+        (
+            8,
+            "render_frag_stage_buffers_eight.air",
+            "reims_stage_buffers_eight_frag",
+        ),
+    ];
+    // `20/255` in every slot and `40/255` in the one a mutant draw moves: the
+    // colours are `20*N/255` and `20*(N+1)/255`, so every reading sits far from
+    // a quantisation tie and no two shapes land the same frame.
+    let ordinary = 20.0f32 / 255.0f32;
+    let mutant_word = 40.0f32 / 255.0f32;
+    let contents = |count: usize, mutant: Option<u32>| -> Vec<BufferContent> {
+        (0..count as u32)
+            .map(|index| {
+                let word = if mutant == Some(index) {
+                    mutant_word
+                } else {
+                    ordinary
+                };
+                let mut bytes = Vec::with_capacity(16);
+                for _ in 0..4 {
+                    bytes.extend_from_slice(&word.to_le_bytes());
+                }
+                BufferContent::Bytes(std::sync::Arc::new(bytes))
+            })
+            .collect()
+    };
+    // The colour both rails have to land: the shader's own sequential sum, in
+    // the same order and the same `f32` arithmetic, scaled back to the eight-bit
+    // attachment.
+    let expected_red = |count: usize, mutant: Option<u32>| -> u8 {
+        let mut sum = 0.0f32;
+        for index in 0..count as u32 {
+            sum += if mutant == Some(index) {
+                mutant_word
+            } else {
+                ordinary
+            };
+        }
+        (sum * 255.0f32).round() as u8
+    };
+    let band_before = route_count("draw_stage_buffers_gt4");
+    let mut draws: u64 = 0;
+    for (count, fixture_name, entry) in shapes {
+        let stages = buffer_declaring_stages(fixture_name, entry);
+        assert!(
+            stages.vertex_stage_buffer_declarations.is_empty(),
+            "{fixture_name}: the reviewed vertex half declares no buffer"
+        );
+        let declarations = &stages.fragment_stage_buffer_declarations;
+        assert_eq!(
+            declarations.len(),
+            count,
+            "{fixture_name}: the fixture's own translation declares {count} buffers: {declarations:#?}"
+        );
+        for (index, declaration) in declarations.iter().enumerate() {
+            assert_eq!(
+                declaration.index, index as u32,
+                "{fixture_name}: slot {index} is declared at its own Metal index"
+            );
+            assert_eq!(
+                declaration.access,
+                StageBufferAccess::Read,
+                "{fixture_name}: slot {index} is read by the entry"
+            );
+            assert_eq!(
+                declaration.footprint,
+                StageBufferFootprint::Static { max_bytes: 16 },
+                "{fixture_name}: slot {index} is reached by one whole `float4`"
+            );
+        }
+        // The draws: the ordinary one, then one mutant per slot the widening had
+        // to carry — the first slot past the old ceiling, and the top one (which
+        // is the same slot for the five-declaration shape).
+        let mut mutants = vec![None, Some(4)];
+        if count > 5 {
+            mutants.push(Some(count as u32 - 1));
+        }
+        let mut ordinary_provider: Option<Vec<u8>> = None;
+        for mutant in mutants {
+            let stated = contents(count, mutant);
+            let staged: Vec<StageBufferBind<'_>> = stated
+                .iter()
+                .enumerate()
+                .map(|(index, content)| {
+                    staged_bind(RenderPipelineStage::Fragment, index as u32, content)
+                })
+                .collect();
+            let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+            for (index, content) in stated.iter().enumerate() {
+                req.storage_buffers.push(engine::StorageBufferResource {
+                    binding: index as u32,
+                    content: content.clone(),
+                });
+            }
+            let label = format!(
+                "{count} stage buffers{}{fixture_name}",
+                match mutant {
+                    Some(index) => format!(", slot {index} moved, "),
+                    None => ", ".to_owned(),
+                }
+            );
+            let provider_frame = match provider_render::submit_render(
+                &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &staged),
+                &req,
+            ) {
+                RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+                other => panic!(
+                    "{label}: a declaration list the contract admits has to leave for the \
+                     provider: {other:?}"
+                ),
+            };
+            draws += 1;
+            let expected = expected_red(count, mutant);
+            assert_eq!(
+                texel_at(&provider_frame, 0, 0),
+                [expected, expected, expected, expected],
+                "{label}: the provider's colour is the sum of every declaration the fixture states"
+            );
+            // The engine arm, for the same draw: the promise this rail makes is
+            // byte-for-byte, and it is what makes "both rails executed one
+            // shape" a statement about the shape.
+            let Some(engine_frame) = engine_pixels(&label, &stages, req) else {
+                return;
+            };
+            assert_eq!(
+                texel_at(&engine_frame, 0, 0),
+                [expected, expected, expected, expected],
+                "{label}: the engine's colour rests on the same declarations"
+            );
+            assert_frames_equal(
+                &format!("canonical provider vs engine, {label}"),
+                &provider_frame,
+                &engine_frame,
+            );
+            let frame_bytes = provider_frame.len();
+            let reading = texel_at(&provider_frame, 0, 0);
+            match (mutant, ordinary_provider.as_ref()) {
+                (None, _) => ordinary_provider = Some(provider_frame),
+                (Some(_), Some(ordinary_frame)) => assert_frames_differ(
+                    &format!("{label}: the widened slot's own bytes reach the frame"),
+                    &provider_frame,
+                    ordinary_frame,
+                ),
+                (Some(_), None) => panic!("{label}: the ordinary draw comes first"),
+            }
+            eprintln!(
+                "{label}: provider == engine, {} bytes, texel {:?}; draw_stage_buffers_gt4 = {}",
+                frame_bytes,
+                reading,
+                route_count("draw_stage_buffers_gt4"),
+            );
+        }
+    }
+    // The span is read under the census band the tail was read under: the band
+    // breaks at the *first* increment's ceiling (four) and is charged once per
+    // request the gate is handed, so the widened shapes land in it beside the
+    // ones still past the contract's own ceiling — which is the population the
+    // next census can size ([`stage_buffer_shape_route`]'s own reading is what
+    // separates them).
+    assert_eq!(
+        route_count("draw_stage_buffers_gt4"),
+        band_before + draws,
+        "every widened request is charged to the bound-buffer band once"
+    );
+    let route_before = route_count("stage_buffer_shape_gt4");
+
+    // The shape past the ceiling, on the same battery: nine declarations — one
+    // more than the contract states — answer the shape slug by name, name the
+    // live ceiling in the sentence, and never reach the provider.
+    let over = ceiling + 1;
+    let mut over_stages = buffer_declaring_stages(
+        "render_frag_stage_buffers_eight.air",
+        "reims_stage_buffers_eight_frag",
+    );
+    over_stages
+        .fragment_stage_buffer_declarations
+        .push(StageBufferDeclaration {
+            index: over as u32,
+            access: StageBufferAccess::Read,
+            footprint: StageBufferFootprint::Static { max_bytes: 16 },
+        });
+    let bind = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16]));
+    let staged = [staged_bind(RenderPipelineStage::Fragment, 0, &bind)];
+    let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    let (slug, detail) = match provider_render::submit_render(
+        &inputs_with_binds(&over_stages, RenderChainRole::SoleOrTail, &staged),
+        &req,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            (reason.slug().to_owned(), reason.detail().to_owned())
+        }
+        other => panic!("{over} declarations are past the contract's own ceiling: {other:?}"),
+    };
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_shape");
+    assert!(
+        detail.contains(&format!("declare {over} stage buffers")),
+        "the sentence names the count: {detail}"
+    );
+    assert!(
+        detail.contains(&format!("at most {ceiling} pipeline-level buffers")),
+        "and the live ceiling it is one past: {detail}"
+    );
+    assert_eq!(
+        route_count("stage_buffer_shape_gt4"),
+        route_before + 1,
+        "the refusal is charged to the tail's own route, once"
+    );
+}
+
 /// The door's buckets after R9n, each its own counter: the two facts that still
 /// keep a declared draw on the engine, and the two arms the increments lifted —
 /// the read-only class R9d admits once its bind is stated, and the slot whose
