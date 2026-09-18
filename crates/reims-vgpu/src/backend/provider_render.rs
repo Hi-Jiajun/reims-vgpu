@@ -8035,9 +8035,18 @@ pub fn vertex_format_route(
 /// because the seam had one boolean for the whole population. This is the
 /// reading that replaces the boolean: charged for every request the gate is
 /// handed, exactly as [`attribute_count_route`] is, so the band's population
-/// and the door's four buckets are the same draws. The bands break at the
-/// canonical contract's own `MAX_RENDER_STAGE_BUFFERS` (4), which is what makes
-/// "two to four" one arm rather than an arbitrary split.
+/// and the door's four buckets are the same draws.
+///
+/// The bands break at four — the ceiling the *first* increment stated, kept
+/// here as a fixed census breakpoint rather than re-read from
+/// [`MAX_RENDER_STAGE_BUFFERS`] — so the arms either side of it stay comparable
+/// across the widening E-SB1 landed (`research/docs/23` §108, which moved the
+/// contract's own ceiling to eight). The arm above four is therefore the
+/// population the widening *split*: the lists it admits (5..=8, which this
+/// file's `a_widened_stage_buffer_declaration_leaves_for_the_provider_and_
+/// agrees_with_the_engine` lands) beside the ones still past the contract's
+/// ceiling, and [`stage_buffer_shape_route`]'s own `gt` route is what tells the
+/// two apart in the same census.
 pub fn stage_buffer_count_route(binds: usize) -> &'static str {
     match binds {
         0 => "draw_stage_buffers_0",
