@@ -7234,6 +7234,56 @@ fn narrow_class<'a>(
             ),
         ));
     }
+    // The pipeline-layout face of the interface the two doors above admitted
+    // one face at a time. The canonical rail builds one layout list for a pass:
+    // set 0 is the sampled pipeline's own — the layout
+    // `metal-api-vulkan`'s `create_render_textures` builds beside the texture
+    // binds — and the stage buffers' sets follow it positionally
+    // (`create_stage_buffers`). A translated module reads each `[[buffer(n)]]`
+    // from a set of its own (the default resource layout puts them in set 0,
+    // `RESOURCE_DESCRIPTOR_SET`/`BUFFER_BINDING_RANGE`), so a pass that binds a
+    // sampled texture *and* states a stage buffer is a shape whose two faces
+    // both want a slot that list holds once: the rail answers it when the
+    // pipeline layout is built, by name
+    // (`render_texture_layout_unsupported`: "a stage buffer occupies descriptor
+    // set 0, which is where this pipeline's combined image samplers live; the
+    // two faces need different slots for one layout to hold both").
+    //
+    // That answer is a *decline*, and a decline on an in-class draw is
+    // fail-closed (`runtime/draw/vulkan.rs` does not re-run the engine), so a
+    // shape this class admits here and the provider then refuses loses the
+    // record's pixels — the guest draws neither. Census v20 measured exactly
+    // that: the R28/E-TX4/E-TX5/E-TX6 widening let the texture door admit a
+    // draw whose vertex stage also reads its `[[buffer(2)]]` from set 0, the
+    // provider declined the layout at submission, and all 388 of the round's
+    // `draws_skipped_after_engine_refusal` records were that one shape — which
+    // is the login window's own icon layers (64x64, 96x64, 144x64, 186x100)
+    // missing from the frame.
+    //
+    // Read last in the gate on purpose: the population this bucket gains is
+    // exactly the one the provider used to refuse at submission, and every
+    // earlier bucket keeps the shape it had. Widening it later means teaching
+    // the rail's layout to hold both faces, which is a provider increment and
+    // not a class preference.
+    if !sampling.textures.is_empty() {
+        if let Some(buffer) = stage_buffers.first() {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_layout",
+                format!(
+                    "a draw whose {} stage reads a [[buffer({})]] argument beside {} sampled \
+                 texture(s) stays on the engine: the canonical rail's pipeline layout carries the \
+                 sampled pipeline's set 0 and the stage buffers' sets in one positional list, so \
+                 a pass that states both faces is refused when that layout is built \
+                 (`render_texture_layout_unsupported`) — and a decline on an in-class draw is \
+                 fail-closed rather than a re-run, so admitting it here is what loses the \
+                 record's pixels. The engine, which lays the two faces out itself, draws it",
+                    buffer.stage.name(),
+                    buffer.index,
+                    sampling.textures.len(),
+                ),
+            ));
+        }
+    }
     Ok(NarrowPass {
         vertex_entry: vertex_entry.to_owned(),
         fragment_entry: fragment_entry.to_owned(),

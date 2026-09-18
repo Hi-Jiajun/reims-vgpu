@@ -8951,6 +8951,90 @@ fn the_stage_buffer_door_names_every_fact_between_a_declaration_and_the_provider
     }
 }
 
+/// The two doors' *overlap* is its own boundary, and it is the class's to
+/// answer rather than the provider's.
+///
+/// Each door above admits one face at a time: a sampled `[[texture(i)]]`
+/// declaration beside its bind, and a `[[buffer(n)]]` declaration beside its
+/// bind. A pass that states both is a shape the canonical rail's *pipeline
+/// layout* cannot hold — the rail's set 0 is the sampled pipeline's combined
+/// image samplers (`create_render_textures`), a translated module reads its
+/// `[[buffer(n)]]` arguments from the set its own reflection names (set 0 by
+/// the default resource layout), and `create_stage_buffers` lays the buffers'
+/// sets out positionally behind that same slot — so the provider answers it
+/// when the layout is built, by name (`render_texture_layout_unsupported`).
+///
+/// That answer is a *decline*, and a decline on an in-class draw is
+/// fail-closed: `runtime/draw/vulkan.rs` does not re-run the engine, so the
+/// record's pixels are lost rather than drawn by the other rail. Census v20
+/// measured the cost of leaving it outside the class — 388
+/// `draws_skipped_after_engine_refusal` records, every one of them pipe 157's
+/// vertex buffer beside its fragment texture (the window's own icon layers,
+/// missing from the frame). The gate states the boundary instead: this test
+/// pins the sentence, the bucket, and the control that the *each* face alone
+/// still crosses to the provider, so the boundary is the overlap and not
+/// either half.
+#[test]
+fn a_sampled_texture_beside_a_stage_buffer_stays_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    // The measured shape: the vertex stage reads `[[buffer(2)]]` while the
+    // fragment stage samples `[[texture(0)]]`.
+    let mut stages = sampled_stages();
+    stages.vertex_stage_buffer_declarations = vec![StageBufferDeclaration {
+        index: 2,
+        access: StageBufferAccess::Read,
+        footprint: StageBufferFootprint::Static { max_bytes: 8 },
+    }];
+    let content = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16]));
+    let bind = staged_bind(RenderPipelineStage::Vertex, 2, &content);
+    let (width, height) = (8u32, 4u32);
+    let req = sampled_request(&stages, sampled_texels(width, height), (width, height));
+
+    let bucket = route_count("render_provider_out_of_class_texture_layout");
+    match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &[bind]),
+        &req,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("overlap: {reason}");
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_texture_layout",
+                "the overlap is the layout's own bucket: {reason}"
+            );
+            let detail = reason.detail();
+            assert!(
+                detail.contains("[[buffer(2)]]") && detail.contains("1 sampled texture(s)"),
+                "the sentence names both faces and the bind's own slot: {detail}"
+            );
+            assert!(
+                detail.contains("render_texture_layout_unsupported"),
+                "the sentence names the provider answer it stands in front of: {detail}"
+            );
+        }
+        other => {
+            panic!("a sampled texture beside a stage buffer stays on the engine: {other:?}")
+        }
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_layout"),
+        bucket + 1,
+        "the overlap charges its own bucket exactly once"
+    );
+
+    // The control: the same draw with the fragment texture alone — the
+    // declaration removed — still crosses to the provider, so the boundary is
+    // the *pair* of faces and not the texture half. (The stage-buffer half's
+    // own control is `the_statement_and_the_wire_carry_the_one_slot_the_entry_dereferences`,
+    // which admits the reviewed buffer fixture with no texture beside it.)
+    let texture_only = sampled_stages();
+    match provider_render::submit_render(&inputs(&texture_only, RenderChainRole::SoleOrTail), &req)
+    {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!("the sampled texture alone is in class: {other:?}"),
+    }
+}
+
 /// R9o: the shape door's three rules, each charged under its own route.
 ///
 /// The census v5 segment's first failure is `stage_buffer_shape` — 88026 of
