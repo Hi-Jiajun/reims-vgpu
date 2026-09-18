@@ -546,6 +546,264 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     );
 }
 
+/// The two B4 fixtures' own lock: they both reset the process-global guest-RAM
+/// map and registration ledger, so they may not run beside each other.
+#[cfg(all(feature = "backend-vulkan", feature = "provider-render"))]
+fn b4_fixture_lock() -> std::sync::MutexGuard<'static, ()> {
+    static B4_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    B4_FIXTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// B4, the first direction: the window the *projection* cannot state comes from
+/// the bytes' own registration.
+///
+/// One surface can be covered by two imports, and the two LOAD-elision doors
+/// used to ask only the first:
+///
+/// * the shim's RAMBlock spans, which a boot imports as a *set* and which
+///   `REIMS_VGPU_n` may narrow to a subset — the projection
+///   [`crate::runtime::guest_ram_map::references_for_runs`] resolves a page list
+///   against;
+/// * the surface's own packed-alias allocation, built by `HostOps::map_pages`
+///   and registered by [`crate::runtime::guest_ram_map::register_alias`] — the
+///   import the sampled and buffer rails already read these same bytes through
+///   (`mapped_sampled_source`, `direct_linear_sample_from_packed`).
+///
+/// A page list no imported span covers answers the projection with no run list
+/// at all, which `load_seed_run_windows` names `Unregistered` and the class
+/// routes to the census as `resident_source_window_unregistered` — the reading
+/// census v29 took 546 times for one boot. The second import states the same
+/// bytes as one window; both halves are asserted here, and the falsifiable half
+/// is the window itself: it exists only once the import has joined the ledger,
+/// so a call site that cut coordinates without the registration still refuses by
+/// name.
+///
+/// The guest-RAM map and its registration ledger are process-global, so this
+/// fixture and the mapping one below take a lock of their own: under `cargo
+/// test`'s default parallelism they would otherwise reset each other's map
+/// between an assertion and the call it describes. (The lib gate runs
+/// `--test-threads=1`, and the rest of the file's map fixtures are the same
+/// hazard the comment on `mapping_sampled_planes_reuse_one_resource_owned_import`
+/// names.)
+#[test]
+#[cfg(all(feature = "backend-vulkan", feature = "provider-render"))]
+fn a_registered_import_states_the_window_a_narrowed_projection_cannot() {
+    use crate::backend::provider_render::{load_seed_run_windows, LoadSeedRunExit};
+    use crate::backend::vulkan::engine::GuestRunSource;
+
+    let _fixture = b4_fixture_lock();
+    crate::runtime::guest_ram_map::reset();
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    // One RAMBlock, so the boot pass has a projection at all. The window below
+    // is deliberately not in it.
+    let ramblock = 0x1000_0000u64;
+    host.map_range(ramblock, (8 * page) as usize, 0);
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    crate::runtime::guest_ram_map::register_imports(&mut host)
+        .expect("the boot pass registers the span it was given");
+
+    // The projection's own answer for pages no imported span covers: no list at
+    // all. This is the fact the census charges as window-unregistered.
+    assert!(!super::vulkan::projection_states_a_window(&None));
+    let projection = GuestRunSource {
+        runs: std::sync::Arc::new(Vec::new()),
+        source_offset: 0,
+        total_len: 2 * page,
+        row_length_texels: 0,
+        pages: None,
+        direct_image: None,
+    };
+    assert_eq!(
+        load_seed_run_windows(&projection, 2 * page),
+        Err(LoadSeedRunExit::Unregistered),
+        "a page list outside every imported span states no window"
+    );
+
+    // The surface's own bytes as its own import: one page-aligned host
+    // allocation over its pages, which is what `map_pages` hands a rail whose
+    // RAMBlock this boot did not import.
+    let span = 2 * page;
+    // Deliberately not page-aligned: the window's bound is what the ledger
+    // names, and the attachment's own first byte is `head` bytes into it.
+    let offset = page / 2;
+    let import = std::sync::Arc::new(
+        crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+            0x7000_0000_0000,
+            span,
+            page,
+        )
+        .expect("a page-aligned host allocation is an import"),
+    );
+
+    // A window is a slice of a *registration*. Before this import has one, the
+    // source carries the run and no window, and the same declaration refuses —
+    // by its own name, and while the bytes stay bindable either way.
+    let unregistered = super::vulkan::registered_import_source(&import, offset, page, 0)
+        .expect("the attachment's span is inside the import");
+    assert!(
+        !super::vulkan::projection_states_a_window(&unregistered.pages),
+        "an import no pass registered states no window"
+    );
+    assert_eq!(
+        load_seed_run_windows(&unregistered, page),
+        Err(LoadSeedRunExit::Unwindowed),
+        "the unregistered import's own run has no window to name"
+    );
+
+    crate::runtime::guest_ram_map::register_alias(&import).expect("the alias joins the ledger");
+    let registered = super::vulkan::registered_import_source(&import, offset, page, 0)
+        .expect("the attachment's span is inside the import");
+    assert!(super::vulkan::projection_states_a_window(&registered.pages));
+    let windows = load_seed_run_windows(&registered, page)
+        .expect("a registered import states the attachment's window");
+    assert_eq!(windows.len(), 1, "one registration, one window");
+    assert_eq!(windows[0].import, import.id().get());
+    assert_eq!(
+        windows[0].host_va,
+        u64::try_from(import.host_base()).expect("a host address fits u64"),
+        "the window is the registration's own page-aligned range"
+    );
+    assert_eq!(
+        windows[0].head, offset,
+        "the attachment's own first byte, inside the widened window"
+    );
+    assert_eq!(
+        (windows[0].bytes_len, windows[0].length),
+        (page, 2 * page),
+        "the window is the attachment's own span widened to the granule"
+    );
+    eprintln!(
+        "B4 second registration: the projection states no window for a span no import covers \
+         (`Unregistered`), while the bytes' own import states one window — import {:#x}, head {} \
+         bytes_len {} length {} — and the same import without a registration states none by name \
+         (`Unwindowed`)",
+        windows[0].import, windows[0].head, windows[0].bytes_len, windows[0].length,
+    );
+
+    crate::runtime::guest_ram_map::reset();
+    crate::runtime::guest_ram::forget_import_limits();
+}
+
+/// B4, the second direction: the mapper-ref door's own import is the mapping's,
+/// and the window it cuts names the attachment's own guest bytes.
+///
+/// The mapping's allocation is the resource whose pages the attachment is
+/// (`mapped_sampled_source`'s own premise), so the door's second source is
+/// [`crate::runtime::mapper::ensure_contig_import_with_footprint`] — the same
+/// registration the sampled rail reads this surface through, built once per
+/// mapping and cached on it. The window is then read back through the host
+/// pointer it names, so "the door states a window" and "that window is the
+/// attachment's bytes" are two separate assertions.
+#[test]
+#[cfg(all(feature = "backend-vulkan", feature = "provider-render"))]
+fn the_mapping_door_cuts_its_window_from_the_mappings_own_import() {
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+
+    let _fixture = b4_fixture_lock();
+    crate::runtime::guest_ram_map::reset();
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let mid = 23u32;
+    let gpa0 = 0x4200_0000u64;
+    let pages = 16u32;
+    host.map_range(gpa0, (u64::from(pages) * page) as usize, 0);
+    assert!(state.map_surface(mid));
+    {
+        let mapping = state.mappings.get_mut(&mid).unwrap();
+        mapping.page_entries = (0..pages)
+            .map(|i| {
+                ((((gpa0 >> PAGE_SHIFT_X86) as u32) + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+            })
+            .collect();
+    }
+    assert!(state.set_mapping_geom(
+        mid,
+        128,
+        128,
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+    ));
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    crate::runtime::guest_ram_map::register_imports(&mut host)
+        .expect("the boot pass registers the span");
+
+    // The attachment's own bytes, two pages and a quarter into the mapping and
+    // four pages long, written through the guest's address so the window's host
+    // pointer is what has to find them. The offset is deliberately not a whole
+    // granule: the window's bound is page-aligned and the attachment's own first
+    // byte is `head` bytes into it.
+    let offset = 2 * page + 1024;
+    let extent = 4 * page;
+    let pattern: Vec<u8> = (0..extent).map(|i| (i % 251) as u8).collect();
+    host.write_gpa(gpa0 + offset, &pattern)
+        .expect("the fixture's own RAM is writable");
+
+    let source =
+        super::vulkan::mapping_import_source(&mut state, &mut host, mid, offset, extent, 0)
+            .expect("the mapping's own import states the attachment's bytes");
+    assert!(super::vulkan::projection_states_a_window(&source.pages));
+    let windows = crate::backend::provider_render::load_seed_run_windows(&source, extent)
+        .expect("the door's second source states the extent");
+    assert_eq!(
+        windows.len(),
+        1,
+        "one mapping, one registration, one window"
+    );
+    let import = std::sync::Arc::clone(
+        state.mappings[&mid]
+            .contig_import
+            .as_ref()
+            .expect("the mapping keeps the import it built"),
+    );
+    assert_eq!(
+        windows[0].import,
+        import.id().get(),
+        "the window is cut from the mapping's own registered import"
+    );
+    assert_eq!(
+        windows[0].host_va,
+        u64::try_from(import.host_base()).expect("a host address fits u64") + 2 * page,
+        "the window starts at the attachment's own first granule"
+    );
+    assert_eq!(
+        windows[0].head, 1024,
+        "the attachment's own first byte inside that granule"
+    );
+    assert_eq!(windows[0].bytes_len, extent);
+    // The window is the attachment's bytes and not merely a range of the right
+    // length: what the guest wrote at `gpa0 + offset` is what its host pointer
+    // holds. The fixture's range outlives the view (it is the `host` above), and
+    // the read stays inside the registration the window names.
+    let named = unsafe {
+        std::slice::from_raw_parts(windows[0].host_va as *const u8, windows[0].length as usize)
+    };
+    assert_eq!(
+        &named[windows[0].head as usize..][..extent as usize],
+        &pattern[..],
+        "the window names the attachment's own bytes"
+    );
+    eprintln!(
+        "B4 mapping door: the window is cut from the mapping's own registered import {:#x} — \
+         host_va {:#x} head {} bytes_len {} length {} for a {}-byte attachment at mapping offset \
+         {} — and the registration's own pointer holds the bytes the guest wrote there",
+        windows[0].import,
+        windows[0].host_va,
+        windows[0].head,
+        windows[0].bytes_len,
+        windows[0].length,
+        extent,
+        offset,
+    );
+
+    crate::runtime::guest_ram_map::reset();
+    crate::runtime::guest_ram::forget_import_limits();
+}
+
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn small_mapping_sampled_plane_uses_its_direct_resource() {
