@@ -9169,6 +9169,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         > = None;
         #[cfg(feature = "provider-render")]
         let mut attachment_window_miss: Option<AttachmentWindowMiss> = None;
+        // R38: the **seed door's** own window — the same question asked by the
+        // other door that has one. The record whose previous contents are the
+        // mapper-ref-texture surface's own guest backing loads the mapping's
+        // pages, and those pages cut into runs exactly as the elision door's do;
+        // what differs is the door, so the answer travels in its own pair of
+        // locals and is stated to the class as
+        // `RenderRailInputs::seed_guest_window`. Asked where the backing is
+        // resolved (below), which is the one place the door's own condition is
+        // known.
+        #[cfg(feature = "provider-render")]
+        let mut seed_window_runs: Option<
+            Vec<crate::backend::provider_render::StageBufferWindow>,
+        > = None;
+        #[cfg(feature = "provider-render")]
+        let mut seed_window_miss: Option<AttachmentWindowMiss> = None;
         if req.chain_from_resident && render_chain_identity(state, req).is_some() {
             // The serialized chain names the resident it intends to load;
             // existence and readiness are engine state and are validated
@@ -9993,6 +10008,50 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         .preserves_prior_contents()
                         && color.target_seed_rgba.is_none()
                 });
+            // R38: the seed door's own window, asked where the door's own
+            // condition is known — the attachment is the mapper-ref-texture
+            // surface's own guest allocation and this record preserves its
+            // previous contents. The pages that backing is *are* those contents,
+            // so the same walk the elision door performs states them as the
+            // attachment's own declaration; the answer travels to the class as
+            // `RenderRailInputs::seed_guest_window`, which is the one input that
+            // can turn this refusal into an executed pass.
+            //
+            // `attachment_window_extent` is the extent both doors cut against,
+            // and the format is the resident's own — the identity the record
+            // names is the mapper-ref identity by the guard this block is
+            // inside, so this is the same value the elision door reads.
+            //
+            // The cut is [`mapper_ref_attachment_window`], the elision door's
+            // own call: it lands the frame the surface's pages are owed before
+            // it names them (`INV-LAND`, `pay_for_mapping`'s
+            // `landed_or_current()`), and that gate is what makes these pages
+            // the record's previous contents rather than merely the pages the
+            // surface happens to occupy. A window the payment or the walk
+            // refuses travels out as its own route and the class keeps the
+            // record on the engine by name.
+            #[cfg(feature = "provider-render")]
+            if resources.load_guest_target_backing {
+                if let (Some(c0), Some(extent)) = (req.colors.first(), attachment_window_extent) {
+                    let format = resources
+                        .target_identity
+                        .as_ref()
+                        .map(|identity| identity.resident_format())
+                        .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
+                    match mapper_ref_attachment_window(
+                        state,
+                        host,
+                        c0.mapping_id,
+                        w,
+                        h,
+                        format,
+                        extent,
+                    ) {
+                        Ok(runs) => seed_window_runs = Some(runs),
+                        Err(miss) => seed_window_miss = Some(miss),
+                    }
+                }
+            }
         }
         // Mapper-ref-texture Load used to have a GPU rail here — ~170 lines of front-frame
         // retention policy resolving which resident image held the frame the
@@ -10988,6 +11047,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     &attachment_window_runs,
                     attachment_window_miss,
                 ),
+                // R38: the same declaration for the *other* door that has one.
+                // A record whose previous contents are the mapper-ref-texture
+                // surface's own guest backing loads those pages, and this is the
+                // run list the door cut for them — or the name of the fact that
+                // stopped it. `None` is every record the door did not elect, and
+                // the class answers those exactly as it did before (its own
+                // refusal, by name).
+                seed_guest_window: attachment_window_input(&seed_window_runs, seed_window_miss),
                 // R25: the frame the record *before* this one produced, when
                 // this record is the packet's middle and the caller holds that
                 // frame as the walk's own chain value
