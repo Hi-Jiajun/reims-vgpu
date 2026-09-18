@@ -1013,6 +1013,11 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // test drives it — the shape [`inputs_with_attachment_window`] and its
         // refusal sibling state.
         attachment_guest_window: None,
+        // R38: the seed door's own window, stated only by the shapes that drive
+        // it ([`inputs_with_seed_window`] and its refusal sibling); every other
+        // fixture is a record whose previous contents are not the surface's own
+        // guest backing.
+        seed_guest_window: None,
         // R25: no predecessor's frame is handed over unless a test states the
         // bytes the walk carries — the shape
         // [`inputs_held_with_chain_value`] drives.
@@ -1193,6 +1198,40 @@ fn inputs_held_with_window_refusal<'a>(
 ) -> RenderRailInputs<'a> {
     RenderRailInputs {
         attachment_guest_window: Some(provider_render::AttachmentGuestWindow::Refused(route)),
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_held`] with the **seed door's** own guest window stated (R38).
+///
+/// The other door that has a window to state: the record's previous contents
+/// are the mapper-ref-texture surface's own guest backing
+/// (`DrawRequest::load_guest_target_backing`), so the pages the window names are
+/// not a copy of a frame this rail keeps — they *are* the contents, and the
+/// contract's ordered run list is the only declaration that states them. The
+/// runs are the class's own input shape, exactly as they are for
+/// [`inputs_held_with_attachment_window`]: the seam's page walk is the layer a
+/// test cannot mint without a guest.
+fn inputs_with_seed_window<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    window: &'a [StageBufferWindow],
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        seed_guest_window: Some(provider_render::AttachmentGuestWindow::Runs(window)),
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_with_seed_window`] with the window the door could **not** cut,
+/// named: the shape every seed-door window refusal is charged for.
+fn inputs_with_seed_window_refusal<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    route: ResidentSourceRoute,
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        seed_guest_window: Some(provider_render::AttachmentGuestWindow::Refused(route)),
         ..inputs_held(stages, role)
     }
 }
@@ -4905,6 +4944,196 @@ fn a_window_the_door_could_not_cut_keeps_the_record_on_the_engine_by_name() {
         0,
         "an answered record is not a refusal: the window's route is charged only where the \
          class refuses"
+    );
+}
+
+/// R38 (RAIL-M): the seed door's own window is **named before it is admitted**.
+///
+/// The measurement round the release is sized on. Census v27b put 919 records —
+/// one door, not a residue — on `render_provider_out_of_class_load_seed`, and
+/// the one question a release cannot answer about its own population is *which*
+/// of those records have a window the contract can state at all: the mapper-ref
+/// surface's own pages, cut into the ordered run list `BufferSource::GuestRuns`
+/// names. So this round asks the door, names every answer, and admits nothing.
+///
+/// Four readings, and each is falsifiable on its own:
+///
+/// * a window that **cuts** is counted under `…_load_seed_backing_window` — the
+///   declarable population, and an upper bound, because a measurement round pays
+///   no debt and so cannot yet separate a window the landing would have held
+///   from one it would not — and the record still keeps the engine under the
+///   door's own bucket. The bucket is the v27b number, deliberately untouched:
+///   a round in which the bucket itself moved could not be told apart from a
+///   release;
+/// * a window that does **not** cut is counted under the name R32's own run-list
+///   arm already gives that fact (`…_load_seed_rows` here), so the two doors'
+///   residuals stay one vocabulary rather than two;
+/// * a fact the door answers *before* it reaches the list — the mapping's
+///   geometry, an unpaid landing, a moved identity, the host's alias — keeps its
+///   B1 window route (`resident_source_window_*`), charged beside the same
+///   bucket;
+/// * a record the seam states **no** window for is refused exactly as it was
+///   before this increment: the door is the one producer of this input, so an
+///   absent answer is a wiring bug and never a fallback.
+#[test]
+fn the_seed_backings_own_window_is_named_before_it_is_admitted() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the window arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    assert!(
+        frame_len <= page as u64,
+        "the fixture's window fits one provider page"
+    );
+    let mut owner = AlignedHost::new(2 * page, page);
+    owner.as_mut_slice()[..frame_len as usize].fill(0x3c);
+    let import = 0x9e3a_u64;
+    provider_owner::register(Region {
+        import,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x55_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let window = StageBufferWindow {
+        import,
+        host_va: owner.pointer as u64,
+        length: page as u64,
+        head: 0,
+        bytes_len: frame_len,
+    };
+
+    // The door's own request shape: the attachment the mapper-ref-texture
+    // surface's guest allocation backs, a load that preserves what is already
+    // there, no seed bytes, and the withheld readback the census's shapes show.
+    let identity = surface_identity(0x7c_38_01);
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.load_guest_target_backing = true;
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: width / 2,
+            height,
+        });
+        req
+    };
+    let refused = |label: &str, inputs: &RenderRailInputs<'_>| match provider_render::submit_render(
+        inputs,
+        &request(),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_load_seed",
+                "{label}: the round names the window beside the door's own bucket, and the \
+                     bucket is the v27b reading: {reason}"
+            );
+            eprintln!("R38 measurement {label}: {}", reason.detail());
+        }
+        other => panic!("{label}: the measurement round admits nothing, got {other:?}"),
+    };
+
+    let deliveries = provider_render::provider_submissions();
+    let bucket_before = route_count("render_provider_out_of_class_load_seed");
+    let declarable_before = route_count("render_provider_out_of_class_load_seed_backing_window");
+    let rows_before = route_count("render_provider_out_of_class_load_seed_rows");
+    let runs_before = route_count("render_provider_out_of_class_load_seed_runs");
+    let geometry_before = route_count("resident_source_window_geometry");
+    let seeded_runs_before = route_count("render_provider_load_seed_runs");
+
+    // 1. The window cuts: named as the declarable population, still kept.
+    let single = [window];
+    refused(
+        "a window that cuts",
+        &inputs_with_seed_window(&stages, RenderChainRole::SoleOrTail, &single),
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_seed_backing_window") - declarable_before,
+        1,
+        "the declarable population is the number the release is sized on"
+    );
+
+    // 2. The window does not cut, and the fact has a name in R32's own family.
+    refused(
+        "padded rows",
+        &inputs_with_seed_window_refusal(
+            &stages,
+            RenderChainRole::SoleOrTail,
+            ResidentSourceRoute::WindowPaddedRows,
+        ),
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_seed_rows") - rows_before,
+        1,
+        "a run list cannot state a padded row, and the name is the one R32's arm already uses"
+    );
+    refused(
+        "no registered window",
+        &inputs_with_seed_window_refusal(
+            &stages,
+            RenderChainRole::SoleOrTail,
+            ResidentSourceRoute::WindowUnwindowed,
+        ),
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_seed_runs") - runs_before,
+        1,
+        "the bytes are not nameable as an owner window, which is R32's `_runs` fact"
+    );
+
+    // 3. A fact the door answers before it cuts keeps the B1 window's route.
+    refused(
+        "a mapping whose geometry is not the attachment's",
+        &inputs_with_seed_window_refusal(
+            &stages,
+            RenderChainRole::SoleOrTail,
+            ResidentSourceRoute::WindowGeometry,
+        ),
+    );
+    assert_eq!(
+        route_count("resident_source_window_geometry") - geometry_before,
+        1,
+        "one name per fact, and this fact's name is the window's own"
+    );
+
+    // 4. No seam answer: the door refuses exactly as it did before this round,
+    //    which is what makes an absent answer a wiring bug rather than a shape.
+    refused(
+        "no window stated",
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+    );
+
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_seed") - bucket_before,
+        5,
+        "all five readings are the door's own bucket: the round moves no edge"
+    );
+    assert_eq!(
+        route_count("render_provider_load_seed_runs") - seeded_runs_before,
+        0,
+        "R32's own run-list arm is a different door and does not move here"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        deliveries,
+        "a measurement round never reaches the provider: it names, and it keeps"
     );
 }
 

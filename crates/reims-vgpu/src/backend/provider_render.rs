@@ -3260,6 +3260,40 @@ impl LoadSeedRunExit {
     }
 }
 
+/// The bucket one **seed-door** window fact answers under, when that fact has a
+/// name in R32's own run-list family (R38).
+///
+/// Both seed doors ask one question of one list — does the surface's own page
+/// range cut into the ordered windows the contract's `BufferSource::GuestRuns`
+/// states — so the facts that can stop the cut answer under the four names
+/// [`LoadSeedRunExit::slug`] already gives the door that reads a
+/// `DrawRequest::target_guest_seed` list. `None` is the other half: the facts
+/// the door answers *before* it reaches the list at all (the mapping's geometry
+/// or texel format is not the attachment's, the owed frame could not be landed,
+/// the debt's identity moved, the host promises no stable alias, the pages would
+/// not cut into importable runs). Those keep the door's own bucket and are
+/// charged under [`resident_source_route`] — the B1 window's own name for the
+/// same fact — rather than being spelled a second time here.
+fn load_seed_window_slug(route: ResidentSourceRoute) -> Option<&'static str> {
+    use ResidentSourceRoute as Route;
+    match route {
+        Route::WindowPaddedRows => Some("render_provider_out_of_class_load_seed_rows"),
+        Route::WindowExtent => Some("render_provider_out_of_class_load_seed_extent"),
+        Route::WindowRegistrations => Some("render_provider_out_of_class_load_seed_registrations"),
+        // The window that is not there: no registered import, no owner window
+        // for a stretch, or pages the owner rail cannot cut into runs at all.
+        // `LoadSeedRunExit` states those three as `Unregistered`, `Unwindowed`
+        // and (`AttachmentWindowMiss::Untileable`) the same route name, and
+        // R32's own family folds them into one bucket — the bytes are not
+        // nameable as an owner window, whether the refusal is one page or all
+        // of them.
+        Route::WindowUnregistered | Route::WindowUnwindowed => {
+            Some("render_provider_out_of_class_load_seed_runs")
+        }
+        _ => None,
+    }
+}
+
 /// The extent one sampled texture's own view states: its extent in texels
 /// beside the bytes one texel of its format takes (`R36`).
 ///
@@ -5931,6 +5965,35 @@ pub struct RenderRailInputs<'a> {
     /// serialized packet chain (R23's arm), a middle (R25's), a seed (R32's) —
     /// and every record that never named a chain at all.
     pub attachment_guest_window: Option<AttachmentGuestWindow<'a>>,
+    /// The attachment's own guest window the **seed door** cut for this record
+    /// (R38), when the record's previous contents are the mapper-ref-texture
+    /// surface's own guest backing (`DrawRequest::load_guest_target_backing`).
+    ///
+    /// This is the same declaration [`Self::attachment_guest_window`] states,
+    /// asked by the other door that has a window to state. The two are separate
+    /// inputs because they answer two different requests: the elision door's
+    /// record *loads the live GPU image* and the window is the pages its
+    /// deferred Store still owes a frame, while this door's record loads the
+    /// attachment's **own guest backing** and the window is simply the pages
+    /// that backing is — no image is named at all, so the window is not an
+    /// optimisation of a readback but the only way to state the contents.
+    ///
+    /// `Runs` is the door's declaration and admits the record as the contract's
+    /// ordered run list ([`NarrowLoad::GuestRuns`]); `Refused(route)` is the
+    /// name of the fact that stopped the door from cutting one, charged beside
+    /// the door's refusal. The routes are the *same* vocabulary
+    /// [`AttachmentGuestWindow::Refused`] states — one name per fact for the
+    /// same question — and the class splits them: the run-list facts answer
+    /// under the four names [`LoadSeedRunExit::slug`] already gives R32's arm,
+    /// and the facts the door answers *before* it cuts (geometry, an unpaid
+    /// landing, a moved identity, no stable alias, an untilable span) keep the
+    /// door's own bucket and are charged as routes beside it.
+    ///
+    /// `None` is every record whose previous contents are not that backing. A
+    /// record whose request states the backing and whose seam hands no answer
+    /// over is a wiring bug rather than a shape: the door is the one producer of
+    /// this input and it states one for every record it elects.
+    pub seed_guest_window: Option<AttachmentGuestWindow<'a>>,
     /// The frame a middle record's previous contents are, when the caller
     /// hands it over (R25).
     ///
@@ -8745,25 +8808,62 @@ fn narrow_class<'a>(
         }
         carried_chain_middle = true;
         NarrowLoad::Bytes(bytes)
+    } else if req.load_guest_target_backing {
+        // R38, R-A (the measurement round): the attachment's own **guest
+        // backing** is the seed door's other statement of the same fact the
+        // elision door's window carries — the pages the pass begins from *are*
+        // the attachment's previous contents, and the contract states them as
+        // the ordered run list `BufferSource::GuestRuns` (E-TX6), with the
+        // record's own frame landing back in that same window (E-TX8's
+        // `StoreOp::Borrowed`, elected below by the `carried_attachment_guest_window`
+        // flag this arm is the second producer of).
+        //
+        // This arm measures that door before it admits anything: the seam cuts
+        // the window the mapper-ref-texture surface's own pages name, and every
+        // record still keeps the engine **by name**. Two names, and which one is
+        // charged is the round's whole reading:
+        //
+        // * `…_load_seed_backing_window` counts the windows that cut — the
+        //   declarable population, and the upper bound the release is sized on,
+        //   because a measurement round pays no debt and so cannot yet tell a
+        //   window the landing would have held from one it would not;
+        // * one of the four names `LoadSeedRunExit::slug` already gives R32's
+        //   run-list arm counts the windows that did not cut, and the facts the
+        //   door answers before it reaches the list at all are charged under
+        //   the B1 window's own routes.
+        //
+        // The door's own bucket is deliberately left untouched, so a census
+        // reads the v27b number in `render_provider_out_of_class_load_seed`
+        // *beside* the decomposition: a round in which the bucket itself moved
+        // could not be told apart from a release.
+        match inputs.seed_guest_window {
+            Some(AttachmentGuestWindow::Runs(_)) => {
+                crate::runtime::drain::note_store_route(
+                    "render_provider_out_of_class_load_seed_backing_window",
+                );
+            }
+            Some(AttachmentGuestWindow::Refused(route)) => {
+                crate::runtime::drain::note_store_route(
+                    load_seed_window_slug(route).unwrap_or_else(|| resident_source_route(route)),
+                );
+            }
+            // The seam elects this door only for a record it also states a
+            // window for, so a missing answer is a wiring bug rather than a
+            // shape — and a wiring bug is not a fallback: the record keeps the
+            // engine under the door's own name, exactly as it did before.
+            None => {}
+        }
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_load_seed",
+            "a record whose previous contents are the attachment's own guest backing stays \
+             on the engine: the mapper-ref-texture surface's own pages are the window this \
+             door would declare as the canonical attachment's `BufferSource::GuestRuns` load, \
+             and this round measures which of those windows cut — by name, and without \
+             admitting any of them",
+        ));
     } else {
         // R32: the two seed doors, in the order the two statements differ.
         //
-        // A record whose previous contents are its own **guest backing** keeps
-        // the engine: the class renders into the provider's own image, the
-        // backing is the guest's pages, and the frame such a record owes them
-        // is a landing this rail does not carry (E-TX8's `StoreOp::Borrowed` is
-        // the E side of it; the reims landing is not wired). It is the same
-        // door the store gate below answers, which is why the sentence names
-        // the backing rather than a seed.
-        if req.load_guest_target_backing {
-            return Err(OutOfClass::new(
-                "render_provider_out_of_class_load_seed",
-                "a record whose previous contents are the attachment's own guest backing stays \
-                 on the engine: the class renders into the provider's own image, and the half \
-                 that would make that legitimate — landing the frame back in the guest's pages \
-                 — is a store arm this rail does not carry",
-            ));
-        }
         // The mapper-ref-texture surface's seed: the request carries the
         // bytes themselves, as the ordered list of windows inside the surface's
         // registered pages (`research/docs/23` §113, E-TX6). The class states
