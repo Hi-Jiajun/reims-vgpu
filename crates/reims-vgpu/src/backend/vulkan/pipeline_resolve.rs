@@ -919,7 +919,8 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         &fragment.words,
     );
     #[cfg(feature = "provider-render")]
-    let sampler_family = crate::backend::provider_render::sampler_family(&fragment.reflection);
+    let sampler_family =
+        crate::backend::provider_render::sampler_family(&fragment.reflection, &fragment.words);
     #[cfg(feature = "provider-render")]
     let texture_interface_refusals = crate::backend::provider_render::texture_interface_refusals(
         &vertex.reflection,

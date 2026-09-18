@@ -41,3 +41,19 @@ beside a runtime `[[sampler(0)]]` argument. The `.ll` is the same body as
 `render_frag_runtime_sampler.ll` (R12) under the new index, which is what makes "the index is a
 binding and not a position" a byte-for-byte comparison against that fixture's frame; re-assemble it
 from the `.ll` with `llvm-as` 22.1.8 like every other fixture here.
+
+The R37 trio is the sampler-family pair beside the one pairing the class cannot state.
+`render_frag_static_and_runtime_sampler.{ll,air}` is one fragment stage carrying *both* sampler
+forms — `[[texture(0)]]` through the module's own AIR `constexpr sampler`, `[[texture(1)]]`
+through a runtime `[[sampler(0)]]` argument — and `render_frag_runtime_then_static_sampler.{ll,air}`
+is the same body with the two texture arguments swapped, so the positional static pairing and the
+module's own sample sites name different textures for one position. Both write their halves into
+separate channels (red is the static half, green and blue the runtime half), which is what makes
+"each texture is declared in the form its own module names" a reading of the attachment rather
+than of the declarations. `render_frag_two_static_samplers.{ll,air}` samples one texture through
+*two* of the module's AIR constexpr samplers, the shape whose own sample sites name two samplers
+for one image: no per-texture declaration can state it, so the class keeps it on the engine by
+name (`render_provider_out_of_class_texture_sampler_family`). The `.ll` bodies are this corpus's
+owned synthetic fixtures — `metal-api-emulator`'s `render_sample_texture_2d_static_and_runtime.frag.ll`
+carries the same two-form body for the canonical side's probe (E `41308a1`) — re-assembled from
+the `.ll` with `llvm-as` 22.1.8 like every other fixture here.

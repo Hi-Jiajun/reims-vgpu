@@ -10741,6 +10741,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         .collect::<Vec<_>>()
                         .into(),
                     statics: resolved.sampler_family.statics.clone(),
+                    // The pairing is a fact of the module's own sample sites,
+                    // not of the device binding band the relocation moves, so
+                    // the answer travels unchanged (R37).
+                    sample_sites: resolved.sampler_family.sample_sites,
                 }
             };
             // R23: the chain's own frame, materialized for the canonical rail's

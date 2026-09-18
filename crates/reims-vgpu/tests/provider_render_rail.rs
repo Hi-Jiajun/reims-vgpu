@@ -23,10 +23,10 @@
 
 use metal_api_core::provider::{
     AttachmentFormat, BufferAccess, BufferSource, ComputeProvider, FieldValue, FootprintProof,
-    RenderPipelineContract, RenderPipelineStage, SemanticDigest, StageBufferBinding,
-    TextureBindingContract, TextureSource, TextureView, TracePass, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, MAX_RENDER_SAMPLERS,
-    MAX_RENDER_TEXTURES,
+    RenderPipelineContract, RenderPipelineStage, SamplerAddressMode, SamplerFilter, SamplerPolicy,
+    SemanticDigest, StageBufferBinding, TextureBindingContract, TextureSource, TextureView,
+    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep,
+    MAX_RENDER_SAMPLERS, MAX_RENDER_TEXTURES,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -37,10 +37,10 @@ use reims_vgpu::backend::provider_owner::{self, Region};
 use reims_vgpu::backend::provider_render::{
     self, PresentSurfaceKey, ProviderRenderDecline, RenderChainRole, RenderInterfaceRefusal,
     RenderPresentRequest, RenderRailInputs, RenderRailOutcome, RenderRuntimeSampler,
-    RenderSamplerFamily, RenderSamplerRefusal, RenderSamplerState, RenderTextureDeclaration,
-    RenderTextureShape, RenderTextureShapeRefusal, ResidentSourceRoute, StageBufferAccess,
-    StageBufferBind, StageBufferDeclaration, StageBufferFootprint, StageBufferLanding,
-    StageBufferWindow, StageWriteback,
+    RenderSampleSites, RenderSamplerFamily, RenderSamplerRefusal, RenderSamplerState,
+    RenderTextureDeclaration, RenderTextureShape, RenderTextureShapeRefusal, ResidentSourceRoute,
+    StageBufferAccess, StageBufferBind, StageBufferDeclaration, StageBufferFootprint,
+    StageBufferLanding, StageBufferWindow, StageWriteback,
 };
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
@@ -253,6 +253,37 @@ fn mirror_runtime_sampled_stages() -> Stages {
     )
 }
 
+/// The stage that carries both sampler forms at once (R37): the reviewed vertex
+/// stage beside a fragment stage whose `[[texture(0)]]` is sampled through the
+/// module's own AIR `constexpr sampler` and whose `[[texture(1)]]` is sampled
+/// through a runtime `[[sampler(0)]]` argument.
+///
+/// The shape the class gate refused by name until this increment
+/// (`render_provider_out_of_class_texture_sampler_family`), on the sentence
+/// that the canonical rail's registration refuses it — a sentence the
+/// canonical side falsified (E `41308a1`). The declarations and the sampler
+/// family are the *production* walks over the fixture's own translation, which
+/// is the fact the runtime hands the rail.
+fn static_and_runtime_sampled_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_static_and_runtime_sampler.air",
+        "reims_static_and_runtime_sampler_frag",
+    )
+}
+
+/// The same shape with the two texture arguments the other way round (R37):
+/// `[[texture(0)]]` is the runtime-sampled one and `[[texture(1)]]` the
+/// static-sampled one, so the positional static pairing and the module's own
+/// sample sites name different textures for the same position. A walk that
+/// reached for the positional static sampler first would declare the runtime
+/// texture as an AIR-static one; this fixture is where that shows up.
+fn runtime_then_static_sampled_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_runtime_then_static_sampler.air",
+        "reims_runtime_then_static_sampler_frag",
+    )
+}
+
 /// The texel-fetched shape (R15): the reviewed vertex stage beside a fragment
 /// stage that reads one `[[texture(0)]]` with `texture.read()` — Metal's
 /// `access::read` qualifier.
@@ -352,7 +383,7 @@ fn sampled_fragment_stages(fragment_fixture: &str, fragment_entry: &'static str)
         reims_vgpu::backend::provider_render::texture_declarations(translated.reflection(), &words)
             .to_vec();
     stages.sampler_family =
-        reims_vgpu::backend::provider_render::sampler_family(translated.reflection());
+        reims_vgpu::backend::provider_render::sampler_family(translated.reflection(), &words);
     // The same production read for the `[[buffer(N)]]` half, so a sampling
     // fixture that also declares a buffer hands the gate the declaration its
     // own translation reports rather than an empty list.
@@ -601,6 +632,56 @@ fn widened_runtime_sampled_request(
         mip_filter,
         address_mode,
     ));
+    req
+}
+
+/// The attachment-covering draw with **both** sampler forms bound (R37): one
+/// view at each declared texture's device binding, the AIR state's own sampler
+/// resource at the static half's binding, and the request's stated state at the
+/// runtime `[[sampler(0)]]` argument's binding.
+///
+/// The two halves take their own bytes, so moving one of them must move the
+/// frame and moving the other must not — which is what makes "each texture is
+/// declared in the form its own module names" a reading rather than a claim.
+/// The walk is over the *declarations* the production path produced, so the
+/// same helper serves both argument orders of the fixture pair.
+fn static_and_runtime_sampled_request(
+    stages: &Stages,
+    static_texels: Vec<Vec<u8>>,
+    runtime_texels: Vec<Vec<u8>>,
+    extent: (u32, u32),
+    min_mag_filter: u32,
+    address_mode: u32,
+) -> DrawRequest {
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = extent.0;
+    req.height = extent.1;
+    for declaration in stages.fragment_texture_declarations.iter() {
+        match declaration.sampler {
+            RenderSamplerState::Policy(_) => {
+                req.sampled_images.push(image_resource(
+                    declaration.binding,
+                    static_texels.clone(),
+                    extent,
+                ));
+                req.samplers
+                    .push(sampled_sampler_resource(declaration.sampler_binding));
+            }
+            RenderSamplerState::Runtime { .. } => {
+                req.sampled_images.push(image_resource(
+                    declaration.binding,
+                    runtime_texels.clone(),
+                    extent,
+                ));
+                req.samplers.push(family_sampler_resource(
+                    declaration.sampler_binding,
+                    min_mag_filter,
+                    address_mode,
+                ));
+            }
+            other => panic!("the mixed sampler-family fixture declares both forms, not {other:?}"),
+        }
+    }
     req
 }
 
@@ -7109,6 +7190,7 @@ fn the_runtime_sampler_declarations_are_what_the_module_says() {
             }]
             .into(),
             statics: Vec::new().into(),
+            sample_sites: RenderSampleSites::Paired,
         },
         "the stage binds one runtime `[[sampler(0)]]` argument and carries no AIR static sampler"
     );
@@ -7303,19 +7385,15 @@ fn the_runtime_sampler_shapes_beside_the_entry_stay_on_the_engine_by_name() {
     // The positive control: the fixture's own shape is in the class.
     in_class("the runtime-sampled fixture", &stages, &request(&stages));
 
-    // 1. The stage's sampler family: both forms in one stage is not a shape
-    //    one canonical pairing rule can state — its static half pairs by
-    //    position, its runtime half by the index a declaration names.
-    let mut mixed = runtime_sampled_stages();
-    mixed.sampler_family.statics = vec![0].into();
-    let (slug, detail) = answer("mixed sampler families", &mixed, &request(&mixed), &[]);
-    eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_texture_sampler_family");
-    assert!(
-        detail.contains("static") && detail.contains("runtime"),
-        "the sentence names both forms: {detail}"
-    );
-
+    // 1. Both sampler forms in *one* stage is not a refusal at all since R37:
+    //    the canonical rail admits each binding in exactly one of the two
+    //    forms, so the stage leaves for the provider and the per-texture
+    //    declarations state the form each texture's own sample sites name.
+    //    `the_stage_that_carries_both_sampler_forms_is_in_the_class_and_each_half_moves_the_frame`
+    //    below is that shape, translated; what still answers under this bucket
+    //    is a *pairing* the declarations cannot state, and
+    //    `the_pairing_shapes_beside_the_entry_stay_on_the_engine_by_name` is
+    //    where its real module lives.
     // 2. More runtime arguments than Metal's own sampler table holds.
     let mut wide = runtime_sampled_stages();
     wide.sampler_family.runtime = (0..=u32::try_from(MAX_RENDER_SAMPLERS).unwrap())
@@ -7493,6 +7571,340 @@ fn the_runtime_sampler_shapes_beside_the_entry_stay_on_the_engine_by_name() {
              {detail}"
         );
     }
+}
+
+/// R37: the declarations of the stage that carries both sampler forms, read
+/// back off the two fixtures' own translations.
+///
+/// The two fixtures differ in one thing — which texture argument comes first —
+/// and that is exactly what the two pairing rules disagree about: the AIR
+/// static sampler pairs *positionally* with the sampled textures that read
+/// through one, while a runtime `[[sampler(n)]]` argument pairs with the
+/// texture whose own sample site names it. The expectations are written by
+/// hand, so a fixture or a walk that moved fails here rather than silently
+/// changing what the seam states: both orders have to declare
+/// `[[texture(0)]]`/`[[texture(1)]]` in the form the *module* names, at the
+/// device bindings the bands resolve them at (32/33 for the textures, 160 for
+/// the runtime argument, 161 for the AIR static sampler).
+#[test]
+fn the_mixed_sampler_family_declarations_are_what_the_module_says() {
+    let nearest_clamp = RenderSamplerState::Policy(SamplerPolicy {
+        filter: SamplerFilter::Nearest,
+        address: SamplerAddressMode::ClampToEdge,
+    });
+    let runtime_zero = RenderSamplerState::Runtime { index: 0 };
+    let sampled = RenderTextureShape::Sampled2D;
+
+    let static_first = static_and_runtime_sampled_stages();
+    assert_eq!(
+        static_first.fragment_texture_declarations,
+        vec![
+            RenderTextureDeclaration {
+                index: 0,
+                binding: 32,
+                sampler_binding: 161,
+                sampler: nearest_clamp,
+                shape: sampled,
+            },
+            RenderTextureDeclaration {
+                index: 1,
+                binding: 33,
+                sampler_binding: 160,
+                sampler: runtime_zero,
+                shape: sampled,
+            },
+        ],
+        "`[[texture(0)]]` is the AIR-static one and `[[texture(1)]]` the runtime one"
+    );
+    let runtime_first = runtime_then_static_sampled_stages();
+    assert_eq!(
+        runtime_first.fragment_texture_declarations,
+        vec![
+            RenderTextureDeclaration {
+                index: 0,
+                binding: 32,
+                sampler_binding: 160,
+                sampler: runtime_zero,
+                shape: sampled,
+            },
+            RenderTextureDeclaration {
+                index: 1,
+                binding: 33,
+                sampler_binding: 161,
+                sampler: nearest_clamp,
+                shape: sampled,
+            },
+        ],
+        "the positional static pairing must not claim `[[texture(0)]]`, whose own sample \
+         site names the runtime argument"
+    );
+    for (label, stages) in [
+        ("static then runtime", &static_first),
+        ("runtime then static", &runtime_first),
+    ] {
+        assert_eq!(
+            stages.sampler_family,
+            RenderSamplerFamily {
+                runtime: vec![RenderRuntimeSampler {
+                    index: 0,
+                    binding: 160,
+                }]
+                .into(),
+                statics: vec![1].into(),
+                sample_sites: RenderSampleSites::Paired,
+            },
+            "{label}: one runtime `[[sampler(0)]]` argument, one AIR static sampler, and one \
+             sampler per image in the module's own sites"
+        );
+        assert!(
+            stages.texture_interface_refusals.is_empty(),
+            "{label}: both forms are inside the translated rail: {:?}",
+            stages.texture_interface_refusals
+        );
+        eprintln!(
+            "R37 {label} declarations: {:?} family={:?}",
+            stages.fragment_texture_declarations, stages.sampler_family
+        );
+    }
+}
+
+/// R37: the stage that carries both sampler forms is in the class, both rails
+/// land the same bytes, and each half moves the frame on its own.
+///
+/// The two halves are bound with the *same* bytes but read at different
+/// coordinates, so the reading is separable: the static half's sample is the
+/// red channel, the runtime half's two samples are green and blue. Moving the
+/// texel the static half reads moves red and nothing else, moving the one the
+/// runtime half reads moves green and nothing else, and stating another runtime
+/// address mode moves the runtime half's wrapped sample while the static half
+/// stays where the module's own AIR state puts it. A rail that folded either
+/// form into the other would move the wrong channel.
+///
+/// Both argument orders run: the fixture pair is the same shape with the two
+/// texture arguments swapped, which is the one place the positional static
+/// pairing and the module's own sample sites name different textures.
+#[test]
+fn the_stage_that_carries_both_sampler_forms_is_in_the_class_and_each_half_moves_the_frame() {
+    let _guard = engine_test_session();
+    let (width, height) = (8u32, 4u32);
+    use reims_vgpu::protocol::sampler as mtl;
+    let nearest = mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+    let clamp = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    let repeat = mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT;
+    // The texels the module's fixed coordinates read: `(6, 3)` for the AIR
+    // static half, `(7, 3)` for the runtime half's clamped reading.
+    let (static_texel, runtime_texel) = (3 * width as usize + 6, 3 * width as usize + 7);
+    let marked = [255u8, 0, 128, 255];
+
+    for (label, stages) in [
+        ("static then runtime", static_and_runtime_sampled_stages()),
+        ("runtime then static", runtime_then_static_sampled_stages()),
+    ] {
+        let texels = sampled_texels(width, height);
+        let request =
+            |static_texels: Vec<Vec<u8>>, runtime_texels: Vec<Vec<u8>>, address_mode: u32| {
+                static_and_runtime_sampled_request(
+                    &stages,
+                    static_texels,
+                    runtime_texels,
+                    (width, height),
+                    nearest,
+                    address_mode,
+                )
+            };
+        let base_request = request(texels.clone(), texels.clone(), clamp);
+        let base = provider_pixels(label, &stages, &base_request);
+        assert_uniform_frame(label, &base, width, height, [16 * 6, 16 * 7, 16 * 2, 255]);
+        assert!(
+            stages
+                .fragment_texture_declarations
+                .iter()
+                .any(|declaration| {
+                    matches!(declaration.sampler, RenderSamplerState::Policy(_))
+                })
+                && stages
+                    .fragment_texture_declarations
+                    .iter()
+                    .any(|declaration| matches!(
+                        declaration.sampler,
+                        RenderSamplerState::Runtime { .. }
+                    )),
+            "{label}: the stage really carries both forms"
+        );
+        if let Some(engine_frame) = engine_pixels(
+            label,
+            &stages,
+            request(texels.clone(), texels.clone(), clamp),
+        ) {
+            assert_frames_equal(label, &base, &engine_frame);
+        }
+
+        // The runtime half's own state, stated by the draw: `repeat` wraps the
+        // sample at u = 1.375 back onto texel 3, and the static half — which
+        // the module states — does not move.
+        let repeated = provider_pixels(
+            label,
+            &stages,
+            &request(texels.clone(), texels.clone(), repeat),
+        );
+        assert_uniform_frame(
+            "runtime sampler repeated",
+            &repeated,
+            width,
+            height,
+            [16 * 6, 16 * 3, 16 * 2, 255],
+        );
+        assert_frames_differ("the runtime state moved the frame", &base, &repeated);
+        if let Some(engine_frame) = engine_pixels(
+            label,
+            &stages,
+            request(texels.clone(), texels.clone(), repeat),
+        ) {
+            assert_frames_equal("runtime sampler repeated", &repeated, &engine_frame);
+        }
+
+        // The static half's own text: moving the texel it reads moves red.
+        let mut static_moved = texels.clone();
+        static_moved[static_texel] = marked.to_vec();
+        let static_frame = provider_pixels(
+            label,
+            &stages,
+            &request(static_moved, texels.clone(), clamp),
+        );
+        assert_uniform_frame(
+            "the static half's texel moved",
+            &static_frame,
+            width,
+            height,
+            [255, 16 * 7, 16 * 2, 255],
+        );
+        assert_frames_differ(
+            "the static half's texel moved the frame",
+            &base,
+            &static_frame,
+        );
+
+        // The runtime half's own text: moving the texel it reads moves green.
+        let mut runtime_moved = texels.clone();
+        runtime_moved[runtime_texel] = marked.to_vec();
+        let runtime_frame = provider_pixels(
+            label,
+            &stages,
+            &request(texels.clone(), runtime_moved, clamp),
+        );
+        assert_uniform_frame(
+            "the runtime half's texel moved",
+            &runtime_frame,
+            width,
+            height,
+            [16 * 6, 255, 16 * 2, 255],
+        );
+        assert_frames_differ(
+            "the runtime half's texel moved the frame",
+            &base,
+            &runtime_frame,
+        );
+
+        // A texel no sample reads reaches neither half.
+        let mut unread_static = texels.clone();
+        unread_static[0] = marked.to_vec();
+        let mut unread_runtime = texels.clone();
+        unread_runtime[0] = marked.to_vec();
+        let untouched = provider_pixels(
+            label,
+            &stages,
+            &request(unread_static, unread_runtime, clamp),
+        );
+        assert_frames_equal(
+            "a texel neither half reads does not reach the frame",
+            &base,
+            &untouched,
+        );
+        eprintln!(
+            "R37 {label}: attachment {width}x{height} — the static half lands {:#04x} in red, \
+             the runtime half {:#04x} clamped and {:#04x} repeated in green, moving either \
+             half's read texel moved its own channel, and provider and engine agree byte for \
+             byte",
+            base[0], base[1], repeated[1],
+        );
+    }
+}
+
+/// R37: the pairing shapes beside that entry, each under its own name — the
+/// one the class cannot state even after the two forms were admitted.
+///
+/// A declaration names exactly one sampler form per texture. The fixture
+/// samples its `[[texture(0)]]` through *two* of the module's AIR constexpr
+/// samplers (nearest + clamp, then linear + clamp), which is a module whose own
+/// sample sites name two samplers for one image: the walk that reads the
+/// declarations off those sites answers `MultipleSamplers` and the class keeps
+/// the stage on the engine by name, instead of declaring the texture through
+/// one of the two and handing the provider a pass the canonical registration
+/// refuses at the other end — a declined draw where the engine would have
+/// drawn it.
+#[test]
+fn the_pairing_shapes_beside_the_entry_stay_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = sampled_fragment_stages(
+        "render_frag_two_static_samplers.air",
+        "reims_two_static_samplers_frag",
+    );
+    assert_eq!(
+        stages.sampler_family.sample_sites,
+        RenderSampleSites::MultipleSamplers,
+        "the fixture's own sample sites name two samplers for one image"
+    );
+    assert_eq!(
+        stages.sampler_family.statics.len(),
+        2,
+        "two AIR constexpr samplers, both live in the emitted module"
+    );
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    use reims_vgpu::protocol::sampler as mtl;
+    let request = static_and_runtime_sampled_request(
+        &stages,
+        texels.clone(),
+        texels,
+        (width, height),
+        mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+        mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    );
+    // The fallback walk's own answer, kept visible on purpose: it declares
+    // both textures as AIR-static ones, which is *not* what the module's sample
+    // sites state (the second texture is the runtime one) — the reason the
+    // class reads the pairing rather than re-deriving the forms from position.
+    eprintln!(
+        "R37 pairing fallback declarations: {:?}",
+        stages.fragment_texture_declarations
+    );
+    let submissions = provider_render::provider_submissions();
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &request) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("door: {}\n  {}", reason.slug(), reason.detail());
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_texture_sampler_family",
+                "the bucket is the sampler family's own"
+            );
+            let detail = reason.detail();
+            assert!(
+                detail.contains("more than one sampler for one texture")
+                    && detail.contains("render_stage_reflection_mismatch")
+                    && detail.contains("render_runtime_sampler_undeclared"),
+                "the sentence names the shape and both canonical refusals it stands in for: \
+                 {detail}"
+            );
+        }
+        other => {
+            panic!("a pairing the declarations cannot state has to stay on the engine: {other:?}")
+        }
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions,
+        "a shape the class cannot state never reaches the provider"
+    );
 }
 
 /// The command frame's own header (R36): `MCC1`, the request tag, and the
@@ -8414,6 +8826,7 @@ fn a_fetched_and_a_sampled_texture_are_declared_apart_and_both_land() {
             }]
             .into(),
             statics: Vec::new().into(),
+            sample_sites: RenderSampleSites::Paired,
         },
         "the stage binds one runtime `[[sampler(0)]]` argument and carries no AIR static sampler"
     );
@@ -8651,6 +9064,7 @@ fn the_sparse_declarations_are_what_the_module_says() {
             }]
             .into(),
             statics: Vec::new().into(),
+            sample_sites: RenderSampleSites::Paired,
         },
         "the stage binds one runtime `[[sampler(0)]]` argument and carries no AIR static sampler"
     );
