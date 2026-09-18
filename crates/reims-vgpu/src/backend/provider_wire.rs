@@ -391,6 +391,49 @@ pub fn render_texture_gathered_extent_no_copy(
     Ok(decoded.supports_render_texture_gathered_extent_no_copy)
 }
 
+/// The attachment-landing-view half of one provider capability snapshot, read
+/// back out of the response frame the provider would send (`research/docs/23`
+/// §115 之后的增量，E-TX13).
+///
+/// The ninth reading of the same one-snapshot rule ([`stage_buffer_support`],
+/// [`compute_texture_support`], [`render_texture_support`],
+/// [`render_sampler_carriage`], [`stage_buffer_namespace_split`],
+/// [`render_texture_gathered_extent`], [`render_vertex_interface_superset`],
+/// [`render_texture_gathered_extent_no_copy`]), and the one this rail's
+/// landing exit needs: a record whose attachment is backed by the guest's own
+/// pages, whose own load is some *other* statement of its previous contents
+/// (the walk's chain value, or a `Clear`), and whose frame the guest's pages
+/// are owed can state where that frame lands *without* changing where the pass
+/// begins from — by carrying a **second** view declaration
+/// (`StoreOp::BorrowedLanding`,
+/// `metal_api_core::provider::AttachmentLandingView`) beside the attachment's
+/// own.
+///
+/// `true` is the provider's own declaration that it executes that arm: the
+/// rail resolves the second declaration through the same serial view list the
+/// attachment's own comes from and copies the readback into the owner's window
+/// (`metal-api-vulkan`'s `resolve_attachment_landing`). `false` is the
+/// fail-closed answer, and it is what a frame written before the bit existed
+/// decodes to (the second family of capability tail E-TX13 opened carries this
+/// bit as `0x00 0x05 <bool>`, so its absence reads as undeclared), so the class
+/// gate that reads this reading keeps the record on the engine under
+/// `render_provider_out_of_class_guest_backing` rather than handing the
+/// provider a store arm the frame never stated it could land.
+///
+/// What the bit deliberately does *not* answer is where the window is: the
+/// second declaration is the seam's own cut of the surface's registered pages,
+/// and a provider that declares this bit still refuses a trace whose
+/// declaration is missing, is a copy arm, or does not concatenate to the
+/// attachment's tightly packed extent (`landing_view_undeclared` /
+/// `owned_bytes` / `staged_lease` / `render_attachment_landing_mismatch`).
+pub fn render_attachment_landing_view(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_attachment_landing_view)
+}
+
 /// The provider's own capability snapshot as it comes back out of the frame
 /// the owner would receive.
 ///

@@ -538,10 +538,16 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // pages by `store_surface_resident`, so this encode owes the caller nothing
     // further.
     let mut surface_store_armed = false;
-    // B3: the frame the *canonical provider* landed in the guest's own pages
-    // (`StoreOp::Borrowed`, E-TX8), carried out of the draw so the Store route
-    // below pays the account and no copy.
-    let mut borrowed_landing: Option<(Vec<u8>, bool)> = None;
+    // B3/E-TX13: the frame the *canonical provider* landed in the guest's own
+    // pages, carried out of the draw so the Store route below pays the account
+    // and no copy — with the arm that landed it, because the two arms owe the
+    // pages two different accounts (E-TX8's window was paid before the pass,
+    // E-TX13's may still carry the debt this landing supersedes).
+    let mut borrowed_landing: Option<(
+        Vec<u8>,
+        bool,
+        crate::backend::provider_render::WindowLanding,
+    )> = None;
     // GVA render Store: the frame remains authoritative in the resident and a
     // resource-scoped debt records the future transfer. The twin of
     // `surface_store_armed`, and it returns through the same door.
@@ -696,14 +702,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     None,
                 );
             }
-            Ok(M2vDrawSpan::BorrowedLanding { bytes, bgra }) => {
-                // B3: the provider's own write put the frame in the guest's
-                // pages. The bytes travel to the Store route anyway, because
-                // that route is what publishes the frame to the surface's own
-                // consumers (`publish_surface_store`, the guest-write witness,
-                // the surface cache) — it just must not land them a second
-                // time.
-                borrowed_landing = Some((bytes, bgra));
+            Ok(M2vDrawSpan::BorrowedLanding {
+                bytes,
+                bgra,
+                landing,
+            }) => {
+                // B3/E-TX13: the provider's own write put the frame in the
+                // guest's pages. The bytes travel to the Store route anyway,
+                // because that route is what publishes the frame to the
+                // surface's own consumers (`publish_surface_store`, the
+                // guest-write witness, the surface cache) — it just must not
+                // land them a second time. The arm travels beside them because
+                // the *account* differs: the E-TX13 arm's window may still
+                // carry the writeback debt of an older deferred Store, and a
+                // landing that has just superseded it owes the pages an answer
+                // about that debt which the E-TX8 arm's cut already gave.
+                borrowed_landing = Some((bytes, bgra, landing));
                 crate::observe::line(format!(
                     "linux_m2v_draw ok borrowed_landing pipe={} {}x{} mid={} gva={:#x}",
                     req.pipeline_ref,
@@ -768,9 +782,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // own guest window (`StoreOp::Borrowed`, E-TX8). Every Store route below
     // exists to get a frame *into* those pages; they already hold this one, so
     // what runs is the account alone.
-    if let Some((bytes, bgra)) = borrowed_landing {
+    if let Some((bytes, bgra, landing)) = borrowed_landing {
         return (
-            borrowed_landing_store(state, host, req, &colors, &bytes, bgra),
+            borrowed_landing_store(state, host, req, &colors, &bytes, bgra, landing),
             None,
         );
     }
@@ -3137,17 +3151,61 @@ fn attachment_window_input(
     }
 }
 
-fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
+/// Whether one cut of a mapping's guest window pays the surface's own writeback
+/// debt before it names the pages (E-TX8 / E-TX13).
+///
+/// The debt is the frame a deferred Store left in a resident and still owes
+/// those pages. Which answer is right is decided by what the caller is about to
+/// do with the window, not by the window:
+///
+/// * [`Self::Pay`] is the elision and seed doors' answer. Their declaration
+///   *reads* the pages as the attachment's previous contents, so `INV-LAND`
+///   requires the pages to hold what the elision read before anything states
+///   them — the payment is the copy the deferred rail already owed and not a
+///   new one.
+/// * [`Self::Leave`] is the landing door's answer (E-TX13). That declaration
+///   only *writes* the pages: the frame it deposits is the surface's newer
+///   content, which supersedes the owed one — and paying first would put the
+///   older frame into the page only for the landing to overwrite it, which is
+///   the C2 degradation ([`crate::runtime::writeback_debt::
+///   supersede_for_mapping`]'s doc names the same choice for the CPU write).
+///   The debt is therefore left armed for the completion to supersede, so a
+///   landing that never happens leaves it exactly as it was.
+#[cfg(feature = "provider-render")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MappingDebtPayment {
+    Pay,
+    Leave,
+}
+
+/// Cut one mapping's registered guest window into the provider-shaped runs one
+/// declaration states (B1 / R38 / E-TX13).
+///
+/// The one walk behind all three doors that state a mapping's own pages: the
+/// geometry and texel format are checked against the mapping's declaration
+/// ([`mapper_ref_texture_sample_window`]'s own arithmetic), the frame the pages
+/// are owed is either paid or deliberately left per [`MappingDebtPayment`], the
+/// pages are cut into the ordered run list the contract's
+/// `BufferSource::GuestRuns` states, and the registered import the sampled rail
+/// reads this surface through is preferred when the RAMBlock projection states
+/// no window.
+///
+/// The answer carries the optional payment when the walk was asked to pay:
+/// `Some` is total for [`MappingDebtPayment::Pay`], where the outcome is what
+/// `INV-LAND` is read through, and `None` for [`MappingDebtPayment::Leave`],
+/// where nothing was paid and the debt's own state is the caller's to keep.
+fn mapper_ref_texture_target_guest_cut<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
     w: u32,
     h: u32,
     target_format: ash::vk::Format,
+    debt: MappingDebtPayment,
 ) -> Result<
     (
         crate::backend::vulkan::engine::GuestTargetSeed,
-        crate::runtime::writeback_debt::MappingPayOutcome,
+        Option<crate::runtime::writeback_debt::MappingPayOutcome>,
     ),
     AttachmentWindowMiss,
 > {
@@ -3202,7 +3260,15 @@ fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
     // the elision door is the one that has to *state* those pages as the
     // attachment's own window — so it is the caller that reads the outcome and
     // refuses by name when the frame could not be landed.
-    let pay = crate::runtime::writeback_debt::pay_for_mapping(state, host, mapping_id);
+    //
+    // E-TX13: the landing door asks the same walk with `Leave`, because nothing
+    // about its declaration reads these pages (see [`MappingDebtPayment`]).
+    let pay = match debt {
+        MappingDebtPayment::Pay => Some(crate::runtime::writeback_debt::pay_for_mapping(
+            state, host, mapping_id,
+        )),
+        MappingDebtPayment::Leave => None,
+    };
     if !guest_run_alias_available(host) {
         return Err(AttachmentWindowMiss::NoAlias);
     }
@@ -3249,6 +3315,74 @@ fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
         },
         pay,
     ))
+}
+
+/// The **paying** cut the two doors whose declaration *reads* a mapping's pages
+/// take (B1's elision door, R38's seed door).
+///
+/// One wrapper rather than a flag at each call site, so the arm that owes
+/// `INV-LAND` cannot be spelled without it: the payment's answer is total on
+/// this arm by construction ([`MappingDebtPayment::Pay`] always asks for it),
+/// and the two callers are the two that have to check it
+/// ([`MappingPayOutcome::landed_or_current`]).
+fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    w: u32,
+    h: u32,
+    target_format: ash::vk::Format,
+) -> Result<
+    (
+        crate::backend::vulkan::engine::GuestTargetSeed,
+        crate::runtime::writeback_debt::MappingPayOutcome,
+    ),
+    AttachmentWindowMiss,
+> {
+    let (seed, pay) = mapper_ref_texture_target_guest_cut(
+        state,
+        host,
+        mapping_id,
+        w,
+        h,
+        target_format,
+        MappingDebtPayment::Pay,
+    )?;
+    Ok((seed, pay.expect("a paying cut states its payment's answer")))
+}
+
+/// The **leaving** cut E-TX13's landing door takes: the same window, cut
+/// without paying the surface's writeback debt.
+///
+/// Read by the class as the second declaration's runs
+/// ([`crate::backend::provider_render::RenderRailInputs::landing_guest_window`]).
+/// The debt is deliberately left where it is, and the completion that knows the
+/// landing happened is what supersedes it
+/// (`crate::runtime::writeback_debt::supersede_for_mapping`'s own rule, applied
+/// to the provider's landing instead of the CPU's write): a cut that pays first
+/// would land the *older* frame only for the newer one to overwrite it, and a
+/// record the class then refuses would have paid a debt the pages still owed.
+#[cfg(feature = "provider-render")]
+fn mapper_ref_landing_window<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    w: u32,
+    h: u32,
+    target_format: ash::vk::Format,
+    extent: u64,
+) -> Result<Vec<crate::backend::provider_render::StageBufferWindow>, AttachmentWindowMiss> {
+    let (seed, _) = mapper_ref_texture_target_guest_cut(
+        state,
+        host,
+        mapping_id,
+        w,
+        h,
+        target_format,
+        MappingDebtPayment::Leave,
+    )?;
+    crate::backend::provider_render::load_seed_run_windows(&seed.source, extent)
+        .map_err(AttachmentWindowMiss::Runs)
 }
 
 fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
@@ -7362,6 +7496,14 @@ enum M2vDrawSpan {
         /// `resolve_attachment_landing` wrote into the window.
         bytes: Vec<u8>,
         bgra: bool,
+        /// Which declaration named that window. Both arms land the same bytes
+        /// in the same kind of place, and the Store route's *account* is the
+        /// one thing they do not share: [`WindowLanding::OwnView`]'s cut paid
+        /// what the pages were owed (`INV-LAND`), while
+        /// [`WindowLanding::LandingView`]'s deliberately left that debt in
+        /// place for the landing to supersede — which is a statement only the
+        /// completion can make, because only it knows the landing happened.
+        landing: crate::backend::provider_render::WindowLanding,
     },
     /// The class-only probe's answer (R42): nothing was encoded, nothing was
     /// drawn and nothing was written — the seam stopped where a submission
@@ -9478,6 +9620,23 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         > = None;
         #[cfg(feature = "provider-render")]
         let mut seed_window_miss: Option<AttachmentWindowMiss> = None;
+        // E-TX13: the **landing** door's own window — the third door that has
+        // one, and the only one whose declaration is a destination rather than a
+        // source. The record it answers is the guest-backed tail the two doors
+        // above cannot state a window for: its previous contents are the walk's
+        // chain value (or a `Clear`), so the pages it must be landed in are not
+        // the pages it begins from. Cut where the surface's own backing is
+        // known, under the provider's own declaration that it executes the arm,
+        // and *without* paying the surface's writeback debt: a cut that paid
+        // would land the older frame only for the newer one to overwrite it, and
+        // the completion is where the debt is superseded — after the landing it
+        // is superseded *by* has actually happened.
+        #[cfg(feature = "provider-render")]
+        let mut landing_window_runs: Option<
+            Vec<crate::backend::provider_render::StageBufferWindow>,
+        > = None;
+        #[cfg(feature = "provider-render")]
+        let mut landing_window_miss: Option<AttachmentWindowMiss> = None;
         if req.chain_from_resident && render_chain_identity(state, req).is_some() {
             // The serialized chain names the resident it intends to load;
             // existence and readiness are engine state and are validated
@@ -10369,6 +10528,46 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     ) {
                         Ok(runs) => seed_window_runs = Some(runs),
                         Err(miss) => seed_window_miss = Some(miss),
+                    }
+                }
+            }
+            // E-TX13: the landing door, asked last because it is the door the
+            // other two are preferred to. Its record is the one neither of them
+            // answered — a guest-backed tail whose own load is some other
+            // statement of its contents — so it is asked exactly where the two
+            // above stated nothing for this record's pages, and only where the
+            // device's own capability frame declares the arm it states (a
+            // provider without it keeps the record on the engine under the
+            // refusal that already names it, and a cut whose window no class arm
+            // could use would be page-table work bought for nothing).
+            #[cfg(feature = "provider-render")]
+            if resources.guest_target_memory.is_some()
+                && writeback_guest
+                && !resources.load_guest_target_backing
+                && attachment_window_runs.is_none()
+                && seed_window_runs.is_none()
+                && matches!(
+                    crate::backend::provider_render::declares_attachment_landing_view(),
+                    Ok(true)
+                )
+            {
+                if let (Some(c0), Some(extent)) = (req.colors.first(), attachment_window_extent) {
+                    let format = resources
+                        .target_identity
+                        .as_ref()
+                        .map(|identity| identity.resident_format())
+                        .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
+                    match mapper_ref_landing_window(
+                        state,
+                        host,
+                        c0.mapping_id,
+                        w,
+                        h,
+                        format,
+                        extent,
+                    ) {
+                        Ok(runs) => landing_window_runs = Some(runs),
+                        Err(miss) => landing_window_miss = Some(miss),
                     }
                 }
             }
@@ -11379,6 +11578,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     &attachment_window_runs,
                     attachment_window_miss,
                 ),
+                // E-TX13: the same declaration asked for the record whose frame
+                // the guest's pages are owed and whose own load is some *other*
+                // statement of its contents. The class elects the store arm
+                // that lands its frame in these runs — the pass still begins
+                // from what it declared — or refuses the record by name, with
+                // the fact that stopped the cut charged beside the refusal
+                // exactly as the elision door's own route is.
+                landing_guest_window: attachment_window_input(
+                    &landing_window_runs,
+                    landing_window_miss,
+                ),
                 // R38: the same declaration for the *other* door that has one.
                 // A record whose previous contents are the mapper-ref-texture
                 // surface's own guest backing loads those pages, and this is the
@@ -11656,11 +11866,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // route publishes). The counters are read before the frame
                     // is moved out of `out`.
                     let present = out.present;
-                    // B3: whether the provider's own write put this frame in
-                    // the guest's pages (`StoreOp::Borrowed`, E-TX8). Read
-                    // before the completion is consumed, and acted on below
-                    // where this rail's Store routes already live.
-                    let landed_in_window = out.landed_in_window;
+                    // B3/E-TX13: which declaration, if any, named the guest's
+                    // own pages as this frame's destination — the provider has
+                    // already written them by the time this is read. Read before
+                    // the completion is consumed, and acted on below where this
+                    // rail's Store routes already live.
+                    let landing = out.landing;
                     // The completion lands at the attachment's own texel width;
                     // the span's consumers read eight-bit colour, so a wide
                     // frame is narrowed here (`provider_span_pixels`) rather
@@ -11689,15 +11900,35 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             ),
                         },
                     ));
-                    if landed_in_window {
-                        // B3: the frame is already in the guest's pages — the
-                        // provider wrote them from the same readback these bytes
-                        // are — so the Store route below must not write them
-                        // again. It still owes the device the account that says
-                        // the pages changed, which is why the span carries the
-                        // bytes rather than being an empty one.
-                        crate::runtime::drain::note_store_route("render_provider_borrowed_landing");
-                        return Ok(M2vDrawSpan::BorrowedLanding { bytes, bgra });
+                    if let Some(landing) = landing {
+                        // B3/E-TX13: the frame is already in the guest's pages —
+                        // the provider wrote them from the same readback these
+                        // bytes are — so the Store route below must not write
+                        // them again. It still owes the device the account that
+                        // says the pages changed, which is why the span carries
+                        // the bytes rather than being an empty one.
+                        //
+                        // The two arms are two names, because they are two
+                        // populations: E-TX8's record began from those pages
+                        // (its window was paid before the pass), E-TX13's began
+                        // from somewhere else and named them as a destination
+                        // only. A census that folded them would see the landing
+                        // population grow without knowing which declaration
+                        // moved, which is exactly what this increment has to be
+                        // read on.
+                        crate::runtime::drain::note_store_route(match landing {
+                            crate::backend::provider_render::WindowLanding::OwnView => {
+                                "render_provider_borrowed_landing"
+                            }
+                            crate::backend::provider_render::WindowLanding::LandingView => {
+                                "render_provider_borrowed_landing_view"
+                            }
+                        });
+                        return Ok(M2vDrawSpan::BorrowedLanding {
+                            bytes,
+                            bgra,
+                            landing,
+                        });
                     }
                     return Ok(M2vDrawSpan::Pixels { bytes, bgra });
                 }
@@ -13495,6 +13726,7 @@ fn borrowed_landing_store<M: HostMemory + HostOps>(
     colors: &[crate::runtime::draw::ColorRtRequest],
     bytes: &[u8],
     bgra: bool,
+    landing: crate::backend::provider_render::WindowLanding,
 ) -> EncodeStatus {
     let Some(c0) = colors.first() else {
         return EncodeStatus::Ok;
@@ -13502,6 +13734,30 @@ fn borrowed_landing_store<M: HostMemory + HostOps>(
     crate::runtime::drain::note_store_route("mapper_ref_texture_resident_stamp_skipped");
     if c0.mapping_id != 0 {
         let (mid, cw, ch, fmt) = (c0.mapping_id, c0.width, c0.height, c0.format);
+        // E-TX13: the arm whose window was cut *without* paying the surface's
+        // writeback debt supersedes that debt here, and only here — at the one
+        // point that knows the landing actually happened. The debt names a frame
+        // the surface's pages were owed; what this command just put in those
+        // pages is the same surface's newer content at the same geometry, which
+        // is exactly the statement `writeback_debt::supersede_for_mapping` drops
+        // a debt for (`mapping_write`'s CPU route makes it one statement earlier,
+        // for a write it is about to make itself). Leaving the debt armed would
+        // let a later reader pay it, and the payment would write the *older*
+        // frame over this one — the one failure this arm could introduce, and
+        // the reason the cut must not drop it instead: a record the class refuses
+        // after the cut never reaches this point, so its pages keep the debt they
+        // are owed.
+        //
+        // `OwnView` (E-TX8) has nothing to do here: its cut paid the debt before
+        // it stated the window (`INV-LAND`), so there is none left to supersede.
+        // The GVA destination below is not this arm's either — E-TX13's cut is
+        // the mapper mapping's own window, so a GVA plane keeps whatever its own
+        // debt ledger says.
+        if landing == crate::backend::provider_render::WindowLanding::LandingView
+            && state.pending_writebacks.take(mid).is_some()
+        {
+            crate::runtime::drain::note_store_route("wbdebt_superseded_by_provider_landing");
+        }
         if let Some(m) = state.mappings.get(&mid) {
             let format = if m.format != 0 {
                 m.format
@@ -14723,7 +14979,15 @@ mod vulkan_split_tests {
         };
         let bytes = vec![0x2bu8; 8 * 4 * 4];
 
-        let status = borrowed_landing_store(&mut state, &mut host, &request, &colors, &bytes, true);
+        let status = borrowed_landing_store(
+            &mut state,
+            &mut host,
+            &request,
+            &colors,
+            &bytes,
+            true,
+            crate::backend::provider_render::WindowLanding::OwnView,
+        );
         assert!(matches!(status, EncodeStatus::Ok));
 
         let after = state.mappings.get(&mapping).expect("the mapping survives");
@@ -14747,6 +15011,126 @@ mod vulkan_split_tests {
             1,
             "the mapper arm of the landing is what this completion accounts for"
         );
+    }
+
+    /// E-TX13's completion guard, asserted where the completion runs: the arm
+    /// whose window was cut **without** paying the surface's writeback debt
+    /// drops that debt once its landing has happened, and the arm whose cut
+    /// *did* pay it (E-TX8) leaves whatever it finds alone.
+    ///
+    /// This is the one place the two declarations differ in their *account*.
+    /// The debt is the frame a deferred Store left in a resident and still owes
+    /// the surface's pages; a landing that has just written those pages holds
+    /// the same surface's newer content at the same geometry, which is why the
+    /// CPU write route drops such a debt rather than paying it
+    /// (`writeback_debt::supersede_for_mapping`). Leaving it armed would let a
+    /// later reader pay it, and the payment would write the *older* frame over
+    /// this one.
+    ///
+    /// The other direction is the reason the guard is scoped to the arm instead
+    /// of being unconditional: E-TX8's cut pays the debt *before* it states the
+    /// window (`INV-LAND`), so a debt it sees at completion is one some other
+    /// reader is still owed a frame from — dropping that one would lose a frame
+    /// nothing else carries. The test arms the ledger by hand for both arms
+    /// because the seam's own cut needs a guest to mint (`runtime::draw`'s
+    /// page walk), and what is asserted here is the completion's half alone.
+    #[test]
+    fn a_landing_view_supersedes_the_mappings_owed_frame_and_the_own_view_leaves_it() {
+        use crate::backend::vulkan::engine::TargetIdentity;
+        use crate::runtime::drain::store_route_count;
+        use crate::runtime::resident_target::ResidentTarget;
+        const SUPERSEDED: &str = "wbdebt_superseded_by_provider_landing";
+
+        let mapping = 7;
+        let (width, height) = (8u32, 4u32);
+        let colors = vec![ColorRtRequest {
+            mapping_id: mapping,
+            width,
+            height,
+            format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            ..Default::default()
+        }];
+        let request = DrawEncodeRequest {
+            task_id: 1,
+            pipeline_ref: 1,
+            ..Default::default()
+        };
+        let bytes = vec![0x2bu8; (width * height * 4) as usize];
+        let arm = |state: &mut DeviceState| {
+            state
+                .pending_writebacks
+                .arm(
+                    mapping,
+                    ResidentTarget::new(TargetIdentity::Surface {
+                        id: mapping,
+                        width,
+                        height,
+                        generation: 1,
+                        format: ash::vk::Format::B8G8R8A8_UNORM,
+                    }),
+                    width,
+                    height,
+                    0x1e,
+                )
+                .is_none()
+                .then_some(())
+                .expect("the ledger starts empty for this mapping");
+        };
+
+        // 1. E-TX8's arm: the debt its cut would have paid is not the
+        //    completion's to drop.
+        {
+            let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            assert!(state.set_mapping_geom(mapping, width, height, 0x1e));
+            arm(&mut state);
+            let before = store_route_count(SUPERSEDED);
+            let status = borrowed_landing_store(
+                &mut state,
+                &mut host,
+                &request,
+                &colors,
+                &bytes,
+                true,
+                crate::backend::provider_render::WindowLanding::OwnView,
+            );
+            assert!(matches!(status, EncodeStatus::Ok));
+            assert!(
+                state.pending_writebacks.get(mapping).is_some(),
+                "the arm whose cut paid its debt leaves a debt it did not arm"
+            );
+            assert_eq!(store_route_count(SUPERSEDED) - before, 0);
+        }
+
+        // 2. E-TX13's arm: the frame it just landed is newer than the owed one,
+        //    so the debt is superseded — and the completion is the one point
+        //    that knows the landing happened.
+        {
+            let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            assert!(state.set_mapping_geom(mapping, width, height, 0x1e));
+            arm(&mut state);
+            let before = store_route_count(SUPERSEDED);
+            let status = borrowed_landing_store(
+                &mut state,
+                &mut host,
+                &request,
+                &colors,
+                &bytes,
+                true,
+                crate::backend::provider_render::WindowLanding::LandingView,
+            );
+            assert!(matches!(status, EncodeStatus::Ok));
+            assert!(
+                state.pending_writebacks.get(mapping).is_none(),
+                "the landing supersedes the frame the pages were still owed"
+            );
+            assert_eq!(
+                store_route_count(SUPERSEDED) - before,
+                1,
+                "the superseded debt is a reading of its own"
+            );
+        }
     }
 
     /// Every guest-page writer in this crate goes through
@@ -17927,7 +18311,7 @@ mod provider_span_pixels_tests {
                     bgra,
                     present: None,
                     stage_writebacks: Vec::new(),
-                    landed_in_window: false,
+                    landing: None,
                 },
             )
             .expect("an eight-bit frame is already what the span speaks");
@@ -17952,7 +18336,7 @@ mod provider_span_pixels_tests {
                 bgra: false,
                 present: None,
                 stage_writebacks: Vec::new(),
-                landed_in_window: false,
+                landing: None,
             },
         )
         .expect("four half channels narrow to four bytes");
@@ -17993,7 +18377,7 @@ mod provider_span_pixels_tests {
                     bgra: false,
                     present: None,
                     stage_writebacks: Vec::new(),
-                    landed_in_window: false,
+                    landing: None,
                 },
             )
             .expect_err(label);

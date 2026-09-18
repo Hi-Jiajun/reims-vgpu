@@ -1081,6 +1081,12 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // test drives it — the shape [`inputs_with_attachment_window`] and its
         // refusal sibling state.
         attachment_guest_window: None,
+        // E-TX13: the *landing* door's own window, stated only by the shapes
+        // that drive the second declaration ([`inputs_with_landing_window`] and
+        // its refusal sibling); every other fixture is a record that either
+        // begins from those pages (the elision and seed doors above) or names
+        // no window at all.
+        landing_guest_window: None,
         // R38: the seed door's own window, stated only by the shapes that drive
         // it ([`inputs_with_seed_window`] and its refusal sibling); every other
         // fixture is a record whose previous contents are not the surface's own
@@ -1335,6 +1341,41 @@ fn inputs_with_seed_window_refusal<'a>(
 ) -> RenderRailInputs<'a> {
     RenderRailInputs {
         seed_guest_window: Some(provider_render::AttachmentGuestWindow::Refused(route)),
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_held`] with the **landing door's** own window stated (E-TX13).
+///
+/// The third door that states a mapping's own pages, and the only one whose
+/// declaration is a *destination*: the record's previous contents are the walk's
+/// chain value (or a `Clear`), so the window cannot be where the pass begins —
+/// it is where the frame the guest's pages are owed lands, and the contract
+/// carries that statement as a **second** view declaration
+/// (`StoreOp::BorrowedLanding`) beside the attachment's own. The runs are the
+/// class's own input shape, exactly as they are for the two doors above: the
+/// seam's page walk is the layer a test cannot mint without a guest.
+fn inputs_with_landing_window<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    window: &'a [StageBufferWindow],
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        landing_guest_window: Some(provider_render::AttachmentGuestWindow::Runs(window)),
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_with_landing_window`] with the window the door could **not** cut,
+/// named: the shape the landing door's own fact is charged for, in the same
+/// vocabulary the elision door's routes use (one question, two askers).
+fn inputs_with_landing_window_refusal<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    route: ResidentSourceRoute,
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        landing_guest_window: Some(provider_render::AttachmentGuestWindow::Refused(route)),
         ..inputs_held(stages, role)
     }
 }
@@ -4840,6 +4881,21 @@ fn a_guest_backed_chain_middle_leaves_for_the_provider_and_its_tail_does_not() {
     //     window is how a wrong frame becomes unobservable. The refusal stays,
     //     and the probe reads the state it is in rather than folding it into
     //     `_none`.
+    //
+    //     E-TX13 narrowed *when* this canary fires, and the narrowing is the
+    //     opposite of a silent conversion: the shape below is the released arm's
+    //     own input (a guest-backed tail whose load is its own bytes, beside the
+    //     window its pages are owed), and on a provider that declares
+    //     `supports_render_attachment_landing_view` the class answers it — the
+    //     pass still begins from those bytes and the *second* declaration lands
+    //     the frame (`a_guest_backed_tail_whose_load_is_the_chain_value_lands_in_
+    //     the_window_a_second_view_names`). What this state reads is therefore
+    //     the no-arm answer, and it is the same statement B3 made: with the arm
+    //     unavailable, a stated window is not adopted as the attachment's
+    //     contents. The bit is unset for this reading rather than the window,
+    //     because a device without the bit is exactly the device that cannot
+    //     answer, and the probe's three families must still partition the
+    //     bucket.
     let mut seeded_tail = tail();
     seeded_tail.target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
     let window_extent = u64::from(width) * u64::from(height) * 4;
@@ -4852,6 +4908,7 @@ fn a_guest_backed_chain_middle_leaves_for_the_provider_and_its_tail_does_not() {
     }];
     let handed_seed = seed.clone();
     let runs_before = route_count(provider_render::GUEST_BACKING_WINDOW_RUNS);
+    let _no_arm = provider_render::override_attachment_landing_view(Some(false));
     let runs_refusal = match provider_render::submit_render(
         &RenderRailInputs {
             load_seed_source_bytes: Some(&handed_seed),
@@ -4860,7 +4917,10 @@ fn a_guest_backed_chain_middle_leaves_for_the_provider_and_its_tail_does_not() {
         &seeded_tail,
     ) {
         RenderRailOutcome::NotInNarrowClass(reason) => reason,
-        other => panic!("a window the record's own bytes disagree with is not adopted: {other:?}"),
+        other => panic!(
+            "a stated window the class may not land in (no arm declared) is not adopted: \
+             {other:?}"
+        ),
     };
     assert_eq!(
         runs_refusal.slug(),
@@ -6343,6 +6403,654 @@ fn the_seed_backings_own_window_carries_the_pass_and_receives_its_frame() {
          render_provider_borrowed_landing_bytes +{frame_len}, render_provider_load_seed_runs \
          +0, render_provider_out_of_class_load_seed +0; the registered memory holds the \
          published frame byte for byte"
+    );
+}
+
+/// E-TX13 (RAIL-A): the guest-backed tail whose own load is the walk's chain
+/// value lands its frame in the window a **second** view declaration names.
+///
+/// This is the population the E-TX8 arm could not answer, and the one census
+/// v31-v34 latched under `render_provider_out_of_class_guest_backing` (the A
+/// family). Its attachment is backed by the guest's own pages, but its *load* is
+/// not those pages: it is the frame the record before it produced, handed on by
+/// the exec walk as `target_rgba8`. Declaring the pages as the attachment's own
+/// view — what `StoreOp::Borrowed` needs — would replace that load source and
+/// answer every texel outside the scissor from the wrong frame, which is why B3
+/// refused the shape instead of converting it. `StoreOp::BorrowedLanding`
+/// separates the two facts, and this test asserts the three things that make the
+/// separation real:
+///
+/// * the pass begins from the **chain value** — the undrawn half of the frame is
+///   the bytes the caller handed over, texel for texel, and not the window's own
+///   bytes (a rail that had rewritten the load source would land the pages'
+///   pre-pass contents there instead);
+/// * the frame the provider published is what the registered window holds
+///   afterwards (`INV-RETURN`), for the half this pass never drew included;
+/// * the frame this rail produced carries the second declaration: the store is
+///   `StoreOp::BorrowedLanding` with an identity that is *not* the attachment's,
+///   and the view it names is one the trace's pool carries at the attachment's
+///   own byte length — a compute pass's binding, which is the only way
+///   `ComputeTrace::serial_resources` collects a view, and therefore the only
+///   way the provider's own landing resolution can find it.
+#[test]
+fn a_guest_backed_tail_whose_load_is_the_chain_value_lands_in_the_window_a_second_view_names() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let half = width / 2;
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let texel = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
+    };
+    // Per-texel bytes rather than one colour: which bytes the pass began from is
+    // read texel by texel, in the half this pass does not draw.
+    let pattern = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+
+    let import = 0x9e4c_u64;
+    let gpa_base = 0x55_5000_u64;
+    let window_bytes = pattern(0x00);
+    let chain = pattern(0x5a);
+    let (mut owner, memory) = seed_backing_fixture(gpa_base, &window_bytes, 4 * u64::from(width));
+
+    // The A family's own request shape: the mapper-ref-texture surface's guest
+    // allocation backs the attachment, the load preserves what is there and is
+    // *not* that backing, the frame the walk hands on is the record's previous
+    // contents, the readback is withheld as the census's shapes show it, and the
+    // partial scissor leaves the un-read half readable in the frame.
+    let identity = surface_identity(0x7c_13_01);
+    let memory = std::sync::Arc::new(memory);
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some((*memory).clone());
+        req.load_guest_target_backing = false;
+        req.target_rgba8 = Some(std::sync::Arc::new(chain.clone()));
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req
+    };
+    // The engine's own frame for the same **contents**, first: the two rails
+    // have to land one frame, and the comparison goes through the engine's byte
+    // arm (`target_rgba8`) because its guest-backed one imports the allocation
+    // through the guest-RAM map, which an off-VM rail test cannot mint.
+    let engine_request = {
+        let mut req = request();
+        req.guest_target_memory = None;
+        req.skip_readback = false;
+        req.readback_skip_reason = ReadbackSkipReason::None;
+        req
+    };
+    let Some(engine) = engine_pixels("E-TX13 landing view", &stages, engine_request) else {
+        return;
+    };
+
+    owner.as_mut_slice()[..frame_len as usize].copy_from_slice(&window_bytes);
+    let window = register_seed_backing(&owner, import, gpa_base, frame_len);
+    let deliveries = provider_render::provider_submissions();
+    let bucket_before = route_count("render_provider_out_of_class_guest_backing");
+    let landed_view_before = route_count("render_provider_borrowed_landing_view_bytes");
+    let landed_own_before = route_count("render_provider_borrowed_landing_bytes");
+    let window_bytes_before = route_count("render_provider_attachment_guest_window_bytes");
+    provider_wire::capture_submission_frames(true);
+    let frame = {
+        let single = [window];
+        let mut inputs = inputs_with_landing_window(&stages, RenderChainRole::SoleOrTail, &single);
+        inputs.load_seed_source_bytes = Some(chain.as_slice());
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::ProviderCompleted(out) => {
+                assert_eq!(
+                    out.landing,
+                    Some(provider_render::WindowLanding::LandingView),
+                    "the completion names the declaration that landed the frame"
+                );
+                semantic_rgba(out.bytes, out.bgra)
+            }
+            other => panic!(
+                "the guest-backed tail whose frame the guest's pages are owed is in class once \
+                 the seam states the landing window: {other:?}"
+            ),
+        }
+    };
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+
+    assert!(
+        provider_render::provider_submissions() > deliveries,
+        "the released shape reaches the canonical provider instead of the engine"
+    );
+    assert_eq!(
+        frames.len(),
+        1,
+        "the second declaration puts the submission on the owner wire, exactly as a load-seed \
+         run list does: the frame is captured for the reading below"
+    );
+    let (wire_trace, _wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let wire_attachment = wire_trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .and_then(|pass| pass.color_attachments.first())
+        .expect("the frame carries the consuming pass's own attachment");
+    let landing = match wire_attachment.store {
+        metal_api_core::provider::StoreOp::BorrowedLanding(view) => view,
+        other => {
+            panic!("the store this rail stated has to be the second-declaration arm, not {other:?}")
+        }
+    };
+    assert_ne!(
+        (landing.allocation_id, landing.view_id),
+        (wire_attachment.allocation_id, wire_attachment.view_id),
+        "the landing view is a second declaration: naming the attachment's own pair would be \
+         `StoreOp::Borrowed`'s statement, and the contract refuses it by name"
+    );
+    let pool = wire_trace
+        .serial_resources()
+        .expect("the trace's pool resolves");
+    let landing_pool_view = pool
+        .iter()
+        .find(|view| view.view_id == landing.view_id && view.allocation_id == landing.allocation_id)
+        .expect(
+            "the landing view has to be in the trace's own pool — the views a *compute pass* \
+             binds — because that is the only list the provider resolves a landing against",
+        );
+    assert_eq!(
+        landing_pool_view.length, frame_len,
+        "the declaring view is stated at the attachment's own tightly packed extent"
+    );
+    assert!(
+        matches!(landing_pool_view.source, BufferSource::GuestRuns(_)),
+        "the window travels as the owner's live runs, not as a copy of anything"
+    );
+
+    assert_eq!(
+        frame.len(),
+        frame_len as usize,
+        "the whole attachment comes back"
+    );
+    assert_frames_equal("E-TX13 landing view, both rails", &frame, &engine);
+    for x in 0..half {
+        assert_texel_near(
+            &format!("landing view: drawn texel ({x}, 0)"),
+            texel(&frame, x, 0),
+            FRAGMENT_TEXEL,
+        );
+    }
+    for y in 0..height {
+        for x in half..width {
+            let expected = chain[((y * width + x) * 4) as usize..][..4].to_vec();
+            assert_eq!(
+                texel(&frame, x, y).to_vec(),
+                expected,
+                "texel ({x}, {y}) is the frame the exec walk handed over: a rail that had turned \
+                 the window into this attachment's load source would show the pages' pre-pass \
+                 bytes here instead"
+            );
+        }
+    }
+    assert_ne!(
+        texel(&frame, half, 0).to_vec(),
+        window_bytes[(half * 4) as usize..][..4].to_vec(),
+        "the window's own bytes and the walk's frame are different pictures: the assertion \
+         above is a reading of the load source and not a coincidence"
+    );
+
+    // `INV-RETURN`, the falsifiable half: the provider's store wrote the frame
+    // into the *registered* window, so the memory this test owns now holds the
+    // published frame — including the half the pass read from the chain value.
+    let landed = owner.as_mut_slice()[..frame_len as usize].to_vec();
+    assert_eq!(
+        landed, frame,
+        "the window holds the frame the provider published: a rail that only loaded it would \
+         leave the pre-pass pattern in every undrawn texel"
+    );
+
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_view_bytes") - landed_view_before,
+        frame_len,
+        "the new arm's own population is a number of its own, priced at the extent"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_bytes") - landed_own_before,
+        0,
+        "E-TX8's arm did not move: the record this one answers never declared the window as its \
+         load source"
+    );
+    assert_eq!(
+        route_count("render_provider_attachment_guest_window_bytes") - window_bytes_before,
+        0,
+        "the merged window name is the *load* declaration's population: this record's window is \
+         a destination, so it is not counted there"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_guest_backing") - bucket_before,
+        0,
+        "an answered guest-backed tail is no longer an out-of-class shape"
+    );
+    eprintln!(
+        "E-TX13 landing view: {width}x{height} attachment, {frame_len} byte window in \
+         registration {import:#x}; the undrawn half is the walk's chain value and not the \
+         window's own bytes; counters render_provider_borrowed_landing_view_bytes \
+         +{frame_len}, render_provider_borrowed_landing_bytes +0, \
+         render_provider_attachment_guest_window_bytes +0, \
+         render_provider_out_of_class_guest_backing +0; the registered memory holds the \
+         published frame byte for byte"
+    );
+}
+
+/// E-TX13 (RAIL-B): the same window on a device that does not declare the arm
+/// keeps the refusal, its slug and its route.
+///
+/// The fail-closed half of the release, and the reading the census is judged
+/// against: a provider whose capability frame leaves
+/// `supports_render_attachment_landing_view` out is a provider whose owner never
+/// sees the arm, so the record stays on the engine under the name it already
+/// has — `render_provider_out_of_class_guest_backing`, one count, no landed
+/// bytes. The window's own state is charged beside the refusal, as it is for
+/// every other arm of this bucket: the landing door's cut states nothing for a
+/// record it never ran for, so the probe's canary keeps reading `_window_none`.
+#[test]
+fn a_guest_backed_tail_keeps_the_refusal_when_the_device_does_not_declare_the_landing_view() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let window_bytes: Vec<u8> = (0..frame_len).map(|byte| byte as u8).collect();
+    let chain: Vec<u8> = (0..frame_len).map(|byte| (byte as u8) ^ 0x5a).collect();
+
+    let import = 0x9e4d_u64;
+    let gpa_base = 0x55_9000_u64;
+    let (owner, memory) = seed_backing_fixture(gpa_base, &window_bytes, 4 * u64::from(width));
+    let identity = surface_identity(0x7c_13_02);
+    let memory = std::sync::Arc::new(memory);
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some((*memory).clone());
+        req.load_guest_target_backing = false;
+        req.target_rgba8 = Some(std::sync::Arc::new(chain.clone()));
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req
+    };
+    let window = register_seed_backing(&owner, import, gpa_base, frame_len);
+    let _off = provider_render::override_attachment_landing_view(Some(false));
+
+    // 1. The window is stated — as a device whose bit was missing would never do,
+    //    which is the point: the *gate* is what closes the arm, so a window the
+    //    seam stated anyway still keeps the record on the engine.
+    {
+        let bucket_before = route_count("render_provider_out_of_class_guest_backing");
+        let landed_before = route_count("render_provider_borrowed_landing_view_bytes");
+        let runs_before = route_count("render_provider_out_of_class_guest_backing_window_runs");
+        let single = [window];
+        let mut inputs = inputs_with_landing_window(&stages, RenderChainRole::SoleOrTail, &single);
+        inputs.load_seed_source_bytes = Some(chain.as_slice());
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_guest_backing",
+                "a provider that does not declare the arm answers with the refusal that already \
+                 names this shape: {reason:?}"
+            ),
+            other => panic!(
+                "a device without the landing-view capability must keep this record on the \
+                 engine, not run it somewhere else: {other:?}"
+            ),
+        }
+        assert_eq!(
+            route_count("render_provider_out_of_class_guest_backing") - bucket_before,
+            1,
+            "the refusal is counted under its own name"
+        );
+        assert_eq!(
+            route_count("render_provider_borrowed_landing_view_bytes") - landed_before,
+            0,
+            "no frame landed: the arm was never elected"
+        );
+        assert_eq!(
+            route_count("render_provider_out_of_class_guest_backing_window_runs") - runs_before,
+            1,
+            "the stated window is still read as a state of this bucket: the record reached the \
+             window door and was refused for the device's answer, not for the window"
+        );
+    }
+
+    // 2. The production shape of a device without the bit: the seam cuts nothing
+    //    (its own ask is the same reading), so the record arrives with no window
+    //    at all and the probe's canary keeps naming it `_window_none`.
+    {
+        let bucket_before = route_count("render_provider_out_of_class_guest_backing");
+        let none_before = route_count("render_provider_out_of_class_guest_backing_window_none");
+        let mut inputs = inputs_held(&stages, RenderChainRole::SoleOrTail);
+        inputs.load_seed_source_bytes = Some(chain.as_slice());
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_guest_backing",
+                "the refusal without a window is the same one, key for key: {reason:?}"
+            ),
+            other => panic!("the windowless shape keeps the engine: {other:?}"),
+        }
+        assert_eq!(
+            route_count("render_provider_out_of_class_guest_backing") - bucket_before,
+            1
+        );
+        assert_eq!(
+            route_count("render_provider_out_of_class_guest_backing_window_none") - none_before,
+            1,
+            "neither door asked about this record's pages, so the bucket's own state reads as it \
+             did before the arm existed"
+        );
+    }
+}
+
+/// E-TX13 (RAIL-C): a window that is not the attachment's own byte extent is
+/// refused by name rather than truncated into place.
+///
+/// The contract states the window's shape twice — the runs concatenate to the
+/// declaring view's byte range, and that range is the attachment's tightly
+/// packed extent — and this is the second rule read on the released arm: a
+/// `bytes_len` the attachment cannot hold is a declaration about bytes no record
+/// wrote. The seam's own cut refuses such a window before it reaches the class
+/// (`load_seed_run_windows`'s `LoadSeedRunExit::Extent`), so this test states the
+/// shape through the class's own input to read the layer behind that cut: a
+/// submission whose declaration disagrees with its attachment may not be
+/// executed and may not charge a landing.
+#[test]
+fn a_landing_window_that_is_not_the_attachment_extent_is_refused_by_name() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let window_bytes: Vec<u8> = (0..frame_len).map(|byte| byte as u8).collect();
+    let chain: Vec<u8> = (0..frame_len).map(|byte| (byte as u8) ^ 0x33).collect();
+
+    let import = 0x9e4e_u64;
+    let gpa_base = 0x55_d000_u64;
+    let (owner, memory) = seed_backing_fixture(gpa_base, &window_bytes, 4 * u64::from(width));
+    let identity = surface_identity(0x7c_13_03);
+    let memory = std::sync::Arc::new(memory);
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some((*memory).clone());
+        req.load_guest_target_backing = false;
+        req.target_rgba8 = Some(std::sync::Arc::new(chain.clone()));
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req
+    };
+    let mut window = register_seed_backing(&owner, import, gpa_base, frame_len);
+    window.bytes_len = frame_len - 4;
+    let landed_before = route_count("render_provider_borrowed_landing_view_bytes");
+    let single = [window];
+    let mut inputs = inputs_with_landing_window(&stages, RenderChainRole::SoleOrTail, &single);
+    inputs.load_seed_source_bytes = Some(chain.as_slice());
+    let refusal = match provider_render::submit_render(&inputs, &request()) {
+        RenderRailOutcome::ProviderDeclined(decline) => {
+            let fields = reims_vgpu::observe::Decline::fields(&decline);
+            let detail = fields
+                .iter()
+                .find(|(name, _)| *name == "detail")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+            format!("{}: {detail}", decline.slug())
+        }
+        other => panic!(
+            "a window that is not the attachment's own extent must not be executed: {other:?}"
+        ),
+    };
+    // Two layers can answer this shape, and both answer by name: the trace's own
+    // admission, because the runs are the declaration's byte range
+    // (`buffer_source_length_mismatch` — the answer this environment gives, since
+    // the disagreement is visible before any device object exists), and the rail's
+    // landing resolution, which weighs the same window against the attachment's
+    // extent (`render_attachment_landing_mismatch`). Neither may be a silent
+    // success, and neither may truncate the frame into place.
+    assert!(
+        refusal.contains("buffer_source_length_mismatch")
+            || refusal.contains("render_attachment_landing_mismatch"),
+        "the refusal names the shape it saw rather than truncating the frame: {refusal}"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_view_bytes") - landed_before,
+        0,
+        "a refused submission is not an answer: no landing bytes are charged"
+    );
+    eprintln!("E-TX13 landing view, short window: refused by name as {refusal}");
+}
+
+/// E-TX13 (RAIL-D): a landing window the door could not cut keeps the
+/// guest-backing refusal and charges the fact that stopped the cut.
+///
+/// The landing door answers in the *same* vocabulary the elision door does — one
+/// question, one name per fact — and this is what makes the census readable when
+/// the arm does not fire: the bucket's count moves, the shape stays on the
+/// engine, and the reading says *which* fact (a padded window, a span across two
+/// registrations, an unregistered page) held it. A route the door never charged
+/// would leave "the arm did not apply" indistinguishable from "the window was
+/// refused".
+#[test]
+fn a_landing_window_the_door_could_not_cut_keeps_the_refusal_and_names_the_fact() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let chain: Vec<u8> = (0..frame_len).map(|byte| (byte as u8) ^ 0x11).collect();
+    let identity = surface_identity(0x7c_13_04);
+    let memory = std::sync::Arc::new(guest_target_memory());
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some((*memory).clone());
+        req.load_guest_target_backing = false;
+        req.target_rgba8 = Some(std::sync::Arc::new(chain.clone()));
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req
+    };
+    let route = ResidentSourceRoute::WindowPaddedRows;
+    let label = "render_provider_out_of_class_guest_backing_window_refused_padded_rows";
+    let bucket_before = route_count("render_provider_out_of_class_guest_backing");
+    let refused_before = route_count(label);
+    let landed_before = route_count("render_provider_borrowed_landing_view_bytes");
+    let mut inputs =
+        inputs_with_landing_window_refusal(&stages, RenderChainRole::SoleOrTail, route);
+    inputs.load_seed_source_bytes = Some(chain.as_slice());
+    match provider_render::submit_render(&inputs, &request()) {
+        RenderRailOutcome::NotInNarrowClass(reason) => assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_guest_backing",
+            "the gate's own judgement is untouched: the record keeps the refusal by name"
+        ),
+        other => panic!("a window the door could not cut keeps the engine: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_guest_backing") - bucket_before,
+        1
+    );
+    assert_eq!(
+        route_count(label) - refused_before,
+        1,
+        "the fact that stopped the cut is charged beside the refusal"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_view_bytes") - landed_before,
+        0
+    );
+}
+
+/// E-TX13 (RAIL-E): the same arm answers the bucket's `Clear` family, whose
+/// window the *elision* door already stated.
+///
+/// The other half of the A/B split census v31 latched: six records a window
+/// whose load is a `Clear` (the B family). Their window is not the landing
+/// door's — the elision door cut it, because the record does not continue the
+/// encoder — so the class takes the runs from
+/// `RenderRailInputs::attachment_guest_window` and elects the *same* second
+/// declaration. What this test pins beyond the chain-value case is that the load
+/// source is still the `Clear`: the undrawn half of the frame is the cleared
+/// colour and not the window's own bytes, and the window the pass *began* from
+/// receives the frame afterwards.
+#[test]
+fn a_guest_backed_clear_tail_lands_in_the_window_the_elision_door_stated() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let half = width / 2;
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let texel = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
+    };
+    let window_bytes: Vec<u8> = (0..frame_len).map(|byte| (byte as u8) ^ 0x3c).collect();
+
+    let import = 0x9e4f_u64;
+    let gpa_base = 0x56_1000_u64;
+    let (mut owner, memory) = seed_backing_fixture(gpa_base, &window_bytes, 4 * u64::from(width));
+    let identity = surface_identity(0x7c_13_05);
+    let memory = std::sync::Arc::new(memory);
+    let request = || {
+        // `narrow_request`'s own declaration is the `Clear` (`CLEAR` is exactly
+        // representable in eight bits, so both rails draw the same colour).
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some((*memory).clone());
+        req.load_guest_target_backing = false;
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req
+    };
+    owner.as_mut_slice()[..frame_len as usize].copy_from_slice(&window_bytes);
+    let window = register_seed_backing(&owner, import, gpa_base, frame_len);
+    let deliveries = provider_render::provider_submissions();
+    let bucket_before = route_count("render_provider_out_of_class_guest_backing");
+    let landed_view_before = route_count("render_provider_borrowed_landing_view_bytes");
+    let landed_own_before = route_count("render_provider_borrowed_landing_bytes");
+    let window_bytes_before = route_count("render_provider_attachment_guest_window_bytes");
+    let frame = {
+        let single = [window];
+        let inputs =
+            inputs_held_with_attachment_window(&stages, RenderChainRole::SoleOrTail, &single);
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::ProviderCompleted(out) => {
+                assert_eq!(
+                    out.landing,
+                    Some(provider_render::WindowLanding::LandingView),
+                    "the elision door's window is a *destination* for this record: the load is a \
+                     `Clear`, so the E-TX8 arm cannot answer it and the second declaration does"
+                );
+                semantic_rgba(out.bytes, out.bgra)
+            }
+            other => panic!(
+                "the `Clear` half of the guest-backed tail population is in class once the seam \
+                 states its window: {other:?}"
+            ),
+        }
+    };
+    assert!(
+        provider_render::provider_submissions() > deliveries,
+        "the released shape reaches the canonical provider instead of the engine"
+    );
+    let cleared = [
+        (CLEAR[0] * 255.0).round() as u8,
+        (CLEAR[1] * 255.0).round() as u8,
+        (CLEAR[2] * 255.0).round() as u8,
+        (CLEAR[3] * 255.0).round() as u8,
+    ];
+    for x in 0..half {
+        assert_texel_near(
+            &format!("clear tail: drawn texel ({x}, 0)"),
+            texel(&frame, x, 0),
+            FRAGMENT_TEXEL,
+        );
+    }
+    for y in 0..height {
+        for x in half..width {
+            assert_eq!(
+                texel(&frame, x, y),
+                cleared,
+                "texel ({x}, {y}) is the pass's own `Clear`: a rail that had turned the window \
+                 into the load source would show its pre-pass bytes here"
+            );
+        }
+    }
+    assert_ne!(
+        cleared.to_vec(),
+        window_bytes[(half * 4) as usize..][..4].to_vec(),
+        "the cleared colour and the window's own bytes are different pictures: the assertion \
+         above is a reading of the load source and not a coincidence"
+    );
+    let landed = owner.as_mut_slice()[..frame_len as usize].to_vec();
+    assert_eq!(
+        landed, frame,
+        "the window holds the frame the provider published, cleared half included"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_view_bytes") - landed_view_before,
+        frame_len,
+        "the arm's own population moves for this door too"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_bytes") - landed_own_before,
+        0
+    );
+    assert_eq!(
+        route_count("render_provider_attachment_guest_window_bytes") - window_bytes_before,
+        0,
+        "the window is not a load declaration here either: the merged name counts the *loads* \
+         the two doors carry, and this record's load is the `Clear`"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_guest_backing") - bucket_before,
+        0,
+        "an answered `Clear` tail is no longer an out-of-class shape"
     );
 }
 
