@@ -7003,20 +7003,25 @@ fn the_stage_buffer_door_names_every_fact_between_a_declaration_and_the_provider
         "the sentence names the source and the rail that would carry it: {detail}"
     );
 
-    // The canonical list's own shape: at most four declarations, one per slot.
-    let five = (0..5)
+    // The canonical list's own shape: at most `MAX_RENDER_STAGE_BUFFERS`
+    // declarations, one per slot. The ceiling is the live contract constant —
+    // E-SB1 raised it from four to eight (`research/docs/23` §108) — so the
+    // shape that crosses it is built from the constant rather than written as
+    // five, and the sentence it is compared with is derived the same way.
+    let over_cap = metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS + 1;
+    let too_many = (0..over_cap as u32)
         .map(|index| StageBufferDeclaration {
             index,
             access: StageBufferAccess::Read,
             footprint: StageBufferFootprint::Static { max_bytes: 4 },
         })
         .collect::<Vec<_>>();
-    let stages = with_fragment(five);
-    let (slug, detail) = answer("five declarations", &stages, &[bind]);
+    let stages = with_fragment(too_many);
+    let (slug, detail) = answer("over-cap declarations", &stages, &[bind]);
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_stage_buffer_shape");
     assert!(
-        detail.contains("declare 5 stage buffers"),
+        detail.contains(&format!("declare {over_cap} stage buffers")),
         "the sentence names the count: {detail}"
     );
     let stages = with_fragment(vec![
@@ -7138,31 +7143,35 @@ fn each_stage_buffer_shape_rule_is_counted_under_its_own_route() {
     // behind the unbound check, so its slot is bound here).
     let content = BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16]));
     let duplicate_binds = [staged_bind(RenderPipelineStage::Fragment, 1, &content)];
+    // The over-cap shape and the sentence naming its count both come from the
+    // live contract ceiling rather than from the four the shape was written
+    // against: E-SB1 raised `MAX_RENDER_STAGE_BUFFERS` to eight
+    // (`research/docs/23` §108), and the rule this arm reads is "longer than the
+    // contract states", not a number of its own.
+    let over_cap = metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS + 1;
     let shapes = [
         (
             "too many",
             "render_provider_out_of_class_stage_buffer_shape",
-            "declare 5 stage buffers",
+            format!("declare {over_cap} stage buffers"),
             with_declarations(
                 &bases,
                 Vec::new(),
-                (0..=metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS as u32)
-                    .map(declaration)
-                    .collect(),
+                (0..over_cap as u32).map(declaration).collect(),
             ),
             &[] as &[StageBufferBind<'_>],
         ),
         (
             "one slot twice",
             "render_provider_out_of_class_stage_buffer_shape",
-            "[[buffer(1)]] twice",
+            "[[buffer(1)]] twice".to_owned(),
             with_declarations(&bases, Vec::new(), vec![declaration(1), declaration(1)]),
             &duplicate_binds,
         ),
         (
             "vertex declaration inside the layout",
             "render_provider_out_of_class_stage_buffer_shape",
-            "1 vertex stream(s)",
+            "1 vertex stream(s)".to_owned(),
             with_declarations(&bases, vec![declaration(0)], Vec::new()),
             &[] as &[StageBufferBind<'_>],
         ),
@@ -7187,7 +7196,7 @@ fn each_stage_buffer_shape_rule_is_counted_under_its_own_route() {
             "{label}: the refusal slug is unchanged"
         );
         assert!(
-            answer.1.contains(expected_sentence),
+            answer.1.contains(expected_sentence.as_str()),
             "{label}: the sentence is unchanged: {}",
             answer.1
         );

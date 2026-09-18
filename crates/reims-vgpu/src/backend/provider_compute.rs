@@ -405,18 +405,38 @@ fn mapped_texture_format(format: StorageImageFormat) -> Option<TextureFormat> {
 }
 
 /// The filter name one [`SamplerFilter`] travels under in a refusal.
+///
+/// The list is the contract's own closed one, which `research/docs/23` §109
+/// (E-TX2) widened to the mip half: every arm is the contract's own spelling,
+/// so a refusal names the state a request stated with the word the contract
+/// publishes — and a state the contract appends later has to be named here
+/// rather than printed as another one. Naming is not admission: which states
+/// *this* rail's request mapping hands to the provider is decided in
+/// `request_sampler_policy` (`backend/provider_render.rs`), and the widened
+/// family is read there by name in a separate increment.
 fn filter_name(filter: SamplerFilter) -> &'static str {
     match filter {
         SamplerFilter::Nearest => "Nearest",
         SamplerFilter::Linear => "Linear",
+        SamplerFilter::NearestMipNearest => "NearestMipNearest",
+        SamplerFilter::NearestMipLinear => "NearestMipLinear",
+        SamplerFilter::LinearMipNearest => "LinearMipNearest",
+        SamplerFilter::LinearMipLinear => "LinearMipLinear",
     }
 }
 
 /// The address name one [`SamplerAddressMode`] travels under in a refusal.
+///
+/// §109 appended Metal's remaining modes except `clampToBorderColor` to the
+/// contract's closed list; the names are again the contract's own, for the
+/// reason [`filter_name`]'s doc states.
 fn address_name(address: SamplerAddressMode) -> &'static str {
     match address {
         SamplerAddressMode::ClampToEdge => "ClampToEdge",
         SamplerAddressMode::Repeat => "Repeat",
+        SamplerAddressMode::MirrorClampToEdge => "MirrorClampToEdge",
+        SamplerAddressMode::MirrorRepeat => "MirrorRepeat",
+        SamplerAddressMode::ClampToZero => "ClampToZero",
     }
 }
 
