@@ -1220,6 +1220,28 @@ fn skip_if_no_gpu(error: &str) -> bool {
         || lower.contains("vk_engine_init")
 }
 
+/// [`engine_pixels`] for a request whose two modules a test translated itself.
+///
+/// [`engine_pixels`] hands the engine `translated(stages, req)`, which
+/// re-translates `stages.air` — the reviewed pairing — and therefore overwrites
+/// whatever modules the caller put in the request. A shape whose engine arm
+/// needs a *variant* of a module (the folded pair's relocated fragment half,
+/// `runtime/draw/vulkan.rs`'s `buf_collide`) has to cross that boundary with
+/// its own words, so this is the same call with the request left as built.
+fn engine_pixels_prepared(label: &str, req: &DrawRequest) -> Option<Vec<u8>> {
+    match engine::execute_draw_request(engine_device(), req) {
+        Ok(out) => Some(semantic_rgba(out.pixels, out.pixels_bgra)),
+        Err(error) => {
+            let text = error.to_string();
+            if skip_if_no_gpu(&text) {
+                eprintln!("SKIP {label} engine arm: no GPU ({text})");
+                return None;
+            }
+            panic!("{label} engine arm: {text}")
+        }
+    }
+}
+
 /// Read a draw's pixels in semantic RGBA8, whatever physical order the
 /// attachment read back in, so the two rails are compared as colours and
 /// layouts separately.
@@ -9296,9 +9318,19 @@ fn a_sampled_texture_beside_a_stage_buffer_crosses_to_the_provider() {
 /// an admitted draw is fail-closed, so the class answers it here instead: this
 /// test pins the sentence, the slug and the rule's own counter, so the next
 /// census can size the population the merge would have lost.
+///
+/// R33 lifted that exit for the devices that declare the split, so this test
+/// states the answer it is about: an *undeclared* provider. The arm is the
+/// fail-closed one — a device that arranges nothing apart, and the shape a
+/// frame written before the bit existed decodes as — and the reading is still
+/// the wire's (`provider_render::override_stage_buffer_namespace_split`
+/// replaces the snapshot the capability frame is written from, not the frame's
+/// own decoding). The declared arm, on a real folded pair of fixtures, is
+/// `a_folded_pair_leaves_for_the_provider_when_the_device_declares_the_split`.
 #[test]
 fn two_stages_reading_one_buffer_index_stay_on_the_engine_by_name() {
     let _guard = engine_test_session();
+    let _undeclared = provider_render::override_stage_buffer_namespace_split(Some(false));
     let mut stages = sampled_stages();
     let declaration = StageBufferDeclaration {
         index: 2,
@@ -9321,6 +9353,7 @@ fn two_stages_reading_one_buffer_index_stay_on_the_engine_by_name() {
 
     let bucket = route_count("render_provider_out_of_class_stage_buffer_shape");
     let folded = route_count("stage_buffer_shape_folded");
+    let delivered = provider_render::provider_submissions();
     match provider_render::submit_render(
         &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
         &req,
@@ -9351,6 +9384,307 @@ fn two_stages_reading_one_buffer_index_stay_on_the_engine_by_name() {
         route_count("stage_buffer_shape_folded"),
         folded + 1,
         "and its own route sizes the rule for the next census"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "and the provider's own submission counter does not move: the class keeps the shape, it \
+         does not hand it over and take a decline back"
+    );
+}
+
+/// The folded pair R33 is about, stated by two fixtures rather than by hand: a
+/// vertex stage that reads its clip positions out of `[[buffer(0)]]` — one
+/// `float2` per `vertex_id` — beside a fragment stage that reads its colour out
+/// of `[[buffer(0)]]`. One Metal index, two stages, two different buffers
+/// behind it, which is the shape R31 kept on the engine by name.
+///
+/// The declarations are the fixtures' own measured reflections, read back from
+/// the canonical translation the provider will run ([`declared_stage_buffers`]),
+/// exactly as the production seam reads them off `ResolvedRenderPipeline`.
+fn folded_pair_stages() -> Stages {
+    let mut stages = Stages {
+        air: (
+            fixture("render_vtx_buffer_positions.air"),
+            fixture("render_frag_buffer.air"),
+        ),
+        vertex_entry: "reims_buffer_positions_vertex",
+        fragment_entry: "reims_buffer_frag",
+        // The vertex stage reads its vertices through the buffer rather than
+        // through `[[stage_in]]`, so the request declares no stream — which is
+        // also what keeps the vertex-layout rule out of this pair's way: the
+        // declaration's index 0 is below no stream's own binding.
+        vertex_attribute_locations: Vec::new(),
+        vertex_stage_buffer_declarations: Vec::new(),
+        fragment_stage_buffer_declarations: Vec::new(),
+        fragment_texture_declarations: Vec::new(),
+        sampler_family: RenderSamplerFamily::default(),
+        texture_interface_refusals: Vec::new(),
+    };
+    stages.vertex_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.0, RenderStage::Vertex, stages.vertex_entry);
+    stages.fragment_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.1, RenderStage::Fragment, stages.fragment_entry);
+    stages
+}
+
+/// R33: the folded pair leaves for the provider when the device declares the
+/// namespace split, and keeps R31's own answer, sentence and route when it does
+/// not — read on one pair of fixtures, because the pair is the whole subject.
+///
+/// R31 handed this shape to the engine by name: `metal2vulkan`'s default
+/// descriptor layout binds either stage's `[[buffer(n)]]` at set 0's own
+/// binding `n`, so a pair that reads one index from both stages folds both
+/// writes onto one descriptor, and the provider refuses that when the merged
+/// set is built (`render_stage_buffer_layout_unsupported`). E-TX9
+/// (`stage-buffer-namespace-split`) published the arrangement that stops the
+/// fold — the vertex stage's *whole* layout in the canonical namespace set,
+/// `metal_api_vulkan::stage_buffer_namespace_layout()`, with the fragment half
+/// left where it was — and declared it as the shape bit
+/// `supports_render_stage_buffer_namespace_split`, which defaults to `false`
+/// and decodes as `false` out of every frame written before it existed.
+///
+/// This rail reads that bit out of the provider's own capability frame
+/// (`provider_wire::stage_buffer_namespace_split`), asks it exactly when the
+/// request's statement is folded, and translates the vertex half under the
+/// namespace layout when the answer is yes. Three readings come out of it: the
+/// declared arm reaches the provider and its frame is the engine's own frame,
+/// byte for byte; both buffers' bytes move that frame, so the vertex half is
+/// really reading its own bind and not the fragment's; and the undeclared arm
+/// still answers R31's slug, sentence and route, without a submission.
+#[test]
+fn a_folded_pair_leaves_for_the_provider_when_the_device_declares_the_split() {
+    let _guard = engine_test_session();
+    let stages = folded_pair_stages();
+    assert_eq!(
+        stages
+            .vertex_stage_buffer_declarations
+            .iter()
+            .map(|declaration| (declaration.index, declaration.access))
+            .collect::<Vec<_>>(),
+        vec![(0, StageBufferAccess::Read)],
+        "the vertex half declares the one `[[buffer(0)]]` the entry reads: {:#?}",
+        stages.vertex_stage_buffer_declarations
+    );
+    assert_eq!(
+        stages
+            .fragment_stage_buffer_declarations
+            .iter()
+            .map(|declaration| (declaration.index, declaration.access))
+            .collect::<Vec<_>>(),
+        vec![(0, StageBufferAccess::Read)],
+        "and the fragment half declares the same index: {:#?}",
+        stages.fragment_stage_buffer_declarations
+    );
+
+    // The two binds, in each rail's own numbering. The rail states them as
+    // (stage, index) pairs; the request states them as the device bindings a
+    // prepared draw carries, where a fragment buffer index the vertex stage
+    // also names moves to `index + FRAG_BUFFER_BINDING_OFFSET`
+    // (`runtime/draw/vulkan.rs`'s `buf_collide`) — which is this pair.
+    let positions =
+        |records: &[(f32, f32)]| BufferContent::Bytes(std::sync::Arc::new(f32x2(records)));
+    let tint = |word: f32| {
+        // The declaration's reach is one four-byte word; the bind carries the
+        // allocation a real guest read would have supplied.
+        let mut bytes = word.to_ne_bytes().to_vec();
+        bytes.resize(16, 0);
+        BufferContent::Bytes(std::sync::Arc::new(bytes))
+    };
+    let request = |vertex: &BufferContent, fragment: &BufferContent| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.vertex_attributes.clear();
+        // A clear the class admits (every component a multiple of 1/255) and
+        // that neither arm draws, so a texel the triangle does not reach is a
+        // different reading from one it drew black.
+        req.color_attachment = Some(attachment_with_clear(
+            MTL_FORMAT_RGBA8_UNORM,
+            [64.0 / 255.0, 128.0 / 255.0, 191.0 / 255.0, 1.0],
+        ));
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: vertex.clone(),
+        });
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: reims_vgpu::runtime::spirv_bind::FRAG_BUFFER_BINDING_OFFSET,
+            content: fragment.clone(),
+        });
+        req
+    };
+    let frame = |label: &str, vertex: &BufferContent, fragment: &BufferContent| {
+        let binds = [
+            staged_bind(RenderPipelineStage::Vertex, 0, vertex),
+            staged_bind(RenderPipelineStage::Fragment, 0, fragment),
+        ];
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &request(vertex, fragment),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: the folded pair is in class on a device that declares the split: \
+                 {other:?}"
+            ),
+        }
+    };
+    // The engine arm: the same AIR, translated by this crate's own translator
+    // and put in the numbering the engine's collision rule gives it — the
+    // fragment half relocated, the module rewritten to match. That is what
+    // `runtime/draw/vulkan.rs` does for a prepared draw, and it is why the two
+    // rails can be compared on one request at all.
+    let engine_frame = |label: &str, vertex: &BufferContent, fragment: &BufferContent| {
+        let cached = |stage| {
+            reims_vgpu::runtime::m2v_cache::translate_cached_reflected(
+                match stage {
+                    metal2vulkan::passes::Stage::Vertex => stages.air.0.as_slice(),
+                    metal2vulkan::passes::Stage::Fragment => stages.air.1.as_slice(),
+                    metal2vulkan::passes::Stage::Kernel => unreachable!("render stages only"),
+                },
+                stage,
+                0,
+            )
+            .expect("the fixture translates")
+        };
+        let mut req = request(vertex, fragment);
+        req.vert_spirv = std::sync::Arc::new(
+            (*cached(metal2vulkan::passes::Stage::Vertex)
+                .variant(false, false)
+                .words)
+                .clone(),
+        );
+        req.frag_spirv = std::sync::Arc::new(
+            (*cached(metal2vulkan::passes::Stage::Fragment)
+                .variant(false, true)
+                .words)
+                .clone(),
+        );
+        engine_pixels_prepared(label, &req)
+    };
+
+    // The declared arm. The device this suite runs on declares the split
+    // (the Vulkan snapshot does, and the wire reading below proves it reaches
+    // this rail's gate through the frame), so no override is held here: what
+    // the class reads is the device's own answer.
+    let screen = positions(&[(-1.0, -3.0), (-1.0, 1.0), (3.0, 1.0)]);
+    let red = tint(1.0);
+    let half = positions(&[(-1.0, -3.0), (-1.0, 1.0), (1.0, 1.0)]);
+    let quarter = tint(0.25);
+    let slug_before = route_count("render_provider_out_of_class_stage_buffer_shape");
+    let folded_before = route_count("stage_buffer_shape_folded");
+    let delivered = provider_render::provider_submissions();
+    let provider = frame("folded pair", &screen, &red);
+    assert_texel_count("folded pair", &provider);
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the folded pair reaches the canonical provider rather than the engine"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_shape"),
+        slug_before,
+        "an admitted folded pair charges no shape bucket"
+    );
+    assert_eq!(
+        route_count("stage_buffer_shape_folded"),
+        folded_before,
+        "and the fold's own route is the *undeclared* answer, not the population"
+    );
+    eprintln!(
+        "folded pair, declared arm: texel {:?} from the fragment's own bind, {} bytes",
+        texel_at(&provider, 0, 0),
+        provider.len(),
+    );
+    assert_eq!(
+        texel_at(&provider, 0, 0),
+        [255, 0, 0, 255],
+        "the fragment colours a covered texel from the bytes behind its own [[buffer(0)]]"
+    );
+
+    // Both halves' bytes move the frame: the vertex half's decide the coverage
+    // (a smaller triangle leaves the clear colour where it does not reach) and
+    // the fragment half's word decides the colour everywhere it does.
+    let half_frame = frame("folded pair, half triangle", &half, &red);
+    assert_frames_differ(
+        "the vertex half's own bind decides the coverage",
+        &provider,
+        &half_frame,
+    );
+    let dim_frame = frame("folded pair, quarter red", &screen, &quarter);
+    assert_frames_differ(
+        "the fragment half's own bind decides the colour",
+        &provider,
+        &dim_frame,
+    );
+    assert_eq!(
+        texel_at(&dim_frame, 0, 0),
+        [64, 0, 0, 255],
+        "and the colour is the word that bind carries"
+    );
+    for (label, vertex, fragment, got) in [
+        ("folded pair", &screen, &red, &provider),
+        ("folded pair, half triangle", &half, &red, &half_frame),
+        ("folded pair, quarter red", &screen, &quarter, &dim_frame),
+    ] {
+        let Some(engine) = engine_frame(label, vertex, fragment) else {
+            return;
+        };
+        assert_frames_equal(label, got, &engine);
+        eprintln!("{label}: the provider's frame is the engine's, byte for byte");
+    }
+
+    // The undeclared arm: the same pair, the same binds, a provider whose frame
+    // does not carry the shape — which is what an older frame decodes as.
+    let _undeclared = provider_render::override_stage_buffer_namespace_split(Some(false));
+    let slug_before = route_count("render_provider_out_of_class_stage_buffer_shape");
+    let folded_before = route_count("stage_buffer_shape_folded");
+    let delivered = provider_render::provider_submissions();
+    let binds = [
+        staged_bind(RenderPipelineStage::Vertex, 0, &screen),
+        staged_bind(RenderPipelineStage::Fragment, 0, &red),
+    ];
+    match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &request(&screen, &red),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("folded pair, undeclared arm: {reason}");
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_stage_buffer_shape",
+                "the undeclared device keeps R31's slug: {reason}"
+            );
+            let detail = reason.detail();
+            assert!(
+                detail.contains("[[buffer(0)]]")
+                    && detail.contains("render_stage_buffer_layout_unsupported")
+                    && detail
+                        .contains("The engine, which keeps the two namespaces apart, draws it"),
+                "R31's sentence, unchanged: {detail}"
+            );
+        }
+        other => panic!("an undeclared provider keeps the folded pair on the engine: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_shape"),
+        slug_before + 1,
+        "and charges the shape slug exactly once"
+    );
+    assert_eq!(
+        route_count("stage_buffer_shape_folded"),
+        folded_before + 1,
+        "under the fold's own route, exactly as R31 did"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "with nothing submitted: the answer is the class's, not a decline taken back from the \
+         provider"
+    );
+    let engine = engine_frame("folded pair, undeclared arm", &screen, &red)
+        .expect("the engine draws the shape the class keeps");
+    assert_eq!(
+        engine.len(),
+        provider.len(),
+        "and that frame is the shape the declared arm compared against"
     );
 }
 
@@ -12263,6 +12597,30 @@ fn the_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
         .capabilities()
         .validate_trace(trace.clone(), resources.clone())
         .expect("the provider that declares the shape admits the same frame");
+
+    // R33's bit, read the same way and out of the same frame: the shape this
+    // rail's folded exit asks about. The declared arm is the device's own
+    // answer; the undeclared arm is a snapshot whose frame leaves the tail out
+    // entirely, which is also what every frame written before the bit existed
+    // decodes as (`metal-api-ipc`'s presence tag).
+    let split =
+        provider_wire::stage_buffer_namespace_split(probe.device_epoch(), &probe.capabilities())
+            .expect("the capability answer encodes and decodes");
+    eprintln!("wire capability answer: supports_render_stage_buffer_namespace_split={split}");
+    assert!(
+        split,
+        "this device declares the folded-pair shape: the vertex half's namespace layout is the \
+         arrangement the class now submits"
+    );
+    let mut unfolded = probe.capabilities();
+    unfolded.supports_render_stage_buffer_namespace_split = false;
+    let undeclared = provider_wire::stage_buffer_namespace_split(probe.device_epoch(), &unfolded)
+        .expect("decode");
+    assert!(
+        !undeclared,
+        "a snapshot that does not declare the shape reads as undeclared, which is the answer the \
+         folded exit keeps R31's own refusing arm on"
+    );
 
     // The population this increment does not touch: no declaration, no frame —
     // so those shapes keep the bytes (and the path) they had.

@@ -189,7 +189,9 @@
 //!   slot out of the pairing when the contract does not declare it
 //!   (`research/docs/23` §95), and the draw proceeds with that slot neither
 //!   declared nor bound — while a contract that states the slot is refused by
-//!   name (measured in `provider_render_rail.rs`);
+//!   name (measured in `provider_render_rail.rs`). A pair whose two stages read
+//!   one index is the fold R31 named and R33 retires for the devices that
+//!   declare the split (see below);
 //! - **a present tail, when the caller states one** (R4b): the record owns the
 //!   packet's frame and hands it to the display rail, so the canonical pass
 //!   *presents* the provider's own target for the guest surface the frame lands
@@ -545,6 +547,38 @@
 //! not the attachment's extent, one split across two registrations, and a seed
 //! the caller does not hand over.
 //!
+//! # The two stages' buffer namespaces, and the fold (R31, R33)
+//!
+//! The two stages' Metal buffer index spaces are independent — a
+//! `setVertexBuffer(_:offset:index:)` at one stage and a
+//! `setFragmentBuffer(_:offset:index:)` at the other are two arguments — while
+//! `metal2vulkan`'s default descriptor layout binds either stage's
+//! `[[buffer(n)]]` at set 0's own binding `n`. A pair that reads one index from
+//! both stages therefore folds both declarations onto one descriptor, and the
+//! provider refuses such a pair when the merged set is built
+//! (`render_stage_buffer_layout_unsupported`). That refusal is a *decline* on
+//! an admitted draw, which is fail-closed, so R31 answered the shape here
+//! first, by name (`render_provider_out_of_class_stage_buffer_shape`, route
+//! `stage_buffer_shape_folded`) and the engine drew it. It was the largest
+//! single bucket of census v23c: 12,262 rows, 42.8% of that boot's seam
+//! failures.
+//!
+//! R33 retires the exit for the devices that can execute the shape. E-TX9
+//! (`metal-api-emulator`'s `stage-buffer-namespace-split`) publishes the
+//! arrangement that stops the fold — the *vertex* stage's whole layout in the
+//! canonical namespace set, `metal_api_vulkan::stage_buffer_namespace_layout()`,
+//! with the fragment half left at the translator's default — and declares it as
+//! the shape bit
+//! `ProviderCapabilities::supports_render_stage_buffer_namespace_split`, which
+//! defaults to `false` and decodes as `false` out of any frame that does not
+//! carry it. This rail reads that bit out of the provider's own capability
+//! frame ([`provider_wire::stage_buffer_namespace_split`]), asks it exactly when
+//! the request's statement makes the pair ([`folded_stage_buffer_pair`]), and
+//! translates the vertex half under that layout when the answer is yes. An
+//! answer of no — every device that arranges nothing apart, and every frame
+//! written before the bit existed — keeps R31's refusal, its sentence and its
+//! own census route, byte for byte, at the same point in the same walk.
+//!
 //! # Error mapping
 //!
 //! Every refusal the provider boundary returns is mapped onto this rail's own
@@ -558,7 +592,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use metal_api_core::provider::{
@@ -3284,6 +3318,92 @@ fn declared_render_texture_support(
     })
 }
 
+/// The folded-pair half of the same device answer (R33).
+///
+/// One snapshot, two readings, exactly as [`declared_stage_buffer_support`]:
+/// the bit the *frame* carries is the one the class gate gets. What it answers
+/// is whether this provider executes a pass whose two stages each read a
+/// `[[buffer(n)]]` argument of the same index — the shape R31 kept on the
+/// engine by name, because the canonical rail's default layout folds both
+/// descriptors onto set 0's own binding `n`. `false` is the fail-closed
+/// answer *and* what a frame written before the bit existed decodes to
+/// (`provider_wire::stage_buffer_namespace_split`), so this read can only ever
+/// widen the class by what the device states.
+fn declared_stage_buffer_namespace_split() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match NAMESPACE_SPLIT_ANSWER.load(Ordering::Relaxed) {
+            NAMESPACE_SPLIT_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_stage_buffer_namespace_split =
+                    answer == NAMESPACE_SPLIT_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::stage_buffer_namespace_split(rail.provider.device_epoch(), &capabilities)
+        .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        })
+}
+
+/// The device's own answer for the folded-pair capability (R33), and the
+/// states the test instrument below can put it in.
+const NAMESPACE_SPLIT_DEVICE: u8 = 0;
+const NAMESPACE_SPLIT_NOT_DECLARED: u8 = 1;
+const NAMESPACE_SPLIT_DECLARED: u8 = 2;
+
+/// Whether the folded-pair capability is read from the device's own frame
+/// ([`NAMESPACE_SPLIT_DEVICE`], what production runs) or from an answer a test
+/// stated.
+static NAMESPACE_SPLIT_ANSWER: AtomicU8 = AtomicU8::new(NAMESPACE_SPLIT_DEVICE);
+
+/// A test's own answer for the folded-pair capability, restored when it drops
+/// (R33).
+///
+/// The rail reads the bit out of the provider's capability frame, and a test
+/// that has to see the fail-closed arm cannot make an admitted device stop
+/// declaring the shape. While this guards an answer, the capability question
+/// is asked of a snapshot carrying it — written, encoded and decoded through
+/// the same frame — so the arm a test sees is the arm an old frame gives
+/// (`absent` reads as undeclared), and the reading is still the wire's.
+///
+/// A guard rather than a plain setter because this one changes a *decision*
+/// and not an observation: a test that unwound through a failed assertion
+/// would otherwise leave the next shape in the same binary answering from a
+/// device that is not its own.
+pub struct StageBufferNamespaceSplitOverride {
+    previous: u8,
+}
+
+impl Drop for StageBufferNamespaceSplitOverride {
+    fn drop(&mut self) {
+        NAMESPACE_SPLIT_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the folded-pair capability as `declared` until the returned guard drops,
+/// or as the device's own answer for `None` (R33).
+pub fn override_stage_buffer_namespace_split(
+    declared: Option<bool>,
+) -> StageBufferNamespaceSplitOverride {
+    let answer = match declared {
+        None => NAMESPACE_SPLIT_DEVICE,
+        Some(false) => NAMESPACE_SPLIT_NOT_DECLARED,
+        Some(true) => NAMESPACE_SPLIT_DECLARED,
+    };
+    StageBufferNamespaceSplitOverride {
+        previous: NAMESPACE_SPLIT_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
 /// The two invocation counts one draw's affine stage-buffer footprint is
 /// bounded by (`research/docs/23` §3.3, v86).
 ///
@@ -3492,6 +3612,40 @@ fn footprint_name(proof: &FootprintProof) -> String {
     }
 }
 
+/// The folded pair one request's statement makes, in the walk's own order
+/// (R31/R33).
+///
+/// Two declarations the walk states — the ones whose access the translation
+/// classifies, which is what [`RenderRailInputs::stage_buffer_statement`]
+/// carries — from different stages, naming one Metal buffer index. The pair is
+/// read in the same canonical order the walk reads it in (vertex bindings
+/// first by index, then the fragment ones), so the first stage it names is the
+/// one the walk would have stated first and the index is the one both name.
+///
+/// This is the walk's fold test and nothing else: it decides nothing about the
+/// shape, and it is what lets the class ask the *device's* own answer to the
+/// rule (R33) before the walk runs — the rule sits inside the canonical walk,
+/// and a walk that ran first would have answered by name before the answer was
+/// in hand. A request that makes no folded pair never reaches the question, so
+/// no other shape asks anything of the rail that it did not ask before.
+fn folded_stage_buffer_pair(
+    inputs: &RenderRailInputs<'_>,
+) -> Option<(RenderPipelineStage, RenderPipelineStage, u32)> {
+    let mut ordered = inputs.stage_buffer_statement().declared;
+    ordered.sort_by_key(|(stage, declaration, _)| (stage.code(), declaration.index));
+    let mut stated: Vec<(RenderPipelineStage, u32)> = Vec::with_capacity(ordered.len());
+    for (stage, declaration, _) in ordered {
+        let folded_onto = stated
+            .iter()
+            .find(|(other, index)| *other != stage && *index == declaration.index);
+        if let Some((other, index)) = folded_onto {
+            return Some((*other, stage, *index));
+        }
+        stated.push((stage, declaration.index));
+    }
+    None
+}
+
 /// The request's two stages' `[[buffer(N)]]` statement, every rule the class
 /// answers it under, in the order the census reads them.
 ///
@@ -3500,11 +3654,19 @@ fn footprint_name(proof: &FootprintProof) -> String {
 /// ([`canonical_vertex_stream_count`]) — because that is the number of
 /// bindings the canonical layout will occupy and the number the contract's own
 /// vertex-layout rule is written against (`research/docs/26` §31).
+///
+/// `stage_buffer_namespace_split` is the device's own answer to the one
+/// question the folded-pair rule asks (`R33`): whether the provider arranges
+/// the two stages' buffer namespaces in different descriptor slots. `true`
+/// states the pair — the walk keeps both declarations and this rail translates
+/// the vertex half under the canonical namespace layout — and `false` answers
+/// it exactly as R31 did, by name, at the same point in the same order.
 fn stage_buffer_gate<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &DrawRequest,
     binds: usize,
     vertex_streams: usize,
+    stage_buffer_namespace_split: bool,
 ) -> Result<Vec<NarrowStageBuffer<'a>>, OutOfClass> {
     // The one statement this request's two stages make (R9m): `declared` is
     // what the contract, the pass's own views and the wire frame are built
@@ -3606,28 +3768,46 @@ fn stage_buffer_gate<'a>(
         // engine here by name (R31). Read inside the same canonical walk as the
         // duplicate rule, so the two rules answer in one order whatever order
         // the reflections stated their declarations in.
+        //
+        // R33 lifts that answer for the devices that declare the split: the
+        // provider translates the vertex half of such a pair under
+        // `metal_api_vulkan::stage_buffer_namespace_layout`, which moves its
+        // whole layout into the canonical namespace set, so the two index
+        // spaces keep their own descriptors and the fold the rail used to
+        // refuse is a shape it now states. The rule reads the *device's* answer
+        // and not the shape's, so the branch below is the same test in the same
+        // place: a device that does not declare the split — an older frame, a
+        // rail that arranges nothing apart — keeps R31's refusal, its sentence
+        // and its own route, byte for byte.
         if let Some(other) = out
             .iter()
             .find(|stated| stated.stage != stage && stated.index == declaration.index)
         {
-            // The folded-pair rule's own route (R31), beside the unchanged
-            // slug.
-            note_stage_buffer_shape(StageBufferShapeRoute::Folded);
-            return Err(OutOfClass::owned(
-                "render_provider_out_of_class_stage_buffer_shape",
-                format!(
-                    "a draw whose {} and {} stages each read [[buffer({})]] stays on the engine: \
+            // The pair is stated rather than refused when the device declares
+            // the split: `other` is the half the vertex stage's namespace
+            // layout moves, and the declarations are paired by (stage, index),
+            // which no layout changes — so the bind and the contract keep
+            // naming the slots they named.
+            if !stage_buffer_namespace_split {
+                // The folded-pair rule's own route (R31), beside the unchanged
+                // slug.
+                note_stage_buffer_shape(StageBufferShapeRoute::Folded);
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_stage_buffer_shape",
+                    format!(
+                        "a draw whose {} and {} stages each read [[buffer({})]] stays on the engine: \
                      the two stages' Metal buffer namespaces are independent, while the canonical \
                      rail binds both at one descriptor — set 0's own binding for that index — and \
                      refuses the pair when the merged set is built \
                      (`render_stage_buffer_layout_unsupported`) rather than execute one stage \
                      under the other's declaration. The engine, which keeps the two namespaces \
                      apart, draws it",
-                    other.stage.name(),
-                    stage.name(),
-                    declaration.index,
-                ),
-            ));
+                        other.stage.name(),
+                        stage.name(),
+                        declaration.index,
+                    ),
+                ));
+            }
         }
         // A vertex stage buffer may not occupy an index the pipeline's vertex
         // layout already describes: this class states the request's streams as
@@ -5579,6 +5759,17 @@ struct RenderPipelineKey {
     vertex_entry: String,
     fragment_entry: String,
     contract: String,
+    /// Whether the vertex module was translated under the canonical namespace
+    /// layout (R33).
+    ///
+    /// Part of the key because it is part of what the registration *did*: the
+    /// same AIR translated under the two layouts is two modules with two
+    /// descriptor arrangements, and a hit that answered with the other one's
+    /// compiled pipeline would bind the stage's buffer at a set the module does
+    /// not read. The fold is a function of the two modules' own reflections, so
+    /// a given pair is folded or not independently of the request — this field
+    /// states that rather than leaving it to be inferred from the AIR.
+    vertex_stage_buffer_namespace_split: bool,
 }
 
 static RENDER_RAIL: OnceLock<RenderRail> = OnceLock::new();
@@ -5754,9 +5945,36 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     crate::runtime::drain::note_store_route(stage_buffer_unused_skip_route(
         inputs.stage_buffer_statement().dropped(),
     ));
+    // R33: the folded pair's own class condition, and the one device answer
+    // this rail asks *before* the gate. The rule it lifts sits inside the
+    // canonical walk — the second declaration of the index is the one that
+    // folds — so an answer read after the walk would arrive after the walk had
+    // already answered by name. The ask is gated on the request's own statement
+    // being folded ([`folded_stage_buffer_pair`], the same intersection the
+    // rule tests), so no other shape reaches the rail's provider any earlier
+    // than it did: the ~99.9% of draws that make no folded pair still answer
+    // the pure gate first, exactly as the comment below states.
+    //
+    // A device that declares the split executes the pair — the vertex half's
+    // whole layout moves to the canonical namespace set
+    // (`metal_api_vulkan::stage_buffer_namespace_layout`) and the walk states
+    // both declarations — and a device (or a frame) that does not keeps R31's
+    // answer, by name, at the same point in the same order.
+    let stage_buffer_namespace_split = match folded_stage_buffer_pair(inputs) {
+        None => false,
+        Some(_) => match declared_stage_buffer_namespace_split() {
+            Ok(declared) => declared,
+            // A provider that cannot be reached cannot answer the question the
+            // walk needs, and an unanswerable candidate is an in-class
+            // candidate: fail closed, exactly as `submit_narrow` does for the
+            // shapes it refuses, rather than running the shape on a rail the
+            // class never named.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
-    let pass = match narrow_class(inputs, req) {
+    let pass = match narrow_class(inputs, req, stage_buffer_namespace_split) {
         Err(reason) => {
             reason.note();
             return RenderRailOutcome::NotInNarrowClass(reason);
@@ -6473,6 +6691,18 @@ struct NarrowPass<'a> {
     /// own counter, for the same reason: the population is what the census
     /// reads, and a submission that never reached the caller is not an answer.
     sampled_target_frames: bool,
+    /// Whether the vertex stage's whole layout is the canonical namespace
+    /// layout rather than the translator's default (R33).
+    ///
+    /// Set when this request's statement is the folded pair *and* the provider
+    /// declared that it arranges the two stages' buffer namespaces apart:
+    /// [`narrow_class`] reads the pair's existence from the statement and the
+    /// device's answer from the frame, and this field is where the two meet.
+    /// The registration below translates the vertex half under
+    /// [`metal_api_vulkan::stage_buffer_namespace_layout`] exactly when it is
+    /// set, so the module's own descriptor layout and the pass's binds state
+    /// one arrangement rather than two.
+    vertex_stage_buffer_namespace_split: bool,
     bgra: bool,
     width: u64,
     height: u64,
@@ -6692,11 +6922,12 @@ impl NarrowPass<'_> {
 /// Whether one request is the narrow class, and the facts the trace is built
 /// from when it is.
 ///
-/// Pure over the request and this rail's own recorded state, and ordered
-/// cheapest-first so a refused shape costs nothing: no provider call, no
-/// translation, no registration, and no device read. Every refusal names the
-/// condition that kept the shape on the engine, because that string is what the
-/// observer reports when a class boundary moves.
+/// Pure over the request and this rail's own recorded state — plus the one
+/// device answer the caller hands it (`stage_buffer_namespace_split`, R33) — and
+/// ordered cheapest-first so a refused shape costs nothing: no provider call,
+/// no translation, and no registration. Every refusal names the condition that
+/// kept the shape on the engine, because that string is what the observer
+/// reports when a class boundary moves.
 ///
 /// Two facts this gate reads are not properties of the request. One is the
 /// attachment window, which belongs to the device's provider and is
@@ -6710,6 +6941,7 @@ impl NarrowPass<'_> {
 fn narrow_class<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &'a DrawRequest,
+    stage_buffer_namespace_split: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R25: the packet's own chain value, when the caller hands it over for the
     // record that continues the chain. Role-gated here so the class states the
@@ -7313,6 +7545,7 @@ fn narrow_class<'a>(
         req,
         req.storage_buffers.len(),
         canonical_vertex_stream_count(&req.vertex_attributes),
+        stage_buffer_namespace_split,
     )?;
     // The sampled textures the fragment stage reads (v101, `research/docs/23`
     // §101): the class states the module's own declarations beside the draw's
@@ -7682,6 +7915,7 @@ fn narrow_class<'a>(
         viewport,
         blend,
         present,
+        vertex_stage_buffer_namespace_split: stage_buffer_namespace_split,
     })
 }
 
@@ -9367,6 +9601,7 @@ fn register_render_pipeline(
         vertex_entry: pass.vertex_entry.clone(),
         fragment_entry: pass.fragment_entry.clone(),
         contract: fingerprint.clone(),
+        vertex_stage_buffer_namespace_split: pass.vertex_stage_buffer_namespace_split,
     };
     let rail = render_rail();
     let mut pipelines =
@@ -9391,7 +9626,16 @@ fn register_render_pipeline(
     // derives the Phase-1 policy, so its refusal text stays byte for byte what
     // it was.
     let policy = provider.spirv_feature_policy();
-    let stage = |air: &[u8], entry: &str, which: &'static str, stage| {
+    // R33: the descriptor layout each stage is translated against is the
+    // module's own Vulkan ABI, and it is the *other* half of the folded pair's
+    // answer. The default layout puts every Metal resource of a stage in set 0,
+    // so a pair that reads one `[[buffer(n)]]` index from both stages folds the
+    // two descriptors onto one slot; the canonical namespace layout moves the
+    // *vertex* half's whole layout to set 1 and leaves the fragment half where
+    // it was, and the provider reads each bound slot back out of the module's
+    // own reflection. Only the folded request whose device declared the split
+    // takes that layout, so every other pair is translated exactly as it was.
+    let stage = |air: &[u8], entry: &str, which: &'static str, stage, layout| {
         let function = device
             .new_library_with_binary_air(air.to_vec())
             .map_err(|error| ProviderRenderDecline::PipelineCompile {
@@ -9403,24 +9647,30 @@ fn register_render_pipeline(
                 step: which,
                 detail: error.to_string(),
             })?;
-        TranslatedRenderStage::translate_with_policy(stage, &function, policy).map_err(|error| {
-            ProviderRenderDecline::PipelineCompile {
+        TranslatedRenderStage::translate_with_policy_and_layout(stage, &function, policy, layout)
+            .map_err(|error| ProviderRenderDecline::PipelineCompile {
                 step: which,
                 detail: error.to_string(),
-            }
-        })
+            })
+    };
+    let vertex_layout = if pass.vertex_stage_buffer_namespace_split {
+        metal_api_vulkan::stage_buffer_namespace_layout()
+    } else {
+        metal2vulkan::reflect::DescriptorLayout::default()
     };
     let vertex = stage(
         inputs.vertex_air,
         &pass.vertex_entry,
         "vertex_stage",
         RenderStage::Vertex,
+        vertex_layout,
     )?;
     let fragment = stage(
         inputs.fragment_air,
         &pass.fragment_entry,
         "fragment_stage",
         RenderStage::Fragment,
+        metal2vulkan::reflect::DescriptorLayout::default(),
     )?;
     let digest = SemanticDigest::new(
         "reims-provider-render-v1",
