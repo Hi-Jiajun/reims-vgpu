@@ -2913,7 +2913,7 @@ fn gather_window(source: &GuestRunSource) -> Option<StageBufferWindow> {
 /// list: the contract's run list *is* the view's byte range, so a list that is
 /// short, padded or unwindowed would be a declaration about bytes no record
 /// wrote.
-fn load_seed_run_windows(
+pub(crate) fn load_seed_run_windows(
     source: &GuestRunSource,
     extent: u64,
 ) -> Result<Vec<StageBufferWindow>, LoadSeedRunExit> {
@@ -2980,7 +2980,7 @@ fn load_seed_run_windows(
 /// is behind rather than one sentence for five of them — the rule
 /// [`SampledGatherExit`] follows for the sampled sibling of this arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LoadSeedRunExit {
+pub(crate) enum LoadSeedRunExit {
     /// The surface's rows are padded (`bufferRowLength`): the byte span the
     /// runs tile is not the attachment's tightly packed extent, and the
     /// contract's list carries no stride.
@@ -3009,6 +3009,24 @@ impl LoadSeedRunExit {
                 "render_provider_out_of_class_load_seed_extent"
             }
             Self::Unregistered | Self::Unwindowed => "render_provider_out_of_class_load_seed_runs",
+        }
+    }
+
+    /// The route this exit answers under when the *elision* door is the one that
+    /// cut the window (B1).
+    ///
+    /// One name per fact and the same facts the seed door counts in its own
+    /// bucket: the two doors read the same window shape, so the class answers
+    /// the same way about both — what differs is which door the census has to
+    /// charge, because one is a seed the caller chose and the other is a frame
+    /// the engine's own elision said it already held.
+    pub(crate) fn window_route(self) -> ResidentSourceRoute {
+        match self {
+            Self::PaddedRows { .. } => ResidentSourceRoute::WindowPaddedRows,
+            Self::Extent { .. } | Self::Total { .. } => ResidentSourceRoute::WindowExtent,
+            Self::Unregistered => ResidentSourceRoute::WindowUnregistered,
+            Self::Unwindowed => ResidentSourceRoute::WindowUnwindowed,
+            Self::Registrations { .. } => ResidentSourceRoute::WindowRegistrations,
         }
     }
 
@@ -4620,6 +4638,13 @@ fn record_production(
         // The frame stayed in the provider's own image under the identity.
         NarrowStore::Resident(resident) if resident == attachment => {}
         NarrowStore::Resident(_) => return None,
+        // B3: the frame landed in the owner's own registered window, and the
+        // view that names it is a lease the submission retires with it — so
+        // there is no view a later trace could sample this production through.
+        // The record is still answered (its bytes are in the guest's pages,
+        // which is where the seed ladder reads them); what is not recorded is a
+        // production, exactly as for a frame the caller kept.
+        NarrowStore::Borrowed => return None,
     }
     // The descriptor is kept as the producing submission built it, with one
     // rewrite: every bind that traveled as a lease becomes the trace's own
@@ -4886,6 +4911,18 @@ enum NarrowStore {
     /// The frame stays in the provider's image under the attachment's own
     /// identity, and no writeback is published (`StoreOp::Resident`).
     Resident(ResidentAttachment),
+    /// The frame lands in the attachment's own guest window, which is the same
+    /// view the pass began from (`StoreOp::Borrowed`, E-TX8, B3).
+    ///
+    /// Elected only for the record whose frame the guest's pages are owed —
+    /// the packet's only record, or its last one
+    /// ([`RenderChainRole::SoleOrTail`]) — and only when the door declared a
+    /// window for the load. The bytes still come back through the completion's
+    /// writeback channel (`RenderAttachment::publishes_bytes` stays true for
+    /// this arm), because the seam's own Store route reads them; what changes is
+    /// that the owner's pages receive them from the provider, so the seam lands
+    /// nothing a second time.
+    Borrowed,
 }
 
 /// Where one record sits in the packet the exec loop walks.
@@ -5173,6 +5210,37 @@ pub struct SampledTargetFrame<'a> {
     pub bytes: &'a [u8],
 }
 
+/// The attachment's own guest window, as the door that opened one record's LOAD
+/// found it (`research/docs/26` §Rn, B1-B3).
+///
+/// The two LOAD elisions (`honour_gva_load_elision`,
+/// `mapper_ref_texture_load_currency_query`) both say the same thing — the
+/// engine's own image already holds the frame this record begins from — and
+/// both are made by a *deferred* Store: the frame is in the engine's resident,
+/// the mapping's or the plane's guest pages are owed it, and
+/// `pending_writebacks` holds that debt (`arm_surface_writeback_debt` /
+/// `arm_gva`). The window is the page range those two names cover, so
+/// "land-then-borrow" is one answer to both halves of the record's obligation:
+/// paying the debt *is* the landing (`INV-LAND`), the run list *is* the load
+/// source (`INV-BORROW`, E-TX6), and the record that owes the guest its frame
+/// lands it back in the same window (`INV-RETURN`, E-TX8).
+///
+/// A window the door could not cut is a *named* answer rather than a silent
+/// absence ([`Self::Refused`]): the class's one `resident_source` refusal is
+/// where that name is charged, so the census reads which fact held the shape
+/// instead of folding it into the door it came in through.
+pub enum AttachmentGuestWindow<'a> {
+    /// The window's runs, ready to be stated as the attachment's own
+    /// declaration: one [`StageBufferWindow`] per maximal import-contiguous
+    /// stretch, in window order, exactly the list
+    /// [`load_seed_run_windows`] states for the R32 seed door.
+    Runs(&'a [StageBufferWindow]),
+    /// The door applied and the window could not be declared. The class charges
+    /// this route beside its refusal, so the sum over the routes is still the
+    /// bucket.
+    Refused(ResidentSourceRoute),
+}
+
 /// What one render submission needs to leave this rail: the two stage
 /// modules' AIR, the entries the translation reports for them, and this
 /// record's place in the chain it belongs to.
@@ -5292,6 +5360,23 @@ pub struct RenderRailInputs<'a> {
     /// identity, or for stating guest bytes beside the live image — leaves the
     /// route uncounted rather than filing it under a refusal it did not get.
     pub resident_source_route: Option<ResidentSourceRoute>,
+    /// The attachment's own guest window the door cut for this record, when the
+    /// record's `load_from_target` chain is one of the two LOAD elisions and the
+    /// door could name the pages its frame lives in (B1-B3,
+    /// [`AttachmentGuestWindow`]).
+    ///
+    /// Asked **before** the two byte arms below, and that order is the point:
+    /// this is the door's own declaration, so a record it answers costs no
+    /// readback at all — the provider gathers the guest's live pages (E-TX6) and
+    /// the packet's last record lands its frame back in the same window
+    /// (E-TX8). The byte arms stay for the records this door could not state
+    /// (`Runs` absent or `Refused`), which is exactly the population the census
+    /// separates by route.
+    ///
+    /// `None` is every record whose chain is not an elision door's — the
+    /// serialized packet chain (R23's arm), a middle (R25's), a seed (R32's) —
+    /// and every record that never named a chain at all.
+    pub attachment_guest_window: Option<AttachmentGuestWindow<'a>>,
     /// The frame a middle record's previous contents are, when the caller
     /// hands it over (R25).
     ///
@@ -5577,6 +5662,18 @@ pub struct RenderRailOutput {
     /// admitted — so a caller that lands these bytes has nothing to do for the
     /// population that came before this increment.
     pub stage_writebacks: Vec<StageWriteback>,
+    /// Whether this pass's frame *already landed* in the attachment's own
+    /// guest window (`StoreOp::Borrowed`, E-TX8, B3).
+    ///
+    /// `true` is the one answer the seam's Store route has to read before it
+    /// lands anything itself: the owner's pages hold the frame by construction
+    /// (`resolve_attachment_landing` writes exactly the readback the bytes above
+    /// are), so a second write is a copy of bytes that are already there — and
+    /// the *account* that says the page changed (`mark_mapping_written` and its
+    /// siblings) belongs to whoever knows the landing happened, which is the
+    /// seam. `false` is every other arm: the caller's store route lands the
+    /// frame exactly as it always has.
+    pub landed_in_window: bool,
 }
 
 /// What one resident-class submission leaves behind.
@@ -6712,6 +6809,17 @@ pub fn resident_source_route(route: ResidentSourceRoute) -> &'static str {
             "resident_source_mapper_ref_frame_unavailable"
         }
         ResidentSourceRoute::Undeclared => "resident_source_undeclared",
+        // B1-B3: the elision doors' own window, when the door applied and the
+        // record's attachment could not be declared as it.
+        ResidentSourceRoute::WindowUnregistered => "resident_source_window_unregistered",
+        ResidentSourceRoute::WindowUnwindowed => "resident_source_window_unwindowed",
+        ResidentSourceRoute::WindowPaddedRows => "resident_source_window_padded_rows",
+        ResidentSourceRoute::WindowExtent => "resident_source_window_extent",
+        ResidentSourceRoute::WindowRegistrations => "resident_source_window_registrations",
+        ResidentSourceRoute::WindowGeometry => "resident_source_window_geometry",
+        ResidentSourceRoute::WindowIdentityMoved => "resident_source_window_identity_moved",
+        ResidentSourceRoute::WindowLandingRefused => "resident_source_window_landing_refused",
+        ResidentSourceRoute::WindowSpanUnmapped => "resident_source_window_span_unmapped",
     }
 }
 
@@ -6744,6 +6852,15 @@ pub fn resident_source_route_bytes(route: ResidentSourceRoute) -> &'static str {
             "resident_source_mapper_ref_frame_unavailable_bytes"
         }
         ResidentSourceRoute::Undeclared => "resident_source_undeclared_bytes",
+        ResidentSourceRoute::WindowUnregistered => "resident_source_window_unregistered_bytes",
+        ResidentSourceRoute::WindowUnwindowed => "resident_source_window_unwindowed_bytes",
+        ResidentSourceRoute::WindowPaddedRows => "resident_source_window_padded_rows_bytes",
+        ResidentSourceRoute::WindowExtent => "resident_source_window_extent_bytes",
+        ResidentSourceRoute::WindowRegistrations => "resident_source_window_registrations_bytes",
+        ResidentSourceRoute::WindowGeometry => "resident_source_window_geometry_bytes",
+        ResidentSourceRoute::WindowIdentityMoved => "resident_source_window_identity_moved_bytes",
+        ResidentSourceRoute::WindowLandingRefused => "resident_source_window_landing_refused_bytes",
+        ResidentSourceRoute::WindowSpanUnmapped => "resident_source_window_span_unmapped_bytes",
     }
 }
 
@@ -6798,6 +6915,36 @@ pub enum ResidentSourceRoute {
     /// which forgets to state its route reads as a number in the census instead
     /// of quietly inflating one.
     Undeclared,
+    /// B1-B3: the door applied and its window's pages have no registration this
+    /// process can import (`WindowRefusal::NoAlias`, or a source whose
+    /// `pages` came back empty), so there is no owner window to read or land
+    /// through.
+    WindowUnregistered,
+    /// The same door, one stretch of whose window has no registered window.
+    WindowUnwindowed,
+    /// The same door on a surface whose rows are padded (`bufferRowLength`):
+    /// the byte span the window tiles is not the attachment's tightly packed
+    /// extent, and the contract's run list carries no stride
+    /// (`research/docs/26` §Rn — the follow-up change
+    /// `render-attachment-window-stride` is what would lift this).
+    WindowPaddedRows,
+    /// The same door whose window's span is not the attachment's extent.
+    WindowExtent,
+    /// The same door whose runs live in more than one registration, a shape one
+    /// declaration cannot state (`render-guest-run-multi-allocation`).
+    WindowRegistrations,
+    /// The same door whose mapping/GVA geometry or texel format is not the
+    /// attachment's own.
+    WindowGeometry,
+    /// The same door whose `map_generation` / GVA generation moved between the
+    /// declaration and the submission.
+    WindowIdentityMoved,
+    /// The same door whose owed frame could not be landed: the guest wrote over
+    /// it, or the rail refused the Store, so the pages do *not* hold the content
+    /// the elision read.
+    WindowLandingRefused,
+    /// The same door whose task GVA span has an unmapped page.
+    WindowSpanUnmapped,
 }
 
 /// Charge one `resident_source` arm's route, and its byte price, beside the
@@ -7255,6 +7402,14 @@ struct NarrowPass<'a> {
     /// these bytes is not the one the other two state (see
     /// [`RenderRailInputs::surface_resident_source_bytes`]).
     carried_surface_resident: bool,
+    /// Whether this pass's previous contents are the *elision door's own guest
+    /// window* rather than any of the byte arms above (B1-B3). Counted as
+    /// `render_provider_attachment_guest_window_bytes` at the completion,
+    /// beside R32's `render_provider_load_seed_runs`: the declaration the two
+    /// state is the same one (`BufferSource::GuestRuns`), so without this flag
+    /// the census could not tell the seed door's population from the elision
+    /// door's — which is the whole question this increment's readings turn on.
+    carried_attachment_guest_window: bool,
     /// Whether at least one of this pass's sampled textures is the frame the
     /// caller read out of the registry (R24's arm). Counted as
     /// `render_provider_sampled_target_frames` at the completion, beside R23's
@@ -7720,6 +7875,13 @@ fn narrow_class<'a>(
     // the completion counts the population under its own name. Set where the
     // bytes are chosen below; false for every arm that carries none.
     let mut carried_surface_resident = false;
+    // B: whether this record's load is the elision door's own guest window
+    // rather than one of the byte arms ([`AttachmentGuestWindow::Runs`]). Set
+    // where the window is chosen, so the completion counts the *window*
+    // population under its own byte name instead of folding it into R32's seed
+    // runs — the two share one declaration shape and have two different
+    // callers.
+    let mut carried_attachment_guest_window = false;
     let load = if req.load_from_target {
         let Some(resident) = resident else {
             return Err(OutOfClass::new(
@@ -7764,50 +7926,70 @@ fn narrow_class<'a>(
             // same statement to this class — the caller's copy of the frame
             // the pass begins from — so both select the contract's trace-owned
             // load and only the population counters differ.
-            let (bytes, from_surface_resident) = match (
-                inputs.resident_source_bytes,
-                inputs.surface_resident_source_bytes,
-            ) {
-                (Some(bytes), _) => (bytes, false),
-                (None, Some(bytes)) => (bytes, true),
-                (None, None) => {
-                    // R34: the one refusal these three doors share, counted by
-                    // the door whose own read declined and priced by the frame
-                    // a readback would have had to carry. `Undeclared` is the
-                    // canary for a door that reached this point without naming
-                    // itself; it can only be earned here, by a record this
-                    // class refused, so a nonzero census reading is evidence
-                    // about the seam rather than about the shape.
-                    note_resident_source(
-                        inputs
-                            .resident_source_route
-                            .unwrap_or(ResidentSourceRoute::Undeclared),
-                        extent,
-                    );
+            // B1-B3: the elision door's own window is asked **first**, because
+            // it is the one declaration that covers both halves of that record's
+            // obligation — the pages the pass begins from (E-TX6's gather) and,
+            // for the record the guest's pages are owed a frame, the landing
+            // that frame makes (E-TX8's `StoreOp::Borrowed`, elected below it).
+            // Nothing is read back to state it: `INV-LAND` says the door paid the
+            // debt before it cut the window, so those pages hold exactly what the
+            // elision's own currency test read.
+            if let Some(AttachmentGuestWindow::Runs(runs)) = inputs.attachment_guest_window {
+                carried_attachment_guest_window = true;
+                NarrowLoad::GuestRuns(runs.to_vec())
+            } else {
+                let (bytes, from_surface_resident) = match (
+                    inputs.resident_source_bytes,
+                    inputs.surface_resident_source_bytes,
+                ) {
+                    (Some(bytes), _) => (bytes, false),
+                    (None, Some(bytes)) => (bytes, true),
+                    (None, None) => {
+                        // R34: the one refusal these three doors share, counted by
+                        // the door whose own read declined and priced by the frame
+                        // a readback would have had to carry. `Undeclared` is the
+                        // canary for a door that reached this point without naming
+                        // itself; it can only be earned here, by a record this
+                        // class refused, so a nonzero census reading is evidence
+                        // about the seam rather than about the shape.
+                        //
+                        // B: a door that *did* state a window and could not cut it
+                        // answers under the window's own route instead. The fact
+                        // that held the shape is what the census has to read, and
+                        // the nine R34 routes keep naming the doors that had no
+                        // window to state at all.
+                        let route = match inputs.attachment_guest_window {
+                            Some(AttachmentGuestWindow::Refused(route)) => route,
+                            _ => inputs
+                                .resident_source_route
+                                .unwrap_or(ResidentSourceRoute::Undeclared),
+                        };
+                        note_resident_source(route, extent);
+                        return Err(OutOfClass::new(
+                            "render_provider_out_of_class_resident_source",
+                            "a record whose previous contents are the live GPU image stays on the \
+                             engine while the caller can neither read a frame this rail keeps nor \
+                             hand the frame over: the resident the chain names is the engine's \
+                             own, and this rail defines no image under it",
+                        ));
+                    }
+                };
+                carried_surface_resident = from_surface_resident;
+                if u64::try_from(bytes.len()).ok() != Some(extent) {
                     return Err(OutOfClass::new(
-                        "render_provider_out_of_class_resident_source",
-                        "a record whose previous contents are the live GPU image stays on the \
-                         engine while the caller can neither read a frame this rail keeps nor \
-                         hand the frame over: the resident the chain names is the engine's own, \
-                         and this rail defines no image under it",
+                        if from_surface_resident {
+                            "render_provider_out_of_class_surface_resident_shape"
+                        } else {
+                            "render_provider_out_of_class_resident_source_shape"
+                        },
+                        "a record whose previous contents are handed over at a width or extent \
+                         other than the attachment's own stays on the engine: the canonical \
+                         attachment uploads exactly the view's declared bytes, so a shorter or \
+                         longer buffer would begin the pass from bytes no record wrote",
                     ));
                 }
-            };
-            carried_surface_resident = from_surface_resident;
-            if u64::try_from(bytes.len()).ok() != Some(extent) {
-                return Err(OutOfClass::new(
-                    if from_surface_resident {
-                        "render_provider_out_of_class_surface_resident_shape"
-                    } else {
-                        "render_provider_out_of_class_resident_source_shape"
-                    },
-                    "a record whose previous contents are handed over at a width or extent other \
-                     than the attachment's own stays on the engine: the canonical attachment \
-                     uploads exactly the view's declared bytes, so a shorter or longer buffer \
-                     would begin the pass from bytes no record wrote",
-                ));
+                NarrowLoad::Bytes(bytes)
             }
-            NarrowLoad::Bytes(bytes)
         } else {
             NarrowLoad::Resident(resident)
         }
@@ -7959,6 +8141,20 @@ fn narrow_class<'a>(
                     };
                     if inputs.resident_frames_fetchable {
                         NarrowStore::Resident(resident)
+                    } else if carried_attachment_guest_window
+                        && inputs.role == RenderChainRole::SoleOrTail
+                    {
+                        // B3 (E-TX8): the record whose frame the guest's pages
+                        // are owed, on a pass whose *load* is those same pages
+                        // declared as the attachment's own view — so the frame
+                        // lands in the window the pass began from, by
+                        // construction and not by a second naming channel
+                        // (`resolve_attachment_landing` reads the declaring
+                        // view's own source). The caller asked to skip its
+                        // readback: this arm honours that where the pooled
+                        // answer could only undo it, because the frame's
+                        // destination is not the provider's image at all.
+                        NarrowStore::Borrowed
                     } else {
                         // The caller asked to skip the readback; this rail
                         // declines the *optimisation* and answers with the
@@ -8459,6 +8655,7 @@ fn narrow_class<'a>(
         carried_chain_middle,
         carried_load_seed_bytes,
         carried_surface_resident,
+        carried_attachment_guest_window,
         sampled_target_frames: sampling
             .textures
             .iter()
@@ -8719,6 +8916,20 @@ fn attachment_identity(
             }
         }
         (NarrowLoad::Clear(_) | NarrowLoad::Bytes(_), NarrowStore::Writeback) => {
+            ResidentAttachment {
+                allocation: ATTACHMENT_ALLOCATION,
+                view: ATTACHMENT_VIEW,
+            }
+        }
+        // Unreachable by construction: `NarrowStore::Borrowed` is elected only
+        // beside a `GuestRuns` load (the window *is* the load's source). The arm
+        // is stated rather than left out so the pair is total, and it names the
+        // pooled view rather than panicking: a future election that broke the
+        // pair would declare a borrowed store beside a view no owner window
+        // backs, which the provider refuses by name
+        // (`render_attachment_landing_unsupported`) instead of writing
+        // anywhere.
+        (NarrowLoad::Clear(_) | NarrowLoad::Bytes(_), NarrowStore::Borrowed) => {
             ResidentAttachment {
                 allocation: ATTACHMENT_ALLOCATION,
                 view: ATTACHMENT_VIEW,
@@ -9128,6 +9339,12 @@ fn submit_narrow(
             store: match pass.store {
                 NarrowStore::Writeback => StoreOp::Store,
                 NarrowStore::Resident(_) => StoreOp::Resident,
+                // B3 (E-TX8): the frame lands in the attachment view's own
+                // declared window. The writeback channel still carries the
+                // bytes (`store_publishes` keeps both arms publishing), so the
+                // seam's own Store route reads a completion exactly as it does
+                // for `Store` — it just has nothing left to land.
+                NarrowStore::Borrowed => StoreOp::Borrowed,
             },
         }],
         // The pass's own rect when the request bound one the contract can name
@@ -9467,8 +9684,31 @@ fn submit_narrow(
     // R32's other arm: the attachment's previous contents are the surface's own
     // guest pages, declared as the contract's ordered run list and gathered by
     // the provider. Counted where the answer happens, like every arm above.
+    //
+    // B: the elision door states the *same* declaration shape from its own
+    // caller (the window it cut after paying the debt), so the two populations
+    // are counted apart by the flag the load arm set — a census that folded them
+    // together could not say whether the seed door or the elision door had
+    // moved, which is exactly the reading this increment is judged on.
     if matches!(pass.load, NarrowLoad::GuestRuns(_)) {
-        crate::runtime::drain::note_store_route("render_provider_load_seed_runs");
+        if pass.carried_attachment_guest_window {
+            crate::runtime::drain::note_store_route_n(
+                "render_provider_attachment_guest_window_bytes",
+                pass.extent,
+            );
+        } else {
+            crate::runtime::drain::note_store_route("render_provider_load_seed_runs");
+        }
+    }
+    // B3: the frame this pass landed in the owner's own window (E-TX8), priced
+    // beside the arm above. Counted where the answer happens for the same reason
+    // every arm here is: a submission that never reached the caller is not an
+    // answer.
+    if matches!(pass.store, NarrowStore::Borrowed) {
+        crate::runtime::drain::note_store_route_n(
+            "render_provider_borrowed_landing_bytes",
+            pass.extent,
+        );
     }
     // R24's own population, counted where the answer happens for the same
     // reason as R23's above: the caller read a sampled GPU target's frame out
@@ -9510,6 +9750,7 @@ fn submit_narrow(
         bgra: pass.bgra,
         present,
         stage_writebacks,
+        landed_in_window: matches!(pass.store, NarrowStore::Borrowed),
     }))
 }
 

@@ -928,6 +928,10 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // that drives the refusal's routes states one through
         // [`inputs_held_with_route`].
         resident_source_route: None,
+        // B1-B3: no fixture states the attachment's own guest window unless a
+        // test drives it — the shape [`inputs_with_attachment_window`] and its
+        // refusal sibling state.
+        attachment_guest_window: None,
         // R25: no predecessor's frame is handed over unless a test states the
         // bytes the walk carries — the shape
         // [`inputs_held_with_chain_value`] drives.
@@ -1076,6 +1080,38 @@ fn inputs_held_with_surface_source<'a>(
 ) -> RenderRailInputs<'a> {
     RenderRailInputs {
         surface_resident_source_bytes: Some(source),
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_held`] with the attachment's own guest window stated (B1-B3): the
+/// elision door cut a window out of the record's own guest pages, and this is
+/// the declaration the class states for it.
+///
+/// The runs are the class's own input shape — [`StageBufferWindow`]s, exactly
+/// what `load_seed_run_windows` hands the provider's owner plan — because the
+/// door that builds them (the seam's payment plus page walk) is the one layer a
+/// test cannot mint without a guest.
+fn inputs_held_with_attachment_window<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    window: &'a [StageBufferWindow],
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        attachment_guest_window: Some(provider_render::AttachmentGuestWindow::Runs(window)),
+        ..inputs_held(stages, role)
+    }
+}
+
+/// [`inputs_held`] with the window the door could **not** cut, named (B1): the
+/// shape every `resident_source_window_*` route is charged for.
+fn inputs_held_with_window_refusal<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    route: ResidentSourceRoute,
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        attachment_guest_window: Some(provider_render::AttachmentGuestWindow::Refused(route)),
         ..inputs_held(stages, role)
     }
 }
@@ -4393,6 +4429,404 @@ fn the_surfaces_frame_the_elision_names_carries_the_composite_into_the_provider(
     }
 }
 
+/// B1-B3 (RAIL-A): the attachment's own guest window — declared as the pass's
+/// load, and landed by the provider's own store.
+///
+/// The census's `render_provider_out_of_class_resident_source` bucket is a
+/// *refusal* count, and the two LOAD elisions are most of it: the engine's own
+/// registry holds the frame the record begins from
+/// (`honour_gva_load_elision` / `mapper_ref_texture_load_currency_query`), the
+/// guest pages it was landed into are owed a copy (`arm_surface_writeback_debt`
+/// / `arm_gva`), and until this increment the class had no declaration that
+/// covers both halves — so it kept every one of them on the engine by name.
+///
+/// The window is that declaration, and this test drives all three of its rules
+/// against a **real** registered host region (the owner rail's own import, the
+/// same primitive the R9d/R11/R28 window tests use):
+///
+/// * `INV-BORROW` — the pass begins from the bytes the registered window holds,
+///   even while the R26 byte arm beside it is handed a different picture;
+/// * the counters separate the door's population from R32's seed runs, and the
+///   byte arms do not move;
+/// * `INV-RETURN` — the frame the provider publishes is the frame the window
+///   holds afterwards, byte for byte, which is the half a rail that only
+///   *loaded* the window could not produce;
+/// * the run list is read in the order it states: two half-windows, swapped,
+///   move the frame's halves with them.
+#[test]
+fn a_borrowed_attachment_window_carries_the_pass_and_receives_its_frame() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    // The fixture is small enough to read texel by texel, and the window it
+    // declares fits one provider page.
+    let (width, height) = (8u32, 4u32);
+    let half = width / 2;
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let texel = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
+    };
+    // Per-texel bytes rather than one colour: which bytes the pass began from,
+    // and which bytes it landed, are read texel by texel.
+    let pattern = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the window arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    assert!(
+        frame_len <= page as u64,
+        "the fixture's window fits one provider page"
+    );
+    let mut owner = AlignedHost::new(2 * page, page);
+    owner.as_mut_slice()[..frame_len as usize].copy_from_slice(&pattern(0));
+    let import = 0x9e2d_u64;
+    provider_owner::register(Region {
+        import,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x53_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let window = StageBufferWindow {
+        import,
+        host_va: owner.pointer as u64,
+        length: page as u64,
+        head: 0,
+        bytes_len: frame_len,
+    };
+
+    let identity = surface_identity(0x7b_26_03);
+    let request = || {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.load_from_target = true;
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req
+    };
+
+    // The R26 byte arm is handed a *different* picture, so the frame says which
+    // arm carried the bytes: a rail that fell through to the readback lands the
+    // other picture in the half this pass does not draw.
+    let other = pattern(0x5a);
+    let bytes_before = route_count("render_provider_attachment_guest_window_bytes");
+    let seed_before = route_count("render_provider_load_seed_runs");
+    let r26_before = route_count("render_provider_surface_resident_source_bytes");
+    let landing_before = route_count("render_provider_borrowed_landing_bytes");
+    let store_before = route_count("render_provider_resident_store");
+    let load_before = route_count("render_provider_resident_load");
+    let frame = {
+        let single = [window];
+        let inputs = RenderRailInputs {
+            surface_resident_source_bytes: Some(&other),
+            ..inputs_held_with_attachment_window(&stages, RenderChainRole::SoleOrTail, &single)
+        };
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!("a record whose door cut its own window is in class: {other:?}"),
+        }
+    };
+    assert_eq!(
+        frame.len(),
+        frame_len as usize,
+        "the whole attachment comes back"
+    );
+    for x in 0..half {
+        assert_texel_near(
+            &format!("borrowed window: drawn texel ({x}, 0)"),
+            texel(&frame, x, 0),
+            FRAGMENT_TEXEL,
+        );
+    }
+    for y in 0..height {
+        for x in half..width {
+            let expected = pattern(0)[((y * width + x) * 4) as usize..][..4].to_vec();
+            assert_eq!(
+                texel(&frame, x, y).to_vec(),
+                expected,
+                "texel ({x}, {y}) is the window's own byte: a rail that read the other arm's \
+                 frame lands that picture here instead"
+            );
+        }
+    }
+    assert_eq!(
+        route_count("render_provider_attachment_guest_window_bytes") - bytes_before,
+        frame_len,
+        "the window arm has its own byte population, priced at the attachment's extent"
+    );
+    assert_eq!(
+        route_count("render_provider_load_seed_runs") - seed_before,
+        0,
+        "R32's seed door is a different caller: the same declaration shape, two numbers"
+    );
+    assert_eq!(
+        route_count("render_provider_surface_resident_source_bytes") - r26_before,
+        0,
+        "the window is asked before the byte arms, so R26's readback population does not move"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_bytes") - landing_before,
+        frame_len,
+        "the frame the guest's pages are owed landed in the window (E-TX8)"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_store") - store_before,
+        0,
+        "no frame stays in an image this caller cannot read"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_load") - load_before,
+        0,
+        "this arm loads from the guest's own pages, not from a resident of this rail's own"
+    );
+
+    // `INV-RETURN`, the falsifiable half: the provider's own store wrote the
+    // frame into the *registered* window — so the bytes the test owns now *are*
+    // the frame, including the half this pass never drew.
+    let landed = owner.as_mut_slice()[..frame_len as usize].to_vec();
+    assert_eq!(
+        landed, frame,
+        "the window holds the frame the provider published: a rail that only loaded it would \
+         leave the pre-pass pattern in every undrawn texel"
+    );
+
+    // The list's order is the declaration's: two half-windows of one
+    // registration, swapped, move the frame's halves with them.
+    let half_len = frame_len / 2;
+    owner.as_mut_slice()[..half_len as usize].copy_from_slice(&pattern(0)[..half_len as usize]);
+    owner.as_mut_slice()[page..page + half_len as usize]
+        .copy_from_slice(&pattern(0)[half_len as usize..]);
+    let first = StageBufferWindow {
+        import,
+        host_va: owner.pointer as u64,
+        length: page as u64,
+        head: 0,
+        bytes_len: half_len,
+    };
+    let second = StageBufferWindow {
+        import,
+        host_va: owner.pointer as u64 + page as u64,
+        length: page as u64,
+        head: 0,
+        bytes_len: half_len,
+    };
+    let borrowed = |runs: &[StageBufferWindow]| -> Vec<u8> {
+        let inputs = inputs_held_with_attachment_window(&stages, RenderChainRole::SoleOrTail, runs);
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!("a two-run window is in class: {other:?}"),
+        }
+    };
+    let straight = borrowed(&[first, second]);
+    let swapped = borrowed(&[second, first]);
+    let undrawn_half = |frame: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(half_len as usize);
+        for y in 0..height {
+            for x in half..width {
+                out.extend_from_slice(&texel(frame, x, y));
+            }
+        }
+        out
+    };
+    // The two runs are the frame's first and second byte halves — its top two
+    // rows and its bottom two — so the swapped declaration's pre-pass image is
+    // the pattern's halves exchanged, and the *undrawn* half of the frame is
+    // what says which of the two orders the provider read.
+    let straight_source = pattern(0);
+    let mut swapped_source = pattern(0)[half_len as usize..].to_vec();
+    swapped_source.extend_from_slice(&pattern(0)[..half_len as usize]);
+    assert_eq!(
+        undrawn_half(&straight),
+        undrawn_half(&straight_source),
+        "in declaration order the assembled window is the pattern itself"
+    );
+    assert_eq!(
+        undrawn_half(&swapped),
+        undrawn_half(&swapped_source),
+        "swapping the two runs moves the undrawn half with them: the list is read in the order \
+         it states"
+    );
+    assert_frames_differ(
+        "the window's run order reaches the frame",
+        &straight,
+        &swapped,
+    );
+    eprintln!(
+        "B1-B3 borrowed window: {width}x{height} attachment, {frame_len} byte window in \
+         registration {import:#x} (host import alignment {alignment}); the undrawn half is the \
+         window's own bytes while the R26 arm beside it was handed another picture; counters \
+         render_provider_attachment_guest_window_bytes +{frame_len} and \
+         render_provider_borrowed_landing_bytes +{frame_len} against \
+         render_provider_load_seed_runs +0 and render_provider_surface_resident_source_bytes +0; \
+         the registered memory holds the published frame byte for byte; two half-windows swapped \
+         move the frame's undrawn half"
+    );
+}
+
+/// B (RAIL-C): a window the door could not cut keeps the record on the engine
+/// **by name**, and the door's own route is not charged for it.
+///
+/// The nine window routes are one per fact the door can answer with, and each
+/// has to be the number the census reads for the shape it describes: the R34
+/// routes name the *door*, these name the *window*. Two directions are asserted
+/// together because both are load-bearing for the next census:
+///
+/// * a stated window that could not be cut is charged under its own route even
+///   while the door states one of the R34 routes beside it — a door that got
+///   far enough to try a window is a different population from one that never
+///   had a window to state;
+/// * a refused window does **not** take the byte arms away: the record is still
+///   answered when the caller hands its frame over, which is the population
+///   `render_provider_surface_resident_source_bytes` reads.
+#[test]
+fn a_window_the_door_could_not_cut_keeps_the_record_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    // The same small fixture the window test uses: this rail is about *which
+    // name* a refusal answers under, and a whole-window attachment would pay
+    // the declared window's own 8 MiB per submission for nothing.
+    let (width, height) = (8u32, 4u32);
+    let extent = u64::from(width) * u64::from(height) * 4;
+    let identity = surface_identity(0x7b_26_04);
+    let request = || {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.load_from_target = true;
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: width / 2,
+            height,
+        });
+        req
+    };
+    let windows = [
+        ResidentSourceRoute::WindowUnregistered,
+        ResidentSourceRoute::WindowUnwindowed,
+        ResidentSourceRoute::WindowPaddedRows,
+        ResidentSourceRoute::WindowExtent,
+        ResidentSourceRoute::WindowRegistrations,
+        ResidentSourceRoute::WindowGeometry,
+        ResidentSourceRoute::WindowIdentityMoved,
+        ResidentSourceRoute::WindowLandingRefused,
+        ResidentSourceRoute::WindowSpanUnmapped,
+    ];
+    for route in windows {
+        let name = provider_render::resident_source_route(route);
+        let bucket_before = route_count("render_provider_out_of_class_resident_source");
+        let own_before = route_count(name);
+        let price_before = route_count(provider_render::resident_source_route_bytes(route));
+        let door_before = route_count(provider_render::resident_source_route(
+            ResidentSourceRoute::MapperRefNoLanding,
+        ));
+        let inputs = RenderRailInputs {
+            resident_source_route: Some(ResidentSourceRoute::MapperRefNoLanding),
+            ..inputs_held_with_window_refusal(&stages, RenderChainRole::SoleOrTail, route)
+        };
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_resident_source",
+                    "{name}: a record whose window could not be cut keeps the engine under the \
+                     bucket's own slug: {reason}"
+                );
+            }
+            other => panic!("{name}: expected the class's refusal, got {other:?}"),
+        }
+        eprintln!("B window refusal {name}: {route:?}");
+        assert_eq!(
+            route_count(name) - own_before,
+            1,
+            "{name}: the window's own route is the number the census reads"
+        );
+        assert_eq!(
+            route_count(provider_render::resident_source_route_bytes(route)) - price_before,
+            extent,
+            "{name}: the route is priced at the whole attachment the window would have covered"
+        );
+        assert_eq!(
+            route_count(provider_render::resident_source_route(
+                ResidentSourceRoute::MapperRefNoLanding
+            )) - door_before,
+            0,
+            "{name}: the door's own route is not charged for a door that stated a window"
+        );
+        assert_eq!(
+            route_count("render_provider_out_of_class_resident_source") - bucket_before,
+            1,
+            "{name}: the bucket still counts the refusal once"
+        );
+    }
+
+    // The other direction: a refused window leaves the byte arms to answer, so
+    // the population R26's completion counter reads is not taken away by the
+    // window's refusal.
+    let handed = vec![0u8; usize::try_from(extent).expect("the extent fits usize")];
+    let r26_before = route_count("render_provider_surface_resident_source_bytes");
+    let refused_window_before = route_count("resident_source_window_padded_rows");
+    let inputs = RenderRailInputs {
+        surface_resident_source_bytes: Some(&handed),
+        ..inputs_held_with_window_refusal(
+            &stages,
+            RenderChainRole::SoleOrTail,
+            ResidentSourceRoute::WindowPaddedRows,
+        )
+    };
+    match provider_render::submit_render(&inputs, &request()) {
+        RenderRailOutcome::ProviderCompleted(_) => {}
+        other => panic!(
+            "a refused window beside a handed-over frame is still answered by R26's arm: {other:?}"
+        ),
+    }
+    eprintln!("B window refusal fallback: R26's byte arm answered the record");
+    assert_eq!(
+        route_count("render_provider_surface_resident_source_bytes") - r26_before,
+        1,
+        "R26's arm still reads the population the window could not state"
+    );
+    assert_eq!(
+        route_count("resident_source_window_padded_rows") - refused_window_before,
+        0,
+        "an answered record is not a refusal: the window's route is charged only where the \
+         class refuses"
+    );
+}
+
 /// R34: the two families inside `resident_source`, counted as the doors that
 /// produced them.
 ///
@@ -4438,6 +4872,20 @@ fn the_resident_source_bucket_is_counted_by_the_door_that_produced_it() {
         ResidentSourceRoute::MapperRefIdentityMismatch,
         ResidentSourceRoute::MapperRefFrameUnavailable,
         ResidentSourceRoute::Undeclared,
+        // B: the nine the elision doors' own windows answer under. The doors
+        // above name the doors; these name the *window* each door tried to
+        // declare and could not, which is the fact the next census reads to
+        // price `render-attachment-window-stride` and
+        // `render-guest-run-multi-allocation`.
+        ResidentSourceRoute::WindowUnregistered,
+        ResidentSourceRoute::WindowUnwindowed,
+        ResidentSourceRoute::WindowPaddedRows,
+        ResidentSourceRoute::WindowExtent,
+        ResidentSourceRoute::WindowRegistrations,
+        ResidentSourceRoute::WindowGeometry,
+        ResidentSourceRoute::WindowIdentityMoved,
+        ResidentSourceRoute::WindowLandingRefused,
+        ResidentSourceRoute::WindowSpanUnmapped,
     ];
 
     // 1. The bucket's own answer, with no door stated: the slug and the
