@@ -4035,6 +4035,136 @@ fn the_in_packet_relay_starts_from_the_walks_bytes_and_keeps_its_own() {
     }
 }
 
+/// R42's second narrowing: a record whose **load** is the guest-runs seed keeps
+/// no frame, however loudly the walk states its promise.
+///
+/// The relay's promise is about an image this rail mints under the record's own
+/// target identity, and one route cannot name that image. A record whose load
+/// is the ordered run list declares its attachment under the owner plan's
+/// registration allocation — the contract pairs every run's reservation with
+/// the *declaring view's* own allocation (`LeaseMismatch` otherwise) — so a
+/// store this rail elects as `Resident` beside it is a second identity for one
+/// attachment. The trace's declaring pass then names the resident mint the
+/// resource table deliberately omits (the run-list arm skips the pooled
+/// insert), and the canonical admission refuses the whole submission by name
+/// (`resource_contract_invalid: unknown allocation`). That is the rung the
+/// commits before this one left standing: fp8's single residual record, and
+/// census v33's 245 `draws_skipped_after_engine_refusal` — one per frame.
+///
+/// This drives the shape in the position the census reads it in: the packet's
+/// head, whose load is its own guest backing (R38's window), whose readback is
+/// withheld, and whose successor's probe admitted it. The answer has to be the
+/// published one — the same frame the caller-store test pins, and no resident
+/// store — because the keep's own image is one this declaration cannot carry.
+#[test]
+fn the_relay_keeps_no_frame_where_the_load_is_the_seed_windows_runs() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let half = width / 2;
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let texel = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
+    };
+    let source: Vec<u8> = (0..width * height)
+        .flat_map(|index| {
+            let x = (index % width) as u8;
+            let y = (index / width) as u8;
+            [x, y, x ^ y, 0xff]
+        })
+        .collect();
+
+    let import = 0x9e3e_u64;
+    let gpa_base = 0x55_4000_u64;
+    let (mut owner, memory) = seed_backing_fixture(gpa_base, &source, 4 * u64::from(width));
+    let window = register_seed_backing(&owner, import, gpa_base, frame_len);
+    // The production shape's own identity: a GVA, not a mapper-ref-texture
+    // surface (`mid=0` in the census lines the two rounds printed), so the
+    // surface door above is not what answers this record.
+    let identity = gva_identity(0x42_00_04, ash::vk::Format::R8G8B8A8_UNORM);
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some(memory.clone());
+        req.load_guest_target_backing = true;
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req
+    };
+
+    let deliveries = provider_render::provider_submissions();
+    let stores_before = route_count("render_provider_resident_store");
+    let landing_before = route_count("render_provider_borrowed_landing_bytes");
+    let single = [window];
+    let mut inputs = inputs_with_seed_window(&stages, RenderChainRole::Head, &single);
+    // The walk's own statement for the record whose successor's probe admitted
+    // it: the keep census v33 measured the refusal under.
+    inputs.chain_keeps_frame = true;
+    let frame = match provider_render::submit_render(&inputs, &request()) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!(
+            "a record whose load is the seed window's runs publishes its frame rather than \
+             refusing it: {other:?}"
+        ),
+    };
+    assert!(
+        provider_render::provider_submissions() > deliveries,
+        "the record still reaches the canonical provider: its load is the window either way"
+    );
+    for x in 0..half {
+        assert_texel_near(
+            &format!("seed window runs, relay promise: drawn texel ({x}, 0)"),
+            texel(&frame, x, 0),
+            FRAGMENT_TEXEL,
+        );
+    }
+    for y in 0..height {
+        for x in half..width {
+            assert_eq!(
+                texel(&frame, x, y).to_vec(),
+                source[((y * width + x) * 4) as usize..][..4].to_vec(),
+                "texel ({x}, {y}) keeps the window's own byte: the promise changes where the \
+                 frame goes, not which bytes the pass begins from"
+            );
+        }
+    }
+    assert_eq!(
+        route_count("render_provider_resident_store") - stores_before,
+        0,
+        "a run-list seed's frame cannot be kept: the attachment's allocation is the plan's \
+         registration, and a resident store would name a second identity for it"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_bytes") - landing_before,
+        0,
+        "the head does not owe the guest's pages a frame, so nothing lands in the window"
+    );
+    // The window is untouched: this record publishes, and the frame the caller
+    // receives is the one a rail that only read the runs hands over.
+    for x in 0..half {
+        assert_eq!(
+            texel(owner.as_mut_slice(), x, height / 2).to_vec(),
+            source[(((height / 2) * width + x) * 4) as usize..][..4].to_vec(),
+            "nothing wrote the guest's pages for a record that publishes its frame"
+        );
+    }
+}
+
 /// R42: the probe and the submission are the same function, so they cannot
 /// disagree about a shape — and a probe submits nothing.
 #[test]
